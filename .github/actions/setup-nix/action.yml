@@ -2,13 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Setup Nix
-description: Install Nix and configure the OpenShell Cachix cache
+description: Install Nix, configure Cachix, and optionally prepare the development shell
 
 inputs:
   cachix-auth-token:
     description: Token used to write build outputs to Cachix
     required: false
     default: ""
+
+  prepare-shell:
+    description: Prepare the development shell, retrying once on failure
+    required: false
+    default: "false"
+  shell-installable:
+    description: Development shell to prepare
+    required: false
+    default: "."
 
 runs:
   using: composite
@@ -22,3 +31,16 @@ runs:
         name: openshell
         authToken: ${{ inputs.cachix-auth-token }}
         skipPush: ${{ inputs.cachix-auth-token == '' }}
+
+    - name: Prepare Nix development shell
+      if: inputs.prepare-shell == 'true'
+      shell: bash
+      env:
+        NIX_SHELL_INSTALLABLE: ${{ inputs.shell-installable }}
+      run: |
+        # HTTP 416 is not retried by Nix; a fresh invocation restarts downloads.
+        if nix develop "$NIX_SHELL_INSTALLABLE" -c true; then
+          exit 0
+        fi
+        echo "::warning::Nix shell preparation failed; retrying once."
+        nix develop "$NIX_SHELL_INSTALLABLE" -c true

@@ -5,24 +5,26 @@ use clap::Parser;
 use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::{NonZeroI64, NonZeroU64};
 use std::path::PathBuf;
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
-use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_podman::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS, DEFAULT_SANDBOX_PIDS_LIMIT,
-    ImagePullPolicy,
-};
-use openshell_driver_podman::otel_tracing::compute_driver_rpc_layer;
+use openshell_core::{AppArmorProfile, ImagePullPolicy, VERSION};
+use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, DEFAULT_PODMAN_STOP_TIMEOUT_SECS};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
 #[command(name = "openshell-driver-podman")]
 #[command(version = VERSION)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     /// Public compute-driver Unix socket used by an external gateway.
     #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
     bind_socket: Option<PathBuf>,
@@ -53,7 +55,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY",
-        default_value_t = ImagePullPolicy::Missing
+        default_value_t = ImagePullPolicy::IfNotPresent
     )]
     sandbox_image_pull_policy: ImagePullPolicy,
 
@@ -71,9 +73,10 @@ struct Args {
     )]
     gateway_port: u16,
 
-    /// Host gateway IP used for sandbox host aliases.
+    /// Trusted supervisor-side destination used for sandbox host aliases.
     ///
-    /// Empty uses Podman's `host-gateway` resolver.
+    /// Empty uses loopback on native Linux and the gvproxy host address on
+    /// macOS Podman Machine.
     #[arg(long, env = "OPENSHELL_PODMAN_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
@@ -84,7 +87,7 @@ struct Args {
     )]
     sandbox_ssh_socket_path: String,
 
-    /// Podman bridge network name.
+    /// Podman network name retained for driver-managed resources.
     #[arg(long, env = "OPENSHELL_NETWORK_NAME", default_value = DEFAULT_NETWORK_NAME)]
     network_name: String,
 
@@ -92,30 +95,47 @@ struct Args {
     #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_PODMAN_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
-    /// Container cgroup PID limit for sandbox containers. Set 0 to inherit
-    /// Podman's runtime/default PID limit.
+    /// Container cgroup PID limit for sandbox containers. Omit to use
+    /// `OpenShell`'s 2048-process default.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PIDS_LIMIT", default_value = "2048")]
+    sandbox_pids_limit: Option<NonZeroI64>,
+
+    /// Health check interval in seconds. Omit it in gateway TOML to disable
+    /// health checks; the standalone driver keeps its prior 10-second default.
     #[arg(
         long,
-        env = "OPENSHELL_SANDBOX_PIDS_LIMIT",
-        default_value_t = DEFAULT_SANDBOX_PIDS_LIMIT
+        env = "OPENSHELL_HEALTH_CHECK_INTERVAL_SECS",
+        default_value = "10"
     )]
-    sandbox_pids_limit: i64,
+    health_check_interval_secs: Option<NonZeroU64>,
 
-    /// OCI image containing the openshell-sandbox supervisor binary.
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
-    /// Host path to the CA certificate for sandbox mTLS.
+    /// Host path to the CA certificate for supervisor-to-gateway TLS.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CA")]
     podman_tls_ca: Option<PathBuf>,
 
-    /// Host path to the client certificate for sandbox mTLS.
+    /// Deprecated; client certificates are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_CERT")]
     podman_tls_cert: Option<PathBuf>,
 
-    /// Host path to the client private key for sandbox mTLS.
+    /// Deprecated; client private keys are rejected.
     #[arg(long, env = "OPENSHELL_PODMAN_TLS_KEY")]
     podman_tls_key: Option<PathBuf>,
+
+    /// Host UNIX socket projected into supervisors for provider SPIFFE token exchange.
+    #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
+    provider_spiffe_workload_api_socket: Option<PathBuf>,
+
+    /// `AppArmor` model: `RuntimeDefault`, `Unconfined`, or `Localhost/<profile>`.
+    #[arg(long, env = "OPENSHELL_APP_ARMOR_PROFILE")]
+    app_armor_profile: Option<AppArmorProfile>,
 
     /// Corporate forward proxy URL for the supervisor's upstream TLS dials,
     /// in explicit `http://host:port` form (scheme and port required).
@@ -177,44 +197,44 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let (tracer_provider, setup_error) = openshell_driver_podman::otel_tracing::provider_for(
-        args.otlp_endpoint.as_deref(),
-        args.gateway_name.as_deref(),
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_podman::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
     );
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracer_provider
-                .as_ref()
-                .map(openshell_driver_podman::otel_tracing::layer),
-        )
-        .init();
-    if let Some(error) = setup_error {
-        tracing::error!(%error, "OTLP exporting could not be started");
-    } else if let Some(endpoint) = &args.otlp_endpoint {
-        info!(endpoint, "OTLP exporting enabled");
-    }
 
     let driver = PodmanComputeDriver::new(PodmanComputeConfig {
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
         socket_path: args.podman_socket,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
         gateway_port: args.gateway_port,
         host_gateway_ip: args
             .host_gateway_ip
             .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
-        sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
+        ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
+        sandbox_runtime_image: args
+            .sandbox_runtime_image
+            .unwrap_or_else(openshell_core::config::default_sandbox_runtime_image),
         supervisor_image: args
             .supervisor_image
             .unwrap_or_else(openshell_core::config::default_supervisor_image),
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
+        provider_spiffe_workload_api_socket: args.provider_spiffe_workload_api_socket,
+        app_armor_profile: args.app_armor_profile,
         sandbox_pids_limit: args.sandbox_pids_limit,
+        health_check_interval_secs: args.health_check_interval_secs,
         https_proxy: args.sandbox_https_proxy,
         no_proxy: args.sandbox_no_proxy,
         proxy_auth_file: args.sandbox_proxy_auth_file,
@@ -225,20 +245,19 @@ async fn main() -> Result<()> {
         uidmap: args.uidmap,
         gidmap: args.gidmap,
         enable_bind_mounts: args.enable_bind_mounts,
-        ..PodmanComputeConfig::default()
     })
     .await
     .into_diagnostic()?;
 
     let service = ComputeDriverServer::new(ComputeDriverService::new(driver));
-    let result = if let Some(socket_path) = args.bind_socket {
+    if let Some(socket_path) = args.bind_socket {
         let listener = openshell_core::external_driver_socket::bind_private(&socket_path)
             .map_err(|err| miette::miette!("{err}"))?;
         let _cleanup =
             openshell_core::external_driver_socket::SocketCleanup::new(socket_path.clone());
         info!(socket = %socket_path.display(), "Starting Podman compute driver");
         tonic::transport::Server::builder()
-            .layer(compute_driver_rpc_layer())
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_incoming_shutdown(
                 openshell_core::external_driver_socket::SameUidUnixIncoming::new(listener),
@@ -249,18 +268,12 @@ async fn main() -> Result<()> {
     } else {
         info!(address = %args.bind_address, "Starting Podman compute driver");
         tonic::transport::Server::builder()
-            .layer(compute_driver_rpc_layer())
+            .layer(openshell_otel::compute_driver_rpc_layer())
             .add_service(service)
             .serve_with_shutdown(args.bind_address, shutdown_signal())
             .await
             .into_diagnostic()
-    };
-    if let Some(provider) = &tracer_provider
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
     }
-    result
 }
 
 async fn select_shutdown_signal(
@@ -326,5 +339,26 @@ mod tests {
             Some("http://collector.internal:4317")
         );
         assert_eq!(args.gateway_name.as_deref(), Some("production-us-west"));
+    }
+
+    #[test]
+    fn standalone_defaults_preserve_health_checks_and_reject_zero_limits() {
+        let defaults = Args::try_parse_from(["openshell-driver-podman"])
+            .expect("standalone driver defaults should parse");
+        assert_eq!(
+            defaults.health_check_interval_secs.map(NonZeroU64::get),
+            Some(10)
+        );
+        assert_eq!(
+            defaults.sandbox_pids_limit.map(NonZeroI64::get),
+            Some(openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
+
+        for flag in ["--sandbox-pids-limit", "--health-check-interval-secs"] {
+            let result = Args::try_parse_from(["openshell-driver-podman", flag, "0"]);
+            assert!(result.is_err(), "zero must be rejected for {flag}");
+            let error = result.err().expect("error was asserted above");
+            assert!(error.to_string().contains("invalid value"), "flag: {flag}");
+        }
     }
 }

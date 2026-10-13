@@ -24,6 +24,7 @@ openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 
 # Async runtime
@@ -37,6 +38,9 @@ chrono = "0.4"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }
+# Styling backend shared by dialoguer and indicatif; `color` overrides its
+# global switch so both follow the CLI's --color setting.
+console = "0.15"
 dialoguer = "0.11"
 indicatif = { workspace = true }
 owo-colors = { workspace = true }
@@ -46,7 +50,7 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "ring"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "aws-lc-rs"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -84,11 +88,15 @@ tracing-subscriber = { workspace = true }
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["poll"] }
 
 [dev-dependencies]
+# Tests import the example profiles from providers/ the way an operator
+# would; the feature is test-only and never reaches a release binary.
+openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
 futures = { workspace = true }
-rcgen = { version = "0.13", features = ["crypto", "pem"] }
+openshell-server = { path = "../openshell-server", features = ["test-support"] }
+rcgen = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 temp-env = "0.3"

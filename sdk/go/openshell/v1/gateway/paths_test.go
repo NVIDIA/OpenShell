@@ -36,7 +36,7 @@ func TestUserConfigDir_XDGUnset(t *testing.T) {
 
 func TestSystemGatewayDir(t *testing.T) {
 	dir := systemGatewayDir()
-	assert.Equal(t, "/etc/openshell/gateways", dir)
+	assert.Equal(t, filepath.FromSlash("/etc/openshell/gateways"), dir)
 }
 
 func TestResolveGatewayDir_UserDir(t *testing.T) {

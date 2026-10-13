@@ -6,7 +6,7 @@ mod common;
 use bytes::Bytes;
 use common::{
     PkiBundle, build_tls_root, generate_pki, generate_rogue_pki, grpc_client_mtls,
-    install_rustls_provider, start_test_server,
+    start_test_server,
 };
 use http_body_util::Empty;
 use hyper::Request;
@@ -54,7 +54,6 @@ fn https_client_mtls(
 
 #[tokio::test]
 async fn serves_grpc_and_http_over_tls_on_same_port() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = openshell_server::TlsAcceptor::from_files(
@@ -96,7 +95,6 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
 
 #[tokio::test]
 async fn mtls_valid_client_cert_accepted() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = openshell_server::TlsAcceptor::from_files(
@@ -127,7 +125,6 @@ async fn mtls_valid_client_cert_accepted() {
 
 #[tokio::test]
 async fn no_client_cert_accepted_with_ca() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = openshell_server::TlsAcceptor::from_files(
@@ -166,7 +163,6 @@ async fn no_client_cert_accepted_with_ca() {
 
 #[tokio::test]
 async fn no_client_cert_rejected_when_required() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = openshell_server::TlsAcceptor::from_files(
@@ -206,7 +202,6 @@ async fn no_client_cert_rejected_when_required() {
 
 #[tokio::test]
 async fn mtls_wrong_ca_client_cert_rejected() {
-    install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = openshell_server::TlsAcceptor::from_files(

@@ -20,7 +20,7 @@ func SSHSessionFromProto(resp *pb.CreateSshSessionResponse) *v1.SSHSession {
 		GatewayPort:        resp.GetGatewayPort(),
 		GatewayScheme:      resp.GetGatewayScheme(),
 		HostKeyFingerprint: resp.GetHostKeyFingerprint(),
-		ExpiresAtMs:        resp.GetExpiresAtMs(),
+		ExpiresAtMs:        MillisFromProto(resp.GetExpirationTime()),
 	}
 }
 
@@ -37,6 +37,6 @@ func SSHSessionToProto(session *v1.SSHSession) *pb.CreateSshSessionResponse {
 		GatewayPort:        session.GatewayPort,
 		GatewayScheme:      session.GatewayScheme,
 		HostKeyFingerprint: session.HostKeyFingerprint,
-		ExpiresAtMs:        session.ExpiresAtMs,
+		ExpirationTime:     TimestampFromMillis(session.ExpiresAtMs),
 	}
 }

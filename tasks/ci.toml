@@ -31,7 +31,7 @@ hide = true
 description = "Build release Rust binaries consumed by the hand-staged snap"
 run = [
   "cargo build --release -p openshell-cli",
-  "cargo build --release -p openshell-server --features bundled-z3",
+  "cargo build --release -p openshell-gateway",
   "cargo build --release -p openshell-sandbox",
 ]
 
@@ -54,6 +54,7 @@ description = "Run repository lint checks"
 depends = [
   "license:check",
   "rust:format:check",
+  "rust:lockfiles:check",
   "rust:lint",
   "python:format:check",
   "python:lint",

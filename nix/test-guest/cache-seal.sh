@@ -49,7 +49,9 @@ sync
 # Deleted credentials can remain in allocated blocks. Fill free space with
 # zeroes so qemu-img convert can safely omit those blocks from the cache disk.
 zero_file=/var/tmp/openshell-cache-zero
-dd if=/dev/zero of="${zero_file}" bs=64M status=none 2>/dev/null || true
+echo "==> Cache sealing: zeroing free disk space"
+dd if=/dev/zero of="${zero_file}" bs=64M status=progress || true
+echo "==> Cache sealing: free disk space zeroed"
 rm -f "${zero_file}"
 sync
 

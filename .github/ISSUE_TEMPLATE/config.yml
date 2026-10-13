@@ -7,11 +7,10 @@ contact_links:
       Vouch Request discussion describing what you want to work on. A
       maintainer will approve you with /vouch.
   - name: Have a question?
-    url: https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#agent-skills-for-contributors
+    url: https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#skills-for-using-openshell
     about: >
-      Point your agent at the repo. It has skills for CLI usage, cluster and
-      inference debugging, policy generation, and more. See CONTRIBUTING.md
-      for the full skills table.
+      Install the public OpenShell skills for CLI usage, cluster and inference
+      debugging, and policy generation. See CONTRIBUTING.md for details.
   - name: Security vulnerability?
     url: https://github.com/NVIDIA/OpenShell/blob/main/SECURITY.md
     about: >

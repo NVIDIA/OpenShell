@@ -14,10 +14,10 @@ If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo inclu
 
 | Skill | What it does | When to use |
 |---|---|---|
-| `update-docs` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
+| `update-docs-from-commits` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
 | `build-from-issue` | Plans and implements work from a GitHub issue, including doc updates. | When working from an issue that has doc impact. |
 
-The skills live in `.agents/skills/` and follow the style guide below automatically. To use one, ask your agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
+These contributor workflows live in `.agents/skills/` and follow the style guide below automatically. They are separate from the public skills in `skills/`, which help users operate OpenShell and can be installed without cloning the repository. To use a contributor skill, ask your repository-aware agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
 
 ## When to Update Docs
 
@@ -25,7 +25,7 @@ Update documentation when your change:
 
 - Adds, removes, or renames a CLI command or flag.
 - Changes default behavior or configuration.
-- Adds, removes, renames, or changes defaults for gateway TOML fields or driver-specific config options. Update `docs/reference/gateway-config.mdx` for these changes.
+- Adds, removes, renames, or changes defaults for gateway TOML fields or driver-specific config options. Update `docs/how-it-works/gateways/configuration.mdx` for these changes.
 - Adds a new feature that users interact with.
 - Fixes a bug that the docs describe incorrectly.
 - Changes an API, protocol, or policy schema.
@@ -89,6 +89,8 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing"
 
 For explicit entries in `docs/index.yml`, keep `page:`. Fern still requires it. If the page defines `sidebar-title`, set `page:` to that value. Otherwise set `page:` to the frontmatter `title`.
 
+Keep every page URL equal to its file path under `docs/`, without `.mdx`. Fern builds URLs from nav labels and slugs, not from file paths, so rename the file when you rename a page, and add a redirect in `fern/docs.yml` for the old URL. When a nav label does not produce the file name, for example `TypeScript`, which Fern turns into `type-script`, set a relative `slug:` on the entry in `docs/index.yml`. `mise run docs` runs `mise run docs:nav`, which fails when a page URL differs from its file path, when a nav label differs from the page's sidebar name, when a page is missing from the navigation, or when a redirect points to a page that does not exist.
+
 ### Page Structure
 
 1. Frontmatter `title` and `description`, plus any relevant page metadata.
@@ -151,15 +153,16 @@ Use these consistently:
 | NVIDIA | Nvidia, nvidia |
 | OpenShell | Open Shell, openShell, Openshell, openshell |
 | mTLS | MTLS, mtls |
+| snap, or Snap when required by sentence or title case | Snap as an inherent proper noun |
 | YAML | yaml, Yaml |
 
 ## Submitting Doc Changes
 
-1. Create a branch following the project convention: `docs/<issue-id>-<description>/<username>`.
+1. Create a branch following the project convention: `docs/<issue-id>-<short-description>/<github-username>`.
 2. Make your changes.
 3. Preview locally with `mise run docs:serve`.
 4. Run `mise run docs`.
-5. Run `mise run pre-commit` to catch formatting issues.
+5. Run the relevant formatting, link, and content checks following [Choose Verification for the Change in CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#choose-verification-for-the-change). Use `mise run pre-commit` when its broader scope is warranted.
 6. Open a PR with `docs:` as the conventional commit type.
 
 ```text

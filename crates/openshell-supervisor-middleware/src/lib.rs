@@ -3,9 +3,17 @@
 
 //! Supervisor middleware registration and chain execution.
 
-mod headers;
+pub mod headers;
 mod remote;
+mod response;
 mod websocket;
+
+pub use response::{
+    HttpResponseDiagnostics, HttpResponseFinish, HttpResponseInvocation,
+    HttpResponseInvocationOutcome, HttpResponseMiddlewareFailure, HttpResponsePreflightInput,
+    HttpResponsePreflightOutcome, HttpResponseSession, MAX_HTTP_RESPONSE_RETAINED_BODY_BYTES,
+    MAX_HTTP_RESPONSE_STREAM_UNIT_BYTES, is_stale_http_response_integrity_header,
+};
 
 pub use websocket::{
     WebSocketCoverage, WebSocketCoverageState, WebSocketInvocation, WebSocketInvocationOutcome,
@@ -22,18 +30,22 @@ use std::time::Duration;
 use miette::{Result, miette};
 use prost::Message;
 
+use openshell_core::extension_protocol::{
+    ExtensionFamily, NegotiatedExtension, gateway_metadata, negotiate,
+};
 use openshell_core::proto::middleware::v1::supervisor_middleware_server::SupervisorMiddleware;
 use openshell_core::proto::{
     Decision, Finding, HeaderMutation, HttpHeader, HttpRequestEvaluation, HttpRequestTarget,
-    MiddlewareBinding, MiddlewareManifest, NetworkMiddlewareConfig, RequestContext, SandboxPolicy,
-    SupervisorMiddlewareOperation, SupervisorMiddlewarePhase, SupervisorMiddlewareService,
-    ValidateConfigRequest, ValidateConfigResponse,
+    MiddlewareBinding, MiddlewareDescribeRequest, MiddlewareManifest, NetworkMiddlewareConfig,
+    RequestContext, SandboxPolicy, SupervisorMiddlewareOperation, SupervisorMiddlewarePhase,
+    SupervisorMiddlewareService, ValidateConfigRequest, ValidateConfigResponse,
 };
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 use tonic::{Request, Response as TonicResponse, Status as TonicStatus};
 
 pub use openshell_core::middleware::{
-    HttpRequestView, InProcessMiddleware, SupervisorMiddlewareEndpoint, WebSocketResponseStream,
+    HttpRequestView, HttpResponseResultStream, InProcessMiddleware, SupervisorMiddlewareEndpoint,
+    WebSocketResponseStream,
 };
 pub type MiddlewareService =
     dyn SupervisorMiddleware<EvaluateWebSocketSessionStream = WebSocketResponseStream>;
@@ -46,7 +58,7 @@ struct GeneratedMiddlewareEndpoint {
 impl SupervisorMiddlewareEndpoint for GeneratedMiddlewareEndpoint {
     async fn describe(
         &self,
-        request: Request<()>,
+        request: Request<MiddlewareDescribeRequest>,
     ) -> std::result::Result<TonicResponse<MiddlewareManifest>, TonicStatus> {
         self.service.describe(request).await
     }
@@ -80,7 +92,9 @@ impl SupervisorMiddlewareEndpoint for GeneratedMiddlewareEndpoint {
 impl InProcessMiddleware for GeneratedMiddlewareEndpoint {
     async fn describe(&self) -> MiddlewareManifest {
         self.service
-            .describe(Request::new(()))
+            .describe(Request::new(MiddlewareDescribeRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+            }))
             .await
             .expect("generated in-process Describe failed")
             .into_inner()
@@ -136,7 +150,9 @@ struct EndpointInProcessAdapter {
 impl InProcessMiddleware for EndpointInProcessAdapter {
     async fn describe(&self) -> MiddlewareManifest {
         self.endpoint
-            .describe(Request::new(()))
+            .describe(Request::new(MiddlewareDescribeRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+            }))
             .await
             .expect("in-process endpoint Describe failed")
             .into_inner()
@@ -179,6 +195,13 @@ impl InProcessMiddleware for EndpointInProcessAdapter {
         requests: tokio::sync::mpsc::Receiver<openshell_core::proto::WebSocketSessionEvent>,
     ) -> std::result::Result<WebSocketResponseStream, tonic::Status> {
         self.endpoint.open_websocket_session(requests).await
+    }
+
+    async fn open_http_response_pre_return(
+        &self,
+        requests: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        self.endpoint.open_http_response_pre_return(requests).await
     }
 }
 
@@ -618,6 +641,16 @@ impl MiddlewareDispatch {
             Self::Grpc(service) => service.open_websocket_session(receiver).await,
         }
     }
+
+    async fn open_http_response_pre_return(
+        &self,
+        receiver: tokio::sync::mpsc::Receiver<openshell_core::proto::HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, tonic::Status> {
+        match self {
+            Self::InProcess(service) => service.open_http_response_pre_return(receiver).await,
+            Self::Grpc(service) => service.open_http_response_pre_return(receiver).await,
+        }
+    }
 }
 
 struct MiddlewareServiceState {
@@ -634,10 +667,10 @@ struct MiddlewareServiceState {
 
 impl MiddlewareServiceState {
     fn timeout_for_binding(&self, binding: &MiddlewareBinding) -> Result<Duration> {
-        if binding.timeout.trim().is_empty() {
+        if binding.request_timeout.is_none() {
             Ok(self.operator_timeout)
         } else {
-            parse_middleware_timeout(&binding.timeout)
+            middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map(|binding_timeout| binding_timeout.min(self.operator_timeout))
                 .map_err(|reason| miette!("middleware binding has invalid timeout: {reason}"))
         }
@@ -697,6 +730,7 @@ pub struct MiddlewareRegistry {
     services: Arc<Vec<Arc<MiddlewareServiceState>>>,
     registered_services: Arc<Vec<RegisteredMiddlewareService>>,
     middleware_names: Arc<HashSet<String>>,
+    negotiated_extensions: Arc<Vec<NegotiatedExtension>>,
     work_admission: Arc<Semaphore>,
     work_admission_waiters: Arc<Semaphore>,
     session_admission: Arc<Semaphore>,
@@ -732,11 +766,17 @@ impl Default for MiddlewareRegistry {
             services: Arc::new(Vec::new()),
             registered_services: Arc::new(Vec::new()),
             middleware_names: Arc::new(HashSet::new()),
+            negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
         }
     }
+}
+
+/// Validate one external middleware registration without opening its transport.
+pub fn validate_registration_config(registration: &SupervisorMiddlewareService) -> Result<()> {
+    validate_registration(registration).map(|_| ())
 }
 
 fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<Duration> {
@@ -765,7 +805,7 @@ fn validate_registration(registration: &SupervisorMiddlewareService) -> Result<D
             registration.name
         ));
     }
-    middleware_timeout_or_default(&registration.timeout).map_err(|reason| {
+    middleware_proto_timeout_or_default(registration.request_timeout.as_ref()).map_err(|reason| {
         miette!(
             "middleware registration '{}' has invalid timeout: {reason}",
             registration.name
@@ -823,6 +863,7 @@ fn validate_payload_limit(source: &str, binding: &MiddlewareBinding) -> Result<u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SupportedBinding {
     HttpPreCredentials,
+    HttpResponsePreReturn,
     WebSocketPreCredentials,
 }
 
@@ -836,6 +877,10 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::HttpPreCredentials),
         (
+            Some(SupervisorMiddlewareOperation::HttpResponse),
+            Some(SupervisorMiddlewarePhase::PreReturn),
+        ) => Ok(SupportedBinding::HttpResponsePreReturn),
+        (
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreCredentials),
         ) => Ok(SupportedBinding::WebSocketPreCredentials),
@@ -843,7 +888,7 @@ fn supported_binding(source: &str, binding: &MiddlewareBinding) -> Result<Suppor
             Some(SupervisorMiddlewareOperation::WebsocketMessage),
             Some(SupervisorMiddlewarePhase::PreReturn),
         ) => Err(miette!(
-            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is reserved for PR 2"
+            "{source} advertises WEBSOCKET_MESSAGE/PRE_RETURN, which is not yet supported"
         )),
         _ => Err(miette!(
             "{source} advertises an unsupported middleware operation/phase pair"
@@ -869,8 +914,8 @@ fn validate_manifest_bindings(
             ));
         }
         let advertised = validate_payload_limit(source, binding)?;
-        if !binding.timeout.trim().is_empty() {
-            parse_middleware_timeout(&binding.timeout)
+        if binding.request_timeout.is_some() {
+            middleware_proto_timeout_or_default(binding.request_timeout.as_ref())
                 .map_err(|reason| miette!("{source} has invalid timeout for binding: {reason}"))?;
         }
         if operator_max_payload_bytes.is_some_and(|limit| limit > advertised) {
@@ -886,6 +931,24 @@ fn validate_manifest_bindings(
         }
     }
     Ok(())
+}
+
+fn middleware_proto_timeout_or_default(
+    value: Option<&prost_types::Duration>,
+) -> std::result::Result<Duration, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_MIDDLEWARE_TIMEOUT);
+    };
+    let timeout =
+        openshell_core::time::duration_to_std(value).map_err(|error| error.to_string())?;
+    if !(MIN_MIDDLEWARE_TIMEOUT..=MAX_MIDDLEWARE_TIMEOUT).contains(&timeout) {
+        return Err(format!(
+            "must be between {}ms and {}s",
+            MIN_MIDDLEWARE_TIMEOUT.as_millis(),
+            MAX_MIDDLEWARE_TIMEOUT.as_secs()
+        ));
+    }
+    Ok(timeout)
 }
 
 fn validate_external_manifest(
@@ -1067,6 +1130,8 @@ impl MiddlewareRegistry {
         let mut services = Vec::with_capacity(in_process_services.len() + registrations.len());
         let mut registered_services = Vec::with_capacity(registrations.len());
         let mut middleware_names = HashSet::new();
+        let mut negotiated_extensions = Vec::new();
+        let gateway = gateway_metadata(ExtensionFamily::SupervisorMiddleware);
 
         for service in in_process_services {
             let service = MiddlewareDispatch::InProcess(service);
@@ -1097,6 +1162,15 @@ impl MiddlewareRegistry {
                 ));
             }
             validate_manifest_bindings(&source, &manifest, None)?;
+            negotiated_extensions.push(
+                negotiate(
+                    ExtensionFamily::SupervisorMiddleware,
+                    &manifest.name,
+                    &gateway,
+                    manifest.extension.clone(),
+                )
+                .map_err(|error| miette!(error.to_string()))?,
+            );
             let attachment_name = manifest.name.clone();
             let manifest_cell = OnceCell::new();
             manifest_cell
@@ -1169,6 +1243,15 @@ impl MiddlewareRegistry {
                 operator_max_payload_bytes,
                 authenticated,
             )?;
+            negotiated_extensions.push(
+                negotiate(
+                    ExtensionFamily::SupervisorMiddleware,
+                    &registration.name,
+                    &gateway,
+                    manifest.extension.clone(),
+                )
+                .map_err(|error| miette!(error.to_string()))?,
+            );
             let manifest_cell = OnceCell::new();
             manifest_cell
                 .set(manifest)
@@ -1188,6 +1271,7 @@ impl MiddlewareRegistry {
             services: Arc::new(services),
             registered_services: Arc::new(registered_services),
             middleware_names: Arc::new(middleware_names),
+            negotiated_extensions: Arc::new(negotiated_extensions),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -1250,6 +1334,11 @@ impl MiddlewareRegistry {
             .map(|service| service.registration.clone())
             .collect()
     }
+
+    #[must_use]
+    pub fn negotiated_extensions(&self) -> &[NegotiatedExtension] {
+        &self.negotiated_extensions
+    }
 }
 
 impl Default for ChainRunner {
@@ -1284,6 +1373,7 @@ impl ChainRunner {
                 })]),
                 registered_services: Arc::new(Vec::new()),
                 middleware_names: Arc::new(HashSet::new()),
+                negotiated_extensions: Arc::new(Vec::new()),
                 work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
                 work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
                 session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -1435,6 +1525,20 @@ impl ChainRunner {
             .entries)
     }
 
+    pub async fn describe_http_response_chain(
+        &self,
+        entries: &[ChainEntry],
+    ) -> Result<Vec<DescribedChainEntry>> {
+        Ok(self
+            .describe_chain_for(
+                entries,
+                SupervisorMiddlewareOperation::HttpResponse,
+                SupervisorMiddlewarePhase::PreReturn,
+            )
+            .await?
+            .entries)
+    }
+
     async fn describe_chain_for(
         &self,
         entries: &[ChainEntry],
@@ -1460,7 +1564,7 @@ impl ChainRunner {
                 });
                 continue;
             };
-            let Some(binding) = Self::binding(manifest, operation, phase).cloned() else {
+            let Some(binding) = Self::binding(manifest, operation, phase).copied() else {
                 // The config remains globally ordered, but it does not
                 // participate in this exact operation/phase chain.
                 unbound.push(entry);
@@ -1601,7 +1705,7 @@ impl ChainRunner {
         let context = RequestContext {
             request_id,
             sandbox_id,
-            sandbox_name,
+            sandbox: sandbox_name,
             workspace,
             originating_process: None,
         };
@@ -1848,6 +1952,7 @@ impl ChainRunner {
                 None
             } else {
                 match headers::apply(
+                    headers::HeaderAuthority::Request,
                     &headers,
                     &connection_nominated_headers,
                     &result.header_mutations,
@@ -1997,6 +2102,18 @@ mod tests {
 
     use tokio_stream::wrappers::TcpListenerStream;
 
+    fn proto_duration(value: &str) -> prost_types::Duration {
+        let duration = match (value.strip_suffix("ms"), value.strip_suffix('s')) {
+            (Some(milliseconds), _) => {
+                Duration::from_millis(milliseconds.parse().expect("integer milliseconds"))
+            }
+            (_, Some(seconds)) => Duration::from_secs(seconds.parse().expect("integer seconds")),
+            (None, None) => panic!("test duration must use ms or s"),
+        };
+        openshell_core::time::duration_from_std(duration)
+            .expect("test duration is in protobuf range")
+    }
+
     #[test]
     fn advertised_audience_mismatch_fails_registration() {
         let configured = "urn:openshell:extension:middleware:content-guard";
@@ -2100,6 +2217,7 @@ mod tests {
     struct BorrowedRecordingService {
         manifest_name: String,
         received: std::sync::Mutex<Vec<RequestAddresses>>,
+        advertise_protocol: bool,
     }
 
     #[tonic::async_trait]
@@ -2112,9 +2230,17 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: self.advertise_protocol.then(|| {
+                    openshell_core::extension_protocol::extension_metadata(
+                        ExtensionFamily::SupervisorMiddleware,
+                        "openshell/test-middleware",
+                        "test",
+                        [],
+                    )
+                }),
             }
         }
 
@@ -2159,6 +2285,7 @@ mod tests {
         let service = Arc::new(BorrowedRecordingService {
             manifest_name: "acme/redactor".into(),
             received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: true,
         });
         let runner = ChainRunner::new(service.clone());
         let entries = [
@@ -2248,9 +2375,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -2339,9 +2472,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: "10ms".into(),
+                    request_timeout: Some(proto_duration("10ms")),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -2551,10 +2690,12 @@ mod tests {
         let first: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
             manifest_name: "openshell/test".into(),
             received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: true,
         });
         let second: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
             manifest_name: "openshell/test".into(),
             received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: true,
         });
 
         let error = MiddlewareRegistry::connect_services(vec![first, second], Vec::new())
@@ -2564,6 +2705,25 @@ mod tests {
             error
                 .to_string()
                 .contains("duplicate supervisor middleware name")
+        );
+    }
+
+    #[tokio::test]
+    async fn in_process_service_without_protocol_metadata_is_rejected() {
+        let service: Arc<dyn InProcessMiddleware> = Arc::new(BorrowedRecordingService {
+            manifest_name: "openshell/legacy".into(),
+            received: std::sync::Mutex::new(Vec::new()),
+            advertise_protocol: false,
+        });
+
+        let error = MiddlewareRegistry::connect_services(vec![service], Vec::new())
+            .await
+            .expect_err("legacy middleware must fail negotiation");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not provide protocol metadata")
         );
     }
 
@@ -2590,7 +2750,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: self.manifest_name.clone(),
@@ -2599,9 +2759,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -2628,7 +2794,7 @@ mod tests {
 
     struct SlowService {
         delay: Duration,
-        binding_timeout: String,
+        binding_timeout: Option<prost_types::Duration>,
     }
 
     #[tonic::async_trait]
@@ -2645,7 +2811,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/slow".into(),
@@ -2654,9 +2820,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: self.binding_timeout.clone(),
+                    request_timeout: self.binding_timeout,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -2704,7 +2876,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/two-stage".into(),
@@ -2713,9 +2885,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 256 * 1024,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -2974,7 +3152,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/recorder".into(),
@@ -2983,9 +3161,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -3025,6 +3209,62 @@ mod tests {
         received: std::sync::Mutex<Vec<HttpRequestEvaluation>>,
     }
 
+    struct InProcessHeaderChainService {
+        received: std::sync::Mutex<Vec<Vec<HttpHeader>>>,
+    }
+
+    #[tonic::async_trait]
+    impl InProcessMiddleware for InProcessHeaderChainService {
+        async fn describe(&self) -> MiddlewareManifest {
+            MiddlewareManifest {
+                name: "test/in-process-header-chain".into(),
+                service_version: "test".into(),
+                bindings: vec![MiddlewareBinding {
+                    operation: SupervisorMiddlewareOperation::HttpRequest as i32,
+                    phase: SupervisorMiddlewarePhase::PreCredentials as i32,
+                    max_payload_bytes: 4096,
+                    request_timeout: None,
+                }],
+                expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
+            }
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            let invocation = {
+                let mut received = self.received.lock().expect("in-process header chain lock");
+                let invocation = received.len();
+                received.push(request.headers().to_vec());
+                invocation
+            };
+            let mut result = allow_result();
+            if invocation == 0 {
+                result.header_mutations.push(write_header(
+                    "cache-control",
+                    "no-store",
+                    ExistingHeaderAction::Overwrite,
+                ));
+            }
+            Ok(result)
+        }
+    }
+
     #[tonic::async_trait]
     impl SupervisorMiddleware for HeaderChainService {
         type EvaluateWebSocketSessionStream = WebSocketResponseStream;
@@ -3039,7 +3279,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             Ok(tonic::Response::new(MiddlewareManifest {
                 name: "test/header-chain".into(),
@@ -3048,9 +3288,15 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 4096,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -3081,13 +3327,13 @@ mod tests {
             let mut result = allow_result();
             if invocation == 0 {
                 result.header_mutations.push(write_header(
-                    "x-openshell-middleware-chain",
+                    "cache-control",
                     "first",
                     ExistingHeaderAction::Overwrite,
                 ));
             } else if invocation == 1 {
                 result.header_mutations.push(write_header(
-                    "x-openshell-middleware-chain",
+                    "cache-control",
                     "second",
                     self.second_action,
                 ));
@@ -3141,11 +3387,54 @@ mod tests {
             let observed: Vec<&str> = received[2]
                 .headers
                 .iter()
-                .filter(|header| header.name == "x-openshell-middleware-chain")
+                .filter(|header| header.name == "cache-control")
                 .map(|header| header.value.as_str())
                 .collect();
             assert_eq!(observed, expected, "action {action:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn in_process_request_middleware_writes_end_to_end_header_without_namespace() {
+        let service = Arc::new(InProcessHeaderChainService {
+            received: std::sync::Mutex::new(Vec::new()),
+        });
+        let runner = ChainRunner::new(service.clone());
+        let entries = [
+            ChainEntry {
+                name: "writer".into(),
+                implementation: "test/in-process-header-chain".into(),
+                order: 0,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+            ChainEntry {
+                name: "observer".into(),
+                implementation: "test/in-process-header-chain".into(),
+                order: 10,
+                config: prost_types::Struct::default(),
+                on_error: OnError::FailClosed,
+            },
+        ];
+
+        let outcome = runner
+            .evaluate(&entries, input("payload"))
+            .await
+            .expect("evaluate in-process header chain");
+        let received = service
+            .received
+            .lock()
+            .expect("recorded in-process headers");
+
+        assert!(outcome.allowed);
+        assert_eq!(
+            received[1]
+                .iter()
+                .filter(|header| header.name == "cache-control")
+                .map(|header| header.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["no-store"]
+        );
     }
 
     #[tokio::test]
@@ -3224,7 +3513,7 @@ mod tests {
         let context = received[0].context.as_ref().expect("request context");
         assert_eq!(context.request_id, "req");
         assert_eq!(context.sandbox_id, "sbx-id");
-        assert_eq!(context.sandbox_name, "sbx-name");
+        assert_eq!(context.sandbox, "sbx-name");
         assert_eq!(context.workspace, "wrks-default");
         assert!(context.originating_process.is_none());
         let target = received[0].target.as_ref().expect("request target");
@@ -3276,7 +3565,9 @@ mod tests {
             .expect("built-in manifest cache");
 
         let manifest = service
-            .describe(Request::new(()))
+            .describe(Request::new(MiddlewareDescribeRequest {
+                gateway: Some(gateway_metadata(ExtensionFamily::SupervisorMiddleware)),
+            }))
             .await
             .expect("describe test service")
             .into_inner();
@@ -3310,6 +3601,7 @@ mod tests {
             ]),
             registered_services: Arc::new(vec![RegisteredMiddlewareService { registration }]),
             middleware_names: Arc::new(HashSet::from([builtin_name, registration_name])),
+            negotiated_extensions: Arc::new(Vec::new()),
             work_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_WORK)),
             work_admission_waiters: Arc::new(Semaphore::new(MAX_QUEUED_MIDDLEWARE_WORK)),
             session_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_MIDDLEWARE_SESSIONS)),
@@ -3502,9 +3794,15 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
         let error = validate_external_manifest(&registration, &manifest, 4097, false)
             .expect_err("operator limit must fit capability");
@@ -3529,9 +3827,15 @@ mod tests {
                 operation: HTTP_REQUEST_OPERATION as i32,
                 phase: PRE_CREDENTIALS_PHASE as i32,
                 max_payload_bytes: u64::MAX,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
         let error = validate_external_manifest(&registration, &manifest, 4096, false)
             .expect_err("extreme advertised payload limit must be rejected");
@@ -3545,13 +3849,19 @@ mod tests {
             operation: HTTP_REQUEST_OPERATION as i32,
             phase: PRE_CREDENTIALS_PHASE as i32,
             max_payload_bytes: 4096,
-            timeout: String::new(),
+            request_timeout: None,
         };
         let manifest = MiddlewareManifest {
             name: "example/service".into(),
             service_version: "test".into(),
             bindings: vec![binding(), binding()],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         let error = validate_external_manifest(&registration, &manifest, 4096, false)
@@ -3564,26 +3874,60 @@ mod tests {
     }
 
     #[test]
+    fn manifest_accepts_http_response_pre_return_binding_when_dispatch_is_available() {
+        let registration = external_registration(4096);
+        let manifest = MiddlewareManifest {
+            name: "example/response".into(),
+            service_version: "test".into(),
+            bindings: vec![MiddlewareBinding {
+                operation: SupervisorMiddlewareOperation::HttpResponse as i32,
+                phase: SupervisorMiddlewarePhase::PreReturn as i32,
+                max_payload_bytes: 4096,
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 0,
+                    nanos: 500_000_000,
+                }),
+            }],
+            expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
+        };
+
+        validate_external_manifest(&registration, &manifest, 4096, false)
+            .expect("HTTP response pre-return binding is supported");
+    }
+
+    #[test]
     fn manifest_accepts_forward_websocket_binding_and_reserves_return_phase() {
         let binding = |phase| MiddlewareBinding {
             operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
             phase: phase as i32,
             max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
-            timeout: "500ms".into(),
+            request_timeout: Some(proto_duration("500ms")),
         };
         let mut manifest = MiddlewareManifest {
             name: "example/websocket".into(),
             service_version: "test".into(),
             bindings: vec![binding(SupervisorMiddlewarePhase::PreCredentials)],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
         validate_manifest_bindings("test WebSocket service", &manifest, None)
             .expect("forward WebSocket binding is supported");
 
         manifest.bindings = vec![binding(SupervisorMiddlewarePhase::PreReturn)];
         let error = validate_manifest_bindings("test WebSocket service", &manifest, None)
-            .expect_err("return-path binding stays reserved for PR 2");
-        assert!(error.to_string().contains("reserved for PR 2"));
+            .expect_err("return-path WebSocket binding is not yet supported");
+        assert!(error.to_string().contains("not yet supported"));
     }
 
     #[test]
@@ -3596,9 +3940,15 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         let error = validate_external_manifest(&registration, &manifest, 0, false)
@@ -3620,9 +3970,15 @@ mod tests {
                 operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                 max_payload_bytes: 4096,
-                timeout: String::new(),
+                request_timeout: None,
             }],
             expected_audience: String::new(),
+            extension: Some(openshell_core::extension_protocol::extension_metadata(
+                ExtensionFamily::SupervisorMiddleware,
+                "openshell/test-middleware",
+                "test",
+                [],
+            )),
         };
 
         let error = validate_external_manifest(&registration, &manifest, 4097, false)
@@ -3669,7 +4025,7 @@ mod tests {
         assert_eq!(timeout, DEFAULT_MIDDLEWARE_TIMEOUT);
 
         let mut registration = external_registration(4096);
-        registration.timeout = "2s".into();
+        registration.request_timeout = Some(proto_duration("2s"));
         let timeout = validate_registration(&registration).expect("operator timeout");
         assert_eq!(timeout, Duration::from_secs(2));
     }
@@ -3678,7 +4034,7 @@ mod tests {
     fn registration_timeout_enforces_bounds() {
         for timeout in ["9ms", "31s"] {
             let mut registration = external_registration(4096);
-            registration.timeout = timeout.into();
+            registration.request_timeout = Some(proto_duration(timeout));
             assert!(validate_registration(&registration).is_err());
         }
     }
@@ -3694,9 +4050,15 @@ mod tests {
                     operation: HTTP_REQUEST_OPERATION as i32,
                     phase: PRE_CREDENTIALS_PHASE as i32,
                     max_payload_bytes: 4096,
-                    timeout: timeout.into(),
+                    request_timeout: Some(proto_duration(timeout)),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             };
             let error = validate_external_manifest(&registration, &manifest, 4096, false)
                 .expect_err("out-of-bounds binding timeout must be rejected");
@@ -3707,11 +4069,11 @@ mod tests {
     #[tokio::test]
     async fn binding_timeout_override_controls_evaluation_and_on_error() {
         let mut registration = external_registration(4096);
-        registration.timeout = "2s".into();
+        registration.request_timeout = Some(proto_duration("2s"));
         let registry = registry_with_external(
             Arc::new(SlowService {
                 delay: Duration::from_millis(50),
-                binding_timeout: "10ms".into(),
+                binding_timeout: Some(proto_duration("10ms")),
             }),
             registration,
         )
@@ -3749,11 +4111,11 @@ mod tests {
     #[tokio::test]
     async fn operator_timeout_controls_binding_without_manifest_override() {
         let mut registration = external_registration(4096);
-        registration.timeout = "10ms".into();
+        registration.request_timeout = Some(proto_duration("10ms"));
         let registry = registry_with_external(
             Arc::new(SlowService {
                 delay: Duration::from_millis(50),
-                binding_timeout: String::new(),
+                binding_timeout: None,
             }),
             registration,
         )
@@ -3784,11 +4146,14 @@ mod tests {
     #[tokio::test]
     async fn operator_timeout_caps_longer_binding_timeout_for_validation_and_evaluation() {
         let mut registration = external_registration(4096);
-        registration.timeout = "10ms".into();
+        registration.request_timeout = Some(proto_duration("10ms"));
         let registry = registry_with_external(
             Arc::new(SlowService {
                 delay: Duration::from_millis(50),
-                binding_timeout: "2s".into(),
+                binding_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
             }),
             registration,
         )
@@ -4140,6 +4505,53 @@ mod tests {
         );
         assert!(outcome.findings.is_empty());
         assert!(!format!("{outcome:?}").contains(secret));
+    }
+
+    #[tokio::test]
+    async fn credential_placeholder_header_mutation_follows_on_error() {
+        let placeholder = "openshell:resolve:env:API_KEY";
+        let service = Arc::new(ScriptedService {
+            manifest_name: "test/middleware".into(),
+            max_body_bytes: 4096,
+            result: openshell_core::proto::HttpRequestResult {
+                header_mutations: vec![write_header(
+                    "x-api-key",
+                    placeholder,
+                    ExistingHeaderAction::Overwrite,
+                )],
+                ..allow_result()
+            },
+        });
+        let registry = registry_with_external(service, external_registration(4096)).await;
+        let runner = ChainRunner::from_registry(registry);
+
+        for (on_error, allowed) in [(OnError::FailClosed, false), (OnError::FailOpen, true)] {
+            let outcome = runner
+                .evaluate(
+                    &[ChainEntry {
+                        name: "guard".into(),
+                        implementation: "local-guard-service".into(),
+                        order: 0,
+                        config: prost_types::Struct::default(),
+                        on_error,
+                    }],
+                    input("hello"),
+                )
+                .await
+                .expect("evaluate credential placeholder mutation");
+
+            assert_eq!(outcome.allowed, allowed);
+            assert!(outcome.header_mutations.is_empty());
+            assert_eq!(outcome.applied.len(), 1);
+            assert!(outcome.applied[0].failed);
+            assert!(!format!("{outcome:?}").contains(placeholder));
+            if !allowed {
+                assert_eq!(
+                    outcome.reason,
+                    "middleware_failed: header_mutation_credential_placeholder"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -4572,7 +4984,7 @@ mod tests {
         close_on_first_message: bool,
         messages: Arc<std::sync::atomic::AtomicUsize>,
         session_ends: Option<
-            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::WebSocketSessionEndReason>,
+            tokio::sync::mpsc::UnboundedSender<openshell_core::proto::MiddlewareSessionEndReason>,
         >,
     }
 
@@ -4663,7 +5075,7 @@ mod tests {
                         Some(web_socket_session_event::Event::SessionEnd(end)) => {
                             if let Some(session_ends) = &session_ends
                                 && let Ok(reason) =
-                                    openshell_core::proto::WebSocketSessionEndReason::try_from(
+                                    openshell_core::proto::MiddlewareSessionEndReason::try_from(
                                         end.reason,
                                     )
                             {
@@ -4704,7 +5116,7 @@ mod tests {
 
         async fn describe(
             &self,
-            _request: Request<()>,
+            _request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             self.describe_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4719,9 +5131,18 @@ mod tests {
                     operation: SupervisorMiddlewareOperation::WebsocketMessage as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
-                    timeout: "1s".into(),
+                    request_timeout: Some(prost_types::Duration {
+                        seconds: 1,
+                        nanos: 0,
+                    }),
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -4762,7 +5183,7 @@ mod tests {
     impl SupervisorMiddlewareEndpoint for OpenAiRedactionService {
         async fn describe(
             &self,
-            request: Request<()>,
+            request: Request<MiddlewareDescribeRequest>,
         ) -> std::result::Result<tonic::Response<MiddlewareManifest>, tonic::Status> {
             SupervisorMiddleware::describe(self, request).await
         }
@@ -4948,14 +5369,14 @@ mod tests {
             assert!(!text.invocations[0].failed);
 
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
                 .await;
         }
     }
 
     #[tokio::test]
     async fn explicit_websocket_preflight_denial_is_authoritative_for_both_error_modes() {
-        use openshell_core::proto::WebSocketSessionEndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason;
 
         for on_error in [OnError::FailOpen, OnError::FailClosed] {
             let (session_ends_tx, mut session_ends_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4991,7 +5412,7 @@ mod tests {
             assert!(!outcome.allowed);
             assert_eq!(
                 outcome.terminal_reason,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert_eq!(
                 outcome.reason,
@@ -5029,7 +5450,7 @@ mod tests {
             assert!(!outcome.invocations[0].failed);
             assert_eq!(
                 session_ends_rx.recv().await,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert!(
                 session_ends_rx.try_recv().is_err(),
@@ -5040,7 +5461,7 @@ mod tests {
 
     #[tokio::test]
     async fn mixed_websocket_preflight_denial_ends_every_opened_stage() {
-        use openshell_core::proto::WebSocketSessionEndReason;
+        use openshell_core::proto::MiddlewareSessionEndReason;
 
         let (first_end_tx, mut first_end_rx) = tokio::sync::mpsc::unbounded_channel();
         let (denier_end_tx, mut denier_end_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -5082,7 +5503,7 @@ mod tests {
         assert!(!outcome.allowed);
         assert_eq!(
             outcome.terminal_reason,
-            Some(WebSocketSessionEndReason::MiddlewareDenial)
+            Some(MiddlewareSessionEndReason::MiddlewareDenial)
         );
         assert_eq!(
             outcome
@@ -5099,7 +5520,7 @@ mod tests {
         for receiver in [&mut first_end_rx, &mut denier_end_rx, &mut last_end_rx] {
             assert_eq!(
                 receiver.recv().await,
-                Some(WebSocketSessionEndReason::MiddlewareDenial)
+                Some(MiddlewareSessionEndReason::MiddlewareDenial)
             );
             assert!(
                 receiver.try_recv().is_err(),
@@ -5176,7 +5597,7 @@ mod tests {
             "middleware_failed: request_message_over_capacity"
         );
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5233,7 +5654,7 @@ mod tests {
         assert!(!redacted.invocations[0].stage_disabled);
 
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5279,7 +5700,7 @@ mod tests {
         );
         assert!(outcome.invocations[0].transformed);
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
     }
 
@@ -5365,7 +5786,7 @@ mod tests {
         assert!(target.query.is_empty());
         assert_eq!(observed.requested_subprotocols, ["realtime"]);
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         let _ = shutdown_tx.send(());
         server_task
@@ -5476,7 +5897,7 @@ mod tests {
         drop(work);
 
         session
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         let _ = shutdown_tx.send(());
         server_task
@@ -5735,8 +6156,10 @@ mod tests {
             "all-skip preflight must not retain session capacity"
         );
         assert_eq!(
-            session_ends_rx.recv().await,
-            Some(openshell_core::proto::WebSocketSessionEndReason::StageSkipped)
+            tokio::time::timeout(Duration::from_secs(1), session_ends_rx.recv())
+                .await
+                .expect("skipped stage must receive session_end"),
+            Some(openshell_core::proto::MiddlewareSessionEndReason::StageSkipped)
         );
         assert!(
             session_ends_rx.try_recv().is_err(),
@@ -5782,7 +6205,7 @@ mod tests {
         sessions
             .pop()
             .expect("retained session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::NormalClose)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::Normal)
             .await;
         assert_eq!(runner.registry.session_admission.available_permits(), 1);
 
@@ -5824,7 +6247,7 @@ mod tests {
         sessions
             .pop()
             .expect("retained old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = replacement
             .preflight_websocket(&chain, websocket_preflight_input("new-generation-admitted"))

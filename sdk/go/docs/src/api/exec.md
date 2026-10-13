@@ -139,8 +139,22 @@ type InteractiveSession interface {
 | `Read`     | Reads output from the process into the provided buffer.             |
 | `Write`    | Sends input to the process.                                         |
 | `Resize`   | Updates the terminal dimensions (columns and rows).                 |
-| `ExitCode` | Returns the process exit code after the session ends.               |
-| `Close`    | Closes the session and releases resources.                          |
+| `ExitCode` | Waits for final gRPC status; returns any observed exit code alongside a later stream error. |
+| `Close` | Aborts the RPC and releases resources. |
+
+SDK sessions also implement the optional `InteractiveSessionControl` interface,
+which embeds `InteractiveSession` and adds `CloseWrite() error` and `Cancel() error`.
+Existing custom implementations only need the original methods above.
+
+Call `CloseInteractiveInput(session)` to end stdin and resize input without
+cancelling output. It invokes `CloseWrite()` when supported; otherwise it returns
+`ErrorUnimplemented` without closing the session. Call `CancelInteractive(session)`
+to invoke `Cancel()` when supported, falling back to `Close()` for legacy sessions.
+The SDK's close and cancel methods are idempotent.
+
+Drain `Read` concurrently with waiting for `ExitCode`; bounded output buffers can
+otherwise prevent completion. After input closure, writes and resizes return
+`io.ErrClosedPipe`. Request EOF is not equivalent to a terminal Ctrl-D keystroke.
 
 ## ExecChunk
 

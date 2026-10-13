@@ -84,7 +84,7 @@ async fn gateway_discovery_handler(
     uri: Uri,
 ) -> impl IntoResponse {
     gateway_discovery_response(
-        state.sandbox_jwt_authenticator.as_deref(),
+        state.extension_jwt_issuer.as_deref(),
         &document_base_url(&headers, &uri),
     )
 }
@@ -113,10 +113,10 @@ fn document_base_url(headers: &HeaderMap, uri: &Uri) -> Option<String> {
 }
 
 fn gateway_discovery_response(
-    authenticator: Option<&crate::auth::sandbox_jwt::SandboxJwtAuthenticator>,
+    issuer: Option<&crate::auth::sandbox_jwt::ExtensionJwtIssuer>,
     base_url: &Option<String>,
 ) -> axum::response::Response {
-    let Some(authenticator) = authenticator else {
+    let Some(issuer) = issuer else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Some(base_url) = base_url else {
@@ -126,7 +126,7 @@ fn gateway_discovery_response(
         return StatusCode::BAD_REQUEST.into_response();
     };
     Json(serde_json::json!({
-        "issuer": authenticator.issuer(),
+        "issuer": issuer.issuer(),
         "jwks_uri": format!("{base_url}/.well-known/jwks.json"),
         "id_token_signing_alg_values_supported": ["EdDSA"],
         "response_types_supported": ["id_token"],
@@ -145,15 +145,15 @@ fn gateway_discovery_response(
 /// gateway from which an integration bootstraps this document; integrations
 /// then cache keys by `kid` and refresh when an unfamiliar `kid` appears.
 async fn gateway_jwks_handler(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
-    gateway_jwks_response(state.sandbox_jwt_authenticator.as_deref())
+    gateway_jwks_response(state.extension_jwt_issuer.as_deref())
 }
 
 fn gateway_jwks_response(
-    authenticator: Option<&crate::auth::sandbox_jwt::SandboxJwtAuthenticator>,
+    issuer: Option<&crate::auth::sandbox_jwt::ExtensionJwtIssuer>,
 ) -> axum::response::Response {
-    authenticator.map_or_else(
+    issuer.map_or_else(
         || StatusCode::NOT_FOUND.into_response(),
-        |authenticator| Json(authenticator.jwks()).into_response(),
+        |issuer| Json(issuer.jwks()).into_response(),
     )
 }
 
@@ -571,6 +571,7 @@ mod tests {
     use super::*;
     use axum::body::to_bytes;
     use openshell_bootstrap::jwt::generate_jwt_key;
+    use std::time::Duration;
 
     #[test]
     fn extract_cookie_finds_value() {
@@ -687,16 +688,18 @@ mod tests {
     #[test]
     fn jwks_response_publishes_configured_gateway_key() {
         let material = generate_jwt_key().expect("key");
-        let authenticator = crate::auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+        let issuer = crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
+            material.signing_key_pem.as_bytes(),
             material.public_key_pem.as_bytes(),
             material.kid.clone(),
             "gateway-a",
+            Duration::from_mins(15),
         )
-        .expect("authenticator");
+        .expect("issuer");
 
-        let response = gateway_jwks_response(Some(&authenticator));
+        let response = gateway_jwks_response(Some(&issuer));
         assert_eq!(response.status(), StatusCode::OK);
-        let key = &authenticator.jwks().keys[0];
+        let key = &issuer.jwks().keys[0];
         assert_eq!(key.kid, material.kid);
         assert_eq!(key.kty, "OKP");
         assert_eq!(key.crv, "Ed25519");
@@ -709,21 +712,23 @@ mod tests {
         assert_eq!(gateway_jwks_response(None).status(), StatusCode::NOT_FOUND);
     }
 
-    fn test_authenticator() -> crate::auth::sandbox_jwt::SandboxJwtAuthenticator {
+    fn test_issuer() -> crate::auth::sandbox_jwt::ExtensionJwtIssuer {
         let material = generate_jwt_key().expect("key");
-        crate::auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
+        crate::auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
+            material.signing_key_pem.as_bytes(),
             material.public_key_pem.as_bytes(),
             material.kid,
             "gateway-a",
+            Duration::from_mins(15),
         )
-        .expect("authenticator")
+        .expect("issuer")
     }
 
     #[tokio::test]
     async fn discovery_document_advertises_issuer_identity_and_absolute_jwks_uri() {
-        let authenticator = test_authenticator();
+        let issuer = test_issuer();
         let response = gateway_discovery_response(
-            Some(&authenticator),
+            Some(&issuer),
             &Some("https://gateway.example:8443".to_string()),
         );
         assert_eq!(response.status(), StatusCode::OK);
@@ -755,7 +760,7 @@ mod tests {
         // A relative jwks_uri could be resolved against the wrong origin, so
         // refuse to emit a document rather than emit an ambiguous one.
         assert_eq!(
-            gateway_discovery_response(Some(&test_authenticator()), &None).status(),
+            gateway_discovery_response(Some(&test_issuer()), &None).status(),
             StatusCode::BAD_REQUEST
         );
     }

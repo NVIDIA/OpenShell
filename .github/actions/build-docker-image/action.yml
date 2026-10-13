@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Build Docker Image
-description: Build and push one architecture of an OpenShell image
+description: Build, push, and export a multi-platform OpenShell image
 
 inputs:
   component:
@@ -11,14 +11,8 @@ inputs:
   binary:
     description: Binary staged in the Docker build context
     required: true
-  triple:
-    description: Binary artifact target triple
-    required: true
-  arch:
-    description: Docker architecture name
-    required: true
-  platform:
-    description: Docker platform
+  target-suffix:
+    description: Binary artifact target suffix
     required: true
   image-tag:
     description: Docker image tag
@@ -35,41 +29,64 @@ runs:
         buildkitd-config: /etc/buildkit/buildkitd.toml
 
     - name: Log in to GHCR
-      shell: bash
-      run: echo "${INPUTS_GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
-      env:
-        INPUTS_GITHUB_TOKEN: ${{ inputs.github-token }}
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.github-token }}
 
-    - name: Download ${{ inputs.binary }}
+    - name: Download amd64 ${{ inputs.binary }}
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
-        name: ${{ inputs.binary }}-${{ inputs.triple }}
-        path: artifact
+        name: ${{ inputs.binary }}-x86_64-${{ inputs.target-suffix }}
+        path: artifact/amd64
+
+    - name: Download arm64 ${{ inputs.binary }}
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        name: ${{ inputs.binary }}-aarch64-${{ inputs.target-suffix }}
+        path: artifact/arm64
 
     - name: Stage ${{ inputs.binary }}
       shell: bash
-      run: install -Dm0755 artifact/${INPUTS_BINARY} deploy/docker/.build/prebuilt-binaries/${INPUTS_ARCH}/${INPUTS_BINARY}
       env:
-        INPUTS_BINARY: ${{ inputs.binary }}
-        INPUTS_ARCH: ${{ inputs.arch }}
+        BINARY: ${{ inputs.binary }}
+      run: |
+        install -Dm0755 artifact/amd64/${BINARY} deploy/docker/.build/prebuilt-binaries/amd64/${BINARY}
+        install -Dm0755 artifact/arm64/${BINARY} deploy/docker/.build/prebuilt-binaries/arm64/${BINARY}
 
     - name: Build ${{ inputs.component }} image
       shell: bash
       env:
+        COMPONENT: ${{ inputs.component }}
         IMAGE_TAG: ${{ inputs.image-tag }}
-        INPUTS_PLATFORM: ${{ inputs.platform }}
-        INPUTS_COMPONENT: ${{ inputs.component }}
-        INPUTS_ARCH: ${{ inputs.arch }}
       run: |
+        install -d artifacts/images
         docker buildx build \
           --builder openshell \
-          --platform ${INPUTS_PLATFORM} \
-          --file deploy/docker/Dockerfile.${INPUTS_COMPONENT} \
-          --target ${INPUTS_COMPONENT} \
-          --tag ghcr.io/nvidia/openshell/${INPUTS_COMPONENT}:${IMAGE_TAG}-${INPUTS_ARCH} \
-          --cache-from type=gha,scope=${INPUTS_COMPONENT}-${INPUTS_ARCH} \
-          --cache-to type=gha,mode=max,scope=${INPUTS_COMPONENT}-${INPUTS_ARCH} \
+          --platform linux/amd64,linux/arm64 \
+          --file deploy/docker/Dockerfile.${COMPONENT} \
+          --target ${COMPONENT} \
+          --tag ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG} \
+          --cache-from type=gha,scope=${COMPONENT} \
+          --cache-to type=gha,mode=max,scope=${COMPONENT} \
           --provenance=mode=min \
           --attest type=sbom \
           --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \
+          --output type=oci,dest=artifacts/images/${COMPONENT}.tar \
           .
+
+    - name: Verify SBOM attestation
+      shell: bash
+      env:
+        IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}
+      run: tasks/scripts/verify-image-sbom.sh "${IMAGE_REF}" --require-cargo
+
+    - name: Upload ${{ inputs.component }} image
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        name: image-${{ inputs.component }}
+        path: artifacts
+        compression-level: 0
+        retention-days: 5
+        if-no-files-found: error

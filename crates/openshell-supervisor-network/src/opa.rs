@@ -6,14 +6,23 @@
 //! Wraps [`regorus::Engine`] to evaluate Rego policies for sandbox network
 //! access decisions. The engine is loaded once at sandbox startup and queried
 //! on every proxy CONNECT request.
+//!
+//! The baked policy uses the `openshell.endpoint_path_matches` native builtin
+//! registered here to share endpoint selector semantics with Rust route selection.
 
 use miette::Result;
 use openshell_core::host_pattern::HostSelector;
+use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
+use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
-use openshell_policy::L7ConfigStanza;
+use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol, PolicyViolation};
+use openshell_policy_schema::{
+    FilesystemPolicy as AuthoredFilesystemPolicy, LandlockPolicy as AuthoredLandlockPolicy,
+    ProcessPolicy as AuthoredProcessPolicy,
+};
 use openshell_supervisor_middleware::{ChainEntry, ChainRunner, MiddlewareRegistry};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -23,10 +32,35 @@ use std::sync::{
 use tokio::sync::watch;
 use tracing::info;
 
+mod raw_schema;
+
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
 /// passthroughs. They reference `data.sandbox.*` for policy data.
 const BAKED_POLICY_RULES: &str = include_str!("../data/sandbox-policy.rego");
+
+fn new_regorus_engine() -> Result<regorus::Engine> {
+    let mut engine = regorus::Engine::new();
+    engine
+        .add_extension(
+            "openshell.endpoint_path_matches".into(),
+            2,
+            Box::new(|params: Vec<regorus::Value>| {
+                let pattern = params[0].as_string()?;
+                let path = params[1].as_string()?;
+                Ok(regorus::Value::from(
+                    openshell_core::endpoint_path::matches(pattern, path),
+                ))
+            }),
+        )
+        .map_err(|_| miette::miette!("failed to register endpoint path matcher"))?;
+    Ok(engine)
+}
+
+/// Maximum number of fixed categories in one policy-load error.
+const POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS: usize = 8;
+/// Maximum byte length of one policy-load error, including its omission marker.
+const POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES: usize = 512;
 
 /// Implementation-owned middleware config validation supplied by the active
 /// in-process catalog for local policy files.
@@ -66,6 +100,8 @@ pub struct MatchedEndpoint {
 pub struct PolicyDnsEligibilitySnapshot {
     pub endpoints: Vec<MatchedEndpoint>,
     pub generation: u64,
+    /// The generation is a fail-closed quarantine, so every name is refused.
+    pub fail_closed: bool,
 }
 
 /// Atomic policy result used to authorize and materialize one egress request.
@@ -90,15 +126,6 @@ pub struct NetworkInput {
     /// process and its ancestors. Captures script paths (e.g. `/usr/local/bin/claude`)
     /// that don't appear in `/proc/<pid>/exe` because the interpreter (node) is the exe.
     pub cmdline_paths: Vec<PathBuf>,
-}
-
-pub(crate) fn network_binary_identity_required() -> bool {
-    std::env::var(openshell_core::sandbox_env::NETWORK_BINARY_IDENTITY).map_or(true, |value| {
-        !matches!(
-            value.as_str(),
-            "relaxed" | "disabled" | "endpoint-only" | "false" | "0"
-        )
-    })
 }
 
 fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
@@ -150,6 +177,7 @@ pub struct SandboxConfig {
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
+    binary_identity_required: bool,
     generation: Arc<AtomicU64>,
     middleware_runner: RwLock<ChainRunner>,
     websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
@@ -176,7 +204,7 @@ pub(crate) fn test_opa_query_count() -> u64 {
 }
 
 /// Generation guard captured when an HTTP tunnel or request path starts.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct PolicyGenerationGuard {
     captured_generation: u64,
     current_generation: Arc<AtomicU64>,
@@ -278,17 +306,23 @@ impl OpaEngine {
         self.websocket_assembly_budget.clone()
     }
 
-    fn with_engine(engine: regorus::Engine) -> Self {
+    fn with_engine(engine: regorus::Engine, binary_identity_required: bool) -> Self {
         let generation = Arc::new(AtomicU64::new(0));
         let (generation_tx, _) = watch::channel(0);
         Self {
             engine: Mutex::new(engine),
+            binary_identity_required,
             generation,
             middleware_runner: RwLock::new(ChainRunner::default()),
             websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget::default(),
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
+    }
+
+    /// Whether network authorization requires a workload binary identity.
+    pub const fn binary_identity_required(&self) -> bool {
+        self.binary_identity_required
     }
 
     fn advance_generation(&self) -> u64 {
@@ -311,14 +345,44 @@ impl OpaEngine {
         data_path: &Path,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
-        let yaml_str = std::fs::read_to_string(data_path).map_err(|e| {
-            miette::miette!("failed to read YAML data from {}: {e}", data_path.display())
-        })?;
-        let mut engine = regorus::Engine::new();
+        Self::from_files_with_identity_requirement(
+            policy_path,
+            data_path,
+            true,
+            validate_middleware_config,
+        )
+    }
+
+    /// Load local policy for a standalone proxy that cannot observe the
+    /// calling process. Authorization is based on the requested endpoint and
+    /// protocol rules instead of binary identity.
+    pub fn from_files_for_endpoint_only_proxy(
+        policy_path: &Path,
+        data_path: &Path,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
+        Self::from_files_with_identity_requirement(
+            policy_path,
+            data_path,
+            false,
+            validate_middleware_config,
+        )
+    }
+
+    fn from_files_with_identity_requirement(
+        policy_path: &Path,
+        data_path: &Path,
+        require_binary_identity: bool,
+        validate_middleware_config: Option<&MiddlewareConfigValidator>,
+    ) -> Result<Self> {
+        // File paths and parser errors can contain policy contents. Discard the
+        // original error, including its source chain, at the load boundary.
+        let yaml_str = std::fs::read_to_string(data_path)
+            .map_err(|_| miette::miette!("failed to read YAML policy data file"))?;
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy_from_file(policy_path)
-            .map_err(|e| miette::miette!("{e}"))?;
-        let require_binary_identity = network_binary_identity_required();
+            .map_err(|_| miette::miette!("failed to load Rego policy"))?;
         emit_binary_identity_mode(require_binary_identity, "files");
         let data_json = preprocess_yaml_data(
             &yaml_str,
@@ -327,28 +391,24 @@ impl OpaEngine {
         )?;
         engine
             .add_data_json(&data_json)
-            .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+            .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Load policy rules and data from strings (data is YAML).
     ///
     /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
-        Self::from_strings_with_options(policy, data_yaml, network_binary_identity_required(), None)
+        Self::from_strings_with_options(policy, data_yaml, true, None)
     }
 
+    /// Load policy strings and validate middleware config through the supplied catalog.
     pub fn from_strings_with_middleware_config(
         policy: &str,
         data_yaml: &str,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
-        Self::from_strings_with_options(
-            policy,
-            data_yaml,
-            network_binary_identity_required(),
-            validate_middleware_config,
-        )
+        Self::from_strings_with_options(policy, data_yaml, true, validate_middleware_config)
     }
 
     #[cfg(test)]
@@ -366,10 +426,10 @@ impl OpaEngine {
         require_binary_identity: bool,
         validate_middleware_config: Option<&MiddlewareConfigValidator>,
     ) -> Result<Self> {
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), policy.into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to load Rego policy"))?;
         emit_binary_identity_mode(require_binary_identity, "strings");
         let data_json = preprocess_yaml_data(
             data_yaml,
@@ -378,8 +438,8 @@ impl OpaEngine {
         )?;
         engine
             .add_data_json(&data_json)
-            .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+            .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Create OPA engine from a typed proto policy.
@@ -401,11 +461,7 @@ impl OpaEngine {
     /// gap between user-specified symlink paths (e.g., `/usr/bin/python3`) and
     /// kernel-resolved canonical paths (e.g., `/usr/bin/python3.11`).
     pub fn from_proto_with_pid(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> Result<Self> {
-        Self::from_proto_with_pid_and_binary_identity_required(
-            proto,
-            entrypoint_pid,
-            network_binary_identity_required(),
-        )
+        Self::from_proto_with_pid_and_binary_identity_required(proto, entrypoint_pid, true)
     }
 
     fn from_proto_with_pid_and_binary_identity_required(
@@ -413,44 +469,49 @@ impl OpaEngine {
         entrypoint_pid: u32,
         require_binary_identity: bool,
     ) -> Result<Self> {
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(proto);
+        // Protobuf cannot distinguish an omitted repeated MCP version field
+        // from an empty one. Canonicalize before any runtime consumer reads
+        // the policy so both representations select the pinned default.
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
+            .map_err(|error| {
+                miette::miette!(render_bounded_validation_diagnostics(
+                    "policy validation failed",
+                    error
+                        .violations()
+                        .iter()
+                        .map(redacted_policy_violation_category),
+                ))
+            })?;
+
+        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
         if !ambiguities.is_empty() {
-            return Err(miette::miette!(
-                "network endpoint ambiguity validation failed:\n{}",
-                ambiguities
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
+            return Err(miette::miette!(render_repeated_validation_diagnostic(
+                "network endpoint ambiguity validation failed",
+                ambiguities.len(),
+                "ambiguous network endpoint selectors",
+            )));
         }
 
         emit_binary_identity_mode(require_binary_identity, "proto");
-        if let Err(violations) = openshell_policy::validate_sandbox_policy(proto) {
-            let errors = violations
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(miette::miette!("policy validation failed:\n{errors}"));
-        }
-
-        let data_json_str = proto_to_opa_data_json(proto, entrypoint_pid);
+        let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
 
         // Parse back to Value for preprocessing, then re-serialize
         let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
-            .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
+            .map_err(|_| miette::miette!("internal: failed to parse proto JSON"))?;
         inject_runtime_policy_data(&mut data, require_binary_identity);
+        normalize_endpoint_protocols(&mut data);
 
         // Validate BEFORE expanding presets
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-        emit_l7_config_warnings(&warnings, "L7 policy validation warning");
         if !errors.is_empty() {
-            return Err(miette::miette!(
-                "L7 policy validation failed:\n{}",
-                errors.join("\n")
-            ));
+            return Err(miette::miette!(render_repeated_validation_diagnostic(
+                "L7 policy validation failed",
+                errors.len(),
+                "invalid L7 policy configuration",
+            )));
         }
+        // Rejected candidates must not leak authored values through warnings.
+        emit_l7_config_warnings(&warnings, "L7 policy validation warning");
 
         normalize_l7_policy_rule_aliases(&mut data);
 
@@ -459,14 +520,14 @@ impl OpaEngine {
         emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
         let data_json = data.to_string();
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine()?;
         engine
             .add_policy("policy.rego".into(), BAKED_POLICY_RULES.into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to load Rego policy"))?;
         engine
             .add_data_json(&data_json)
-            .map_err(|e| miette::miette!("{e}"))?;
-        Ok(Self::with_engine(engine))
+            .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
+        Ok(Self::with_engine(engine, require_binary_identity))
     }
 
     /// Evaluate a network access request against the loaded policy.
@@ -613,7 +674,7 @@ impl OpaEngine {
     /// The owned endpoint records and generation are captured while holding
     /// the engine lock, so reloads cannot mix data from one generation with
     /// the generation number of another. Fail-closed quarantine produces an
-    /// empty snapshot for its quarantine generation.
+    /// empty snapshot, marked `fail_closed`, for its quarantine generation.
     pub fn policy_dns_eligibility_snapshot(&self) -> Result<PolicyDnsEligibilitySnapshot> {
         let mut engine = self
             .engine
@@ -630,6 +691,7 @@ impl OpaEngine {
             return Ok(PolicyDnsEligibilitySnapshot {
                 endpoints: Vec::new(),
                 generation,
+                fail_closed: true,
             });
         }
 
@@ -647,6 +709,7 @@ impl OpaEngine {
         Ok(PolicyDnsEligibilitySnapshot {
             endpoints,
             generation,
+            fail_closed: false,
         })
     }
 
@@ -682,7 +745,7 @@ impl OpaEngine {
     /// validation guarantees as initial load. Atomically replaces the inner
     /// engine on success; on failure the previous engine is untouched (LKG).
     pub fn reload_from_proto(&self, proto: &ProtoSandboxPolicy) -> Result<()> {
-        self.reload_from_proto_with_pid(proto, 0)
+        self.reload_from_proto_with_pid(proto, 0).map(|_| ())
     }
 
     /// Reload policy from a proto with symlink resolution.
@@ -690,49 +753,45 @@ impl OpaEngine {
     /// When `entrypoint_pid` is non-zero, binary paths that are symlinks
     /// inside the container filesystem are resolved and added as additional
     /// match entries. See [`from_proto_with_pid`] for details.
+    /// Returns evidence tied to the generation installed by this call.
     pub fn reload_from_proto_with_pid(
         &self,
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
-    ) -> Result<()> {
-        // Build a complete new engine through the same validated pipeline.
-        let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
-        let new_engine = new
-            .engine
-            .into_inner()
-            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        let mut engine = self
-            .engine
-            .lock()
-            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        *engine = new_engine;
-        *self
-            .fail_closed_reason
-            .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+    ) -> Result<PolicyGenerationGuard> {
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, None, || {})
     }
 
     /// Reload the policy and middleware registry as one runtime generation.
-    ///
-    /// Both replacements are prepared before the live locks are acquired. The
-    /// engine and runner are then swapped while holding both locks, followed by
-    /// a single generation increment. A preparation or lock failure leaves the
-    /// live pair and generation untouched.
     pub fn reload_policy_and_middleware_from_proto_with_pid(
         &self,
         proto: &ProtoSandboxPolicy,
         entrypoint_pid: u32,
         registry: MiddlewareRegistry,
-    ) -> Result<()> {
+    ) -> Result<PolicyGenerationGuard> {
+        self.reload_configuration_from_proto_with_pid(proto, entrypoint_pid, Some(registry), || {})
+    }
+
+    /// Validate a complete candidate before publishing policy, middleware, and
+    /// prepared credentials together. A validation or lock failure leaves the
+    /// active configuration untouched and never invokes `commit_credentials`.
+    ///
+    /// The callback must be infallible and must not call back into this engine.
+    /// Existing policy guards become stale before credentials change; new
+    /// policy readers remain blocked until the complete configuration is live.
+    pub fn reload_configuration_from_proto_with_pid(
+        &self,
+        proto: &ProtoSandboxPolicy,
+        entrypoint_pid: u32,
+        registry: Option<MiddlewareRegistry>,
+        commit_credentials: impl FnOnce(),
+    ) -> Result<PolicyGenerationGuard> {
         let new = Self::from_proto_with_pid(proto, entrypoint_pid)?;
         let new_engine = new
             .engine
             .into_inner()
             .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
-        // Match clone_engine_for_tunnel's lock order (engine, then runner) so
-        // readers can observe only the old pair or the new pair.
+        // Match clone_engine_for_tunnel's lock order (engine, then runner).
         let mut engine = self
             .engine
             .lock()
@@ -741,15 +800,19 @@ impl OpaEngine {
             .middleware_runner
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
-        let new_runner = runner.with_replacement_registry(registry);
-        *engine = new_engine;
-        *runner = new_runner;
-        *self
+        let mut fail_closed_reason = self
             .fail_closed_reason
             .write()
-            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))? = None;
-        self.advance_generation();
-        Ok(())
+            .map_err(|_| miette::miette!("OPA fail-closed state lock poisoned"))?;
+        let new_runner = registry.map(|registry| runner.with_replacement_registry(registry));
+        let generation = self.advance_generation();
+        commit_credentials();
+        *engine = new_engine;
+        if let Some(new_runner) = new_runner {
+            *runner = new_runner;
+        }
+        *fail_closed_reason = None;
+        self.generation_guard(generation)
     }
 
     /// Publish a deny-all quarantine generation without activating any part
@@ -810,6 +873,7 @@ impl OpaEngine {
     /// generation comparison and callback linearizes state derived from an OPA
     /// snapshot with every policy reload and fail-closed transition. Callers
     /// must not perform I/O or other long-running work in `operation`.
+    #[allow(dead_code)]
     pub(crate) fn with_current_generation<T>(
         &self,
         expected_generation: u64,
@@ -888,22 +952,24 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
 
-        // Query filesystem policy
+        // Evaluation errors can include authored Rego source. Regorus may
+        // evaluate other rules while resolving any one query, so report the
+        // static-settings operation without attributing it to a single rule.
         let fs_val = engine
             .eval_rule("data.openshell.sandbox.filesystem_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let filesystem = parse_filesystem_policy(&fs_val);
 
         // Query landlock policy
         let ll_val = engine
             .eval_rule("data.openshell.sandbox.landlock_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let landlock = parse_landlock_policy(&ll_val);
 
         // Query process policy
         let proc_val = engine
             .eval_rule("data.openshell.sandbox.process_policy".into())
-            .map_err(|e| miette::miette!("{e}"))?;
+            .map_err(|_| miette::miette!("failed to evaluate static sandbox settings"))?;
         let process = parse_process_policy(&proc_val);
 
         Ok(SandboxConfig {
@@ -1373,24 +1439,249 @@ fn emit_l7_config_warnings(warnings: &[String], prefix: &str) {
     }
 }
 
-/// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
+/// Validate containers before normalizers or Rego can skip malformed policy data.
+///
+/// OPA-native data can contain runtime fields and omit authored-policy sections.
+/// Validate only the shapes consumed here; existing validators own field semantics.
+/// Return the first fixed structural diagnostic so errors cannot grow with the
+/// input or expose authored names, paths, or values.
+fn validate_opa_data_structure(data: &serde_json::Value) -> Result<()> {
+    let root = data
+        .as_object()
+        .ok_or_else(|| miette::miette!("OPA policy data must be an object"))?;
+
+    for field in ["filesystem_policy", "landlock", "process"] {
+        if root.get(field).is_some_and(|value| !value.is_object()) {
+            return Err(miette::miette!("{field} must be an object"));
+        }
+    }
+
+    if let Some(middlewares) = root.get("network_middlewares") {
+        let middlewares = middlewares
+            .as_object()
+            .ok_or_else(|| miette::miette!("network_middlewares must be an object"))?;
+        if middlewares.values().any(|value| !value.is_object()) {
+            return Err(miette::miette!(
+                "network middleware entries must be objects"
+            ));
+        }
+    }
+
+    // Omitted collections retain their existing defaults. Present malformed
+    // collections must not be mistaken for an omitted configuration.
+    let Some(policies) = root.get("network_policies") else {
+        return Ok(());
+    };
+    let policies = policies
+        .as_object()
+        .ok_or_else(|| miette::miette!("network_policies must be an object"))?;
+    for policy in policies.values() {
+        let policy = policy
+            .as_object()
+            .ok_or_else(|| miette::miette!("network policy entries must be objects"))?;
+        let endpoints =
+            validate_opa_object_array(policy.get("endpoints"), "network policy endpoints")?;
+        for endpoint in endpoints {
+            validate_opa_object_array(endpoint.get("rules"), "network endpoint rules")?;
+            validate_opa_object_array(endpoint.get("deny_rules"), "network endpoint deny_rules")?;
+        }
+        validate_opa_object_array(policy.get("binaries"), "network policy binaries")?;
+    }
+
+    Ok(())
+}
+
+/// Return an optional collection only after validating its traversal contract.
+///
+/// Callers supply fixed schema labels, never identifiers from policy data, so
+/// both error variants remain bounded and contain no author-controlled values.
+fn validate_opa_object_array<'a>(
+    value: Option<&'a serde_json::Value>,
+    field: &'static str,
+) -> Result<&'a [serde_json::Value]> {
+    let Some(value) = value else {
+        return Ok(&[]);
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| miette::miette!("{field} must be an array"))?;
+    if entries.iter().any(|entry| !entry.is_object()) {
+        return Err(miette::miette!("{field} entries must be objects"));
+    }
+    Ok(entries)
+}
+
+/// Validate static sections with the authored types while retaining OPA-only data.
+/// Keep schema errors and their source chains out of load diagnostics because
+/// they can contain authored keys, paths, or values.
+fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
+    if let Some(filesystem) = data.get_mut("filesystem_policy") {
+        let settings: AuthoredFilesystemPolicy = serde_json::from_value(filesystem.clone())
+            .map_err(|_| miette::miette!("invalid filesystem policy settings"))?;
+        openshell_policy::validate_filesystem_paths(&settings.read_only, &settings.read_write)
+            .map_err(|violations| {
+                miette::miette!(render_bounded_validation_diagnostics(
+                    "invalid filesystem policy settings",
+                    violations.iter().map(redacted_policy_violation_category),
+                ))
+            })?;
+        // A present stanza defaults to false; an absent stanza must stay absent
+        // so Rego's undefined result retains the runtime workdir default.
+        filesystem["include_workdir"] = settings.include_workdir.into();
+    }
+    if let Some(landlock) = data.get_mut("landlock") {
+        let settings: AuthoredLandlockPolicy = serde_json::from_value(landlock.clone())
+            .map_err(|_| miette::miette!("invalid Landlock policy settings"))?;
+        // Serde also accepts a map for a unit enum variant. Runtime consumers
+        // read a string, so retain the validated meaning in canonical form.
+        *landlock = serde_json::to_value(settings)
+            .map_err(|_| miette::miette!("failed to serialize Landlock policy settings"))?;
+    }
+    if let Some(process) = data.get("process") {
+        let settings = serde_json::from_value::<AuthoredProcessPolicy>(process.clone())
+            .map_err(|_| miette::miette!("invalid process policy settings"))?;
+        // Omitted identities are resolved by the compute runtime. Explicit
+        // values follow the same non-root identity contract as typed policy.
+        for identity in [&settings.run_as_user, &settings.run_as_group] {
+            if !identity.is_empty() && !openshell_policy::is_valid_sandbox_identity(identity) {
+                return Err(miette::miette!(
+                    "invalid process policy settings: invalid process identity"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Select a fixed category without formatting authored fields or nested reasons.
+/// Keep this match exhaustive so new validator variants require an explicit
+/// decision before their diagnostics can cross the supervisor load boundary.
+fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static str {
+    match violation {
+        PolicyViolation::InvalidProcessIdentity { .. } => "invalid process identity",
+        PolicyViolation::InvalidLandlockCompatibility { .. } => "invalid Landlock compatibility",
+        PolicyViolation::PathTraversal { .. }
+        | PolicyViolation::RelativePath { .. }
+        | PolicyViolation::OverlyBroadPath { .. }
+        | PolicyViolation::FieldTooLong { .. } => "invalid filesystem path",
+        PolicyViolation::TooManyPaths { .. } => "filesystem path limit exceeded",
+        PolicyViolation::TldWildcard { .. }
+        | PolicyViolation::TcpEndpointIpLiteral { .. }
+        | PolicyViolation::InvalidTcpEndpointHost { .. }
+        | PolicyViolation::InvalidHostWildcard { .. } => "invalid network endpoint host",
+        PolicyViolation::MissingEndpointHost { .. }
+        | PolicyViolation::MissingTcpEndpointHost { .. } => "missing network endpoint host",
+        PolicyViolation::MissingEndpointPort { .. }
+        | PolicyViolation::InvalidEndpointPort { .. } => "invalid network endpoint port",
+        PolicyViolation::MissingSigningService { .. } => {
+            "incomplete credential signing configuration"
+        }
+        PolicyViolation::UnknownCredentialSigning { .. } => {
+            "invalid credential signing configuration"
+        }
+        PolicyViolation::CredentialSigningWithBodyRewrite { .. } => {
+            "conflicting credential rewrite configuration"
+        }
+        PolicyViolation::InvalidL7Endpoint { .. } => "invalid L7 endpoint configuration",
+        PolicyViolation::InvalidMiddlewareConfig { .. } => "invalid middleware configuration",
+        PolicyViolation::TooManyMiddlewareConfigs { .. } => {
+            "middleware configuration limit exceeded"
+        }
+        PolicyViolation::DuplicateMiddlewareOrder { .. } => "duplicate middleware order",
+        PolicyViolation::TooManyMiddlewareSelectorPatterns { .. } => {
+            "middleware selector limit exceeded"
+        }
+        PolicyViolation::MiddlewareTlsSkipConflict { .. } => {
+            "middleware conflicts with TLS inspection"
+        }
+        PolicyViolation::MissingMcpVersions { .. } => "missing MCP protocol version",
+        PolicyViolation::McpOptionsOnNonMcpEndpoint { .. } => "MCP options require MCP protocol",
+        PolicyViolation::UnsupportedMcpVersion { .. } => "unsupported MCP protocol version",
+        PolicyViolation::DuplicateMcpVersion { .. } => "duplicate MCP protocol version",
+    }
+}
+
+/// Render only fixed, implementation-owned headings and categories. Reserve
+/// space for the omission marker before adding each complete item; never copy
+/// or truncate a validator's payload-bearing Display, Debug, or source chain.
+fn render_bounded_validation_diagnostics(
+    heading: &'static str,
+    diagnostics: impl Iterator<Item = &'static str>,
+) -> String {
+    const OMITTED_SUFFIX: &str = "; additional violations omitted";
+    let mut rendered = heading.to_string();
+    for (index, category) in diagnostics.enumerate() {
+        let separator = if index == 0 { ": " } else { "; " };
+        if index == POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS
+            || rendered.len() + separator.len() + category.len() + OMITTED_SUFFIX.len()
+                > POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES
+        {
+            rendered.push_str(OMITTED_SUFFIX);
+            break;
+        }
+        rendered.push_str(separator);
+        rendered.push_str(category);
+    }
+    rendered
+}
+
+/// String-only validators have no safe fields to expose; retain their stage
+/// and bounded item count without inspecting their authored error text.
+fn render_repeated_validation_diagnostic(
+    heading: &'static str,
+    count: usize,
+    category: &'static str,
+) -> String {
+    render_bounded_validation_diagnostics(heading, std::iter::repeat_n(category, count))
+}
+
+/// Preprocess YAML policy data: parse, validate shapes, normalize, expand presets, return JSON.
 fn preprocess_yaml_data(
     yaml_str: &str,
     require_binary_identity: bool,
     validate_middleware_config: Option<&MiddlewareConfigValidator>,
 ) -> Result<String> {
-    let mut data: serde_json::Value = serde_yml::from_str(yaml_str)
-        .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+    let mut data: serde_json::Value = serde_yml::from_str(yaml_str).map_err(|error| {
+        // Parser text and source chains can include keys, values, and snippets.
+        // Numeric source positions are safe and help locate the authored error.
+        let category = match error.kind() {
+            serde_yml::ErrorKind::Syntax => "invalid syntax",
+            serde_yml::ErrorKind::Io => "input read failure",
+            serde_yml::ErrorKind::Budget => "parser limit exceeded",
+            serde_yml::ErrorKind::Policy => "unsupported YAML construct",
+            serde_yml::ErrorKind::KeyCollision => "key collision",
+            serde_yml::ErrorKind::DuplicateKey => "duplicate key",
+            serde_yml::ErrorKind::EndOfStream => "unexpected end of input",
+            serde_yml::ErrorKind::Data => "invalid data",
+            // ErrorKind is non-exhaustive; future kinds stay payload-free.
+            _ => "invalid YAML",
+        };
+        error.location().map_or_else(
+            || miette::miette!("failed to parse YAML data: {category}"),
+            |location| {
+                miette::miette!(
+                    "failed to parse YAML data: {category} at line {}, column {}",
+                    location.line(),
+                    location.column(),
+                )
+            },
+        )
+    })?;
+    validate_opa_data_structure(&data)?;
+    raw_schema::validate_network_settings(&data)?;
+    validate_opa_static_settings(&mut data)?;
     inject_runtime_policy_data(&mut data, require_binary_identity);
+    normalize_endpoint_protocols(&mut data);
 
     // Normalize port → ports for all endpoints so Rego always sees "ports" array.
     normalize_endpoint_ports(&mut data);
     let config_errors = normalize_l7_config_aliases(&mut data);
     if !config_errors.is_empty() {
-        return Err(miette::miette!(
-            "L7 policy validation failed:\n{}",
-            config_errors.join("\n")
-        ));
+        return Err(miette::miette!(render_repeated_validation_diagnostic(
+            "L7 policy validation failed",
+            config_errors.len(),
+            "invalid L7 protocol configuration",
+        )));
     }
 
     // Validate BEFORE expanding presets (catches user errors like rules+access)
@@ -1401,26 +1692,28 @@ fn preprocess_yaml_data(
                 openshell_policy::validate_network_middleware_json_with_config(&data, validate)
             },
         )
-        .map_err(|error| miette::miette!(error))?;
+        .map_err(|_| {
+            miette::miette!("failed to parse or convert middleware policy configuration")
+        })?;
     if !middleware_errors.is_empty() {
-        return Err(miette::miette!(
-            "middleware policy validation failed:\n{}",
+        return Err(miette::miette!(render_bounded_validation_diagnostics(
+            "middleware policy validation failed",
             middleware_errors
                 .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
+                .map(redacted_policy_violation_category),
+        )));
     }
 
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
-    emit_l7_config_warnings(&warnings, "L7 policy validation warning");
     if !errors.is_empty() {
-        return Err(miette::miette!(
-            "L7 policy validation failed:\n{}",
-            errors.join("\n")
-        ));
+        return Err(miette::miette!(render_repeated_validation_diagnostic(
+            "L7 policy validation failed",
+            errors.len(),
+            "invalid L7 policy configuration",
+        )));
     }
+    // Emit authored warnings only after the candidate passes validation.
+    emit_l7_config_warnings(&warnings, "L7 policy validation warning");
 
     normalize_l7_policy_rule_aliases(&mut data);
 
@@ -1428,7 +1721,58 @@ fn preprocess_yaml_data(
     let expansion_warnings = crate::l7::expand_access_presets(&mut data);
     emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
-    serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
+    serde_json::to_string(&data).map_err(|_| miette::miette!("failed to serialize OPA policy data"))
+}
+
+/// Canonicalize recognized protocol spellings before L7 validation or Rego use.
+///
+/// Rust parses protocol names case-insensitively, while Rego compares stable
+/// wire keys. Publishing one canonical spelling keeps rule validation, typed
+/// routing, and authorization on the same protocol branch.
+fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
+    let Some(policies) = data
+        .get_mut("network_policies")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    for policy in policies.values_mut() {
+        let Some(endpoints) = policy
+            .get_mut("endpoints")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            continue;
+        };
+
+        for endpoint in endpoints {
+            let Some(endpoint) = endpoint.as_object_mut() else {
+                continue;
+            };
+            let Some(protocol) = endpoint.get("protocol").and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let canonical = if protocol.eq_ignore_ascii_case("tcp") {
+                Some("tcp")
+            } else {
+                PolicyL7Protocol::parse(protocol).map(|protocol| match protocol {
+                    PolicyL7Protocol::Rest => "rest",
+                    PolicyL7Protocol::Websocket => "websocket",
+                    PolicyL7Protocol::Graphql => "graphql",
+                    PolicyL7Protocol::Sql => "sql",
+                    PolicyL7Protocol::JsonRpc => "json-rpc",
+                    PolicyL7Protocol::Mcp => "mcp",
+                })
+            };
+            if let Some(canonical) = canonical {
+                endpoint.insert(
+                    "protocol".to_string(),
+                    serde_json::Value::String(canonical.to_string()),
+                );
+            }
+        }
+    }
 }
 
 /// Normalize endpoint port/ports in JSON data.
@@ -1502,6 +1846,28 @@ fn normalize_l7_config_aliases(data: &mut serde_json::Value) -> Vec<String> {
             for stanza in L7ConfigStanza::ALL {
                 normalize_l7_config_alias(&mut errors, ep_obj, &loc, stanza);
             }
+
+            // The nested MCP stanza is optional, but the runtime projection is
+            // not. Materialize the pinned default at this YAML boundary so a
+            // missing alias cannot later look like corrupted runtime state.
+            if ep_obj
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| protocol.eq_ignore_ascii_case("mcp"))
+                && !ep_obj.contains_key("mcp_versions")
+            {
+                match openshell_policy::l7_config_alias_runtime_fields(
+                    L7ConfigStanza::Mcp,
+                    serde_json::json!({}),
+                ) {
+                    Ok(fields) => {
+                        for (field, value) in fields {
+                            ep_obj.insert(field.to_string(), value);
+                        }
+                    }
+                    Err(error) => errors.push(format!("{loc}.mcp: {error}")),
+                }
+            }
         }
     }
 
@@ -1518,14 +1884,21 @@ fn normalize_l7_config_alias(
     let Some(config) = ep.get(key).cloned() else {
         return;
     };
-    if config.is_null() {
-        ep.remove(key);
-        return;
-    }
+    // Explicit null must reach the canonical parser: it is invalid authored
+    // configuration, while an omitted stanza may select protocol defaults.
     match openshell_policy::l7_config_alias_runtime_fields(stanza, config) {
         Ok(fields) => {
             ep.remove(key);
             for (field, value) in fields {
+                if stanza == L7ConfigStanza::Mcp
+                    && field == "mcp_versions"
+                    && ep.contains_key(field)
+                {
+                    errors.push(format!(
+                        "{loc}: mcp.versions and mcp_versions cannot both be set"
+                    ));
+                    continue;
+                }
                 ep.entry(field.to_string()).or_insert(value);
             }
         }
@@ -1620,6 +1993,31 @@ fn normalize_l7_rule_aliases(
                 "method".to_string(),
                 serde_json::Value::String(method.to_string()),
             );
+        }
+    }
+
+    // MCP tool aliases must move into params before matcher normalization so
+    // both authored forms produce the same endpoint configuration as protobuf.
+    normalize_l7_matcher_map(rule, "query");
+    normalize_l7_matcher_map(rule, "params");
+}
+
+/// Normalize nonempty matcher leaves to the protobuf runtime representation.
+///
+/// OPA data also accepts explicit `glob` and `any` objects. Keeping those intact
+/// makes normalization idempotent for already lowered data and protobuf reloads.
+fn normalize_l7_matcher_map(rule: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
+    let Some(matchers) = rule
+        .get_mut(field)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for matcher in matchers.values_mut() {
+        // Rego permits an empty scalar to match an empty query value, whereas
+        // an empty glob object never matches. Preserve this OPA-only form.
+        if matcher.as_str().is_some_and(|glob| !glob.is_empty()) {
+            *matcher = serde_json::json!({ "glob": matcher.take() });
         }
     }
 }
@@ -1855,6 +2253,7 @@ fn l7_matchers_to_json(
 /// kernel-resolved canonical paths reported by `/proc/<pid>/exe` (e.g.,
 /// `/usr/bin/python3.11`).
 fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> String {
+    let policy_hash = deterministic_policy_hash(proto);
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
             serde_json::json!({
@@ -1916,14 +2315,24 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.protocol.is_empty() {
                         ep["protocol"] = e.protocol.clone().into();
                     }
-                    if !e.tls.is_empty() {
-                        ep["tls"] = e.tls.clone().into();
+                    if e.tls != 0 {
+                        ep["tls"] = openshell_policy::network_tls_mode_to_str(e.tls)
+                            .map_or_else(|| format!("unknown({})", e.tls), str::to_owned)
+                            .into();
                     }
-                    if !e.enforcement.is_empty() {
-                        ep["enforcement"] = e.enforcement.clone().into();
+                    if e.enforcement != 0 {
+                        ep["enforcement"] =
+                            openshell_policy::network_enforcement_mode_to_str(e.enforcement)
+                                .map_or_else(
+                                    || format!("unknown({})", e.enforcement),
+                                    str::to_owned,
+                                )
+                                .into();
                     }
-                    if !e.access.is_empty() {
-                        ep["access"] = e.access.clone().into();
+                    if e.access != 0 {
+                        ep["access"] = openshell_policy::network_access_preset_to_str(e.access)
+                            .map_or_else(|| format!("unknown({})", e.access), str::to_owned)
+                            .into();
                     }
                     if !e.rules.is_empty() {
                         let rules: Vec<serde_json::Value> = e
@@ -1931,29 +2340,48 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .iter()
                             .map(|r| {
                                 let a = r.allow.as_ref();
-                                let mut allow = serde_json::json!({
-                                    "method": a.map_or("", |a| &a.method),
-                                    "path": a.map_or("", |a| &a.path),
-                                    "command": a.map_or("", |a| &a.command),
-                                    "operation_type": a.map_or("", |a| &a.operation_type),
-                                    "operation_name": a.map_or("", |a| &a.operation_name),
-                                });
-                                if let Some(a) = a
-                                    && !a.fields.is_empty()
-                                {
-                                    allow["fields"] = a.fields.clone().into();
+                                let mut allow = serde_json::Map::new();
+                                if let Some(a) = a {
+                                    // Proto3 represents absent scalar selectors as empty
+                                    // strings. Omit them so protobuf and YAML rules expose
+                                    // the same selector families to runtime validation.
+                                    if !a.method.is_empty() {
+                                        allow.insert("method".to_string(), a.method.clone().into());
+                                    }
+                                    if !a.path.is_empty() {
+                                        allow.insert("path".to_string(), a.path.clone().into());
+                                    }
+                                    if !a.command.is_empty() {
+                                        allow
+                                            .insert("command".to_string(), a.command.clone().into());
+                                    }
+                                    if !a.operation_type.is_empty() {
+                                        allow.insert(
+                                            "operation_type".to_string(),
+                                            a.operation_type.clone().into(),
+                                        );
+                                    }
+                                    if !a.operation_name.is_empty() {
+                                        allow.insert(
+                                            "operation_name".to_string(),
+                                            a.operation_name.clone().into(),
+                                        );
+                                    }
+                                    if !a.fields.is_empty() {
+                                        allow.insert("fields".to_string(), a.fields.clone().into());
+                                    }
                                 }
                                 let query = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.query)
                                 });
                                 if !query.is_empty() {
-                                    allow["query"] = query.into();
+                                    allow.insert("query".to_string(), query.into());
                                 }
                                 let params = a.map_or_else(serde_json::Map::new, |allow| {
                                     l7_matchers_to_json(&allow.params)
                                 });
                                 if !params.is_empty() {
-                                    allow["params"] = params.into();
+                                    allow.insert("params".to_string(), params.into());
                                 }
                                 serde_json::json!({ "allow": allow })
                             })
@@ -2018,6 +2446,23 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.provider_credentialed {
                         ep["provider_credentialed"] = true.into();
                     }
+                    if !e.token_grant_owner.is_empty() {
+                        // Preserve the gateway's endpoint identity so admission
+                        // can select its grants without reconstructing ownership
+                        // from overlapping host and path selectors.
+                        ep["token_grant_owner"] = e.token_grant_owner.clone().into();
+                    }
+                    if is_mcp_protocol(&e.protocol) {
+                        // Derive endpoint identity from the policy endpoint while
+                        // it is still available. Request handling carries this
+                        // opaque value through exact path selection and never
+                        // recomputes identity from a concrete request host.
+                        ep["endpoint_id"] =
+                            openshell_core::endpoint_status::endpoint_id(e).into();
+                        // The selected endpoint must retain its policy identity
+                        // so it cannot bind to a replacement observation inventory.
+                        ep["policy_hash"] = policy_hash.clone().into();
+                    }
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
                     }
@@ -2059,6 +2504,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
                     }
                     if let Some(mcp) = &e.mcp {
+                        if e.protocol.eq_ignore_ascii_case("mcp") {
+                            ep["mcp_versions"] = mcp.versions.clone().into();
+                        }
                         if let Some(strict_tool_names) = mcp.strict_tool_names {
                             ep["mcp_strict_tool_names"] = strict_tool_names.into();
                         }
@@ -2074,17 +2522,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .binaries
                 .iter()
                 .flat_map(|b| {
-                    // The deprecated harness bit is ignored by policy YAML, but
-                    // advisor-generated proposals use it as internal provenance.
-                    #[allow(deprecated)]
-                    let advisor_proposed = b.harness;
-                    let binary_entry = |path: &str| {
-                        let mut entry = serde_json::json!({"path": path});
-                        if advisor_proposed {
-                            entry["advisor_proposed"] = true.into();
-                        }
-                        entry
-                    };
+                    let binary_entry = |path: &str| serde_json::json!({"path": path});
                     let mut entries = vec![binary_entry(&b.path)];
                     match resolve_binary_in_container(&b.path, entrypoint_pid) {
                         BinaryResolution::Resolved(resolved) => {
@@ -2192,8 +2630,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 mod tests {
     use super::*;
 
+    use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
-        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, NetworkBinary,
+        FilesystemPolicy as ProtoFs, L7Allow, L7QueryMatcher, L7Rule, McpOptions, NetworkBinary,
         NetworkEndpoint, NetworkMiddlewareConfig, NetworkPolicyRule, ProcessPolicy as ProtoProc,
         SandboxPolicy as ProtoSandboxPolicy,
     };
@@ -2201,8 +2640,683 @@ mod tests {
     const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
     const TEST_DATA_YAML: &str = include_str!("../testdata/sandbox-policy.yaml");
 
+    fn assert_safe_load_error(error: &miette::Report, payloads: &[&str]) {
+        assert!(error.to_string().len() <= POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES);
+        assert_eq!(
+            error.chain().count(),
+            1,
+            "raw error source must be discarded"
+        );
+        for rendered in [
+            format!("{error}"),
+            format!("{error:#}"),
+            format!("{error:?}"),
+            format!("{error:#?}"),
+        ] {
+            // Debug adds renderer-owned decoration to the bounded message.
+            assert!(rendered.len() <= 2048, "{rendered}");
+            for payload in payloads {
+                assert!(
+                    !rendered.contains(payload),
+                    "diagnostic leaked {payload}: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn load_diagnostics_enforce_item_and_byte_limits_with_omission() {
+        const LONG_CATEGORY: &str = concat!(
+            "固定診断固定診断固定診断固定診断固定診断固定診断固定診断固定診断",
+            "固定診断固定診断固定診断固定診断固定診断固定診断固定診断固定診断",
+        );
+        for count in [0, 1, 8, 9, 100_000] {
+            let message = render_repeated_validation_diagnostic(
+                "policy validation failed",
+                count,
+                "invalid filesystem path",
+            );
+            assert!(message.len() <= 512);
+            assert_eq!(
+                message.matches("invalid filesystem path").count(),
+                count.min(8)
+            );
+            assert_eq!(message.contains("additional violations omitted"), count > 8);
+        }
+
+        // A future long fixed category must hit the byte ceiling before the
+        // item ceiling, retain complete UTF-8 items, and always mark omission.
+        let message =
+            render_repeated_validation_diagnostic("policy validation failed", 8, LONG_CATEGORY);
+        assert!(message.len() <= 512);
+        assert_eq!(message.matches(LONG_CATEGORY).count(), 2);
+        assert!(message.ends_with("; additional violations omitted"));
+    }
+
+    #[test]
+    fn load_diagnostics_yaml_errors_are_safe_across_file_load_and_reload() {
+        let secret = "private-payload-秘密".repeat(1024);
+        let candidate = |endpoint: serde_json::Value| {
+            serde_json::json!({
+                "network_policies": { &secret: {"endpoints": [endpoint]} }
+            })
+            .to_string()
+        };
+        let cases = [
+            (
+                format!("private-key: *{secret}"),
+                "failed to parse YAML data",
+            ),
+            (
+                format!("private-key: [\"{secret}"),
+                "failed to parse YAML data",
+            ),
+            (
+                candidate(serde_json::json!({"host": "example.test", "port": 443,
+                "protocol": "mcp", "mcp": {"max_body_bytes": &secret}})),
+                "invalid L7 protocol configuration",
+            ),
+            (
+                candidate(serde_json::json!({"host": "example.test", "port": 443,
+                "protocol": "rest", "enforcement": &secret})),
+                "invalid L7 policy configuration",
+            ),
+            (
+                serde_json::json!({"network_middlewares": {&secret: {
+                    "middleware": &secret, "order": &secret
+                }}})
+                .to_string(),
+                "failed to parse or convert middleware policy configuration",
+            ),
+            (
+                serde_json::json!({"network_middlewares": {&secret: {
+                    "middleware": &secret, "on_error": &secret,
+                    "endpoints": {"include": ["example.test"]}
+                }}})
+                .to_string(),
+                "invalid middleware configuration",
+            ),
+        ];
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("private-policy.rego");
+        let data_path = directory.path().join("private-data.yaml");
+        std::fs::write(&policy_path, TEST_POLICY).unwrap();
+        let engine = l7_engine();
+        let generation = engine.current_generation();
+        let guard = engine.generation_guard(generation).unwrap();
+        let allowed = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        let denied = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+        for (data, expected) in cases {
+            std::fs::write(&data_path, &data).unwrap();
+            for error in [
+                OpaEngine::from_strings(TEST_POLICY, &data)
+                    .err()
+                    .expect("invalid initial load"),
+                OpaEngine::from_files(&policy_path, &data_path)
+                    .err()
+                    .expect("invalid file load"),
+                OpaEngine::from_files_for_endpoint_only_proxy(&policy_path, &data_path, None)
+                    .err()
+                    .expect("invalid endpoint-only file load"),
+                engine
+                    .reload(TEST_POLICY, &data)
+                    .expect_err("invalid reload"),
+            ] {
+                assert!(error.to_string().contains(expected), "{error}");
+                assert_safe_load_error(
+                    &error,
+                    &["private-payload", "秘密", "private-key", "example.test"],
+                );
+            }
+            assert_eq!(engine.current_generation(), generation);
+            assert!(!guard.is_stale());
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+        }
+    }
+
+    #[test]
+    fn load_diagnostics_catalog_errors_drop_callback_payloads_and_bound_items() {
+        let secret = "private-catalog-秘密".repeat(1024);
+        let calls = Arc::new(AtomicU64::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let validate = move |_: &str, _: &prost_types::Struct| {
+            callback_calls.fetch_add(1, Ordering::Relaxed);
+            Err(secret.clone())
+        };
+        let middlewares: serde_json::Map<String, serde_json::Value> = (0..10)
+            .map(|order| {
+                (
+                    format!("private-stage-{order}"),
+                    serde_json::json!({"middleware": "private-implementation", "order": order,
+                "endpoints": {"include": ["private.example.test"]},
+                "config": {"private-key": "private-value"}}),
+                )
+            })
+            .collect();
+        let data = serde_json::json!({"network_middlewares": middlewares}).to_string();
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("data.yaml");
+        std::fs::write(&policy_path, TEST_POLICY).unwrap();
+        std::fs::write(&data_path, &data).unwrap();
+        for error in [
+            OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, Some(&validate))
+                .err()
+                .unwrap(),
+            OpaEngine::from_files_with_middleware_config(&policy_path, &data_path, Some(&validate))
+                .err()
+                .unwrap(),
+            OpaEngine::from_files_for_endpoint_only_proxy(
+                &policy_path,
+                &data_path,
+                Some(&validate),
+            )
+            .err()
+            .unwrap(),
+        ] {
+            assert_safe_load_error(&error, &["private-", "秘密", "private.example.test"]);
+            let message = error.to_string();
+            assert_eq!(
+                message.matches("invalid middleware configuration").count(),
+                8
+            );
+            assert!(message.ends_with("additional violations omitted"));
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 30);
+        let accept = |_: &str, _: &prost_types::Struct| Ok(());
+        assert!(
+            OpaEngine::from_strings_with_middleware_config(TEST_POLICY, &data, Some(&accept))
+                .is_ok()
+        );
+        let required =
+            OpaEngine::from_files_with_middleware_config(&policy_path, &data_path, Some(&accept))
+                .unwrap();
+        let endpoint_only =
+            OpaEngine::from_files_for_endpoint_only_proxy(&policy_path, &data_path, Some(&accept))
+                .unwrap();
+        assert!(required.binary_identity_required());
+        assert!(!endpoint_only.binary_identity_required());
+    }
+
+    #[test]
+    fn load_diagnostics_rego_and_file_errors_drop_source_and_paths() {
+        let private_rego = "package private_package\nprivate_rule := \"private-secret";
+        let engine = test_engine();
+        let generation = engine.current_generation();
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("private-policy.rego");
+        let data_path = directory.path().join("private-data.yaml");
+        std::fs::write(&policy_path, private_rego).unwrap();
+        std::fs::write(&data_path, TEST_DATA_YAML).unwrap();
+        for error in [
+            OpaEngine::from_strings(private_rego, TEST_DATA_YAML)
+                .err()
+                .unwrap(),
+            OpaEngine::from_files(&policy_path, &data_path)
+                .err()
+                .unwrap(),
+            OpaEngine::from_files_for_endpoint_only_proxy(&policy_path, &data_path, None)
+                .err()
+                .unwrap(),
+            engine.reload(private_rego, TEST_DATA_YAML).unwrap_err(),
+        ] {
+            assert_eq!(error.to_string(), "failed to load Rego policy");
+            assert_safe_load_error(&error, &["private", directory.path().to_str().unwrap()]);
+        }
+        assert_eq!(engine.current_generation(), generation);
+        std::fs::remove_file(&policy_path).unwrap();
+        let error = OpaEngine::from_files(&policy_path, &data_path)
+            .err()
+            .unwrap();
+        assert_safe_load_error(&error, &["private", directory.path().to_str().unwrap()]);
+        std::fs::remove_file(&data_path).unwrap();
+        let error = OpaEngine::from_files(&policy_path, &data_path)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "failed to read YAML policy data file");
+        assert_safe_load_error(&error, &["private", directory.path().to_str().unwrap()]);
+        std::fs::write(&data_path, [0xff]).unwrap();
+        let error = OpaEngine::from_files(&policy_path, &data_path)
+            .err()
+            .unwrap();
+        assert_safe_load_error(&error, &["private", directory.path().to_str().unwrap()]);
+    }
+
+    #[test]
+    fn load_diagnostics_proto_ambiguities_are_bounded_and_reloads_preserve_decisions() {
+        let valid = defaultable_mcp_proto(None);
+        let engine = OpaEngine::from_proto(&valid).unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .unwrap();
+        let mut candidate = valid.clone();
+        for index in 0..16 {
+            candidate.network_policies.insert(
+                format!("private-policy-{index}"),
+                NetworkPolicyRule {
+                    name: format!("private-rule-{index}"),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "*.example.com".into(),
+                        port: 443,
+                        tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/private/binary".into(),
+                    }],
+                },
+            );
+        }
+        for error in [
+            OpaEngine::from_proto(&candidate).err().unwrap(),
+            OpaEngine::from_proto_with_pid(&candidate, 0).err().unwrap(),
+            engine.reload_from_proto(&candidate).unwrap_err(),
+            engine
+                .reload_from_proto_with_pid(&candidate, 0)
+                .unwrap_err(),
+        ] {
+            assert_safe_load_error(
+                &error,
+                &["private-", "/private/binary", "example.com", "skip"],
+            );
+            let message = error.to_string();
+            assert_eq!(
+                message
+                    .matches("ambiguous network endpoint selectors")
+                    .count(),
+                8
+            );
+            assert!(message.ends_with("additional violations omitted"));
+            assert_eq!(engine.current_generation(), 0);
+            assert!(!guard.is_stale());
+            assert!(eval_l7(
+                &engine,
+                &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/list")
+            ));
+            assert!(!eval_l7(
+                &engine,
+                &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/call")
+            ));
+        }
+        engine.reload_from_proto(&valid).unwrap();
+        assert_eq!(engine.current_generation(), 1);
+        assert!(guard.is_stale());
+    }
+
+    #[test]
+    fn load_diagnostics_proto_landlock_values_are_redacted() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.landlock = Some(openshell_core::proto::LandlockPolicy {
+            compatibility: "private-landlock-秘密".repeat(1024),
+        });
+        let error = OpaEngine::from_proto(&policy).err().unwrap();
+        assert!(error.to_string().contains("invalid Landlock compatibility"));
+        assert_safe_load_error(&error, &["private-landlock", "秘密"]);
+    }
+
+    #[test]
+    fn load_diagnostics_rejected_l7_candidates_do_not_emit_authored_warnings() {
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        const CHILD: &str = "OPENSHELL_TEST_OPA_DIAGNOSTICS_CHILD";
+        struct Capture(Arc<Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, _: &tracing::Event<'_>, _: Context<'_, S>) {
+                if let Some(event) = openshell_ocsf::tracing_layers::clone_current_event() {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(serde_json::to_string(&event).unwrap());
+                }
+            }
+        }
+        // Tracing callsite interest is process-wide, so concurrent tests with
+        // other subscribers can disable this thread's capture. Exercise the
+        // real loader in an isolated test process with the same executable.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "opa::tests::load_diagnostics_rejected_l7_candidates_do_not_emit_authored_warnings", "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let mut data = serde_json::json!({"network_policies": {"private-warning-policy": {
+            "endpoints": [{"host": "example.test", "port": 443, "protocol": "rest",
+                "path": "/private-warning-path[", "access": "read-only",
+                "rules": [{"allow": {"method": "GET", "path": "/private-rule"}}],
+                "enforcement": "private-invalid-enforcement"}]
+        }}});
+        // Confirm the fixture really has both a warning and a rejection.
+        let (errors, warnings) = crate::l7::validate_l7_policies(&data);
+        assert!(!errors.is_empty());
+        assert!(!warnings.is_empty());
+        tracing::subscriber::with_default(subscriber, || {
+            let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
+                .err()
+                .unwrap();
+            assert_safe_load_error(&error, &["private-"]);
+            assert!(
+                !events.lock().unwrap().is_empty(),
+                "capture must see loader events"
+            );
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|event| !event.contains("private-"))
+            );
+
+            // Accepted-candidate warnings retain their existing operator contract.
+            events.lock().unwrap().clear();
+            data["network_policies"]["private-warning-policy"]["endpoints"][0]["enforcement"] =
+                "audit".into();
+            data["network_policies"]["private-warning-policy"]["endpoints"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("rules");
+            let (errors, _) = crate::l7::validate_l7_policies(&data);
+            assert!(errors.is_empty(), "positive control: {errors:?}");
+            assert!(OpaEngine::from_strings(TEST_POLICY, &data.to_string()).is_ok());
+            assert!(
+                events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event.contains("private-warning"))
+            );
+        });
+    }
+
     fn test_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).expect("Failed to load test policy")
+    }
+
+    fn opa_container_policy() -> serde_json::Value {
+        serde_json::json!({
+            "filesystem_policy": {},
+            "landlock": {},
+            "process": {},
+            "network_middlewares": {},
+            "network_policies": {
+                "admin": {
+                    "endpoints": [{
+                        "host": "admin.example.test",
+                        "port": 443,
+                        "protocol": "rest",
+                        "enforcement": "enforce",
+                        "access": "full",
+                        "deny_rules": [{"method": "DELETE", "path": "/admin/**"}],
+                    }],
+                    "binaries": [{"path": "/usr/bin/curl"}],
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn yaml_containers_reject_malformed_objects_and_collections() {
+        let valid = opa_container_policy();
+        OpaEngine::from_strings(TEST_POLICY, &valid.to_string())
+            .expect("control policy must load before changing one container");
+        let invalid_objects = [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!("untrusted-marker"),
+            serde_json::json!(42),
+            serde_json::json!(false),
+        ];
+        for invalid in &invalid_objects {
+            let error = OpaEngine::from_strings(TEST_POLICY, &invalid.to_string())
+                .err()
+                .expect("non-object root must reject");
+            assert_eq!(error.to_string(), "OPA policy data must be an object");
+        }
+
+        let object_cases = [
+            ("/filesystem_policy", "filesystem_policy must be an object"),
+            ("/landlock", "landlock must be an object"),
+            ("/process", "process must be an object"),
+            ("/network_policies", "network_policies must be an object"),
+            (
+                "/network_policies/admin",
+                "network policy entries must be objects",
+            ),
+            (
+                "/network_middlewares",
+                "network_middlewares must be an object",
+            ),
+            (
+                "/network_middlewares/untrusted-marker",
+                "network middleware entries must be objects",
+            ),
+        ];
+        for (pointer, expected) in object_cases {
+            for invalid in &invalid_objects {
+                let mut candidate = valid.clone();
+                let (parent, field) = pointer.rsplit_once('/').expect("field pointer");
+                candidate
+                    .pointer_mut(parent)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("container parent must be an object")
+                    .insert(field.to_string(), invalid.clone());
+                let error = OpaEngine::from_strings(TEST_POLICY, &candidate.to_string())
+                    .err()
+                    .expect("malformed object must reject");
+                assert_eq!(error.to_string(), expected, "{pointer}: {invalid}");
+            }
+        }
+
+        let collection_cases = [
+            (
+                "/network_policies/admin/endpoints",
+                "network policy endpoints",
+            ),
+            (
+                "/network_policies/admin/binaries",
+                "network policy binaries",
+            ),
+            (
+                "/network_policies/admin/endpoints/0/rules",
+                "network endpoint rules",
+            ),
+            (
+                "/network_policies/admin/endpoints/0/deny_rules",
+                "network endpoint deny_rules",
+            ),
+        ];
+        for (pointer, field_label) in collection_cases {
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!({"untrusted-marker": "value"}),
+                serde_json::json!("untrusted-marker"),
+                serde_json::json!(42),
+                serde_json::json!(false),
+                serde_json::json!([null]),
+                serde_json::json!(["untrusted-marker"]),
+                serde_json::json!([{}, false]),
+            ] {
+                let mut candidate = valid.clone();
+                let (parent, field) = pointer.rsplit_once('/').expect("field pointer");
+                candidate
+                    .pointer_mut(parent)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("collection parent must be an object")
+                    .insert(field.to_string(), invalid.clone());
+                let error = OpaEngine::from_strings(TEST_POLICY, &candidate.to_string())
+                    .err()
+                    .expect("malformed collection must reject");
+                let expected = if invalid.is_array() {
+                    format!("{field_label} entries must be objects")
+                } else {
+                    format!("{field_label} must be an array")
+                };
+                assert_eq!(error.to_string(), expected, "{pointer}: {invalid}");
+                assert!(error.to_string().len() <= 128);
+                assert!(!error.to_string().contains("untrusted-marker"));
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_containers_preserve_valid_denials_and_rejected_reload_generation() {
+        let valid = opa_container_policy();
+        let engine = OpaEngine::from_strings(TEST_POLICY, &valid.to_string())
+            .expect("valid deny-rule list must load");
+        let allowed = l7_input("admin.example.test", 443, "GET", "/public");
+        let denied = l7_input("admin.example.test", 443, "DELETE", "/admin/users");
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+        let generation = engine.current_generation();
+
+        let mut malformed = valid.clone();
+        malformed["network_policies"]["admin"]["endpoints"][0]["deny_rules"] =
+            serde_json::json!({"method": "DELETE", "path": "/admin/**"});
+        let error = engine
+            .reload(TEST_POLICY, &malformed.to_string())
+            .expect_err("mapping-shaped deny_rules must reject before access expansion");
+        assert_eq!(
+            error.to_string(),
+            "network endpoint deny_rules must be an array"
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+
+        // A later valid replacement must still install and notify consumers.
+        let mut repaired = valid;
+        repaired["network_policies"]["admin"]["endpoints"][0]["deny_rules"][0]["path"] =
+            "/other/**".into();
+        engine
+            .reload(TEST_POLICY, &repaired.to_string())
+            .expect("valid replacement must install after a rejected reload");
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert!(eval_l7(&engine, &denied));
+    }
+
+    #[test]
+    fn yaml_containers_file_and_middleware_loaders_reject_before_config_validation() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("policy.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).expect("write policy rules");
+        let mut valid = opa_container_policy();
+        valid["network_middlewares"]["guard"] = serde_json::json!({
+            "middleware": "openshell/regex",
+            "order": 1,
+            "endpoints": {"include": ["admin.example.test"]},
+            "config": {},
+        });
+        let config_calls = Arc::new(AtomicU64::new(0));
+        let observed_calls = Arc::clone(&config_calls);
+        let count_config: &MiddlewareConfigValidator = &move |_, _| {
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        };
+        OpaEngine::from_strings_with_middleware_config(
+            TEST_POLICY,
+            &valid.to_string(),
+            Some(count_config),
+        )
+        .expect("valid control must reach middleware configuration validation");
+        assert_eq!(config_calls.load(Ordering::Relaxed), 1);
+
+        let mut malformed = valid;
+        malformed["network_policies"]["admin"]["endpoints"][0]["deny_rules"] =
+            serde_json::json!({"method": "DELETE", "path": "/admin/**"});
+        std::fs::write(&data_path, malformed.to_string()).expect("write malformed policy");
+        let validate_config: &MiddlewareConfigValidator =
+            &|_, _| panic!("structural rejection must precede middleware implementation callbacks");
+        for result in [
+            OpaEngine::from_files(&rules_path, &data_path),
+            OpaEngine::from_files_with_middleware_config(
+                &rules_path,
+                &data_path,
+                Some(validate_config),
+            ),
+            OpaEngine::from_strings_with_middleware_config(
+                TEST_POLICY,
+                &malformed.to_string(),
+                Some(validate_config),
+            ),
+        ] {
+            assert_eq!(
+                result.err().expect("raw loader must reject").to_string(),
+                "network endpoint deny_rules must be an array"
+            );
+        }
+
+        std::fs::write(&data_path, opa_container_policy().to_string())
+            .expect("write repaired policy");
+        let engine = OpaEngine::from_files(&rules_path, &data_path)
+            .expect("valid raw file must load after repair");
+        assert!(eval_l7(
+            &engine,
+            &l7_input("admin.example.test", 443, "GET", "/public")
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &l7_input("admin.example.test", 443, "DELETE", "/admin/users")
+        ));
+    }
+
+    #[test]
+    fn yaml_containers_preserve_opa_only_data_and_existing_semantic_validation() {
+        for data in [
+            "{}",
+            "network_policies: {}",
+            "filesystem_policy: {}\nlandlock: {}\nprocess: {}\nnetwork_middlewares: {}",
+            "network_policies: { empty: { endpoints: [], binaries: [] } }",
+            "runtime_extension: { values: [null, true, 1, custom] }",
+        ] {
+            OpaEngine::from_strings(TEST_POLICY, data)
+                .expect("valid versionless OPA data and omitted containers must remain supported");
+        }
+
+        let mut data = opa_container_policy();
+        data["runtime_extension"] = serde_json::json!({"values": [null, true, 1, "custom"]});
+        let loaded = preprocess_yaml_data(&data.to_string(), false, None)
+            .expect("supported runtime data must preprocess");
+        let loaded: serde_json::Value = serde_json::from_str(&loaded).expect("OPA JSON data");
+        assert_eq!(loaded["runtime_extension"], data["runtime_extension"]);
+
+        data["network_policies"]["admin"]["endpoints"][0]["deny_rules"] = serde_json::json!([]);
+        let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
+            .err()
+            .expect("an empty deny-rule list remains semantically invalid");
+        assert_eq!(
+            error.to_string(),
+            "L7 policy validation failed: invalid L7 policy configuration"
+        );
+        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"]);
+    }
+
+    #[test]
+    fn yaml_containers_structural_errors_are_fixed_for_large_untrusted_input() {
+        let mut data = opa_container_policy();
+        let marker = "sensitive-\u{1f980}".repeat(1024);
+        data["network_policies"]["admin"]["endpoints"] =
+            serde_json::Value::Array(vec![serde_json::json!({"deny_rules": marker}); 1024]);
+        let error = OpaEngine::from_strings(TEST_POLICY, &data.to_string())
+            .err()
+            .expect("malformed denial collections must reject");
+        let message = error.to_string();
+        assert_eq!(message, "network endpoint deny_rules must be an array");
+        assert!(message.len() <= 128);
+        assert_eq!(message.lines().count(), 1);
+        assert!(!message.contains("sensitive"));
     }
 
     fn test_proto() -> ProtoSandboxPolicy {
@@ -2225,7 +3339,6 @@ mod tests {
                 ],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2240,7 +3353,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/glab".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -2260,6 +3372,712 @@ mod tests {
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+        }
+    }
+
+    fn defaultable_mcp_proto(mcp: Option<McpOptions>) -> ProtoSandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "mcp".to_string(),
+                    mcp,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                }],
+            },
+        );
+        policy
+    }
+
+    fn projected_allow(
+        protocol: &str,
+        allow: L7Allow,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                "selector_projection".to_string(),
+                NetworkPolicyRule {
+                    name: "selector_projection".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: protocol.to_string(),
+                        rules: vec![L7Rule { allow: Some(allow) }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![],
+                },
+            )]),
+            ..Default::default()
+        };
+        let projected: serde_json::Value = serde_json::from_str(&proto_to_opa_data_json(&proto, 0))
+            .expect("protobuf policy projection must produce JSON");
+        projected["network_policies"]["selector_projection"]["endpoints"][0]["rules"][0]["allow"]
+            .as_object()
+            .expect("projected allow rule must be an object")
+            .clone()
+    }
+
+    #[test]
+    fn proto_projection_omits_absent_allow_selectors() {
+        let allow = projected_allow(
+            "websocket",
+            L7Allow {
+                operation_type: "subscription".to_string(),
+                operation_name: "NewMessages".to_string(),
+                fields: vec!["messageAdded".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    #[test]
+    fn proto_projection_preserves_nonempty_allow_selectors() {
+        let allow = projected_allow(
+            "rest",
+            L7Allow {
+                method: "POST".to_string(),
+                path: "/repos/**".to_string(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            allow,
+            serde_json::json!({
+                "method": "POST",
+                "path": "/repos/**",
+            })
+            .as_object()
+            .expect("expected object")
+            .clone()
+        );
+    }
+
+    fn assert_endpoint_config_parity(
+        yaml_config: &serde_json::Value,
+        proto_config: &serde_json::Value,
+        canonical_policy: &ProtoSandboxPolicy,
+        endpoint: &NetworkEndpoint,
+    ) {
+        assert!(yaml_config.get("endpoint_id").is_none());
+        assert!(yaml_config.get("policy_hash").is_none());
+        let mut expected = yaml_config.clone();
+        if is_mcp_protocol(&endpoint.protocol) {
+            // Gateway MCP observations carry canonical endpoint/policy identity.
+            // Derive only that metadata independently; compare every remaining
+            // configuration field without filtering actual runtime output.
+            expected["endpoint_id"] = openshell_core::endpoint_status::endpoint_id(endpoint).into();
+            expected["policy_hash"] = deterministic_policy_hash(canonical_policy).into();
+            assert_eq!(proto_config["endpoint_id"], expected["endpoint_id"]);
+            assert_eq!(proto_config["policy_hash"], expected["policy_hash"]);
+        } else {
+            assert!(proto_config.get("endpoint_id").is_none());
+            assert!(proto_config.get("policy_hash").is_none());
+        }
+        assert_eq!(
+            &expected, proto_config,
+            "{}: endpoint configuration must match apart from verified gateway identity",
+            endpoint.protocol
+        );
+    }
+
+    #[test]
+    fn yaml_and_proto_loads_have_protocol_config_and_authorization_parity() {
+        let data = r#"
+version: 1
+network_policies:
+  parity:
+    name: parity
+    endpoints:
+      - host: rest.parity.test
+        port: 443
+        path: /items/**
+        protocol: rest
+        enforcement: enforce
+        allow_encoded_slash: true
+        rules:
+          - allow: { method: GET, path: /items/** }
+      - host: graphql.parity.test
+        port: 443
+        path: /graphql
+        protocol: graphql
+        enforcement: enforce
+        graphql_max_body_bytes: 65536
+        rules:
+          - allow:
+              operation_type: query
+              operation_name: GetWidget
+              fields: [id, name]
+      - host: websocket.parity.test
+        port: 443
+        path: /graphql
+        protocol: websocket
+        enforcement: enforce
+        websocket_credential_rewrite: true
+        rules:
+          - allow: { method: GET, path: /graphql }
+          - allow:
+              operation_type: subscription
+              fields: [messageAdded]
+      - host: jsonrpc.parity.test
+        port: 443
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc: { max_body_bytes: 32768 }
+        rules:
+          - allow: { method: status.get }
+      - host: mcp.parity.test
+        port: 443
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          max_body_bytes: 16384
+          strict_tool_names: false
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto = openshell_policy::parse_sandbox_policy(data)
+            .expect("protocol parity fixture must parse into the typed schema");
+        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
+            .expect("protocol parity fixture must canonicalize");
+        let yaml_engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from YAML");
+        let proto_engine = OpaEngine::from_proto(&proto).expect("engine from protobuf");
+
+        let cases = [
+            (
+                "REST",
+                "rest.parity.test",
+                l7_input("rest.parity.test", 443, "GET", "/items/one"),
+                l7_input("rest.parity.test", 443, "DELETE", "/items/one"),
+            ),
+            (
+                "GraphQL",
+                "graphql.parity.test",
+                l7_graphql_input(
+                    "graphql.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "query",
+                        "operation_name": "GetWidget",
+                        "fields": ["id"],
+                        "persisted_query": false
+                    }]),
+                ),
+                l7_graphql_input(
+                    "graphql.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "mutation",
+                        "operation_name": "DeleteWidget",
+                        "fields": ["id"],
+                        "persisted_query": false
+                    }]),
+                ),
+            ),
+            (
+                "WebSocket",
+                "websocket.parity.test",
+                l7_websocket_graphql_input(
+                    "websocket.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "subscription",
+                        "fields": ["messageAdded"],
+                        "persisted_query": false
+                    }]),
+                ),
+                l7_websocket_graphql_input(
+                    "websocket.parity.test",
+                    serde_json::json!([{
+                        "operation_type": "subscription",
+                        "fields": ["adminAuditLog"],
+                        "persisted_query": false
+                    }]),
+                ),
+            ),
+            (
+                "JSON-RPC",
+                "jsonrpc.parity.test",
+                l7_jsonrpc_input("jsonrpc.parity.test", 443, "/rpc", "status.get"),
+                l7_jsonrpc_input("jsonrpc.parity.test", 443, "/rpc", "status.delete"),
+            ),
+            (
+                "MCP",
+                "mcp.parity.test",
+                l7_jsonrpc_input_with_params(
+                    "mcp.parity.test",
+                    443,
+                    "/mcp",
+                    "tools/call",
+                    serde_json::json!({ "name": "read_status" }),
+                ),
+                l7_jsonrpc_input_with_params(
+                    "mcp.parity.test",
+                    443,
+                    "/mcp",
+                    "tools/call",
+                    serde_json::json!({ "name": "delete_status" }),
+                ),
+            ),
+        ];
+
+        for (protocol, host, allowed, denied) in cases {
+            let network_input = NetworkInput {
+                host: host.to_string(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".to_string(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let yaml_config = yaml_engine
+                .query_endpoint_config(&network_input)
+                .expect("query YAML endpoint config")
+                .unwrap_or_else(|| panic!("{protocol}: expected YAML endpoint config"));
+            let proto_config = proto_engine
+                .query_endpoint_config(&network_input)
+                .expect("query protobuf endpoint config")
+                .unwrap_or_else(|| panic!("{protocol}: expected protobuf endpoint config"));
+            let yaml_config: serde_json::Value = serde_json::from_str(
+                &yaml_config
+                    .to_json_str()
+                    .expect("YAML endpoint config must serialize"),
+            )
+            .expect("YAML endpoint config must be JSON");
+            let proto_config: serde_json::Value = serde_json::from_str(
+                &proto_config
+                    .to_json_str()
+                    .expect("protobuf endpoint config must serialize"),
+            )
+            .expect("protobuf endpoint config must be JSON");
+
+            let endpoint = proto.network_policies["parity"]
+                .endpoints
+                .iter()
+                .find(|endpoint| endpoint.host == host)
+                .expect("fixture contains the exact endpoint");
+            assert_endpoint_config_parity(&yaml_config, &proto_config, &proto, endpoint);
+            assert_eq!(
+                yaml_config.get("mcp_versions").is_some(),
+                protocol == "MCP",
+                "{protocol}: only MCP endpoints carry revision state"
+            );
+            assert!(
+                eval_l7(&yaml_engine, &allowed) && eval_l7(&proto_engine, &allowed),
+                "{protocol}: equivalent allowed request must pass both ingress formats"
+            );
+            assert!(
+                !eval_l7(&yaml_engine, &denied) && !eval_l7(&proto_engine, &denied),
+                "{protocol}: equivalent denied request must fail both ingress formats"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_and_proto_matchers_retain_decisions_and_provenance_across_reload() {
+        // Exercise allow and deny matchers through both public loaders. The
+        // denied request also matches the allow rule, proving deny precedence.
+        for (protocol, selector, allowed, denied) in [
+            (
+                "rest",
+                "query",
+                serde_json::json!({"name": ["read_status"]}),
+                serde_json::json!({"name": ["read_secret"]}),
+            ),
+            (
+                "mcp",
+                "params",
+                serde_json::json!({"name": "read_status"}),
+                serde_json::json!({"name": "read_secret"}),
+            ),
+        ] {
+            let method = if protocol == "mcp" {
+                "tools/call"
+            } else {
+                "GET"
+            };
+            let path = if protocol == "rest" { "path: /**" } else { "" };
+            let deny_matcher = if protocol == "rest" {
+                "\"read_sec*\""
+            } else {
+                "{any: [read_secret, read_private]}"
+            };
+            let source = format!(
+                r#"
+version: 1
+network_policies:
+  matchers:
+    name: matchers
+    endpoints:
+      - host: matchers.parity.test
+        port: 443
+        protocol: {protocol}
+        enforcement: enforce
+        rules:
+          - allow:
+              method: {method}
+              {path}
+              {selector}: {{name: "read_*"}}
+        deny_rules:
+          - method: {method}
+            {path}
+            {selector}: {{name: {deny_matcher}}}
+    binaries:
+      - {{path: /usr/bin/curl}}
+"#
+            );
+            let mut proto =
+                openshell_policy::parse_sandbox_policy(&source).expect("authored policy");
+            let endpoint = &mut proto
+                .network_policies
+                .get_mut("matchers")
+                .unwrap()
+                .endpoints[0];
+            endpoint.provider_credentialed = true;
+            endpoint.advisor_proposed = true;
+            let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto)
+                .expect("runtime provenance fixture must canonicalize");
+            let mut data: serde_json::Value = serde_yml::from_str(&source).unwrap();
+            let endpoint = &mut data["network_policies"]["matchers"]["endpoints"][0];
+            endpoint["provider_credentialed"] = true.into();
+            endpoint["advisor_proposed"] = true.into();
+            // Versionless data and runtime provenance are accepted OPA inputs.
+            data.as_object_mut().unwrap().remove("version");
+            let yaml_engine = OpaEngine::from_strings(TEST_POLICY, &data.to_string()).unwrap();
+            let proto_engine = OpaEngine::from_proto(&proto).unwrap();
+            let input = NetworkInput {
+                host: "matchers.parity.test".into(),
+                port: 443,
+                binary_path: "/usr/bin/curl".into(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let request = |value| {
+                if protocol == "mcp" {
+                    l7_jsonrpc_input_with_params(&input.host, 443, "/", method, value)
+                } else {
+                    l7_input_with_query(&input.host, 443, method, "/", value)
+                }
+            };
+            let allowed = request(allowed);
+            let denied = request(denied);
+            let normalized = preprocess_yaml_data(&data.to_string(), true, None).unwrap();
+            assert_eq!(
+                normalized,
+                preprocess_yaml_data(&normalized, true, None).unwrap()
+            );
+
+            for phase in ["startup", "reload"] {
+                if phase == "reload" {
+                    yaml_engine.reload(TEST_POLICY, &normalized).unwrap();
+                    proto_engine.reload_from_proto(&proto).unwrap();
+                }
+                let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap().unwrap();
+                let proto_config = proto_engine.query_endpoint_config(&input).unwrap().unwrap();
+                assert_endpoint_config_parity(
+                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
+                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
+                    &proto,
+                    &proto.network_policies["matchers"].endpoints[0],
+                );
+                for engine in [&yaml_engine, &proto_engine] {
+                    let snapshot = engine.authorize_egress(&input).unwrap();
+                    assert_eq!(snapshot.generation, u64::from(phase == "reload"));
+                    assert_eq!(
+                        yaml_config["provider_credentialed"],
+                        regorus::Value::Bool(true)
+                    );
+                    assert_eq!(yaml_config["advisor_proposed"], regorus::Value::Bool(true));
+                    assert!(eval_l7(engine, &allowed), "{protocol} {phase}: allow");
+                    assert!(
+                        !eval_l7(engine, &denied),
+                        "{protocol} {phase}: deny takes precedence"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_and_proto_sql_and_l4_policies_have_config_and_decision_parity() {
+        // SQL policy classification is audit-only. Check its rule decisions
+        // here without claiming that the proxy enforces SQL commands.
+        for (protocol, fields) in [
+            (
+                "sql",
+                "enforcement: audit\n        rules: [{allow: {command: SELECT}}]",
+            ),
+            ("tcp", ""),
+            ("", ""),
+        ] {
+            let source = format!(
+                r#"
+version: 1
+network_policies:
+  parity:
+    name: parity
+    endpoints:
+      - host: sql-l4.parity.test
+        port: 443
+        protocol: "{protocol}"
+        {fields}
+    binaries:
+      - {{path: /usr/bin/curl}}
+"#
+            );
+            let proto = openshell_policy::parse_sandbox_policy(&source).unwrap();
+            let yaml_engine = OpaEngine::from_strings(TEST_POLICY, &source).unwrap();
+            let proto_engine = OpaEngine::from_proto(&proto).unwrap();
+            let mut input = NetworkInput {
+                host: "sql-l4.parity.test".into(),
+                port: 443,
+                binary_path: "/usr/bin/curl".into(),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            assert_eq!(
+                yaml_engine.query_endpoint_config(&input).unwrap(),
+                proto_engine.query_endpoint_config(&input).unwrap()
+            );
+            for engine in [&yaml_engine, &proto_engine] {
+                assert!(matches!(
+                    engine.evaluate_network_action(&input).unwrap(),
+                    NetworkAction::Allow { .. }
+                ));
+                if protocol == "sql" {
+                    let config = engine.query_endpoint_config(&input).unwrap().unwrap();
+                    assert_eq!(config["enforcement"], regorus::Value::from("audit"));
+                    let mut request = l7_input(&input.host, 443, "", "/");
+                    request["request"]["command"] = "SELECT".into();
+                    assert!(eval_l7(engine, &request));
+                    request["request"]["command"] = "DELETE".into();
+                    assert!(!eval_l7(engine, &request));
+                }
+            }
+            input.host = "unlisted.parity.test".into();
+            for engine in [&yaml_engine, &proto_engine] {
+                assert!(matches!(
+                    engine.evaluate_network_action(&input).unwrap(),
+                    NetworkAction::Deny { .. }
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_mcp_params_maps_preserve_denials_and_reject_malformed_reload() {
+        let valid = serde_json::json!({
+            "network_policies": {
+                "tools": {
+                    "endpoints": [{
+                        "host": "mcp.params.test",
+                        "port": 443,
+                        "protocol": "mcp",
+                        "enforcement": "enforce",
+                        "rules": [{"allow": {"method": "tools/call", "tool": "read_*"}}],
+                        "deny_rules": [{"method": "tools/call", "tool": "read_secret"}]
+                    }],
+                    "binaries": [{"path": "/usr/bin/curl"}]
+                }
+            }
+        });
+        let request = |name: &str| {
+            l7_jsonrpc_input_with_params(
+                "mcp.params.test",
+                443,
+                "/mcp",
+                "tools/call",
+                serde_json::json!({"name": name}),
+            )
+        };
+        let allowed = request("read_status");
+        let denied = request("read_secret");
+
+        for yaml in [true, false] {
+            let encode = |data: &serde_json::Value| {
+                if yaml {
+                    serde_yml::to_string(data).expect("serialize YAML policy")
+                } else {
+                    data.to_string()
+                }
+            };
+            let engine = OpaEngine::from_strings(TEST_POLICY, &encode(&valid))
+                .expect("omitted params must preserve tool aliases");
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+            let generation = engine.current_generation();
+
+            // Every raw rule shape must reject before normalization can remove
+            // an alias. Failed reloads must leave both allow and deny intact.
+            for (rule_pointer, flat_allow, diagnostic) in [
+                (
+                    "/rules/0/allow",
+                    false,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/rules/0",
+                    true,
+                    "rules[0].allow.params: expected map of matchers",
+                ),
+                (
+                    "/deny_rules/0",
+                    false,
+                    "deny_rules[0].params: expected map of matchers",
+                ),
+            ] {
+                for params in [
+                    serde_json::Value::Null,
+                    serde_json::json!([]),
+                    serde_json::json!("invalid"),
+                    serde_json::json!(false),
+                    serde_json::json!(42),
+                ] {
+                    let mut candidate = valid.clone();
+                    let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                    if flat_allow {
+                        endpoint["rules"][0] = endpoint["rules"][0]["allow"].take();
+                    }
+                    endpoint
+                        .pointer_mut(rule_pointer)
+                        .expect("fixture rule exists")["params"] = params;
+                    // The validator identifies the malformed field internally;
+                    // public load errors must redact authored policy details.
+                    let (errors, _) = crate::l7::validate_l7_policies(&candidate);
+                    assert!(
+                        errors.iter().any(|error| error.contains(diagnostic)),
+                        "{errors:?}"
+                    );
+                    let source = encode(&candidate);
+                    let error = OpaEngine::from_strings(TEST_POLICY, &source)
+                        .err()
+                        .expect("non-map params must reject at startup");
+                    // A malformed rule may produce multiple safe categories.
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("invalid L7 policy configuration"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
+                    let error = engine
+                        .reload(TEST_POLICY, &source)
+                        .expect_err("non-map params must reject on reload");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("invalid L7 policy configuration"),
+                        "{error}"
+                    );
+                    assert_safe_load_error(&error, &[diagnostic, "mcp.params.test", "read_secret"]);
+                    assert_eq!(engine.current_generation(), generation);
+                    assert!(eval_l7(&engine, &allowed));
+                    assert!(!eval_l7(&engine, &denied));
+                }
+            }
+
+            // Empty maps accept alias insertion; explicit name maps retain the
+            // same selector without an alias. Neither form may erase a deny.
+            for explicit_name in [false, true] {
+                let mut candidate = valid.clone();
+                let endpoint = &mut candidate["network_policies"]["tools"]["endpoints"][0];
+                for pointer in ["/rules/0/allow", "/deny_rules/0"] {
+                    let rule = endpoint.pointer_mut(pointer).expect("fixture rule exists");
+                    rule["params"] = if explicit_name {
+                        let tool = rule.as_object_mut().expect("rule map").remove("tool");
+                        serde_json::json!({"name": tool.expect("fixture tool selector")})
+                    } else {
+                        serde_json::json!({})
+                    };
+                }
+                let source = encode(&candidate);
+                let control = OpaEngine::from_strings(TEST_POLICY, &source)
+                    .expect("valid matcher map must load");
+                assert!(eval_l7(&control, &allowed));
+                assert!(!eval_l7(&control, &denied));
+                let previous_generation = engine.current_generation();
+                engine
+                    .reload(TEST_POLICY, &source)
+                    .expect("valid matcher map must reload after rejection");
+                assert_eq!(engine.current_generation(), previous_generation + 1);
+                assert!(eval_l7(&engine, &allowed));
+                assert!(!eval_l7(&engine, &denied));
+            }
+        }
+    }
+
+    #[test]
+    fn yaml_empty_query_matcher_retains_deny_semantics_across_reload() {
+        // Empty scalar matchers are OPA-only: an empty protobuf glob has no
+        // presence and is rejected. Rego strings can still match empty input.
+        let source = r#"
+network_policies:
+  empty_query:
+    name: empty_query
+    endpoints:
+      - host: empty.parity.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
+        deny_rules:
+          - method: GET
+            path: /**
+            query: {name: ""}
+    binaries:
+      - {path: /usr/bin/curl}
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, source).unwrap();
+        for phase in ["startup", "reload"] {
+            if phase == "reload" {
+                engine.reload(TEST_POLICY, source).unwrap();
+            }
+            for (value, allowed) in [("", false), ("present", true)] {
+                let request = l7_input_with_query(
+                    "empty.parity.test",
+                    443,
+                    "GET",
+                    "/",
+                    serde_json::json!({"name": [value]}),
+                );
+                assert_eq!(
+                    eval_l7(&engine, &request),
+                    allowed,
+                    "{phase}: name={value:?}"
+                );
+            }
         }
     }
 
@@ -2287,13 +4105,14 @@ process:
 "#;
 
     #[test]
-    fn policy_dns_snapshot_is_tcp_only_stable_and_generation_consistent() {
+    fn policy_dns_snapshot_includes_every_tcp_carried_endpoint() {
         let engine = OpaEngine::from_strings(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA).unwrap();
 
         let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
 
         assert_eq!(snapshot.generation, engine.current_generation());
-        assert_eq!(snapshot.endpoints.len(), 2);
+        assert!(!snapshot.fail_closed);
+        assert_eq!(snapshot.endpoints.len(), 4);
         assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
         assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
         assert_eq!(
@@ -2306,15 +4125,17 @@ process:
             panic!("eligible endpoint must retain concrete ports");
         };
         assert_eq!(ports.as_ref(), &[53.into(), 853.into()]);
-        assert_eq!(snapshot.endpoints[1].endpoint_index, 4);
+        assert_eq!(snapshot.endpoints[1].endpoint_index, 1);
+        assert_eq!(snapshot.endpoints[2].endpoint_index, 2);
+        assert_eq!(snapshot.endpoints[3].endpoint_index, 4);
 
         engine
             .reload(TEST_POLICY, POLICY_DNS_SNAPSHOT_DATA)
             .unwrap();
         let reloaded = engine.policy_dns_eligibility_snapshot().unwrap();
         assert_eq!(reloaded.generation, snapshot.generation + 1);
-        assert_eq!(reloaded.endpoints.len(), 2);
-        assert_eq!(reloaded.endpoints[1].endpoint_index, 4);
+        assert_eq!(reloaded.endpoints.len(), 4);
+        assert_eq!(reloaded.endpoints[3].endpoint_index, 4);
     }
 
     #[test]
@@ -2326,13 +4147,20 @@ process:
 
         assert_eq!(snapshot.generation, generation);
         assert!(snapshot.endpoints.is_empty());
+        assert!(snapshot.fail_closed);
     }
 
     #[test]
     fn policy_dns_snapshot_accepts_the_default_multi_policy_shape() {
         let engine = OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).unwrap();
         let snapshot = engine.policy_dns_eligibility_snapshot().unwrap();
-        assert!(snapshot.endpoints.is_empty());
+        assert_eq!(snapshot.endpoints.len(), 15);
+        assert!(
+            snapshot
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.policy_name == "claude_code")
+        );
     }
 
     #[test]
@@ -2500,6 +4328,442 @@ process:
             !decision.allowed,
             "percent-encoded dot should not be decoded by OPA glob"
         );
+    }
+
+    /// The typed schema gives an absent `filesystem_policy` the platform
+    /// default, `include_workdir: true`, and gives a present but empty stanza
+    /// `include_workdir: false`. Loading the same YAML directly into OPA must
+    /// agree in both cases, and versionless OPA data must follow the same rule
+    /// for a present empty stanza.
+    #[test]
+    fn yaml_and_proto_filesystem_policy_have_include_workdir_parity() {
+        for (data, expected) in [
+            ("version: 1\n", true),
+            ("version: 1\nfilesystem_policy: {}\n", false),
+        ] {
+            let proto = openshell_policy::parse_sandbox_policy(data)
+                .expect("fixture must parse into the typed schema");
+            let proto_config = OpaEngine::from_proto(&proto)
+                .expect("engine from protobuf")
+                .query_sandbox_config()
+                .expect("config from protobuf");
+            let yaml_config = OpaEngine::from_strings(TEST_POLICY, data)
+                .expect("engine from YAML")
+                .query_sandbox_config()
+                .expect("config from YAML");
+            assert_eq!(
+                proto_config.filesystem.include_workdir, expected,
+                "typed contract for {data:?}"
+            );
+            assert_eq!(
+                yaml_config.filesystem.include_workdir, expected,
+                "raw OPA loading for {data:?}"
+            );
+        }
+
+        let versionless = OpaEngine::from_strings(TEST_POLICY, "filesystem_policy: {}\n")
+            .expect("versionless OPA data must load")
+            .query_sandbox_config()
+            .expect("config from versionless OPA data");
+        assert!(
+            !versionless.filesystem.include_workdir,
+            "raw OPA loading of a versionless empty filesystem stanza"
+        );
+    }
+
+    #[test]
+    fn yaml_and_proto_landlock_policy_have_compatibility_parity() {
+        for (stanza, hard_requirement) in [
+            ("{}", false),
+            ("{compatibility: best_effort}", false),
+            ("{compatibility: hard_requirement}", true),
+            ("{compatibility: {best_effort: null}}", false),
+            ("{compatibility: {hard_requirement: null}}", true),
+        ] {
+            let versionless = format!("landlock: {stanza}\n");
+            let versioned = format!("version: 1\n{versionless}");
+            let proto = openshell_policy::parse_sandbox_policy(&versioned)
+                .expect("valid typed Landlock representation");
+            let typed = OpaEngine::from_proto(&proto)
+                .expect("typed engine")
+                .query_sandbox_config()
+                .expect("typed sandbox config");
+            assert_eq!(
+                matches!(
+                    typed.landlock.compatibility,
+                    LandlockCompatibility::HardRequirement
+                ),
+                hard_requirement,
+                "typed contract for {stanza}"
+            );
+            for data in [&versioned, &versionless] {
+                let raw = OpaEngine::from_strings(TEST_POLICY, data)
+                    .expect("valid raw Landlock representation")
+                    .query_sandbox_config()
+                    .expect("raw sandbox config");
+                assert_eq!(
+                    matches!(
+                        raw.landlock.compatibility,
+                        LandlockCompatibility::HardRequirement
+                    ),
+                    hard_requirement,
+                    "raw OPA loading for {data}"
+                );
+            }
+        }
+    }
+
+    /// Nested values that the typed schema rejects must also be rejected when
+    /// the same policy is loaded directly into OPA, with or without a
+    /// `version` key, instead of being replaced by defaults
+    /// (`include_workdir: true`, best-effort Landlock) or dropped. Each case
+    /// has a valid twin that both paths accept, so the test cannot pass by
+    /// rejecting valid input.
+    #[test]
+    fn raw_opa_loading_rejects_nested_values_the_typed_schema_rejects() {
+        const JSON_RPC_ENDPOINT: &str = r"network_policies:
+  rpc:
+    name: rpc
+    endpoints:
+      - host: jsonrpc.parity.test
+        port: 443
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc: JSON_RPC_OPTIONS
+        rules:
+          - allow: { method: status.get }
+    binaries:
+      - { path: /usr/bin/curl }
+";
+        // Each case is (name, invalid body, valid twin body). Bodies omit
+        // `version` so each invalid body is also loaded as versionless OPA data.
+        let cases = [
+            (
+                "string include_workdir",
+                "filesystem_policy: {include_workdir: \"false\"}\n".to_owned(),
+                "filesystem_policy: {include_workdir: false}\n".to_owned(),
+            ),
+            (
+                "non-string read_only entry",
+                "filesystem_policy: {read_only: [7]}\n".to_owned(),
+                "filesystem_policy: {read_only: [\"/usr\"]}\n".to_owned(),
+            ),
+            (
+                "non-string read_write entry",
+                "filesystem_policy: {read_write: [false]}\n".to_owned(),
+                "filesystem_policy: {read_write: [\"/tmp\"]}\n".to_owned(),
+            ),
+            (
+                "unknown filesystem field",
+                "filesystem_policy: {private_typo: false}\n".to_owned(),
+                "filesystem_policy: {}\n".to_owned(),
+            ),
+            (
+                "unknown Landlock compatibility",
+                "landlock: {compatibility: required}\n".to_owned(),
+                "landlock: {compatibility: hard_requirement}\n".to_owned(),
+            ),
+            (
+                "unknown Landlock field",
+                "landlock: {private_typo: true}\n".to_owned(),
+                "landlock: {}\n".to_owned(),
+            ),
+            (
+                "non-string process identity",
+                "process: {run_as_user: 7}\n".to_owned(),
+                "process: {run_as_user: sandbox}\n".to_owned(),
+            ),
+            (
+                "null process group",
+                "process: {run_as_group: null}\n".to_owned(),
+                "process: {run_as_group: sandbox}\n".to_owned(),
+            ),
+            (
+                "unknown process field",
+                "process: {private_typo: sandbox}\n".to_owned(),
+                "process: {}\n".to_owned(),
+            ),
+            (
+                "explicit null json_rpc options",
+                JSON_RPC_ENDPOINT.replace("JSON_RPC_OPTIONS", "null"),
+                JSON_RPC_ENDPOINT.replace("JSON_RPC_OPTIONS", "{ max_body_bytes: 32768 }"),
+            ),
+        ];
+
+        // Check every fixture before failing, so one run reports each input the
+        // raw loader accepts instead of stopping at the first.
+        let mut accepted_by_raw_opa = Vec::new();
+        for (case, invalid, valid) in &cases {
+            let valid = format!("version: 1\n{valid}");
+            assert!(
+                openshell_policy::parse_sandbox_policy(&valid).is_ok(),
+                "typed schema must accept the valid {case} twin"
+            );
+            assert!(
+                OpaEngine::from_strings(TEST_POLICY, &valid).is_ok(),
+                "raw OPA loading must accept the valid {case} twin"
+            );
+
+            let versioned = format!("version: 1\n{invalid}");
+            assert!(
+                openshell_policy::parse_sandbox_policy(&versioned).is_err(),
+                "typed schema must reject the {case} fixture"
+            );
+            for (form, data) in [("versioned", versioned.as_str()), ("versionless", invalid)] {
+                match OpaEngine::from_strings(TEST_POLICY, data) {
+                    Ok(_) => accepted_by_raw_opa.push(format!("{case} ({form})")),
+                    Err(error) => assert_safe_load_error(&error, &["private_typo"]),
+                }
+            }
+        }
+
+        let hard_requirement = OpaEngine::from_strings(
+            TEST_POLICY,
+            "version: 1\nlandlock: {compatibility: hard_requirement}\n",
+        )
+        .expect("valid Landlock twin must load")
+        .query_sandbox_config()
+        .expect("config from valid Landlock twin");
+        assert!(matches!(
+            hard_requirement.landlock.compatibility,
+            LandlockCompatibility::HardRequirement
+        ));
+
+        assert!(
+            accepted_by_raw_opa.is_empty(),
+            "raw OPA loading accepted fixtures that the typed schema rejects: {accepted_by_raw_opa:?}"
+        );
+    }
+
+    #[test]
+    fn raw_opa_network_leaves_reject_typed_schema_errors() {
+        let valid = opa_container_policy();
+        let mut accepted = Vec::new();
+        for (field, invalid, control) in [
+            (
+                "allow_encoded_slash",
+                serde_json::json!("true"),
+                serde_json::json!(true),
+            ),
+            (
+                "websocket_credential_rewrite",
+                serde_json::json!("true"),
+                serde_json::json!(true),
+            ),
+            ("port", serde_json::json!("443"), serde_json::json!(443)),
+            (
+                "deny_rules",
+                serde_json::json!([{"method": ["DELETE"], "path": "/admin/**"}]),
+                serde_json::json!([{"method": "DELETE", "path": "/admin/**"}]),
+            ),
+        ] {
+            let mut policy = valid.clone();
+            policy["version"] = 1.into();
+            policy["network_policies"]["admin"]["endpoints"][0][field] = control;
+            openshell_policy::parse_sandbox_policy(&policy.to_string()).expect("typed valid twin");
+            OpaEngine::from_strings(TEST_POLICY, &policy.to_string()).expect("raw valid twin");
+            policy["network_policies"]["admin"]["endpoints"][0][field] = invalid;
+            assert!(
+                openshell_policy::parse_sandbox_policy(&policy.to_string()).is_err(),
+                "typed {field}"
+            );
+            for versioned in [true, false] {
+                if !versioned {
+                    policy.as_object_mut().expect("object").remove("version");
+                }
+                match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
+                    Ok(_) => accepted.push(format!("{field} (versioned={versioned})")),
+                    Err(error) => {
+                        assert_safe_load_error(&error, &["admin.example.test", "/admin/**"]);
+                    }
+                }
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw loader accepted invalid network fields: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn raw_opa_static_semantics_match_typed_validation() {
+        let mut accepted = Vec::new();
+        for invalid in [
+            serde_json::json!({"process": {"run_as_user": "root"}}),
+            serde_json::json!({"process": {"run_as_group": "0"}}),
+            serde_json::json!({"process": {"run_as_user": "4294967295"}}),
+            serde_json::json!({"filesystem_policy": {"read_write": ["/"]}}),
+            serde_json::json!({"filesystem_policy": {"read_write": ["///"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["relative-private-path"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["/tmp/../private-path"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": [format!("/{}", "p".repeat(4096))]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": vec!["/usr"; 257]}}),
+        ] {
+            let mut versioned = invalid.clone();
+            versioned["version"] = 1.into();
+            assert!(
+                openshell_policy::parse_sandbox_policy(&versioned.to_string()).map_or(
+                    true,
+                    |policy| openshell_policy::validate_sandbox_policy(&policy).is_err()
+                ),
+                "typed invalid static settings"
+            );
+            for policy in [&invalid, &versioned] {
+                match OpaEngine::from_strings(TEST_POLICY, &policy.to_string()) {
+                    Ok(_) => accepted.push(invalid.clone()),
+                    Err(error) => {
+                        assert_safe_load_error(&error, &["root", "private-path", "4294967295"]);
+                    }
+                }
+            }
+        }
+        for valid in [
+            serde_json::json!({"process": {}}),
+            serde_json::json!({"process": {"run_as_user": "sandbox", "run_as_group": "1"}}),
+            serde_json::json!({"process": {"run_as_user": "4294967294", "run_as_group": "sandbox"}}),
+            serde_json::json!({"filesystem_policy": {"read_only": ["/"], "read_write": ["/tmp"]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": vec!["/usr"; 256]}}),
+            serde_json::json!({"filesystem_policy": {"read_only": [format!("/{}", "p".repeat(4095))]}}),
+        ] {
+            let mut versioned = valid.clone();
+            versioned["version"] = 1.into();
+            let typed = openshell_policy::parse_sandbox_policy(&versioned.to_string())
+                .expect("typed static control");
+            openshell_policy::validate_sandbox_policy(&typed).expect("valid typed static settings");
+            for policy in [&valid, &versioned] {
+                OpaEngine::from_strings(TEST_POLICY, &policy.to_string())
+                    .expect("raw static control")
+                    .query_sandbox_config()
+                    .expect("static config");
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "raw loader accepted {} invalid static policies",
+            accepted.len()
+        );
+    }
+
+    #[test]
+    fn startup_evaluation_errors_discard_authored_rego_and_sources() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("private-rules.rego");
+        let data_path = directory.path().join("private-data.yaml");
+        std::fs::write(&data_path, "{}").expect("write data");
+        for rule in ["filesystem_policy", "landlock_policy", "process_policy"] {
+            for repetitions in [1, 20] {
+                let marker = "private-eval-marker-".repeat(repetitions);
+                let rules = format!(
+                    "package openshell.sandbox\n{rule} := {{\"value\": \"{marker}one\"}}\n{rule} := {{\"value\": \"{marker}two\"}}\n"
+                );
+                std::fs::write(&rules_path, &rules).expect("write conflicting rules");
+                for engine in [
+                    OpaEngine::from_strings(&rules, "{}").expect("conflict is an evaluation error"),
+                    OpaEngine::from_files(&rules_path, &data_path).expect("file rules compile"),
+                ] {
+                    let error = engine
+                        .query_sandbox_config()
+                        .err()
+                        .expect("conflicting complete rules must fail");
+                    assert_safe_load_error(
+                        &error,
+                        &["private-eval-marker", "private-rules.rego", "value"],
+                    );
+                    assert_eq!(
+                        error.to_string(),
+                        "failed to evaluate static sandbox settings"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn raw_opa_nested_validation_preserves_file_loads_and_rejected_reload() {
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let rules_path = directory.path().join("policy.rego");
+        let data_path = directory.path().join("policy.yaml");
+        std::fs::write(&rules_path, TEST_POLICY).expect("write policy rules");
+        let valid = opa_container_policy();
+        std::fs::write(&data_path, valid.to_string()).expect("write valid policy");
+        let engine = OpaEngine::from_files(&rules_path, &data_path).expect("valid file policy");
+        let proxy = OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+            .expect("valid endpoint-only policy");
+        for loaded in [&engine, &proxy] {
+            assert!(
+                !loaded
+                    .query_sandbox_config()
+                    .expect("filesystem config")
+                    .filesystem
+                    .include_workdir,
+                "file loaders must retain the typed default for an empty filesystem stanza"
+            );
+        }
+        let allowed = l7_input("admin.example.test", 443, "GET", "/public");
+        let denied = l7_input("admin.example.test", 443, "DELETE", "/admin/users");
+        let generation = engine.current_generation();
+        assert!(eval_l7(&engine, &allowed));
+        assert!(!eval_l7(&engine, &denied));
+
+        // Malformed nested settings must fail before replacing any installed
+        // decisions or notifying consumers of a new generation.
+        for (pointer, replacement) in [
+            (
+                "/filesystem_policy",
+                serde_json::json!({"include_workdir": "private-value-秘密".repeat(1024)}),
+            ),
+            (
+                "/landlock",
+                serde_json::json!({"compatibility": "private-value-秘密".repeat(1024)}),
+            ),
+            ("/process", serde_json::json!({"run_as_user": 7})),
+            ("/process", serde_json::json!({"run_as_user": "root"})),
+            (
+                "/filesystem_policy",
+                serde_json::json!({"read_write": ["/"]}),
+            ),
+            (
+                "/network_policies/admin/endpoints/0/deny_rules/0/method",
+                serde_json::json!(["DELETE"]),
+            ),
+            (
+                "/network_policies/admin/binaries/0/path",
+                serde_json::json!(["/usr/bin/curl"]),
+            ),
+        ] {
+            let mut malformed = valid.clone();
+            *malformed
+                .pointer_mut(pointer)
+                .expect("existing static section") = replacement;
+            let data = malformed.to_string();
+            std::fs::write(&data_path, &data).expect("write malformed policy");
+            for error in [
+                OpaEngine::from_files(&rules_path, &data_path)
+                    .err()
+                    .expect("file loader must reject malformed nested values"),
+                OpaEngine::from_files_for_endpoint_only_proxy(&rules_path, &data_path, None)
+                    .err()
+                    .expect("endpoint-only file loader must reject malformed nested values"),
+                engine
+                    .reload(TEST_POLICY, &data)
+                    .expect_err("reload must reject malformed nested values"),
+            ] {
+                assert_safe_load_error(&error, &["private-value", "秘密", "admin.example.test"]);
+            }
+            assert_eq!(engine.current_generation(), generation);
+            assert!(eval_l7(&engine, &allowed));
+            assert!(!eval_l7(&engine, &denied));
+        }
+
+        let mut repaired = valid;
+        repaired["network_policies"]["admin"]["endpoints"][0]["deny_rules"][0]["path"] =
+            "/other/**".into();
+        engine
+            .reload(TEST_POLICY, &repaired.to_string())
+            .expect("valid replacement after rejected reloads");
+        assert_eq!(engine.current_generation(), generation + 1);
+        assert!(eval_l7(&engine, &denied));
     }
 
     #[test]
@@ -3064,7 +5328,8 @@ process:
                 "path": path,
                 "query_params": {},
                 "jsonrpc": {
-                    "method": method
+                    "method": method,
+                    "mcp_method_classification": "available"
                 }
             }
         })
@@ -3170,8 +5435,33 @@ process:
         val == regorus::Value::from(true)
     }
 
+    fn assert_l7_denial(
+        engine: &OpaEngine,
+        input: &serde_json::Value,
+        deny_rule_matches: bool,
+        expected_reason: &str,
+    ) {
+        let mut eng = engine.engine.lock().unwrap();
+        set_regorus_input(&mut eng, input.clone()).unwrap();
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.allow_request".into())
+                .expect("evaluate allow_request"),
+            regorus::Value::from(false),
+        );
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.deny_request".into())
+                .expect("evaluate deny_request"),
+            regorus::Value::from(deny_rule_matches),
+        );
+        assert_eq!(
+            eng.eval_rule("data.openshell.sandbox.request_deny_reason".into())
+                .expect("evaluate one unambiguous denial reason"),
+            regorus::Value::from(expected_reason),
+        );
+    }
+
     fn eval_l7_raw_data(data: serde_json::Value, input: serde_json::Value) -> bool {
-        let mut engine = regorus::Engine::new();
+        let mut engine = new_regorus_engine().unwrap();
         engine
             .add_policy("policy.rego".into(), TEST_POLICY.into())
             .unwrap();
@@ -3183,6 +5473,195 @@ process:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         val == regorus::Value::from(true)
+    }
+
+    fn token_grant_owner_engine(policies: serde_json::Value) -> OpaEngine {
+        // Owner identities are trusted runtime metadata, so these Rego tests
+        // load the already-normalized data that follows policy conversion.
+        let mut engine = new_regorus_engine().expect("register runtime builtins");
+        engine
+            .add_policy("policy.rego".into(), TEST_POLICY.into())
+            .expect("load owner admission policy");
+        engine
+            .add_data_json(&serde_json::json!({"network_policies": policies}).to_string())
+            .expect("load normalized owner metadata");
+        OpaEngine::with_engine(engine, true)
+    }
+
+    fn token_grant_owner_endpoint(owner: &str, path: &str, method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "host": "api.example.test", "ports": [8080], "path": path,
+            "protocol": "rest", "token_grant_owner": owner,
+            "rules": [{"allow": {"method": method, "path": path}}],
+        })
+    }
+
+    fn eval_token_grant_owners(engine: &OpaEngine, input: &serde_json::Value) -> Vec<String> {
+        let mut engine = engine.engine.lock().expect("owner query engine lock");
+        set_regorus_input(&mut engine, input.clone()).expect("owner query input");
+        let owners = engine
+            .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+            .expect("evaluate admitted grant owners");
+        let regorus::Value::Array(owners) = owners else {
+            panic!("owner query must always return an array, including denial");
+        };
+        owners
+            .iter()
+            .map(|owner| match owner {
+                regorus::Value::String(owner) => owner.to_string(),
+                _ => panic!("owner query must only return string identities"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn l7_token_grant_owners_require_exact_endpoint_admission() {
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "allowed": {
+                "endpoints": [
+                    token_grant_owner_endpoint("owner-broad", "/a/**", "GET"),
+                    token_grant_owner_endpoint("owner-narrow", "/a/private/**", "POST"),
+                ],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+            "other_binary": {
+                "endpoints": [token_grant_owner_endpoint("owner-other", "/a/**", "GET")],
+                "binaries": [{"path": "/usr/bin/other-client"}],
+            },
+        }));
+        let input = l7_input("api.example.test", 8080, "GET", "/a/private/item");
+        assert!(
+            eval_l7(&engine, &input),
+            "broader endpoint permits forwarding"
+        );
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner-broad"]);
+
+        let input = l7_input("api.example.test", 8080, "POST", "/a/private/item");
+        assert!(eval_l7(&engine, &input));
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner-narrow"]);
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_union_allow_and_global_deny() {
+        let mut broad = token_grant_owner_endpoint("owner-z", "/a/**", "GET");
+        broad["deny_rules"] = serde_json::json!([{"method": "GET", "path": "/a/private/blocked"}]);
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "broad": {
+                "endpoints": [broad],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+            "narrow": {
+                "endpoints": [
+                    token_grant_owner_endpoint("owner-a", "/a/private/**", "GET"),
+                    token_grant_owner_endpoint("owner-z", "/a/private/**", "GET"),
+                ],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }));
+        let allowed = l7_input("api.example.test", 8080, "GET", "/a/private/item");
+        assert!(eval_l7(&engine, &allowed));
+        assert_eq!(
+            eval_token_grant_owners(&engine, &allowed),
+            ["owner-a", "owner-z"]
+        );
+
+        let denied = l7_input("api.example.test", 8080, "GET", "/a/private/blocked");
+        assert!(!eval_l7(&engine, &denied));
+        assert!(eval_token_grant_owners(&engine, &denied).is_empty());
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_binary_and_query_restrictions() {
+        let mut endpoint = token_grant_owner_endpoint("owner", "/a/**", "GET");
+        endpoint["rules"][0]["allow"]["query"] = serde_json::json!({"team": {"glob": "prod-*"}});
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "owner": {
+                "endpoints": [endpoint],
+                "binaries": [{"path": "/opt/tools/*"}],
+            },
+        }));
+        let mut input = l7_input_with_query(
+            "api.example.test",
+            8080,
+            "GET",
+            "/a/item",
+            serde_json::json!({"team": ["prod-east"]}),
+        );
+        input["exec"]["cmdline_paths"] = serde_json::json!(["/opt/tools/client"]);
+        assert!(
+            eval_token_grant_owners(&engine, &input).is_empty(),
+            "argv cannot grant access"
+        );
+        input["exec"]["ancestors"] = serde_json::json!(["/opt/tools/client"]);
+        assert_eq!(eval_token_grant_owners(&engine, &input), ["owner"]);
+        input["request"]["query_params"] = serde_json::json!({"team": ["prod-east", "dev"]});
+        assert!(
+            eval_token_grant_owners(&engine, &input).is_empty(),
+            "every query value must match"
+        );
+    }
+
+    #[test]
+    fn l7_token_grant_owners_exclude_audit_denial_and_missing_metadata() {
+        let mut audit = token_grant_owner_endpoint("owner-audit", "/a/**", "GET");
+        audit["enforcement"] = "audit".into();
+        let mut missing = token_grant_owner_endpoint("", "/b/**", "GET");
+        missing
+            .as_object_mut()
+            .expect("endpoint object")
+            .remove("token_grant_owner");
+        let mut malformed = token_grant_owner_endpoint("", "/c/**", "GET");
+        malformed["token_grant_owner"] = 42.into();
+        let engine = token_grant_owner_engine(serde_json::json!({
+            "owner": {
+                "endpoints": [audit, missing, malformed, token_grant_owner_endpoint("", "/d/**", "GET")],
+                "binaries": [{"path": "/usr/bin/curl"}],
+            },
+        }));
+        let audit_denied = l7_input("api.example.test", 8080, "POST", "/a/item");
+        assert!(!eval_l7(&engine, &audit_denied));
+        assert!(eval_token_grant_owners(&engine, &audit_denied).is_empty());
+        for path in ["/b/item", "/c/item", "/d/item"] {
+            let input = l7_input("api.example.test", 8080, "GET", path);
+            assert!(eval_l7(&engine, &input));
+            assert!(eval_token_grant_owners(&engine, &input).is_empty());
+        }
+    }
+
+    #[test]
+    fn l7_token_grant_owners_preserve_proto_identity() {
+        let mut proto = test_proto();
+        proto.network_policies = std::collections::HashMap::from([(
+            "owner".to_owned(),
+            NetworkPolicyRule {
+                name: "owner".to_owned(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.test".to_owned(),
+                    port: 8080,
+                    path: "/a/**".to_owned(),
+                    protocol: "rest".to_owned(),
+                    token_grant_owner: "gateway-stamped-owner".to_owned(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "GET".to_owned(),
+                            path: "/a/**".to_owned(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_owned(),
+                }],
+            },
+        )]);
+        let engine = OpaEngine::from_proto(&proto).expect("load stamped proto endpoint");
+        let input = l7_input("api.example.test", 8080, "GET", "/a/item");
+        assert!(eval_l7(&engine, &input));
+        assert_eq!(
+            eval_token_grant_owners(&engine, &input),
+            ["gateway-stamped-owner"]
+        );
     }
 
     #[test]
@@ -3213,7 +5692,7 @@ process:
                     host: "host.k3d.internal".to_string(),
                     port: 56123,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "GET".to_string(),
@@ -3231,7 +5710,6 @@ process:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3567,12 +6045,12 @@ network_policies:
 "#;
         let data_json: serde_json::Value =
             serde_yml::from_str(data).expect("fixture should parse as YAML");
-        let mut rego = regorus::Engine::new();
+        let mut rego = new_regorus_engine().unwrap();
         rego.add_policy("policy.rego".into(), TEST_POLICY.into())
             .expect("policy should load");
         rego.add_data_json(&data_json.to_string())
             .expect("data should load");
-        let engine = OpaEngine::with_engine(rego);
+        let engine = OpaEngine::with_engine(rego, true);
         let input = l7_websocket_graphql_input(
             "realtime.graphql.com",
             serde_json::json!([{
@@ -3638,6 +6116,91 @@ network_policies:
             !eval_l7(&engine, &graphql_mutation),
             "REST rules on the same host must not allow a GraphQL mutation"
         );
+    }
+
+    #[test]
+    fn endpoint_path_matching_uses_canonical_rust_semantics() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let mut rego = engine.engine.lock().unwrap();
+        for (pattern, path, expected) in [
+            ("", "/p", true),
+            ("**", "/p/a", true),
+            ("/**", "/p/a", true),
+            ("/p", "/p", true),
+            ("/p", "/p/a", false),
+            ("/p/**", "/p", true),
+            ("/p/**", "/p/", true),
+            ("/p/**", "/p/a/b", true),
+            ("/p/**", "/prefix", false),
+            ("/v1/*", "/v1/a", true),
+            ("/v1/*", "/v1/a/b", true),
+            ("/v1/*", "/v1/a.json", true),
+            ("/v1/*", "/v1/a.b/c.d", true),
+            ("/v1/*", "/v2/a", false),
+            ("/v?/items", "/v1/items", true),
+            ("/v[12]/*", "/v2/a/b", true),
+            // A trailing /** treats its prefix literally, including glob syntax.
+            ("/v*/**", "/v1/a", false),
+            ("/v*/**", "/v*/a", true),
+            // Rust glob treats braces literally and invalid patterns as exact paths.
+            ("/a{b,c}", "/ab", false),
+            ("/a{b,c}", "/a{b,c}", true),
+            ("/[", "/[", true),
+            ("/[", "/p", false),
+        ] {
+            assert_eq!(
+                openshell_core::endpoint_path::matches(pattern, path),
+                expected
+            );
+            set_regorus_input(
+                &mut rego,
+                serde_json::json!({
+                    "endpoint": { "path": pattern },
+                    "request": { "path": path },
+                }),
+            )
+            .unwrap();
+            let result = rego
+                .eval_query(
+                    "data.openshell.sandbox.endpoint_path_matches_request(input.endpoint, input.request)".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                !result.result.is_empty(),
+                expected,
+                "endpoint selector {pattern:?}, request path {path:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_path_matching_preserves_rule_path_globs() {
+        let engine = OpaEngine::from_strings(TEST_POLICY, "network_policies: {}\n").unwrap();
+        let mut rego = engine.engine.lock().unwrap();
+        for (pattern, path, expected) in [
+            ("/p/**", "/p", false),
+            ("/p/**", "/p/a/b", true),
+            ("/v1/*", "/v1/a", true),
+            ("/v1/*", "/v1/a/b", false),
+        ] {
+            set_regorus_input(
+                &mut rego,
+                serde_json::json!({ "pattern": pattern, "path": path }),
+            )
+            .unwrap();
+            let result = rego
+                .eval_query(
+                    "data.openshell.sandbox.path_matches(input.path, input.pattern)".into(),
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                !result.result.is_empty(),
+                expected,
+                "rule pattern {pattern:?}, request path {path:?}",
+            );
+        }
     }
 
     #[test]
@@ -3752,7 +6315,7 @@ network_policies:
                     host: "api.proto.com".to_string(),
                     port: 8080,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "GET".to_string(),
@@ -3769,7 +6332,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3824,7 +6386,7 @@ network_policies:
                     port: 8000,
                     path: "/rpc".to_string(),
                     protocol: "json-rpc".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "initialize".to_string(),
@@ -3841,7 +6403,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -3897,7 +6458,11 @@ network_policies:
                     port: 8000,
                     path: "/mcp".to_string(),
                     protocol: "mcp".to_string(),
-                    enforcement: "enforce".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    mcp: Some(McpOptions {
+                        versions: vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()],
+                        ..Default::default()
+                    }),
                     rules: vec![L7Rule {
                         allow: Some(L7Allow {
                             method: "tools/call".to_string(),
@@ -3914,7 +6479,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4516,10 +7080,34 @@ network_policies:
             "tools/call",
             serde_json::json!({"name": "blocked_action"}),
         );
-        assert!(!eval_l7(&engine, &blocked));
+        assert_l7_denial(
+            &engine,
+            &blocked,
+            true,
+            "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors",
+        );
+
+        let unmatched_tool = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "private_tool_name", "arguments.secret": "private-value"}),
+        );
+        assert_l7_denial(
+            &engine,
+            &unmatched_tool,
+            false,
+            "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors",
+        );
 
         let list_tools = l7_jsonrpc_input("mcp.params.test", 8000, "/mcp", "tools/list");
-        assert!(!eval_l7(&engine, &list_tools));
+        assert_l7_denial(
+            &engine,
+            &list_tools,
+            false,
+            "MCP core method is not permitted by policy; ask the policy owner to review rules for this method in the selected MCP revision",
+        );
     }
 
     #[test]
@@ -4555,6 +7143,185 @@ network_policies:
 
         let list_tools = l7_jsonrpc_input("mcp.default.test", 8000, "/mcp", "tools/list");
         assert!(eval_l7(&engine, &list_tools));
+
+        let mut extension = l7_jsonrpc_input(
+            "mcp.default.test",
+            8000,
+            "/mcp",
+            "vendor/private_method_name",
+        );
+        extension["request"]["jsonrpc"]["mcp_method_classification"] =
+            serde_json::json!("extension");
+        assert_l7_denial(
+            &engine,
+            &extension,
+            false,
+            "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions",
+        );
+    }
+
+    #[test]
+    fn l7_mcp_extension_requires_an_exact_method_literal() {
+        let data = r#"
+network_policies:
+  exact_extension:
+    name: exact_extension
+    endpoints:
+      - host: mcp.extension-exact.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/vendor
+    binaries:
+      - { path: /usr/bin/curl }
+  wildcard_extension:
+    name: wildcard_extension
+    endpoints:
+      - host: mcp.extension-wildcard.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/*
+    binaries:
+      - { path: /usr/bin/curl }
+  denied_extension:
+    name: denied_extension
+    endpoints:
+      - host: mcp.extension-denied.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: tools/vendor
+        deny_rules:
+          - method: tools/*
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        let mut exact = l7_jsonrpc_input("mcp.extension-exact.test", 8000, "/mcp", "tools/vendor");
+        exact["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
+        assert!(eval_l7(&engine, &exact));
+
+        exact["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("unavailable");
+        assert!(
+            !eval_l7(&engine, &exact),
+            "known methods unavailable in the selected profile must fail closed"
+        );
+
+        let mut wildcard =
+            l7_jsonrpc_input("mcp.extension-wildcard.test", 8000, "/mcp", "tools/vendor");
+        wildcard["request"]["jsonrpc"]["mcp_method_classification"] =
+            serde_json::json!("extension");
+        assert_l7_denial(
+            &engine,
+            &wildcard,
+            false,
+            "MCP extension method has no matching exact allow rule; ask the policy owner to review rules with an exact method name and any parameter restrictions; allow_all_known_mcp_methods does not allow extensions",
+        );
+
+        let mut denied =
+            l7_jsonrpc_input("mcp.extension-denied.test", 8000, "/mcp", "tools/vendor");
+        denied["request"]["jsonrpc"]["mcp_method_classification"] = serde_json::json!("extension");
+        assert_l7_denial(
+            &engine,
+            &denied,
+            true,
+            "MCP request blocked by a deny rule; ask the policy owner to review deny_rules and tool selectors",
+        );
+    }
+
+    #[test]
+    fn l7_mcp_denial_reason_matches_request_path_and_protocol() {
+        let data = r#"
+network_policies:
+  mixed:
+    name: mixed
+    endpoints:
+      - host: mcp.reasons.test
+        port: 8000
+        path: /rpc
+        protocol: json-rpc
+        enforcement: enforce
+        rules: [{allow: {method: reports.list}}]
+      - host: mcp.reasons.test
+        port: 8000
+        path: /rest
+        protocol: rest
+        enforcement: enforce
+        rules: [{allow: {method: GET, path: /rest}}]
+      - host: mcp.reasons.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          allow_all_known_mcp_methods: true
+        rules: [{allow: {tool: read_status}}]
+    binaries:
+      - {path: /usr/bin/curl}
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        // Select the explanation by the current request path, not the first
+        // configured endpoint for this host and port.
+        let unmatched_tool = l7_jsonrpc_input_with_params(
+            "mcp.reasons.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "other_tool"}),
+        );
+        assert_l7_denial(
+            &engine,
+            &unmatched_tool,
+            false,
+            "MCP tool call has no matching allow rule; ask the policy owner to review rules and tool selectors",
+        );
+        for path in ["/rest", "/rpc", "/other"] {
+            assert_l7_denial(
+                &engine,
+                &l7_jsonrpc_input("mcp.reasons.test", 8000, path, "tools/call"),
+                false,
+                &format!("POST {path} not permitted by policy"),
+            );
+        }
+
+        // Batch envelopes have no selected call until the relay evaluates
+        // each member. Protocol failures also remain outside policy hints.
+        for field in ["method", "error", "mcp_method_classification"] {
+            let mut input = unmatched_tool.clone();
+            input["request"]["jsonrpc"][field] = match field {
+                "method" => serde_json::Value::Null,
+                "error" => serde_json::json!("invalid MCP request"),
+                _ => serde_json::json!("unavailable"),
+            };
+            assert_l7_denial(&engine, &input, false, "POST /mcp not permitted by policy");
+        }
+
+        assert_l7_denial(
+            &engine,
+            &l7_jsonrpc_response_input("mcp.reasons.test", 8000, "/rpc"),
+            true,
+            "JSON-RPC response frames are not permitted from client to server",
+        );
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_response_input("mcp.reasons.test", 8000, "/mcp")
+        ));
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.reasons.test", 8000, "/mcp", "tools/list")
+        ));
     }
 
     #[test]
@@ -4659,10 +7426,23 @@ network_policies:
             panic!("JSON-RPC params matchers should fail validation");
         };
 
+        let message = err.to_string();
         assert!(
-            err.to_string().contains("do not support params"),
-            "unexpected validation error: {err}"
+            message.contains("invalid L7 policy configuration"),
+            "unexpected validation error: {message}"
         );
+        for authored in [
+            "invalid_jsonrpc_params",
+            "jsonrpc.invalid.test",
+            "/rpc",
+            "reports.search",
+            "quarterly",
+        ] {
+            assert!(
+                !message.contains(authored),
+                "diagnostic leaked {authored}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -4691,9 +7471,21 @@ network_policies:
 
         let message = err.to_string();
         assert!(
-            message.contains("json_rpc") && message.contains("on_parse_error"),
-            "unexpected validation error: {err}"
+            message.contains("invalid L7 protocol configuration"),
+            "unexpected validation error: {message}"
         );
+        for authored in [
+            "invalid_jsonrpc_config",
+            "jsonrpc.invalid-config.test",
+            "/rpc",
+            "json_rpc",
+            "on_parse_error",
+        ] {
+            assert!(
+                !message.contains(authored),
+                "diagnostic leaked {authored}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -4722,9 +7514,21 @@ network_policies:
 
         let message = err.to_string();
         assert!(
-            message.contains("mcp") && message.contains("large"),
-            "unexpected validation error: {err}"
+            message.contains("invalid L7 protocol configuration"),
+            "unexpected validation error: {message}"
         );
+        for authored in [
+            "invalid_mcp_config",
+            "mcp.invalid-config.test",
+            "/mcp",
+            "max_body_bytes",
+            "large",
+        ] {
+            assert!(
+                !message.contains(authored),
+                "diagnostic leaked {authored}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -4824,6 +7628,7 @@ network_policies:
         protocol: mcp
         enforcement: enforce
         mcp:
+          versions: ["2025-11-25", "2025-03-26"]
           strict_tool_names: false
         rules:
           - allow:
@@ -4847,6 +7652,557 @@ network_policies:
         let l7 = crate::l7::parse_l7_config(&config).expect("parse l7 config");
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Mcp);
         assert!(!l7.mcp_strict_tool_names);
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ]
+        );
+    }
+
+    const PROTOCOL_NAME_CASES: [(&str, &str); 7] = [
+        ("tcp", "TcP"),
+        ("rest", "ReSt"),
+        ("websocket", "WeBsOcKeT"),
+        ("graphql", "GrApHqL"),
+        ("sql", "SqL"),
+        ("json-rpc", "JsOn-RpC"),
+        ("mcp", "McP"),
+    ];
+
+    fn assert_loaded_protocol_name(engine: &OpaEngine, authored: &str, canonical: &str) {
+        // Inspect stored data before typed parsing, which accepts mixed case and
+        // would otherwise hide a missing normalization step in either loader.
+        let data = engine.engine.lock().expect("OPA engine lock").get_data();
+        assert_eq!(
+            data["network_policies"]["protocol_names"]["endpoints"][0]["protocol"],
+            regorus::Value::from(canonical),
+            "stored protocol for {authored}"
+        );
+
+        let input = NetworkInput {
+            host: "protocol.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("endpoint query");
+        if canonical == "tcp" {
+            // TCP remains an L4 endpoint; canonical spelling must not opt it
+            // into request inspection or change its network-level allowance.
+            assert!(config.is_none(), "TCP must not return L7 configuration");
+            assert!(matches!(
+                engine
+                    .evaluate_network_action(&input)
+                    .expect("network query"),
+                NetworkAction::Allow { .. }
+            ));
+        } else {
+            let config = config.expect("L7 endpoint configuration");
+            assert_eq!(
+                config["protocol"],
+                regorus::Value::from(canonical),
+                "published endpoint protocol for {authored}"
+            );
+            crate::l7::parse_l7_config(&config).expect("valid typed L7 configuration");
+        }
+    }
+
+    #[test]
+    fn protocol_names_yaml_load_canonicalizes_all_supported_values() {
+        for (canonical, mixed_case) in PROTOCOL_NAME_CASES {
+            let fields = match canonical {
+                "tcp" => "",
+                "rest" | "websocket" => {
+                    "enforcement: enforce\n        rules: [{allow: {method: GET, path: /status}}]"
+                }
+                "graphql" => {
+                    "enforcement: enforce\n        rules: [{allow: {operation_type: query, fields: [viewer]}}]"
+                }
+                // SQL inspection supports audit mode, not enforce mode.
+                "sql" => "enforcement: audit\n        rules: [{allow: {command: SELECT}}]",
+                "json-rpc" => "enforcement: enforce\n        rules: [{allow: {method: status}}]",
+                "mcp" => "enforcement: enforce\n        rules: [{allow: {method: tools/list}}]",
+                _ => unreachable!("fixture must name a supported protocol"),
+            };
+            for authored in [
+                canonical.to_string(),
+                canonical.to_ascii_uppercase(),
+                mixed_case.into(),
+            ] {
+                let yaml = format!(
+                    r#"
+network_policies:
+  protocol_names:
+    name: protocol_names
+    endpoints:
+      - host: protocol.example.com
+        port: 443
+        protocol: {authored}
+        {fields}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+                );
+                let engine = OpaEngine::from_strings(TEST_POLICY, &yaml)
+                    .unwrap_or_else(|error| panic!("valid YAML protocol {authored}: {error}"));
+                assert_loaded_protocol_name(&engine, &authored, canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_names_proto_load_canonicalizes_all_supported_values() {
+        for (canonical, mixed_case) in PROTOCOL_NAME_CASES {
+            let allow = match canonical {
+                "tcp" => None,
+                "rest" | "websocket" => Some(L7Allow {
+                    method: "GET".into(),
+                    path: "/status".into(),
+                    ..Default::default()
+                }),
+                "graphql" => Some(L7Allow {
+                    operation_type: "query".into(),
+                    fields: vec!["viewer".into()],
+                    ..Default::default()
+                }),
+                "sql" => Some(L7Allow {
+                    command: "SELECT".into(),
+                    ..Default::default()
+                }),
+                "json-rpc" | "mcp" => Some(L7Allow {
+                    method: if canonical == "mcp" {
+                        "tools/list"
+                    } else {
+                        "status"
+                    }
+                    .into(),
+                    ..Default::default()
+                }),
+                _ => unreachable!("fixture must name a supported protocol"),
+            };
+            for authored in [
+                canonical.to_string(),
+                canonical.to_ascii_uppercase(),
+                mixed_case.into(),
+            ] {
+                let mut policy = openshell_policy::restrictive_default_policy();
+                policy.network_policies.insert(
+                    "protocol_names".into(),
+                    NetworkPolicyRule {
+                        name: "protocol_names".into(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "protocol.example.com".into(),
+                            port: 443,
+                            protocol: authored.clone(),
+                            // TCP has no L7 settings; SQL only supports audit.
+                            enforcement: match canonical {
+                                "tcp" => openshell_core::proto::NetworkEnforcementMode::Unspecified,
+                                "sql" => openshell_core::proto::NetworkEnforcementMode::Audit,
+                                _ => openshell_core::proto::NetworkEnforcementMode::Enforce,
+                            } as i32,
+                            rules: allow
+                                .clone()
+                                .map(|allow| L7Rule { allow: Some(allow) })
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        }],
+                        binaries: vec![NetworkBinary {
+                            path: "/usr/bin/curl".into(),
+                        }],
+                    },
+                );
+                let engine = OpaEngine::from_proto(&policy)
+                    .unwrap_or_else(|error| panic!("valid protobuf protocol {authored}: {error}"));
+                assert_loaded_protocol_name(&engine, &authored, canonical);
+            }
+        }
+    }
+
+    #[test]
+    fn protocol_names_normalization_preserves_other_data_and_is_idempotent() {
+        let mut data = serde_json::json!({
+            "network_policies": {
+                "first": {
+                    "endpoints": [
+                        {"protocol": "ReSt", "path": "/KeepCase", "host": "KeepCase.example"},
+                        {"protocol": "FutureProtocol"},
+                        {"protocol": ""},
+                        {"protocol": null},
+                        {"protocol": 42},
+                        {"host": "no-protocol.example"}
+                    ]
+                },
+                "second": {"endpoints": [{"protocol": "JsOn-RpC"}]}
+            }
+        });
+        let mut expected = data.clone();
+        expected["network_policies"]["first"]["endpoints"][0]["protocol"] = "rest".into();
+        expected["network_policies"]["second"]["endpoints"][0]["protocol"] = "json-rpc".into();
+
+        normalize_endpoint_protocols(&mut data);
+        assert_eq!(data, expected, "only recognized protocol names may change");
+        normalize_endpoint_protocols(&mut data);
+        assert_eq!(data, expected, "normalization must be idempotent");
+    }
+
+    #[test]
+    fn yaml_load_accepts_mixed_case_mcp_protocol_with_default_versions() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        let config_json: serde_json::Value = serde_json::from_str(
+            &config
+                .to_json_str()
+                .expect("endpoint config must serialize as JSON"),
+        )
+        .expect("endpoint config must be valid JSON");
+        assert_eq!(
+            config_json["protocol"],
+            serde_json::json!("mcp"),
+            "OPA data must use the canonical protocol key"
+        );
+        assert_eq!(l7.mcp_versions, vec![DEFAULT_MCP_PROTOCOL_VERSION]);
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/list")
+        ));
+        assert!(!eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/call")
+        ));
+    }
+
+    #[test]
+    fn yaml_load_rejects_rest_shaped_rules_on_mixed_case_mcp_protocol() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: MCP
+        rules:
+          - allow:
+              method: POST
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("mixed-case MCP must not bypass MCP rule validation");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid L7 policy configuration"),
+            "{message}"
+        );
+        for authored in ["mcp.example.com", "POST", "**"] {
+            assert!(
+                !message.contains(authored),
+                "diagnostic leaked {authored}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_invalid_flat_mcp_versions_before_activation() {
+        for (case, versions) in [
+            ("empty", "[]"),
+            ("non-string", "[1]"),
+            ("unsupported", "[\"2026-01-01\"]"),
+            ("duplicate", "[\"2025-11-25\", \"2025-11-25\"]"),
+            ("non-canonical", "[\"2025-11-25\", \"2025-03-26\"]"),
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: {versions}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("invalid MCP runtime metadata must reject activation: {case}");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid L7 policy configuration"),
+                "{case}: {message}"
+            );
+            assert!(!message.contains("2026-01-01"), "{case}: {message}");
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_nested_and_flat_mcp_version_collision() {
+        let data = r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp_versions: ["2025-03-26"]
+        mcp:
+          versions: ["2025-11-25"]
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+
+        let Err(error) = OpaEngine::from_strings(TEST_POLICY, data) else {
+            panic!("ambiguous MCP revision sources must reject activation");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("invalid L7 protocol configuration"),
+            "{message}"
+        );
+        for authored in ["mcp_versions", "2025-03-26", "2025-11-25"] {
+            assert!(
+                !message.contains(authored),
+                "diagnostic leaked {authored}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_null_mcp_config_before_defaulting() {
+        for mcp_fields in [
+            "mcp: null",
+            "mcp: null\n        mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        {mcp_fields}
+        rules:
+          - allow:
+              method: tools/list
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("null MCP config must reject activation");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid L7 protocol configuration"),
+                "{message}"
+            );
+            assert!(!message.contains("2025-11-25"), "{message}");
+        }
+    }
+
+    #[test]
+    fn yaml_load_rejects_mcp_versions_on_non_mcp_protocols() {
+        for mcp_fields in [
+            "mcp:\n          versions: [\"2025-11-25\"]",
+            "mcp_versions: [\"2025-11-25\"]",
+        ] {
+            let data = format!(
+                r#"
+network_policies:
+  json_rpc:
+    name: json_rpc
+    endpoints:
+      - host: rpc.example.com
+        port: 443
+        protocol: json-rpc
+        {mcp_fields}
+        rules:
+          - allow:
+              method: ping
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+
+            let Err(error) = OpaEngine::from_strings(TEST_POLICY, &data) else {
+                panic!("MCP revision policy must not apply to generic JSON-RPC");
+            };
+            let message = error.to_string();
+            assert!(
+                message.contains("invalid L7 policy configuration"),
+                "{message}"
+            );
+            for authored in ["rpc.example.com", "ping", "2025-11-25"] {
+                assert!(
+                    !message.contains(authored),
+                    "diagnostic leaked {authored}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l7_endpoint_config_derives_endpoint_id_from_proto() {
+        let mut policy = defaultable_mcp_proto(None);
+        let endpoint = policy
+            .network_policies
+            .get_mut("mcp")
+            .and_then(|rule| rule.endpoints.first_mut())
+            .expect("MCP test endpoint");
+        endpoint.path = "/mcp".to_string();
+        let expected = openshell_core::endpoint_status::endpoint_id(endpoint);
+        policy
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP test rule")
+            .binaries = vec![NetworkBinary {
+            path: "/usr/bin/curl".to_string(),
+        }];
+        let canonical = openshell_policy::validate_and_canonicalize_sandbox_policy(policy.clone())
+            .expect("canonical MCP test policy");
+        let expected_hash = deterministic_policy_hash(&canonical);
+        let engine = OpaEngine::from_proto(&policy).expect("engine from proto");
+        let config = engine
+            .query_endpoint_config(&NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: String::new(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            })
+            .expect("query endpoint config")
+            .expect("MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse MCP config");
+        assert_eq!(
+            l7.endpoint_id, expected,
+            "OPA must carry the ID derived from the exact proto endpoint"
+        );
+        assert_eq!(l7.policy_hash, expected_hash);
+    }
+
+    #[tokio::test]
+    async fn mixed_case_mcp_policy_keeps_endpoint_observation_identity() {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointResult, endpoint_id,
+            endpoint_status_channel,
+        };
+        use openshell_core::policy_identity::deterministic_policy_hash;
+
+        for protocol in ["Mcp", "MCP"] {
+            let mut policy = defaultable_mcp_proto(None);
+            let rule = policy
+                .network_policies
+                .get_mut("mcp")
+                .expect("MCP test rule");
+            rule.endpoints[0].protocol = protocol.to_string();
+            rule.binaries = vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+            }];
+            let policy = openshell_policy::validate_and_canonicalize_sandbox_policy(policy)
+                .expect("mixed-case MCP policy is valid");
+            let expected_id = endpoint_id(&policy.network_policies["mcp"].endpoints[0]);
+            let (sender, mut receiver) = endpoint_status_channel();
+            let mut tracker = receiver.tracker();
+            sender
+                .reset(
+                    EndpointConfigVersion {
+                        policy_hash: deterministic_policy_hash(&policy),
+                        provider_env_revision: 1,
+                    },
+                    vec![EndpointInventoryEntry {
+                        endpoint_id: expected_id.clone(),
+                        uses_provider_credentials: false,
+                    }],
+                )
+                .await
+                .expect("install mixed-case MCP inventory");
+            assert!(tracker.apply(receiver.recv().await.expect("inventory reset")));
+            let engine = OpaEngine::from_proto(&policy).expect("engine from mixed-case MCP proto");
+            let selected = engine
+                .query_endpoint_config(&NetworkInput {
+                    host: "mcp.example.com".into(),
+                    port: 443,
+                    binary_path: PathBuf::from("/usr/bin/curl"),
+                    binary_sha256: String::new(),
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                })
+                .expect("query mixed-case MCP endpoint")
+                .expect("mixed-case MCP endpoint config");
+            let selected =
+                crate::l7::parse_l7_config(&selected).expect("parse selected MCP config");
+            assert_eq!(selected.protocol, crate::l7::L7Protocol::Mcp);
+            assert_eq!(
+                selected.endpoint_id, expected_id,
+                "{protocol} must retain inventory identity"
+            );
+            let observer = crate::l7::EndpointObserver::begin(Some(&sender), &selected)
+                .expect("mixed-case MCP endpoint begins an observation");
+            observer.observe(EndpointResult::HttpResponseReceived);
+            while let Ok(command) = receiver.try_recv() {
+                tracker.apply(command);
+            }
+            let snapshot = tracker
+                .snapshot()
+                .expect("mixed-case MCP inventory remains installed");
+            assert_eq!(snapshot.endpoints.len(), 1);
+            assert_eq!(snapshot.endpoints[0].endpoint_id, expected_id);
+            assert_eq!(
+                snapshot.endpoints[0].result,
+                EndpointResult::HttpResponseReceived
+            );
+        }
     }
 
     #[test]
@@ -4860,14 +8216,13 @@ network_policies:
                     host: "registry.npmjs.org".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-only".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
                     allow_encoded_slash: true,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4918,14 +8273,13 @@ network_policies:
                     host: "gateway.example.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "full".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     websocket_credential_rewrite: true,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -4976,15 +8330,14 @@ network_policies:
                     host: "bedrock-runtime.us-east-2.amazonaws.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-write".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
                     credential_signing: "sigv4".to_string(),
                     signing_service: "bedrock".to_string(),
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/claude".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5036,8 +8389,8 @@ network_policies:
                     host: "custom-vpc-endpoint.example.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "full".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::Full as i32,
                     credential_signing: "sigv4".to_string(),
                     signing_service: "s3".to_string(),
                     signing_region: "us-west-2".to_string(),
@@ -5045,7 +8398,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/local/bin/aws".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5098,14 +8450,13 @@ network_policies:
                     host: "slack.com".to_string(),
                     port: 443,
                     protocol: "rest".to_string(),
-                    enforcement: "enforce".to_string(),
-                    access: "read-write".to_string(),
+                    enforcement: openshell_core::proto::NetworkEnforcementMode::Enforce as i32,
+                    access: openshell_core::proto::NetworkAccessPreset::ReadWrite as i32,
                     request_body_credential_rewrite: true,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/node".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5222,7 +8573,7 @@ network_policies:
     }
 
     #[test]
-    fn proto_load_rejects_ambiguous_endpoint_metadata_with_rationale() {
+    fn proto_load_redacts_ambiguous_endpoint_metadata() {
         let mut policy = ProtoSandboxPolicy::default();
         policy.network_policies.insert(
             "wildcard".to_string(),
@@ -5231,12 +8582,11 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "*.example.com".to_string(),
                     port: 443,
-                    tls: "skip".to_string(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5251,7 +8601,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/bash".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -5261,9 +8610,215 @@ network_policies:
         };
         let message = error.to_string();
         assert!(message.contains("ambiguity validation failed"));
-        assert!(message.contains("wildcard"));
-        assert!(message.contains("exact"));
-        assert!(message.contains("tls"));
+        assert!(message.contains("ambiguous network endpoint selectors"));
+        assert_safe_load_error(
+            &error,
+            &[
+                "wildcard",
+                "exact",
+                "*.example.com",
+                "api.example.com",
+                "/usr/bin/curl",
+                "/usr/bin/bash",
+            ],
+        );
+    }
+
+    #[test]
+    fn proto_load_accepts_defaultable_mcp_versions_with_mixed_case_protocol() {
+        let mut implicit_defaults = defaultable_mcp_proto(None);
+        implicit_defaults
+            .network_policies
+            .get_mut("mcp")
+            .expect("defaultable MCP fixture contains the MCP policy")
+            .endpoints[0]
+            .protocol = "Mcp".to_string();
+        let explicit_defaults = defaultable_mcp_proto(Some(McpOptions::default()));
+
+        for policy in [implicit_defaults, explicit_defaults] {
+            let engine = OpaEngine::from_proto(&policy)
+                .expect("supervisor ingress must materialize the pinned MCP revision");
+            let input = NetworkInput {
+                host: "mcp.example.com".into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let config = engine
+                .query_endpoint_config(&input)
+                .expect("query endpoint config")
+                .expect("expected MCP endpoint config");
+            let config_json: serde_json::Value = serde_json::from_str(
+                &config
+                    .to_json_str()
+                    .expect("endpoint config must serialize as JSON"),
+            )
+            .expect("endpoint config must be valid JSON");
+            assert_eq!(config_json["protocol"], serde_json::json!("mcp"));
+            let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+            assert_eq!(
+                l7.mcp_versions,
+                vec![DEFAULT_MCP_PROTOCOL_VERSION],
+                "protobuf ingress must preserve the materialized default through OPA"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_load_projects_canonical_mcp_versions_to_l7_config() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["2025-11-25".to_string(), "2025-03-26".to_string()],
+            ..Default::default()
+        }));
+        let engine = OpaEngine::from_proto(&policy).expect("valid MCP policy");
+        let input = NetworkInput {
+            host: "mcp.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query endpoint config")
+            .expect("expected MCP endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
+
+        assert_eq!(
+            l7.mcp_versions,
+            vec![
+                openshell_core::mcp::McpProtocolVersion::V2025_03_26,
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+            ],
+            "protobuf ingress must preserve the canonical allowlist through OPA"
+        );
+    }
+
+    #[test]
+    fn proto_load_bounds_validation_error_without_policy_values() {
+        let endpoints = (0..16)
+            .map(|index| NetworkEndpoint {
+                host: format!("private-{index}.sensitive.example.test"),
+                port: 443,
+                protocol: "mcp".to_string(),
+                mcp: Some(McpOptions {
+                    versions: vec![format!("private-version-{index}")],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            network_policies: std::collections::HashMap::from([(
+                "private-policy-name".to_string(),
+                NetworkPolicyRule {
+                    name: "private-rule-name".to_string(),
+                    endpoints,
+                    binaries: vec![NetworkBinary {
+                        path: "/private/sensitive/binary".to_string(),
+                    }],
+                },
+            )]),
+            ..Default::default()
+        };
+
+        let error = OpaEngine::from_proto(&policy)
+            .err()
+            .expect("invalid MCP revisions must reject protobuf activation")
+            .to_string();
+
+        assert!(
+            error.len() <= POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES,
+            "validation error exceeded byte bound: {error}"
+        );
+        let rendered_categories = error.matches("invalid L7 endpoint configuration").count()
+            + error.matches("unsupported MCP protocol version").count();
+        assert_eq!(
+            rendered_categories, POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS,
+            "validation error must stop at the item bound: {error}"
+        );
+        assert!(
+            error.contains("additional violations omitted"),
+            "validation error must mark omitted categories: {error}"
+        );
+        for authored in [
+            "private-policy-name",
+            "private-rule-name",
+            "private-0.sensitive.example.test",
+            "private-15.sensitive.example.test",
+            "private-version-0",
+            "private-version-15",
+            "/private/sensitive/binary",
+        ] {
+            assert!(
+                !error.contains(authored),
+                "validation error echoed authored value {authored}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_reload_reuses_redacted_validation_and_preserves_last_known_good() {
+        let valid = defaultable_mcp_proto(None);
+        let engine = OpaEngine::from_proto(&valid).expect("initial policy must load");
+        let generation = engine.current_generation();
+        let mut invalid = valid;
+        invalid
+            .network_policies
+            .get_mut("mcp")
+            .expect("MCP policy")
+            .endpoints[0]
+            .mcp = Some(McpOptions {
+            versions: vec!["private-authored-version".to_string()],
+            ..Default::default()
+        });
+
+        let error = engine
+            .reload_from_proto(&invalid)
+            .expect_err("invalid reload must fail closed")
+            .to_string();
+
+        assert!(
+            error.contains("unsupported MCP protocol version"),
+            "{error}"
+        );
+        assert!(!error.contains("private-authored-version"), "{error}");
+        assert!(error.len() <= POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES);
+        assert_eq!(engine.current_generation(), generation);
+        assert!(eval_l7(
+            &engine,
+            &l7_jsonrpc_input("mcp.example.com", 443, "/", "tools/list")
+        ));
+    }
+
+    #[test]
+    fn proto_load_rejects_unsupported_mcp_versions() {
+        let policy = defaultable_mcp_proto(Some(McpOptions {
+            versions: vec!["latest".to_string()],
+            ..Default::default()
+        }));
+
+        let Err(error) = OpaEngine::from_proto(&policy) else {
+            panic!("canonicalization must not repair an unsupported MCP revision");
+        };
+        let error = error.to_string();
+        assert!(error.contains("policy validation failed"), "{error}");
+        assert!(
+            error.contains("unsupported MCP protocol version"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("latest"),
+            "validation diagnostics must not echo authored protocol values: {error}"
+        );
+        assert!(
+            error.len() <= POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES,
+            "validation diagnostics must be byte-bounded: {error}"
+        );
     }
 
     #[tokio::test]
@@ -5730,7 +9285,7 @@ process:
     // network_action tests
     // ========================================================================
 
-    const INFERENCE_TEST_DATA: &str = r#"
+    const PROVIDER_ENDPOINT_TEST_DATA: &str = r#"
 network_policies:
   claude_code:
     name: claude_code
@@ -5755,7 +9310,7 @@ process:
   run_as_group: sandbox
 "#;
 
-    const NO_INFERENCE_TEST_DATA: &str = r#"
+    const OTHER_ENDPOINT_TEST_DATA: &str = r#"
 network_policies:
   gitlab:
     name: gitlab
@@ -5774,19 +9329,19 @@ process:
   run_as_group: sandbox
 "#;
 
-    fn inference_engine() -> OpaEngine {
-        OpaEngine::from_strings(TEST_POLICY, INFERENCE_TEST_DATA)
-            .expect("Failed to load inference test data")
+    fn provider_endpoint_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, PROVIDER_ENDPOINT_TEST_DATA)
+            .expect("Failed to load provider endpoint test data")
     }
 
-    fn no_inference_engine() -> OpaEngine {
-        OpaEngine::from_strings(TEST_POLICY, NO_INFERENCE_TEST_DATA)
-            .expect("Failed to load no-inference test data")
+    fn other_endpoint_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, OTHER_ENDPOINT_TEST_DATA)
+            .expect("Failed to load alternate endpoint test data")
     }
 
     #[test]
     fn explicitly_allowed_endpoint_binary_returns_allow() {
-        let engine = inference_engine();
+        let engine = provider_endpoint_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
@@ -5808,7 +9363,7 @@ process:
     fn relaxed_binary_identity_allows_declared_endpoint_without_binary_match() {
         let engine = OpaEngine::from_strings_with_binary_identity_required(
             TEST_POLICY,
-            INFERENCE_TEST_DATA,
+            PROVIDER_ENDPOINT_TEST_DATA,
             false,
         )
         .expect("Failed to load relaxed binary identity test data");
@@ -5846,7 +9401,7 @@ process:
 
     #[test]
     fn unknown_endpoint_returns_deny() {
-        let engine = inference_engine();
+        let engine = provider_endpoint_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
             port: 443,
@@ -5863,8 +9418,8 @@ process:
     }
 
     #[test]
-    fn unknown_endpoint_without_inference_returns_deny() {
-        let engine = no_inference_engine();
+    fn unknown_endpoint_with_other_policy_returns_deny() {
+        let engine = other_endpoint_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
             port: 443,
@@ -5884,7 +9439,7 @@ process:
     fn endpoint_in_policy_binary_not_allowed_returns_deny() {
         // api.anthropic.com is declared but python3 is not in the binary list.
         // With binary allow/deny, this is denied.
-        let engine = inference_engine();
+        let engine = provider_endpoint_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
@@ -5901,8 +9456,8 @@ process:
     }
 
     #[test]
-    fn endpoint_in_policy_binary_not_allowed_without_inference_returns_deny() {
-        let engine = no_inference_engine();
+    fn endpoint_in_policy_binary_not_allowed_with_other_policy_returns_deny() {
+        let engine = other_endpoint_engine();
         let input = NetworkInput {
             host: "gitlab.com".into(),
             port: 443,
@@ -6261,8 +9816,12 @@ network_policies:
             .err()
             .expect("explicit TCP must reject credential binding during activation");
 
-        assert!(error.to_string().contains("credential_binding"));
-        assert!(error.to_string().contains("protocol tcp"));
+        assert!(
+            error
+                .to_string()
+                .contains("invalid L7 policy configuration")
+        );
+        assert!(error.to_string().contains("L7 policy validation failed"));
     }
 
     #[test]
@@ -6394,64 +9953,6 @@ network_policies:
     }
 
     #[test]
-    fn exact_declared_endpoint_host_false_for_advisor_proposed_binary() {
-        let mut network_policies = std::collections::HashMap::new();
-        let mut proposal_binary = NetworkBinary {
-            path: "/usr/bin/curl".to_string(),
-            ..Default::default()
-        };
-        #[allow(deprecated)]
-        {
-            proposal_binary.harness = true;
-        }
-        network_policies.insert(
-            "allow_mcp_internal_corp_example_com_8443".to_string(),
-            NetworkPolicyRule {
-                name: "allow_mcp_internal_corp_example_com_8443".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "mcp-internal.corp.example.com".to_string(),
-                    port: 8443,
-                    ..Default::default()
-                }],
-                binaries: vec![proposal_binary],
-            },
-        );
-        let proto = ProtoSandboxPolicy {
-            version: 1,
-            filesystem: Some(ProtoFs {
-                include_workdir: true,
-                read_only: vec![],
-                read_write: vec![],
-            }),
-            landlock: Some(openshell_core::proto::LandlockPolicy {
-                compatibility: "best_effort".to_string(),
-            }),
-            process: Some(ProtoProc {
-                run_as_user: "sandbox".to_string(),
-                run_as_group: "sandbox".to_string(),
-            }),
-            network_policies,
-            network_middlewares: std::collections::HashMap::default(),
-        };
-        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
-        let input = NetworkInput {
-            host: "mcp-internal.corp.example.com".into(),
-            port: 8443,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-
-        let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "advisor proposal should still allow at OPA L4"
-        );
-        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
-    }
-
-    #[test]
     fn exact_declared_endpoint_host_false_for_advisor_proposed_endpoint() {
         let mut network_policies = std::collections::HashMap::new();
         network_policies.insert(
@@ -6467,7 +9968,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -6538,7 +10038,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -6769,7 +10268,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7147,7 +10645,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -7190,7 +10687,6 @@ network_policies:
         port: 8080
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -7238,7 +10734,6 @@ network_policies:
         ports: [8080, 9090]
         protocol: rest
         enforcement: enforce
-        tls: terminate
         rules:
           - allow:
               method: GET
@@ -7746,7 +11241,6 @@ network_policies:
                     .iter()
                     .map(|p| NetworkBinary {
                         path: p.to_str().unwrap().to_string(),
-                        ..Default::default()
                     })
                     .collect(),
             },
@@ -7806,7 +11300,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7880,7 +11373,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -7999,7 +11491,7 @@ network_policies:
         old_sessions
             .pop()
             .expect("old-generation session")
-            .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+            .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
             .await;
         let admitted = current_runner
             .preflight_websocket(
@@ -8087,7 +11579,6 @@ network_policies:
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/python3".to_string(),
-                    ..Default::default()
                 }],
             },
         );
@@ -8122,6 +11613,44 @@ network_policies:
         assert!(described[0].is_resolved());
     }
 
+    #[test]
+    fn rejected_configuration_never_commits_credentials() {
+        let mut proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        proto.network_middlewares.insert(
+            String::new(),
+            NetworkMiddlewareConfig {
+                middleware: openshell_supervisor_middleware_builtins::BUILTIN_REGEX.into(),
+                ..Default::default()
+            },
+        );
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                panic!("invalid candidate must not publish credentials");
+            })
+            .expect_err("invalid candidate");
+        assert_eq!(engine.current_generation(), 0);
+    }
+
+    #[test]
+    fn configuration_commit_invalidates_old_guards_before_credentials_change() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        let old = engine.clone_engine_for_tunnel(0).unwrap();
+        engine.enter_fail_closed("invalid candidate").unwrap();
+        let mut committed = false;
+        engine
+            .reload_configuration_from_proto_with_pid(&proto, 0, None, || {
+                assert!(old.generation_guard().is_stale());
+                assert_eq!(engine.current_generation(), 2);
+                committed = true;
+            })
+            .unwrap();
+        assert!(committed);
+        assert!(engine.fail_closed_reason().is_none());
+        assert!(engine.clone_engine_for_tunnel(2).is_ok());
+    }
+
     #[tokio::test]
     async fn failed_combined_reload_preserves_policy_registry_and_generation() {
         let proto = test_proto();
@@ -8148,9 +11677,18 @@ network_policies:
             .await
             .expect("empty registry");
 
-        engine
+        let error = engine
             .reload_policy_and_middleware_from_proto_with_pid(&invalid, 0, empty_registry)
             .expect_err("invalid policy must reject the combined reload");
+        assert_safe_load_error(
+            &error,
+            &[openshell_supervisor_middleware_builtins::BUILTIN_REGEX],
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("invalid middleware configuration")
+        );
 
         assert_eq!(engine.current_generation(), 1);
         let claude_input = NetworkInput {
@@ -8378,10 +11916,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -8426,6 +11961,94 @@ network_policies:
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn exact_deny_symlink_expands_but_glob_deny_does_not() {
+        use std::os::unix::fs::symlink;
+
+        if !procfs_root_accessible() {
+            eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
+            return;
+        }
+
+        let link_dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("python3");
+        let link = link_dir.path().join("python");
+        std::fs::write(&target, b"python binary").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let target_path = target.to_string_lossy();
+        let exact_link = link.to_string_lossy();
+        let candidate_glob = format!("{}/*", link_dir.path().to_string_lossy());
+        let policy = |deny_binary: &str| {
+            format!(
+                r#"
+version: 1
+network_policies:
+  grant:
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules: [{{ allow: {{ method: GET, path: "/**" }} }}]
+    binaries: [{{ path: "{target_path}" }}]
+  deny:
+    endpoints:
+      - host: example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules: [{{ allow: {{ method: GET, path: "/**" }} }}]
+        deny_rules: [{{ method: "*", path: "/**" }}]
+    binaries: [{{ path: "{deny_binary}" }}]
+filesystem_policy:
+  include_workdir: false
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#
+            )
+        };
+
+        let maximum = openshell_policy::parse_sandbox_policy(&policy(&exact_link))
+            .expect("maximum policy should parse");
+        let candidate = openshell_policy::parse_sandbox_policy(&policy(&candidate_glob))
+            .expect("candidate policy should parse");
+        let pid = std::process::id();
+        let maximum_engine =
+            OpaEngine::from_proto_with_pid(&maximum, pid).expect("maximum engine should load");
+        let candidate_engine =
+            OpaEngine::from_proto_with_pid(&candidate, pid).expect("candidate engine should load");
+        let input = serde_json::json!({
+            "network": { "host": "example.com", "port": 443 },
+            "exec": {
+                "path": target_path,
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "GET",
+                "path": "/",
+                "query_params": {}
+            }
+        });
+
+        assert!(
+            eval_l7(&candidate_engine, &input),
+            "the candidate glob must not be resolved through the exact symlink"
+        );
+        assert!(
+            !eval_l7(&maximum_engine, &input),
+            "the maximum exact deny must expand to the resolved target"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn reload_from_proto_with_pid_resolves_symlinks() {
         use std::os::unix::fs::symlink;
 
@@ -8456,10 +12079,7 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: link_path,
-                    ..Default::default()
-                }],
+                binaries: vec![NetworkBinary { path: link_path }],
             },
         );
         let proto = ProtoSandboxPolicy {
@@ -8743,7 +12363,7 @@ network_middlewares:
     endpoints:
       include: ["api.example.com"]
 "#,
-                "invalid on_error",
+                "invalid middleware configuration",
             ),
             (
                 "duplicate order",
@@ -8760,7 +12380,7 @@ network_middlewares:
     endpoints:
       include: ["other.example.com"]
 "#,
-                "duplicate order 10",
+                "duplicate middleware order",
             ),
             (
                 "missing selector",
@@ -8769,7 +12389,7 @@ network_middlewares:
   redactor:
     middleware: openshell/regex
 "#,
-                "endpoint selector is required",
+                "invalid middleware configuration",
             ),
             (
                 "malformed selector",
@@ -8780,7 +12400,7 @@ network_middlewares:
     endpoints:
       include: ["api[.example.com"]
 "#,
-                "invalid host pattern",
+                "invalid middleware configuration",
             ),
             (
                 "tls skip selector",
@@ -8799,7 +12419,7 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 "#,
-                "tls: skip",
+                "middleware conflicts with TLS inspection",
             ),
             (
                 "tls skip wildcard overlap",
@@ -8818,7 +12438,7 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 "#,
-                "tls: skip",
+                "middleware conflicts with TLS inspection",
             ),
         ];
 
@@ -8850,7 +12470,7 @@ network_middlewares:
     endpoints:
       include: ["api.example.com"]
 "#,
-                "not a registered OpenShell built-in",
+                "invalid middleware configuration",
             ),
             (
                 "invalid regex config",
@@ -8863,7 +12483,7 @@ network_middlewares:
     endpoints:
       include: ["api.example.com"]
 "#,
-                "supports only mode: redact",
+                "invalid middleware configuration",
             ),
         ] {
             let error =
@@ -8898,7 +12518,10 @@ network_middlewares:
             .expect("supervisor must reject invalid effective middleware policy")
             .to_string();
         assert!(error.contains("policy validation failed"), "{error}");
-        assert!(error.contains("invalid host pattern"), "{error}");
+        assert!(
+            error.contains("invalid middleware configuration"),
+            "{error}"
+        );
     }
 
     #[test]

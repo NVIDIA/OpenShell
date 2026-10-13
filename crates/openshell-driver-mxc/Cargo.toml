@@ -14,7 +14,12 @@ repository.workspace = true
 name = "openshell_driver_mxc"
 
 [dependencies]
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", default-features = false }
+openshell-policy = { path = "../openshell-policy" }
+# OCSF builders + emit target used by the Windows ETW audit consumer. OS-agnostic
+# crate (no windows deps), so safe to depend on from all targets; only the
+# windows-gated `etw_consumer` module actually uses it.
+openshell-ocsf = { path = "../openshell-ocsf" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 futures = { workspace = true }
@@ -26,18 +31,21 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 
+# ETW/TDH real-time consumer and host CONNECT proxy integration.
+[target.'cfg(target_os = "windows")'.dependencies]
+openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+windows = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"
-# Used by Windows-only integration tests to parse policy YAML into the typed
-# proto. Inert on non-Windows.
-openshell-policy = { path = "../openshell-policy" }
 # Needed by the real-wxc integration test (wxc_exec_real.rs) which builds
 # --config-base64 payloads without going through the async WxcExecInvoker.
 # base64 and serde_json are already [dependencies] but dev-dependency resolution
 # is independent; explicit entries make them visible to integration tests.
 base64 = { workspace = true }
+rustls = { workspace = true }
 serde_json = { workspace = true }
 # Used by the drift guard test (handled_fields_inventory) to parse YAML into a
 # generic serde_json::Value for key enumeration.

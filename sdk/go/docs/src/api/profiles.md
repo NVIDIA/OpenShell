@@ -7,10 +7,11 @@ credentials, and model mappings for providers like OpenAI, Anthropic, or custom 
 
 ## List
 
-List all provider profiles visible to the current user.
+`List` returns a lazy pager over visible provider profiles. Use `ListAll` to
+collect every page.
 
 ```go
-profiles, err := client.Providers().Profiles().List(ctx, "default")
+profiles, err := client.Providers().Profiles().ListAll(ctx, "default")
 if err != nil {
     log.Fatal(err)
 }

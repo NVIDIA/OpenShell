@@ -5,10 +5,13 @@ package converter
 
 import (
 	"fmt"
+	"slices"
+	"time"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	dm "github.com/NVIDIA/OpenShell/sdk/go/proto/datamodelv1"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -18,17 +21,24 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 		return nil
 	}
 
-	result := &types.Sandbox{}
+	result := &types.Sandbox{HostKeyFingerprint: s.GetHostKeyFingerprint()}
 
 	if m := s.GetMetadata(); m != nil {
 		result.ID = m.GetId()
 		result.Name = m.GetName()
-		result.CreatedAt = TimeFromMillis(m.GetCreatedAtMs())
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
 		result.Labels = CopyStringMap(m.GetLabels())
 		result.Annotations = CopyStringMap(m.GetAnnotations())
 		result.ResourceVersion = m.GetResourceVersion()
 		result.Workspace = m.GetWorkspace()
-		result.DeletionTimestamp = TimeFromMillisPtr(m.GetDeletionTimestampMs())
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
+	}
+
+	if provenance := s.GetCreatedFromWorkloadTemplate(); provenance != nil {
+		result.CreatedFromWorkloadTemplate = &types.SandboxWorkloadTemplateProvenance{
+			Name:            provenance.GetName(),
+			ResourceVersion: provenance.GetResourceVersion(),
+		}
 	}
 
 	if spec := s.GetSpec(); spec != nil {
@@ -46,10 +56,11 @@ func SandboxFromProto(s *pb.Sandbox) *types.Sandbox {
 
 func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	result := types.SandboxSpec{
-		LogLevel:    spec.GetLogLevel(),
-		Environment: CopyStringMap(spec.GetEnvironment()),
-		Providers:   CopyStringSlice(spec.GetProviders()),
-		Policy:      SandboxPolicyFromProto(spec.GetPolicy()),
+		LogLevel:      spec.GetLogLevel(),
+		Environment:   CopyStringMap(spec.GetEnvironment()),
+		Providers:     CopyStringSlice(spec.GetProviders()),
+		Policy:        SandboxPolicyFromProto(spec.GetPolicy()),
+		RestartPolicy: SandboxRestartPolicyFromProto(spec.GetRestartPolicy()),
 	}
 
 	if tmpl := spec.GetTemplate(); tmpl != nil {
@@ -72,8 +83,11 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 	}
 
 	if rr := spec.GetResourceRequirements(); rr != nil {
-		if gpu := rr.GetGpu(); gpu != nil && gpu.Count != nil {
-			result.GPUCount = gpu.Count
+		if gpu := rr.GetGpu(); gpu != nil {
+			result.GPU = true
+			if gpu.Count != nil {
+				result.GPUCount = gpu.Count
+			}
 		}
 	}
 	result.Command = CopyStringSlice(spec.GetCommand())
@@ -84,7 +98,6 @@ func sandboxSpecFromProto(spec *pb.SandboxSpec) types.SandboxSpec {
 
 func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 	result := types.SandboxStatus{
-		SandboxName:          status.GetSandboxName(),
 		AgentPod:             status.GetAgentPod(),
 		AgentFd:              status.GetAgentFd(),
 		SandboxFd:            status.GetSandboxFd(),
@@ -98,12 +111,66 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Status:             c.GetStatus(),
 			Reason:             c.GetReason(),
 			Message:            c.GetMessage(),
-			LastTransitionTime: c.GetLastTransitionTime(),
+			LastTransitionTime: TimestampStringFromProto(c.GetTransitionTime()),
+		})
+	}
+	for _, endpoint := range status.GetEndpointStatuses() {
+		result.EndpointStatuses = append(result.EndpointStatuses, types.EndpointStatus{
+			EndpointID:     endpoint.GetEndpointId(),
+			Host:           endpoint.GetHost(),
+			Ports:          slices.Clone(endpoint.GetPorts()),
+			Path:           endpoint.GetPath(),
+			LastResult:     endpointResultFromProto(endpoint.GetLastResult()),
+			LastReportedAt: TimestampStringFromProto(endpoint.GetLastReportedTime()),
 		})
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
+	if admission := status.GetConfigurationAdmission(); admission != nil {
+		state := types.ConfigurationAdmissionUnknown
+		switch admission.GetState() {
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_PENDING:
+			state = types.ConfigurationAdmissionPending
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_ACCEPTED:
+			state = types.ConfigurationAdmissionAccepted
+		case pb.ConfigurationAdmissionState_CONFIGURATION_ADMISSION_STATE_REJECTED:
+			state = types.ConfigurationAdmissionRejected
+		}
+		result.ConfigurationAdmission = &types.SandboxConfigurationAdmission{
+			State:               state,
+			PolicyVersion:       admission.GetPolicyVersion(),
+			PolicyHash:          admission.GetPolicyHash(),
+			ConfigRevision:      admission.GetConfigRevision(),
+			ProviderEnvRevision: admission.GetProviderEnvRevision(),
+			Error:               admission.GetError(),
+		}
+	}
+	result.RestartCount = status.GetRestartCount()
+	result.NextRestartAtMs = MillisFromProto(status.GetNextRestartTime())
+	result.MainProcessStartedAtMs = MillisFromProto(status.GetMainProcessStartedTime())
 
 	return result
+}
+
+func endpointResultFromProto(result pb.EndpointResult) types.EndpointResult {
+	switch result {
+	case pb.EndpointResult_ENDPOINT_RESULT_NO_OBSERVED_EXCHANGE:
+		return types.EndpointNoObservedExchange
+	case pb.EndpointResult_ENDPOINT_RESULT_HTTP_RESPONSE_RECEIVED:
+		return types.EndpointHTTPResponseReceived
+	case pb.EndpointResult_ENDPOINT_RESULT_POLICY_DENIED:
+		return types.EndpointPolicyDenied
+	case pb.EndpointResult_ENDPOINT_RESULT_CREDENTIAL_UNAVAILABLE:
+		return types.EndpointCredentialUnavailable
+	case pb.EndpointResult_ENDPOINT_RESULT_TLS_FAILED:
+		return types.EndpointTLSFailed
+	case pb.EndpointResult_ENDPOINT_RESULT_TRANSPORT_FAILED:
+		return types.EndpointTransportFailed
+	case pb.EndpointResult_ENDPOINT_RESULT_UPSTREAM_REJECTED:
+		return types.EndpointUpstreamRejected
+	default:
+		// Unknown wire values must not imply an observation or a successful call.
+		return types.EndpointUnspecified
+	}
 }
 
 // SandboxPhaseFromProto converts a proto SandboxPhase to an SDK SandboxPhase.
@@ -125,6 +192,8 @@ func SandboxPhaseFromProto(phase pb.SandboxPhase) types.SandboxPhase {
 		return types.SandboxStopped
 	case pb.SandboxPhase_SANDBOX_PHASE_STARTING:
 		return types.SandboxStarting
+	case pb.SandboxPhase_SANDBOX_PHASE_COMPLETED:
+		return types.SandboxCompleted
 	default:
 		return types.SandboxUnknown
 	}
@@ -149,6 +218,8 @@ func SandboxPhaseToProto(phase types.SandboxPhase) pb.SandboxPhase {
 		return pb.SandboxPhase_SANDBOX_PHASE_STOPPED
 	case types.SandboxStarting:
 		return pb.SandboxPhase_SANDBOX_PHASE_STARTING
+	case types.SandboxCompleted:
+		return pb.SandboxPhase_SANDBOX_PHASE_COMPLETED
 	default:
 		return pb.SandboxPhase_SANDBOX_PHASE_UNKNOWN
 	}
@@ -162,14 +233,14 @@ func SandboxToProto(s *types.Sandbox) *pb.Sandbox {
 
 	return &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{
-			Id:                  s.ID,
-			Name:                s.Name,
-			CreatedAtMs:         MillisFromTime(s.CreatedAt),
-			Labels:              CopyStringMap(s.Labels),
-			Annotations:         CopyStringMap(s.Annotations),
-			ResourceVersion:     s.ResourceVersion,
-			Workspace:           s.Workspace,
-			DeletionTimestampMs: MillisFromTimePtr(s.DeletionTimestamp),
+			Id:              s.ID,
+			Name:            s.Name,
+			CreatedTime:     TimestampFromTime(s.CreatedAt),
+			Labels:          CopyStringMap(s.Labels),
+			Annotations:     CopyStringMap(s.Annotations),
+			ResourceVersion: s.ResourceVersion,
+			Workspace:       s.Workspace,
+			DeletionTime:    TimestampFromTimePtr(s.DeletionTimestamp),
 		},
 		Spec: SandboxSpecToProto(&s.Spec),
 	}
@@ -215,7 +286,7 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 		result.Template = tmpl
 	}
 
-	if spec.GPUCount != nil {
+	if spec.GPU || spec.GPUCount != nil {
 		result.ResourceRequirements = &pb.ResourceRequirements{
 			Gpu: &pb.GpuResourceRequirements{
 				Count: spec.GPUCount,
@@ -225,8 +296,33 @@ func SandboxSpecToProto(spec *types.SandboxSpec) *pb.SandboxSpec {
 
 	result.Command = CopyStringSlice(spec.Command)
 	result.Tty = spec.TTY
+	result.RestartPolicy = SandboxRestartPolicyToProto(spec.RestartPolicy)
 
 	return result
+}
+
+// SandboxRestartPolicyFromProto converts the restart policy to the curated SDK type.
+func SandboxRestartPolicyFromProto(policy pb.SandboxRestartPolicy) types.SandboxRestartPolicy {
+	switch policy {
+	case pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE:
+		return types.SandboxRestartOnFailure
+	case pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS:
+		return types.SandboxRestartAlways
+	default:
+		return types.SandboxRestartNever
+	}
+}
+
+// SandboxRestartPolicyToProto converts the curated SDK restart policy to protobuf.
+func SandboxRestartPolicyToProto(policy types.SandboxRestartPolicy) pb.SandboxRestartPolicy {
+	switch policy {
+	case types.SandboxRestartOnFailure:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ON_FAILURE
+	case types.SandboxRestartAlways:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_ALWAYS
+	default:
+		return pb.SandboxRestartPolicy_SANDBOX_RESTART_POLICY_NEVER
+	}
 }
 
 // SandboxSpecToProtoChecked converts an SDK SandboxSpec and reports values
@@ -259,4 +355,222 @@ func SandboxSpecToProtoChecked(spec *types.SandboxSpec) (*pb.SandboxSpec, error)
 		result.Template.DriverConfig = driverConfig
 	}
 	return result, nil
+}
+
+// SandboxWorkloadTemplateFromProto converts a reusable template proto to an SDK template.
+func SandboxWorkloadTemplateFromProto(t *pb.SandboxWorkloadTemplate) *types.SandboxWorkloadTemplate {
+	if t == nil {
+		return nil
+	}
+
+	result := &types.SandboxWorkloadTemplate{}
+	if m := t.GetMetadata(); m != nil {
+		result.ID = m.GetId()
+		result.Name = m.GetName()
+		result.CreatedAt = TimeFromProto(m.GetCreatedTime())
+		result.Labels = CopyStringMap(m.GetLabels())
+		result.Annotations = CopyStringMap(m.GetAnnotations())
+		result.ResourceVersion = m.GetResourceVersion()
+		result.Workspace = m.GetWorkspace()
+		result.DeletionTimestamp = TimePtrFromProto(m.GetDeletionTime())
+	}
+	if spec := t.GetSpec(); spec != nil {
+		result.Spec = SandboxWorkloadTemplateSpecFromProto(spec)
+	}
+	return result
+}
+
+// SandboxWorkloadTemplateSpecFromProto converts a reusable template spec proto.
+func SandboxWorkloadTemplateSpecFromProto(spec *pb.SandboxWorkloadTemplateSpec) types.SandboxWorkloadTemplateSpec {
+	result := types.SandboxWorkloadTemplateSpec{}
+	if spec == nil {
+		return result
+	}
+	result.Workload = SandboxWorkloadConfigFromProto(spec.GetWorkload())
+	result.DesiredServiceLevel = SandboxServiceLevelFromProto(spec.GetDesiredServiceLevel())
+	if dc := spec.GetDriverConfig(); dc != nil {
+		result.DriverConfig = dc.AsMap()
+	}
+	return result
+}
+
+// SandboxWorkloadConfigFromProto converts a portable workload proto.
+func SandboxWorkloadConfigFromProto(workload *pb.SandboxWorkloadConfig) *types.SandboxWorkloadConfig {
+	if workload == nil {
+		return nil
+	}
+	return &types.SandboxWorkloadConfig{
+		Image:       workload.GetImage(),
+		Environment: CopyStringMap(workload.GetEnvironment()),
+		Resources:   SandboxResourcesFromProto(workload.GetResources()),
+	}
+}
+
+// SandboxResourcesFromProto converts portable resource requirements.
+func SandboxResourcesFromProto(resources *pb.SandboxResources) *types.SandboxResources {
+	if resources == nil {
+		return nil
+	}
+	return &types.SandboxResources{
+		CPU:    resources.GetCpu(),
+		Memory: resources.GetMemory(),
+		GPU:    sandboxResourceGpuFromProto(resources),
+	}
+}
+
+// SandboxServiceLevelFromProto converts template service-level hints.
+func SandboxServiceLevelFromProto(level *pb.SandboxServiceLevel) *types.SandboxServiceLevel {
+	if level == nil {
+		return nil
+	}
+	return &types.SandboxServiceLevel{
+		Startup: SandboxStartupFromProto(level.GetStartup()),
+	}
+}
+
+// SandboxStartupFromProto converts startup service-level hints.
+func SandboxStartupFromProto(startup *pb.SandboxStartup) *types.SandboxStartup {
+	if startup == nil {
+		return nil
+	}
+	return &types.SandboxStartup{
+		ReadyWithin: durationFromProto(startup.GetReadyWithin()),
+		MaxBurst:    startup.GetMaxBurst(),
+	}
+}
+
+// SandboxWorkloadTemplateToProto converts an SDK reusable template to proto.
+func SandboxWorkloadTemplateToProto(t *types.SandboxWorkloadTemplate) *pb.SandboxWorkloadTemplate {
+	if t == nil {
+		return nil
+	}
+	return &pb.SandboxWorkloadTemplate{
+		Metadata: &dm.ObjectMeta{
+			Id:              t.ID,
+			Name:            t.Name,
+			CreatedTime:     TimestampFromTime(t.CreatedAt),
+			Labels:          CopyStringMap(t.Labels),
+			Annotations:     CopyStringMap(t.Annotations),
+			ResourceVersion: t.ResourceVersion,
+			Workspace:       t.Workspace,
+			DeletionTime:    TimestampFromTimePtr(t.DeletionTimestamp),
+		},
+		Spec: SandboxWorkloadTemplateSpecToProto(&t.Spec),
+	}
+}
+
+// SandboxWorkloadTemplateSpecToProto converts an SDK reusable template spec to proto.
+func SandboxWorkloadTemplateSpecToProto(spec *types.SandboxWorkloadTemplateSpec) *pb.SandboxWorkloadTemplateSpec {
+	if spec == nil {
+		return nil
+	}
+	result := &pb.SandboxWorkloadTemplateSpec{
+		Workload:            SandboxWorkloadConfigToProto(spec.Workload),
+		DesiredServiceLevel: SandboxServiceLevelToProto(spec.DesiredServiceLevel),
+	}
+	if spec.DriverConfig != nil {
+		if driverConfig, err := structpb.NewStruct(spec.DriverConfig); err == nil {
+			result.DriverConfig = driverConfig
+		}
+	}
+	return result
+}
+
+// SandboxWorkloadConfigToProto converts an SDK portable workload to proto.
+func SandboxWorkloadConfigToProto(workload *types.SandboxWorkloadConfig) *pb.SandboxWorkloadConfig {
+	if workload == nil {
+		return nil
+	}
+	return &pb.SandboxWorkloadConfig{
+		Image:       workload.Image,
+		Environment: CopyStringMap(workload.Environment),
+		Resources:   SandboxResourcesToProto(workload.Resources),
+	}
+}
+
+// SandboxResourcesToProto converts portable resource requirements.
+func SandboxResourcesToProto(resources *types.SandboxResources) *pb.SandboxResources {
+	if resources == nil {
+		return nil
+	}
+	return &pb.SandboxResources{
+		Cpu:    resources.CPU,
+		Memory: resources.Memory,
+		Gpu:    sandboxResourceGpuToProto(resources),
+	}
+}
+
+func sandboxResourceGpuToProto(resources *types.SandboxResources) *pb.GpuResourceRequirements {
+	if resources == nil || resources.GPU == nil {
+		return nil
+	}
+	return &pb.GpuResourceRequirements{Count: CopyUint32Ptr(resources.GPU.Count)}
+}
+
+func sandboxResourceGpuFromProto(resources *pb.SandboxResources) *types.SandboxGPURequirements {
+	if resources == nil || resources.GetGpu() == nil {
+		return nil
+	}
+	return &types.SandboxGPURequirements{Count: CopyUint32Ptr(resources.GetGpu().Count)}
+}
+
+// SandboxServiceLevelToProto converts template service-level hints.
+func SandboxServiceLevelToProto(level *types.SandboxServiceLevel) *pb.SandboxServiceLevel {
+	if level == nil {
+		return nil
+	}
+	return &pb.SandboxServiceLevel{
+		Startup: SandboxStartupToProto(level.Startup),
+	}
+}
+
+// SandboxStartupToProto converts startup service-level hints.
+func SandboxStartupToProto(startup *types.SandboxStartup) *pb.SandboxStartup {
+	if startup == nil {
+		return nil
+	}
+	return &pb.SandboxStartup{
+		ReadyWithin: durationToProto(startup.ReadyWithin),
+		MaxBurst:    startup.MaxBurst,
+	}
+}
+
+// SandboxWorkloadTemplateToProtoChecked converts an SDK reusable template and
+// reports driver config values that protobuf Struct cannot represent.
+func SandboxWorkloadTemplateToProtoChecked(t *types.SandboxWorkloadTemplate) (*pb.SandboxWorkloadTemplate, error) {
+	result := SandboxWorkloadTemplateToProto(t)
+	if t == nil {
+		return result, nil
+	}
+	if t.Spec.DriverConfig != nil {
+		driverConfig, err := structpb.NewStruct(t.Spec.DriverConfig)
+		if err != nil {
+			return nil, fmt.Errorf("driver config: %w", err)
+		}
+		result.Spec.DriverConfig = driverConfig
+	}
+	return result, nil
+}
+
+// CopyUint32Ptr returns a copy of a *uint32 pointer.
+func CopyUint32Ptr(p *uint32) *uint32 {
+	if p == nil {
+		return nil
+	}
+	v := *p
+	return &v
+}
+
+func durationFromProto(d *durationpb.Duration) time.Duration {
+	if d == nil {
+		return 0
+	}
+	return d.AsDuration()
+}
+
+func durationToProto(d time.Duration) *durationpb.Duration {
+	if d == 0 {
+		return nil
+	}
+	return durationpb.New(d)
 }

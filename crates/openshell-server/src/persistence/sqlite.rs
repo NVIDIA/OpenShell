@@ -2,46 +2,222 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
-    WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
+    DraftChunkRecord, ObjectCursor, ObjectListQuery, ObjectRecord, PersistenceError,
+    PersistenceResult, PolicyRecord, WriteCondition, WriteResult, current_time_ms, map_db_error,
+    map_migrate_error,
 };
 use crate::policy_store::{
-    AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
-    policy_payload_from_record, policy_record_for_atomic_write, policy_record_from_parts,
-    project_policy_revision_onto_sandbox,
+    AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
+    draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
+    policy_record_for_atomic_write, policy_record_from_parts, project_policy_revision_onto_sandbox,
 };
 use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
 use openshell_core::proto::Sandbox;
 use prost::Message;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Connection, Row, SqlitePool};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
+use sqlx::{Connection, QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::Mutex;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
-use super::{DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+#[cfg(test)]
+pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
+    SQLITE_MIGRATOR
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| migration.sql.as_ref())
+}
+static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
     pool: SqlitePool,
+    /// Pool for writes whose loss after a crash is harmless; see
+    /// [`SqliteStore::create_relaxed`]. On-disk stores open it with
+    /// `synchronous=NORMAL`; in-memory stores share `pool`.
+    relaxed_pool: SqlitePool,
+    #[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
+    in_memory_keepalive: Option<Arc<Mutex<Option<SqliteConnection>>>>,
+}
+
+fn push_label_selector(
+    sql: &mut QueryBuilder<Sqlite>,
+    label_selector: &str,
+) -> PersistenceResult<()> {
+    let mut labels: Vec<_> = super::parse_label_selector(label_selector)?
+        .into_iter()
+        .collect();
+    labels.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    for (key, value) in labels {
+        let escaped_key = key
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\'', "''");
+        sql.push(format!(
+            " AND json_extract(o.labels, '$.\"{escaped_key}\"') = "
+        ))
+        .push_bind(value);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) async fn replace_pool_connection(store: &SqliteStore) -> PersistenceResult<()> {
+    let connection = store.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    connection.close().await.map_err(|e| map_db_error(&e))
+}
+
+/// Apply the on-disk journal settings and switch the database file to WAL
+/// once, before the pool opens its connections.
+///
+/// The gateway's hot paths (SSH-session tokens minted and revoked around every
+/// forwarded connection, sandbox status updates) are many small autocommit
+/// writes. `SQLite`'s default rollback journal makes each of those commits pay
+/// several `fsync` calls and blocks readers while a writer holds the lock, so
+/// under a burst of forwarded connections the whole store serializes on disk
+/// latency. WAL mode removes the reader/writer exclusion and cuts each commit
+/// to a single `fsync` of the WAL file.
+///
+/// The main pool keeps `synchronous=FULL` rather than the usual WAL pairing
+/// of `NORMAL`. Under `NORMAL` a power loss or kernel crash can roll back
+/// transactions that were already acknowledged, and several of those writes
+/// tighten authorization: an SSH session revoked just before the crash would
+/// come back valid for the rest of its lifetime. `FULL` keeps every
+/// acknowledged commit durable. Writes whose loss only ever denies access,
+/// such as minting a new SSH session token, go through a separate
+/// `synchronous=NORMAL` pool instead ([`SqliteStore::create_relaxed`]). Both
+/// pools append to the same WAL file, so the next `FULL` commit's `fsync` also
+/// makes every earlier relaxed commit durable, and a crash can never roll back
+/// a `FULL` commit.
+///
+/// `journal_mode=WAL` is persistent in the database file, but switching into
+/// it needs exclusive access: if another connection holds the file open, the
+/// switch waits out `busy_timeout` and then fails. Doing it up front on one
+/// connection means the pool connections only ever re-apply the pragma to a
+/// file that is already in WAL mode, which never blocks, and a failure
+/// surfaces as a single clear connect error instead of a pool error later.
+/// The first start after upgrading a rollback-journal database therefore needs
+/// the file to be otherwise unopened. `synchronous` is a per-connection
+/// setting and is applied through the options on every connection.
+///
+/// In-memory databases are left on their defaults: WAL is meaningless there
+/// and the shared-cache keepalive connection already provides their lifetime
+/// guarantees.
+async fn configure_on_disk_durability(
+    options: SqliteConnectOptions,
+) -> PersistenceResult<SqliteConnectOptions> {
+    let options = options
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full);
+    let wal_error = |e: &sqlx::Error| {
+        PersistenceError::Database(format!(
+            "failed to switch SQLite database {} to WAL journal mode (the switch needs \
+             exclusive access; close other connections to the file and retry): {}",
+            options.get_filename().display(),
+            map_db_error(e)
+        ))
+    };
+    let connection = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|e| wal_error(&e))?;
+    connection.close().await.map_err(|e| wal_error(&e))?;
+    Ok(options)
+}
+
+/// Insert a new object at resource version 1, failing if it already exists.
+async fn insert_new_object(
+    pool: &SqlitePool,
+    object_type: &str,
+    id: &str,
+    name: &str,
+    workspace: &str,
+    payload: &[u8],
+    labels: Option<&str>,
+) -> PersistenceResult<WriteResult> {
+    let now_ms = current_time_ms();
+    sqlx::query(
+        r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
+"#,
+    )
+    .bind(object_type)
+    .bind(id)
+    .bind(name)
+    .bind(workspace)
+    .bind(payload)
+    .bind(now_ms)
+    .bind(labels.unwrap_or("{}"))
+    .execute(pool)
+    .await
+    .map_err(|e| map_db_error(&e))?;
+
+    Ok(WriteResult {
+        resource_version: 1,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+    })
+}
+
+#[cfg(test)]
+pub(super) async fn journal_settings(store: &SqliteStore) -> PersistenceResult<(String, i64)> {
+    pool_journal_settings(&store.pool).await
+}
+
+#[cfg(test)]
+pub(super) async fn relaxed_journal_settings(
+    store: &SqliteStore,
+) -> PersistenceResult<(String, i64)> {
+    pool_journal_settings(&store.relaxed_pool).await
+}
+
+#[cfg(test)]
+async fn pool_journal_settings(pool: &SqlitePool) -> PersistenceResult<(String, i64)> {
+    let mut connection = pool.acquire().await.map_err(|e| map_db_error(&e))?;
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+    Ok((journal_mode, synchronous))
 }
 
 impl SqliteStore {
     /// Closes the connection pool.
     #[cfg(test)]
     pub(crate) async fn close_for_test(&self) {
-        self.pool.close().await;
+        self.close().await;
     }
 
     pub async fn connect(url: &str) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
         let max_connections = if is_in_memory { 1 } else { 5 };
 
-        let options = SqliteConnectOptions::from_str(url)
+        let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
             .create_if_missing(true);
+
+        if is_in_memory {
+            if options.get_filename().as_os_str().is_empty()
+                || options.get_filename() == Path::new(":memory:")
+            {
+                let sequence = IN_MEMORY_DB_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                options = options.filename(format!("file:openshell-in-memory-{sequence}"));
+            }
+            options = options.shared_cache(true);
+        }
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
@@ -55,24 +231,86 @@ impl SqliteStore {
         // so we can restrict the permissions after the database is connected.
         let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
 
+        if !is_in_memory {
+            options = configure_on_disk_durability(options).await?;
+        }
+
+        let in_memory_keepalive = if is_in_memory {
+            let connection = SqliteConnection::connect_with(&options)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+            Some(Arc::new(Mutex::new(Some(connection))))
+        } else {
+            None
+        };
+
+        let relaxed_options =
+            (!is_in_memory).then(|| options.clone().synchronous(SqliteSynchronous::Normal));
+
         let pool = pool_options
             .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
+
+        // SQLite serializes writers, so one connection is enough for the
+        // relaxed pool.
+        let relaxed_pool = match relaxed_options {
+            Some(relaxed_options) => SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(relaxed_options)
+                .await
+                .map_err(|e| map_db_error(&e))?,
+            None => pool.clone(),
+        };
 
         // Tighten the permissions of the database file to owner-only access (0o600).
         if let Some(path) = db_path {
             restrict_db_file_permissions(&path)?;
         }
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            relaxed_pool,
+            in_memory_keepalive,
+        })
     }
 
     pub async fn migrate(&self) -> PersistenceResult<()> {
         SQLITE_MIGRATOR
             .run(&self.pool)
             .await
-            .map_err(|e| map_migrate_error(&e))
+            .map_err(|e| map_migrate_error(&e))?;
+        self.migrate_legacy_time_payloads().await
+    }
+
+    async fn migrate_legacy_time_payloads(&self) -> PersistenceResult<()> {
+        let mut transaction = self.pool.begin().await.map_err(|e| map_db_error(&e))?;
+        let rows = sqlx::query("SELECT id, object_type, payload FROM objects ORDER BY id")
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        for row in rows {
+            let id: String = row.try_get("id").map_err(|e| map_db_error(&e))?;
+            let object_type: String = row.try_get("object_type").map_err(|e| map_db_error(&e))?;
+            let payload: Vec<u8> = row.try_get("payload").map_err(|e| map_db_error(&e))?;
+            let migrated =
+                super::legacy_time_wire::migrate(&object_type, &payload).map_err(|error| {
+                    PersistenceError::Migration(format!(
+                        "failed to migrate {object_type} record {id}: {error}"
+                    ))
+                })?;
+            if migrated != payload {
+                sqlx::query("UPDATE objects SET payload = ?1 WHERE id = ?2")
+                    .bind(migrated)
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| map_db_error(&e))?;
+            }
+        }
+
+        transaction.commit().await.map_err(|e| map_db_error(&e))
     }
 
     /// Verify the database is reachable by acquiring a pooled connection
@@ -87,7 +325,14 @@ impl SqliteStore {
     /// Do not call from runtime code; this tears down the active pool.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
+        self.relaxed_pool.close().await;
         self.pool.close().await;
+        if let Some(keepalive) = &self.in_memory_keepalive {
+            let connection = keepalive.lock().await.take();
+            if let Some(connection) = connection {
+                let _ = connection.close().await;
+            }
+        }
     }
 
     pub async fn put(
@@ -124,6 +369,33 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
         Ok(())
     }
 
+    /// Create an object with `synchronous=NORMAL` durability.
+    ///
+    /// Same semantics as [`Self::put_if`] with [`WriteCondition::MustCreate`],
+    /// except that a power loss or kernel crash shortly after the call returns
+    /// may roll the insert back. Use it only for objects whose absence denies
+    /// access, never for writes that revoke or tighten anything.
+    pub async fn create_relaxed(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<WriteResult> {
+        insert_new_object(
+            &self.relaxed_pool,
+            object_type,
+            id,
+            name,
+            workspace,
+            payload,
+            labels,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn put_if(
         &self,
@@ -139,37 +411,24 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
 
         match condition {
             WriteCondition::MustCreate => {
-                // Insert only - fail if object exists
-                sqlx::query(
-                    r#"
-INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
-"#,
+                insert_new_object(
+                    &self.pool,
+                    object_type,
+                    id,
+                    name,
+                    workspace,
+                    payload,
+                    labels,
                 )
-                .bind(object_type)
-                .bind(id)
-                .bind(name)
-                .bind(workspace)
-                .bind(payload)
-                .bind(now_ms)
-                .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
                 .await
-                .map_err(|e| map_db_error(&e))?;
-
-                Ok(WriteResult {
-                    resource_version: 1,
-                    created_at_ms: now_ms,
-                    updated_at_ms: now_ms,
-                })
             }
             WriteCondition::MatchResourceVersion(expected_version) => {
-                // Update with version check
-                let result = sqlx::query(
+                let row = sqlx::query(
                     r#"
 UPDATE "objects"
 SET "payload" = ?4, "labels" = ?5, "updated_at_ms" = ?6, "resource_version" = "resource_version" + 1
 WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -178,37 +437,28 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
                 .bind(payload)
                 .bind(labels.unwrap_or("{}"))
                 .bind(now_ms)
-                .execute(&self.pool)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                if result.rows_affected() == 0 {
-                    // The version-matched UPDATE matched no row. Distinguish a
-                    // version mismatch (row present, different version) from an
-                    // absent row (deleted / never existed). Both are CAS
-                    // precondition failures, so report them as typed `Conflict`
-                    // rather than a backend-dependent error string: absent rows
-                    // carry `current_resource_version: None`.
-                    let existing = self.get(object_type, id).await?;
-                    return Err(PersistenceError::Conflict {
-                        current_resource_version: existing.map(|record| record.resource_version),
-                    });
+                if let Some(row) = row {
+                    return Ok(write_result_from_row(&row));
                 }
 
-                // Fetch the updated record to get the new resource_version
-                let updated = self.get(object_type, id).await?.ok_or_else(|| {
-                    PersistenceError::Database("object disappeared after update".to_string())
-                })?;
-
-                Ok(WriteResult {
-                    resource_version: updated.resource_version,
-                    created_at_ms: updated.created_at_ms,
-                    updated_at_ms: updated.updated_at_ms,
+                // The version-matched UPDATE matched no row. Distinguish a
+                // version mismatch (row present, different version) from an
+                // absent row (deleted / never existed). Both are CAS
+                // precondition failures, so report them as typed `Conflict`
+                // rather than a backend-dependent error string: absent rows
+                // carry `current_resource_version: None`.
+                let existing = self.get(object_type, id).await?;
+                Err(PersistenceError::Conflict {
+                    current_resource_version: existing.map(|record| record.resource_version),
                 })
             }
             WriteCondition::Unconditional => {
                 // Unconditional upsert by name
-                sqlx::query(
+                let row = sqlx::query(
                     r#"
 INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
@@ -217,6 +467,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
     "updated_at_ms" = excluded."updated_at_ms",
     "labels" = excluded."labels",
     "resource_version" = "objects"."resource_version" + 1
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -226,23 +477,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .bind(payload)
                 .bind(now_ms)
                 .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                // Fetch the result to get the resource_version
-                let record = self
-                    .get_by_name(object_type, workspace, name)
-                    .await?
-                    .ok_or_else(|| {
-                        PersistenceError::Database("object disappeared after upsert".to_string())
-                    })?;
-
-                Ok(WriteResult {
-                    resource_version: record.resource_version,
-                    created_at_ms: record.created_at_ms,
-                    updated_at_ms: record.updated_at_ms,
-                })
+                Ok(write_result_from_row(&row))
             }
         }
     }
@@ -357,6 +596,67 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 1)
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_if_workspace_count_below(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        workspace: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        max_count: u64,
+    ) -> PersistenceResult<Option<WriteResult>> {
+        let now_ms = current_time_ms();
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|e| map_db_error(&e))?;
+
+        let row: (i64,) = sqlx::query_as(
+            r#"
+SELECT COUNT(*) FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+"#,
+        )
+        .bind(object_type)
+        .bind(workspace)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        let count = u64::try_from(row.0).unwrap_or(0);
+        if count >= max_count {
+            tx.commit().await.map_err(|e| map_db_error(&e))?;
+            return Ok(None);
+        }
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(workspace)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        tx.commit().await.map_err(|e| map_db_error(&e))?;
+
+        Ok(Some(WriteResult {
+            resource_version: 1,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+        }))
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -414,6 +714,27 @@ WHERE "object_type" = ?1 AND "id" = ?2
         .await
         .map_err(|e| map_db_error(&e))?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_many(&self, object_type: &str, ids: &[String]) -> PersistenceResult<u64> {
+        let mut deleted = 0_u64;
+        for ids in ids.chunks(DELETE_MANY_BATCH_SIZE) {
+            let mut query = QueryBuilder::<Sqlite>::new("DELETE FROM objects WHERE object_type = ");
+            query.push_bind(object_type).push(" AND id IN (");
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+
+            deleted += query
+                .build()
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?
+                .rows_affected();
+        }
+        Ok(deleted)
     }
 
     pub async fn count_in_workspace(
@@ -541,6 +862,164 @@ LIMIT ?2 OFFSET ?3
 
         Ok(rows.into_iter().map(row_to_object_record).collect())
     }
+    pub async fn list_after(
+        &self,
+        object_type: &str,
+        workspace: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query(
+                r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+  AND ("created_at_ms", "name", "id") > (?3, ?4, ?5)
+ORDER BY "created_at_ms" ASC, "name" ASC, "id" ASC
+LIMIT ?6
+"#,
+            )
+            .bind(object_type)
+            .bind(workspace)
+            .bind(cursor.created_at_ms)
+            .bind(&cursor.name)
+            .bind(&cursor.id)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1 AND "workspace" = ?2
+ORDER BY "created_at_ms" ASC, "name" ASC, "id" ASC
+LIMIT ?3
+"#,
+            )
+            .bind(object_type)
+            .bind(workspace)
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+    pub async fn list_by_type_after(
+        &self,
+        object_type: &str,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = if let Some(cursor) = after {
+            sqlx::query(r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1
+  AND ("created_at_ms", "name", "workspace", "id") > (?2, ?3, ?4, ?5)
+ORDER BY "created_at_ms" ASC, "name" ASC, "workspace" ASC, "id" ASC
+LIMIT ?6
+"#).bind(object_type).bind(cursor.created_at_ms).bind(&cursor.name).bind(&cursor.workspace).bind(&cursor.id).bind(i64::from(limit)).fetch_all(&self.pool).await
+        } else {
+            sqlx::query(r#"
+SELECT "object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
+FROM "objects"
+WHERE "object_type" = ?1
+ORDER BY "created_at_ms" ASC, "name" ASC, "workspace" ASC, "id" ASC
+LIMIT ?2
+"#).bind(object_type).bind(i64::from(limit)).fetch_all(&self.pool).await
+        }.map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
+    pub async fn list_object_page(
+        &self,
+        object_type: &str,
+        query: ObjectListQuery<'_>,
+        after: Option<&ObjectCursor>,
+        limit: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            "SELECT o.object_type, o.id, o.name, o.workspace, o.payload, \
+             o.created_at_ms, o.updated_at_ms, o.labels, o.resource_version \
+             FROM objects o WHERE o.object_type = ",
+        );
+        sql.push_bind(object_type);
+
+        match query {
+            ObjectListQuery::Workspace(workspace) => {
+                sql.push(" AND o.workspace = ").push_bind(workspace);
+            }
+            ObjectListQuery::AllWorkspaces => {}
+            ObjectListQuery::Scope(scope) => {
+                sql.push(" AND o.scope = ").push_bind(scope);
+            }
+            ObjectListQuery::WorkspaceSelector {
+                workspace,
+                label_selector,
+            } => {
+                sql.push(" AND o.workspace = ").push_bind(workspace);
+                push_label_selector(&mut sql, label_selector)?;
+            }
+            ObjectListQuery::AllWorkspacesSelector(label_selector) => {
+                push_label_selector(&mut sql, label_selector)?;
+            }
+            ObjectListQuery::Membership {
+                member_type,
+                member_name,
+            } => {
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(")");
+            }
+            ObjectListQuery::MembershipSelector {
+                member_type,
+                member_name,
+                label_selector,
+            } => {
+                sql.push(
+                    " AND o.workspace = '' AND EXISTS (SELECT 1 FROM objects m \
+                          WHERE m.object_type = ",
+                )
+                .push_bind(member_type)
+                .push(" AND m.workspace = o.name AND m.name = ")
+                .push_bind(member_name)
+                .push(")");
+                push_label_selector(&mut sql, label_selector)?;
+            }
+        }
+
+        if let Some(cursor) = after {
+            sql.push(" AND (o.created_at_ms, COALESCE(o.name, ''), o.workspace, o.id) > (")
+                .push_bind(cursor.created_at_ms)
+                .push(", ")
+                .push_bind(&cursor.name)
+                .push(", ")
+                .push_bind(&cursor.workspace)
+                .push(", ")
+                .push_bind(&cursor.id)
+                .push(")");
+        }
+        sql.push(
+            " ORDER BY o.created_at_ms ASC, COALESCE(o.name, '') ASC, \
+             o.workspace ASC, o.id ASC LIMIT ",
+        )
+        .push_bind(i64::from(limit));
+
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
 
     pub async fn list_with_membership(
         &self,
@@ -629,7 +1108,8 @@ AND EXISTS (
         )
         .unwrap();
 
-        let mut query = sqlx::query(&sql)
+        // Label paths above escape SQL quotes; all values remain bound parameters.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(object_type)
             .bind(member_type)
             .bind(member_name);
@@ -682,27 +1162,24 @@ LIMIT ?3 OFFSET ?4
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        use super::parse_label_selector;
-
-        let required_labels = parse_label_selector(label_selector)?;
-        let all_records = self.list(object_type, workspace, u32::MAX, 0).await?;
-
-        let filtered: Vec<ObjectRecord> = all_records
-            .into_iter()
-            .filter(|record| {
-                let labels_json = record.labels.as_deref().unwrap_or("{}");
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_str(labels_json).unwrap_or_default();
-
-                required_labels
-                    .iter()
-                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
-            })
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-
-        Ok(filtered)
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            r#"SELECT o."object_type", o."id", o."name", o."workspace", o."payload", o."created_at_ms", o."updated_at_ms", o."labels", o."resource_version"
+FROM "objects" o
+WHERE o."object_type" = "#,
+        );
+        sql.push_bind(object_type).push(" AND o.\"workspace\" = ");
+        sql.push_bind(workspace);
+        push_label_selector(&mut sql, label_selector)?;
+        sql.push(" ORDER BY o.\"created_at_ms\" ASC, o.\"name\" ASC LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
     }
 
     pub async fn list_all_with_selector(
@@ -712,27 +1189,23 @@ LIMIT ?3 OFFSET ?4
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        use super::parse_label_selector;
-
-        let required_labels = parse_label_selector(label_selector)?;
-        let all_records = self.list_by_type(object_type, u32::MAX, 0).await?;
-
-        let filtered: Vec<ObjectRecord> = all_records
-            .into_iter()
-            .filter(|record| {
-                let labels_json = record.labels.as_deref().unwrap_or("{}");
-                let labels: std::collections::HashMap<String, String> =
-                    serde_json::from_str(labels_json).unwrap_or_default();
-
-                required_labels
-                    .iter()
-                    .all(|(key, value)| labels.get(key).is_some_and(|v| v == value))
-            })
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
-
-        Ok(filtered)
+        let mut sql = QueryBuilder::<Sqlite>::new(
+            r#"SELECT o."object_type", o."id", o."name", o."workspace", o."payload", o."created_at_ms", o."updated_at_ms", o."labels", o."resource_version"
+FROM "objects" o
+WHERE o."object_type" = "#,
+        );
+        sql.push_bind(object_type);
+        push_label_selector(&mut sql, label_selector)?;
+        sql.push(" ORDER BY o.\"created_at_ms\" ASC, o.\"name\" ASC LIMIT ")
+            .push_bind(i64::from(limit))
+            .push(" OFFSET ")
+            .push_bind(i64::from(offset));
+        let rows = sql
+            .build()
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_db_error(&e))?;
+        Ok(rows.into_iter().map(row_to_object_record).collect())
     }
     pub async fn put_policy_revision(
         &self,
@@ -967,6 +1440,32 @@ LIMIT ?3 OFFSET ?4
         .bind(sandbox_id)
         .bind(i64::from(limit))
         .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        rows.into_iter().map(row_to_policy_record).collect()
+    }
+
+    pub async fn list_policies_before(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        before_version: Option<i64>,
+    ) -> PersistenceResult<Vec<PolicyRecord>> {
+        let rows = sqlx::query(
+            r#"
+SELECT "id", "scope", "version", "status", "payload", "created_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "scope" = ?2 AND (?3 IS NULL OR "version" < ?3)
+ORDER BY "version" DESC
+LIMIT ?4
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(sandbox_id)
+        .bind(before_version)
+        .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
@@ -1262,6 +1761,54 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn update_draft_chunk_evaluation_if_unchanged(
+        &self,
+        expected: &DraftChunkRecord,
+        evaluated: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        let Some(row) = sqlx::query(
+            r#"
+SELECT "id", "scope", "status", "hit_count", "payload", "created_at_ms", "updated_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&expected.id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        else {
+            return Ok(false);
+        };
+        let stored_payload: Vec<u8> = row.get("payload");
+        let mut current = row_to_draft_chunk_record(row)?;
+        if !draft_chunk_evaluation_inputs_match(&current, expected) {
+            return Ok(false);
+        }
+        apply_draft_chunk_evaluation(&mut current, evaluated);
+        let payload = draft_chunk_payload_from_record(&current)?;
+        // Compare-and-swap on the payload read above: a concurrent edit or
+        // evaluation between the read and this write leaves nothing updated.
+        let result = sqlx::query(
+            r#"
+UPDATE "objects"
+SET "payload" = ?3, "updated_at_ms" = ?4
+WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
+  AND "payload" = ?5
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&expected.id)
+        .bind(payload)
+        .bind(current.last_seen_ms)
+        .bind(stored_payload)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete_draft_chunks(
         &self,
         sandbox_id: &str,
@@ -1346,8 +1893,22 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     [with_suffix("-wal"), with_suffix("-shm")]
 }
 
+/// Read the `RETURNING` columns of a write, so the result describes that write
+/// and not whichever one landed last.
+fn write_result_from_row(row: &sqlx::sqlite::SqliteRow) -> WriteResult {
+    WriteResult {
+        resource_version: row_resource_version(row),
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+    }
+}
+
+fn row_resource_version(row: &sqlx::sqlite::SqliteRow) -> u64 {
+    let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+    resource_version.max(1).cast_unsigned()
+}
+
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
-    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -1357,7 +1918,7 @@ fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: row.get("labels"),
-        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        resource_version: row_resource_version(&row),
     }
 }
 

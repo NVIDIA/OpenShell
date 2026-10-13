@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 id: gator
-payload_version: 7
+payload_version: 12
 display_name: Gator Gate Agent
 description: Validate and monitor OpenShell GitHub issues and pull requests through the gator state machine.
 
@@ -10,13 +10,12 @@ sandbox:
   name_prefix: gtr
   from: agent://.
   gateway: docker-dev
-  background_log_dir: logs
 
 harness:
   default: codex
   supported:
     codex:
-      model: gpt-5.6-sol
+      model: gpt-6.1-sol
       reasoning: medium
 
 runtime:
@@ -28,8 +27,6 @@ profile_paths:
   - providers
 
 settings:
-  - key: providers_v2_enabled
-    value: true
   - key: agent_policy_proposals_enabled
     value: true
   - key: proposal_approval_mode

@@ -12,7 +12,7 @@ runtime workload. It is a single image that runs two validation steps:
 
 The image builds the samples from `NVIDIA/cuda-samples` tag `v12.8` with a CUDA
 12.8 builder image, then copies only the compiled binaries into the OpenShell
-community base final image.
+default workload final image.
 
 The workload prints `OPENSHELL_GPU_WORKLOAD_SUCCESS` only after both samples
 pass. On failure it prints `OPENSHELL_GPU_WORKLOAD_FAILURE` and exits non-zero.

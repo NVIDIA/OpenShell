@@ -31,13 +31,6 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_KUBERNETES_SECRETS_NAMESPACE")]
     namespace: Option<String>,
-
-    #[arg(
-        long,
-        env = "OPENSHELL_KUBERNETES_SECRETS_ALLOW_REFERENCE_NAMESPACE",
-        default_value_t = false
-    )]
-    allow_reference_namespace: bool,
 }
 
 #[tokio::main]
@@ -78,12 +71,6 @@ fn driver_config(args: &Args) -> toml::Table {
         config.insert(
             "namespace".to_string(),
             toml::Value::String(namespace.clone()),
-        );
-    }
-    if args.allow_reference_namespace {
-        config.insert(
-            "allow_reference_namespace".to_string(),
-            toml::Value::Boolean(true),
         );
     }
     config

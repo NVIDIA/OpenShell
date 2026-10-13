@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Prepare an interactive tmachine shell
+  hosts: all
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Set the tmachine SSH password
+      become: true
+      ansible.builtin.command:
+        argv: [chpasswd]
+        stdin: tmachine:tmachine
+      no_log: true
+      changed_when: false

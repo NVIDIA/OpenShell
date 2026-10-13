@@ -5,8 +5,6 @@ use openshell_vfio::{
     GpuBindGuard, GpuBindState, GpuBinding, GpuInfo, SysfsRoot, prepare_gpu_for_passthrough,
     probe_host_nvidia_vfio_readiness, reconcile_stale_bindings, validate_bdf,
 };
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -156,163 +154,15 @@ pub struct GpuAssignment {
     pub iommu_group: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Subnet allocation for per-sandbox TAP networking
-// ---------------------------------------------------------------------------
-
-/// Allocates /30 subnets from a pool for per-sandbox TAP networking.
-pub struct SubnetAllocator {
-    base: Ipv4Addr,
-    prefix_len: u8,
-    next_offset: u32,
-    allocated: HashMap<String, SubnetAllocation>,
-}
-
-pub struct SubnetAllocation {
-    pub host_ip: Ipv4Addr,
-    pub guest_ip: Ipv4Addr,
-    pub prefix_len: u8,
-    pub offset: u32,
-}
-
 static NEXT_VSOCK_CID: AtomicU32 = AtomicU32::new(3);
-
-impl SubnetAllocator {
-    pub fn new(base: Ipv4Addr, prefix_len: u8) -> Self {
-        Self {
-            base,
-            prefix_len,
-            next_offset: 0,
-            allocated: HashMap::new(),
-        }
-    }
-
-    pub fn allocate(&mut self, sandbox_id: &str) -> Result<SubnetAllocation, String> {
-        let pool_size = 1u32 << (32 - self.prefix_len);
-        let max_subnets = pool_size / 4;
-
-        if u32::try_from(self.allocated.len()).unwrap_or(u32::MAX) >= max_subnets {
-            return Err("subnet pool exhausted".to_string());
-        }
-
-        while self
-            .allocated
-            .values()
-            .any(|a| a.offset == self.next_offset)
-        {
-            self.next_offset = (self.next_offset + 1) % max_subnets;
-        }
-
-        let base_u32 = u32::from(self.base);
-        let subnet_base = base_u32 + (self.next_offset * 4);
-        let host_ip = Ipv4Addr::from(subnet_base + 1);
-        let guest_ip = Ipv4Addr::from(subnet_base + 2);
-
-        let allocation = SubnetAllocation {
-            host_ip,
-            guest_ip,
-            prefix_len: 30,
-            offset: self.next_offset,
-        };
-
-        self.allocated.insert(sandbox_id.to_string(), allocation);
-        self.next_offset = (self.next_offset + 1) % max_subnets;
-
-        let alloc = &self.allocated[sandbox_id];
-        Ok(SubnetAllocation {
-            host_ip: alloc.host_ip,
-            guest_ip: alloc.guest_ip,
-            prefix_len: alloc.prefix_len,
-            offset: alloc.offset,
-        })
-    }
-
-    pub fn release(&mut self, sandbox_id: &str) {
-        self.allocated.remove(sandbox_id);
-    }
-}
 
 pub fn allocate_vsock_cid() -> u32 {
     NEXT_VSOCK_CID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Generate a locally-administered MAC from sandbox ID using FNV-1a.
-pub fn mac_from_sandbox_id(sandbox_id: &str) -> [u8; 6] {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in sandbox_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let bytes = hash.to_le_bytes();
-    let mut mac = [bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]];
-    mac[0] = (mac[0] & 0xFE) | 0x02;
-    mac
-}
-
-/// TAP device name from sandbox ID (fits `IFNAMSIZ=16`).
-pub fn tap_device_name(sandbox_id: &str) -> String {
-    let mut end = sandbox_id.len().min(8);
-    // Walk back to a UTF-8 char boundary (str::floor_char_boundary requires
-    // Rust 1.91 — we still build on older toolchains).
-    while end > 0 && !sandbox_id.is_char_boundary(end) {
-        end -= 1;
-    }
-    let prefix = &sandbox_id[..end];
-    format!("vmtap-{prefix}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn subnet_allocator_assigns_sequential_blocks() {
-        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 0, 128, 0), 17);
-
-        let s1 = alloc.allocate("sandbox-1").unwrap();
-        assert_eq!(s1.host_ip, Ipv4Addr::new(10, 0, 128, 1));
-        assert_eq!(s1.guest_ip, Ipv4Addr::new(10, 0, 128, 2));
-        assert_eq!(s1.prefix_len, 30);
-
-        let s2 = alloc.allocate("sandbox-2").unwrap();
-        assert_eq!(s2.host_ip, Ipv4Addr::new(10, 0, 128, 5));
-        assert_eq!(s2.guest_ip, Ipv4Addr::new(10, 0, 128, 6));
-    }
-
-    #[test]
-    fn subnet_allocator_recycles_after_release() {
-        let mut alloc = SubnetAllocator::new(Ipv4Addr::new(10, 0, 128, 0), 17);
-
-        let _s1 = alloc.allocate("sandbox-1").unwrap();
-        let _s2 = alloc.allocate("sandbox-2").unwrap();
-        alloc.release("sandbox-1");
-
-        let s3 = alloc.allocate("sandbox-3").unwrap();
-        assert_eq!(s3.host_ip, Ipv4Addr::new(10, 0, 128, 9));
-    }
-
-    #[test]
-    fn tap_device_name_truncates_long_ids() {
-        assert_eq!(tap_device_name("abc"), "vmtap-abc");
-        assert_eq!(tap_device_name("abcdefghijklmnop"), "vmtap-abcdefgh");
-    }
-
-    #[test]
-    fn mac_from_sandbox_id_sets_locally_administered_bit() {
-        let mac = mac_from_sandbox_id("sandbox-123");
-        assert_eq!(mac[0] & 0x02, 0x02, "locally-administered bit must be set");
-        assert_eq!(mac[0] & 0x01, 0x00, "multicast bit must be clear");
-    }
-
-    #[test]
-    fn mac_from_sandbox_id_deterministic() {
-        let mac1 = mac_from_sandbox_id("sandbox-x");
-        let mac2 = mac_from_sandbox_id("sandbox-x");
-        assert_eq!(mac1, mac2);
-
-        let mac3 = mac_from_sandbox_id("sandbox-y");
-        assert_ne!(mac1, mac3);
-    }
 
     #[test]
     fn vsock_cid_increments() {

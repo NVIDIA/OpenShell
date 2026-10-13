@@ -3,20 +3,13 @@
 
 //! Selected compute-driver config construction.
 //!
-//! This module owns loading the selected driver config from TOML, applying
-//! driver-specific environment overrides, and applying gateway startup defaults.
-//! It does not acquire, connect to, or start compute drivers.
-
-#[cfg(all(not(target_os = "windows"), feature = "in-tree-compute-drivers"))]
-pub mod builtin;
+//! This module owns loading the selected driver config from TOML and applying
+//! gateway startup defaults and endpoint overrides. It does not acquire,
+//! connect to, or start compute drivers.
 
 use crate::config_file;
 use crate::defaults::LocalTlsPaths;
-#[cfg(target_os = "windows")]
-use openshell_core::ComputeDriverKind;
 use openshell_core::{Error, Result};
-#[cfg(target_os = "windows")]
-use openshell_driver_mxc::MxcComputeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -24,23 +17,49 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuestTlsPaths {
     ca: PathBuf,
-    cert: PathBuf,
-    key: PathBuf,
 }
 
 impl GuestTlsPaths {
-    pub(crate) fn as_paths(&self) -> (&std::path::Path, &std::path::Path, &std::path::Path) {
-        (&self.ca, &self.cert, &self.key)
+    pub(crate) fn as_path(&self) -> &std::path::Path {
+        &self.ca
     }
-}
 
-impl From<&LocalTlsPaths> for GuestTlsPaths {
-    fn from(paths: &LocalTlsPaths) -> Self {
-        Self {
-            ca: paths.ca.clone(),
-            cert: paths.client_cert.clone(),
-            key: paths.client_key.clone(),
+    /// Validate gateway CA configuration without reading certificate files.
+    pub(crate) fn validate_configuration(
+        gateway: Option<&config_file::GatewayFileSection>,
+        tls_disabled: bool,
+    ) -> std::result::Result<(), String> {
+        if tls_disabled && gateway.is_some_and(|gateway| gateway.guest_tls_ca.is_some()) {
+            return Err(
+                "guest_tls_ca requires gateway TLS; remove it or omit --disable-tls".to_string(),
+            );
         }
+        Ok(())
+    }
+
+    /// Explicit gateway CA configuration takes precedence over the
+    /// package-managed local CA. User client credentials stay on the host.
+    pub(crate) fn resolve(
+        gateway: Option<&config_file::GatewayFileSection>,
+        local: Option<&LocalTlsPaths>,
+        tls_disabled: bool,
+    ) -> std::result::Result<Option<Self>, String> {
+        Self::validate_configuration(gateway, tls_disabled)?;
+        if tls_disabled {
+            return Ok(None);
+        }
+        if let Some(ca) = gateway.and_then(|gateway| gateway.guest_tls_ca.as_ref()) {
+            if !ca.is_file() {
+                return Err(format!(
+                    "guest_tls_ca '{}' does not exist or is not a file",
+                    ca.display()
+                ));
+            }
+            return Ok(Some(Self { ca: ca.clone() }));
+        }
+        Ok(local.map(|paths| Self {
+            ca: paths.ca.clone(),
+        }))
     }
 }
 
@@ -53,13 +72,28 @@ pub struct DriverStartupContext<'a> {
     pub endpoint_overrides: &'a BTreeMap<String, PathBuf>,
 }
 
-/// Build the selected MXC config from TOML. MXC is Windows-only and has no
-/// runtime-default overlay; the driver reads its own settings from the config.
-/// The Linux built-in driver configs now live in the `builtin` submodule
-/// (compiled only off Windows).
-#[cfg(target_os = "windows")]
-pub fn mxc_config_from_context(context: DriverStartupContext<'_>) -> Result<MxcComputeConfig> {
-    driver_config_from_context(context, ComputeDriverKind::Mxc.as_str())
+/// Decode common controls without interpreting backend-specific driver fields.
+pub fn admission_config_from_context(
+    context: DriverStartupContext<'_>,
+    name: &str,
+) -> Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+    let mut table = toml::map::Map::new();
+    if let Some(config) = context
+        .file
+        .and_then(|file| file.openshell.drivers.get(name))
+    {
+        for field in ["allow_driver_config", "resource_admission"] {
+            if let Some(value) = config.get(field) {
+                table.insert(field.into(), value.clone());
+            }
+        }
+    }
+    let policy: openshell_core::resource_admission::DriverAdmissionConfig =
+        toml::Value::Table(table).try_into().map_err(|error| {
+            Error::config(format!("invalid driver admission configuration: {error}"))
+        })?;
+    policy.validate().map_err(Error::config)?;
+    Ok(policy)
 }
 
 pub fn remote_driver_config_from_context(
@@ -73,6 +107,7 @@ pub fn remote_driver_config_from_context(
             &file.openshell.gateway,
             file.openshell.drivers.get(name),
         );
+        reject_driver_owned_guest_tls_fields(&merged)?;
         if let Some(socket_path) = merged.get("socket_path").and_then(toml::Value::as_str) {
             cfg.socket_path = PathBuf::from(socket_path);
         }
@@ -86,51 +121,6 @@ pub fn remote_driver_config_from_context(
 pub struct RemoteDriverConfig {
     #[serde(default)]
     pub socket_path: PathBuf,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct KubernetesSaBootstrapConfig {
-    pub namespace: String,
-    pub service_account_name: String,
-    pub workspace_mode: String,
-    pub gateway_id: String,
-}
-
-impl Default for KubernetesSaBootstrapConfig {
-    fn default() -> Self {
-        Self {
-            namespace: "openshell".to_string(),
-            service_account_name: "default".to_string(),
-            workspace_mode: "shared".to_string(),
-            gateway_id: "openshell".to_string(),
-        }
-    }
-}
-
-pub fn kubernetes_sa_bootstrap_config(
-    file: Option<&config_file::ConfigFile>,
-) -> Result<KubernetesSaBootstrapConfig> {
-    let Some(file) = file else {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    };
-    if !file.openshell.drivers.contains_key("kubernetes") {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    }
-    let merged = config_file::driver_table(
-        "kubernetes",
-        &file.openshell.gateway,
-        file.openshell.drivers.get("kubernetes"),
-    );
-    merged.try_into().map_err(|error| {
-        Error::config(format!(
-            "invalid Kubernetes ServiceAccount bootstrap config: {error}"
-        ))
-    })
 }
 
 pub fn driver_config_from_context<T>(
@@ -158,11 +148,34 @@ where
         &file.openshell.gateway,
         file.openshell.drivers.get(driver_name),
     );
+    reject_driver_owned_guest_tls_fields(&merged)?;
     merged.try_into().map_err(|e| {
         Error::config(format!(
             "invalid [openshell.drivers.{driver_name}] table: {e}"
         ))
     })
+}
+
+/// Reject TLS paths in gateway driver tables. The gateway CA is injected
+/// into the selected local driver after gateway validation.
+fn reject_driver_owned_guest_tls_fields(table: &toml::Value) -> Result<()> {
+    let Some(table) = table.as_table() else {
+        return Ok(());
+    };
+    for field in ["guest_tls_ca", "guest_tls_cert", "guest_tls_key"] {
+        if table.contains_key(field) {
+            let message = if field == "guest_tls_ca" {
+                "guest_tls_ca belongs in [openshell.gateway], not a [openshell.drivers.*] table"
+                    .to_string()
+            } else {
+                format!(
+                    "{field} is no longer supported; remove it because supervisors authenticate with bearer tokens"
+                )
+            };
+            return Err(Error::config(message));
+        }
+    }
+    Ok(())
 }
 
 fn apply_remote_driver_overrides(
@@ -188,6 +201,7 @@ fn validate_remote_driver_config(cfg: &RemoteDriverConfig, name: &str) -> Result
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     fn test_context(file: Option<&config_file::ConfigFile>) -> DriverStartupContext<'_> {
         static EMPTY_ENDPOINT_OVERRIDES: std::sync::LazyLock<BTreeMap<String, PathBuf>> =
@@ -209,6 +223,181 @@ mod tests {
     }
 
     #[test]
+    fn common_admission_defaults_and_replacement_apply_to_every_driver() {
+        for name in ["kubernetes", "docker", "podman", "vm", "mxc", "external"] {
+            let defaults = admission_config_from_context(test_context(None), name).unwrap();
+            assert!(!defaults.allow_driver_config);
+            assert!(defaults.resource_admission.enabled);
+            assert_eq!(defaults.resource_admission.required_labels.len(), 2);
+            let file: config_file::ConfigFile = toml::from_str(&format!(
+                "[openshell.drivers.{name}]\nallow_driver_config = true\n[openshell.drivers.{name}.resource_admission.required_labels]\n\"example.com/approved\" = \"yes\"\n"
+            )).unwrap();
+            let custom = admission_config_from_context(test_context(Some(&file)), name).unwrap();
+            assert!(custom.allow_driver_config);
+            assert_eq!(
+                custom.resource_admission.required_labels,
+                BTreeMap::from([("example.com/approved".into(), "yes".into())])
+            );
+        }
+    }
+
+    #[test]
+    fn common_admission_rejects_empty_map_and_preserves_explicit_opt_out() {
+        let file: config_file::ConfigFile =
+            toml::from_str("[openshell.drivers.docker.resource_admission.required_labels]\n")
+                .unwrap();
+        assert!(admission_config_from_context(test_context(Some(&file)), "docker").is_err());
+        let file: config_file::ConfigFile = toml::from_str("[openshell.drivers.docker.resource_admission]\nenabled = false\nrequired_labels = {}\n").unwrap();
+        let policy = admission_config_from_context(test_context(Some(&file)), "docker").unwrap();
+        assert!(!policy.resource_admission.enabled);
+        assert!(!policy.allow_driver_config);
+    }
+
+    #[test]
+    fn gateway_guest_tls_resolves_explicit_ca() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, b"test").expect("write TLS fixture");
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(ca.clone()),
+            ..Default::default()
+        };
+
+        let resolved = GuestTlsPaths::resolve(Some(&gateway), None, false)
+            .expect("complete guest TLS should resolve")
+            .expect("guest TLS bundle");
+
+        assert_eq!(resolved.as_path(), ca.as_path());
+    }
+
+    #[test]
+    fn gateway_guest_tls_rejects_missing_explicit_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(dir.path().join("missing-ca.pem")),
+            ..Default::default()
+        };
+        let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
+            .expect_err("missing explicit file must fail");
+        assert!(error.contains("guest_tls_ca"));
+        assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn gateway_guest_tls_uses_package_managed_bundle() {
+        let local = LocalTlsPaths {
+            ca: PathBuf::from("/managed/ca.pem"),
+            server_cert: PathBuf::from("/managed/server-cert.pem"),
+            server_key: PathBuf::from("/managed/server-key.pem"),
+            client_cert: PathBuf::from("/managed/client-cert.pem"),
+            client_key: PathBuf::from("/managed/client-key.pem"),
+        };
+        let resolved = GuestTlsPaths::resolve(None, Some(&local), false)
+            .expect("managed bundle should resolve")
+            .expect("guest TLS bundle");
+        assert_eq!(resolved.as_path(), Path::new("/managed/ca.pem"));
+    }
+
+    #[test]
+    fn gateway_guest_tls_can_be_absent() {
+        assert!(GuestTlsPaths::resolve(None, None, false).unwrap().is_none());
+        assert!(GuestTlsPaths::resolve(None, None, true).unwrap().is_none());
+    }
+
+    #[test]
+    fn gateway_guest_tls_rejects_plaintext_gateway() {
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(PathBuf::from("/tmp/ca.pem")),
+            ..Default::default()
+        };
+        let error = GuestTlsPaths::resolve(Some(&gateway), None, true)
+            .expect_err("guest TLS and plaintext gateway conflict");
+        assert!(error.contains("requires gateway TLS"));
+    }
+
+    #[derive(Debug, Default, Deserialize)]
+    struct EmptyDriverConfig {}
+
+    #[test]
+    fn driver_owned_guest_tls_fields_are_rejected_for_local_and_remote_drivers() {
+        for field in ["guest_tls_ca", "guest_tls_cert", "guest_tls_key"] {
+            let source = format!(
+                r#"
+[openshell]
+version = 2
+
+[openshell.drivers.kyma]
+socket_path = "/run/openshell/kyma.sock"
+{field} = "/run/openshell/guest.pem"
+"#
+            );
+            let file: config_file::ConfigFile = toml::from_str(&source).expect("valid TOML");
+
+            let local_error =
+                driver_config_from_context::<EmptyDriverConfig>(test_context(Some(&file)), "kyma")
+                    .expect_err("local driver TLS field must be rejected");
+            assert!(local_error.to_string().contains(field));
+            let guidance = if field == "guest_tls_ca" {
+                "[openshell.gateway]"
+            } else {
+                "no longer supported; remove it"
+            };
+            assert!(local_error.to_string().contains(guidance));
+
+            let remote_error = remote_driver_config_from_context(test_context(Some(&file)), "kyma")
+                .expect_err("remote driver TLS field must be rejected");
+            assert!(remote_error.to_string().contains(field));
+            assert!(remote_error.to_string().contains(guidance));
+        }
+    }
+
+    #[test]
+    fn explicit_gateway_guest_tls_takes_precedence_over_package_bundle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let explicit = [dir.path().join("explicit-ca.pem")];
+        for path in &explicit {
+            std::fs::write(path, b"explicit").expect("write explicit TLS fixture");
+        }
+        let gateway = config_file::GatewayFileSection {
+            guest_tls_ca: Some(explicit[0].clone()),
+            ..Default::default()
+        };
+        let package = LocalTlsPaths {
+            ca: PathBuf::from("/managed/ca.pem"),
+            server_cert: PathBuf::from("/managed/server-cert.pem"),
+            server_key: PathBuf::from("/managed/server-key.pem"),
+            client_cert: PathBuf::from("/managed/client-cert.pem"),
+            client_key: PathBuf::from("/managed/client-key.pem"),
+        };
+
+        let resolved = GuestTlsPaths::resolve(Some(&gateway), Some(&package), false)
+            .expect("explicit bundle resolves")
+            .expect("guest bundle");
+        assert_eq!(resolved.as_path(), explicit[0].as_path());
+    }
+
+    #[test]
+    fn gateway_guest_tls_rejects_ca_directory() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let files = [dir.path().join("ca.pem")];
+        for path in &files {
+            std::fs::write(path, b"fixture").expect("write TLS fixture");
+        }
+
+        for index in 0..files.len() {
+            let mut paths = files.clone();
+            paths[index] = dir.path().to_path_buf();
+            let gateway = config_file::GatewayFileSection {
+                guest_tls_ca: Some(paths[0].clone()),
+                ..Default::default()
+            };
+            let error = GuestTlsPaths::resolve(Some(&gateway), None, false)
+                .expect_err("directory TLS input must be rejected");
+            assert!(error.contains("not a file"), "{error}");
+        }
+    }
+
+    #[test]
     fn remote_driver_config_reads_socket_path_from_named_table() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
@@ -225,11 +414,11 @@ socket_path = "/run/openshell/kyma.sock"
     }
 
     #[test]
-    fn remote_driver_config_ignores_in_process_driver_fields() {
+    fn remote_driver_config_reads_only_socket_path() {
         let file: config_file::ConfigFile = toml::from_str(
             r#"
-[openshell.gateway]
-sandbox_namespace = "sandboxes"
+[openshell]
+version = 2
 
 [openshell.drivers.kubernetes]
 socket_path = "/run/openshell/kubernetes.sock"
@@ -245,29 +434,6 @@ service_account_name = "sandbox-sa"
             cfg.socket_path,
             PathBuf::from("/run/openshell/kubernetes.sock")
         );
-    }
-
-    #[test]
-    fn kubernetes_sa_bootstrap_uses_public_gateway_config() {
-        let file: config_file::ConfigFile = toml::from_str(
-            r#"
-[openshell.gateway]
-sandbox_namespace = "sandboxes"
-
-[openshell.drivers.kubernetes]
-socket_path = "/run/openshell/kubernetes.sock"
-workspace_mode = "managed"
-gateway_id = "gateway-a"
-service_account_name = "sandbox-sa"
-"#,
-        )
-        .expect("valid config");
-
-        let cfg = kubernetes_sa_bootstrap_config(Some(&file)).expect("bootstrap config");
-        assert_eq!(cfg.namespace, "sandboxes");
-        assert_eq!(cfg.workspace_mode, "managed");
-        assert_eq!(cfg.gateway_id, "gateway-a");
-        assert_eq!(cfg.service_account_name, "sandbox-sa");
     }
 
     #[test]

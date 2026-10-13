@@ -7,7 +7,6 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,11 +17,13 @@ use bollard::query_parameters::{
     RemoveVolumeOptionsBuilder, StartContainerOptions, WaitContainerOptions,
 };
 use futures_util::TryStreamExt;
-use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
+#[cfg(feature = "e2e-docker")]
+use openshell_e2e::harness::container::ImageGuard;
+use openshell_e2e::harness::container::e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
 
-const TEST_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+const TEST_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
 const BIND_TARGET: &str = "/sandbox/e2e-bind";
 #[cfg(feature = "e2e-docker")]
@@ -44,56 +45,6 @@ static NEXT_VOLUME_ID: AtomicU64 = AtomicU64::new(0);
 struct VolumeGuard {
     docker: Docker,
     name: String,
-}
-
-struct ImageGuard {
-    engine: ContainerEngine,
-    tag: String,
-}
-
-impl ImageGuard {
-    fn build(driver: &str, dockerfile: &Path, context: &Path) -> Result<Self, String> {
-        let engine = ContainerEngine::from_env()?;
-        let tag = format!("localhost/{}-oci-user:latest", unique_volume_name(driver));
-        let output = engine
-            .command()
-            .args([
-                "build",
-                "--file",
-                dockerfile
-                    .to_str()
-                    .ok_or_else(|| "Dockerfile path must be UTF-8".to_string())?,
-                "--tag",
-                &tag,
-                context
-                    .to_str()
-                    .ok_or_else(|| "image context path must be UTF-8".to_string())?,
-            ])
-            .output()
-            .map_err(|err| format!("run {} build: {err}", engine.name()))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{} build failed (exit {:?}):\n{}{}",
-                engine.name(),
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        Ok(Self { engine, tag })
-    }
-}
-
-impl Drop for ImageGuard {
-    fn drop(&mut self) {
-        let _ = self
-            .engine
-            .command()
-            .args(["image", "rm", "--force", &self.tag])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
 }
 
 impl VolumeGuard {
@@ -145,7 +96,6 @@ async fn sandbox_mounts_existing_driver_config_volume() {
         volume.name
     );
     let mut sandbox = SandboxGuard::create(&[
-        "--no-keep",
         "--driver-config-json",
         &driver_config,
         "--",
@@ -185,8 +135,12 @@ async fn oci_workspace_preparation_skips_nested_volume_ownership() {
     let image_context = tempfile::tempdir().expect("create OCI image context");
     let dockerfile = image_context.path().join("Dockerfile");
     fs::write(&dockerfile, OCI_USER_DOCKERFILE).expect("write OCI image Dockerfile");
-    let image = ImageGuard::build(&driver, &dockerfile, image_context.path())
-        .expect("build OCI-user image with selected container engine");
+    let image = ImageGuard::build(
+        &format!("{driver}-oci-user"),
+        &dockerfile,
+        image_context.path(),
+    )
+    .expect("build OCI-user image with selected container engine");
 
     let driver_config = format!(
         r#"{{"{driver}":{{"mounts":[{{"type":"volume","source":"{}","target":"{OCI_VOLUME_TARGET}","read_only":false}}]}}}}"#,
@@ -195,7 +149,7 @@ async fn oci_workspace_preparation_skips_nested_volume_ownership() {
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &[
             "--from",
-            &image.tag,
+            image.tag(),
             "--driver-config-json",
             &driver_config,
             "--no-tty",
@@ -269,7 +223,6 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
     let policy = write_bind_mount_policy().expect("write bind mount policy");
     let policy_path = policy.path().to_str().expect("policy path must be utf-8");
     let mut sandbox = SandboxGuard::create(&[
-        "--no-keep",
         "--policy",
         policy_path,
         "--driver-config-json",
@@ -298,10 +251,20 @@ fn write_bind_mount_policy() -> Result<tempfile::NamedTempFile, String> {
     let mut file =
         tempfile::NamedTempFile::new().map_err(|err| format!("create bind policy: {err}"))?;
     file.write_all(
-        br"version: 1
+        br#"version: 1
 
 filesystem_policy:
   include_workdir: false
+  read_only:
+    - "/bin"
+    - "/dev"
+    - "/etc"
+    - "/lib"
+    - "/proc"
+    - "/usr"
+  read_write:
+    - "/sandbox/e2e-bind"
+    - "/tmp"
 
 landlock:
   compatibility: best_effort
@@ -309,7 +272,7 @@ landlock:
 process:
   run_as_user: sandbox
   run_as_group: sandbox
-",
+"#,
     )
     .map_err(|err| format!("write bind policy: {err}"))?;
     Ok(file)
@@ -507,7 +470,7 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
         "docker" => Docker::connect_with_local_defaults()
             .map_err(|err| format!("connect to Docker API: {err}"))?,
         "podman" => {
-            let socket = podman_socket_path();
+            let socket = podman_socket_path()?;
             let socket_display = socket.display().to_string();
             Docker::connect_with_unix(
                 socket
@@ -527,36 +490,11 @@ async fn connect_container_api(driver: &str) -> Result<Docker, String> {
     Ok(docker)
 }
 
-fn podman_socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("OPENSHELL_PODMAN_SOCKET") {
-        return PathBuf::from(path);
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").unwrap_or_default();
-        PathBuf::from(home).join(".local/share/containers/podman/machine/podman.sock")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-            || {
-                let uid = std::process::Command::new("id")
-                    .arg("-u")
-                    .output()
-                    .ok()
-                    .and_then(|output| {
-                        String::from_utf8(output.stdout)
-                            .ok()
-                            .map(|value| value.trim().to_string())
-                    })
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| "1000".to_string());
-                PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
-            },
-            |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
-        )
-    }
+fn podman_socket_path() -> Result<PathBuf, String> {
+    let path = std::env::var_os("OPENSHELL_PODMAN_SOCKET").ok_or_else(|| {
+        "OPENSHELL_PODMAN_SOCKET must be set by e2e/with-podman-gateway.sh".to_string()
+    })?;
+    Ok(PathBuf::from(path))
 }
 
 fn unique_volume_name(driver: &str) -> String {

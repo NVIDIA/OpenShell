@@ -5,16 +5,16 @@
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
-//! The serde types here are the **single canonical representation** of the YAML
-//! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
-//! these types, ensuring round-trip fidelity.
+//! The canonical authored representation and bounded parser live in
+//! `openshell-policy-schema`; this crate adapts that representation to the
+//! runtime protobuf model and owns runtime-dependent validation.
 
 mod compose;
 mod l7_validate;
 mod merge;
 mod middleware;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
@@ -25,210 +25,70 @@ pub use ambiguity::{EndpointAmbiguity, find_endpoint_ambiguities};
 
 use hickory_proto::rr::Name;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::mcp::{
+    DEFAULT_MCP_PROTOCOL_VERSION, McpProtocolVersion, canonicalize_mcp_versions,
+};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, McpOptions, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy,
 };
-use serde::{Deserialize, Serialize};
 
 pub use compose::{
     PROVIDER_RULE_NAME_PREFIX, ProviderPolicyLayer, compose_effective_policy,
     is_provider_rule_name, provider_rule_name, strip_provider_rule_names,
 };
 pub use l7_validate::{
-    L7EndpointFields, L7Protocol, validate_explicit_tcp_additional_fields,
-    validate_l7_endpoint_semantics,
+    L7EndpointFields, L7Protocol, agent_authored_transport_rejection,
+    network_access_preset_from_str, network_access_preset_to_str,
+    network_enforcement_mode_from_str, network_enforcement_mode_to_str, network_tls_mode_from_str,
+    network_tls_mode_to_str, validate_endpoint_mode_values, validate_endpoint_modes,
+    validate_explicit_tcp_additional_fields, validate_l7_endpoint_semantics,
 };
 pub use merge::{
-    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning,
-    canonicalize_advisor_add_rule, generated_rule_name, merge_policy, policy_covers_rule,
+    L7BinaryScope, L7RuleTarget, PolicyMergeError, PolicyMergeOp, PolicyMergeResult,
+    PolicyMergeWarning, canonicalize_advisor_add_rule, generated_rule_name, merge_policy,
+    policy_covers_rule,
 };
 pub use middleware::middleware_host_matches;
 pub use middleware::validate_json as validate_network_middleware_json;
 pub use middleware::validate_json_with_config as validate_network_middleware_json_with_config;
 
-// ---------------------------------------------------------------------------
-// YAML serde types (canonical — used for both parsing and serialization)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    filesystem_policy: Option<FilesystemDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    landlock: Option<LandlockDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process: Option<ProcessDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    network_middlewares: BTreeMap<String, middleware::NetworkMiddlewareConfigDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesystemDef {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_only: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_write: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LandlockDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    compatibility: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProcessDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_user: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_group: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkPolicyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    endpoints: Vec<NetworkEndpointDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    binaries: Vec<NetworkBinaryDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "Endpoint DTO mirrors independent policy schema toggles."
-)]
-struct NetworkEndpointDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    host: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    /// Single port (backwards compat). Mutually exclusive with `ports`.
-    /// Uses `u16` to reject invalid values >65535 at parse time.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    port: u16,
-    /// Multiple ports. When non-empty, this endpoint covers all listed ports.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<u16>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    protocol: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    tls: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    enforcement: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    access: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<L7RuleDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    allowed_ips: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    deny_rules: Vec<L7DenyRuleDef>,
-    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
-    /// rather than rejected by the L7 path canonicalizer. Required for
-    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
-    /// Defaults to false (strict).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    allow_encoded_slash: bool,
-    /// When true, client-to-server WebSocket text messages on this REST
-    /// endpoint rewrite credential placeholders after an allowed 101 upgrade.
-    /// Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    websocket_credential_rewrite: bool,
-    /// When true, supported textual REST request bodies rewrite credential
-    /// placeholders before forwarding upstream. Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    request_body_credential_rewrite: bool,
-    /// Explicitly permits credentials on traffic paths that `OpenShell` cannot
-    /// inspect or rewrite. Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    allow_uninspected_credentials: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    persisted_queries: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    graphql_max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    credential_signing: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    signing_service: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    signing_region: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    credential_binding: Option<NetworkCredentialBindingDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    json_rpc: Option<JsonRpcConfigDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mcp: Option<McpConfigDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkCredentialBindingDef {
-    provider: String,
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(v: &u16) -> bool {
-    *v == 0
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct JsonRpcConfigDef {
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    max_body_bytes: u32,
-}
+// The authored serde tree lives in `openshell-policy-schema`. These local
+// aliases keep the protobuf adapter readable while exposing consumer-facing
+// names from the schema crate.
+use openshell_policy_schema::{
+    AnyMatcher as QueryAnyDef, FilesystemPolicy as FilesystemDef,
+    GraphqlOperation as GraphqlOperationDef, JsonRpcConfig as JsonRpcConfigDef,
+    L7Allow as L7AllowDef, L7DenyRule as L7DenyRuleDef, L7Rule as L7RuleDef,
+    LandlockCompatibility as LandlockCompatibilityDef, LandlockPolicy as LandlockDef,
+    MCP_VERSION_REMEDIATION, McpConfig as McpConfigDef, NetworkBinary as NetworkBinaryDef,
+    NetworkCredentialBinding as NetworkCredentialBindingDef, NetworkEndpoint as NetworkEndpointDef,
+    NetworkPolicyRule as NetworkPolicyRuleDef, ParameterMatcher as ParamMatcherDef,
+    PolicyDocument as PolicyFile, ProcessPolicy as ProcessDef, QueryMatcher as QueryMatcherDef,
+};
 
 fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
     (max_body_bytes > 0).then_some(JsonRpcConfigDef { max_body_bytes })
 }
 
-// MCP rides the same HTTP/JSON-RPC inspection machinery at runtime, but it
-// gets its own policy stanza so user-authored YAML can name the primary
-// protocol instead of treating MCP as generic JSON-RPC.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct McpConfigDef {
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    max_body_bytes: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    strict_tool_names: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    allow_all_known_mcp_methods: Option<bool>,
-}
-
 fn mcp_config_from_proto(max_body_bytes: u32, mcp: Option<&McpOptions>) -> Option<McpConfigDef> {
+    let mut versions = mcp
+        .map(|config| config.versions.clone())
+        .unwrap_or_default();
+    canonicalize_mcp_versions(&mut versions);
     let strict_tool_names = mcp.and_then(|config| config.strict_tool_names);
     let allow_all_known_mcp_methods = mcp.and_then(|config| config.allow_all_known_mcp_methods);
-    (max_body_bytes > 0 || strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some())
-        .then_some(McpConfigDef {
-            max_body_bytes,
-            strict_tool_names,
-            allow_all_known_mcp_methods,
-        })
+    (!versions.is_empty()
+        || max_body_bytes > 0
+        || strict_tool_names.is_some()
+        || allow_all_known_mcp_methods.is_some())
+    .then_some(McpConfigDef {
+        versions: Some(versions),
+        max_body_bytes,
+        strict_tool_names,
+        allow_all_known_mcp_methods,
+    })
 }
 
 /// Nested L7 config stanzas accepted by the YAML policy schema.
@@ -250,20 +110,16 @@ impl L7ConfigStanza {
     }
 }
 
-/// Parse an L7 nested config stanza and return the flattened runtime fields
-/// consumed by the supervisor policy engine.
-///
-/// The stanza schema stays tied to this crate's canonical serde definitions, so
-/// adding a new supported field requires updating this conversion next to the
-/// type that parses it.
+/// Parse an L7 config fragment using the canonical schema and return runtime
+/// fields consumed by the supervisor policy engine.
 pub fn l7_config_alias_runtime_fields(
     stanza: L7ConfigStanza,
     value: serde_json::Value,
 ) -> Result<Vec<(&'static str, serde_json::Value)>> {
     match stanza {
         L7ConfigStanza::JsonRpc => {
-            let JsonRpcConfigDef { max_body_bytes } = serde_json::from_value(value)
-                .map_err(|error| miette::miette!("invalid json_rpc config: {error}"))?;
+            let JsonRpcConfigDef { max_body_bytes } =
+                openshell_policy_schema::parse_json_rpc_config(value)?;
             let mut fields = Vec::new();
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
@@ -271,135 +127,29 @@ pub fn l7_config_alias_runtime_fields(
             Ok(fields)
         }
         L7ConfigStanza::Mcp => {
+            let config = openshell_policy_schema::parse_mcp_config(value)?;
             let McpConfigDef {
+                versions,
                 max_body_bytes,
                 strict_tool_names,
                 allow_all_known_mcp_methods,
-            } = serde_json::from_value(value)
-                .map_err(|error| miette::miette!("invalid mcp config: {error}"))?;
-            let mut fields = Vec::new();
+            } = config;
+            let mut versions = versions.unwrap_or_else(default_mcp_versions);
+            canonicalize_mcp_versions(&mut versions);
+            let mut fields = vec![("mcp_versions", serde_json::json!(versions))];
             if max_body_bytes > 0 {
                 fields.push(("json_rpc_max_body_bytes", serde_json::json!(max_body_bytes)));
             }
-            if let Some(strict_tool_names) = strict_tool_names {
-                fields.push((
-                    "mcp_strict_tool_names",
-                    serde_json::json!(strict_tool_names),
-                ));
+            if let Some(value) = strict_tool_names {
+                fields.push(("mcp_strict_tool_names", serde_json::json!(value)));
             }
-            if let Some(allow_all_known_mcp_methods) = allow_all_known_mcp_methods {
-                fields.push((
-                    "mcp_allow_all_known_mcp_methods",
-                    serde_json::json!(allow_all_known_mcp_methods),
-                ));
+            if let Some(value) = allow_all_known_mcp_methods {
+                fields.push(("mcp_allow_all_known_mcp_methods", serde_json::json!(value)));
             }
             Ok(fields)
         }
     }
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphqlOperationDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7RuleDef {
-    allow: L7AllowDef,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7AllowDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool: Option<QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    params: BTreeMap<String, ParamMatcherDef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum QueryMatcherDef {
-    // Short form: `query: { repo: "NVIDIA/*" }`.
-    Glob(String),
-    // Expanded form: `query: { repo: { any: ["NVIDIA/*", "openai/*"] } }`.
-    Any(QueryAnyDef),
-}
-
-// MCP params can be authored as nested maps in YAML, but the runtime matcher
-// map remains flat so the Rego policy can share query-param matching.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-enum ParamMatcherDef {
-    Matcher(QueryMatcherDef),
-    Object(BTreeMap<String, Self>),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryAnyDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    any: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7DenyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tool: Option<QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    params: BTreeMap<String, ParamMatcherDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkBinaryDef {
-    path: String,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    harness: bool,
-}
-
-// ---------------------------------------------------------------------------
-// YAML → proto conversion
-// ---------------------------------------------------------------------------
-
 fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
     match matcher {
         QueryMatcherDef::Glob(glob) => L7QueryMatcher { glob, any: vec![] },
@@ -580,26 +330,44 @@ fn json_rpc_max_body_bytes(json_rpc: &Option<JsonRpcConfigDef>, mcp: &Option<Mcp
     )
 }
 
-fn mcp_strict_tool_names(mcp: &Option<McpConfigDef>) -> Option<bool> {
-    mcp.as_ref().and_then(|config| config.strict_tool_names)
-}
+fn mcp_options(protocol: &str, mcp: &Option<McpConfigDef>) -> Option<McpOptions> {
+    if !is_mcp_protocol(protocol) {
+        return None;
+    }
 
-fn mcp_allow_all_known_mcp_methods(mcp: &Option<McpConfigDef>) -> Option<bool> {
-    mcp.as_ref()
-        .and_then(|config| config.allow_all_known_mcp_methods)
-}
-
-fn mcp_options(mcp: &Option<McpConfigDef>) -> Option<McpOptions> {
-    let strict_tool_names = mcp_strict_tool_names(mcp);
-    let allow_all_known_mcp_methods = mcp_allow_all_known_mcp_methods(mcp);
-    (strict_tool_names.is_some() || allow_all_known_mcp_methods.is_some()).then_some(McpOptions {
-        strict_tool_names,
-        allow_all_known_mcp_methods,
+    let mut versions = mcp
+        .as_ref()
+        .and_then(|config| config.versions.clone())
+        .unwrap_or_else(default_mcp_versions);
+    // Authored YAML is validated before this conversion. Sort only after that
+    // boundary so duplicate or unsupported input cannot be hidden.
+    canonicalize_mcp_versions(&mut versions);
+    Some(McpOptions {
+        strict_tool_names: mcp.as_ref().and_then(|config| config.strict_tool_names),
+        allow_all_known_mcp_methods: mcp
+            .as_ref()
+            .and_then(|config| config.allow_all_known_mcp_methods),
+        versions,
     })
 }
 
 fn is_mcp_protocol(protocol: &str) -> bool {
     protocol.eq_ignore_ascii_case("mcp")
+}
+
+fn default_mcp_versions() -> Vec<String> {
+    // The single pinned constant is intentionally independent of the registry
+    // size and order, so adding support for a revision cannot widen an
+    // existing versionless policy.
+    vec![DEFAULT_MCP_PROTOCOL_VERSION.as_str().to_string()]
+}
+
+/// Sort one protobuf MCP contract without hiding invalid input.
+///
+/// Exact supported revisions use semantic catalog order. Duplicate and
+/// unsupported identifiers remain present for subsequent validation.
+pub(crate) fn canonicalize_mcp_options(options: &mut McpOptions) {
+    canonicalize_mcp_versions(&mut options.versions);
 }
 
 fn split_tool_param(
@@ -705,6 +473,19 @@ fn yaml_mcp_method(
 }
 
 fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
+    for (policy_name, rule) in &raw.network_policies {
+        for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
+            let errors =
+                validate_endpoint_modes(&endpoint.tls, &endpoint.enforcement, &endpoint.access);
+            if !errors.is_empty() {
+                return Err(miette::miette!(
+                    "network policy '{policy_name}': endpoint {endpoint_index}: {}",
+                    errors.join("; ")
+                ));
+            }
+        }
+    }
+
     let network_middlewares = middleware::into_proto(raw.network_middlewares)
         .into_diagnostic()
         .wrap_err("failed to convert network middleware config")?;
@@ -741,9 +522,15 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             port: normalized_ports.first().copied().unwrap_or(0),
                             ports: normalized_ports,
                             protocol: protocol.clone(),
-                            tls: e.tls,
-                            enforcement: e.enforcement,
-                            access: e.access,
+                            tls: network_tls_mode_from_str(&e.tls)
+                                .expect("endpoint modes validated above")
+                                as i32,
+                            enforcement: network_enforcement_mode_from_str(&e.enforcement)
+                                .expect("endpoint modes validated above")
+                                as i32,
+                            access: network_access_preset_from_str(&e.access)
+                                .expect("endpoint modes validated above")
+                                as i32,
                             rules: allow_rules
                                 .into_iter()
                                 .map(|r| L7Rule {
@@ -762,6 +549,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             // Provider credential provenance is derived by the
                             // gateway and cannot be authored in policy YAML.
                             provider_credentialed: false,
+                            token_grant_owner: String::new(),
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,
@@ -790,17 +578,14 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                                 }
                             }),
                             json_rpc_max_body_bytes: json_rpc_max_body_bytes(&e.json_rpc, &e.mcp),
-                            mcp: mcp_options(&e.mcp),
+                            mcp: mcp_options(&protocol, &e.mcp),
                         }
                     })
                     .collect(),
                 binaries: rule
                     .binaries
                     .into_iter()
-                    .map(|b| NetworkBinary {
-                        path: b.path,
-                        ..Default::default()
-                    })
+                    .map(|b| NetworkBinary { path: b.path })
                     .collect(),
             };
             (key, proto_rule)
@@ -815,7 +600,10 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
             read_write: fs.read_write,
         }),
         landlock: raw.landlock.map(|ll| LandlockPolicy {
-            compatibility: ll.compatibility,
+            compatibility: match ll.compatibility {
+                LandlockCompatibilityDef::BestEffort => "best_effort".to_string(),
+                LandlockCompatibilityDef::HardRequirement => "hard_requirement".to_string(),
+            },
         }),
         process: raw.process.map(|p| ProcessPolicy {
             run_as_user: p.run_as_user,
@@ -830,16 +618,28 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
 // Proto → YAML conversion
 // ---------------------------------------------------------------------------
 
-fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
+fn from_proto(policy: &SandboxPolicy) -> Result<PolicyFile> {
     let filesystem_policy = policy.filesystem.as_ref().map(|fs| FilesystemDef {
         include_workdir: fs.include_workdir,
         read_only: fs.read_only.clone(),
         read_write: fs.read_write.clone(),
     });
 
-    let landlock = policy.landlock.as_ref().map(|ll| LandlockDef {
-        compatibility: ll.compatibility.clone(),
-    });
+    let landlock = match policy.landlock.as_ref() {
+        Some(ll) => {
+            let compatibility = match ll.compatibility.as_str() {
+                "hard_requirement" => LandlockCompatibilityDef::HardRequirement,
+                "best_effort" | "" => LandlockCompatibilityDef::BestEffort,
+                otherwise => miette::bail!(
+                    "invalid landlock.compatibility {:?}; accepted: {}",
+                    otherwise,
+                    openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                ),
+            };
+            Some(LandlockDef { compatibility })
+        }
+        _ => None,
+    };
 
     let process = policy.process.as_ref().and_then(|p| {
         if p.run_as_user.is_empty() && p.run_as_group.is_empty() {
@@ -855,21 +655,37 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
     let network_policies = policy
         .network_policies
         .iter()
-        .map(|(key, rule)| {
+        .map(|(key, rule)| -> Result<_> {
             let yaml_rule = NetworkPolicyRuleDef {
                 name: rule.name.clone(),
                 endpoints: rule
                     .endpoints
                     .iter()
-                    .map(|e| {
+                    .map(|e| -> Result<_> {
                         // Use compact form: if ports has exactly 1 element,
                         // emit port (scalar). If >1, emit ports (array).
-                        // Proto uses u32; YAML uses u16. Clamp at boundary.
-                        let clamp = |v: u32| -> u16 { v.min(65535) as u16 };
+                        // Proto uses u32; authored ports are u16. Reject an
+                        // invalid protobuf value instead of silently clamping.
+                        let checked = |value: u32| {
+                            u16::try_from(value).map_err(|_| {
+                                miette::miette!(
+                                    "cannot serialize endpoint '{}': port {value} exceeds {}",
+                                    e.host,
+                                    u16::MAX
+                                )
+                            })
+                        };
                         let (port, ports) = if e.ports.len() > 1 {
-                            (0, e.ports.iter().map(|&p| clamp(p)).collect())
+                            (
+                                0,
+                                e.ports
+                                    .iter()
+                                    .copied()
+                                    .map(checked)
+                                    .collect::<Result<Vec<_>>>()?,
+                            )
                         } else {
-                            (clamp(e.ports.first().copied().unwrap_or(e.port)), vec![])
+                            (checked(e.ports.first().copied().unwrap_or(e.port))?, vec![])
                         };
                         let protocol = e.protocol.clone();
                         let mcp_allow_all_known_mcp_methods = !is_mcp_protocol(&protocol)
@@ -903,15 +719,21 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         } else {
                             (json_rpc_config_from_proto(e.json_rpc_max_body_bytes), None)
                         };
-                        NetworkEndpointDef {
+                        Ok(NetworkEndpointDef {
                             host: e.host.clone(),
                             path: e.path.clone(),
                             port,
                             ports,
                             protocol,
-                            tls: e.tls.clone(),
-                            enforcement: e.enforcement.clone(),
-                            access: e.access.clone(),
+                            tls: network_tls_mode_to_str(e.tls)
+                                .expect("policy enum values validated before serialization")
+                                .to_string(),
+                            enforcement: network_enforcement_mode_to_str(e.enforcement)
+                                .expect("policy enum values validated before serialization")
+                                .to_string(),
+                            access: network_access_preset_to_str(e.access)
+                                .expect("policy enum values validated before serialization")
+                                .to_string(),
                             rules,
                             allowed_ips: e.allowed_ips.clone(),
                             deny_rules,
@@ -945,32 +767,38 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             }),
                             json_rpc,
                             mcp,
-                        }
+                        })
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>>>()?,
                 binaries: rule
                     .binaries
                     .iter()
                     .map(|b| NetworkBinaryDef {
                         path: b.path.clone(),
-                        harness: false,
                     })
                     .collect(),
             };
-            (key.clone(), yaml_rule)
+            Ok((key.clone(), yaml_rule))
         })
-        .collect();
+        .collect::<Result<BTreeMap<_, _>>>()?;
 
     let network_middlewares = middleware::from_proto(&policy.network_middlewares);
 
-    PolicyFile {
-        version: policy.version,
+    Ok(PolicyFile {
+        // Proto3 scalar fields do not preserve presence. Treat zero as an
+        // omitted authored version and materialize the only supported schema
+        // version in canonical output.
+        version: if policy.version == 0 {
+            1
+        } else {
+            policy.version
+        },
         filesystem_policy,
         landlock,
         process,
         network_policies,
         network_middlewares,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,11 +850,21 @@ pub fn is_valid_sandbox_identity(value: &str) -> bool {
 // Public API
 // ---------------------------------------------------------------------------
 
+// Validate raw authored values and their relationship to the endpoint protocol
+// before conversion. Keeping validation outside the Serde error wrapper makes
+// actionable MCP diagnostics the top-level user-facing error.
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yml::from_str(yaml)
-        .into_diagnostic()
-        .wrap_err("failed to parse sandbox policy YAML")?;
+    let raw = openshell_policy_schema::parse_policy(yaml)?;
+    to_proto(raw)
+}
+
+/// Parse a sandbox policy from a regular file using the shared bounded reader.
+pub fn parse_sandbox_policy_file(path: &Path) -> Result<SandboxPolicy> {
+    let raw = openshell_policy_schema::parse_policy_file(
+        path,
+        openshell_policy_schema::ParseLimits::default(),
+    )?;
     to_proto(raw)
 }
 
@@ -1036,10 +874,12 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    let yaml_repr = from_proto(policy);
-    serde_yml::to_string(&yaml_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to YAML")
+    validate_proto_version_for_authored_serialization(policy)?;
+    validate_policy_enum_values(policy)?;
+    let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
+        .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
+    let yaml_repr = from_proto(&canonical)?;
+    openshell_policy_schema::serialize_policy(&yaml_repr)
 }
 
 /// Convert a proto sandbox policy into the canonical policy JSON representation.
@@ -1047,10 +887,38 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    let json_repr = from_proto(policy);
-    serde_json::to_value(&json_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to JSON")
+    validate_proto_version_for_authored_serialization(policy)?;
+    validate_policy_enum_values(policy)?;
+    let canonical = validate_and_canonicalize_mcp_policy_schema(policy.clone())
+        .map_err(|error| miette::miette!("cannot serialize invalid sandbox policy: {error}"))?;
+    let json_repr = from_proto(&canonical)?;
+    openshell_policy_schema::policy_to_json_value(&json_repr)
+}
+
+fn validate_proto_version_for_authored_serialization(policy: &SandboxPolicy) -> Result<()> {
+    if !matches!(policy.version, 0 | 1) {
+        miette::bail!(
+            "cannot serialize unsupported protobuf policy version {}; expected 0 (omitted) or 1",
+            policy.version
+        );
+    }
+    Ok(())
+}
+
+fn validate_policy_enum_values(policy: &SandboxPolicy) -> Result<()> {
+    for (policy_name, rule) in &policy.network_policies {
+        for (endpoint_index, endpoint) in rule.endpoints.iter().enumerate() {
+            let errors =
+                validate_endpoint_mode_values(endpoint.tls, endpoint.enforcement, endpoint.access);
+            if !errors.is_empty() {
+                return Err(miette::miette!(
+                    "network policy '{policy_name}': endpoint {endpoint_index}: {}",
+                    errors.join("; ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serialize a proto sandbox policy to a pretty-printed JSON string.
@@ -1071,20 +939,14 @@ pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
 /// caller to omit the policy and let the server / sandbox apply its own
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    let contents = if let Some(p) = cli_path {
-        let path = Path::new(p);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
+    let policy = if let Some(p) = cli_path {
+        parse_sandbox_policy_file(Path::new(p))?
     } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
-        let path = Path::new(&policy_path);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
+        parse_sandbox_policy_file(Path::new(&policy_path))?
     } else {
         return Ok(None);
     };
-    parse_sandbox_policy(&contents).map(Some)
+    Ok(Some(policy))
 }
 
 /// Well-known path where a sandbox container image can ship a policy YAML file.
@@ -1095,7 +957,7 @@ pub use openshell_core::container_paths::CONTAINER_POLICY_PATH;
 
 /// Legacy path used before the navigator → openshell rename.
 ///
-/// Existing community sandbox images still ship their policy at this path.
+/// Older images may still ship their policy at this path.
 /// The sandbox supervisor tries [`CONTAINER_POLICY_PATH`] first, then falls
 /// back to this legacy path for backward compatibility.
 pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
@@ -1106,18 +968,18 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// This policy grants filesystem access to standard system paths, leaves
 /// process identity selection to the compute runtime, enables Landlock in
 /// best-effort mode, and **blocks all network access** (no network policies,
-/// no inference routing).
+/// and no provider-derived endpoint access).
 pub fn restrictive_default_policy() -> SandboxPolicy {
     SandboxPolicy {
         version: 1,
         filesystem: Some(FilesystemPolicy {
             include_workdir: true,
             read_only: vec![
+                "/bin".into(),
                 "/usr".into(),
                 "/lib".into(),
                 "/proc".into(),
                 "/dev/urandom".into(),
-                "/app".into(),
                 "/etc".into(),
                 "/var/log".into(),
             ],
@@ -1229,6 +1091,28 @@ pub enum PolicyViolation {
         middleware_name: String,
         policy_name: String,
         host: String,
+    },
+    /// `landlock.compatibility` has an unrecognized value.
+    InvalidLandlockCompatibility { value: String },
+    /// An effective MCP endpoint has not materialized a protocol revision.
+    MissingMcpVersions { policy_name: String, host: String },
+    /// A non-MCP endpoint carries MCP-only configuration.
+    McpOptionsOnNonMcpEndpoint {
+        policy_name: String,
+        host: String,
+        protocol: String,
+    },
+    /// An MCP revision allowlist contains an unsupported exact identifier.
+    UnsupportedMcpVersion {
+        policy_name: String,
+        host: String,
+        version: String,
+    },
+    /// An MCP revision allowlist contains the same identifier more than once.
+    DuplicateMcpVersion {
+        policy_name: String,
+        host: String,
+        version: String,
     },
 }
 
@@ -1392,6 +1276,49 @@ impl fmt::Display for PolicyViolation {
                      '{policy_name}' tls: skip endpoint '{host}'"
                 )
             }
+            Self::InvalidLandlockCompatibility { value } => {
+                write!(
+                    f,
+                    "invalid landlock.compatibility '{value}'; accepted: {}",
+                    openshell_core::policy::LANDLOCK_COMPATIBILITY_VALUES.join(", ")
+                )
+            }
+            Self::MissingMcpVersions { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': MCP endpoint '{host}' has no materialized protocol version"
+                )
+            }
+            Self::McpOptionsOnNonMcpEndpoint {
+                policy_name,
+                host,
+                protocol,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' uses protocol '{protocol}' and cannot configure mcp options"
+                )
+            }
+            Self::UnsupportedMcpVersion {
+                policy_name,
+                host,
+                version,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': MCP endpoint '{host}' has unsupported protocol version '{version}'; {MCP_VERSION_REMEDIATION}"
+                )
+            }
+            Self::DuplicateMcpVersion {
+                policy_name,
+                host,
+                version,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': MCP endpoint '{host}' repeats protocol version '{version}'"
+                )
+            }
         }
     }
 }
@@ -1413,8 +1340,79 @@ impl fmt::Display for PolicyViolation {
 /// - Middleware names, implementations, failure modes, selectors, and built-in
 ///   configurations must be valid
 /// - Middleware selectors must not match endpoints that skip TLS inspection
+/// - MCP endpoints must carry a nonempty, unique allowlist of exact supported
+///   revisions
+/// - Non-MCP endpoints must not carry MCP options
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    validate_sandbox_policy_with_mcp_presence(policy, McpVersionPresence::RequireMaterialized)
+}
+
+/// Validate filesystem paths shared by typed policies and raw OPA data.
+///
+/// Paths must be absolute, contain no parent traversal, and fit the path count
+/// and byte limits. Read-write access to the filesystem root is forbidden.
+/// Callers that expose errors outside trusted authoring tools must redact the
+/// path values carried by the returned violations.
+pub fn validate_filesystem_paths(
+    read_only: &[String],
+    read_write: &[String],
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+    let total_paths = read_only.len() + read_write.len();
+    if total_paths > MAX_FILESYSTEM_PATHS {
+        violations.push(PolicyViolation::TooManyPaths { count: total_paths });
+    }
+
+    for path_str in read_only.iter().chain(read_write.iter()) {
+        if path_str.len() > MAX_PATH_LENGTH {
+            violations.push(PolicyViolation::FieldTooLong {
+                path: truncate_for_display(path_str),
+                length: path_str.len(),
+            });
+            continue;
+        }
+        let path = Path::new(path_str);
+        if !path.has_root() {
+            violations.push(PolicyViolation::RelativePath {
+                path: path_str.clone(),
+            });
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            violations.push(PolicyViolation::PathTraversal {
+                path: path_str.clone(),
+            });
+        }
+    }
+
+    for path_str in read_write {
+        // Repeated separators still designate the filesystem root.
+        if path_str.trim_end_matches('/').is_empty() {
+            violations.push(PolicyViolation::OverlyBroadPath {
+                path: path_str.clone(),
+            });
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpVersionPresence {
+    RequireMaterialized,
+    AllowDefaultable,
+}
+
+fn validate_sandbox_policy_with_mcp_presence(
+    policy: &SandboxPolicy,
+    mcp_version_presence: McpVersionPresence,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
@@ -1436,60 +1434,38 @@ pub fn validate_sandbox_policy(
         }
     }
 
-    // Check filesystem paths
-    if let Some(ref fs) = policy.filesystem {
-        let total_paths = fs.read_only.len() + fs.read_write.len();
-        if total_paths > MAX_FILESYSTEM_PATHS {
-            violations.push(PolicyViolation::TooManyPaths { count: total_paths });
-        }
-
-        for path_str in fs.read_only.iter().chain(fs.read_write.iter()) {
-            if path_str.len() > MAX_PATH_LENGTH {
-                violations.push(PolicyViolation::FieldTooLong {
-                    path: truncate_for_display(path_str),
-                    length: path_str.len(),
-                });
-                continue;
-            }
-
-            let path = Path::new(path_str);
-
-            if !path.has_root() {
-                violations.push(PolicyViolation::RelativePath {
-                    path: path_str.clone(),
-                });
-            }
-
-            if path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                violations.push(PolicyViolation::PathTraversal {
-                    path: path_str.clone(),
-                });
-            }
-        }
-
-        // Only reject "/" as read-write (overly broad)
-        for path_str in &fs.read_write {
-            let normalized = path_str.trim_end_matches('/');
-            if normalized.is_empty() {
-                // Path is "/" or "///" etc.
-                violations.push(PolicyViolation::OverlyBroadPath {
-                    path: path_str.clone(),
-                });
-            }
-        }
+    // Check landlock compatibility mode is a recognized value. Direct gRPC/SDK
+    // clients bypass YAML serde validation, so reject invalid values here at the
+    // gateway create path rather than deferring rejection to sandbox startup.
+    if let Some(ref landlock) = policy.landlock
+        && !openshell_core::policy::is_valid_landlock_compatibility(&landlock.compatibility)
+    {
+        violations.push(PolicyViolation::InvalidLandlockCompatibility {
+            value: landlock.compatibility.clone(),
+        });
     }
 
+    if let Some(ref fs) = policy.filesystem
+        && let Err(errors) = validate_filesystem_paths(&fs.read_only, &fs.read_write)
+    {
+        violations.extend(errors);
+    }
+
+    // Protobuf maps do not preserve iteration order. Sort rule keys so callers
+    // receive stable validation errors for equivalent policy inputs.
+    let mut network_policies: Vec<_> = policy.network_policies.iter().collect();
+    network_policies.sort_by_key(|(name, _)| *name);
+
     // Check network policy endpoint hosts for TLD wildcards.
-    for (key, rule) in &policy.network_policies {
+    for (key, rule) in network_policies {
         let name = if rule.name.is_empty() {
             key.clone()
         } else {
             rule.name.clone()
         };
         for (endpoint_index, ep) in rule.endpoints.iter().enumerate() {
+            let access = network_access_preset_to_str(ep.access).unwrap_or_default();
+            let enforcement = network_enforcement_mode_to_str(ep.enforcement).unwrap_or_default();
             let explicit_tcp = l7_validate::is_explicit_tcp_protocol(&ep.protocol);
             if ep.host.trim().is_empty() && explicit_tcp {
                 violations.push(PolicyViolation::MissingTcpEndpointHost {
@@ -1587,7 +1563,7 @@ pub fn validate_sandbox_policy(
                 });
             let fields = L7EndpointFields {
                 protocol: &ep.protocol,
-                access: &ep.access,
+                access,
                 has_rules: !ep.rules.is_empty(),
                 has_deny_rules: !ep.deny_rules.is_empty(),
                 rules_would_deny_all,
@@ -1598,8 +1574,13 @@ pub fn validate_sandbox_policy(
                     .unwrap_or(false),
             };
             let mut l7_errors = validate_l7_endpoint_semantics(&fields);
+            l7_errors.extend(validate_endpoint_mode_values(
+                ep.tls,
+                ep.enforcement,
+                ep.access,
+            ));
             let mut explicit_tcp_fields = Vec::new();
-            if !ep.enforcement.is_empty() {
+            if ep.enforcement != 0 {
                 explicit_tcp_fields.push("enforcement");
             }
             if !ep.path.is_empty() {
@@ -1644,13 +1625,10 @@ pub fn validate_sandbox_policy(
                     ep.persisted_queries
                 ));
             }
-            if ep.protocol == "sql" && ep.enforcement == "enforce" {
+            if ep.protocol == "sql" && enforcement == "enforce" {
                 l7_errors.push(
                     "SQL enforcement requires full SQL parsing; use enforcement: audit".to_string(),
                 );
-            }
-            if ep.mcp.is_some() && ep.protocol != "mcp" {
-                l7_errors.push("mcp options are only valid for protocol mcp".to_string());
             }
             if ep.protocol == "graphql" {
                 for (rule_index, rule) in ep.rules.iter().enumerate() {
@@ -1693,6 +1671,7 @@ pub fn validate_sandbox_policy(
                     reason,
                 }
             }));
+            collect_mcp_endpoint_violations(&name, ep, mcp_version_presence, &mut violations);
         }
     }
 
@@ -1757,6 +1736,186 @@ fn validate_tcp_dns_host_selector(host: &str) -> std::result::Result<(), String>
     Ok(())
 }
 
+fn collect_mcp_endpoint_violations(
+    policy_name: &str,
+    endpoint: &NetworkEndpoint,
+    mcp_version_presence: McpVersionPresence,
+    violations: &mut Vec<PolicyViolation>,
+) {
+    if is_mcp_protocol(&endpoint.protocol) {
+        let Some(mcp) = endpoint.mcp.as_ref() else {
+            if mcp_version_presence == McpVersionPresence::RequireMaterialized {
+                violations.push(PolicyViolation::MissingMcpVersions {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                });
+            }
+            return;
+        };
+        if mcp.versions.is_empty() {
+            if mcp_version_presence == McpVersionPresence::RequireMaterialized {
+                violations.push(PolicyViolation::MissingMcpVersions {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                });
+            }
+            return;
+        }
+
+        let mut seen = BTreeSet::new();
+        for version in &mcp.versions {
+            if !seen.insert(version.as_str()) {
+                violations.push(PolicyViolation::DuplicateMcpVersion {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                    version: version.clone(),
+                });
+            }
+            if version.parse::<McpProtocolVersion>().is_err() {
+                violations.push(PolicyViolation::UnsupportedMcpVersion {
+                    policy_name: policy_name.to_string(),
+                    host: endpoint.host.clone(),
+                    version: version.clone(),
+                });
+            }
+        }
+    } else if endpoint.mcp.is_some() {
+        violations.push(PolicyViolation::McpOptionsOnNonMcpEndpoint {
+            policy_name: policy_name.to_string(),
+            host: endpoint.host.clone(),
+            protocol: endpoint.protocol.clone(),
+        });
+    }
+}
+
+fn validate_mcp_policy_schema(
+    policy: &SandboxPolicy,
+    mcp_version_presence: McpVersionPresence,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+    let mut network_policies: Vec<_> = policy.network_policies.iter().collect();
+    network_policies.sort_by_key(|(name, _)| *name);
+    for (key, rule) in network_policies {
+        let policy_name = if rule.name.is_empty() {
+            key.as_str()
+        } else {
+            rule.name.as_str()
+        };
+        for endpoint in &rule.endpoints {
+            collect_mcp_endpoint_violations(
+                policy_name,
+                endpoint,
+                mcp_version_presence,
+                &mut violations,
+            );
+        }
+    }
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// Error returned when a checked policy boundary receives invalid protobuf state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyValidationError {
+    violations: Vec<PolicyViolation>,
+}
+
+impl PolicyValidationError {
+    /// Borrow every violation found while validating the policy.
+    #[must_use]
+    pub fn violations(&self) -> &[PolicyViolation] {
+        &self.violations
+    }
+
+    /// Consume the error and return every violation.
+    #[must_use]
+    pub fn into_violations(self) -> Vec<PolicyViolation> {
+        self.violations
+    }
+}
+
+impl fmt::Display for PolicyValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "sandbox policy validation failed")?;
+        for violation in &self.violations {
+            write!(formatter, "; {violation}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for PolicyValidationError {}
+
+fn validate_and_canonicalize_mcp_policy_schema(
+    mut policy: SandboxPolicy,
+) -> std::result::Result<SandboxPolicy, PolicyValidationError> {
+    validate_mcp_policy_schema(&policy, McpVersionPresence::AllowDefaultable)
+        .map_err(|violations| PolicyValidationError { violations })?;
+    materialize_default_mcp_versions(&mut policy);
+    canonicalize_mcp_version_allowlists(&mut policy);
+    validate_mcp_policy_schema(&policy, McpVersionPresence::RequireMaterialized)
+        .map_err(|violations| PolicyValidationError { violations })?;
+    Ok(policy)
+}
+
+/// Validate raw protobuf policy state, then return its canonical representation.
+///
+/// Validation deliberately runs before default materialization and sorting so
+/// malformed, duplicate, or misplaced MCP state cannot be repaired or hidden
+/// by normalization. Missing or empty protobuf MCP options select the pinned
+/// default because proto3 repeated fields do not preserve authoring presence.
+/// Canonicalization only inserts the known pinned default and sorts allowlists
+/// that the first pass already proved valid, so it cannot invalidate another
+/// policy field. Debug builds recheck that local transformation invariant
+/// without imposing a second whole-policy traversal on production read paths.
+pub fn validate_and_canonicalize_sandbox_policy(
+    mut policy: SandboxPolicy,
+) -> std::result::Result<SandboxPolicy, PolicyValidationError> {
+    validate_sandbox_policy_with_mcp_presence(&policy, McpVersionPresence::AllowDefaultable)
+        .map_err(|violations| PolicyValidationError { violations })?;
+    materialize_default_mcp_versions(&mut policy);
+    canonicalize_mcp_version_allowlists(&mut policy);
+    debug_assert!(
+        validate_sandbox_policy(&policy).is_ok(),
+        "validated MCP canonicalization must preserve every policy invariant"
+    );
+    Ok(policy)
+}
+
+/// Replace absent protobuf MCP options and empty revision lists with the
+/// single pinned policy default while preserving every explicit MCP option.
+pub(crate) fn materialize_default_mcp_versions(policy: &mut SandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            if !is_mcp_protocol(&endpoint.protocol) {
+                continue;
+            }
+            let options = endpoint.mcp.get_or_insert_default();
+            if options.versions.is_empty() {
+                options.versions = default_mcp_versions();
+            }
+        }
+    }
+}
+
+/// Canonicalize every MCP revision allowlist without deleting invalid input.
+///
+/// This helper is crate-private because external callers should use
+/// [`validate_and_canonicalize_sandbox_policy`] and cannot safely normalize an
+/// unvalidated policy in place.
+pub(crate) fn canonicalize_mcp_version_allowlists(policy: &mut SandboxPolicy) {
+    for rule in policy.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            if let Some(options) = endpoint.mcp.as_mut() {
+                canonicalize_mcp_options(options);
+            }
+        }
+    }
+}
+
 /// Truncate a string for safe inclusion in error messages.
 fn truncate_for_display(s: &str) -> String {
     if s.len() <= 80 {
@@ -1780,7 +1939,7 @@ fn truncate_for_display(s: &str) -> String {
 ///
 /// Re-exported from `openshell-core` so existing call sites
 /// (`openshell_policy::normalize_path`) keep resolving.
-pub use openshell_core::paths::normalize_path;
+pub use openshell_policy_schema::normalize_path;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1972,6 +2131,10 @@ network_policies:
         let fs = policy.filesystem.expect("must have filesystem policy");
         assert!(fs.include_workdir);
         assert!(
+            fs.read_only.iter().any(|p| p == "/bin"),
+            "read_only should contain /bin"
+        );
+        assert!(
             fs.read_only.iter().any(|p| p == "/usr"),
             "read_only should contain /usr"
         );
@@ -2014,19 +2177,132 @@ network_policies:
     }
 
     #[test]
-    fn process_identity_omission_survives_yaml_round_trip() {
-        let policy = parse_sandbox_policy("version: 1\nprocess:\n  run_as_user: \"1234\"\n")
-            .expect("partial process identity should parse");
-        let process = policy.process.as_ref().expect("process section");
-        assert_eq!(process.run_as_user, "1234");
-        assert!(process.run_as_group.is_empty());
-        assert!(validate_sandbox_policy(&policy).is_ok());
+    fn canonical_serializers_materialize_omitted_proto_version() {
+        let policy = SandboxPolicy::default();
 
-        let yaml = serialize_sandbox_policy(&policy).expect("partial identity should serialize");
-        assert!(yaml.contains("run_as_user"));
-        assert!(!yaml.contains("run_as_group"));
-        let reparsed = parse_sandbox_policy(&yaml).expect("round trip should parse");
-        assert!(reparsed.process.unwrap().run_as_group.is_empty());
+        let yaml = serialize_sandbox_policy(&policy).expect("serialize default protobuf policy");
+        assert_eq!(
+            parse_sandbox_policy(&yaml)
+                .expect("canonical YAML must round trip")
+                .version,
+            1
+        );
+
+        let json =
+            sandbox_policy_to_json_value(&policy).expect("serialize default protobuf policy");
+        assert_eq!(json["version"], 1);
+    }
+
+    #[test]
+    fn validation_rejects_unknown_security_sensitive_endpoint_values() {
+        let error = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  github_api:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: skp
+        enforcement: enforc
+        access: read-wirte
+",
+        )
+        .expect_err("unknown YAML names must be rejected before protobuf conversion");
+        let message = error.to_string();
+
+        assert!(message.contains("unknown tls value 'skp'"));
+        assert!(message.contains("unknown enforcement value 'enforc'"));
+        assert!(message.contains("unknown access value 'read-wirte'"));
+
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "unknown_enum".to_string(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    enforcement: 99,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).expect_err("unknown enum must fail");
+        assert!(
+            violations[0]
+                .to_string()
+                .contains("unknown enforcement enum value 99")
+        );
+    }
+
+    #[test]
+    fn canonical_serializers_reject_unsupported_proto_version() {
+        let policy = SandboxPolicy {
+            version: 2,
+            ..Default::default()
+        };
+
+        let error = serialize_sandbox_policy(&policy)
+            .expect_err("unsupported protobuf versions must not serialize");
+        assert!(error.to_string().contains("protobuf policy version 2"));
+    }
+
+    #[test]
+    fn canonical_serializers_preserve_independent_process_identity_omission() {
+        let cases = [
+            ("", "", None, None),
+            ("1500", "", Some("1500"), None),
+            ("", "1600", None, Some("1600")),
+            ("1500", "1600", Some("1500"), Some("1600")),
+        ];
+
+        for (user, group, expected_user, expected_group) in cases {
+            let policy = SandboxPolicy {
+                version: 1,
+                process: Some(ProcessPolicy {
+                    run_as_user: user.to_owned(),
+                    run_as_group: group.to_owned(),
+                }),
+                ..Default::default()
+            };
+
+            let yaml = serialize_sandbox_policy(&policy)
+                .expect("omitted process identity components must serialize to YAML");
+            assert_eq!(yaml.contains("run_as_user:"), expected_user.is_some());
+            assert_eq!(yaml.contains("run_as_group:"), expected_group.is_some());
+
+            let reparsed = parse_sandbox_policy(&yaml).expect("canonical YAML must round trip");
+            let reparsed_user = reparsed
+                .process
+                .as_ref()
+                .map(|process| process.run_as_user.as_str())
+                .filter(|value| !value.is_empty());
+            let reparsed_group = reparsed
+                .process
+                .as_ref()
+                .map(|process| process.run_as_group.as_str())
+                .filter(|value| !value.is_empty());
+            assert_eq!(reparsed_user, expected_user);
+            assert_eq!(reparsed_group, expected_group);
+
+            let json = sandbox_policy_to_json_value(&policy)
+                .expect("omitted process identity components must serialize to JSON");
+            let json_process = json.get("process");
+            assert_eq!(
+                json_process.and_then(|process| process.get("run_as_user")),
+                expected_user.map(serde_json::Value::from).as_ref()
+            );
+            assert_eq!(
+                json_process.and_then(|process| process.get("run_as_group")),
+                expected_group.map(serde_json::Value::from).as_ref()
+            );
+            assert_eq!(
+                json_process.is_some(),
+                expected_user.is_some() || expected_group.is_some()
+            );
+        }
     }
 
     #[test]
@@ -2155,6 +2431,7 @@ network_policies:
         let fields = l7_config_alias_runtime_fields(
             L7ConfigStanza::Mcp,
             serde_json::json!({
+                "versions": ["2025-11-25", "2025-03-26", "2025-06-18"],
                 "max_body_bytes": 131_072,
                 "strict_tool_names": false,
                 "allow_all_known_mcp_methods": true
@@ -2165,9 +2442,29 @@ network_policies:
         assert_eq!(
             fields,
             vec![
+                (
+                    "mcp_versions",
+                    serde_json::json!(["2025-03-26", "2025-06-18", "2025-11-25"])
+                ),
                 ("json_rpc_max_body_bytes", serde_json::json!(131_072)),
                 ("mcp_strict_tool_names", serde_json::json!(false)),
                 ("mcp_allow_all_known_mcp_methods", serde_json::json!(true)),
+            ]
+        );
+
+        let runtime_only_fields = l7_config_alias_runtime_fields(
+            L7ConfigStanza::Mcp,
+            serde_json::json!({"strict_tool_names": false}),
+        )
+        .expect("runtime alias parsing supplies the pinned wire profile");
+        assert_eq!(
+            runtime_only_fields,
+            vec![
+                (
+                    "mcp_versions",
+                    serde_json::json!([DEFAULT_MCP_PROTOCOL_VERSION.as_str()])
+                ),
+                ("mcp_strict_tool_names", serde_json::json!(false))
             ]
         );
 
@@ -2177,6 +2474,451 @@ network_policies:
         )
         .expect_err("unknown JSON-RPC config fields must be rejected");
         assert!(err.to_string().contains("on_parse_error"));
+    }
+
+    #[test]
+    fn l7_mcp_alias_rejects_invalid_raw_version_authoring() {
+        let cases = [
+            ("null config", serde_json::Value::Null),
+            ("null versions", serde_json::json!({"versions": null})),
+            ("empty versions", serde_json::json!({"versions": []})),
+            (
+                "duplicate revision",
+                serde_json::json!({"versions": ["2025-11-25", "2025-11-25"]}),
+            ),
+            (
+                "unsupported revision",
+                serde_json::json!({"versions": ["2025-11-26"]}),
+            ),
+            (
+                "leading whitespace",
+                serde_json::json!({"versions": [" 2025-11-25"]}),
+            ),
+            (
+                "trailing whitespace",
+                serde_json::json!({"versions": ["2025-11-25 "]}),
+            ),
+        ];
+
+        for (case, value) in cases {
+            let error = l7_config_alias_runtime_fields(L7ConfigStanza::Mcp, value)
+                .expect_err("invalid raw MCP version authoring must fail");
+            assert!(
+                error.to_string().contains("invalid mcp config"),
+                "{case} returned an unexpected diagnostic: {error}"
+            );
+        }
+    }
+
+    const MCP_VERSIONS: [&str; 4] = ["2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"];
+
+    fn mcp_version_options(versions: &[&str]) -> McpOptions {
+        McpOptions {
+            versions: versions.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn mcp_version_policy(protocol: &str, mcp: Option<McpOptions>) -> SandboxPolicy {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "versioned".to_string(),
+            NetworkPolicyRule {
+                name: "versioned".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: protocol.to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "tools/list".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    mcp,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        policy
+    }
+
+    fn mcp_version_endpoint_yaml(protocol: &str, mcp_body: Option<&str>) -> String {
+        let mcp = mcp_body.map_or_else(String::new, |body| format!("        mcp:\n{body}"));
+        format!(
+            "version: 1\nnetwork_policies:\n  versioned:\n    endpoints:\n      - host: mcp.example.com\n        port: 443\n        protocol: {protocol}\n{mcp}"
+        )
+    }
+
+    #[test]
+    fn mcp_version_profile_fixture_round_trips_in_canonical_order() {
+        let fixture = include_str!("../testdata/mcp-version-profiles.yaml");
+        let policy = parse_sandbox_policy(fixture).expect("fixed MCP profile fixture must parse");
+        let endpoint = &policy.network_policies["versioned_mcp"].endpoints[0];
+        assert_eq!(
+            endpoint.mcp.as_ref().expect("MCP options").versions,
+            MCP_VERSIONS
+        );
+
+        let canonical =
+            serialize_sandbox_policy(&policy).expect("MCP profile fixture must serialize");
+        let positions =
+            MCP_VERSIONS.map(|version| canonical.find(version).expect("serialized revision"));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            parse_sandbox_policy(&canonical).expect("canonical fixture must parse"),
+            policy
+        );
+    }
+
+    #[test]
+    fn omitted_authored_mcp_versions_materialize_the_pinned_default() {
+        let omitted_stanza = parse_sandbox_policy(&mcp_version_endpoint_yaml("mcp", None))
+            .expect("an omitted MCP stanza must select the default revision");
+        let explicit_default = parse_sandbox_policy(&mcp_version_endpoint_yaml(
+            "mcp",
+            Some("          versions: [\"2025-11-25\"]\n"),
+        ))
+        .expect("the explicit default revision must parse");
+        assert_eq!(omitted_stanza, explicit_default);
+
+        let omitted_versions = parse_sandbox_policy(&mcp_version_endpoint_yaml(
+            "mcp",
+            Some("          strict_tool_names: false\n"),
+        ))
+        .expect("an omitted versions key must select the default revision");
+        let options = omitted_versions.network_policies["versioned"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options must be materialized");
+        assert_eq!(options.versions, default_mcp_versions());
+        assert_eq!(options.strict_tool_names, Some(false));
+
+        let yaml = serialize_sandbox_policy(&omitted_stanza)
+            .expect("the materialized default must serialize");
+        assert!(yaml.contains("versions:"));
+        assert!(yaml.contains(DEFAULT_MCP_PROTOCOL_VERSION.as_str()));
+    }
+
+    #[test]
+    fn pinned_mcp_default_does_not_expand_to_the_supported_registry() {
+        assert_eq!(default_mcp_versions().len(), 1);
+        assert_eq!(
+            default_mcp_versions(),
+            [DEFAULT_MCP_PROTOCOL_VERSION.as_str()]
+        );
+        assert!(McpProtocolVersion::ALL.len() > default_mcp_versions().len());
+    }
+
+    #[test]
+    fn sessionless_mcp_version_requires_an_explicit_policy_opt_in() {
+        let mut authored =
+            mcp_version_endpoint_yaml("mcp", Some("          versions: [\"2026-07-28\"]\n"));
+        authored.push_str("        rules:\n          - allow:\n              method: tools/list\n");
+        let explicit = parse_sandbox_policy(&authored)
+            .expect("the sessionless revision must be accepted when explicitly allowed");
+        let options = explicit.network_policies["versioned"].endpoints[0]
+            .mcp
+            .as_ref()
+            .expect("MCP options must be materialized");
+        assert_eq!(options.versions, ["2026-07-28"]);
+        validate_sandbox_policy(&explicit)
+            .expect("a sessionless endpoint with an explicit method rule must validate");
+
+        let yaml = serialize_sandbox_policy(&explicit)
+            .expect("an explicitly allowed sessionless revision must serialize");
+        assert_eq!(
+            parse_sandbox_policy(&yaml).expect("the sessionless policy must round-trip"),
+            explicit
+        );
+        assert!(!default_mcp_versions().contains(&"2026-07-28".to_string()));
+    }
+
+    #[test]
+    fn mcp_version_yaml_rejects_explicit_empty_duplicate_unknown_and_misplaced_values() {
+        let cases = [
+            ("null allowlist", "mcp", Some("          versions: null\n")),
+            ("empty allowlist", "mcp", Some("          versions: []\n")),
+            (
+                "empty identifier",
+                "mcp",
+                Some("          versions: [\"\"]\n"),
+            ),
+            (
+                "duplicate revision",
+                "mcp",
+                Some("          versions: [\"2025-03-26\", \"2025-03-26\"]\n"),
+            ),
+            (
+                "unsupported revision",
+                "mcp",
+                Some("          versions: [\"2025-03-27\"]\n"),
+            ),
+            (
+                "unsupported alias",
+                "mcp",
+                Some("          versions: [\"latest\"]\n"),
+            ),
+            (
+                "moving draft alias",
+                "mcp",
+                Some("          versions: [\"draft\"]\n"),
+            ),
+            (
+                "leading whitespace",
+                "mcp",
+                Some("          versions: [\" 2025-03-26\"]\n"),
+            ),
+            (
+                "trailing whitespace",
+                "mcp",
+                Some("          versions: [\"2025-03-26 \"]\n"),
+            ),
+            (
+                "non-MCP placement",
+                "json-rpc",
+                Some("          versions: [\"2025-03-26\"]\n"),
+            ),
+        ];
+
+        for (case, protocol, body) in cases {
+            let yaml = mcp_version_endpoint_yaml(protocol, body);
+            assert!(parse_sandbox_policy(&yaml).is_err(), "{case} must fail");
+        }
+
+        let mut null_mcp = mcp_version_endpoint_yaml("mcp", None);
+        null_mcp.push_str("        mcp: null\n");
+        assert!(
+            parse_sandbox_policy(&null_mcp).is_err(),
+            "an explicit null MCP stanza must fail"
+        );
+    }
+
+    #[test]
+    fn mcp_version_proto_validation_preserves_raw_invalid_values() {
+        let cases = [
+            ("empty identifier", vec![""]),
+            ("unsupported revision", vec!["2025-03-27"]),
+            ("unsupported alias", vec!["latest"]),
+            ("moving draft alias", vec!["draft"]),
+            ("leading whitespace", vec![" 2025-03-26"]),
+            ("trailing whitespace", vec!["2025-03-26 "]),
+        ];
+        for (case, versions) in cases {
+            let policy = mcp_version_policy("mcp", Some(mcp_version_options(&versions)));
+            let violations = validate_sandbox_policy(&policy).expect_err(case);
+            assert!(violations.iter().any(|violation| matches!(
+                violation,
+                PolicyViolation::UnsupportedMcpVersion { version, .. }
+                    if version == versions[0]
+            )));
+        }
+
+        let duplicate = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&["2025-03-26", "2025-03-26"])),
+        );
+        assert!(
+            validate_sandbox_policy(&duplicate)
+                .expect_err("duplicate must fail")
+                .iter()
+                .any(|violation| matches!(
+                    violation,
+                    PolicyViolation::DuplicateMcpVersion { version, .. }
+                        if version == "2025-03-26"
+                ))
+        );
+
+        for misplaced in [McpOptions::default(), mcp_version_options(&["2025-03-26"])] {
+            let policy = mcp_version_policy("rest", Some(misplaced));
+            assert!(matches!(
+                validate_sandbox_policy(&policy)
+                    .expect_err("misplaced options must fail")
+                    .as_slice(),
+                [PolicyViolation::McpOptionsOnNonMcpEndpoint { .. }]
+            ));
+        }
+    }
+
+    #[test]
+    fn protobuf_missing_and_empty_mcp_options_materialize_the_same_default() {
+        let missing = mcp_version_policy("mcp", None);
+        let empty = mcp_version_policy("mcp", Some(McpOptions::default()));
+        let explicit = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(
+                &[DEFAULT_MCP_PROTOCOL_VERSION.as_str()],
+            )),
+        );
+
+        for raw in [&missing, &empty] {
+            assert!(matches!(
+                validate_sandbox_policy(raw)
+                    .expect_err("borrowed validation requires canonical effective state")
+                    .as_slice(),
+                [PolicyViolation::MissingMcpVersions { .. }]
+            ));
+            let canonical = validate_and_canonicalize_sandbox_policy(raw.clone())
+                .expect("checked protobuf boundaries must materialize the default");
+            assert_eq!(canonical, explicit);
+            assert_eq!(
+                canonical.network_policies["versioned"].endpoints[0]
+                    .mcp
+                    .as_ref()
+                    .expect("MCP options must be materialized")
+                    .versions,
+                default_mcp_versions()
+            );
+        }
+
+        assert_eq!(
+            serialize_sandbox_policy(&missing).expect("missing options must serialize"),
+            serialize_sandbox_policy(&explicit).expect("explicit options must serialize")
+        );
+        let defaulted_json =
+            sandbox_policy_to_json_value(&empty).expect("empty options must serialize");
+        assert_eq!(
+            defaulted_json,
+            sandbox_policy_to_json_value(&explicit).expect("explicit options must serialize")
+        );
+        assert_eq!(
+            defaulted_json["network_policies"]["versioned"]["endpoints"][0]["mcp"]["versions"],
+            serde_json::json!([DEFAULT_MCP_PROTOCOL_VERSION.as_str()])
+        );
+    }
+
+    #[test]
+    fn unsupported_mcp_version_errors_explain_the_explicit_l4_escape_hatch() {
+        const DEFAULT_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision";
+        const L4_REMEDIATION: &str =
+            "omit protocol and mcp for deliberate uninspected L4 passthrough";
+
+        let yaml = mcp_version_endpoint_yaml("mcp", Some("          versions: [\"draft\"]\n"));
+        let authored_diagnostic = parse_sandbox_policy(&yaml)
+            .expect_err("moving draft aliases must fail closed")
+            .to_string();
+        assert!(
+            authored_diagnostic.contains(DEFAULT_REMEDIATION)
+                && authored_diagnostic.contains(L4_REMEDIATION),
+            "rendered diagnostic omitted remediation choices: {authored_diagnostic}"
+        );
+
+        let policy = mcp_version_policy("mcp", Some(mcp_version_options(&["2026-07-29"])));
+        let violations = validate_sandbox_policy(&policy)
+            .expect_err("unsupported protobuf revisions must fail closed");
+        assert!(violations.iter().map(ToString::to_string).any(|message| {
+            message.contains(DEFAULT_REMEDIATION) && message.contains(L4_REMEDIATION)
+        }));
+    }
+
+    #[test]
+    fn mcp_version_canonicalization_preserves_invalid_and_duplicate_entries() {
+        let mut policy = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&[
+                "unknown-z",
+                "2025-11-25",
+                "2025-03-26",
+                "2025-03-26",
+                "unknown-a",
+            ])),
+        );
+
+        canonicalize_mcp_version_allowlists(&mut policy);
+
+        assert_eq!(
+            policy.network_policies["versioned"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            [
+                "2025-03-26",
+                "2025-03-26",
+                "2025-11-25",
+                "unknown-a",
+                "unknown-z",
+            ]
+        );
+        let violations = validate_sandbox_policy(&policy)
+            .expect_err("normalization must not repair invalid input");
+        assert!(
+            violations
+                .iter()
+                .any(|violation| matches!(violation, PolicyViolation::DuplicateMcpVersion { .. }))
+        );
+        assert!(
+            violations.iter().any(|violation| matches!(
+                violation,
+                PolicyViolation::UnsupportedMcpVersion { .. }
+            ))
+        );
+    }
+
+    #[test]
+    fn canonical_serializers_reject_invalid_mcp_policy_before_conversion() {
+        let invalid = [
+            mcp_version_policy(
+                "mcp",
+                Some(mcp_version_options(&["2025-03-26", "2025-03-26"])),
+            ),
+            mcp_version_policy("mcp", Some(mcp_version_options(&["latest"]))),
+            mcp_version_policy("mcp", Some(mcp_version_options(&["2025-03-26 "]))),
+            mcp_version_policy("rest", Some(McpOptions::default())),
+            mcp_version_policy("json-rpc", Some(mcp_version_options(&["2025-03-26"]))),
+        ];
+
+        for policy in invalid {
+            assert!(serialize_sandbox_policy(&policy).is_err());
+            assert!(sandbox_policy_to_json_value(&policy).is_err());
+            assert!(serialize_sandbox_policy_json(&policy).is_err());
+        }
+    }
+
+    #[test]
+    fn canonical_serializers_do_not_enforce_unrelated_mutation_safety_rules() {
+        let mut policy = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&["2025-11-25", "2025-03-26"])),
+        );
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "root".to_string(),
+            run_as_group: "sandbox".to_string(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_err());
+
+        let yaml = serialize_sandbox_policy(&policy)
+            .expect("serialization must remain available for policy inspection");
+        let first = yaml.find("2025-03-26").expect("first version");
+        let second = yaml.find("2025-11-25").expect("second version");
+        assert!(first < second);
+        assert!(sandbox_policy_to_json_value(&policy).is_ok());
+    }
+
+    #[test]
+    fn mcp_version_checked_canonicalization_returns_valid_semantic_order() {
+        let policy = mcp_version_policy(
+            "mcp",
+            Some(mcp_version_options(&[
+                "2026-07-28",
+                "2025-11-25",
+                "2025-03-26",
+                "2025-06-18",
+            ])),
+        );
+        let canonical = validate_and_canonicalize_sandbox_policy(policy)
+            .expect("valid policy must canonicalize");
+
+        assert_eq!(
+            canonical.network_policies["versioned"].endpoints[0]
+                .mcp
+                .as_ref()
+                .expect("MCP options")
+                .versions,
+            MCP_VERSIONS
+        );
+        assert!(validate_sandbox_policy(&canonical).is_ok());
     }
 
     #[test]
@@ -2312,6 +3054,80 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_landlock_compatibility() {
+        let err = parse_sandbox_policy("version: 1\nlandlock:\n  compatibility: bogus\n")
+            .expect_err("should reject invalid YAML enum value");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("best_effort") && msg.contains("hard_requirement"),
+            "error should list accepted values, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn parse_accepts_known_landlock_compatibility() {
+        for value in ["best_effort", "hard_requirement"] {
+            let yaml = format!("version: 1\nlandlock:\n  compatibility: {value}\n");
+            let policy = parse_sandbox_policy(&yaml).expect("should parse");
+            assert_eq!(
+                policy.landlock.as_ref().expect("landlock").compatibility,
+                value,
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_invalid_landlock_compatibility_proto() {
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: "nope".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidLandlockCompatibility { .. })),
+            "expected InvalidLandlockCompatibility, got: {violations:?}",
+        );
+    }
+
+    #[test]
+    fn validate_accepts_empty_landlock_compatibility() {
+        // Empty string is the proto default and maps to best_effort.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn serialize_rejects_invalid_landlock_compatibility() {
+        // Old policies persisted before gateway validation can hold invalid
+        // values; serialization must error rather than normalize to best_effort.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: "hard-requirement".to_string(),
+        });
+        let err = serialize_sandbox_policy(&policy).expect_err("should reject");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("best_effort") && msg.contains("hard_requirement"),
+            "error should list accepted values, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn serialize_accepts_empty_landlock_compatibility() {
+        // Empty string is the proto default; serialize must not error on it.
+        let mut policy = restrictive_default_policy();
+        policy.landlock = Some(LandlockPolicy {
+            compatibility: String::new(),
+        });
+        assert!(serialize_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -2500,7 +3316,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".into(),
                     port: 443,
-                    tls: "skip".into(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
@@ -2531,7 +3347,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".into(),
                     port: 443,
-                    tls: "skip".into(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
@@ -2555,7 +3371,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "api.example.com".into(),
                     port: 443,
-                    tls: "skip".into(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
@@ -2583,7 +3399,7 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "*.example.com".into(),
                     port: 443,
-                    tls: "skip".into(),
+                    tls: openshell_core::proto::NetworkTlsMode::Skip as i32,
                     ..Default::default()
                 }],
                 binaries: Vec::new(),
@@ -3823,6 +4639,7 @@ network_policies:
         protocol: mcp
         enforcement: enforce
         mcp:
+          versions: [2025-03-26]
           max_body_bytes: 131072
           strict_tool_names: false
         rules:
@@ -3874,6 +4691,7 @@ network_policies:
         port: 443
         protocol: mcp
         mcp:
+          versions: [2025-03-26]
           max_body_bytes: 131072
           strict_tool_names: false
         rules:
@@ -3902,6 +4720,45 @@ network_policies:
         assert!(yaml_out.contains("mcp:"));
         assert!(yaml_out.contains("strict_tool_names: false"));
         assert_eq!(proto1, proto2);
+    }
+
+    #[test]
+    fn round_trip_preserves_any_as_an_mcp_parameter_name() {
+        let yaml = r#"
+version: 1
+network_policies:
+  mcp:
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: mcp
+        mcp: {}
+        rules:
+          - allow:
+              method: tools/call
+              params:
+                arguments:
+                  any: "first"
+                  other: "second"
+"#;
+
+        let proto = parse_sandbox_policy(yaml).expect("authored policy must parse");
+        let params = &proto.network_policies["mcp"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow rule")
+            .params;
+        assert_eq!(params["arguments.any"].glob, "first");
+        assert_eq!(params["arguments.other"].glob, "second");
+
+        let serialized = serialize_sandbox_policy(&proto).expect("protobuf policy must serialize");
+        assert!(serialized.contains("arguments:"));
+        assert!(serialized.contains("any: first"));
+        assert!(serialized.contains("other: second"));
+
+        let reparsed =
+            parse_sandbox_policy(&serialized).expect("serialized protobuf policy must parse again");
+        assert_eq!(reparsed, proto);
     }
 
     #[test]
@@ -4049,6 +4906,28 @@ network_policies:
     }
 
     #[test]
+    fn parse_rejects_removed_network_binary_harness_field() {
+        let yaml = r"
+version: 1
+network_policies:
+  legacy:
+    endpoints:
+      - host: example.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
+        harness: true
+";
+
+        let error = parse_sandbox_policy(yaml).expect_err("removed harness field must be rejected");
+        let error_debug = format!("{error:?}");
+        assert!(
+            error_debug.contains("unknown field") && error_debug.contains("harness"),
+            "unexpected error: {error_debug}"
+        );
+    }
+
+    #[test]
     fn rejects_port_above_65535() {
         let yaml = r"
 version: 1
@@ -4062,5 +4941,27 @@ network_policies:
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"
         );
+    }
+
+    #[test]
+    fn serialization_rejects_proto_port_above_u16() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        policy.network_policies.insert(
+            "too-wide".to_owned(),
+            NetworkPolicyRule {
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".to_owned(),
+                    port: u32::from(u16::MAX) + 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let error =
+            serialize_sandbox_policy(&policy).expect_err("wide protobuf port must not be clamped");
+        assert!(error.to_string().contains("exceeds"));
     }
 }

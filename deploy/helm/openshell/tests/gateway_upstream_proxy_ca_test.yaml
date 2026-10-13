@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway upstream proxy CA volume
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+  - templates/deployment.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  # The gateway workload template is shared by the StatefulSet and the
+  # Deployment, so both kinds must mount the operator's CA bundle.
+  - it: mounts the corporate proxy CA into the gateway StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      upstreamProxy.url: https://proxy.corp.example:3130
+      upstreamProxy.caBundle.configMapName: corporate-proxy-ca
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: upstream-proxy-ca
+            mountPath: /etc/openshell-tls/proxy-ca
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: upstream-proxy-ca
+            configMap:
+              name: corporate-proxy-ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+
+  - it: mounts the corporate proxy CA into the gateway Deployment
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      server.externalDbSecret: openshell-pg
+      upstreamProxy.url: https://proxy.corp.example:3130
+      upstreamProxy.caBundle.configMapName: corporate-proxy-ca
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: upstream-proxy-ca
+            mountPath: /etc/openshell-tls/proxy-ca
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: upstream-proxy-ca
+            configMap:
+              name: corporate-proxy-ca
+              items:
+                - key: ca.crt
+                  path: ca.crt
+
+  # The mounted filename stays ca.crt whatever the operator's ConfigMap key is,
+  # so the rendered proxy_ca_bundle path never has to vary.
+  - it: projects a custom ConfigMap key onto the fixed mounted filename
+    template: templates/statefulset.yaml
+    set:
+      upstreamProxy.url: https://proxy.corp.example:3130
+      upstreamProxy.caBundle.configMapName: openshift-trusted-ca
+      upstreamProxy.caBundle.key: ca-bundle.crt
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: upstream-proxy-ca
+            configMap:
+              name: openshift-trusted-ca
+              items:
+                - key: ca-bundle.crt
+                  path: ca.crt
+
+  # Kubernetes requires both ConfigMap reference fields to be strings. Quote
+  # numeric-looking operator values in the rendered workload so YAML does not
+  # decode them as numbers before typed Kubernetes validation.
+  - it: preserves numeric-looking ConfigMap references as strings
+    template: templates/statefulset.yaml
+    set:
+      upstreamProxy.url: https://proxy.corp.example:3130
+      upstreamProxy.caBundle.configMapName: "123"
+      upstreamProxy.caBundle.key: "456"
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: upstream-proxy-ca
+            configMap:
+              name: "123"
+              items:
+                - key: "456"
+                  path: ca.crt
+
+  - it: adds no volume when no corporate proxy CA is configured
+    template: templates/statefulset.yaml
+    set:
+      upstreamProxy.url: http://proxy.corp.example:8080
+    asserts:
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: upstream-proxy-ca
+          any: true

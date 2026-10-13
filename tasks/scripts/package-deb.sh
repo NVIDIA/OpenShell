@@ -21,6 +21,7 @@ Build the openshell Debian package.
 Required environment:
   OPENSHELL_CLI_BINARY        Path to openshell
   OPENSHELL_GATEWAY_BINARY    Path to openshell-gateway
+  OPENSHELL_PROVER_BINARY     Path to openshell-prover
   OPENSHELL_DRIVER_VM_BINARY  Path to openshell-driver-vm
   OPENSHELL_DEB_VERSION       Debian package version
 
@@ -69,6 +70,7 @@ infer_deb_arch() {
 
 require_env OPENSHELL_CLI_BINARY
 require_env OPENSHELL_GATEWAY_BINARY
+require_env OPENSHELL_PROVER_BINARY
 require_env OPENSHELL_DRIVER_VM_BINARY
 require_env OPENSHELL_DEB_VERSION
 
@@ -110,6 +112,7 @@ mkdir -p "$pkgroot/DEBIAN"
 # Binaries.
 stage_binary "$OPENSHELL_CLI_BINARY"       "$pkgroot/usr/bin/openshell"
 stage_binary "$OPENSHELL_GATEWAY_BINARY"   "$pkgroot/usr/bin/openshell-gateway"
+stage_binary "$OPENSHELL_PROVER_BINARY"    "$pkgroot/usr/bin/openshell-prover"
 stage_binary "$OPENSHELL_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/openshell/openshell-driver-vm"
 
 # Per-user systemd unit. Each user enables it via `systemctl --user`.

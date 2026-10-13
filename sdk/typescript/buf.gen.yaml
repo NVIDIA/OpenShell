@@ -5,7 +5,7 @@
 # validation policy live in the repo-level buf.yaml; this template only drives
 # generation. buf compiles the module with its own compiler (no protoc) and
 # runs the connect-es plugin from this package's devDependencies. Limited to
-# the client-surface closure so we don't emit the unused inference/compute/test
+# the client-surface closure so we don't emit unused compute/test
 # protos; well-known types resolve through @bufbuild/protobuf/wkt and are not
 # generated.
 version: v2
@@ -17,6 +17,10 @@ inputs:
       - ../../proto/sandbox.proto
       - ../../proto/datamodel.proto
       - ../../proto/options.proto
+  # Standard rich gRPC error messages, pinned to an immutable Google APIs commit.
+  - module: buf.build/googleapis/googleapis:c17df5b2beca46928cc87d5656bd5343
+    paths:
+      - google/rpc/error_details.proto
 plugins:
   - local: ./node_modules/.bin/protoc-gen-es
     out: src/gen

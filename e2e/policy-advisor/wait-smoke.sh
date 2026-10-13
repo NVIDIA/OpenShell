@@ -129,8 +129,6 @@ create_sandbox() {
         --upload "${RUNNER_SOURCE}:/sandbox/runner.sh" \
         --no-git-ignore \
         --no-auto-providers \
-        --no-tty \
-        -- bash -lc "chmod +x /sandbox/runner.sh && echo sandbox ready" \
         | sed 's/^/  /'
 
     "$OPENSHELL_BIN" sandbox ssh-config "$SANDBOX" > "$SSH_CONFIG"
@@ -140,6 +138,8 @@ create_sandbox() {
     local _i
     for _i in $(seq 1 30); do
         if ssh -F "$SSH_CONFIG" "$SSH_HOST" true >/dev/null 2>&1; then
+            ssh -F "$SSH_CONFIG" "$SSH_HOST" chmod +x /sandbox/runner.sh \
+                || fail "could not make uploaded runner executable"
             ok "SSH up"
             return
         fi

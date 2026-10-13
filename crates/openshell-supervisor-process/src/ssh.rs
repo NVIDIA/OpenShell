@@ -3,38 +3,69 @@
 
 //! Embedded SSH server for sandbox access.
 
-use crate::child_env;
+mod input;
+mod upload;
+
+#[cfg(test)]
+mod exec_input_tests;
+
+#[cfg(test)]
+mod upload_tests;
+
 use crate::main_session::{MainOutput, MainSession};
-#[cfg(target_os = "linux")]
-use crate::managed_children;
-use crate::process::{
-    ProcessEnforcementMode, ResolvedProcessIdentity, ResolvedWorkspace,
-    drop_privileges_with_identity, is_supervisor_only_env_var, session_user_and_home,
-};
-use crate::sandbox;
 #[cfg(unix)]
 use libc;
 use miette::{IntoDiagnostic, Result};
-use nix::pty::{Winsize, openpty};
-use nix::unistd::setsid;
-use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_core::policy::SandboxPolicy;
-use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_core::VERSION;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, ChannelOpenHandle, Handle, Session};
 use russh::{ChannelId, ChannelOpenFailure, Sig};
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
 use tracing::warn;
+
+const NO_LOGIN_SHELL_ENV: (&str, &str) = ("OPENSHELL_NO_LOGIN_SHELL", "1");
+const MAIN_DETACH_PREFIX: u8 = 0x10;
+const MAIN_DETACH_KEY: u8 = 0x11;
+const MAIN_DETACH_EOF: u8 = 0x04;
+const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const SSH_PEER_TIMEOUT: Duration = Duration::from_mins(1);
+
+mod peer_stream;
+
+#[cfg(test)]
+#[path = "ssh/reconnect_tests.rs"]
+mod reconnect_tests;
+
+fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
+    let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
+    for &byte in data {
+        if *prefix_pending {
+            if byte == MAIN_DETACH_KEY {
+                *prefix_pending = false;
+                return (forward, true);
+            }
+            forward.push(MAIN_DETACH_PREFIX);
+            *prefix_pending = false;
+        }
+        if byte == MAIN_DETACH_EOF {
+            return (forward, true);
+        }
+        if byte == MAIN_DETACH_PREFIX {
+            *prefix_pending = true;
+        } else {
+            forward.push(byte);
+        }
+    }
+    (forward, false)
+}
 
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the Unix socket listener. Extracted so that startup errors can be
@@ -45,17 +76,33 @@ type SshServerInit = (
     Option<Arc<(PathBuf, PathBuf)>>,
 );
 
+/// A managed SSH server must never silently replace its pinned identity.
+pub fn parse_host_key(key: Option<&openshell_core::jwt::SecretSshHostKey>) -> Result<PrivateKey> {
+    let key = key.ok_or_else(|| {
+        miette::miette!("sandbox SSH host key is missing; restart with a matching gateway release")
+    })?;
+    let key = PrivateKey::from_openssh(key.expose_secret())
+        .map_err(|_| miette::miette!("invalid sandbox SSH host key"))?;
+    if key.algorithm() != Algorithm::Ed25519 || key.is_encrypted() {
+        return Err(miette::miette!(
+            "sandbox SSH host key must be an unencrypted Ed25519 key"
+        ));
+    }
+    Ok(key)
+}
+
 fn ssh_server_init(
     listen_path: &Path,
     ca_file_paths: &Option<(PathBuf, PathBuf)>,
-    enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
+    host_key: PrivateKey,
 ) -> Result<SshServerInit> {
-    let mut rng = rand::rng();
-    let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
-
     let mut config = russh::server::Config {
+        server_id: russh::SshId::Standard(Cow::Owned(format!("SSH-2.0-OpenShell_{VERSION}"))),
         auth_rejection_time: Duration::from_secs(1),
+        // Peer replies keep idle attachments alive without relying on shell I/O.
+        keepalive_interval: Some(SSH_KEEPALIVE_INTERVAL),
+        keepalive_max: 3,
         ..Default::default()
     };
     config.keys.push(host_key);
@@ -63,17 +110,14 @@ fn ssh_server_init(
     let config = Arc::new(config);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
 
-    // In full enforcement mode the supervisor normally starts as root and can
-    // isolate the SSH socket in a root-only directory before spawning
-    // unprivileged children. Sidecar topology is different: the gateway relay
-    // runs in the network sidecar as a different UID, so the shared sidecar
-    // state directory must stay group-accessible. Sidecar mode uses a Linux
-    // abstract socket instead, so the workload cannot unlink the relay target.
+    // A driver may place the supervisor in another container, so an explicitly
+    // shared socket retains group access. Linux abstract sockets avoid a
+    // workload-replaceable filesystem inode.
     let abstract_socket = crate::unix_socket::is_abstract(listen_path);
     if !abstract_socket && let Some(parent) = listen_path.parent() {
         std::fs::create_dir_all(parent).into_diagnostic()?;
         #[cfg(unix)]
-        if enforcement_mode.uses_privileged_process_setup() && !shared_socket {
+        if !shared_socket {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
             std::fs::set_permissions(parent, perms).into_diagnostic()?;
@@ -88,7 +132,7 @@ fn ssh_server_init(
     let listener = UnixListener::bind(runtime_path.as_ref()).into_diagnostic()?;
 
     // Tighten filesystem-socket permissions. Abstract sockets have no inode;
-    // sidecar relay connections authenticate the listener with SO_PEERCRED.
+    // local relay connections authenticate the listener with SO_PEERCRED.
     #[cfg(unix)]
     if !abstract_socket {
         use std::os::unix::fs::PermissionsExt;
@@ -113,69 +157,49 @@ fn ssh_server_init(
 pub async fn run_ssh_server(
     listen_path: PathBuf,
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
-    policy: SandboxPolicy,
-    workspace: ResolvedWorkspace,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
-    provider_credentials: ProviderCredentialState,
-    user_environment: HashMap<String, String>,
-    resolved_identity: ResolvedProcessIdentity,
-    enforcement_mode: ProcessEnforcementMode,
     shared_socket: bool,
-    main_session: Arc<MainSession>,
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    main_session: Option<Arc<MainSession>>,
+    host_key: PrivateKey,
 ) -> Result<()> {
-    let (listener, config, ca_paths) = match ssh_server_init(
-        &listen_path,
-        &ca_file_paths,
-        enforcement_mode,
-        shared_socket,
-    ) {
-        Ok(v) => {
-            // Signal that the SSH server has bound the socket and is ready to
-            // accept connections. The parent task awaits this before spawning
-            // the entrypoint process, ensuring exec requests won't race
-            // against server startup.
-            let _ = ready_tx.send(Ok(()));
-            v
-        }
-        Err(err) => {
-            let _ = ready_tx.send(Err(err));
-            return Ok(());
-        }
-    };
+    let (listener, config, _ca_paths) =
+        match ssh_server_init(&listen_path, &ca_file_paths, shared_socket, host_key) {
+            Ok(v) => {
+                // Signal that the SSH server has bound the socket and is ready to
+                // accept connections. The parent task awaits this before spawning
+                // the entrypoint process, ensuring exec requests won't race
+                // against server startup.
+                let _ = ready_tx.send(Ok(()));
+                v
+            }
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                return Ok(());
+            }
+        };
 
-    let mut consecutive_resource_errors: u32 = 0;
-    let mut consecutive_unknown_errors: u32 = 0;
-
+    let mut consecutive_resource_errors = 0;
+    let mut consecutive_unknown_errors = 0;
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
                 consecutive_resource_errors = 0;
                 consecutive_unknown_errors = 0;
                 let config = config.clone();
-                let policy = policy.clone();
-                let workspace = workspace.clone();
-                let proxy_url = proxy_url.clone();
-                let ca_paths = ca_paths.clone();
-                let provider_credentials = provider_credentials.clone();
-                let user_environment = user_environment.clone();
-                let main_session = Arc::clone(&main_session);
+                let port_forward = port_forward.clone();
+                let boundary_exec = boundary_exec.clone();
+                let main_session = main_session.clone();
 
                 tokio::spawn(async move {
                     if let Err(err) = handle_connection(
                         stream,
                         config,
-                        policy,
-                        workspace,
-                        netns_fd,
-                        proxy_url,
-                        ca_paths,
-                        provider_credentials,
-                        user_environment,
-                        resolved_identity,
-                        enforcement_mode,
+                        port_forward,
+                        boundary_exec,
                         main_session,
+                        SSH_PEER_TIMEOUT,
                     )
                     .await
                     {
@@ -190,45 +214,31 @@ pub async fn run_ssh_server(
                     }
                 });
             }
-            Err(err) => {
-                match classify_ssh_accept_error(
-                    &err,
-                    &mut consecutive_resource_errors,
-                    &mut consecutive_unknown_errors,
-                ) {
-                    SshAcceptAction::Terminal => {
-                        ocsf_emit!(
-                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                .activity(ActivityId::Fail)
-                                .severity(SeverityId::High)
-                                .status(StatusId::Failure)
-                                .message(format!(
-                                    "SSH accept loop exiting on terminal error: {err}"
-                                ))
-                                .build()
-                        );
-                        break;
-                    }
-                    SshAcceptAction::Retry { backoff, severity } => {
-                        ocsf_emit!(
-                            SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
-                                .activity(ActivityId::Fail)
-                                .severity(severity)
-                                .status(StatusId::Failure)
-                                .message(format!(
-                                    "SSH accept error (retrying in {}ms): {err}",
-                                    backoff.as_millis(),
-                                ))
-                                .build()
-                        );
-                        tokio::time::sleep(backoff).await;
-                    }
+            Err(error) => match classify_ssh_accept_error(
+                &error,
+                &mut consecutive_resource_errors,
+                &mut consecutive_unknown_errors,
+            ) {
+                SshAcceptAction::Terminal => {
+                    return Err(error).into_diagnostic();
                 }
-            }
+                SshAcceptAction::Retry { backoff, severity } => {
+                    ocsf_emit!(
+                        SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(severity)
+                            .status(StatusId::Failure)
+                            .message(format!(
+                                "SSH accept error (retrying in {}ms): {error}",
+                                backoff.as_millis()
+                            ))
+                            .build()
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            },
         }
     }
-
-    Ok(())
 }
 
 const MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS: u32 = 10;
@@ -243,13 +253,13 @@ enum SshAcceptAction {
 }
 
 fn classify_ssh_accept_error(
-    err: &std::io::Error,
+    error: &std::io::Error,
     consecutive_resource_errors: &mut u32,
     consecutive_unknown_errors: &mut u32,
 ) -> SshAcceptAction {
     #[cfg(unix)]
     if matches!(
-        err.raw_os_error(),
+        error.raw_os_error(),
         Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK)
     ) {
         return SshAcceptAction::Terminal;
@@ -257,7 +267,7 @@ fn classify_ssh_accept_error(
 
     #[cfg(unix)]
     if matches!(
-        err.raw_os_error(),
+        error.raw_os_error(),
         Some(
             libc::EMFILE
                 | libc::ENFILE
@@ -280,26 +290,20 @@ fn classify_ssh_accept_error(
         )
     ) {
         *consecutive_unknown_errors = 0;
-
-        #[cfg(unix)]
-        let is_resource_pressure = matches!(
-            err.raw_os_error(),
+        let resource_pressure = matches!(
+            error.raw_os_error(),
             Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM | libc::ENOSR)
         );
-        #[cfg(not(unix))]
-        let is_resource_pressure = false;
-
-        if is_resource_pressure {
+        if resource_pressure {
             *consecutive_resource_errors = consecutive_resource_errors.saturating_add(1);
-            let backoff_ms = 100u64
-                .saturating_mul(1u64 << (*consecutive_resource_errors).min(7).saturating_sub(1))
+            let backoff_ms = 100_u64
+                .saturating_mul(1_u64 << (*consecutive_resource_errors).min(7).saturating_sub(1))
                 .min(5_000);
             return SshAcceptAction::Retry {
                 backoff: Duration::from_millis(backoff_ms),
                 severity: SeverityId::Medium,
             };
         }
-
         *consecutive_resource_errors = 0;
         return SshAcceptAction::Retry {
             backoff: Duration::from_millis(100),
@@ -307,24 +311,25 @@ fn classify_ssh_accept_error(
         };
     }
 
-    #[cfg(unix)]
     #[cfg(target_os = "linux")]
-    if matches!(err.raw_os_error(), Some(libc::ENONET)) {
-        *consecutive_unknown_errors = 0;
+    if error.raw_os_error() == Some(libc::ENONET) {
         *consecutive_resource_errors = 0;
+        *consecutive_unknown_errors = 0;
         return SshAcceptAction::Retry {
             backoff: Duration::from_millis(100),
             severity: SeverityId::Low,
         };
     }
 
+    *consecutive_resource_errors = 0;
     *consecutive_unknown_errors = consecutive_unknown_errors.saturating_add(1);
     if *consecutive_unknown_errors >= MAX_CONSECUTIVE_UNKNOWN_SSH_ACCEPT_ERRORS {
-        return SshAcceptAction::Terminal;
-    }
-    SshAcceptAction::Retry {
-        backoff: Duration::from_millis(100),
-        severity: SeverityId::Low,
+        SshAcceptAction::Terminal
+    } else {
+        SshAcceptAction::Retry {
+            backoff: Duration::from_millis(100),
+            severity: SeverityId::Low,
+        }
     }
 }
 
@@ -332,16 +337,10 @@ fn classify_ssh_accept_error(
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
-    policy: SandboxPolicy,
-    workspace: ResolvedWorkspace,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_credentials: ProviderCredentialState,
-    user_environment: HashMap<String, String>,
-    resolved_identity: ResolvedProcessIdentity,
-    enforcement_mode: ProcessEnforcementMode,
-    main_session: Arc<MainSession>,
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    main_session: Option<Arc<MainSession>>,
+    peer_timeout: Duration,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -357,21 +356,13 @@ async fn handle_connection(
             .build()
     );
 
-    let handler = SshHandler::new(
-        policy,
-        workspace,
-        netns_fd,
-        proxy_url,
-        ca_file_paths,
-        provider_credentials,
-        user_environment,
-        resolved_identity,
-        enforcement_mode,
-        main_session,
-    );
+    let handler = SshHandler::new(port_forward, boundary_exec, main_session);
+    let stream = peer_stream::PeerStream::new(stream, peer_timeout);
     russh::server::run_stream(config, stream, handler)
         .await
-        .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
+        .map_err(|err| miette::miette!("ssh stream error: {err}"))?
+        .await
+        .map_err(|err| miette::miette!("ssh session error: {err}"))?;
     Ok(())
 }
 
@@ -381,58 +372,39 @@ async fn handle_connection(
 /// sender.  This allows `window_change_request` to resize the correct PTY when
 /// multiple channels are open simultaneously (e.g. parallel shells, shell +
 /// sftp, etc.).
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Default)]
 struct ChannelState {
+    upload: Option<upload::Upload>,
+    command_started: bool,
     input_sender: Option<InputSender>,
-    pty_master: Option<std::fs::File>,
+    input_task: Option<input::InputTask>,
+    process: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryProcess>>,
+    terminal: Option<Arc<dyn openshell_isolation_interface::contract::BoundaryTerminal>>,
     pty_request: Option<PtyRequest>,
+    no_login_shell: bool,
     main_input_owner: Option<u64>,
     main_attached: bool,
     main_read_only: bool,
+    /// A writable attachment denied stdin may retry on later input. Explicit
+    /// viewers and channels that sent EOF must never acquire a new lease.
+    main_input_pending: bool,
     main_detach_prefix_pending: bool,
     main_output_task: Option<tokio::task::AbortHandle>,
 }
 
-const MAIN_DETACH_PREFIX: u8 = 0x10; // Ctrl-P
-const MAIN_DETACH_KEY: u8 = 0x11; // Ctrl-Q
-
-/// Remove the `OpenShell` detach sequence from canonical-main input.
-///
-/// A trailing Ctrl-P remains pending across SSH data frames. If the following
-/// byte is not Ctrl-Q, both bytes are forwarded unchanged. Bytes after a
-/// completed detach sequence are discarded because the attachment is closing.
-fn filter_main_detach_sequence(prefix_pending: &mut bool, data: &[u8]) -> (Vec<u8>, bool) {
-    let mut forward = Vec::with_capacity(data.len() + usize::from(*prefix_pending));
-
-    for &byte in data {
-        if *prefix_pending {
-            if byte == MAIN_DETACH_KEY {
-                *prefix_pending = false;
-                return (forward, true);
-            }
-            forward.push(MAIN_DETACH_PREFIX);
-            *prefix_pending = false;
-        }
-
-        if byte == MAIN_DETACH_PREFIX {
-            *prefix_pending = true;
-        } else {
-            forward.push(byte);
-        }
-    }
-
-    (forward, false)
-}
-
 enum InputSender {
-    Process(mpsc::Sender<Vec<u8>>),
+    Process(input::InputSender),
     Main(tokio::sync::mpsc::Sender<Vec<u8>>),
 }
 
 impl InputSender {
     fn send(&self, data: Vec<u8>) -> Result<(), &'static str> {
         match self {
-            Self::Process(sender) => sender.send(data).map_err(|_| "process stdin closed"),
+            Self::Process(sender) => sender.send(&data).map_err(|error| match error {
+                input::SendError::Full => "process stdin buffer is full",
+                input::SendError::Closed => "process stdin closed",
+            }),
             Self::Main(sender) => sender.try_send(data).map_err(|error| match error {
                 tokio::sync::mpsc::error::TrySendError::Full(_) => "canonical stdin buffer is full",
                 tokio::sync::mpsc::error::TrySendError::Closed(_) => {
@@ -444,24 +416,26 @@ impl InputSender {
 }
 
 struct SshHandler {
-    policy: SandboxPolicy,
-    workspace: ResolvedWorkspace,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_credentials: ProviderCredentialState,
-    user_environment: HashMap<String, String>,
-    resolved_identity: ResolvedProcessIdentity,
-    enforcement_mode: ProcessEnforcementMode,
-    main_session: Arc<MainSession>,
+    /// Loopback port-forward, injected by the orchestrator (RFC 0012). In-pod
+    /// this connects from inside the workload netns; a delegated backend
+    /// tunnels into its guest. The handler does not know which.
+    port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
+    boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+    main_session: Option<Arc<MainSession>>,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
 impl Drop for SshHandler {
     fn drop(&mut self) {
+        let Some(main_session) = self.main_session.as_ref() else {
+            return;
+        };
         for state in self.channels.values_mut() {
+            if state.main_attached {
+                main_session.end_terminal_attachment();
+            }
             if let Some(owner) = state.main_input_owner.take() {
-                self.main_session.release_input(owner);
+                main_session.release_input(owner);
             }
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
@@ -471,29 +445,14 @@ impl Drop for SshHandler {
 }
 
 impl SshHandler {
-    #[allow(clippy::too_many_arguments)]
     fn new(
-        policy: SandboxPolicy,
-        workspace: ResolvedWorkspace,
-        netns_fd: Option<RawFd>,
-        proxy_url: Option<String>,
-        ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-        provider_credentials: ProviderCredentialState,
-        user_environment: HashMap<String, String>,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
-        main_session: Arc<MainSession>,
+        port_forward: Arc<dyn openshell_isolation_interface::contract::BoundaryLoopbackConnector>,
+        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+        main_session: Option<Arc<MainSession>>,
     ) -> Self {
         Self {
-            policy,
-            workspace,
-            netns_fd,
-            proxy_url,
-            ca_file_paths,
-            provider_credentials,
-            user_environment,
-            resolved_identity,
-            enforcement_mode,
+            port_forward,
+            boundary_exec,
             main_session,
             channels: HashMap::new(),
         }
@@ -528,20 +487,31 @@ impl russh::server::Handler for SshHandler {
 
     /// Clean up per-channel state when the channel is closed.
     ///
-    /// This is the final cleanup and subsumes `channel_eof` — if `channel_close`
-    /// fires without a preceding `channel_eof`, all resources (`pty_master` File,
-    /// `input_sender`) are dropped here.
+    /// Unlike EOF, close cancels pending stdin writes before terminating the
+    /// process. A child that does not read stdin must not retain queued input.
     async fn channel_close(
         &mut self,
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(state) = self.channels.remove(&channel) {
-            if let Some(owner) = state.main_input_owner {
-                self.main_session.release_input(owner);
+        if let Some(mut state) = self.channels.remove(&channel) {
+            state.input_task.take();
+            if state.main_attached
+                && let Some(main_session) = self.main_session.as_ref()
+            {
+                main_session.end_terminal_attachment();
+                if let Some(owner) = state.main_input_owner.take() {
+                    main_session.release_input(owner);
+                }
+                if let Some(task) = state.main_output_task.take() {
+                    task.abort();
+                }
+                return Ok(());
             }
-            if let Some(task) = state.main_output_task {
-                task.abort();
+            if let Some(process) = state.process {
+                // Channel ownership defines the exec lifetime. Closing an SSH
+                // channel must not strand an in-boundary process.
+                let _ = process.terminate().await;
             }
         }
         Ok(())
@@ -576,9 +546,8 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         }
 
-        // Only allow forwarding to loopback destinations to prevent the
-        // sandbox SSH server from being used as a generic proxy.
-        if !is_loopback_host(host_to_connect) {
+        let target = direct_tcpip_target(host_to_connect, port_to_connect);
+        if target.is_none() {
             ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
@@ -597,16 +566,13 @@ impl russh::server::Handler for SshHandler {
         let host = host_to_connect.to_string();
         // SSH protocol port is bounded by u32 but only u16 is meaningful;
         // saturate as a guard for malformed clients.
-        let port = u16::try_from(port_to_connect).unwrap_or(u16::MAX);
-        let netns_fd = self.netns_fd;
-
-        // Confirm the channel before spawning: the task below writes to it, and
-        // the peer must see the open-confirmation first.
+        let port = u16::try_from(port_to_connect).expect("port range checked above");
+        let target = target.expect("loopback target checked above");
+        let port_forward = self.port_forward.clone();
         reply.accept().await;
 
         tokio::spawn(async move {
-            let addr = format!("{host}:{port}");
-            let tcp = match connect_in_netns(&addr, netns_fd).await {
+            let mut tcp_stream = match port_forward.connect(target).await {
                 Ok(stream) => stream,
                 Err(err) => {
                     ocsf_emit!(
@@ -614,7 +580,9 @@ impl russh::server::Handler for SshHandler {
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
-                            .message(format!("direct-tcpip: failed to connect to {addr}: {err}"))
+                            .message(format!(
+                                "direct-tcpip: failed to connect to {host}:{port}: {err}"
+                            ))
                             .build()
                     );
                     let _ = channel.close().await;
@@ -623,7 +591,6 @@ impl russh::server::Handler for SshHandler {
             };
 
             let mut channel_stream = channel.into_stream();
-            let mut tcp_stream = tcp;
 
             let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut tcp_stream).await;
         });
@@ -646,6 +613,10 @@ impl russh::server::Handler for SshHandler {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| anyhow::anyhow!("pty_request on unknown channel {channel:?}"))?;
+        if state.upload.is_some() || state.command_started {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         state.pty_request = Some(PtyRequest {
             term: term.to_string(),
             col_width,
@@ -671,18 +642,17 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         };
         if state.main_attached {
-            self.main_session
-                .resize(col_width, row_height, pixel_width, pixel_height);
-        } else if let Some(master) = state.pty_master.as_ref() {
-            let winsize = Winsize {
-                ws_row: to_u16(row_height.max(1)),
-                ws_col: to_u16(col_width.max(1)),
-                ws_xpixel: to_u16(pixel_width),
-                ws_ypixel: to_u16(pixel_height),
-            };
-            if let Err(e) = unsafe_pty::set_winsize(master.as_raw_fd(), winsize) {
-                warn!("failed to resize PTY for channel {channel:?}: {e}");
+            if let Some(main_session) = self.main_session.as_ref() {
+                main_session
+                    .resize(col_width, row_height, pixel_width, pixel_height)
+                    .await;
             }
+        } else if let Some(terminal) = state.terminal.as_ref()
+            && let Err(e) = terminal
+                .resize(to_u16(col_width.max(1)), to_u16(row_height.max(1)))
+                .await
+        {
+            warn!("failed to resize PTY for channel {channel:?}: {e}");
         }
         Ok(())
     }
@@ -692,14 +662,27 @@ impl russh::server::Handler for SshHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some() || state.command_started)
+        {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
         // Only allocate a PTY when the client explicitly requested one via
         // pty_request.  VS Code Remote-SSH sends shell_request *without* a
         // preceding pty_request and expects pipe-based I/O with clean LF line
         // endings.  Forcing a PTY here caused CRLF translation which made
         // VS Code misdetect the platform as Windows (and then try to run
         // `powershell`).
-        self.start_shell(channel, session.handle(), None)?;
+        match self.start_shell(channel, session.handle(), None).await {
+            Ok(()) => session.channel_success(channel)?,
+            Err(error) => {
+                warn!(%error, ?channel, "failed to start boundary shell");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 
@@ -709,12 +692,29 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
-        let command = String::from_utf8_lossy(data).trim().to_string();
-        if command.is_empty() {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some() || state.command_started)
+        {
+            session.channel_failure(channel)?;
             return Ok(());
         }
-        self.start_shell(channel, session.handle(), Some(command))?;
+        let command = String::from_utf8_lossy(data).trim().to_string();
+        if command.is_empty() {
+            session.channel_success(channel)?;
+            return Ok(());
+        }
+        match self
+            .start_shell(channel, session.handle(), Some(command))
+            .await
+        {
+            Ok(()) => session.channel_success(channel)?,
+            Err(error) => {
+                warn!(%error, ?channel, "failed to start boundary exec");
+                session.channel_failure(channel)?;
+            }
+        }
         Ok(())
     }
 
@@ -724,56 +724,117 @@ impl russh::server::Handler for SshHandler {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if name == "openshell-main" {
-            let state = self.channels.get_mut(&channel).ok_or_else(|| {
-                anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
-            })?;
-            if let Some(pty) = state.pty_request.take() {
-                self.main_session.resize(
-                    pty.col_width,
-                    pty.row_height,
-                    pty.pixel_width,
-                    pty.pixel_height,
-                );
+        let Some(state) = self.channels.get_mut(&channel) else {
+            session.channel_failure(channel)?;
+            return Ok(());
+        };
+        if state.upload.is_some() || state.command_started || state.main_attached {
+            session.channel_failure(channel)?;
+            return Ok(());
+        }
+        if name == openshell_core::upload::SUBSYSTEM {
+            if state.pty_request.is_some() {
+                session.channel_failure(channel)?;
+                return Ok(());
             }
-            let (input, input_warning) = if state.main_read_only {
+            // Extraction starts once the plan line arrives on stdin.
+            state.upload = Some(upload::Upload::new());
+            session.channel_success(channel)?;
+            return Ok(());
+        }
+        if name == "openshell-main" {
+            let Some(state) = self.channels.get(&channel) else {
+                session.channel_failure(channel)?;
+                return Ok(());
+            };
+            // Supervisor diagnostics bypass the PTY's output processing. SSH
+            // puts terminal clients in raw mode, so send the carriage return too.
+            let line_ending = if state.pty_request.is_some() {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let main_session = self
+                .main_session
+                .clone()
+                .ok_or("no main session is available")
+                .and_then(|main_session| {
+                    main_session.begin_terminal_attachment()?;
+                    Ok(main_session)
+                });
+            let main_session = match main_session {
+                Ok(main_session) => main_session,
+                Err(error) => {
+                    // The subsystem is supported, but its terminal is unavailable.
+                    // A bare request failure hides this reason in OpenSSH clients.
+                    session.channel_success(channel)?;
+                    session.extended_data(
+                        channel,
+                        1,
+                        format!(
+                            "openshell: cannot connect to the canonical main process: {error}{line_ending}"
+                        )
+                        .into_bytes(),
+                    )?;
+                    session.exit_status_request(channel, 1)?;
+                    session.eof(channel)?;
+                    session.close(channel)?;
+                    return Ok(());
+                }
+            };
+            let state = self
+                .channels
+                .get_mut(&channel)
+                .expect("main channel existence checked above");
+            state.main_attached = true;
+            if let Some(pty) = state.pty_request.take() {
+                main_session
+                    .resize(
+                        pty.col_width,
+                        pty.row_height,
+                        pty.pixel_width,
+                        pty.pixel_height,
+                    )
+                    .await;
+            }
+            let (input, warning) = if state.main_read_only {
                 (None, None)
             } else {
-                match self.main_session.acquire_input() {
+                match main_session.acquire_input() {
                     Ok((owner, input)) => {
                         state.main_input_owner = Some(owner);
                         (Some(InputSender::Main(input)), None)
                     }
-                    Err(error) => {
-                        warn!(%error, "main process input lease unavailable; attaching read-only");
-                        (None, Some(error))
-                    }
+                    Err(error) => (None, Some(error)),
                 }
             };
-            state.main_attached = true;
-            state.main_detach_prefix_pending = false;
+            state.main_input_pending = warning.is_some();
             state.input_sender = input;
-            let mut output = self.main_session.subscribe();
+            state.main_detach_prefix_pending = false;
+            let mut output = main_session.subscribe();
+            let terminal_delivery = main_session.clone();
             let handle = session.handle();
             session.channel_success(channel)?;
-            if let Some(error) = input_warning {
+            if let Some(error) = warning {
                 let _ = handle
                     .extended_data(
                         channel,
                         1,
-                        format!("openshell: {error}; attached read-only\n").into_bytes(),
+                        format!("openshell: {error}; attached read-only; retry input after the owner disconnects; press Ctrl-C or Ctrl-D to exit{line_ending}").into_bytes(),
                     )
                     .await;
             }
             let output_task = tokio::spawn(async move {
                 loop {
                     match output.recv().await {
+                        Ok(MainOutput::Exit(code)) => {
+                            terminal_delivery.wait_for_terminal_reported().await;
+                            let _ =
+                                send_main_output(&handle, channel, MainOutput::Exit(code)).await;
+                            break;
+                        }
                         Ok(event) => {
-                            let exited = matches!(event, MainOutput::Exit(_));
-                            send_main_output(&handle, channel, event).await;
-                            if exited {
-                                break;
-                            }
+                            let _ = send_main_output(&handle, channel, event).await;
                         }
                         Err(error) => {
                             let _ = handle
@@ -798,28 +859,24 @@ impl russh::server::Handler for SshHandler {
             }
         } else if name == "sftp" {
             session.channel_success(channel)?;
-            // sftp-server speaks the SFTP binary protocol over stdin/stdout,
-            // which is exactly what spawn_pipe_exec wires up.  This enables
-            // modern scp (SFTP-based, OpenSSH 9.0+) and SFTP clients to
-            // transfer files into and out of the sandbox.
-            let input_sender = spawn_pipe_exec(
-                &self.policy,
-                &self.workspace,
-                Some("/usr/lib/openssh/sftp-server".to_string()),
-                session.handle(),
+            // The sandbox runtime implements SFTP over the boundary streams so
+            // the workload image does not need an sftp-server executable.
+            self.start_exec_spec(
                 channel,
-                self.netns_fd,
-                self.proxy_url.clone(),
-                self.ca_file_paths.clone(),
-                &self.provider_credentials.child_env_with_gcp_resolved(),
-                &self.user_environment,
-                self.resolved_identity,
-                self.enforcement_mode,
-            )?;
-            let state = self.channels.get_mut(&channel).ok_or_else(|| {
-                anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
-            })?;
-            state.input_sender = Some(InputSender::Process(input_sender));
+                session.handle(),
+                openshell_isolation_interface::contract::ExecSpec {
+                    program: String::new(),
+                    args: Vec::new(),
+                    shell: None,
+                    runtime_helper: Some(
+                        openshell_isolation_interface::contract::RuntimeHelper::Sftp,
+                    ),
+                    env: vec![],
+                    workdir: None,
+                    pty: false,
+                },
+            )
+            .await?;
         } else {
             ocsf_emit!(
                 SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
@@ -843,8 +900,15 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Accept the env request so the client knows we handled it, but we
-        // don't actually propagate the variables — the sandbox environment is
-        // controlled via policy.  We must reply so VSCode doesn't stall.
+        // don't actually propagate arbitrary variables — the sandbox
+        // environment is controlled via policy. The login-shell opt-out is a
+        // supervisor signal carried over SSH because the protocol has no
+        // native field for it.
+        if variable_name == NO_LOGIN_SHELL_ENV.0
+            && let Some(state) = self.channels.get_mut(&channel)
+        {
+            state.no_login_shell = variable_value == NO_LOGIN_SHELL_ENV.1;
+        }
         if variable_name == "OPENSHELL_MAIN_READ_ONLY"
             && variable_value == "1"
             && let Some(state) = self.channels.get_mut(&channel)
@@ -861,42 +925,70 @@ impl russh::server::Handler for SshHandler {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some())
+        {
+            return self.upload_data(channel, data, session).await;
+        }
         let Some(state) = self.channels.get_mut(&channel) else {
             warn!("data on unknown channel {channel:?}");
             return Ok(());
         };
-
-        let main_attached = state.main_attached;
-        let (forward, detach) = if main_attached {
+        if !state.main_attached {
+            // Russh replenishes receive credit before this callback. Waiting
+            // for space here would block signals, close, and output credit on
+            // the same SSH connection. Reject overflow before copying input.
+            if let Some(InputSender::Process(sender)) = &state.input_sender
+                && sender.send(data) == Err(input::SendError::Full)
+            {
+                self.reject_exec_input(channel, session, "process stdin buffer is full")?;
+            }
+            return Ok(());
+        }
+        // A viewer has no process stdin to interrupt. Ctrl-C closes only its
+        // attachment; the input owner's Ctrl-C still reaches the process.
+        if state.main_attached && state.main_input_owner.is_none() && data.contains(&0x03) {
+            self.close_main_attachment(channel, session.handle(), None)
+                .await;
+            return Ok(());
+        }
+        let denied_prefix = state.main_input_pending && state.main_detach_prefix_pending;
+        let (mut forward, detach) = if state.main_attached {
             filter_main_detach_sequence(&mut state.main_detach_prefix_pending, data)
         } else {
             (data.to_vec(), false)
         };
-        let send_error = (!forward.is_empty())
+        // Remember a denied viewer's prefix only to recognize split detach
+        // sequences. It must not become process input when a later frame wins
+        // the lease: that earlier keystroke was sent without write ownership.
+        if denied_prefix && forward.first() == Some(&MAIN_DETACH_PREFIX) {
+            forward.remove(0);
+        }
+        // A reconnect can precede detection of the old connection's failure.
+        // Retry only on new input, using the same exclusive acquisition as a
+        // fresh attachment. Detach keys retain their read-only behavior.
+        if state.main_attached
+            && state.main_input_pending
+            && !state.main_read_only
+            && !detach
+            && !forward.is_empty()
+            && let Some(main_session) = self.main_session.as_ref()
+            && !main_session.finished()
+            && let Ok((owner, input)) = main_session.acquire_input()
+        {
+            state.main_input_owner = Some(owner);
+            state.input_sender = Some(InputSender::Main(input));
+            state.main_input_pending = false;
+            session.extended_data(channel, 1, b"openshell: input enabled\r\n".to_vec())?;
+        }
+        let error = (!forward.is_empty())
             .then(|| state.input_sender.as_ref()?.send(forward).err())
             .flatten();
-
-        if let Some(error) = send_error {
-            let handle = session.handle();
-            if main_attached {
-                self.close_main_attachment(channel, handle, Some(error))
-                    .await;
-            } else {
-                let _ = handle
-                    .extended_data(
-                        channel,
-                        1,
-                        format!("openshell: {error}; closing attachment\n").into_bytes(),
-                    )
-                    .await;
-                let _ = handle.close(channel).await;
-            }
-            return Ok(());
-        }
-        if detach {
-            self.close_main_attachment(channel, session.handle(), None)
+        if state.main_attached && (detach || error.is_some()) {
+            self.close_main_attachment(channel, session.handle(), error)
                 .await;
-            return Ok(());
         }
         Ok(())
     }
@@ -904,22 +996,51 @@ impl russh::server::Handler for SshHandler {
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
-        _session: &mut Session,
+        session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Drop the input sender so the stdin writer thread sees a
-        // disconnected channel and closes the child's stdin pipe.  This
-        // is essential for commands like `cat | tar xf -` which need
-        // stdin EOF to know the input stream is complete.
+        if self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.upload.as_ref())
+            .is_some_and(upload::Upload::awaiting_plan)
+        {
+            return self.reject_upload(channel, session, Some("upload ended before its plan"));
+        }
+        // Drop only the sender: the writer drains accepted bytes and then
+        // closes stdin. Commands such as `cat | tar xf -` need this half-close
+        // to finish while their output remains available to the SSH client.
         if let Some(state) = self.channels.get_mut(&channel) {
             if state.main_attached
                 && let Some(owner) = state.main_input_owner.take()
+                && let Some(main_session) = self.main_session.as_ref()
             {
-                self.main_session.release_input(owner);
+                // A canonical process outlives one SSH attachment. Release
+                // this channel's lease without closing process stdin so a
+                // replacement attachment can become the input owner.
+                main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_input_pending = false;
             state.main_detach_prefix_pending = false;
         } else {
             warn!("channel_eof on unknown channel {channel:?}");
+        }
+        Ok(())
+    }
+
+    async fn extended_data(
+        &mut self,
+        channel: ChannelId,
+        _ext: u32,
+        _data: &[u8],
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if self
+            .channels
+            .get(&channel)
+            .is_some_and(|state| state.upload.is_some())
+        {
+            return self.reject_upload(channel, session, None);
         }
         Ok(())
     }
@@ -930,49 +1051,341 @@ impl russh::server::Handler for SshHandler {
         signal: Sig,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if !self
+        if self
             .channels
             .get(&channel)
             .is_some_and(|state| state.main_attached)
         {
+            let signal = match signal {
+                Sig::HUP => Some(nix::sys::signal::Signal::SIGHUP),
+                Sig::INT => Some(nix::sys::signal::Signal::SIGINT),
+                Sig::KILL => Some(nix::sys::signal::Signal::SIGKILL),
+                Sig::QUIT => Some(nix::sys::signal::Signal::SIGQUIT),
+                Sig::TERM => Some(nix::sys::signal::Signal::SIGTERM),
+                _ => None,
+            };
+            if let (Some(signal), Some(main_session)) = (signal, self.main_session.as_ref())
+                && let Err(error) = main_session.signal_group(signal).await
+            {
+                warn!(%error, ?signal, "failed to signal canonical main process group");
+            }
             return Ok(());
         }
+        let Some(process) = self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.process.clone())
+        else {
+            return Ok(());
+        };
         let signal = match signal {
-            Sig::HUP => Some(nix::sys::signal::Signal::SIGHUP),
-            Sig::INT => Some(nix::sys::signal::Signal::SIGINT),
-            Sig::KILL => Some(nix::sys::signal::Signal::SIGKILL),
-            Sig::QUIT => Some(nix::sys::signal::Signal::SIGQUIT),
-            Sig::TERM => Some(nix::sys::signal::Signal::SIGTERM),
+            Sig::HUP => Some(openshell_isolation_interface::contract::BoundarySignal::Hup),
+            Sig::INT => Some(openshell_isolation_interface::contract::BoundarySignal::Int),
+            Sig::KILL => Some(openshell_isolation_interface::contract::BoundarySignal::Kill),
+            Sig::TERM => Some(openshell_isolation_interface::contract::BoundarySignal::Term),
             _ => None,
         };
         if let Some(signal) = signal
-            && let Err(error) = self.main_session.signal_group(signal)
+            && let Err(error) = process.signal(signal).await
         {
-            warn!(%error, ?signal, "failed to signal canonical main process group");
+            warn!(%error, ?signal, "failed to signal boundary exec process");
         }
         Ok(())
     }
 }
 
-async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) {
-    match event {
-        MainOutput::Stdout(data) => {
-            let _ = handle.data(channel, data).await;
-        }
-        MainOutput::Stderr(data) => {
-            let _ = handle.extended_data(channel, 1, data).await;
-        }
-        MainOutput::Exit(code) => {
-            let _ = handle.eof(channel).await;
-            let _ = handle
-                .exit_status_request(channel, code.max(0).unsigned_abs())
-                .await;
-            let _ = handle.close(channel).await;
-        }
-    }
-}
-
 impl SshHandler {
+    /// Read the plan, start extraction, then admit archive bytes within credit.
+    async fn upload_data(
+        &mut self,
+        channel: ChannelId,
+        mut data: &[u8],
+        session: &mut Session,
+    ) -> anyhow::Result<()> {
+        let Some(state) = self.channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        let Some(upload) = state.upload.as_mut() else {
+            return Ok(());
+        };
+        if upload.awaiting_plan() {
+            let command = match upload.read_plan(&mut data).and_then(|plan| {
+                plan.map(|plan| openshell_core::upload::build_extract_command(&plan))
+                    .transpose()
+            }) {
+                Ok(None) => return Ok(()),
+                Ok(Some(command)) => command,
+                Err(error) => {
+                    return self.reject_upload(channel, session, Some(&error.to_string()));
+                }
+            };
+            let spec = openshell_isolation_interface::contract::ExecSpec {
+                program: String::new(),
+                args: Vec::new(),
+                shell: Some(openshell_isolation_interface::contract::ShellSpec {
+                    command: Some(command),
+                    login: !state.no_login_shell,
+                }),
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            };
+            // Like exec requests, start inline: a close is handled only after
+            // the process is registered with this channel.
+            if let Err(error) = self.start_exec_spec(channel, session.handle(), spec).await {
+                let message = format!("failed to start upload extraction: {error}");
+                return self.reject_upload(channel, session, Some(&message));
+            }
+            if data.is_empty() {
+                return Ok(());
+            }
+        }
+        let Some(state) = self.channels.get_mut(&channel) else {
+            return Ok(());
+        };
+        let (Some(upload), Some(InputSender::Process(sender))) =
+            (state.upload.as_mut(), state.input_sender.as_ref())
+        else {
+            return Ok(());
+        };
+        if !upload.admits(data.len()) {
+            return self.reject_upload(channel, session, None);
+        }
+        match sender.send(data) {
+            Ok(()) => upload.record(data.len()),
+            Err(input::SendError::Full) => return self.reject_upload(channel, session, None),
+            // The extractor closed stdin; its exit status reports the failure.
+            Err(input::SendError::Closed) => {}
+        }
+        Ok(())
+    }
+
+    /// Fail an upload with exit status 74 unless its result was reported.
+    fn reject_upload(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !self
+            .channels
+            .get(&channel)
+            .and_then(|state| state.upload.as_ref())
+            .is_some_and(upload::Upload::reject)
+        {
+            return Ok(());
+        }
+        // Only startup failures carry a message; the client's output window is
+        // still open then. Later rejections must not queue output.
+        if let Some(message) = message {
+            session.extended_data(channel, 1, format!("openshell: {message}\n").into_bytes())?;
+        }
+        self.reject_exec_input(channel, session, message.unwrap_or("invalid upload stream"))
+    }
+
+    fn reject_exec_input(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        if let Some(mut state) = self.channels.remove(&channel) {
+            // A locally initiated close may never call channel_close. Release
+            // input here and keep backend termination off the session loop.
+            state.input_task.take();
+            if let Some(process) = state.process.take() {
+                tokio::spawn(async move {
+                    if let Err(error) = process.terminate().await {
+                        warn!(%error, "failed to terminate rejected exec");
+                    }
+                });
+            }
+        }
+        // Session methods enqueue directly. Do not add stderr data here: with
+        // no output credit, russh would retain it and stop draining Handle
+        // messages for other channels. Exit status needs no output credit.
+        warn!(?channel, "{reason}; terminating exec");
+        session.exit_status_request(channel, 74)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
+    async fn start_shell(
+        &mut self,
+        channel: ChannelId,
+        handle: Handle,
+        command: Option<String>,
+    ) -> anyhow::Result<()> {
+        let state = self
+            .channels
+            .get_mut(&channel)
+            .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
+        let no_login_shell = state.no_login_shell;
+        let pty = state.pty_request.take();
+        let pty_requested = pty.is_some();
+        let env = pty
+            .as_ref()
+            .map(|request| vec![("TERM".to_string(), request.term.clone())])
+            .unwrap_or_default();
+        self.start_exec_spec(
+            channel,
+            handle,
+            openshell_isolation_interface::contract::ExecSpec {
+                program: String::new(),
+                args: Vec::new(),
+                shell: Some(openshell_isolation_interface::contract::ShellSpec {
+                    command,
+                    login: !no_login_shell,
+                }),
+                runtime_helper: None,
+                env,
+                workdir: None,
+                pty: pty_requested,
+            },
+        )
+        .await?;
+        if let (Some(pty), Some(terminal)) = (
+            pty,
+            self.channels
+                .get(&channel)
+                .and_then(|state| state.terminal.as_ref()),
+        ) {
+            terminal
+                .resize(to_u16(pty.col_width.max(1)), to_u16(pty.row_height.max(1)))
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn start_exec_spec(
+        &mut self,
+        channel: ChannelId,
+        handle: Handle,
+        spec: openshell_isolation_interface::contract::ExecSpec,
+    ) -> anyhow::Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        let mut exec = self
+            .boundary_exec
+            .exec(spec)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let state = self
+            .channels
+            .get_mut(&channel)
+            .ok_or_else(|| anyhow::anyhow!("exec on unknown channel {channel:?}"))?;
+        if state.upload.is_some() && exec.stdin.is_none() {
+            let process = exec.process.clone();
+            tokio::spawn(async move {
+                let _ = process.terminate().await;
+            });
+            anyhow::bail!("extraction process has no stdin");
+        }
+        state.process = Some(exec.process.clone());
+        state.command_started = true;
+        state.terminal = exec.terminal.take();
+        let output_status = exec.output_status.take();
+
+        let mut finisher = None;
+        if let Some(stdin) = exec.stdin.take() {
+            let (sender, task) = if let Some(upload) = state.upload.as_mut() {
+                let (sender, task, progress) = input::InputTask::spawn_with_progress(stdin);
+                finisher =
+                    Some(upload.start(channel, handle.clone(), progress, exec.process.clone()));
+                (sender, task)
+            } else {
+                input::InputTask::spawn(stdin)
+            };
+            state.input_sender = Some(InputSender::Process(sender));
+            state.input_task = Some(task);
+        }
+        let input_abort = state
+            .input_task
+            .as_ref()
+            .map(input::InputTask::abort_handle);
+
+        // Upload stdout carries only credit, so extraction output uses stderr.
+        let stdout_extended = finisher.is_some();
+        let mut stdout = exec.stdout;
+        let stdout_handle = handle.clone();
+        let stdout_task = tokio::spawn(async move {
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(size) => {
+                        let data = buffer[..size].to_vec();
+                        let _ = if stdout_extended {
+                            stdout_handle.extended_data(channel, 1, data).await
+                        } else {
+                            stdout_handle.data(channel, data).await
+                        };
+                    }
+                }
+            }
+        });
+        let stderr_task = exec.stderr.map(|mut stderr| {
+            let stderr_handle = handle.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    match stderr.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(size) => {
+                            let _ = stderr_handle
+                                .extended_data(channel, 1, buffer[..size].to_vec())
+                                .await;
+                        }
+                    }
+                }
+            })
+        });
+        tokio::spawn(async move {
+            let status = if let Some(output_status) = output_status {
+                // The boundary stream's final status includes output delivery
+                // failure. Process wait alone reports only the child's exit.
+                let _ = stdout_task.await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                output_status.await.ok()
+            } else {
+                let status = exec.process.wait().await.ok();
+                let _ = stdout_task.await;
+                if let Some(task) = stderr_task {
+                    let _ = task.await;
+                }
+                status
+            };
+            let code = match status {
+                Some(openshell_isolation_interface::contract::BoundaryExitStatus::Exited(code)) => {
+                    code.max(0).cast_unsigned()
+                }
+                Some(openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
+                    signal,
+                )) => (128_i32.saturating_add(signal)).max(0).cast_unsigned(),
+                None => 74,
+            };
+            let code = match finisher {
+                Some(finisher) => finisher.finish(&handle, code).await,
+                None => Some(code),
+            };
+            if let Some(input_abort) = input_abort {
+                input_abort.abort();
+            }
+            let Some(code) = code else {
+                return;
+            };
+            let _ = handle.eof(channel).await;
+            let _ = handle.exit_status_request(channel, code).await;
+            let _ = handle.close(channel).await;
+        });
+        Ok(())
+    }
+
     async fn close_main_attachment(
         &mut self,
         channel: ChannelId,
@@ -980,15 +1393,23 @@ impl SshHandler {
         error: Option<&str>,
     ) {
         if let Some(state) = self.channels.get_mut(&channel) {
-            if let Some(owner) = state.main_input_owner.take() {
-                self.main_session.release_input(owner);
+            if state.main_attached {
+                if let Some(main_session) = self.main_session.as_ref() {
+                    main_session.end_terminal_attachment();
+                }
+                state.main_attached = false;
+            }
+            if let Some(owner) = state.main_input_owner.take()
+                && let Some(main_session) = self.main_session.as_ref()
+            {
+                main_session.release_input(owner);
             }
             state.input_sender.take();
+            state.main_input_pending = false;
             state.main_detach_prefix_pending = false;
             if let Some(task) = state.main_output_task.take() {
                 task.abort();
             }
-            state.main_attached = false;
         }
         if let Some(error) = error {
             let _ = handle
@@ -1003,115 +1424,25 @@ impl SshHandler {
         let _ = handle.exit_status_request(channel, 0).await;
         let _ = handle.close(channel).await;
     }
+}
 
-    fn start_shell(
-        &mut self,
-        channel: ChannelId,
-        handle: Handle,
-        command: Option<String>,
-    ) -> anyhow::Result<()> {
-        let provider_env = self.provider_credentials.child_env_with_gcp_resolved();
-        let state = self
-            .channels
-            .get_mut(&channel)
-            .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
-        if let Some(pty) = state.pty_request.take() {
-            // PTY was requested — allocate a real PTY (interactive shell or
-            // exec that explicitly asked for a terminal).
-            let (pty_master, input_sender) = spawn_pty_shell(
-                &self.policy,
-                &self.workspace,
-                command,
-                &pty,
-                handle,
-                channel,
-                self.netns_fd,
-                self.proxy_url.clone(),
-                self.ca_file_paths.clone(),
-                &provider_env,
-                &self.user_environment,
-                self.resolved_identity,
-                self.enforcement_mode,
-            )?;
-            state.pty_master = Some(pty_master);
-            state.input_sender = Some(InputSender::Process(input_sender));
-        } else {
-            // No PTY requested — use plain pipes so stdout/stderr are
-            // separate and output has clean LF line endings.  This is the
-            // path VSCode Remote-SSH exec commands take.
-            let input_sender = spawn_pipe_exec(
-                &self.policy,
-                &self.workspace,
-                command,
-                handle,
-                channel,
-                self.netns_fd,
-                self.proxy_url.clone(),
-                self.ca_file_paths.clone(),
-                &provider_env,
-                &self.user_environment,
-                self.resolved_identity,
-                self.enforcement_mode,
-            )?;
-            state.input_sender = Some(InputSender::Process(input_sender));
+async fn send_main_output(handle: &Handle, channel: ChannelId, event: MainOutput) -> bool {
+    match event {
+        MainOutput::Stdout(data) => handle.data(channel, data).await.is_ok(),
+        MainOutput::Stderr(data) => handle.extended_data(channel, 1, data).await.is_ok(),
+        MainOutput::Exit(code) => {
+            let eof = handle.eof(channel).await.is_ok();
+            let status = handle
+                .exit_status_request(channel, code.max(0).unsigned_abs())
+                .await
+                .is_ok();
+            let close = handle.close(channel).await.is_ok();
+            eof && status && close
         }
-        Ok(())
     }
 }
 
-/// Connect a TCP stream to `addr` inside the sandbox network namespace.
-///
-/// The SSH supervisor runs in the host network namespace while sandbox child
-/// processes run in an isolated network namespace (with their own loopback).
-/// A plain `TcpStream::connect("127.0.0.1:port")` from the supervisor would
-/// hit the host loopback, not the sandbox loopback where services are listening.
-///
-/// On Linux, we spawn a dedicated OS thread, call `setns` to enter the sandbox
-/// namespace, create the socket there, then convert it to a tokio `TcpStream`.
-/// We use `std::thread::spawn` (not `spawn_blocking`) because `setns` changes
-/// the calling thread's network namespace permanently — a tokio blocking-pool
-/// thread could be reused for unrelated tasks and must not be contaminated.
-/// On non-Linux platforms (no network namespace support), we connect directly.
-pub async fn connect_in_netns(
-    addr: &str,
-    netns_fd: Option<RawFd>,
-) -> std::io::Result<tokio::net::TcpStream> {
-    #[cfg(target_os = "linux")]
-    if let Some(fd) = netns_fd {
-        let addr = addr.to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::spawn(move || {
-            let result = (|| -> std::io::Result<std::net::TcpStream> {
-                // Enter the sandbox network namespace on this dedicated thread.
-                // SAFETY: setns is safe to call; this is a dedicated thread that
-                // will exit after the connection is established.
-                #[allow(unsafe_code)]
-                let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                std::net::TcpStream::connect(&addr)
-            })();
-            let _ = tx.send(result);
-        });
-
-        let std_stream = rx
-            .await
-            .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
-        std_stream.set_nonblocking(true)?;
-        let stream = tokio::net::TcpStream::from_std(std_stream)?;
-        set_tcp_nodelay_best_effort(&stream);
-        return Ok(stream);
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    let _ = netns_fd;
-
-    let stream = tokio::net::TcpStream::connect(addr).await?;
-    set_tcp_nodelay_best_effort(&stream);
-    Ok(stream)
-}
-
+#[allow(dead_code)]
 #[derive(Clone)]
 struct PtyRequest {
     term: String,
@@ -1130,559 +1461,6 @@ impl Default for PtyRequest {
             pixel_width: 0,
             pixel_height: 0,
         }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_child_env(
-    cmd: &mut Command,
-    session_home: &str,
-    session_user: &str,
-    term: &str,
-    proxy_url: Option<&str>,
-    ca_file_paths: Option<&(PathBuf, PathBuf)>,
-    provider_env: &HashMap<String, String>,
-    user_environment: &HashMap<String, String>,
-) {
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-
-    cmd.env_clear()
-        .env(openshell_core::sandbox_env::SANDBOX, "1")
-        .env("HOME", session_home)
-        .env("USER", session_user)
-        .env("SHELL", "/bin/bash")
-        .env("PATH", &path)
-        .env("TERM", term);
-
-    for (key, value) in user_environment {
-        if !key.starts_with("OPENSHELL_") {
-            cmd.env(key, value);
-        }
-    }
-
-    if let Some(url) = proxy_url {
-        for (key, value) in child_env::proxy_env_vars(url) {
-            cmd.env(key, value);
-        }
-    }
-
-    if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
-        for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
-            cmd.env(key, value);
-        }
-    }
-
-    for (key, value) in provider_env {
-        if is_supervisor_only_env_var(key) {
-            continue;
-        }
-        cmd.env(key, value);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn spawn_pty_shell(
-    policy: &SandboxPolicy,
-    workspace: &ResolvedWorkspace,
-    command: Option<String>,
-    pty: &PtyRequest,
-    handle: Handle,
-    channel: ChannelId,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_env: &HashMap<String, String>,
-    user_environment: &HashMap<String, String>,
-    resolved_identity: ResolvedProcessIdentity,
-    enforcement_mode: ProcessEnforcementMode,
-) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
-    let winsize = Winsize {
-        ws_row: to_u16(pty.row_height.max(1)),
-        ws_col: to_u16(pty.col_width.max(1)),
-        ws_xpixel: to_u16(pty.pixel_width),
-        ws_ypixel: to_u16(pty.pixel_height),
-    };
-    let openpty = openpty(Some(&winsize), None)?;
-    let master = std::fs::File::from(openpty.master);
-    let slave = std::fs::File::from(openpty.slave);
-    let slave_fd = slave.as_raw_fd();
-
-    let stdin = slave.try_clone()?;
-    let stdout = slave.try_clone()?;
-    let stderr = slave;
-    let mut reader = master.try_clone()?;
-    let mut writer = master.try_clone()?;
-
-    let mut cmd = command.map_or_else(
-        || {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-i");
-            c
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
-            c
-        },
-    );
-
-    let term = if pty.term.is_empty() {
-        "xterm-256color"
-    } else {
-        pty.term.as_str()
-    };
-
-    // Derive USER and HOME from the policy's run_as_user when available,
-    // falling back to "sandbox" / "/sandbox" for backward compatibility.
-    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
-    apply_child_env(
-        &mut cmd,
-        &session_home,
-        &session_user,
-        term,
-        proxy_url.as_deref(),
-        ca_file_paths.as_deref(),
-        provider_env,
-        user_environment,
-    );
-    cmd.stdin(stdin).stdout(stdout).stderr(stderr);
-
-    if let Some(dir) = workspace.root() {
-        cmd.current_dir(dir);
-    }
-
-    // Probe Landlock availability from the parent process where tracing works.
-    #[cfg(target_os = "linux")]
-    if enforcement_mode.enforces_child_sandbox() {
-        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
-    }
-
-    // Phase 1: Prepare Landlock ruleset before the child applies it.
-    #[cfg(target_os = "linux")]
-    let prepared_sandbox =
-        crate::process::prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
-            .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
-
-    #[cfg(unix)]
-    {
-        unsafe_pty::install_pre_exec(
-            &mut cmd,
-            policy.clone(),
-            workspace.owned_root(),
-            slave_fd,
-            netns_fd,
-            resolved_identity,
-            enforcement_mode,
-            #[cfg(target_os = "linux")]
-            prepared_sandbox,
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
-    #[cfg(not(target_os = "linux"))]
-    let mut child = cmd.spawn()?;
-    #[cfg(target_os = "linux")]
-    let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
-    let master_file = master;
-
-    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        while let Ok(bytes) = receiver.recv() {
-            if writer.write_all(&bytes).is_err() {
-                break;
-            }
-            let _ = writer.flush();
-        }
-    });
-
-    let runtime = tokio::runtime::Handle::current();
-    let runtime_reader = runtime.clone();
-    let handle_clone = handle.clone();
-    // Signal from the reader thread to the exit thread that all output has
-    // been forwarded.  The exit thread waits for this before sending the
-    // exit-status and closing the channel, ensuring the correct SSH protocol
-    // ordering: data → EOF → exit-status → close.
-    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    let handle_clone = handle_clone.clone();
-                    let _ = runtime_reader
-                        .block_on(async move { handle_clone.data(channel, data).await });
-                }
-            }
-        }
-        // Send EOF to indicate no more data will be sent on this channel.
-        let eof_handle = handle_clone.clone();
-        let _ = runtime_reader.block_on(async move { eof_handle.eof(channel).await });
-        // Notify the exit thread that all output has been forwarded.
-        let _ = reader_done_tx.send(());
-    });
-
-    let handle_exit = handle;
-    let runtime_exit = runtime;
-    std::thread::spawn(move || {
-        let status = child.wait().ok();
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
-        let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
-        // Wait for the reader thread to finish forwarding all output before
-        // sending exit-status and closing the channel.  This prevents the
-        // race where close() was called before exit_status_request().
-        //
-        // Use a timeout because a backgrounded grandchild process (e.g.
-        // `nohup daemon &`) may hold the PTY slave open indefinitely,
-        // preventing the reader from reaching EOF.  Two seconds is enough
-        // for any remaining buffered data to drain.
-        let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
-        drop(runtime_exit.spawn(async move {
-            let _ = handle_exit.exit_status_request(channel, code).await;
-            let _ = handle_exit.close(channel).await;
-        }));
-    });
-
-    Ok((master_file, sender))
-}
-
-/// Spawn a command using plain pipes (no PTY).
-///
-/// stdout is forwarded as SSH channel data and stderr as SSH extended data
-/// (type 1), preserving the separation that clients like `VSCode` Remote-SSH
-/// expect.  Output retains clean LF line endings (no CRLF translation).
-#[allow(clippy::too_many_arguments)]
-fn spawn_pipe_exec(
-    policy: &SandboxPolicy,
-    workspace: &ResolvedWorkspace,
-    command: Option<String>,
-    handle: Handle,
-    channel: ChannelId,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
-    provider_env: &HashMap<String, String>,
-    user_environment: &HashMap<String, String>,
-    resolved_identity: ResolvedProcessIdentity,
-    enforcement_mode: ProcessEnforcementMode,
-) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
-    let mut cmd = command.map_or_else(
-        || {
-            // No command — read from stdin.  Do *not* pass `-i`; interactive
-            // mode reads .bashrc, writes prompts to stderr, and can introduce
-            // just enough latency for VS Code Remote-SSH's platform detection
-            // to time out and fall back to "windows".  Plain `bash` with piped
-            // stdin already reads commands line-by-line (script mode), which is
-            // exactly what VS Code's local server expects.
-            Command::new("/bin/bash")
-        },
-        |command| {
-            let mut c = Command::new("/bin/bash");
-            // Use login shell (-l) so that .profile/.bashrc are sourced and
-            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
-            // are available without hardcoding them here.
-            c.arg("-lc").arg(command);
-            c
-        },
-    );
-
-    let (session_user, session_home) = session_user_and_home(policy, workspace.home());
-    apply_child_env(
-        &mut cmd,
-        &session_home,
-        &session_user,
-        "dumb",
-        proxy_url.as_deref(),
-        ca_file_paths.as_deref(),
-        provider_env,
-        user_environment,
-    );
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(dir) = workspace.root() {
-        cmd.current_dir(dir);
-    }
-
-    // Probe Landlock availability from the parent process where tracing works.
-    #[cfg(target_os = "linux")]
-    if enforcement_mode.enforces_child_sandbox() {
-        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
-    }
-
-    // Phase 1: Prepare Landlock ruleset before the child applies it.
-    #[cfg(target_os = "linux")]
-    let prepared_sandbox =
-        crate::process::prepare_child_sandbox(policy, workspace.root(), enforcement_mode)
-            .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
-
-    #[cfg(unix)]
-    {
-        unsafe_pty::install_pre_exec_no_pty(
-            &mut cmd,
-            policy.clone(),
-            workspace.owned_root(),
-            netns_fd,
-            resolved_identity,
-            enforcement_mode,
-            #[cfg(target_os = "linux")]
-            prepared_sandbox,
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    let mut child = crate::process::spawn_std_command_with_supervisor_identity_namespace(cmd)?;
-    #[cfg(not(target_os = "linux"))]
-    let mut child = cmd.spawn()?;
-    #[cfg(target_os = "linux")]
-    let child_pid = child.id();
-    #[cfg(target_os = "linux")]
-    managed_children::register(child_pid);
-
-    let child_stdin = child.stdin.take();
-    let child_stdout = child.stdout.take().expect("stdout must be piped");
-    let child_stderr = child.stderr.take().expect("stderr must be piped");
-
-    // stdin writer thread
-    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let Some(mut stdin) = child_stdin else {
-            return;
-        };
-        while let Ok(bytes) = receiver.recv() {
-            if stdin.write_all(&bytes).is_err() {
-                break;
-            }
-            let _ = stdin.flush();
-        }
-    });
-
-    let runtime = tokio::runtime::Handle::current();
-
-    // Signal from the reader threads to the exit thread that all output has
-    // been forwarded.
-    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
-
-    // stdout reader
-    let stdout_handle = handle.clone();
-    let stdout_runtime = runtime.clone();
-    let reader_done_stdout = reader_done_tx.clone();
-    std::thread::spawn(move || {
-        let mut reader = child_stdout;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    let h = stdout_handle.clone();
-                    let _ = stdout_runtime.block_on(async move { h.data(channel, data).await });
-                }
-            }
-        }
-        let _ = reader_done_stdout.send(());
-    });
-
-    // stderr reader — sends as extended data (type 1)
-    let stderr_handle = handle.clone();
-    let stderr_runtime = runtime.clone();
-    std::thread::spawn(move || {
-        let mut reader = child_stderr;
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    let h = stderr_handle.clone();
-                    let _ = stderr_runtime
-                        .block_on(async move { h.extended_data(channel, 1, data).await });
-                }
-            }
-        }
-        let _ = reader_done_tx.send(());
-    });
-
-    // Exit waiter thread
-    let handle_exit = handle;
-    let runtime_exit = runtime;
-    std::thread::spawn(move || {
-        let status = child.wait().ok();
-        #[cfg(target_os = "linux")]
-        managed_children::unregister(child_pid);
-        let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
-        // Wait for both reader threads.
-        let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
-        let _ = reader_done_rx.recv_timeout(Duration::from_secs(1));
-        drop(runtime_exit.spawn(async move {
-            let _ = handle_exit.eof(channel).await;
-            let _ = handle_exit.exit_status_request(channel, code).await;
-            let _ = handle_exit.close(channel).await;
-        }));
-    });
-
-    Ok(sender)
-}
-
-mod unsafe_pty {
-    #[cfg(not(target_os = "linux"))]
-    use super::sandbox;
-    use super::{
-        Command, ProcessEnforcementMode, RawFd, ResolvedProcessIdentity, SandboxPolicy, Winsize,
-        drop_privileges_with_identity, setsid,
-    };
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
-    #[allow(unsafe_code)]
-    pub fn set_winsize(fd: RawFd, winsize: Winsize) -> std::io::Result<()> {
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    // `libc::TIOCSCTTY` is `u32` on macOS/BSD and `u64` on Linux; allow the
-    // cross-platform conversion so the same expression compiles everywhere.
-    #[allow(clippy::useless_conversion)]
-    fn set_controlling_tty(fd: RawFd) -> std::io::Result<()> {
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    #[allow(unsafe_code)]
-    #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            clippy::unnecessary_wraps,
-            reason = "Linux pre_exec setup can fail while non-Linux setup cannot."
-        )
-    )]
-    pub fn install_pre_exec(
-        cmd: &mut Command,
-        policy: SandboxPolicy,
-        _workdir: Option<String>,
-        slave_fd: RawFd,
-        netns_fd: Option<RawFd>,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
-        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    ) {
-        // Wrap in Option so we can .take() it out of the FnMut closure.
-        // pre_exec is only called once (after fork, before exec).
-        #[cfg(target_os = "linux")]
-        let mut prepared = prepared;
-        unsafe {
-            cmd.pre_exec(move || {
-                setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
-                set_controlling_tty(slave_fd)?;
-
-                enter_netns_and_sandbox(
-                    netns_fd,
-                    &policy,
-                    resolved_identity,
-                    enforcement_mode,
-                    #[cfg(target_os = "linux")]
-                    prepared.take(),
-                )
-            });
-        }
-    }
-
-    /// Pre-exec hook for pipe-based (non-PTY) exec.
-    ///
-    /// Skips `setsid` and `TIOCSCTTY` since there is no controlling terminal.
-    #[allow(unsafe_code)]
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(
-            clippy::unnecessary_wraps,
-            reason = "Linux pre_exec setup can fail while non-Linux setup cannot."
-        )
-    )]
-    pub fn install_pre_exec_no_pty(
-        cmd: &mut Command,
-        policy: SandboxPolicy,
-        _workdir: Option<String>,
-        netns_fd: Option<RawFd>,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
-        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    ) {
-        #[cfg(target_os = "linux")]
-        let mut prepared = prepared;
-        unsafe {
-            cmd.pre_exec(move || {
-                enter_netns_and_sandbox(
-                    netns_fd,
-                    &policy,
-                    resolved_identity,
-                    enforcement_mode,
-                    #[cfg(target_os = "linux")]
-                    prepared.take(),
-                )
-            });
-        }
-    }
-
-    fn enter_netns_and_sandbox(
-        netns_fd: Option<RawFd>,
-        policy: &SandboxPolicy,
-        resolved_identity: ResolvedProcessIdentity,
-        enforcement_mode: ProcessEnforcementMode,
-        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
-    ) -> std::io::Result<()> {
-        // Enter network namespace before dropping privileges.
-        // This ensures SSH shell processes are isolated to the same
-        // network namespace as the entrypoint, forcing all traffic
-        // through the veth pair and CONNECT proxy.
-        #[cfg(target_os = "linux")]
-        if let Some(fd) = netns_fd {
-            #[allow(unsafe_code)]
-            let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-            if result != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        let _ = netns_fd;
-
-        // Drop privileges. initgroups/setgid/setuid need /etc/group and
-        // /etc/passwd which would be blocked if Landlock were already enforced.
-        if enforcement_mode.uses_privileged_process_setup() {
-            drop_privileges_with_identity(policy, resolved_identity)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-        }
-        crate::process::harden_child_process()
-            .map_err(|err| std::io::Error::other(err.to_string()))?;
-
-        // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
-        // restrict_self() does not require root.
-        #[cfg(target_os = "linux")]
-        if let Some(prepared) = prepared {
-            crate::sandbox::linux::enforce(prepared)
-                .map_err(|err| std::io::Error::other(err.to_string()))?;
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        if enforcement_mode.enforces_child_sandbox() {
-            sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
-        }
-
-        Ok(())
     }
 }
 
@@ -1725,28 +1503,675 @@ fn is_loopback_host(host: &str) -> bool {
     }
 }
 
+/// Resolve a (loopback-validated) destination host string to an `IpAddr`,
+/// mapping `localhost` to `127.0.0.1`.
+///
+/// Returns `None` for anything that does not parse to an IP, so
+/// [`LoopbackTarget::new`] never sees a hostname.
+fn loopback_ip(host: &str) -> Option<std::net::IpAddr> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.eq_ignore_ascii_case("localhost") {
+        return Some(std::net::Ipv4Addr::LOCALHOST.into());
+    }
+    host.parse().ok()
+}
+
+fn direct_tcpip_target(
+    host: &str,
+    port: u32,
+) -> Option<openshell_isolation_interface::contract::LoopbackTarget> {
+    if !is_loopback_host(host) {
+        return None;
+    }
+    let port = u16::try_from(port).ok()?;
+    let ip = loopback_ip(host)?;
+    openshell_isolation_interface::contract::LoopbackTarget::new(ip, port).ok()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::doc_markdown,
-    unsafe_code,
-    reason = "Test code: doc text references identifiers and uses libc::winsize zero-init."
+    reason = "Test documentation references protocol and API identifiers."
 )]
 mod tests {
     use super::*;
-    use std::process::Stdio;
+    use std::io::Write as _;
 
-    /// Regression test: the direct-tcpip connect path sets `TCP_NODELAY`.
+    pub(super) struct AcceptAnyServerKey;
+
+    struct PinnedServerKey(String);
+
+    impl russh::client::Handler for PinnedServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(key
+                .public_key()
+                .fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string()
+                == self.0)
+        }
+    }
+
+    #[test]
+    fn managed_host_key_rejects_missing_and_invalid_material() {
+        assert!(parse_host_key(None).is_err());
+        let secret = openshell_core::jwt::SecretSshHostKey::new("secret-invalid-key".to_string());
+        let error = parse_host_key(Some(&secret)).unwrap_err().to_string();
+        assert!(!error.contains(secret.expose_secret()));
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let secret = openshell_core::jwt::SecretSshHostKey::new(
+            key.to_openssh(russh::keys::ssh_key::LineEnding::default())
+                .unwrap()
+                .to_string(),
+        );
+        let decoded = parse_host_key(Some(&secret)).unwrap();
+        assert_eq!(key.public_key(), decoded.public_key());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
-    async fn connect_in_netns_sets_tcp_nodelay() {
+    async fn pinned_identity_matches_direct_and_relayed_ssh_after_listener_restart() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let fingerprint = key
+            .public_key()
+            .fingerprint(russh::keys::HashAlg::Sha256)
+            .to_string();
+        let temp = tempfile::tempdir().unwrap();
+        for relay in [false, true] {
+            let socket = temp.path().join("ssh.sock");
+            let (listener, config, _) =
+                ssh_server_init(&socket, &None, false, key.clone()).unwrap();
+            let server = tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let config = config.clone();
+                    tokio::spawn(async move {
+                        let handler = SshHandler::new(
+                            Arc::new(TestLoopbackConnector),
+                            Arc::new(RejectingExec),
+                            None,
+                        );
+                        if let Ok(session) =
+                            russh::server::run_stream(config, stream, handler).await
+                        {
+                            let _ = session.await;
+                        }
+                    });
+                }
+            });
+            let direct = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            let stream: openshell_isolation_interface::contract::BoundaryDuplexStream = if relay {
+                let (client, mut tunnel) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(async move {
+                    let mut direct = direct;
+                    let _ = tokio::io::copy_bidirectional(&mut tunnel, &mut direct).await;
+                });
+                Box::new(client)
+            } else {
+                Box::new(direct)
+            };
+            let mut client = russh::client::connect_stream(
+                Arc::new(russh::client::Config::default()),
+                stream,
+                PinnedServerKey(fingerprint.clone()),
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                client.authenticate_none("sandbox").await.unwrap(),
+                russh::client::AuthResult::Success
+            ));
+            client
+                .disconnect(russh::Disconnect::ByApplication, "done", "")
+                .await
+                .unwrap();
+            let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+            assert!(
+                russh::client::connect_stream(
+                    Arc::new(russh::client::Config::default()),
+                    stream,
+                    PinnedServerKey("SHA256:wrong".to_string())
+                )
+                .await
+                .is_err()
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    impl russh::client::Handler for AcceptAnyServerKey {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    pub(super) struct TestLoopbackConnector;
+
+    #[async_trait::async_trait]
+    impl openshell_isolation_interface::contract::BoundaryLoopbackConnector for TestLoopbackConnector {
+        async fn connect(
+            &self,
+            target: openshell_isolation_interface::contract::LoopbackTarget,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::BoundaryDuplexStream,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            let stream = tokio::net::TcpStream::connect((target.host(), target.port()))
+                .await
+                .map_err(|error| {
+                    openshell_isolation_interface::contract::BackendError::Process(
+                        error.to_string(),
+                    )
+                })?;
+            Ok(Box::new(stream))
+        }
+    }
+
+    pub(super) struct RejectingExec;
+
+    #[async_trait::async_trait]
+    impl openshell_isolation_interface::contract::BoundaryExec for RejectingExec {
+        async fn exec(
+            &self,
+            _spec: openshell_isolation_interface::contract::ExecSpec,
+        ) -> std::result::Result<
+            openshell_isolation_interface::contract::ExecSession,
+            openshell_isolation_interface::contract::BackendError,
+        > {
+            Err(
+                openshell_isolation_interface::contract::BackendError::Unsupported(
+                    "exec is not used by direct-tcpip tests".into(),
+                ),
+            )
+        }
+    }
+
+    async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
+        main_test_client(Some(MainSession::inert())).await
+    }
+
+    async fn main_test_client(
+        main_session: Option<Arc<MainSession>>,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
+        test_client(
+            main_session,
+            Arc::new(RejectingExec),
+            russh::client::Config::default(),
+        )
+        .await
+    }
+
+    pub(super) async fn test_client(
+        main_session: Option<Arc<MainSession>>,
+        boundary_exec: Arc<dyn openshell_isolation_interface::contract::BoundaryExec>,
+        client_config: russh::client::Config,
+    ) -> russh::client::Handle<AcceptAnyServerKey> {
+        let host_key = {
+            let mut rng = rand::rng();
+            PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key")
+        };
+        let mut server_config = russh::server::Config {
+            auth_rejection_time: Duration::from_millis(1),
+            ..Default::default()
+        };
+        server_config.keys.push(host_key);
+
+        let handler = SshHandler::new(Arc::new(TestLoopbackConnector), boundary_exec, main_session);
+        let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            if let Ok(session) =
+                russh::server::run_stream(Arc::new(server_config), server_stream, handler).await
+            {
+                let _ = session.await;
+            }
+        });
+
+        let mut client = russh::client::connect_stream(
+            Arc::new(client_config),
+            client_stream,
+            AcceptAnyServerKey,
+        )
+        .await
+        .expect("SSH handshake should complete over the duplex");
+        let auth = client
+            .authenticate_none("sandbox")
+            .await
+            .expect("auth_none should not error");
+        assert!(matches!(auth, russh::client::AuthResult::Success));
+        client
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_accept_errors_retry_with_bounded_backoff() {
+        let mut resource_errors = 0;
+        let mut unknown_errors = 0;
+        let aborted = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+        assert_eq!(
+            classify_ssh_accept_error(&aborted, &mut resource_errors, &mut unknown_errors),
+            SshAcceptAction::Retry {
+                backoff: Duration::from_millis(100),
+                severity: SeverityId::Low,
+            }
+        );
+
+        let exhausted = std::io::Error::from_raw_os_error(libc::EMFILE);
+        let first =
+            classify_ssh_accept_error(&exhausted, &mut resource_errors, &mut unknown_errors);
+        let second =
+            classify_ssh_accept_error(&exhausted, &mut resource_errors, &mut unknown_errors);
+        assert_eq!(
+            first,
+            SshAcceptAction::Retry {
+                backoff: Duration::from_millis(100),
+                severity: SeverityId::Medium,
+            }
+        );
+        assert_eq!(
+            second,
+            SshAcceptAction::Retry {
+                backoff: Duration::from_millis(200),
+                severity: SeverityId::Medium,
+            }
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_listener_accept_error_is_terminal() {
+        let mut resource_errors = 0;
+        let mut unknown_errors = 0;
+        let error = std::io::Error::from_raw_os_error(libc::EBADF);
+        assert_eq!(
+            classify_ssh_accept_error(&error, &mut resource_errors, &mut unknown_errors),
+            SshAcceptAction::Terminal
+        );
+    }
+
+    #[test]
+    fn direct_tcpip_target_rejects_non_loopback_and_out_of_range_ports() {
+        assert!(direct_tcpip_target("10.0.0.1", 80).is_none());
+        assert!(direct_tcpip_target("127.0.0.1", 65_537).is_none());
+    }
+
+    #[test]
+    fn direct_tcpip_target_accepts_loopback_destinations() {
+        let target = direct_tcpip_target("localhost", 8_080).expect("loopback target");
+        assert_eq!(
+            target.host(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        assert_eq!(target.port(), 8_080);
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_handler_rejects_invalid_destinations() {
+        for (host, port) in [("10.0.0.1", 80), ("127.0.0.1", 65_537)] {
+            let client = authenticated_test_client().await;
+            let error = client
+                .channel_open_direct_tcpip(host, port, "127.0.0.1", 0)
+                .await
+                .expect_err("invalid forwarding destination must be refused");
+            assert!(matches!(
+                error,
+                russh::Error::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_tcpip_handler_relays_loopback_bytes() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind listener");
-        let addr = listener.local_addr().expect("local addr");
+            .expect("bind loopback echo listener");
+        let port = listener.local_addr().expect("listener address").port();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept forwarded stream");
+            let mut payload = [0_u8; 4];
+            socket.read_exact(&mut payload).await.expect("read payload");
+            socket.write_all(&payload).await.expect("echo payload");
+        });
 
-        let stream = connect_in_netns(&addr.to_string(), None)
+        let client = authenticated_test_client().await;
+        let channel = client
+            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 0)
             .await
-            .expect("connect");
-        assert!(stream.nodelay().expect("query TCP_NODELAY"));
+            .expect("loopback forwarding must be allowed");
+        let mut stream = channel.into_stream();
+        stream.write_all(b"ping").await.expect("write channel");
+        let mut echoed = [0_u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut echoed))
+            .await
+            .expect("forwarded response timeout")
+            .expect("read channel");
+        assert_eq!(&echoed, b"ping");
+    }
+
+    async fn next_main_event(
+        channel: &mut russh::Channel<russh::client::Msg>,
+    ) -> russh::ChannelMsg {
+        tokio::time::timeout(Duration::from_secs(5), channel.wait())
+            .await
+            .expect("main attachment event timeout")
+            .expect("main attachment channel closed before expected event")
+    }
+
+    async fn assert_main_rejection(
+        main_session: Option<Arc<MainSession>>,
+        terminal: bool,
+        message: &str,
+    ) {
+        let client = main_test_client(main_session).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        if terminal {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_main_event(&mut channel).await,
+                russh::ChannelMsg::Success
+            ));
+        }
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        match next_main_event(&mut channel).await {
+            russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                assert_eq!(String::from_utf8_lossy(&data), message);
+            }
+            event => panic!("expected actionable stderr, got {event:?}"),
+        }
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 1 }
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn main_attachment_missing_session_reports_terminal_error() {
+        assert_main_rejection(None, false, "openshell: cannot connect to the canonical main process: no main session is available\n").await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_finished_session_reports_terminal_error() {
+        let main_session = MainSession::inert();
+        assert!(!main_session.finish(130, false).await);
+        assert_main_rejection(Some(main_session), false, "openshell: cannot connect to the canonical main process: canonical main process already finished\n").await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_pty_rejections_return_cursor_to_start_of_line() {
+        assert_main_rejection(None, true, "openshell: cannot connect to the canonical main process: no main session is available\r\n").await;
+        let main_session = MainSession::inert();
+        assert!(!main_session.finish(130, false).await);
+        assert_main_rejection(Some(main_session), true, "openshell: cannot connect to the canonical main process: canonical main process already finished\r\n").await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_occupied_stdin_still_attaches_read_only() {
+        assert_read_only_attachment(false, "\n", 0x03).await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_read_only_pty_warning_returns_cursor_to_start_of_line() {
+        assert_read_only_attachment(true, "\r\n", 0x03).await;
+    }
+
+    #[tokio::test]
+    async fn main_attachment_read_only_ctrl_d_detaches_without_releasing_owner_lease() {
+        assert_read_only_attachment(false, "\n", MAIN_DETACH_EOF).await;
+    }
+
+    async fn assert_read_only_attachment(terminal: bool, line_ending: &str, detach_key: u8) {
+        let main_session = MainSession::inert();
+        let (owner, _input) = main_session.acquire_input().unwrap();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        if terminal {
+            channel
+                .request_pty(true, "xterm", 80, 24, 0, 0, &[])
+                .await
+                .unwrap();
+            assert!(matches!(
+                next_main_event(&mut channel).await,
+                russh::ChannelMsg::Success
+            ));
+        }
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        match next_main_event(&mut channel).await {
+            russh::ChannelMsg::ExtendedData { data, ext: 1 } => {
+                assert_eq!(
+                    String::from_utf8_lossy(&data),
+                    format!(
+                        "openshell: canonical main process already has an input owner; attached read-only; retry input after the owner disconnects; press Ctrl-C or Ctrl-D to exit{line_ending}"
+                    )
+                );
+            }
+            event => panic!("expected read-only warning, got {event:?}"),
+        }
+        assert!(main_session.acquire_input().is_err());
+        let mut data = b"ignored".to_vec();
+        data.push(detach_key);
+        data.extend_from_slice(b"also ignored");
+        channel.data(&data[..]).await.unwrap();
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(
+            main_session.acquire_input().is_err(),
+            "viewer must not release the owner's input lease"
+        );
+        main_session.release_input(owner);
+    }
+
+    async fn assert_viewer_closed(channel: &mut russh::Channel<russh::client::Msg>) {
+        assert!(matches!(
+            next_main_event(channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 0 }
+        ));
+        assert!(matches!(
+            next_main_event(channel).await,
+            russh::ChannelMsg::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn main_attachment_explicit_read_only_ctrl_c_exits_without_input_lease() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .set_env(true, "OPENSHELL_MAIN_READ_ONLY", "1")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        channel.data(&b"\x03"[..]).await.unwrap();
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(matches!(
+            input.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (owner, _) = main_session
+            .acquire_input()
+            .expect("viewer leaves stdin available");
+        main_session.release_input(owner);
+    }
+
+    #[tokio::test]
+    async fn main_attachment_ctrl_d_detaches_without_closing_main_stdin() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session.clone())).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+
+        channel.data(&b"hello\x04ignored"[..]).await.unwrap();
+        assert_eq!(input.recv().await.unwrap(), b"hello");
+        assert_viewer_closed(&mut channel).await;
+        assert!(!main_session.finished());
+        assert!(matches!(
+            input.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        let (owner, _) = main_session
+            .acquire_input()
+            .expect("detaching must release the input lease");
+        main_session.release_input(owner);
+    }
+
+    #[test]
+    fn main_detach_filter_preserves_prefix_before_ctrl_d() {
+        let mut prefix_pending = false;
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x10"),
+            (Vec::new(), false)
+        );
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x04ignored"),
+            (vec![0x10], true)
+        );
+        assert!(!prefix_pending);
+        assert_eq!(
+            filter_main_detach_sequence(&mut prefix_pending, b"\x10\x11"),
+            (Vec::new(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn main_attachment_input_owner_ctrl_c_reaches_main_stdin() {
+        let (main_session, mut input) = MainSession::inert_with_input();
+        let client = main_test_client(Some(main_session)).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        for data in [b"\x03".as_slice(), b"still attached".as_slice()] {
+            channel.data(data).await.unwrap();
+            let forwarded = tokio::time::timeout(Duration::from_secs(5), input.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(forwarded, data);
+        }
+        channel.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn main_attachment_accepts_declared_session_after_process_exit() {
+        let (main_session, mut slave) = MainSession::terminal_for_test();
+        let mut output = main_session.subscribe();
+        slave.write_all(b"retained output").unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), output.recv()).await.unwrap().unwrap(),
+            MainOutput::Stdout(data) if data == b"retained output"[..]
+        ));
+        drop(slave);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), main_session.finish(23, true))
+                .await
+                .unwrap()
+        );
+        main_session.mark_terminal_reported();
+        let client = main_test_client(Some(main_session)).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "openshell-main")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Success
+        ));
+        assert!(
+            matches!(next_main_event(&mut channel).await, russh::ChannelMsg::Data { data } if data == b"retained output"[..])
+        );
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Eof
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::ExitStatus { exit_status: 23 }
+        ));
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Close
+        ));
+    }
+
+    #[tokio::test]
+    async fn main_attachment_unknown_subsystem_still_fails_request() {
+        let client = main_test_client(None).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel
+            .request_subsystem(true, "unknown-subsystem")
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_main_event(&mut channel).await,
+            russh::ChannelMsg::Failure
+        ));
     }
 
     #[cfg(unix)]
@@ -1763,15 +2188,20 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn ssh_server_init_full_enforcement_keeps_private_socket() {
+    async fn ssh_server_init_keeps_private_socket() {
         let temp = tempfile::tempdir().unwrap();
         let parent = temp.path().join("ssh");
         std::fs::create_dir_all(&parent).unwrap();
         set_file_mode(&parent, 0o775);
         let socket = parent.join("ssh.sock");
 
-        let (listener, _, _) =
-            ssh_server_init(&socket, &None, ProcessEnforcementMode::Full, false).unwrap();
+        let (listener, _, _) = ssh_server_init(
+            &socket,
+            &None,
+            false,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
         drop(listener);
 
         assert_eq!(file_mode(&parent), 0o700);
@@ -1787,8 +2217,13 @@ mod tests {
         set_file_mode(&parent, 0o775);
         let socket = parent.join("ssh.sock");
 
-        let (listener, _, _) =
-            ssh_server_init(&socket, &None, ProcessEnforcementMode::Full, true).unwrap();
+        let (listener, _, _) = ssh_server_init(
+            &socket,
+            &None,
+            true,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
         drop(listener);
 
         assert_eq!(file_mode(&parent), 0o775);
@@ -1799,8 +2234,13 @@ mod tests {
     #[tokio::test]
     async fn ssh_server_abstract_socket_cannot_be_replaced_while_bound() {
         let socket = PathBuf::from(format!("@openshell-ssh-test-{}", uuid::Uuid::new_v4()));
-        let (listener, _, _) =
-            ssh_server_init(&socket, &None, ProcessEnforcementMode::NetworkOnly, true).unwrap();
+        let (listener, _, _) = ssh_server_init(
+            &socket,
+            &None,
+            true,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
 
         assert!(
             !socket.exists(),
@@ -1812,109 +2252,6 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
 
         drop(listener);
-    }
-
-    /// Verify that dropping the input sender (the operation `channel_eof`
-    /// performs) causes the stdin writer loop to exit and close the child's
-    /// stdin pipe.  Without this, commands like `cat | tar xf -` used by
-    /// `sync --up` hang forever waiting for EOF on stdin.
-    #[test]
-    fn dropping_input_sender_closes_child_stdin() {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-
-        let mut child = Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn cat");
-
-        let child_stdin = child.stdin.take().expect("stdin must be piped");
-
-        // Replicate the stdin writer loop from spawn_pipe_exec.
-        std::thread::spawn(move || {
-            let mut stdin = child_stdin;
-            while let Ok(bytes) = receiver.recv() {
-                if stdin.write_all(&bytes).is_err() {
-                    break;
-                }
-                let _ = stdin.flush();
-            }
-        });
-
-        sender.send(b"hello".to_vec()).unwrap();
-
-        // Simulate what channel_eof does: drop the sender.
-        drop(sender);
-
-        // cat should see EOF on stdin and exit.  Use a timeout so the test
-        // fails fast instead of hanging if the mechanism is broken.
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(child.wait_with_output());
-        });
-        let output = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("cat hung for 5s — stdin was not closed (channel_eof bug)")
-            .expect("failed to wait for cat");
-
-        assert!(
-            output.status.success(),
-            "cat exited with {:?}",
-            output.status
-        );
-        assert_eq!(output.stdout, b"hello");
-    }
-
-    /// Verify that the stdin writer delivers all buffered data before exiting
-    /// when the sender is dropped.  This ensures channel_eof doesn't cause
-    /// data loss — only signals "no more data after this".
-    #[test]
-    fn stdin_writer_delivers_buffered_data_before_eof() {
-        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-
-        let mut child = Command::new("wc")
-            .arg("-c")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn wc");
-
-        let child_stdin = child.stdin.take().expect("stdin must be piped");
-
-        std::thread::spawn(move || {
-            let mut stdin = child_stdin;
-            while let Ok(bytes) = receiver.recv() {
-                if stdin.write_all(&bytes).is_err() {
-                    break;
-                }
-                let _ = stdin.flush();
-            }
-        });
-
-        // Send multiple chunks, then drop the sender.
-        for _ in 0..100 {
-            sender.send(vec![0u8; 1024]).unwrap();
-        }
-        drop(sender);
-
-        let (done_tx, done_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = done_tx.send(child.wait_with_output());
-        });
-        let output = done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("wc hung for 5s — stdin was not closed")
-            .expect("failed to wait for wc");
-
-        let count: usize = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .expect("wc output was not a number");
-        assert_eq!(
-            count,
-            100 * 1024,
-            "expected all 100 KiB delivered before EOF"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -1965,659 +2302,5 @@ mod tests {
         assert!(!is_loopback_host(""));
         assert!(!is_loopback_host("not-an-ip"));
         assert!(!is_loopback_host("[]"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Per-channel PTY state tests (#543)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn set_winsize_applies_to_correct_pty() {
-        // Verify that set_winsize applies to a specific PTY master FD,
-        // which is the mechanism that per-channel tracking relies on.
-        // With the old single-pty_master design, a window_change_request
-        // for channel N would resize whatever PTY was stored last —
-        // potentially belonging to a different channel.
-        let pty_a = openpty(None, None).expect("openpty a");
-        let pty_b = openpty(None, None).expect("openpty b");
-        let master_a = std::fs::File::from(pty_a.master);
-        let master_b = std::fs::File::from(pty_b.master);
-        let fd_a = master_a.as_raw_fd();
-        let fd_b = master_b.as_raw_fd();
-        assert_ne!(fd_a, fd_b, "two PTYs must have distinct FDs");
-
-        // Close the slave ends to avoid leaking FDs in the test.
-        drop(std::fs::File::from(pty_a.slave));
-        drop(std::fs::File::from(pty_b.slave));
-
-        // Resize only PTY B.
-        let winsize_b = Winsize {
-            ws_row: 50,
-            ws_col: 120,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe_pty::set_winsize(fd_b, winsize_b).expect("set_winsize on PTY B");
-
-        // Resize PTY A to a different size.
-        let winsize_a = Winsize {
-            ws_row: 24,
-            ws_col: 80,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        unsafe_pty::set_winsize(fd_a, winsize_a).expect("set_winsize on PTY A");
-
-        // Read back sizes via ioctl to verify independence.
-        let mut actual_a: libc::winsize = unsafe { std::mem::zeroed() };
-        let mut actual_b: libc::winsize = unsafe { std::mem::zeroed() };
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::ioctl(fd_a, libc::TIOCGWINSZ, &mut actual_a);
-            libc::ioctl(fd_b, libc::TIOCGWINSZ, &mut actual_b);
-        }
-
-        assert_eq!(actual_a.ws_row, 24, "PTY A should be 24 rows");
-        assert_eq!(actual_a.ws_col, 80, "PTY A should be 80 cols");
-        assert_eq!(actual_b.ws_row, 50, "PTY B should be 50 rows");
-        assert_eq!(actual_b.ws_col, 120, "PTY B should be 120 cols");
-    }
-
-    #[test]
-    fn channel_state_independent_input_senders() {
-        // Verify that each channel gets its own input sender so that
-        // data() and channel_eof() affect only the targeted channel.
-        let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
-        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
-
-        let mut state_a = ChannelState {
-            input_sender: Some(InputSender::Process(tx_a)),
-            ..Default::default()
-        };
-        let state_b = ChannelState {
-            input_sender: Some(InputSender::Process(tx_b)),
-            ..Default::default()
-        };
-
-        // Send data to channel A only.
-        state_a
-            .input_sender
-            .as_ref()
-            .unwrap()
-            .send(b"hello-a".to_vec())
-            .unwrap();
-        // Send data to channel B only.
-        state_b
-            .input_sender
-            .as_ref()
-            .unwrap()
-            .send(b"hello-b".to_vec())
-            .unwrap();
-
-        assert_eq!(rx_a.recv().unwrap(), b"hello-a");
-        assert_eq!(rx_b.recv().unwrap(), b"hello-b");
-
-        // EOF on channel A (drop sender) should not affect channel B.
-        state_a.input_sender.take();
-        assert!(
-            rx_a.recv().is_err(),
-            "channel A sender dropped, recv should fail"
-        );
-
-        // Channel B should still be functional.
-        state_b
-            .input_sender
-            .as_ref()
-            .unwrap()
-            .send(b"still-alive".to_vec())
-            .unwrap();
-        assert_eq!(rx_b.recv().unwrap(), b"still-alive");
-    }
-
-    #[test]
-    fn main_detach_filter_forwards_ctrl_c_unchanged() {
-        let mut prefix_pending = false;
-        let (forward, detach) =
-            filter_main_detach_sequence(&mut prefix_pending, b"before\x03after");
-
-        assert_eq!(forward, b"before\x03after");
-        assert!(!detach);
-        assert!(!prefix_pending);
-    }
-
-    #[test]
-    fn main_detach_filter_removes_sequence_and_trailing_input() {
-        let mut prefix_pending = false;
-        let (forward, detach) =
-            filter_main_detach_sequence(&mut prefix_pending, b"before\x10\x11after");
-
-        assert_eq!(forward, b"before");
-        assert!(detach);
-        assert!(!prefix_pending);
-    }
-
-    #[test]
-    fn main_detach_filter_recognizes_sequence_across_frames() {
-        let mut prefix_pending = false;
-        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"before\x10");
-        assert_eq!(forward, b"before");
-        assert!(!detach);
-        assert!(prefix_pending);
-
-        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"\x11");
-        assert!(forward.is_empty());
-        assert!(detach);
-        assert!(!prefix_pending);
-    }
-
-    #[test]
-    fn main_detach_filter_forwards_unmatched_prefix() {
-        let mut prefix_pending = false;
-        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"\x10");
-        assert!(forward.is_empty());
-        assert!(!detach);
-        assert!(prefix_pending);
-
-        let (forward, detach) = filter_main_detach_sequence(&mut prefix_pending, b"x");
-        assert_eq!(forward, b"\x10x");
-        assert!(!detach);
-        assert!(!prefix_pending);
-    }
-
-    // -----------------------------------------------------------------------
-    // session_user_and_home tests (Phase 2: numeric UID support)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn session_user_and_home_returns_numeric_uid_as_user() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-        let policy = SandboxPolicy {
-            version: 1,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: Some("1000".into()),
-                run_as_group: None,
-            },
-        };
-        let (user, home) = session_user_and_home(&policy, None);
-        assert_eq!(user, "1000");
-        // Numeric UID has no passwd entry — defaults to /sandbox.
-        assert_eq!(home, "/sandbox");
-    }
-
-    #[test]
-    fn session_user_and_home_uses_driver_workspace_when_supplied() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-        let policy = SandboxPolicy {
-            version: 1,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: Some("1234".into()),
-                run_as_group: Some("1235".into()),
-            },
-        };
-
-        let (user, home) = session_user_and_home(&policy, Some("/workspace/project"));
-        assert_eq!(user, "1234");
-        assert_eq!(home, "/workspace/project");
-    }
-
-    #[test]
-    fn session_user_and_home_returns_name_from_passwd() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-        let policy = SandboxPolicy {
-            version: 1,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: Some("sandbox".into()),
-                run_as_group: None,
-            },
-        };
-        let (user, home) = session_user_and_home(&policy, None);
-        assert_eq!(user, "sandbox");
-        // Name-based — should resolve via passwd (or /home/{user}).
-        assert!(!home.is_empty());
-    }
-
-    #[test]
-    fn session_user_and_home_defaults_to_sandbox_when_empty() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-        let policy = SandboxPolicy {
-            version: 1,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: Some(String::new()),
-                run_as_group: None,
-            },
-        };
-        let (user, home) = session_user_and_home(&policy, None);
-        assert_eq!(user, "sandbox");
-        assert_eq!(home, "/sandbox");
-    }
-
-    #[test]
-    fn session_user_and_home_defaults_to_sandbox_when_none() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-        let policy = SandboxPolicy {
-            version: 1,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: None,
-                run_as_group: None,
-            },
-        };
-        let (user, home) = session_user_and_home(&policy, None);
-        assert_eq!(user, "sandbox");
-        assert_eq!(home, "/sandbox");
-    }
-
-    #[test]
-    fn session_user_and_home_handles_large_numeric_uid() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-        let policy = SandboxPolicy {
-            version: 1,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: Some("1000660000".into()),
-                run_as_group: None,
-            },
-        };
-        let (user, home) = session_user_and_home(&policy, None);
-        assert_eq!(user, "1000660000");
-        assert_eq!(home, "/sandbox");
-    }
-
-    /// `install_pre_exec_no_pty` runs drop_privileges and succeeds when the
-    /// current user/group is already the configured one (no actual uid change).
-    ///
-    /// This exercises the pre_exec hook end-to-end without needing root: a policy
-    /// with no run_as_user/group is a no-op when the process is already unprivileged.
-    #[cfg(unix)]
-    #[test]
-    fn pre_exec_always_calls_drop_privileges() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
-        };
-
-        // No user/group configured and not running as root → drop_privileges is
-        // a no-op, so spawn succeeds regardless of the effective UID.
-        let policy = SandboxPolicy {
-            version: 0,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: None,
-                run_as_group: None,
-            },
-        };
-
-        // Skip if running as root: drop_privileges would try to switch to
-        // "sandbox" which may not exist in the test environment.
-        if rustix::process::geteuid().is_root() {
-            return;
-        }
-
-        let mut cmd = Command::new("echo");
-        cmd.arg("drop-privileges-ok");
-        cmd.stdout(Stdio::piped());
-
-        unsafe_pty::install_pre_exec_no_pty(
-            &mut cmd,
-            policy,
-            None,
-            None, // no netns fd
-            ResolvedProcessIdentity::default(),
-            ProcessEnforcementMode::Full,
-            #[cfg(target_os = "linux")]
-            Some(
-                sandbox::linux::prepare(
-                    &SandboxPolicy {
-                        version: 0,
-                        filesystem: FilesystemPolicy::default(),
-                        network: NetworkPolicy::default(),
-                        landlock: LandlockPolicy::default(),
-                        process: ProcessPolicy {
-                            run_as_user: None,
-                            run_as_group: None,
-                        },
-                    },
-                    None,
-                )
-                .expect("prepare should succeed in test environment"),
-            ),
-        );
-
-        let output = cmd
-            .spawn()
-            .expect("spawn must succeed")
-            .wait_with_output()
-            .expect("wait_with_output");
-        assert!(output.status.success(), "echo should exit 0");
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("drop-privileges-ok"),
-            "echo output should contain 'drop-privileges-ok'"
-        );
-    }
-
-    /// SSH pre-exec uses the numeric identity resolved from OCI metadata rather
-    /// than looking the preserved declaration up through host NSS.
-    #[cfg(unix)]
-    #[test]
-    fn pre_exec_uses_resolved_oci_identity() {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
-        };
-
-        if rustix::process::geteuid().is_root() {
-            return;
-        }
-
-        let policy = SandboxPolicy {
-            version: 0,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: Some("__oci_user_not_in_host_nss__".into()),
-                run_as_group: Some("__oci_group_not_in_host_nss__".into()),
-            },
-        };
-        let resolved = ResolvedProcessIdentity::new(
-            Some(rustix::process::geteuid().as_raw()),
-            Some(rustix::process::getegid().as_raw()),
-        );
-
-        let mut cmd = Command::new("echo");
-        cmd.arg("resolved-identity-ok");
-        cmd.stdout(Stdio::piped());
-
-        unsafe_pty::install_pre_exec_no_pty(
-            &mut cmd,
-            policy,
-            None,
-            None,
-            resolved,
-            ProcessEnforcementMode::Full,
-            #[cfg(target_os = "linux")]
-            None,
-        );
-
-        let output = cmd
-            .spawn()
-            .expect("spawn should use resolved numeric identity")
-            .wait_with_output()
-            .expect("wait should succeed");
-        assert!(output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout).trim(),
-            "resolved-identity-ok"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // direct-tcpip authorization wiring (SEC-007)
-    //
-    // The `loopback_host_*` tests above cover the predicate in isolation.
-    // These drive the real `russh::server::Handler` over an in-memory duplex
-    // so the deny path itself is covered: channel-open authorization travels
-    // through a reply handle rather than the handler's return value, so a
-    // handler that never rejects anything still type-checks and still passes
-    // every predicate test.
-    // -----------------------------------------------------------------------
-
-    struct AcceptAnyServerKey;
-
-    impl russh::client::Handler for AcceptAnyServerKey {
-        type Error = russh::Error;
-
-        async fn check_server_key(
-            &mut self,
-            _server_public_key: &russh::keys::PublicKey,
-        ) -> Result<bool, Self::Error> {
-            Ok(true)
-        }
-    }
-
-    fn forwarding_test_policy() -> SandboxPolicy {
-        use openshell_core::policy::{
-            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy,
-        };
-
-        SandboxPolicy {
-            version: 0,
-            filesystem: FilesystemPolicy::default(),
-            network: NetworkPolicy::default(),
-            landlock: LandlockPolicy::default(),
-            process: ProcessPolicy {
-                run_as_user: None,
-                run_as_group: None,
-            },
-        }
-    }
-
-    /// Serve `SshHandler` on one end of an in-memory duplex and return an
-    /// authenticated client handle for the other end.
-    ///
-    /// The handler gets `netns_fd: None` so `connect_in_netns` performs a plain
-    /// TCP connect, making the forwarding path reachable without a network
-    /// namespace.
-    async fn authenticated_test_client_with_main(
-        main_session: Arc<MainSession>,
-    ) -> russh::client::Handle<AcceptAnyServerKey> {
-        // Scoped so the `!Send` ThreadRng is dropped before the first await.
-        let host_key = {
-            let mut rng = rand::rng();
-            PrivateKey::random(&mut rng, Algorithm::Ed25519).expect("host key")
-        };
-        let mut server_config = russh::server::Config {
-            auth_rejection_time: Duration::from_millis(1),
-            ..Default::default()
-        };
-        server_config.keys.push(host_key);
-
-        let handler = SshHandler::new(
-            forwarding_test_policy(),
-            ResolvedWorkspace::default(),
-            None,
-            None,
-            None,
-            ProviderCredentialState::from_child_env_snapshot(0, HashMap::new()),
-            HashMap::new(),
-            ResolvedProcessIdentity::default(),
-            ProcessEnforcementMode::NetworkOnly,
-            main_session,
-        );
-
-        let (server_stream, client_stream) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(async move {
-            if let Ok(session) =
-                russh::server::run_stream(Arc::new(server_config), server_stream, handler).await
-            {
-                let _ = session.await;
-            }
-        });
-
-        let mut client = russh::client::connect_stream(
-            Arc::new(russh::client::Config::default()),
-            client_stream,
-            AcceptAnyServerKey,
-        )
-        .await
-        .expect("SSH handshake should complete over the duplex");
-
-        let auth = client
-            .authenticate_none("sandbox")
-            .await
-            .expect("auth_none should not error");
-        assert!(
-            matches!(auth, russh::client::AuthResult::Success),
-            "sandbox SSH server accepts the none auth method"
-        );
-
-        client
-    }
-
-    async fn authenticated_test_client() -> russh::client::Handle<AcceptAnyServerKey> {
-        authenticated_test_client_with_main(MainSession::inert()).await
-    }
-
-    #[tokio::test]
-    async fn abrupt_transport_drop_releases_main_input_lease() {
-        let main_session = MainSession::inert();
-        let client = authenticated_test_client_with_main(Arc::clone(&main_session)).await;
-        let channel = client.channel_open_session().await.expect("open session");
-        channel
-            .request_subsystem(true, "openshell-main")
-            .await
-            .expect("attach main subsystem");
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                match main_session.acquire_input() {
-                    Err(_) => break,
-                    Ok((owner, _)) => main_session.release_input(owner),
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("main subsystem should acquire canonical input lease");
-
-        drop(channel);
-        drop(client);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if main_session.acquire_input().is_ok() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("handler drop should release canonical input lease");
-    }
-
-    #[tokio::test]
-    async fn main_subsystem_applies_initial_pty_dimensions() {
-        let (main_session, _slave) = MainSession::terminal_for_test();
-        let client = authenticated_test_client_with_main(Arc::clone(&main_session)).await;
-        let channel = client.channel_open_session().await.expect("open session");
-        channel
-            .request_pty(true, "xterm-256color", 200, 60, 1600, 900, &[])
-            .await
-            .expect("request PTY");
-        channel
-            .request_subsystem(true, "openshell-main")
-            .await
-            .expect("attach main subsystem");
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if main_session.terminal_size_for_test() == (200, 60) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("main subsystem should apply the initial PTY dimensions");
-    }
-
-    #[tokio::test]
-    async fn direct_tcpip_rejects_non_loopback_destination() {
-        let client = authenticated_test_client().await;
-
-        let err = client
-            .channel_open_direct_tcpip("10.0.0.1", 80, "127.0.0.1", 0)
-            .await
-            .expect_err("forwarding to a non-loopback host must be refused");
-
-        assert!(
-            matches!(
-                err,
-                russh::Error::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited)
-            ),
-            "expected AdministrativelyProhibited, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_tcpip_rejects_port_above_tcp_range() {
-        let client = authenticated_test_client().await;
-
-        // 65_537 truncates to port 1 when cast to u16, so the guard has to
-        // reject it before the cast rather than forward to a privileged port.
-        let err = client
-            .channel_open_direct_tcpip("127.0.0.1", 65_537, "127.0.0.1", 0)
-            .await
-            .expect_err("a port outside the TCP range must be refused");
-
-        assert!(
-            matches!(
-                err,
-                russh::Error::ChannelOpenFailure(ChannelOpenFailure::AdministrativelyProhibited)
-            ),
-            "expected AdministrativelyProhibited, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_tcpip_forwards_to_loopback_listener() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback echo listener");
-        let port = listener.local_addr().expect("listener address").port();
-        tokio::spawn(async move {
-            if let Ok((mut socket, _)) = listener.accept().await {
-                let mut buf = [0u8; 64];
-                if let Ok(n) = socket.read(&mut buf).await
-                    && n > 0
-                {
-                    let _ = socket.write_all(&buf[..n]).await;
-                }
-            }
-        });
-
-        let client = authenticated_test_client().await;
-        let channel = client
-            .channel_open_direct_tcpip("127.0.0.1", u32::from(port), "127.0.0.1", 0)
-            .await
-            .expect("forwarding to a loopback listener must be allowed");
-
-        let mut stream = channel.into_stream();
-        stream.write_all(b"ping").await.expect("write to channel");
-
-        let mut echoed = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
-            .await
-            .expect("relayed response should arrive before the timeout")
-            .expect("read from channel");
-        assert_eq!(&echoed, b"ping", "bytes round-trip through the tunnel");
     }
 }

@@ -1,6 +1,8 @@
 ---
 name: sbom
 description: Generate and manage Software Bill of Materials (SBOMs) for the OpenShell project. Covers SBOM generation with Syft, license resolution via public registries, and CSV export for compliance review. Trigger keywords - SBOM, sbom, bill of materials, license audit, license resolution, generate sbom, sbom csv, dependency license, supply chain, license scan.
+metadata:
+  internal: true
 ---
 
 # SBOM Generation and License Resolution
@@ -13,7 +15,7 @@ The OpenShell SBOM tooling produces source-tree CycloneDX JSON SBOMs using Syft,
 
 SBOMs are **release artifacts only** -- they are generated on demand and not committed to the repository. Output lands in `deploy/sbom/output/` (gitignored).
 
-Pushed gateway and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
+Pushed gateway, sandbox, and supervisor images carry an SPDX SBOM and minimal SLSA provenance as OCI attestations. Branch E2E, Release Dev, and Release Tag image binaries embed cargo-auditable metadata, so their image SBOMs include linked Rust crates.
 
 ## Prerequisites
 

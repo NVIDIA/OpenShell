@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::color::Colorize;
 use crate::tls::{
     TlsOptions, build_insecure_rustls_config, build_rustls_config, grpc_client,
     require_tls_materials,
@@ -19,8 +20,7 @@ use openshell_bootstrap::{
     save_active_gateway, store_gateway_metadata,
 };
 use openshell_bootstrap::{GatewayMetadataSource, ListedGateway};
-use openshell_core::proto::{GetGatewayInfoRequest, HealthRequest, ServiceStatus};
-use owo_colors::OwoColorize;
+use openshell_core::proto::{ExtensionKind, GetGatewayInfoRequest, HealthRequest, ServiceStatus};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tonic::{Code, Status};
@@ -33,6 +33,7 @@ struct GatewayInfoView {
     status: String,
     version: String,
     compute_drivers: Vec<ComputeDriverInfoView>,
+    extensions: Vec<ExtensionInfoView>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,17 @@ struct ComputeDriverInfoView {
 struct ComputeDriverCapabilitiesView {
     driver_name: String,
     driver_version: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExtensionInfoView {
+    kind: String,
+    configured_name: String,
+    implementation_name: String,
+    implementation_version: String,
+    protocol_version: String,
+    supported_capabilities: Vec<String>,
+    required_capabilities: Vec<String>,
 }
 
 /// Show gateway status.
@@ -376,6 +388,19 @@ pub async fn gateway_info(
         })?
         .into_inner();
 
+    let extensions = info
+        .extensions
+        .into_iter()
+        .map(|extension| ExtensionInfoView {
+            kind: extension_kind_name(extension.kind).to_string(),
+            configured_name: extension.configured_name,
+            implementation_name: extension.implementation_name,
+            implementation_version: extension.implementation_version,
+            protocol_version: format!("{}.{}", extension.protocol_major, extension.protocol_minor),
+            supported_capabilities: extension.supported_capabilities,
+            required_capabilities: extension.required_capabilities,
+        })
+        .collect();
     let view = GatewayInfoView {
         gateway: gateway_name.to_string(),
         server: server.to_string(),
@@ -396,6 +421,7 @@ pub async fn gateway_info(
                 }
             })
             .collect(),
+        extensions,
     };
 
     print_gateway_info(&view, output)
@@ -422,8 +448,50 @@ fn print_gateway_info(view: &GatewayInfoView, output: &str) -> Result<()> {
     println!("  {} {}", "Status:".dimmed(), view.status);
     println!("  {} {}", "Version:".dimmed(), view.version);
     print_compute_driver_info(&view.compute_drivers);
+    print_extension_info(&view.extensions);
 
     Ok(())
+}
+
+fn extension_kind_name(kind: i32) -> &'static str {
+    match ExtensionKind::try_from(kind).unwrap_or(ExtensionKind::Unspecified) {
+        ExtensionKind::ComputeDriver => "compute-driver",
+        ExtensionKind::CredentialDriver => "credential-driver",
+        ExtensionKind::GatewayInterceptor => "gateway-interceptor",
+        ExtensionKind::SupervisorMiddleware => "supervisor-middleware",
+        ExtensionKind::Unspecified => "unspecified",
+    }
+}
+
+fn print_extension_info(extensions: &[ExtensionInfoView]) {
+    if extensions.is_empty() {
+        return;
+    }
+    println!("  {}", "Extensions:".dimmed());
+    for extension in extensions {
+        println!("    {} ({})", extension.configured_name, extension.kind);
+        println!(
+            "      {} {} {} (protocol {})",
+            "Implementation:".dimmed(),
+            extension.implementation_name,
+            extension.implementation_version,
+            extension.protocol_version
+        );
+        if !extension.supported_capabilities.is_empty() {
+            println!(
+                "      {} {}",
+                "Capabilities:".dimmed(),
+                extension.supported_capabilities.join(", ")
+            );
+        }
+        if !extension.required_capabilities.is_empty() {
+            println!(
+                "      {} {}",
+                "Requires gateway:".dimmed(),
+                extension.required_capabilities.join(", ")
+            );
+        }
+    }
 }
 
 fn print_compute_driver_info(drivers: &[ComputeDriverInfoView]) {
@@ -467,6 +535,15 @@ fn gateway_info_to_json(view: &GatewayInfoView) -> serde_json::Value {
                 },
             }))
             .collect::<Vec<_>>(),
+        "extensions": view.extensions.iter().map(|extension| serde_json::json!({
+            "kind": &extension.kind,
+            "configured_name": &extension.configured_name,
+            "implementation_name": &extension.implementation_name,
+            "implementation_version": &extension.implementation_version,
+            "protocol_version": &extension.protocol_version,
+            "supported_capabilities": &extension.supported_capabilities,
+            "required_capabilities": &extension.required_capabilities,
+        })).collect::<Vec<_>>(),
     })
 }
 
@@ -1507,16 +1584,16 @@ pub fn gateway_remove(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverCapabilitiesView, ComputeDriverInfoView, GatewayAuthenticationState,
-        GatewayInfoView, TlsOptions, format_gateway_select_header, format_gateway_select_items,
-        gateway_add, gateway_auth_label, gateway_authentication_state,
+        ComputeDriverCapabilitiesView, ComputeDriverInfoView, ExtensionInfoView,
+        GatewayAuthenticationState, GatewayInfoView, TlsOptions, format_gateway_select_header,
+        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_authentication_state,
         gateway_env_override_warning, gateway_info_to_json, gateway_remote_label,
         gateway_select_with, gateway_to_json, gateway_type_label, http_health_check,
         import_local_package_mtls_bundle, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         plaintext_gateway_is_remote,
     };
     use crate::TEST_ENV_LOCK;
-    use crate::test_utils::{EnvVarGuard, with_tmp_xdg};
+    use crate::test_utils::{Environment, with_tmp_xdg, with_tmp_xdg_env};
     use hyper::StatusCode;
     use openshell_bootstrap::{
         GatewayMetadata, GatewayMetadataSource, ListedGateway, load_active_gateway,
@@ -1529,21 +1606,20 @@ mod tests {
     use std::thread;
     use tonic::Status;
 
-    fn with_tmp_xdg_and_system<F: FnOnce()>(tmp: &Path, system: &Path, f: F) {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let xdg_guard = EnvVarGuard::set(
-            "XDG_CONFIG_HOME",
-            tmp.to_str().expect("temp path should be utf-8"),
-        );
-        let system_guard = EnvVarGuard::set(
-            "OPENSHELL_SYSTEM_GATEWAY_DIR",
-            system.to_str().expect("system path should be utf-8"),
-        );
-        f();
-        drop(system_guard);
-        drop(xdg_guard);
+    fn with_tmp_xdg_and_system(
+        tmp: &Path,
+        system: &Path,
+        env: Environment,
+        f: impl FnOnce(&Path, &Path),
+    ) {
+        env.set("XDG_CONFIG_HOME", tmp)
+            .set("OPENSHELL_SYSTEM_GATEWAY_DIR", system)
+            .run(|| {
+                let user = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                let system =
+                    PathBuf::from(std::env::var_os("OPENSHELL_SYSTEM_GATEWAY_DIR").unwrap());
+                f(&user, &system);
+            });
     }
 
     fn edge_registration(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -1629,7 +1705,7 @@ mod tests {
     #[test]
     fn gateway_select_uses_explicit_name_without_prompting() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             store_gateway_metadata(
                 "alpha",
                 &edge_registration("alpha", "https://alpha.example.com"),
@@ -1653,18 +1729,22 @@ mod tests {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::set("OPENSHELL_GATEWAY", "openshell");
 
-        let warning = gateway_env_override_warning("docker-dev").expect("env override should warn");
+        Environment::new()
+            .set("OPENSHELL_GATEWAY", "openshell")
+            .run(|| {
+                let warning =
+                    gateway_env_override_warning("docker-dev").expect("env override should warn");
 
-        assert!(
-            warning.contains("OPENSHELL_GATEWAY=openshell"),
-            "warning should name the overriding env var: {warning}"
-        );
-        assert!(
-            warning.contains("export OPENSHELL_GATEWAY=docker-dev"),
-            "warning should suggest updating the env var: {warning}"
-        );
+                assert!(
+                    warning.contains("OPENSHELL_GATEWAY=openshell"),
+                    "warning should name the overriding env var: {warning}"
+                );
+                assert!(
+                    warning.contains("export OPENSHELL_GATEWAY=docker-dev"),
+                    "warning should suggest updating the env var: {warning}"
+                );
+            });
     }
 
     #[test]
@@ -1672,15 +1752,18 @@ mod tests {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _env = EnvVarGuard::set("OPENSHELL_GATEWAY", "docker-dev");
 
-        assert_eq!(gateway_env_override_warning("docker-dev"), None);
+        Environment::new()
+            .set("OPENSHELL_GATEWAY", "docker-dev")
+            .run(|| {
+                assert_eq!(gateway_env_override_warning("docker-dev"), None);
+            });
     }
 
     #[test]
     fn gateway_select_prefers_active_gateway_as_default_choice() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             store_gateway_metadata(
                 "alpha",
                 &edge_registration("alpha", "https://alpha.example.com"),
@@ -1708,7 +1791,7 @@ mod tests {
     #[test]
     fn gateway_select_non_interactive_lists_gateways_without_prompting() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             store_gateway_metadata(
                 "alpha",
                 &edge_registration("alpha", "https://alpha.example.com"),
@@ -1824,6 +1907,15 @@ mod tests {
                     driver_version: "0.0.75".to_string(),
                 },
             }],
+            extensions: vec![ExtensionInfoView {
+                kind: "compute-driver".to_string(),
+                configured_name: "podman".to_string(),
+                implementation_name: "openshell/podman".to_string(),
+                implementation_version: "0.0.75".to_string(),
+                protocol_version: "1.0".to_string(),
+                supported_capabilities: vec!["openshell.compute.contract".to_string()],
+                required_capabilities: vec!["openshell.compute.contract".to_string()],
+            }],
         };
 
         let json = gateway_info_to_json(&view);
@@ -1836,6 +1928,7 @@ mod tests {
             json["compute_drivers"][0]["capabilities"]["driver_name"],
             "podman"
         );
+        assert_eq!(json["extensions"][0]["protocol_version"], "1.0");
         assert_eq!(
             json["compute_drivers"][0]["capabilities"]["driver_version"],
             "0.0.75"
@@ -1851,6 +1944,7 @@ mod tests {
             status: "healthy".to_string(),
             version: "0.0.74".to_string(),
             compute_drivers: Vec::new(),
+            extensions: Vec::new(),
         };
 
         let json = gateway_info_to_json(&view);
@@ -1879,12 +1973,15 @@ mod tests {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _tls_dir = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", "/tmp/openshell-test-tls");
 
-        assert_eq!(
-            package_managed_tls_dirs(),
-            vec![PathBuf::from("/tmp/openshell-test-tls")],
-        );
+        Environment::new()
+            .set("OPENSHELL_LOCAL_TLS_DIR", "/tmp/openshell-test-tls")
+            .run(|| {
+                assert_eq!(
+                    package_managed_tls_dirs(),
+                    vec![PathBuf::from("/tmp/openshell-test-tls")],
+                );
+            });
     }
 
     #[test]
@@ -1896,28 +1993,30 @@ mod tests {
         fs::write(package_tls.join("client/tls.crt"), "client cert").expect("write cert");
         fs::write(package_tls.join("client/tls.key"), "client key").expect("write key");
 
-        with_tmp_xdg(tmpdir.path(), || {
-            let _tls_dir = EnvVarGuard::set(
-                "OPENSHELL_LOCAL_TLS_DIR",
-                package_tls.to_str().expect("temp path should be utf-8"),
-            );
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new().set("OPENSHELL_LOCAL_TLS_DIR", &package_tls),
+            |tmpdir| {
+                let package_tls =
+                    PathBuf::from(std::env::var_os("OPENSHELL_LOCAL_TLS_DIR").unwrap());
 
-            let imported =
-                import_local_package_mtls_bundle("openshell").expect("import local bundle");
+                let imported =
+                    import_local_package_mtls_bundle("openshell").expect("import local bundle");
 
-            assert_eq!(imported.as_deref(), Some(package_tls.as_path()));
+                assert_eq!(imported.as_deref(), Some(package_tls.as_path()));
 
-            let mtls = tmpdir.path().join("openshell/gateways/openshell/mtls");
-            assert_eq!(fs::read_to_string(mtls.join("ca.crt")).unwrap(), "ca");
-            assert_eq!(
-                fs::read_to_string(mtls.join("tls.crt")).unwrap(),
-                "client cert",
-            );
-            assert_eq!(
-                fs::read_to_string(mtls.join("tls.key")).unwrap(),
-                "client key",
-            );
-        });
+                let mtls = tmpdir.join("openshell/gateways/openshell/mtls");
+                assert_eq!(fs::read_to_string(mtls.join("ca.crt")).unwrap(), "ca");
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                    "client cert",
+                );
+                assert_eq!(
+                    fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                    "client key",
+                );
+            },
+        );
     }
 
     #[test]
@@ -1929,7 +2028,7 @@ mod tests {
         fs::write(mtls.join("tls.crt"), "client cert").expect("write cert");
         fs::write(mtls.join("tls.key"), "client key").expect("write key");
 
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             assert!(mtls_certs_exist_for_gateway("k8s"));
             assert!(!mtls_certs_exist_for_gateway("openshell"));
         });
@@ -1970,9 +2069,8 @@ mod tests {
 
     #[test]
     fn gateway_add_registers_plaintext_loopback_gateway_without_local_flag() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
             runtime.block_on(async {
                 gateway_add(
@@ -2002,9 +2100,8 @@ mod tests {
 
     #[test]
     fn gateway_add_respects_local_flag_for_plaintext_registrations() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
             runtime.block_on(async {
                 gateway_add(
@@ -2032,7 +2129,6 @@ mod tests {
 
     #[tokio::test]
     async fn http_health_check_supports_plain_http_endpoints() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
         let server = thread::spawn(move || {
@@ -2061,9 +2157,8 @@ mod tests {
 
     #[test]
     fn gateway_add_oidc_rolls_back_on_auth_failure() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
+        with_tmp_xdg(tmpdir.path(), |_| {
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
 
             // Register a working plaintext gateway first so we can verify
@@ -2118,144 +2213,155 @@ mod tests {
     }
     #[test]
     fn gateway_add_oidc_rollback_keeps_system_active_fallback_userless() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let user = tempfile::tempdir().expect("create user tmpdir");
         let system = tempfile::tempdir().expect("create system tmpdir");
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            fs::write(system.path().join("active_gateway"), "system-default")
-                .expect("write system active gateway");
-            assert_eq!(load_user_active_gateway(), None);
-            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+        with_tmp_xdg_and_system(
+            user.path(),
+            system.path(),
+            Environment::new(),
+            |_, system| {
+                fs::write(system.join("active_gateway"), "system-default")
+                    .expect("write system active gateway");
+                assert_eq!(load_user_active_gateway(), None);
+                assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
 
-            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
-            runtime.block_on(async {
-                gateway_add(
-                    "https://gateway.example.com",
-                    Some("oidc-fail"),
-                    None,
-                    false,
-                    Some("http://127.0.0.1:1/realms/nonexistent"),
-                    "openshell-cli",
-                    None,
-                    None,
-                    false,
-                )
-                .await
-                .expect("gateway_add should not return Err on auth failure");
-            });
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://gateway.example.com",
+                        Some("oidc-fail"),
+                        None,
+                        false,
+                        Some("http://127.0.0.1:1/realms/nonexistent"),
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("gateway_add should not return Err on auth failure");
+                });
 
-            assert!(
-                load_gateway_metadata("oidc-fail").is_err(),
-                "failed OIDC gateway should be removed after auth failure"
-            );
-            assert_eq!(
-                load_user_active_gateway(),
-                None,
-                "rollback should not persist the system fallback into user config"
-            );
-            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
-        });
+                assert!(
+                    load_gateway_metadata("oidc-fail").is_err(),
+                    "failed OIDC gateway should be removed after auth failure"
+                );
+                assert_eq!(
+                    load_user_active_gateway(),
+                    None,
+                    "rollback should not persist the system fallback into user config"
+                );
+                assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+            },
+        );
     }
 
     #[test]
     fn gateway_add_cloud_rolls_back_on_auth_failure() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        with_tmp_xdg(tmpdir.path(), || {
-            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
-            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
-            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+        with_tmp_xdg_env(
+            tmpdir.path(),
+            Environment::new()
+                .set("OPENSHELL_NO_BROWSER", "0")
+                .set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1"),
+            |_| {
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
 
-            // Register a working plaintext gateway first.
-            runtime.block_on(async {
-                gateway_add(
-                    "http://127.0.0.1:9999",
+                // Register a working plaintext gateway first.
+                runtime.block_on(async {
+                    gateway_add(
+                        "http://127.0.0.1:9999",
+                        Some("existing-gw"),
+                        None,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("register seed gateway");
+                });
+                assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
+
+                // Attempt cloud gateway add. Keep browser suppression disabled so
+                // auth failure still rolls back the registration, but use the
+                // test-only auth failure hook instead of opening the OS browser.
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:1",
+                        Some("cloud-fail"),
+                        None,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("gateway_add should not return Err on auth failure");
+                });
+
+                // The failed registration should have been rolled back.
+                assert!(
+                    load_gateway_metadata("cloud-fail").is_err(),
+                    "failed cloud gateway should be removed after auth failure"
+                );
+                assert_eq!(
+                    load_active_gateway().as_deref(),
                     Some("existing-gw"),
-                    None,
-                    false,
-                    None,
-                    "openshell-cli",
-                    None,
-                    None,
-                    false,
-                )
-                .await
-                .expect("register seed gateway");
-            });
-            assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
-
-            // Attempt cloud gateway add. Keep browser suppression disabled so
-            // auth failure still rolls back the registration, but use the
-            // test-only auth failure hook instead of opening the OS browser.
-            runtime.block_on(async {
-                gateway_add(
-                    "https://127.0.0.1:1",
-                    Some("cloud-fail"),
-                    None,
-                    false,
-                    None,
-                    "openshell-cli",
-                    None,
-                    None,
-                    false,
-                )
-                .await
-                .expect("gateway_add should not return Err on auth failure");
-            });
-
-            // The failed registration should have been rolled back.
-            assert!(
-                load_gateway_metadata("cloud-fail").is_err(),
-                "failed cloud gateway should be removed after auth failure"
-            );
-            assert_eq!(
-                load_active_gateway().as_deref(),
-                Some("existing-gw"),
-                "active gateway should be restored after rollback"
-            );
-        });
+                    "active gateway should be restored after rollback"
+                );
+            },
+        );
     }
     #[test]
     fn gateway_add_cloud_rollback_keeps_system_active_fallback_userless() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
         let user = tempfile::tempdir().expect("create user tmpdir");
         let system = tempfile::tempdir().expect("create system tmpdir");
-        with_tmp_xdg_and_system(user.path(), system.path(), || {
-            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
-            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
-            fs::write(system.path().join("active_gateway"), "system-default")
-                .expect("write system active gateway");
-            assert_eq!(load_user_active_gateway(), None);
-            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+        with_tmp_xdg_and_system(
+            user.path(),
+            system.path(),
+            Environment::new()
+                .set("OPENSHELL_NO_BROWSER", "0")
+                .set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1"),
+            |_, system| {
+                fs::write(system.join("active_gateway"), "system-default")
+                    .expect("write system active gateway");
+                assert_eq!(load_user_active_gateway(), None);
+                assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
 
-            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
-            runtime.block_on(async {
-                gateway_add(
-                    "https://127.0.0.1:1",
-                    Some("cloud-fail"),
-                    None,
-                    false,
-                    None,
-                    "openshell-cli",
-                    None,
-                    None,
-                    false,
-                )
-                .await
-                .expect("gateway_add should not return Err on auth failure");
-            });
+                let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+                runtime.block_on(async {
+                    gateway_add(
+                        "https://127.0.0.1:1",
+                        Some("cloud-fail"),
+                        None,
+                        false,
+                        None,
+                        "openshell-cli",
+                        None,
+                        None,
+                        false,
+                    )
+                    .await
+                    .expect("gateway_add should not return Err on auth failure");
+                });
 
-            assert!(
-                load_gateway_metadata("cloud-fail").is_err(),
-                "failed cloud gateway should be removed after auth failure"
-            );
-            assert_eq!(
-                load_user_active_gateway(),
-                None,
-                "rollback should not persist the system fallback into user config"
-            );
-            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
-        });
+                assert!(
+                    load_gateway_metadata("cloud-fail").is_err(),
+                    "failed cloud gateway should be removed after auth failure"
+                );
+                assert_eq!(
+                    load_user_active_gateway(),
+                    None,
+                    "rollback should not persist the system fallback into user config"
+                );
+                assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+            },
+        );
     }
     #[test]
     fn status_to_json_connected() {

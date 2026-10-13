@@ -7,7 +7,7 @@
 //! to either the gRPC service or HTTP endpoints based on the request headers.
 
 use bytes::{Bytes, BytesMut};
-use http::{Extensions, HeaderValue, Request, Response, StatusCode};
+use http::{Extensions, HeaderValue, Request, Response};
 use http_body::Body;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited, StreamBody};
 use hyper::body::Incoming;
@@ -17,15 +17,17 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
-use openshell_core::Config;
-use openshell_core::proto::{
-    inference_server::InferenceServer, open_shell_server::OpenShellServer,
+use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::{
+    Config,
+    proto::{Provider, UpdateProviderRequest},
 };
 use openshell_gateway_interceptors::{EvaluationContext, GatewayInterceptorRuntime};
 use openshell_otel::HeaderMapExtractor;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt as _;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
+use prost::Message;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
@@ -45,11 +47,9 @@ use crate::{
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
-    auth::principal::{Principal, UserPrincipal},
-    gateway_listener::GatewayListenerScope,
-    http_router,
-    inference::InferenceService,
-    service_http_router,
+    auth::principal::{OperatorPrincipal, Principal, UserPrincipal},
+    auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
+    http_router, service_http_router,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -62,6 +62,16 @@ impl MakeRequestId for UuidRequestId {
         Some(RequestId::new(HeaderValue::from_str(&id).unwrap()))
     }
 }
+
+/// Paths called on a timer rather than by someone waiting on the result.
+const POLLED_PATHS: &[&str] = &[
+    "/health",
+    "/healthz",
+    "/readyz",
+    "/openshell.v1.OpenShell/GetSandboxConfig",
+    "/openshell.v1.OpenShell/ReportProviderReadiness",
+    "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+];
 
 /// Build a tracing span for an inbound request, recording the `request_id`
 /// header (set by [`UuidRequestId`] or supplied by the client).
@@ -79,7 +89,7 @@ fn make_request_span<B>(req: &Request<B>) -> Span {
     // the callsite name.
     let otel_name = otel_span_name(req.method(), path);
 
-    let span = if matches!(path, "/health" | "/healthz" | "/readyz") {
+    let span = if POLLED_PATHS.contains(&path) {
         tracing::debug_span!(
             "request",
             method = %req.method(),
@@ -135,11 +145,17 @@ fn log_response<B>(res: &Response<B>, latency: Duration, span: &Span) {
     if status.is_server_error() {
         crate::otel_tracing::mark_error(span);
     }
-    tracing::info!(
-        status = status.as_u16(),
-        latency_ms = latency.as_millis(),
-        "response"
-    );
+    // Polled requests get a DEBUG span, which is `None` when filtered out.
+    let polled = span
+        .metadata()
+        .is_none_or(|m| *m.level() == tracing::Level::DEBUG);
+    let server_error = status.is_server_error();
+    let (status, latency_ms) = (status.as_u16(), latency.as_millis());
+    match (polled, server_error) {
+        (false, _) => tracing::info!(status, latency_ms, "response"),
+        (true, true) => tracing::warn!(status, latency_ms, "response"),
+        (true, false) => tracing::debug!(status, latency_ms, "response"),
+    }
 }
 
 fn record_response_trailers(
@@ -199,6 +215,10 @@ macro_rules! request_id_middleware {
 /// the largest payload and well within this cap under normal use.
 const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
 const MAX_INTERCEPTED_GRPC_BODY_SIZE: usize = MAX_GRPC_DECODE_SIZE + 5;
+/// Concurrent HTTP/2 streams allowed per connection. Sits above the
+/// per-replica pending relay budget so pooled peer connections are bounded by
+/// the relay caps rather than by the transport.
+const MAX_HTTP2_CONCURRENT_STREAMS: u32 = 1024;
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -219,22 +239,7 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_on_listener(stream, GatewayListenerScope::Primary)
-            .await
-    }
-
-    /// Serve a connection and preserve its listener scope in request
-    /// extensions for downstream routing and policy decisions.
-    pub(crate) async fn serve_on_listener<S>(
-        &self,
-        stream: S,
-        listener_scope: GatewayListenerScope,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        self.serve_with_peer_identity_on_listener(stream, None, listener_scope)
-            .await
+        self.serve_with_peer_identity(stream, None).await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -246,31 +251,43 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity_on_listener(
-            stream,
-            peer_identity,
-            GatewayListenerScope::Primary,
-        )
-        .await
+        self.serve_with_verified_certificate(stream, peer_identity, None)
+            .await
     }
 
-    /// Serve a TLS connection and preserve its listener scope in request
-    /// extensions for downstream routing and policy decisions.
-    pub(crate) async fn serve_with_peer_identity_on_listener<S>(
+    /// TLS listener only: fingerprint and identity must originate from its verified handshake.
+    pub async fn serve_with_verified_certificate<S>(
         &self,
         stream: S,
         peer_identity: Option<Identity>,
-        listener_scope: GatewayListenerScope,
+        certificate_sha256: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let operator = if self.state.config.mtls_auth.operator_enabled {
+            peer_identity
+                .as_ref()
+                .filter(|identity| {
+                    identity.provider == crate::auth::identity::IdentityProvider::Mtls
+                        && identity.roles.iter().any(|role| role == "operator")
+                })
+                .zip(certificate_sha256)
+                .map(|(identity, certificate_sha256)| OperatorPrincipal {
+                    identity: identity.clone(),
+                    certificate_sha256,
+                })
+        } else {
+            None
+        };
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
-        let openshell =
-            GatewayInterceptorGrpcService::new(openshell, self.state.gateway_interceptors.clone());
-        let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let openshell = GatewayInterceptorGrpcService::new(
+            openshell,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
+        let reflection = self.state.reflection_service.clone();
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -278,7 +295,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, inference),
+            GrpcRouter::new(openshell, reflection),
             authenticator_chain,
             authz_policy,
             self.state
@@ -289,7 +306,8 @@ impl MultiplexService {
                 .flatten(),
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
-        );
+        )
+        .with_operator(operator);
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
@@ -297,20 +315,22 @@ impl MultiplexService {
         let grpc_service = request_id_middleware!(grpc_service);
         let http_service = request_id_middleware!(http_service);
 
-        let service = GatewayListenerContextService::new(
-            MultiplexedService::new(grpc_service, http_service),
-            listener_scope,
-        );
+        let service = MultiplexedService::new(grpc_service, http_service);
 
         let mut builder = Builder::new(TokioExecutor::new());
         // Server-side HTTP/2 keepalive: supervisors hold long-lived sessions, and without
         // it the gateway never PINGs them, so idle/half-dead connections linger and orphan
         // in-flight relay execs. The timer is required — hyper panics on the keepalive
         // interval without one.
+        //
+        // Peer relays from one replica now share a single pooled connection, so every
+        // forwarded session for every sandbox counts against this one limit. hyper's
+        // default of 200 would cap the whole replica pair below MAX_PENDING_RELAYS.
         builder
             .http2()
             .timer(TokioTimer::new())
             .adaptive_window(true)
+            .max_concurrent_streams(MAX_HTTP2_CONCURRENT_STREAMS)
             .keep_alive_interval(Some(Duration::from_secs(20)))
             .keep_alive_timeout(Duration::from_secs(10));
 
@@ -329,26 +349,9 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_service_http_on_listener(stream, GatewayListenerScope::Primary)
-            .await
-    }
-
-    /// Serve a plaintext service HTTP connection and preserve its listener
-    /// scope in request extensions.
-    pub(crate) async fn serve_service_http_on_listener<S>(
-        &self,
-        stream: S,
-        listener_scope: GatewayListenerScope,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let http_service = GatewayListenerContextService::new(
-            TowerToHyperService::new(request_id_middleware!(service_http_router(
-                self.state.clone()
-            ))),
-            listener_scope,
-        );
+        let http_service = TowerToHyperService::new(request_id_middleware!(service_http_router(
+            self.state.clone()
+        )));
 
         Builder::new(TokioExecutor::new())
             .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
@@ -358,49 +361,25 @@ impl MultiplexService {
     }
 }
 
-/// Adds the immutable listener authorization scope to every served request.
-#[derive(Clone)]
-struct GatewayListenerContextService<S> {
-    inner: S,
-    listener_scope: GatewayListenerScope,
-}
-
-impl<S> GatewayListenerContextService<S> {
-    fn new(inner: S, listener_scope: GatewayListenerScope) -> Self {
-        Self {
-            inner,
-            listener_scope,
-        }
-    }
-}
-
-impl<S, B> hyper::service::Service<Request<B>> for GatewayListenerContextService<S>
-where
-    S: hyper::service::Service<Request<B>>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn call(&self, mut request: Request<B>) -> Self::Future {
-        request.extensions_mut().insert(self.listener_scope);
-        self.inner.call(request)
-    }
-}
-
 /// `OpenShell` gRPC wrapper that applies configured gateway interceptors before
 /// tonic dispatches to a specific RPC handler.
 #[derive(Clone)]
 struct GatewayInterceptorGrpcService<S> {
     inner: S,
     interceptors: Option<GatewayInterceptorRuntime>,
+    state: Option<Arc<ServerState>>,
 }
 
 impl<S> GatewayInterceptorGrpcService<S> {
-    fn new(inner: S, interceptors: Option<GatewayInterceptorRuntime>) -> Self {
+    fn new(
+        inner: S,
+        interceptors: Option<GatewayInterceptorRuntime>,
+        state: Option<Arc<ServerState>>,
+    ) -> Self {
         Self {
             inner,
             interceptors,
+            state,
         }
     }
 }
@@ -424,6 +403,7 @@ where
 
     fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
         let interceptors = self.interceptors.clone();
+        let state = self.state.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -437,16 +417,35 @@ where
             }
 
             let context = gateway_interceptor_context(req.extensions());
-            let (parts, body) = req.into_parts();
-            let body = match collect_intercepted_grpc_body(body).await {
+            let principal = req.extensions().get::<Principal>().cloned();
+            let (mut parts, body) = req.into_parts();
+            let mut body = match collect_intercepted_grpc_body(body).await {
                 Ok(body) => body,
                 Err(status) => return Ok(status.into_http()),
             };
+            // Retain only in memory. evaluate_request below validates the single
+            // uncompressed frame before this extension reaches typed dispatch.
+            let original_body = body.clone();
+            if let Some(state) = state.as_ref() {
+                body =
+                    match hydrate_update_provider_identity(&path, body, state, principal.as_ref())
+                        .await
+                    {
+                        Ok(body) => body,
+                        Err(status) => return Ok(status.into_http()),
+                    };
+            }
 
             let intercepted = match interceptors.evaluate_request(&path, &body, &context).await {
                 Ok(intercepted) => intercepted,
                 Err(status) => return Ok(status.into_http()),
             };
+
+            parts
+                .extensions
+                .insert(crate::grpc::mutation_replay::OriginalMutation(
+                    original_body[GRPC_FRAME_HEADER_LEN..].to_vec(),
+                ));
 
             let req = Request::from_parts(
                 parts,
@@ -455,6 +454,10 @@ where
             let response = inner.ready().await?.call(req).await?;
 
             if grpc_status_from_response(&response) != "0"
+                || response
+                    .headers()
+                    .get("openshell-replayed")
+                    .is_some_and(|value| value == "true")
                 || !interceptors.has_post_commit(&intercepted)
             {
                 return Ok(response);
@@ -495,6 +498,104 @@ where
             Ok(response)
         })
     }
+}
+
+const UPDATE_PROVIDER_PATH: &str = "/openshell.v1.OpenShell/UpdateProvider";
+const GRPC_FRAME_HEADER_LEN: usize = 5;
+
+/// Complete immutable provider identity before policy interception.
+///
+/// Update requests intentionally omit immutable fields. Loading them here keeps
+/// `provider update` a write-only operation while giving policy interceptors a
+/// canonical proposed operation derived from trusted gateway state.
+async fn hydrate_update_provider_identity(
+    path: &str,
+    body: Bytes,
+    state: &ServerState,
+    principal: Option<&Principal>,
+) -> Result<Bytes, tonic::Status> {
+    if path != UPDATE_PROVIDER_PATH {
+        return Ok(body);
+    }
+
+    let mut request = decode_unary_grpc_message::<UpdateProviderRequest>(&body)?;
+    let Some(provider) = request.provider.as_mut() else {
+        return Ok(body);
+    };
+    if !provider.r#type.is_empty() && !provider.profile_workspace.is_empty() {
+        return Ok(body);
+    }
+    let name = provider
+        .metadata
+        .as_ref()
+        .map(|metadata| metadata.name.as_str())
+        .unwrap_or_default();
+    if name.is_empty() {
+        return Ok(body);
+    }
+
+    let principal =
+        principal.ok_or_else(|| tonic::Status::unauthenticated("authentication required"))?;
+    let authorized = authorize_workspace(
+        state.store.as_ref(),
+        &state.admin_role,
+        principal,
+        crate::auth::workspace_authz::selected_workspace_name(request.workspace_scope.as_ref())?,
+        MinWorkspaceRole::Admin,
+    )
+    .await?;
+    let workspace =
+        crate::grpc::workspace::resolve_workspace(state.store.as_ref(), &authorized.workspace)
+            .await?
+            .name;
+    let existing = state
+        .store
+        .get_message_by_name::<Provider>(&workspace, name)
+        .await
+        .map_err(|error| tonic::Status::internal(format!("provider lookup failed: {error}")))?
+        .ok_or_else(|| tonic::Status::not_found(format!("provider '{name}' not found")))?;
+
+    if provider.r#type.is_empty() {
+        provider.r#type = existing.r#type;
+    }
+    if provider.profile_workspace.is_empty() {
+        provider.profile_workspace = existing.profile_workspace;
+    }
+
+    encode_unary_grpc_message(&request)
+}
+
+fn decode_unary_grpc_message<M>(body: &[u8]) -> Result<M, tonic::Status>
+where
+    M: Message + Default,
+{
+    if body.len() < GRPC_FRAME_HEADER_LEN {
+        return Err(tonic::Status::invalid_argument("gRPC frame is too short"));
+    }
+    if body[0] != 0 {
+        return Err(tonic::Status::unimplemented(
+            "gateway interceptors do not support compressed gRPC frames",
+        ));
+    }
+    let message_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    if body.len() != GRPC_FRAME_HEADER_LEN + message_len {
+        return Err(tonic::Status::invalid_argument(
+            "gRPC body must contain exactly one frame",
+        ));
+    }
+    M::decode(&body[GRPC_FRAME_HEADER_LEN..])
+        .map_err(|error| tonic::Status::invalid_argument(format!("invalid gRPC message: {error}")))
+}
+
+fn encode_unary_grpc_message<M: Message>(message: &M) -> Result<Bytes, tonic::Status> {
+    let message = message.encode_to_vec();
+    let message_len = u32::try_from(message.len())
+        .map_err(|_| tonic::Status::resource_exhausted("gRPC message exceeds u32"))?;
+    let mut frame = Vec::with_capacity(GRPC_FRAME_HEADER_LEN + message.len());
+    frame.push(0);
+    frame.extend_from_slice(&message_len.to_be_bytes());
+    frame.extend_from_slice(&message);
+    Ok(Bytes::from(frame))
 }
 
 async fn collect_intercepted_grpc_body(body: BoxBody) -> Result<Bytes, tonic::Status> {
@@ -614,6 +715,15 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 fields.insert("scopes".to_string(), user.identity.scopes.join(","));
             }
         }
+        Principal::Operator(operator) => {
+            fields.insert("kind".to_string(), "operator".to_string());
+            fields.insert("subject".to_string(), operator.identity.subject.clone());
+            fields.insert("provider".to_string(), "mtls".to_string());
+            fields.insert(
+                "certificate_sha256".to_string(),
+                operator.certificate_sha256.clone(),
+            );
+        }
         Principal::Sandbox(sandbox) => {
             fields.insert("kind".to_string(), "sandbox".to_string());
             fields.insert("sandbox_id".to_string(), sandbox.sandbox_id.clone());
@@ -621,14 +731,18 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 "source".to_string(),
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
-                    SandboxIdentitySource::BootstrapCert { .. } => "bootstrap_cert",
-                    SandboxIdentitySource::K8sServiceAccount { .. } => "k8s_service_account",
+                    SandboxIdentitySource::ComputeDriver { .. } => "compute_driver",
                 }
                 .to_string(),
             );
             if let Some(trust_domain) = &sandbox.trust_domain {
                 fields.insert("trust_domain".to_string(), trust_domain.clone());
             }
+        }
+        Principal::Peer(peer) => {
+            fields.insert("kind".to_string(), "peer".to_string());
+            fields.insert("replica_id".to_string(), peer.replica_id.clone());
+            fields.insert("pod_uid".to_string(), peer.pod_uid.clone());
         }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
@@ -676,7 +790,7 @@ impl GrpcRateLimiter {
         })
     }
 
-    fn allow(&self) -> bool {
+    pub(crate) fn allow(&self) -> bool {
         let now = Instant::now();
         let mut state = self
             .state
@@ -797,36 +911,35 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and Inference services
-/// based on the request path prefix.
+/// Combined gRPC service that routes between `OpenShell` and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, I> {
+pub struct GrpcRouter<N, R> {
     openshell: N,
-    inference: I,
+    reflection: R,
 }
 
-impl<N, I> GrpcRouter<N, I> {
-    fn new(openshell: N, inference: I) -> Self {
+impl<N, R> GrpcRouter<N, R> {
+    fn new(openshell: N, reflection: R) -> Self {
         Self {
             openshell,
-            inference,
+            reflection,
         }
     }
 }
 
-const INFERENCE_PATH_PREFIX: &str = "/openshell.inference.v1.Inference/";
+pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
+impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
     N::Future: Send,
     N::Error: Send,
-    I: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+    R: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
         + Clone
         + Send
         + 'static,
-    I::Future: Send,
+    R::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -838,10 +951,8 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
-
-        if is_inference {
-            let mut svc = self.inference.clone();
+        if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
+            let mut svc = self.reflection.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
             let mut svc = self.openshell.clone();
@@ -853,32 +964,44 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
-///    — exchanges a projected SA token for a `Principal::Sandbox` so the
-///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
-///    other path; only present when the gateway runs in-cluster.
-/// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
-///    via a distinctive `kid` so non-matching Bearer tokens fall through.
-/// 3. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 1. `PeerServiceAccountAuthenticator` (path-scoped to peer RPCs)
+///    — validates gateway replica projected `ServiceAccount` tokens with
+///    `TokenReview` for internal peer relay calls. No-op on every other path.
+/// 2. `ComputeDriverAuthenticator` (path-scoped to `IssueSandboxToken`)
+///    — delegates a driver-native credential and receives a sandbox identity
+///    so the handler can mint a gateway JWT. No-op on every other path.
+/// 3. `SandboxSessionJwtAuthenticator` — validates generation-bound gateway
+///    JWTs against the durable sandbox identity. Untyped legacy sandbox JWTs
+///    are not admitted.
+/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
 /// Once sandbox authentication is configured, callers must present an
 /// explicit credential for authenticated gRPC methods. Missing bearer auth
 /// is promoted to an mTLS user only when `mtls_auth.enabled` is configured
-/// for local single-user gateways, or to an unsafe local developer user when
-/// `auth.allow_unauthenticated_users` is explicitly enabled.
+/// and the connection presents a verified client certificate, or to an unsafe
+/// local developer user when `auth.allow_unauthenticated_users` is explicitly
+/// enabled.
 ///
 /// When neither OIDC nor sandbox credentials are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
 /// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
-    if let Some(k8s) = state.k8s_sa_authenticator.clone() {
-        authenticators.push(k8s);
+    if let Some(peer) = state.peer_authenticator.clone() {
+        authenticators.push(peer);
     }
-    if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
-        authenticators.push(jwt);
+    if let Some(driver) = state.compute_driver_authenticator.clone() {
+        authenticators.push(driver);
+    }
+    if let Some(authority) = state.sandbox_session_jwt_authority.clone() {
+        authenticators.push(Arc::new(
+            crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+                authority,
+                state.store.clone(),
+            ),
+        ));
     }
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
@@ -911,6 +1034,7 @@ pub struct AuthGrpcRouter<S> {
     peer_identity: Option<Identity>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
+    operator: Option<OperatorPrincipal>,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -938,7 +1062,13 @@ impl<S> AuthGrpcRouter<S> {
             peer_identity,
             mtls_auth_enabled,
             allow_unauthenticated_users,
+            operator: None,
         }
+    }
+
+    fn with_operator(mut self, operator: Option<OperatorPrincipal>) -> Self {
+        self.operator = operator;
+        self
     }
 }
 
@@ -979,6 +1109,7 @@ where
         let peer_identity = self.peer_identity.clone();
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
+        let operator = self.operator.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -991,7 +1122,14 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            let principal = if let Some(chain) = chain {
+            let principal = if let Some(operator) = operator {
+                if req.headers().contains_key(http::header::AUTHORIZATION) {
+                    return Ok(status_response(tonic::Status::unauthenticated(
+                        "operator certificates must not be combined with authorization headers",
+                    )));
+                }
+                Principal::Operator(operator)
+            } else if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
                     Ok(Some(p)) => p,
                     Ok(None) => match (mtls_auth_enabled, peer_identity) {
@@ -1022,6 +1160,13 @@ where
             };
 
             match principal {
+                Principal::Operator(_) => {
+                    if !crate::auth::method_authz::is_operator_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "operators may not call supervisor, peer, or unknown methods",
+                        )));
+                    }
+                }
                 Principal::User(ref user) => {
                     if !crate::auth::method_authz::is_user_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
@@ -1038,6 +1183,13 @@ where
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
+                        )));
+                    }
+                }
+                Principal::Peer(_) => {
+                    if !crate::auth::method_authz::is_peer_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "gateway peer principals may not call this method",
                         )));
                     }
                 }
@@ -1069,38 +1221,6 @@ impl<G, H> MultiplexedService<G, H> {
     }
 }
 
-fn listener_allows_request(
-    listener_scope: Option<&GatewayListenerScope>,
-    is_grpc: bool,
-    path: &str,
-) -> bool {
-    match listener_scope {
-        Some(GatewayListenerScope::ComputeDriverCallback) => {
-            is_grpc && crate::auth::sandbox_methods::is_sandbox_callable(path)
-        }
-        Some(GatewayListenerScope::Primary) | None => true,
-    }
-}
-
-fn callback_listener_rejection(is_grpc: bool) -> Response<BoxBody> {
-    if is_grpc {
-        let response: Response<tonic::body::Body> = tonic::Status::permission_denied(
-            "compute-driver callback listeners accept sandbox callback RPCs only",
-        )
-        .into_http();
-        let (parts, body) = response.into_parts();
-        let body = body.map_err(Into::into).boxed_unsync();
-        Response::from_parts(parts, BoxBody(body))
-    } else {
-        Response::builder()
-            .status(StatusCode::FORBIDDEN)
-            .body(boxed_body_from_bytes(Bytes::from_static(
-                b"compute-driver callback listeners accept gRPC callbacks only",
-            )))
-            .expect("static callback listener rejection response must be valid")
-    }
-}
-
 impl<G, H, GBody, HBody> hyper::service::Service<Request<Incoming>> for MultiplexedService<G, H>
 where
     G: tower::Service<Request<BoxBody>, Response = Response<GBody>> + Clone + Send + 'static,
@@ -1123,15 +1243,6 @@ where
             .headers()
             .get("content-type")
             .is_some_and(|v| v.as_bytes().starts_with(b"application/grpc"));
-
-        if !listener_allows_request(
-            req.extensions().get::<GatewayListenerScope>(),
-            is_grpc,
-            req.uri().path(),
-        ) {
-            let response = callback_listener_rejection(is_grpc);
-            return Box::pin(async move { Ok(response) });
-        }
 
         if is_grpc {
             let method = grpc_method_from_path(req.uri().path());
@@ -1287,6 +1398,15 @@ where
     })
 }
 
+/// Fingerprint of the leaf certificate verified during the TLS handshake.
+pub fn extract_peer_certificate_sha256<S>(
+    stream: &tokio_rustls::server::TlsStream<S>,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let certificate = stream.get_ref().1.peer_certificates()?.first()?;
+    Some(format!("{:x}", Sha256::digest(certificate.as_ref())))
+}
+
 /// Boxed body type for uniform handling.
 pub struct BoxBody(
     http_body_util::combinators::UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>,
@@ -1316,6 +1436,7 @@ impl Body for BoxBody {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use http::StatusCode;
     use http_body_util::Empty;
     use openshell_core::GatewayInterceptorConfig;
     use openshell_core::proto::CreateSandboxRequest;
@@ -1325,123 +1446,11 @@ mod tests {
         ProviderProfileSnapshotRequest,
         gateway_interceptor_server::{GatewayInterceptor, GatewayInterceptorServer},
     };
-    use prost::Message as _;
     use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio_stream::wrappers::TcpListenerStream;
     use tower::Service;
-
-    #[tokio::test]
-    async fn listener_context_service_preserves_listener_scope() {
-        let observed = Arc::new(Mutex::new(None));
-        let captured = observed.clone();
-        let inner = hyper::service::service_fn(move |request: Request<Empty<Bytes>>| {
-            *captured.lock().unwrap() = request.extensions().get::<GatewayListenerScope>().copied();
-            async move { Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new())) }
-        });
-        let service = GatewayListenerContextService::new(inner, GatewayListenerScope::Primary);
-        hyper::service::Service::call(&service, Request::new(Empty::<Bytes>::new()))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            *observed.lock().unwrap(),
-            Some(GatewayListenerScope::Primary)
-        );
-    }
-
-    fn callback_listener_scope() -> GatewayListenerScope {
-        GatewayListenerScope::ComputeDriverCallback
-    }
-
-    #[test]
-    fn callback_listener_allows_sandbox_callback_rpcs() {
-        let scope = callback_listener_scope();
-        let callback_paths = [
-            "/openshell.v1.OpenShell/ConnectSupervisor",
-            "/openshell.v1.OpenShell/RelayStream",
-            "/openshell.v1.OpenShell/GetSandboxConfig",
-            "/openshell.v1.OpenShell/ReportPolicyStatus",
-            "/openshell.v1.OpenShell/PushSandboxLogs",
-            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
-            "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
-            "/openshell.v1.OpenShell/RefreshSandboxToken",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
-        ];
-
-        for path in callback_paths {
-            assert!(
-                listener_allows_request(Some(&scope), true, path),
-                "callback listener should allow {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn callback_listener_surface_matches_rpc_auth_metadata() {
-        let scope = callback_listener_scope();
-
-        for path in crate::auth::method_authz::all_paths() {
-            assert_eq!(
-                listener_allows_request(Some(&scope), true, path),
-                crate::auth::method_authz::is_sandbox_callable(path),
-                "callback listener exposure must follow rpc_auth metadata for {path}"
-            );
-        }
-    }
-
-    #[test]
-    fn callback_listener_rejects_non_callback_routes() {
-        let scope = callback_listener_scope();
-        let rejected_grpc_paths = [
-            "/grpc.health.v1.Health/Check",
-            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
-            "/openshell.v1.OpenShell/ListSandboxes",
-            "/openshell.v1.OpenShell/DeleteSandbox",
-            "/openshell.v1.OpenShell/CreateProvider",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
-            "/openshell.inference.v1.Inference/SetInferenceRoute",
-        ];
-
-        for path in rejected_grpc_paths {
-            assert!(
-                !listener_allows_request(Some(&scope), true, path),
-                "callback listener should reject {path}"
-            );
-        }
-        assert!(!listener_allows_request(Some(&scope), false, "/health"));
-        assert!(!listener_allows_request(Some(&scope), false, "/service"));
-    }
-
-    #[test]
-    fn primary_listener_routing_is_unchanged() {
-        let primary = GatewayListenerScope::Primary;
-        let paths = [
-            "/grpc.health.v1.Health/Check",
-            "/openshell.v1.OpenShell/ListSandboxes",
-            "/openshell.inference.v1.Inference/GetInferenceRoute",
-            "/health",
-            "/service",
-        ];
-
-        for path in paths {
-            assert!(listener_allows_request(Some(&primary), true, path));
-            assert!(listener_allows_request(Some(&primary), false, path));
-            assert!(listener_allows_request(None, true, path));
-            assert!(listener_allows_request(None, false, path));
-        }
-    }
-
-    #[test]
-    fn callback_listener_rejections_use_protocol_appropriate_statuses() {
-        let grpc = callback_listener_rejection(true);
-        assert_eq!(grpc.status(), StatusCode::OK);
-        assert_eq!(grpc.headers().get("grpc-status").unwrap(), "7");
-
-        let http = callback_listener_rejection(false);
-        assert_eq!(http.status(), StatusCode::FORBIDDEN);
-    }
 
     #[derive(Clone)]
     struct PostCommitTestInterceptor;
@@ -1467,6 +1476,12 @@ mod tests {
                 }],
                 provider_profiles: false,
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::GatewayInterceptor,
+                    "openshell/post-commit-test",
+                    "test",
+                    [],
+                )),
             }))
         }
 
@@ -1545,12 +1560,6 @@ mod tests {
     }
 
     async fn start_http_server_with_middleware() -> std::net::SocketAddr {
-        start_http_server_with_middleware_on_listener(GatewayListenerScope::Primary).await
-    }
-
-    async fn start_http_server_with_middleware_on_listener(
-        listener_scope: GatewayListenerScope,
-    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -1558,7 +1567,6 @@ mod tests {
         let http_service = request_id_middleware!(http_service);
 
         let service = MultiplexedService::new(http_service.clone(), http_service);
-        let service = GatewayListenerContextService::new(service, listener_scope);
 
         tokio::spawn(async move {
             loop {
@@ -1611,39 +1619,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_listener_filter_is_applied_before_route_dispatch() {
-        let addr = start_http_server_with_middleware_on_listener(callback_listener_scope()).await;
-
-        let health = http1_get(addr, "/healthz", &[]).await;
-        assert_eq!(health.status(), StatusCode::FORBIDDEN);
-
-        let admin = http1_request(
-            addr,
-            "POST",
-            "/openshell.v1.OpenShell/ListSandboxes",
-            &[("content-type", "application/grpc")],
-        )
-        .await;
-        assert_eq!(admin.status(), StatusCode::OK);
-        assert_eq!(admin.headers().get("grpc-status").unwrap(), "7");
-
-        let callback = http1_request(
-            addr,
-            "POST",
-            "/openshell.v1.OpenShell/ConnectSupervisor",
-            &[("content-type", "application/grpc")],
-        )
-        .await;
-        assert_ne!(
-            callback
-                .headers()
-                .get("grpc-status")
-                .and_then(|value| value.to_str().ok()),
-            Some("7")
-        );
-    }
-
-    #[tokio::test]
     async fn intercepted_grpc_body_collection_rejects_oversized_body() {
         let oversized = Bytes::from(vec![0_u8; MAX_INTERCEPTED_GRPC_BODY_SIZE + 1]);
         let status = collect_intercepted_grpc_body(boxed_body_from_bytes(oversized))
@@ -1651,6 +1626,59 @@ mod tests {
             .expect_err("oversized body should be rejected");
 
         assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn update_provider_interception_hydrates_identity_from_trusted_state() {
+        let state = crate::grpc::test_support::test_server_state().await;
+        let existing = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-id".to_string(),
+                name: "managed-provider".to_string(),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            r#type: "agent-tool-gateway".to_string(),
+            profile_workspace: "default".to_string(),
+            ..Default::default()
+        };
+        state.store.put_message(&existing).await.unwrap();
+
+        let request = UpdateProviderRequest {
+            provider: Some(Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    name: "managed-provider".to_string(),
+                    workspace: "default".to_string(),
+                    ..Default::default()
+                }),
+                credentials: std::collections::HashMap::from([(
+                    "TOKEN".to_string(),
+                    "rotated".to_string(),
+                )]),
+                ..Default::default()
+            }),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            ..Default::default()
+        };
+        let authed = crate::grpc::test_support::authed_request(());
+        let principal = authed.extensions().get::<Principal>().unwrap();
+
+        let hydrated = hydrate_update_provider_identity(
+            UPDATE_PROVIDER_PATH,
+            grpc_frame(&request.encode_to_vec()),
+            state.as_ref(),
+            Some(principal),
+        )
+        .await
+        .unwrap();
+        let hydrated = decode_unary_grpc_message::<UpdateProviderRequest>(&hydrated).unwrap();
+        let provider = hydrated.provider.unwrap();
+
+        assert_eq!(provider.r#type, "agent-tool-gateway");
+        assert_eq!(provider.profile_workspace, "default");
+        assert_eq!(provider.credentials.get("TOKEN").unwrap(), "rotated");
     }
 
     #[tokio::test]
@@ -1720,7 +1748,7 @@ mod tests {
                 )))
             }
         });
-        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime));
+        let mut service = GatewayInterceptorGrpcService::new(inner, Some(runtime), None);
         let request_body = grpc_frame(&CreateSandboxRequest::default().encode_to_vec());
         let request = Request::builder()
             .uri("/openshell.v1.OpenShell/CreateSandbox")
@@ -1733,6 +1761,198 @@ mod tests {
         let collected = response.into_body().collect().await.unwrap();
         assert_eq!(collected.to_bytes(), committed_body);
         interceptor_task.abort();
+    }
+
+    #[derive(Clone, Default)]
+    struct ReplayTestInterceptor {
+        modifications: Arc<AtomicUsize>,
+        validations: Arc<AtomicUsize>,
+        observations: Arc<AtomicUsize>,
+        deny: Arc<std::sync::atomic::AtomicBool>,
+        name: Arc<Mutex<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl GatewayInterceptor for ReplayTestInterceptor {
+        async fn describe(
+            &self,
+            request: tonic::Request<DescribeRequest>,
+        ) -> Result<tonic::Response<InterceptorManifest>, tonic::Status> {
+            let mut manifest = PostCommitTestInterceptor
+                .describe(request)
+                .await?
+                .into_inner();
+            manifest.bindings.push(InterceptorBinding {
+                id: "validate-create".into(),
+                selector: manifest.bindings[0].selector.clone(),
+                phases: vec![
+                    GatewayInterceptorPhase::ModifyOperation.into(),
+                    GatewayInterceptorPhase::Validate.into(),
+                ],
+                failure_policy: "fail_closed".into(),
+            });
+            Ok(tonic::Response::new(manifest))
+        }
+
+        async fn evaluate(
+            &self,
+            request: tonic::Request<InterceptorEvaluation>,
+        ) -> Result<tonic::Response<InterceptorResult>, tonic::Status> {
+            use openshell_core::proto::gateway_interceptor::v1::{
+                JsonPatch, interceptor_evaluation::Phase,
+            };
+            let mut result = InterceptorResult {
+                allowed: true,
+                ..Default::default()
+            };
+            match request.into_inner().phase.unwrap() {
+                Phase::ModifyOperation(_) => {
+                    self.modifications.fetch_add(1, Ordering::SeqCst);
+                    result.patches.push(JsonPatch {
+                        op: "replace".into(),
+                        path: "/name".into(),
+                        value: Some(prost_types::Value {
+                            kind: Some(prost_types::value::Kind::StringValue(
+                                self.name.lock().unwrap().clone(),
+                            )),
+                        }),
+                        ..Default::default()
+                    });
+                }
+                Phase::Validate(_) => {
+                    self.validations.fetch_add(1, Ordering::SeqCst);
+                    result.allowed = !self.deny.load(Ordering::SeqCst);
+                    result.reason = "current policy denies creation".into();
+                    result.status_code = "PERMISSION_DENIED".into();
+                }
+                Phase::PostCommit(_) => {
+                    self.observations.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            Ok(tonic::Response::new(result))
+        }
+
+        async fn snapshot_provider_profiles(
+            &self,
+            request: tonic::Request<ProviderProfileSnapshotRequest>,
+        ) -> Result<tonic::Response<ProviderProfileSnapshot>, tonic::Status> {
+            PostCommitTestInterceptor
+                .snapshot_provider_profiles(request)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_replay_revalidates_interceptors_and_observes_commit_once() {
+        use openshell_core::proto::{
+            SandboxResponse, SandboxSpec, open_shell_server::OpenShellServer,
+        };
+        let interceptor = ReplayTestInterceptor::default();
+        *interceptor.name.lock().unwrap() = "intercepted-create".into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = interceptor.clone();
+        let task = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(GatewayInterceptorServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let runtime = openshell_gateway_interceptors::initialize(vec![GatewayInterceptorConfig {
+            name: "post-commit-test".into(),
+            grpc_endpoint: format!("http://{address}"),
+            ..Default::default()
+        }])
+        .await
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let key = directory.path().join("key");
+        std::fs::write(&key, b"test-only-private-key").unwrap();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.gateway_jwt =
+            Some(openshell_core::config::GatewayJwtConfig {
+                signing_key_path: key,
+                public_key_path: directory.path().join("public"),
+                kid_path: directory.path().join("kid"),
+                gateway_id: "test".into(),
+                ttl_secs: None,
+            });
+        let inner = OpenShellServer::new(OpenShellService::new(state.clone()));
+        let mut service = GatewayInterceptorGrpcService::new(inner, runtime, Some(state));
+        let input = CreateSandboxRequest {
+            name: "client-original".into(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let request = || {
+            let principal = crate::grpc::test_support::authed_request(())
+                .extensions()
+                .get::<Principal>()
+                .unwrap()
+                .clone();
+            Request::builder()
+                .uri("/openshell.v1.OpenShell/CreateSandbox")
+                .header("content-type", "application/grpc")
+                .header("openshell-replayed", "true")
+                .extension(principal)
+                .body(boxed_body_from_bytes(grpc_frame(&input.encode_to_vec())))
+                .unwrap()
+        };
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert!(!first.headers().contains_key("openshell-replayed"));
+        let first = first.into_body().collect().await.unwrap();
+        assert_eq!(first.trailers().unwrap().get("grpc-status").unwrap(), "0");
+        let first = decode_unary_grpc_message::<SandboxResponse>(&first.to_bytes()).unwrap();
+        assert_eq!(
+            first
+                .sandbox
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .name,
+            "intercepted-create"
+        );
+        let replay = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(replay.headers().get("openshell-replayed").unwrap(), "true");
+        let replay = replay.into_body().collect().await.unwrap();
+        assert_eq!(
+            decode_unary_grpc_message::<SandboxResponse>(&replay.to_bytes()).unwrap(),
+            first
+        );
+        assert_eq!(interceptor.modifications.load(Ordering::SeqCst), 2);
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 2);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+        interceptor.deny.store(true, Ordering::SeqCst);
+        let denied = service
+            .ready()
+            .await
+            .unwrap()
+            .call(request())
+            .await
+            .unwrap();
+        assert_eq!(denied.headers().get("grpc-status").unwrap(), "7");
+        assert_eq!(interceptor.validations.load(Ordering::SeqCst), 3);
+        assert_eq!(interceptor.observations.load(Ordering::SeqCst), 1);
+        task.abort();
     }
 
     #[test]
@@ -2139,6 +2359,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn polled_paths_get_debug_request_spans() {
+        let _traced = crate::otel_tracing::test_exporter::install_traced();
+        let level = |path: &str| {
+            let req = Request::builder()
+                .uri(path)
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            *make_request_span(&req)
+                .metadata()
+                .expect("span enabled")
+                .level()
+        };
+
+        for path in [
+            "/healthz",
+            "/openshell.v1.OpenShell/GetSandboxConfig",
+            "/openshell.v1.OpenShell/ReportProviderReadiness",
+            "/openshell.v1.OpenShell/PeerReportProviderReadiness",
+        ] {
+            assert_eq!(level(path), tracing::Level::DEBUG, "{path}");
+        }
+        assert_eq!(
+            level("/openshell.v1.OpenShell/CreateSandbox"),
+            tracing::Level::INFO
+        );
+    }
+
+    #[test]
+    fn polled_path_responses_log_at_debug() {
+        let log_buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuf(log_buf.clone());
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::INFO)
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(move || writer.clone())
+                        .with_ansi(false),
+                )
+        };
+        {
+            let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let respond = |path: &str, status: u16| {
+                let req = Request::builder()
+                    .uri(path)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                let res = Response::builder()
+                    .status(status)
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                log_response(&res, Duration::from_millis(1), &make_request_span(&req));
+            };
+            respond("/openshell.v1.OpenShell/GetSandboxConfig", 200);
+            respond("/healthz", 200);
+            respond("/openshell.v1.OpenShell/CreateSandbox", 201);
+            respond("/healthz", 503);
+        }
+
+        let output = String::from_utf8(log_buf.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 2, "got: {output}");
+        assert!(
+            lines[0].contains("INFO") && lines[0].contains("status=201"),
+            "got: {output}"
+        );
+        assert!(
+            lines[1].contains("WARN") && lines[1].contains("status=503"),
+            "got: {output}"
+        );
+    }
+
     /// The `TraceLayer` creates the server span, so no gRPC handler needs
     /// `#[instrument]`. The request ID carries into it so a trace can be
     /// correlated with the gateway's logs.
@@ -2320,7 +2614,6 @@ mod tests {
             "/openshell.v1.OpenShell/CreateSandbox",
             "/openshell.v1.OpenShell/ListSandboxes",
             "/openshell.v1.OpenShell/DeleteSandbox",
-            "/openshell.inference.v1.Inference/GetInferenceBundle",
             "/metrics",
         ];
 
@@ -2343,7 +2636,6 @@ mod tests {
 
         let expected = [
             "GET",
-            "openshell.inference.v1.Inference/GetInferenceBundle",
             "openshell.v1.OpenShell/CreateSandbox",
             "openshell.v1.OpenShell/DeleteSandbox",
             "openshell.v1.OpenShell/ListSandboxes",
@@ -2369,13 +2661,6 @@ mod tests {
         assert_eq!(
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
-        );
-        assert_eq!(
-            otel_span_name(
-                &http::Method::POST,
-                "/openshell.inference.v1.Inference/GetInferenceBundle"
-            ),
-            "openshell.inference.v1.Inference/GetInferenceBundle"
         );
     }
 
@@ -2404,14 +2689,6 @@ mod tests {
     }
 
     #[test]
-    fn grpc_method_extracts_inference_service() {
-        assert_eq!(
-            grpc_method_from_path("/openshell.inference.v1.Inference/GetInferenceBundle"),
-            "GetInferenceBundle"
-        );
-    }
-
-    #[test]
     fn grpc_method_handles_bare_path() {
         assert_eq!(grpc_method_from_path("Health"), "Health");
     }
@@ -2424,6 +2701,464 @@ mod tests {
     #[test]
     fn grpc_method_handles_empty_string() {
         assert_eq!(grpc_method_from_path(""), "");
+    }
+
+    #[tokio::test]
+    async fn grpc_router_dispatches_gateway_and_reflection_paths() {
+        #[derive(Clone)]
+        struct RouteRecorder {
+            name: &'static str,
+            calls: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for RouteRecorder {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, _req: Request<B>) -> Self::Future {
+                self.calls.lock().unwrap().push(self.name);
+                Box::pin(async { Ok(Response::new(tonic::body::Body::empty())) })
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service = |name| RouteRecorder {
+            name,
+            calls: calls.clone(),
+        };
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+
+        for path in [
+            "/openshell.v1.OpenShell/Health",
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+        ] {
+            router
+                .call(
+                    Request::builder()
+                        .uri(path)
+                        .body(Empty::<Bytes>::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+    }
+
+    #[tokio::test]
+    async fn reflection_protocol_serves_complete_public_descriptors_and_recovers_from_errors() {
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use prost_reflect::{DescriptorPool, Value};
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let reflection =
+            crate::reflection::build_gateway_reflection_service(&Config::new(None)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let rejecting_oidc = Arc::new(MockAuthenticator::returning(Err(
+            tonic::Status::unauthenticated("OIDC credentials required"),
+        )));
+        let grpc = AuthGrpcRouter::with_peer_identity(
+            GrpcRouter::new(unrouted, reflection),
+            Some(AuthenticatorChain::new(vec![rejecting_oidc])),
+            None,
+            None,
+            true,
+            false,
+        );
+        let service = MultiplexedService::new(grpc, unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let list_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let descriptor_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "openshell.v1.OpenShell".to_string(),
+            )),
+        };
+        let missing_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "openshell.v1.DoesNotExist".to_string(),
+            )),
+        };
+        let list_after_error_request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([
+                list_request,
+                descriptor_request,
+                missing_request,
+                list_after_error_request,
+            ]))
+            .await
+            .unwrap()
+            .into_inner();
+        let response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ListServicesResponse(response)) = response.message_response
+        else {
+            panic!("expected a reflection list-services response");
+        };
+        let mut names: Vec<_> = response
+            .service
+            .into_iter()
+            .map(|service| service.name)
+            .collect();
+        names.sort();
+
+        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+
+        let descriptor_response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::FileDescriptorResponse(response)) =
+            descriptor_response.message_response
+        else {
+            panic!("expected a reflection file-descriptor response");
+        };
+        let mut reflected_pool = DescriptorPool::new();
+        for descriptor in &response.file_descriptor_proto {
+            reflected_pool
+                .decode_file_descriptor_proto(descriptor.as_slice())
+                .unwrap();
+        }
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.OpenShell")
+                .is_some(),
+            "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_message_by_name("openshell.v1.HealthRequest")
+                .is_some(),
+            "the response must include imported public message descriptors"
+        );
+
+        let source_pool = DescriptorPool::decode(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
+        let source_auth = source_pool
+            .get_extension_by_name("openshell.options.v1.authorization")
+            .unwrap();
+        let reflected_auth = reflected_pool
+            .get_extension_by_name("openshell.options.v1.authorization")
+            .unwrap();
+        let source_health = source_pool
+            .get_service_by_name("openshell.v1.OpenShell")
+            .unwrap()
+            .methods()
+            .find(|method| method.name() == "Health")
+            .unwrap();
+        let reflected_health = reflected_pool
+            .get_service_by_name("openshell.v1.OpenShell")
+            .unwrap()
+            .methods()
+            .find(|method| method.name() == "Health")
+            .unwrap();
+        let source_options = source_health.options();
+        let reflected_options = reflected_health.options();
+        let Value::Message(source_auth_value) = &*source_options.get_extension(&source_auth) else {
+            panic!("source authorization option must be a message");
+        };
+        let Value::Message(reflected_auth_value) =
+            &*reflected_options.get_extension(&reflected_auth)
+        else {
+            panic!("reflected authorization option must be a message");
+        };
+        assert_eq!(
+            source_auth_value.encode_to_vec(),
+            reflected_auth_value.encode_to_vec()
+        );
+
+        let source_secret = source_pool
+            .get_extension_by_name("openshell.options.v1.secret")
+            .unwrap();
+        let reflected_secret = reflected_pool
+            .get_extension_by_name("openshell.options.v1.secret")
+            .unwrap();
+        let source_field = source_pool
+            .get_message_by_name("openshell.v1.TcpForwardInit")
+            .unwrap()
+            .get_field_by_name("authorization_token")
+            .unwrap();
+        let reflected_field = reflected_pool
+            .get_message_by_name("openshell.v1.TcpForwardInit")
+            .unwrap()
+            .get_field_by_name("authorization_token")
+            .unwrap();
+        assert_eq!(
+            source_field.options().get_extension(&source_secret),
+            reflected_field.options().get_extension(&reflected_secret),
+            "secret-field annotations must retain their original value"
+        );
+
+        let error_response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ErrorResponse(error)) = error_response.message_response else {
+            panic!("expected an in-band reflection error response");
+        };
+        assert_eq!(error.error_code, tonic::Code::NotFound as i32);
+
+        let response_after_error = responses.message().await.unwrap().unwrap();
+        assert!(matches!(
+            response_after_error.message_response,
+            Some(MessageResponse::ListServicesResponse(_))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflection_protocol_resolves_canonical_enum_values_and_extensions() {
+        use prost::Message;
+        use tonic_reflection::pb::v1::{
+            ExtensionRequest, ServerReflectionRequest,
+            server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let reflection =
+            crate::reflection::build_gateway_reflection_service(&Config::new(None)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let service = MultiplexedService::new(GrpcRouter::new(unrouted, reflection), unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+
+        for (symbol, expected_file) in [
+            ("openshell.v1.SANDBOX_PHASE_READY", "openshell.proto"),
+            (
+                "google.protobuf.FieldDescriptorProto.TYPE_DOUBLE",
+                "google/protobuf/descriptor.proto",
+            ),
+        ] {
+            let request = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingSymbol(symbol.to_string())),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::iter([request]))
+                .await
+                .unwrap()
+                .into_inner();
+            let response = responses.message().await.unwrap().unwrap();
+            let Some(MessageResponse::FileDescriptorResponse(response)) = response.message_response
+            else {
+                panic!("expected a descriptor response for canonical enum value {symbol}");
+            };
+            let names: std::collections::BTreeSet<_> = response
+                .file_descriptor_proto
+                .iter()
+                .map(|descriptor| {
+                    prost_types::FileDescriptorProto::decode(descriptor.as_slice())
+                        .unwrap()
+                        .name
+                        .unwrap()
+                })
+                .collect();
+            assert!(names.contains(expected_file));
+        }
+
+        for (containing_type, extension_number) in [
+            ("google.protobuf.MethodOptions", 50_000),
+            ("google.protobuf.FieldOptions", 50_001),
+        ] {
+            let request = ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingExtension(ExtensionRequest {
+                    containing_type: containing_type.to_string(),
+                    extension_number,
+                })),
+            };
+            let mut responses = client
+                .server_reflection_info(tokio_stream::iter([request]))
+                .await
+                .unwrap()
+                .into_inner();
+            let response = responses.message().await.unwrap().unwrap();
+            let Some(MessageResponse::FileDescriptorResponse(response)) = response.message_response
+            else {
+                panic!("expected a descriptor response for extension {extension_number}");
+            };
+            let names: std::collections::BTreeSet<_> = response
+                .file_descriptor_proto
+                .iter()
+                .map(|descriptor| {
+                    prost_types::FileDescriptorProto::decode(descriptor.as_slice())
+                        .unwrap()
+                        .name
+                        .unwrap()
+                })
+                .collect();
+            assert!(names.contains("options.proto"));
+        }
+
+        let requests = [
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::AllExtensionNumbersOfType(
+                    "google.protobuf.MethodOptions".to_string(),
+                )),
+            },
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::FileContainingExtension(ExtensionRequest {
+                    containing_type: "google.protobuf.MethodOptions".to_string(),
+                    extension_number: 49_999,
+                })),
+            },
+            ServerReflectionRequest {
+                host: String::new(),
+                message_request: Some(MessageRequest::ListServices(String::new())),
+            },
+        ];
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter(requests))
+            .await
+            .unwrap()
+            .into_inner();
+        let extension_numbers = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::AllExtensionNumbersResponse(extension_numbers)) =
+            extension_numbers.message_response
+        else {
+            panic!("expected an extension-number response");
+        };
+        assert_eq!(
+            extension_numbers.base_type_name,
+            "google.protobuf.MethodOptions"
+        );
+        assert_eq!(extension_numbers.extension_number, [50_000]);
+
+        let unknown_extension = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ErrorResponse(error)) = unknown_extension.message_response else {
+            panic!("expected an in-band error for an unknown extension");
+        };
+        assert_eq!(error.error_code, tonic::Code::NotFound as i32);
+        assert!(matches!(
+            responses.message().await.unwrap().unwrap().message_response,
+            Some(MessageResponse::ListServicesResponse(_))
+        ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn reflection_rate_limit_charges_each_query_on_one_stream() {
+        use tonic::Code;
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest,
+        };
+
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let reflection = crate::reflection::build_gateway_reflection_service(&config).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let unrouted = tower::service_fn(|_request: Request<BoxBody>| async {
+            Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
+        });
+        let service = MultiplexedService::new(GrpcRouter::new(unrouted, reflection), unrouted);
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    Builder::new(TokioExecutor::new())
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let query = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([query.clone(), query]))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(responses.message().await.unwrap().is_some());
+        let status = responses
+            .message()
+            .await
+            .expect_err("second query on the same stream must be rate limited");
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        server.abort();
+    }
+
+    #[test]
+    fn reflection_descriptor_excludes_internal_service_protos() {
+        let descriptors = crate::reflection::gateway_reflection_descriptors().unwrap();
+        let names: std::collections::BTreeSet<_> = descriptors
+            .iter()
+            .map(prost_reflect::FileDescriptor::name)
+            .collect();
+
+        assert!(names.contains("openshell.proto"));
+        assert!(names.contains("sandbox.proto"));
+        assert!(!names.contains("compute_driver.proto"));
+        assert!(!names.contains("credential_driver.proto"));
+        assert!(!names.contains("gateway_interceptor.proto"));
+        assert!(!names.contains("supervisor_middleware.proto"));
     }
 
     #[test]
@@ -2472,6 +3207,8 @@ mod tests {
             Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
+        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use serde::Serialize;
         use std::sync::Arc;
         use std::sync::Mutex;
         use tower::Service;
@@ -2539,6 +3276,18 @@ mod tests {
             })
         }
 
+        fn provider_writer_principal() -> Principal {
+            Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "provider-rotation-job".to_string(),
+                    display_name: None,
+                    roles: vec!["openshell-admin".to_string()],
+                    scopes: vec!["provider:write".to_string()],
+                    provider: IdentityProvider::Oidc,
+                },
+            })
+        }
+
         fn mtls_identity(subject: &str) -> Identity {
             Identity {
                 subject: subject.to_string(),
@@ -2557,6 +3306,125 @@ mod tests {
                 },
                 trust_domain: Some("openshell".to_string()),
             })
+        }
+
+        fn operator_principal() -> OperatorPrincipal {
+            let mut identity = mtls_identity("operator");
+            identity.roles = vec!["operator".to_string()];
+            OperatorPrincipal {
+                identity,
+                certificate_sha256: "verified-leaf".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn operator_is_admin_but_not_supervisor_peer_or_unknown() {
+            for (method, permitted) in [
+                ("GetProviderCredentials", true),
+                ("CreateWorkspace", true),
+                ("UpdateProvider", true),
+                ("GetSandboxConfig", true),
+                ("ConnectSupervisor", false),
+                ("PeerRelay", false),
+                ("IssueSandboxToken", false),
+                ("Unknown", false),
+            ] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::with_peer_identity(
+                    recorder,
+                    None,
+                    Some(AuthzPolicy {
+                        admin_role: "oidc-admin".into(),
+                        user_role: "oidc-user".into(),
+                        scopes_enabled: true,
+                    }),
+                    None,
+                    false,
+                    false,
+                )
+                .with_operator(Some(operator_principal()));
+                let response = router
+                    .call(empty_request(&format!("/openshell.v1.OpenShell/{method}")))
+                    .await
+                    .unwrap();
+                if permitted {
+                    assert!(grpc_status(&response).is_none());
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::Operator(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn user_bearer_claims_and_local_dev_cannot_export_credentials() {
+            let mut user = mtls_identity("ordinary-user");
+            user.provider = IdentityProvider::Oidc;
+            user.roles = vec!["operator".into(), "openshell-admin".into()];
+            user.scopes = vec!["openshell:all".into()];
+            for principal in [
+                Principal::User(UserPrincipal { identity: user }),
+                sandbox_principal(),
+                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "replica".into(),
+                    pod_uid: "pod".into(),
+                }),
+            ] {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Some(principal)),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+                let response = router
+                    .call(empty_request(
+                        "/openshell.v1.OpenShell/GetProviderCredentials",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            }
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, None, None);
+            let response = router
+                .call(empty_request(
+                    "/openshell.v1.OpenShell/GetProviderCredentials",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+        }
+
+        #[derive(Serialize)]
+        struct LegacySandboxClaims {
+            sub: String,
+            iss: String,
+            aud: String,
+            iat: i64,
+            exp: i64,
+            sandbox_id: String,
+        }
+
+        fn legacy_sandbox_token(material: &openshell_bootstrap::jwt::JwtKeyMaterial) -> String {
+            let claims = LegacySandboxClaims {
+                sub: "spiffe://openshell/sandbox/sandbox-a".to_string(),
+                iss: "openshell-gateway:test".to_string(),
+                aud: "openshell-gateway:test".to_string(),
+                iat: 1,
+                exp: 0,
+                sandbox_id: "sandbox-a".to_string(),
+            };
+            let mut header = Header::new(Algorithm::EdDSA);
+            header.kid = Some(material.kid.clone());
+            encode(
+                &header,
+                &claims,
+                &EncodingKey::from_ed_pem(material.signing_key_pem.as_bytes())
+                    .expect("signing key"),
+            )
+            .expect("legacy token")
         }
 
         #[tokio::test]
@@ -2626,6 +3494,31 @@ mod tests {
 
             assert!(seen.lock().unwrap().is_none());
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn reflection_bypasses_oidc_and_mtls_user_authentication() {
+            let oidc = Arc::new(MockAuthenticator::returning(Err(
+                tonic::Status::unauthenticated("OIDC credentials required"),
+            )));
+            let chain = AuthenticatorChain::new(vec![oidc]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, Some(chain), None, None, true, false);
+
+            let res = router
+                .call(empty_request(
+                    "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert_eq!(grpc_status(&res), None);
+            assert!(
+                seen.lock().unwrap().is_none(),
+                "reflection must not receive an authenticated user principal"
+            );
         }
 
         #[tokio::test]
@@ -2726,27 +3619,6 @@ mod tests {
             ));
         }
 
-        #[tokio::test]
-        async fn sandbox_principal_can_fetch_inference_bundle() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
-            let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
-
-            let res = router
-                .call(empty_request(
-                    "/openshell.inference.v1.Inference/GetInferenceBundle",
-                ))
-                .await
-                .unwrap();
-
-            assert_eq!(res.status(), 200);
-            assert!(matches!(
-                seen.lock().unwrap().as_ref(),
-                Some(Principal::Sandbox(_))
-            ));
-        }
-
         /// A user principal — even one carrying `openshell:all` and the
         /// admin role — must not reach a `sandbox`-annotated method. The
         /// router enforces this from the per-handler auth-mode declarations
@@ -2780,7 +3652,6 @@ mod tests {
                 "/openshell.v1.OpenShell/RelayStream",
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
-                "/openshell.inference.v1.Inference/GetInferenceBundle",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
                 let chain = AuthenticatorChain::new(vec![mock]);
@@ -2796,14 +3667,47 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn provider_write_scope_allows_update_without_provider_read() {
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: true,
+            };
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                provider_writer_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy.clone()));
+            let response = router
+                .call(empty_request(UPDATE_PROVIDER_PATH))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(seen.lock().unwrap().is_some());
+
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+                provider_writer_principal(),
+            ))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy));
+            let response = router
+                .call(empty_request("/openshell.v1.OpenShell/GetProvider"))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            assert!(seen.lock().unwrap().is_none());
+        }
+
+        #[tokio::test]
         async fn sandbox_principal_is_denied_on_user_and_admin_methods() {
             for path in [
                 "/openshell.v1.OpenShell/ListSandboxes",
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
-                "/openshell.inference.v1.Inference/GetInferenceRoute",
-                "/openshell.inference.v1.Inference/SetInferenceRoute",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);
@@ -2830,6 +3734,52 @@ mod tests {
             assert!(seen.lock().unwrap().is_none());
             // tonic sets grpc-status=16 (UNAUTHENTICATED) in trailers.
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn legacy_sandbox_jwt_cannot_reach_sensitive_sandbox_methods() {
+            let material = openshell_bootstrap::jwt::generate_jwt_key().expect("JWT key");
+            let authority = Arc::new(
+                crate::auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
+                    material.signing_key_pem.as_bytes(),
+                    material.public_key_pem.as_bytes(),
+                    material.kid.clone(),
+                    "test",
+                    Some(Duration::from_mins(15)),
+                )
+                .expect("session authority"),
+            );
+            let store = Arc::new(
+                crate::persistence::Store::connect("sqlite::memory:")
+                    .await
+                    .expect("store"),
+            );
+            let token = legacy_sandbox_token(&material);
+
+            for path in [
+                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+                "/openshell.v1.OpenShell/ConnectSupervisor",
+            ] {
+                let authenticator = Arc::new(
+                    crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
+                        authority.clone(),
+                        store.clone(),
+                    ),
+                );
+                let chain = AuthenticatorChain::new(vec![authenticator]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+                let request = Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Full::new(Bytes::new()))
+                    .expect("request");
+
+                let response = router.call(request).await.expect("router response");
+
+                assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
+                assert_eq!(grpc_status(&response).as_deref(), Some("16"), "{path}");
+            }
         }
 
         #[tokio::test]

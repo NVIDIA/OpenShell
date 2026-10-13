@@ -1,193 +1,48 @@
 ---
 name: sync-agent-infra
-description: Detect and fix drift across agent-first infrastructure files. Ensures skill inventories, workflow chains, architecture tables, issue/PR templates, and cross-references stay consistent when skills, crates, or workflows change. Run after adding, removing, or renaming skills or components. Trigger keywords - sync agent infra, sync skills, update agent docs, check agent consistency, agent infra drift, sync contributing, sync agents.
+description: Reconcile contributor skills, AGENTS.md, CONTRIBUTING.md, issue and PR templates, and workflow references after repository workflow changes.
+metadata:
+  internal: true
 ---
 
 # Sync Agent Infrastructure
 
-Detect and fix drift across the agent-first infrastructure files. These files reference each other and must stay consistent:
+Keep contributor guidance consistent without copying procedural workflows into `AGENTS.md`. That file holds repository coding conventions and pointers; the relevant skills hold issue, PR, and maintenance procedures. `CONTRIBUTING.md` explains the human workflow.
 
-| File | What it tracks |
-|------|---------------|
-| `AGENTS.md` | Project identity, workflow chains, architecture overview, issue/PR conventions, skill maintenance pointer |
-| `CONTRIBUTING.md` | Skills table, workflow chains, "When to Open an Issue" guidance, skill references |
-| `CONTRIBUTING.md` issue lifecycle section | Human-facing issue states, roadmap decisions, acceptance signals, and direct-versus-queued agent ownership |
-| `README.md` | "Built With Agents" section, "Explore with your agent" skill references |
-| `.github/ISSUE_TEMPLATE/bug_report.yml` | Skill name references in diagnostic guidance |
-| `.github/ISSUE_TEMPLATE/feature_request.yml` | Skill name references in investigation guidance |
-| `.github/ISSUE_TEMPLATE/config.yml` | Contact link text referencing skills |
-| `.github/workflows/issue-triage.yml` | Comment text referencing skills |
-| `.agents/skills/triage-issue/SKILL.md` | Skill name references in gate check and diagnosis steps |
-| `.agents/skills/openshell-cli/SKILL.md` | Companion skills table |
-| `.agents/skills/create-github-pr/SKILL.md` | Pre-PR agent infrastructure check |
-| `.agents/skills/review-github-pr/SKILL.md` | Review-time agent infrastructure check |
-| `.agents/skills/build-from-issue/SKILL.md` | Label awareness and pre-commit agent infrastructure check |
-| `.claude/agents/principal-engineer-reviewer.md` | Shared review-time agent infrastructure check |
+## When to run
 
-## When to Run
+Run after adding, removing, or renaming a skill or crate; changing issue or PR conventions; changing development workflows; or modifying templates or agent cross references. Run before opening a PR that touches these areas.
 
-- After adding, removing, or renaming a skill in `.agents/skills/`
-- After adding, removing, or renaming a crate in `crates/`
-- After changing workflow chain relationships between skills
-- After changing which product or development areas a skill covers
-- After modifying issue or PR templates
-- Before opening a PR that touches any of the above
+## Maintenance map
 
-## Skill Maintenance Map
-
-Use this map when product behavior, commands, or development workflows change. It is a routing aid, not an exhaustive dependency list. Search `.agents/skills/` for the changed command, field, component, or workflow before concluding that no other skill needs an update.
-
-| Change area | Skills to review |
+| Change | Skills to inspect |
 |---|---|
+| Issues, triage, labels, or feature proposals | `create-github-issue`, `triage-issue`, `create-spike`, `build-from-issue` |
+| PR template, vouch behavior, or review conventions | `create-github-pr`, `review-github-pr`, `build-from-issue` |
+| Security assessment or remediation | `review-security-issue`, `fix-security-issue` |
+| Published docs workflow | `update-docs-from-commits` |
 | CLI commands, flags, defaults, or workflows | `openshell-cli` |
-| Sandbox policy schema, presets, or enforcement behavior | `generate-sandbox-policy`, `openshell-cli` |
-| Supervisor middleware policy, registrations, runtime, or failure behavior | `generate-sandbox-policy`, `openshell-cli`, `debug-openshell-cluster` |
-| Gateway deployment, Helm, runtime drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
-| Inference routing, providers, or `inference.local` behavior | `debug-inference`, `openshell-cli` |
-| TUI architecture, navigation, data fetching, or UX | `tui-development` |
-| Release artifacts or post-publish smoke coverage | `test-release-canary` |
-| GitHub Actions workflows, required checks, or CI diagnostics | `watch-github-actions`; also `test-release-canary` for release smoke coverage |
-| Gator harness, sandbox image, supervision, or model overrides | `launch-openshell-gator` |
-| SBOM generation, dependency metadata, or license workflows | `sbom` |
-| Issue templates, labels, contribution gates, or spike/build workflow | `triage-issue`, `create-spike`, `build-from-issue`, `create-github-issue` |
-| PR template, review conventions, or vouch behavior | `create-github-pr`, `review-github-pr`, `build-from-issue` |
-| Security review or remediation workflow | `review-security-issue`, `fix-security-issue` |
-| RFC template, numbering, or lifecycle | `create-rfc` |
-| Documentation structure, navigation, or doc-update workflow | `update-docs` |
-| Skills, crates, workflow chains, issue/PR templates, or agent cross-references | `sync-agent-infra` |
+| Sandbox policy schema or enforcement | `generate-sandbox-policy`, `openshell-cli` |
+| Gateway deployment, Helm, drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
+| Inference providers or native model endpoints | `debug-inference`, `openshell-cli` |
+| TUI behavior | `tui-development` |
+| Release artifacts or smoke coverage | `test-release-canary` |
+| CI diagnostics | `watch-github-actions` |
+| Gator supervision | `launch-openshell-gator` |
+| SBOM workflow | `sbom` |
+| RFC workflow | `create-rfc` |
 
-## Prerequisites
+Search both `skills/` and `.agents/skills/` for affected commands, fields, and components; the map is a starting point.
 
-You must be in the OpenShell repository root.
+## Consistency check
 
-## Step 1: Inventory Current State
+1. Compare `skills/*/SKILL.md` and `.agents/skills/*/SKILL.md` with the inventories in `CONTRIBUTING.md`. Public skills must work outside a checkout and use installed CLI help and published documentation. Contributor skills must set `metadata.internal: true`. Confirm names are unique and local links resolve.
+2. Compare `crates/` with the architecture table in `AGENTS.md`. Check the public and contributor skill rows.
+3. Follow Label Discovery in `CONTRIBUTING.md` to retrieve every page of current GitHub labels and resolve unclear descriptions, then check issue guidance for the general triage → validation → human acceptance process. Skills should mention the `state:*` namespace without enumerating exact labels, and should not depend on `agent:*` labels. A direct request authorizes only the requested phase; unattended work uses current state descriptions, maintainer assignments, and comments to establish the authorized phase.
+4. Check issue templates, `create-github-issue`, `create-spike`, and `triage-issue` for the first-hand OpenShell User Story, OpenShell-only bug reproduction, notional UX examples, and consideration of applicable extension points.
+5. Check the PR template, `create-github-pr`, `build-from-issue`, `fix-security-issue`, and `CONTRIBUTING.md`: every PR must close an existing issue covering its scope, except automated dependency updates as described in `CONTRIBUTING.md`. Multi-PR work needs an issue per PR; a separate issue may track the overall effort.
+6. Check contributor branch instructions and examples against Branch Names in `CONTRIBUTING.md`; AGENTS.md and skills should refer to that convention. Check `README.md`, `.github/ISSUE_TEMPLATE/`, `.github/workflows/`, `.agents/agents/`, and related skill cross references for stale workflow statements. Keep user-facing documentation changes minimal and avoid duplicated internal explanations.
+7. Check that PR, build, TUI, and docs contribution guidance follow the scoped verification guidance in `CONTRIBUTING.md`; they must not require full Rust, SDK, or repository CI for changes that cannot affect those areas.
+8. Use `npx -y skills add . --list` from a disposable clean copy when skill discovery changes. It should expose public skills only; clean generated files afterward.
 
-Gather the source of truth for each category.
-
-### Skills
-
-List all skill directories:
-
-```bash
-ls -1 .agents/skills/
-```
-
-This is the canonical skill list. Every other file must agree with it.
-
-### Crates
-
-List all crate directories:
-
-```bash
-ls -1 crates/
-```
-
-### Workflow Chains
-
-The canonical workflow chains are defined in `AGENTS.md` under "## Workflow Chains". Read that section — it is the source of truth for skill pipelines.
-
-### Labels
-
-The canonical label set is used by skills and templates. The key labels are: `state:triage-needed`, `state:needs-info`, `state:validated`, `state:accepted`, `agent:plan-requested`, `agent:plan-ready`, `agent:implementation-requested`, `agent:in-progress`, `agent:pr-opened`, `roadmap`, `topic:security`, `good first issue`, `help wanted`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels. Lifecycle and `agent:*` request labels gate unattended queue pickup. They do not prevent a direct user request: the agent warns about each missing or incomplete expected workflow label and continues with the requested phase without changing those labels.
-
-## Step 2: Check Each File for Drift
-
-For each file in the table above, check for the following inconsistencies:
-
-### `CONTRIBUTING.md`
-
-1. **Skills table** — Every skill in `.agents/skills/` must appear in the "Agent Skills for Contributors" table. No skill in the table should reference a directory that doesn't exist.
-2. **Workflow chains** — Must match `AGENTS.md` workflow chains exactly.
-3. **Skill references in prose** — Any skill mentioned by name in "Before You Open an Issue", "When to Open an Issue", or "When NOT to Open an Issue" must exist in `.agents/skills/`.
-
-### `AGENTS.md`
-
-1. **Architecture overview** — Every crate in `crates/` must appear in the architecture table. The `python/`, `proto/`, `deploy/`, `.agents/` rows must also be present.
-2. **Workflow chains** — Verify each skill named in a chain exists in `.agents/skills/`.
-3. **Issue/PR conventions** — Verify referenced skills (`create-github-issue`, `create-github-pr`, `build-from-issue`) exist.
-4. **Skill maintenance pointer** — Verify it still points to `sync-agent-infra` and does not duplicate the maintenance map from this skill.
-
-### Issue Lifecycle Documentation
-
-1. **`CONTRIBUTING.md` issue lifecycle section** — State, roadmap, acceptance-signal, and agent-workflow meanings must match `AGENTS.md`.
-2. **Invocation modes** — Lifecycle and `agent:*` request labels must gate unattended queue pickup without blocking a direct user request to a specific agent.
-3. **Direct-mode warnings** — Guidance must require the agent to warn about each missing or incomplete expected workflow label, continue with the requested phase, and leave labels unchanged.
-
-### `README.md`
-
-1. **"Explore with your agent"** — Skill names referenced must exist in `.agents/skills/`.
-2. **"Built With Agents"** — Skill names referenced must exist. Workflow descriptions should be consistent with `AGENTS.md` chains.
-
-### Issue Templates
-
-1. **`bug_report.yml`** — Must collect a User Story, Problem Statement, Impact / Why This Matters, Acceptance Criteria, Reproduction Steps, and Environment. Logs are optional and bug-specific; reporter diagnostics must not be required.
-2. **`feature_request.yml`** — Must collect a User Story, Problem Statement, Impact / Why This Matters, Proposed Design, Acceptance Criteria, and Alternatives Considered. The design describes workflow and observable behavior without prescribing internal implementation; agent investigation is optional.
-3. **`config.yml`** — Skill category descriptions in contact links should be accurate.
-
-### Issue Triage Workflow
-
-1. **`issue-triage.yml`** — Skill names in the redirect comment must exist.
-
-### Skill Cross-References
-
-1. **`triage-issue`** — Skills referenced in gate check and diagnosis steps must exist.
-2. **`openshell-cli`** — Companion skills table entries must exist.
-3. **`build-from-issue`** — Label names must match the project's label taxonomy. Lifecycle and request labels must gate unattended queue pickup, while direct requests warn on workflow discrepancies and continue.
-4. **`create-spike`** — Reference to `build-from-issue` as next step must be accurate.
-5. **`review-security-issue`** / **`fix-security-issue`** — Cross-references between the two must be accurate.
-6. **PR creation and review checks** — The `create-github-pr`, `review-github-pr`, `build-from-issue`, and `principal-engineer-reviewer` references to `sync-agent-infra` must exist and use trigger conditions aligned with this skill.
-
-## Step 3: Report Drift
-
-If any inconsistencies are found, report them in a structured format:
-
-```markdown
-## Agent Infrastructure Drift Report
-
-### Skills Inventory
-- ADDED (exists in .agents/skills/ but missing from CONTRIBUTING.md): <list>
-- REMOVED (in CONTRIBUTING.md but missing from .agents/skills/): <list>
-- OK: <count> skills consistent
-
-### Architecture Table
-- ADDED (exists in crates/ but missing from AGENTS.md): <list>
-- REMOVED (in AGENTS.md but missing from crates/): <list>
-- OK: <count> components consistent
-
-### Workflow Chains
-- STALE: <chain name> references non-existent skill <skill>
-- OK: <count> chains consistent
-
-### Cross-References
-- <file>:<line> references non-existent skill <skill>
-- <file>:<line> references non-existent label <label>
-- The skill maintenance map has a stale or missing change-area mapping: <details>
-- OK: <count> references consistent
-```
-
-If no drift is found, report: "Agent infrastructure is consistent. No drift detected."
-
-## Step 4: Fix Drift
-
-If drift is found, fix it by updating the affected files:
-
-1. **Added skill** — Add it to the CONTRIBUTING.md skills table in the appropriate category. If it participates in a workflow chain, update the chains in both `AGENTS.md` and `CONTRIBUTING.md`.
-2. **Removed skill** — Remove it from all files. Check for references in templates and other skills.
-3. **Renamed skill** — Update every reference across all files.
-4. **Added crate** — Add a row to the AGENTS.md architecture table.
-5. **Removed crate** — Remove the row from the AGENTS.md architecture table.
-6. **Changed workflow chain** — Update chains in both `AGENTS.md` and `CONTRIBUTING.md`. Update the "Built With Agents" section in `README.md` if the change is user-visible.
-7. **Changed skill coverage** — Update the skill maintenance map in this file and any affected cross-references or companion-skill tables.
-
-After fixing, re-run Step 2 to verify consistency.
-
-## Step 5: Summarize Changes
-
-Report what was fixed:
-
-```markdown
-## Changes Made
-- Updated CONTRIBUTING.md skills table: added `<skill>`
-- Updated AGENTS.md architecture table: removed `<crate>`
-- Fixed cross-reference in `.agents/skills/triage-issue/SKILL.md`: `<old>` → `<new>`
-```
+Fix contradictions, then repeat the affected checks. Report files changed and any remaining drift. Do not treat an old document's label list as a source of truth over current GitHub metadata.

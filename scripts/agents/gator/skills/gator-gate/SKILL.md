@@ -30,17 +30,24 @@ gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="
 gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablocked --silent || true
 ```
 
-If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof"}` so the supervisor retries soon.
+If a required GitHub REST read or write fails with `EOF`, `Empty reply from server`, or a sandbox `NET:FAIL` after the current policy shows the endpoint was allowed, treat it as a transient transport or provider failure. Do not convert the PR or issue to `gator:blocked`, do not report it as a rate-limit/auth failure, and do not keep probing optional endpoints such as `/rate_limit`. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"github_transport_eof","notes":"GitHub transport failed after policy allowed the request. The supervisor should retry without changing the PR state."}` so the supervisor retries soon.
 
-If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed"}` so the supervisor retries after the operator or provider issue clears.
+If the `principal-engineer-reviewer` sub-agent fails before producing usable review output, treat that as transient gator infrastructure failure, not as a PR blocker. This includes Codex auth or token-refresh failures, model transport failures, sub-agent command failures, empty reviewer output, malformed reviewer output, and sandbox policy denials that only affect the sub-agent harness. Do not post a marked gator comment or PR review, do not apply `gator:blocked`, and do not consume the one-disposition-per-head-SHA slot. In supervised watch mode, finish with `OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"reviewer_subagent_failed","notes":"The reviewer did not produce usable feedback, so no PR state was changed. The supervisor should retry the review."}` so the supervisor retries after the operator or provider issue clears.
 
 ## Authority Rules
 
 - Do not push commits to a contributor's PR branch by default.
 - You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
-- Do not post `/ok to test <sha>` unless the current GitHub user has maintainer authority.
+- Do not post `/ok to test <full-head-sha>` unless the current GitHub user has maintainer authority.
 - Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
-- Security vulnerabilities must not be triaged through public GitHub issues. Follow `SECURITY.md`.
+- Surface security-related findings introduced or newly exposed by an unmerged
+  PR in that PR's normal review, using the same evidence, severity, and blocker
+  rules as other findings. A security classification alone does not require
+  private triage or suspend operator-authorized test dispatch.
+- For pre-existing vulnerabilities independent of the PR, follow `SECURITY.md`:
+  retain detailed evidence privately and notify the operator without publishing
+  exploit details. Do not initiate external disclosure, contact PSIRT, or submit
+  a security report without explicit operator authorization.
 
 Maintainer authority means one of:
 
@@ -132,6 +139,13 @@ Treat the ledger as required reviewer input, not optional background:
 - Use `current_patch_id`, `previous_reviewed_patch_id`, base SHA, and merge-base
   SHA to preserve review identity across rebases and merge-main commits. If
   `rebase_equivalent` is true, do not review the same effective patch again.
+- A null `current_patch_id` disables patch-equivalence shortcuts; it does not
+  invalidate the feedback ledger. Preserve exact-SHA history and review the
+  author-only delta conservatively when the head changed.
+- For large PRs, fetch the exact commits and inspect local `git diff` output
+  file-by-file. Do not depend on `gh pr diff` or GitHub's full-diff endpoint:
+  those reject oversized diffs. Review schema/generated changes separately
+  from handwritten behavior, without silently excluding them from scope.
 - For a non-equivalent rebase, compare author patch IDs or use `git range-diff`
   to isolate the author-only delta. Upstream changes are context, not new PR
   findings.
@@ -181,7 +195,7 @@ Thread resolution is required housekeeping for an addressed inline finding,
 not a new review disposition, and does not consume the one-disposition-per-head
 SHA slot. If GitHub does not confirm every requested resolution, do not advance
 the Gator state or post the follow-up disposition. Return
-`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed"}`
+`OPENSHELL_AGENT_RESULT {"status":"transient_failure","next_poll_seconds":120,"reason":"review_thread_resolution_failed","notes":"GitHub did not confirm every requested Gator thread resolution. Retry reconciliation before advancing the PR state."}`
 and retry the reconciliation later.
 
 ## Labels
@@ -382,7 +396,7 @@ For closed-unmerged PRs:
 
 For closed or merged PRs that have no active `gator:*` label and already have a monitoring-complete gator comment, take no GitHub write action.
 
-In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged"}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed"}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
+In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged","notes":"The monitored PR was merged, so Gator monitoring is complete."}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed","notes":"The monitored PR was closed without merging, so Gator monitoring is complete."}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
 
 ## Watch Loop Rules
 
@@ -391,10 +405,10 @@ Every gator state is a watch state. On each invocation, determine the current st
 When `OPENSHELL_AGENT_RUN_MODE=watch`, the OpenShell agent supervisor owns the sleep/relaunch loop. In that mode, perform exactly one reconciliation cycle, do not run `sleep 900` or an unbounded polling loop inside the harness, and finish with a single final-line result sentinel:
 
 ```text
-OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending","notes":"Required checks are still running on the current head. Gator will inspect the results next cycle."}
 ```
 
-Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. The supervisor will sleep and invoke the harness again with fresh GitHub state.
+Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. Every sentinel must include `notes`: one or two concise, plain-language sentences that summarize the current diagnosis, identify any notable issue or unanswered question, and state the next useful action or owner. Make the notes understandable when read aloud. Do not repeat mechanical metadata, dump raw logs, or include secrets. The supervisor will persist the result, sleep, and invoke the harness again with fresh GitHub state.
 
 When not running under supervised watch mode, do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
 
@@ -440,7 +454,7 @@ Move to `gator:blocked` when any of these apply:
 - PR is blocked by the vouch system or was auto-closed for lack of vouch
 - DCO is missing or failing
 - PR has merge conflicts or `mergeStateStatus` indicates dirty/blocked for conflict reasons
-- Required `/ok to test <sha>` is needed and the current user lacks maintainer authority
+- Required `/ok to test <full-head-sha>` is needed and the current user lacks maintainer authority
 - Required CI cannot run because the copy-pr mirror is missing or stale and maintainer authority is unavailable
 
 For auto-closed vouch-gate PRs, do not treat the proposal as invalid. Comment only if useful, then stop and wait until the author is vouched and the PR is reopened.
@@ -527,13 +541,13 @@ Validate small and concentrated work when it has clear motivation and one of the
 - TUI, CLI, or API quality-of-life improvement with a clear user path
 - Driver improvement that makes sandbox lifecycle management easier or more efficient
 - Documentation clarification, typo fix, errata, or missing documentation
-- CI/CD/build/release improvement, including Snap, package, release, or test harness work
+- CI/CD/build/release improvement, including snap, package, release, or test harness work
 
 Documentation changes from non-maintainers must not reorder ToC items, change fundamental hierarchy, or restructure docs without a clear maintainer-approved reason.
 
-### Provider V2 and Credential Support
+### Provider Profiles and Credential Support
 
-Provider V2 work is a supported high-traction area, but require all of the following:
+Provider-profile work is a supported high-traction area, but requires all of the following:
 
 - Clear UX path for how users configure and use the provider feature in OpenShell
 - Clear statement of why the change is important
@@ -541,7 +555,13 @@ Provider V2 work is a supported high-traction area, but require all of the follo
 - Security boundary analysis for credential handling
 - Explanation of whether secrets remain hidden from the sandbox agent
 
-Provider additions and updates must use providers v2 through provider profiles. Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking review finding unless a maintainer explicitly requests the legacy path. Do not ask contributors to update both systems for compatibility; the provider profile is the source of truth for new provider network policy, credentials, discovery, and refresh metadata.
+Provider profiles are the authoritative provider model. Provider additions and
+updates must define their network policy, credentials, discovery, refresh
+metadata, and user-facing semantics through a built-in or imported profile.
+Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking
+review finding unless a maintainer explicitly requests the legacy path. Do not
+ask contributors to update both systems for compatibility or to enable a
+gateway feature switch; profile-backed behavior is always active.
 
 Be skeptical of changes that expose raw credentials to agents or weaken the credential proxy model, even if the user story is clear.
 
@@ -638,6 +658,14 @@ Keep reviews proportional, scope-bound, and convergent:
 - Route pre-existing security defects through the private security process.
   Do not publish exploit details or make them blockers on the current PR.
   Route other pre-existing defects to a non-blocking follow-up.
+- A pre-existing unsafe primitive does not make a new PR-owned exposure
+  pre-existing. Compare base and head: if the PR creates a new reachable path,
+  trusted sink, or security contract that makes the defect exploitable, surface
+  the regression in the PR review with its invariant, impact, fix, and verification.
+  Do not substitute a generic private-security notice for actionable feedback
+  or invent a `private_security_review_required` gate solely because the finding
+  is security-related. Existing review blockers still follow normal state rules;
+  this distinction does not waive findings or authorize tests otherwise forbidden.
 - Treat docs, skill drift, diagnostic wording, and test-strength feedback as
   non-blocking unless the published contract is materially false, the
   diagnostic causes an operational or safety failure, or missing coverage
@@ -912,19 +940,29 @@ Use `test:e2e` for changes that affect:
 
 Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavior.
 
-Use `test:e2e-kubernetes` for Kubernetes HA, Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, or controller behavior when the Kubernetes-specific suite is needed.
+Use `test:e2e` for Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, workspace mode, or controller behavior; it runs the Kubernetes, managed-workspace, and operator-workspace suites.
+
+Add `test:e2e-kubernetes` for gateway high availability or Kubernetes Secrets and Vault credential driver storage. It runs only the HA and credential-driver suites, so apply it alongside `test:e2e` when other Kubernetes coverage is also needed.
+
+Apply `test:windows` whenever a PR affects Windows support. This includes Windows or MSVC CI and `mise` tasks, Windows lock-file platform entries, the MXC driver, and `cfg(windows)` implementations or tests in otherwise cross-platform crates. Apply it alongside any applicable E2E label; it is not a substitute for runtime coverage.
 
 After applying a `test:*` label, read the bot comment that is posted by the E2E Label Help workflow and follow its instructions.
 
 If a mirror is missing or stale and you have maintainer authority, post:
 
 ```text
-/ok to test <sha>
+/ok to test <full-head-sha>
 ```
 
-The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+`<full-head-sha>` MUST be the full 40-character SHA-1 of the current PR head. Read it fresh from GitHub immediately before posting instead of reusing a SHA from earlier in the cycle:
 
-If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <sha>`.
+```bash
+gh api repos/NVIDIA/OpenShell/pulls/<number> --jq .head.sha
+```
+
+The `/ok to test <full-head-sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+
+If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <full-head-sha>` with the full current head SHA written out.
 
 Do not treat a test label or `/ok to test` comment as proof that testing
 started. Confirm that every required workflow has a check or run for the
@@ -955,8 +993,10 @@ Required gates include at least:
 
 - `OpenShell / Branch Checks`
 - `OpenShell / Helm Lint`
+- `OpenShell / Trivy Changes`
 - `OpenShell / E2E` when `test:e2e` is applied
 - `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
+- Both x64 and ARM64 `Windows MSVC / PR lint and test` checks when `test:windows` is applied
 
 If checks are pending, wait a reasonable interval and re-check.
 

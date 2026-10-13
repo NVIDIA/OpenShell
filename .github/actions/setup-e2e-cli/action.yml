@@ -1,5 +1,5 @@
 name: Setup E2E CLI
-description: Download an architecture-matched prebuilt OpenShell CLI for E2E tests
+description: Download architecture-matched prebuilt OpenShell host CLIs for E2E tests
 
 runs:
   using: composite

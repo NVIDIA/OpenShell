@@ -6,10 +6,17 @@
 //! Kubernetes wiring coverage for authenticated corporate forward proxies.
 //!
 //! The shell wrapper configures the gateway before it starts, creates the
-//! credential Secret, and forces sidecar topology. This test starts a proxy
+//! credential Secret, and enables the Kubernetes sandbox runtime. This test starts a proxy
 //! and an HTTPS upstream on the host visible to sandbox pods, then proves that
 //! a permitted request uses authenticated CONNECT while a policy-denied port
 //! never reaches the proxy.
+//!
+//! The `https-ca` mode additionally terminates TLS on the proxy listener with
+//! a leaf signed by a private CA that the wrapper publishes as a ConfigMap in
+//! the gateway's release namespace. It covers the whole staging chain —
+//! gateway read, bootstrap-Secret key, supervisor mount, `--upstream-proxy-ca-bundle`
+//! argument — because the CONNECT handshake cannot succeed unless every link
+//! works.
 
 use std::io::Write as _;
 
@@ -23,9 +30,29 @@ const USER: &str = "proxyuser";
 const PASS: &str = "proxypass";
 const MARKER: &str = "kubernetes-corporate-proxy-upstream";
 
-fn proxy_script() -> String {
+/// Python source for the forward proxy.
+///
+/// With `tls`, the listener is wrapped in TLS using the wrapper-supplied leaf,
+/// so the supervisor must complete a verified handshake against the operator
+/// CA bundle before it can issue CONNECT.
+fn proxy_script(tls: Option<(&str, &str)>) -> String {
+    let tls_setup = match tls {
+        Some((cert, key)) => format!(
+            r#"
+import ssl, tempfile, os
+_d=tempfile.mkdtemp()
+_cert=os.path.join(_d,'proxy.crt'); _key=os.path.join(_d,'proxy.key')
+open(_cert,'w').write({cert:?})
+open(_key,'w').write({key:?})
+_ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); _ctx.load_cert_chain(_cert,_key)
+def wrap(sock):
+  return _ctx.wrap_socket(sock, server_side=True)
+"#
+        ),
+        None => "\ndef wrap(sock):\n  return sock\n".to_string(),
+    };
     format!(
-        r#"
+        r#"{tls_setup}
 import base64, select, socket, threading
 expected = 'Basic ' + base64.b64encode(b'{USER}:{PASS}').decode()
 def head(c):
@@ -68,7 +95,11 @@ def handle(c):
 s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',{FIXTURE_PORT})); s.listen(32)
 print('proxy-listening',flush=True)
 while True:
-  c,_=s.accept(); threading.Thread(target=handle,args=(c,),daemon=True).start()
+  c,_=s.accept()
+  try: c=wrap(c)
+  except OSError as e:
+    print('handshake-failed %s' % e, flush=True); c.close(); continue
+  threading.Thread(target=handle,args=(c,),daemon=True).start()
 "#
     )
 }
@@ -151,8 +182,22 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
         );
         return;
     }
+    let proxy_tls = if mode == "https-ca" {
+        let cert = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_TLS_CERT")
+            .expect("https-ca mode requires the proxy leaf certificate from the wrapper");
+        let key = std::env::var("OPENSHELL_E2E_CORPORATE_PROXY_TLS_KEY")
+            .expect("https-ca mode requires the proxy leaf key from the wrapper");
+        Some((cert, key))
+    } else {
+        None
+    };
+    let proxy_source = proxy_script(
+        proxy_tls
+            .as_ref()
+            .map(|(cert, key)| (cert.as_str(), key.as_str())),
+    );
     let proxy =
-        HostSupportContainer::start_python_on_host_port(&proxy_script(), FIXTURE_PORT, proxy_port)
+        HostSupportContainer::start_python_on_host_port(&proxy_source, FIXTURE_PORT, proxy_port)
             .await
             .expect("start authenticated forward proxy");
     let upstream = if mode == "no-proxy" {
@@ -207,6 +252,15 @@ async fn kubernetes_corporate_proxy_uses_secret_and_never_falls_back() {
             logs.contains("auth=ok"),
             "Secret credentials must reach proxy:\n{logs}"
         );
+        if mode == "https-ca" {
+            // A staging failure anywhere in the chain (gateway read, Secret
+            // key, mount, argv) shows up here: the supervisor cannot verify
+            // the listener leaf, so no CONNECT is ever sent.
+            assert!(
+                !logs.contains("handshake-failed"),
+                "supervisor must verify the proxy leaf against the staged CA bundle:\n{logs}"
+            );
+        }
         assert!(
             !logs.contains("auth=fail"),
             "proxy must not receive missing credentials:\n{logs}"

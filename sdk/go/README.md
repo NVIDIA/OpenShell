@@ -28,7 +28,9 @@ patterns will look familiar:
 - **Watch primitives**: channel-based watchers with `ResultChan()` and `Stop()`,
   identical to `watch.Interface` in client-go
 - **Functional options**: variadic option patterns for list filtering,
-  pagination, and watch configuration
+  pagination, and watch configuration. Nil options are silently ignored
+  at every entry point, so conditional option lists are safe to pass
+  without filtering out nil entries.
 - **Composable auth with token refresh**: wraps `oauth2.TokenSource` for
   automatic token caching and coalesced refresh, following the k8s client-go
   `cachingTokenSource` pattern
@@ -72,6 +74,31 @@ if err != nil {
     log.Fatal(err)
 }
 fmt.Println(string(result.Stdout))
+```
+
+### Pagination
+
+List methods return a lazy pager without issuing a request. `NextPage` fetches
+one page with the supplied context, while `ListAll` explicitly exhausts every
+page. `PageSize` is a per-request maximum and `PageToken` resumes a prior query.
+
+```go
+pager, err := client.Sandboxes().List("default", v1.ListOptions{PageSize: 100})
+if err != nil {
+    log.Fatal(err)
+}
+for {
+    page, err := pager.NextPage(ctx)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if page == nil {
+        break
+    }
+    for _, sandbox := range page.Items {
+        fmt.Println(sandbox.Name)
+    }
+}
 ```
 
 ### With automatic token refresh
@@ -223,39 +250,11 @@ The pre-1.0 SDK intentionally includes source-incompatible API corrections:
   types preserve that scope.
 - Several public struct field orders changed. Use keyed struct literals.
 - Initialisms use Go spelling, including `JSONRPCMaxBodyBytes`.
+- Provider profile durations use the exact `RefreshBefore`, `MaxLifetime`, and
+  `CacheTTL` fields. The legacy whole-second fields were removed.
 
 These changes are intentional while the module remains below v1. Update callers
 as one migration rather than relying on the v0.0.101 API shape.
-
-### Inference Route Management
-
-Configure how inference requests are routed for a workspace:
-
-```go
-// Set an inference route
-route, err := client.Inference().SetRoute(ctx, "my-workspace", &v1.InferenceRouteConfig{
-    ProviderName: "openai",
-    ModelID:      "gpt-4",
-    RouteName:    "",        // empty string = default route
-    TimeoutSecs:  120,
-})
-if err != nil {
-    log.Fatal(err)
-}
-fmt.Printf("Route v%d: %s/%s\n", route.Version, route.ProviderName, route.ModelID)
-
-// Retrieve the route
-route, err = client.Inference().GetRoute(ctx, "my-workspace", "")
-if err != nil {
-    log.Fatal(err)
-}
-
-// Delete the route
-err = client.Inference().DeleteRoute(ctx, "my-workspace", "")
-if err != nil {
-    log.Fatal(err)
-}
-```
 
 ## Architecture
 
@@ -270,7 +269,6 @@ Client
   │     ├── Profiles() → ProfileInterface (list, get, import, update, lint, delete)
   │     └── Refresh()  → RefreshInterface (configure, status, rotate, delete)
   ├── Workspaces()  → WorkspaceInterface  (create, get, list, delete, members)
-  ├── Inference()   → InferenceInterface  (set, get, delete inference routes)
   └── Policy()      → PolicyInterface     (draft review, approve, reject, merge, status)
 ```
 
@@ -279,6 +277,18 @@ an internal converter layer. The public API surface uses type aliases so
 consumers import a single package. See the [Architecture](https://ro14nd.de/openshell-sdk-go/architecture.html) overview for details.
 
 ## Features
+
+Use `CloseInteractiveInput(session)` to close stdin and resize input while keeping
+output readable. SDK sessions implement the optional `InteractiveSessionControl`
+interface (`CloseWrite()` and `Cancel()`); the original `InteractiveSession`
+interface remains unchanged for existing mocks and wrappers. Input closure returns
+`ErrorUnimplemented` for sessions without that capability and leaves them open.
+`CancelInteractive(session)` uses `Cancel()` when available and otherwise calls
+`Close()`. SDK close/cancel operations are idempotent; writes and resizes after
+input closure return `io.ErrClosedPipe`. Drain `Read` concurrently with waiting for `ExitCode()`.
+`ExitCode()` waits for final gRPC status and returns any observed process exit code
+alongside a later stream error. An exit event alone does not establish successful
+stream completion.
 
 | Feature | Interface | Docs |
 |---------|-----------|------|
@@ -292,7 +302,7 @@ consumers import a single package. See the [Architecture](https://ro14nd.de/open
 | Policy management (draft review, approve, reject, merge, global policy) | `PolicyInterface` | [Policy](https://ro14nd.de/openshell-sdk-go/api/policy.html) |
 | Sandbox logs (streaming retrieval) | `SandboxInterface` | [Sandboxes](https://ro14nd.de/openshell-sdk-go/api/sandboxes.html) |
 | Workspace management (create, get, list, delete, members) | `WorkspaceInterface` | [Workspaces](https://ro14nd.de/openshell-sdk-go/api/workspaces.html) |
-| Inference route management (set, get, delete) | `InferenceInterface` | [Inference](https://ro14nd.de/openshell-sdk-go/api/inference.html) |
+| Sandbox provider attachment (attach, detach, list) | `SandboxInterface` | [Sandboxes](https://ro14nd.de/openshell-sdk-go/api/sandboxes.html) |
 | Gateway info and current user identity | `HealthInterface` | [Health](https://ro14nd.de/openshell-sdk-go/api/health.html) |
 | Health checking | `HealthInterface` | [Health](https://ro14nd.de/openshell-sdk-go/api/health.html) |
 | SSH tunneling and TCP forwarding | `SSHInterface`, `TCPInterface` | [SSH](https://ro14nd.de/openshell-sdk-go/api/ssh.html), [TCP](https://ro14nd.de/openshell-sdk-go/api/tcp.html) |
@@ -306,7 +316,7 @@ consumers import a single package. See the [Architecture](https://ro14nd.de/open
 
 ## Prerequisites
 
-- Go 1.25 or later
+- Go 1.25.13 or later
 - [mise](https://mise.jdx.dev) (recommended for reproducible builds)
 
 ## Build and Test

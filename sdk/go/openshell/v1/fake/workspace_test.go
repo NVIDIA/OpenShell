@@ -19,9 +19,10 @@ func TestWorkspaceDelete_RemovesMembers(t *testing.T) {
 	require.NoError(t, err)
 	_, err = fc.Workspaces().AddMember(ctx, "team", "alice", types.WorkspaceRoleUser)
 	require.NoError(t, err)
-	require.NoError(t, fc.Workspaces().Delete(ctx, "team"))
+	_, err = fc.Workspaces().Delete(ctx, "team")
+	require.NoError(t, err)
 
-	members, err := fc.Workspaces().ListMembers(ctx, "team")
+	members, err := fc.Workspaces().ListAllMembers(ctx, "team")
 	require.NoError(t, err)
 	assert.Empty(t, members)
 }
@@ -101,14 +102,14 @@ func TestFakeWorkspace_List(t *testing.T) {
 	_, _ = fc.Workspaces().Create(context.Background(), "ws-1", nil)
 	_, _ = fc.Workspaces().Create(context.Background(), "ws-2", nil)
 
-	workspaces, err := fc.Workspaces().List(context.Background())
+	workspaces, err := fc.Workspaces().ListAll(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, workspaces, 2)
 }
 
 func TestFakeWorkspace_List_Empty(t *testing.T) {
 	fc := NewClient()
-	workspaces, err := fc.Workspaces().List(context.Background())
+	workspaces, err := fc.Workspaces().ListAll(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, workspaces)
 }
@@ -117,7 +118,7 @@ func TestFakeWorkspace_Delete(t *testing.T) {
 	fc := NewClient()
 	_, _ = fc.Workspaces().Create(context.Background(), "del-ws", nil)
 
-	err := fc.Workspaces().Delete(context.Background(), "del-ws")
+	_, err := fc.Workspaces().Delete(context.Background(), "del-ws")
 	require.NoError(t, err)
 
 	_, err = fc.Workspaces().Get(context.Background(), "del-ws")
@@ -126,7 +127,7 @@ func TestFakeWorkspace_Delete(t *testing.T) {
 
 func TestFakeWorkspace_Delete_EmptyName(t *testing.T) {
 	fc := NewClient()
-	err := fc.Workspaces().Delete(context.Background(), "")
+	_, err := fc.Workspaces().Delete(context.Background(), "")
 
 	require.Error(t, err)
 	assert.True(t, types.IsInvalidArgument(err))
@@ -134,7 +135,7 @@ func TestFakeWorkspace_Delete_EmptyName(t *testing.T) {
 
 func TestFakeWorkspace_Delete_NotFound(t *testing.T) {
 	fc := NewClient()
-	err := fc.Workspaces().Delete(context.Background(), "missing")
+	_, err := fc.Workspaces().Delete(context.Background(), "missing")
 
 	require.Error(t, err)
 	assert.True(t, types.IsNotFound(err))
@@ -188,17 +189,17 @@ func TestFakeWorkspace_RemoveMember(t *testing.T) {
 	fc := NewClient()
 	_, _ = fc.Workspaces().AddMember(context.Background(), "ws", "user@example.com", types.WorkspaceRoleAdmin)
 
-	err := fc.Workspaces().RemoveMember(context.Background(), "ws", "user@example.com")
+	_, err := fc.Workspaces().RemoveMember(context.Background(), "ws", "user@example.com")
 	require.NoError(t, err)
 
-	members, err := fc.Workspaces().ListMembers(context.Background(), "ws")
+	members, err := fc.Workspaces().ListAllMembers(context.Background(), "ws")
 	require.NoError(t, err)
 	assert.Empty(t, members)
 }
 
 func TestFakeWorkspace_RemoveMember_EmptyWorkspace(t *testing.T) {
 	fc := NewClient()
-	err := fc.Workspaces().RemoveMember(context.Background(), "", "user@example.com")
+	_, err := fc.Workspaces().RemoveMember(context.Background(), "", "user@example.com")
 
 	require.Error(t, err)
 	assert.True(t, types.IsInvalidArgument(err))
@@ -206,7 +207,7 @@ func TestFakeWorkspace_RemoveMember_EmptyWorkspace(t *testing.T) {
 
 func TestFakeWorkspace_RemoveMember_EmptySubject(t *testing.T) {
 	fc := NewClient()
-	err := fc.Workspaces().RemoveMember(context.Background(), "ws", "")
+	_, err := fc.Workspaces().RemoveMember(context.Background(), "ws", "")
 
 	require.Error(t, err)
 	assert.True(t, types.IsInvalidArgument(err))
@@ -214,7 +215,7 @@ func TestFakeWorkspace_RemoveMember_EmptySubject(t *testing.T) {
 
 func TestFakeWorkspace_RemoveMember_NotFound(t *testing.T) {
 	fc := NewClient()
-	err := fc.Workspaces().RemoveMember(context.Background(), "ws", "missing@example.com")
+	_, err := fc.Workspaces().RemoveMember(context.Background(), "ws", "missing@example.com")
 
 	require.Error(t, err)
 	assert.True(t, types.IsNotFound(err))
@@ -225,14 +226,14 @@ func TestFakeWorkspace_ListMembers(t *testing.T) {
 	_, _ = fc.Workspaces().AddMember(context.Background(), "ws", "user1@example.com", types.WorkspaceRoleAdmin)
 	_, _ = fc.Workspaces().AddMember(context.Background(), "ws", "user2@example.com", types.WorkspaceRoleUser)
 
-	members, err := fc.Workspaces().ListMembers(context.Background(), "ws")
+	members, err := fc.Workspaces().ListAllMembers(context.Background(), "ws")
 	require.NoError(t, err)
 	assert.Len(t, members, 2)
 }
 
 func TestFakeWorkspace_ListMembers_EmptyWorkspace(t *testing.T) {
 	fc := NewClient()
-	_, err := fc.Workspaces().ListMembers(context.Background(), "")
+	_, err := fc.Workspaces().ListAllMembers(context.Background(), "")
 
 	require.Error(t, err)
 	assert.True(t, types.IsInvalidArgument(err))
@@ -243,12 +244,12 @@ func TestFakeWorkspace_ListMembers_Isolation(t *testing.T) {
 	_, _ = fc.Workspaces().AddMember(context.Background(), "ws-a", "user@example.com", types.WorkspaceRoleAdmin)
 	_, _ = fc.Workspaces().AddMember(context.Background(), "ws-b", "other@example.com", types.WorkspaceRoleUser)
 
-	membersA, err := fc.Workspaces().ListMembers(context.Background(), "ws-a")
+	membersA, err := fc.Workspaces().ListAllMembers(context.Background(), "ws-a")
 	require.NoError(t, err)
 	assert.Len(t, membersA, 1)
 	assert.Equal(t, "user@example.com", membersA[0].PrincipalSubject)
 
-	membersB, err := fc.Workspaces().ListMembers(context.Background(), "ws-b")
+	membersB, err := fc.Workspaces().ListAllMembers(context.Background(), "ws-b")
 	require.NoError(t, err)
 	assert.Len(t, membersB, 1)
 	assert.Equal(t, "other@example.com", membersB[0].PrincipalSubject)
@@ -264,19 +265,19 @@ func TestFakeWorkspace_Closed(t *testing.T) {
 	_, err = fc.Workspaces().Get(context.Background(), "ws")
 	assert.True(t, types.IsUnavailable(err))
 
-	_, err = fc.Workspaces().List(context.Background())
+	_, err = fc.Workspaces().ListAll(context.Background())
 	assert.True(t, types.IsUnavailable(err))
 
-	err = fc.Workspaces().Delete(context.Background(), "ws")
+	_, err = fc.Workspaces().Delete(context.Background(), "ws")
 	assert.True(t, types.IsUnavailable(err))
 
 	_, err = fc.Workspaces().AddMember(context.Background(), "ws", "user", types.WorkspaceRoleAdmin)
 	assert.True(t, types.IsUnavailable(err))
 
-	err = fc.Workspaces().RemoveMember(context.Background(), "ws", "user")
+	_, err = fc.Workspaces().RemoveMember(context.Background(), "ws", "user")
 	assert.True(t, types.IsUnavailable(err))
 
-	_, err = fc.Workspaces().ListMembers(context.Background(), "ws")
+	_, err = fc.Workspaces().ListAllMembers(context.Background(), "ws")
 	assert.True(t, types.IsUnavailable(err))
 }
 

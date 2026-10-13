@@ -1,6 +1,31 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/google-vertex-ai.yaml
+#   openshell provider profile import -f providers/google-vertex-ai.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   none declared. Add the binaries that call Vertex — the SDK
+#                    interpreter, curl, or an agent CLI — before relying on
+#                    binary-scoped attribution for this profile.
+# Reference layout:  any image with a Vertex-capable client. The profile also
+#                    projects VERTEX_AI_PROJECT_ID and VERTEX_AI_REGION into the
+#                    sandbox so SDKs and agent CLIs pick up the target project.
+# Credential scope:  a gateway-refreshed Google access token, as
+#                    GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN (service-account JWT)
+#                    or GOOGLE_VERTEX_AI_TOKEN (gcloud ADC), sent as a bearer
+#                    authorization header. GOOGLE_SERVICE_ACCOUNT_KEY is refresh
+#                    bootstrap material and is never injected into the sandbox.
+# Endpoint access:   the aiplatform.googleapis.com regional and replicated hosts,
+#                    read-write, L7 enforced.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      curl -sS -H "Authorization: Bearer $GOOGLE_VERTEX_AI_TOKEN" \
+#                        https://us-central1-aiplatform.googleapis.com/v1/projects/$VERTEX_AI_PROJECT_ID/locations/us-central1/publishers/google/models
+
 id: google-vertex-ai
 display_name: Google Vertex AI
 description: Google Vertex AI inference provider (Anthropic Claude, Gemini, and third-party models)

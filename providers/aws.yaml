@@ -1,6 +1,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/aws.yaml
+#   openshell provider profile import -f providers/aws.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   none declared — this profile grants no egress.
+# Reference layout:  any image with an AWS SDK or the aws CLI. Credentials arrive
+#                    as the standard AWS_* environment variables, so clients pick
+#                    them up without configuration.
+# Credential scope:  AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY and
+#                    AWS_SESSION_TOKEN, minted by the gateway with one STS
+#                    AssumeRole call and rotated before expiry. The role ARN and
+#                    any long-lived source keys stay at the gateway; configure
+#                    them with `openshell provider refresh configure`.
+# Endpoint access:   none. The profile declares no endpoints, so it grants no
+#                    network access on its own — pair it with a sandbox policy
+#                    or another profile (see aws-s3.yaml) that names the AWS
+#                    hosts the workload needs.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      aws sts get-caller-identity
+
 id: aws
 display_name: AWS
 description: Generic AWS access via STS temporary credentials

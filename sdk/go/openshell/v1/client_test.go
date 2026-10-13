@@ -36,7 +36,6 @@ func TestNewClient_ValidConfig(t *testing.T) {
 	assert.NotNil(t, client.Config())
 	assert.NotNil(t, client.Policy())
 	assert.NotNil(t, client.Workspaces())
-	assert.NotNil(t, client.Inference())
 
 	err = client.Close()
 	assert.NoError(t, err)

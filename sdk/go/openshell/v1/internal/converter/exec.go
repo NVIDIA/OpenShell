@@ -37,21 +37,22 @@ func ExecChunkFromEvent(event *pb.ExecSandboxEvent) (*types.ExecChunk, int, erro
 }
 
 // ExecRequestToProto builds a proto ExecSandboxRequest for Run/Stream modes.
-func ExecRequestToProto(sandboxID string, command []string, opts *types.ExecOptions) *pb.ExecSandboxRequest {
+func ExecRequestToProto(sandboxName string, command []string, opts *types.ExecOptions) *pb.ExecSandboxRequest {
 	req := &pb.ExecSandboxRequest{
-		SandboxId: sandboxID,
-		Command:   CopyStringSlice(command),
+		Sandbox: sandboxName,
+		Command: CopyStringSlice(command),
 	}
 	if opts != nil {
 		req.Workdir = opts.WorkDir
 		req.Environment = CopyStringMap(opts.Env)
+		req.NoLoginShell = opts.NoLoginShell
 	}
 	return req
 }
 
 // ExecInteractiveRequestToProto builds a proto ExecSandboxRequest for Interactive mode.
-func ExecInteractiveRequestToProto(sandboxID string, command []string, cols, rows uint32, opts *types.ExecOptions) *pb.ExecSandboxRequest {
-	req := ExecRequestToProto(sandboxID, command, opts)
+func ExecInteractiveRequestToProto(sandboxName string, command []string, cols, rows uint32, opts *types.ExecOptions) *pb.ExecSandboxRequest {
+	req := ExecRequestToProto(sandboxName, command, opts)
 	req.Tty = true
 	req.Cols = cols
 	req.Rows = rows

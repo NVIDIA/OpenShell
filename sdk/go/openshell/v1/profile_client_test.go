@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -34,7 +35,8 @@ type mockProfileServer struct {
 	lintErr   error
 	deleteErr error
 
-	lastListReq *pb.ListProviderProfilesRequest
+	lastListReq               *pb.ListProviderProfilesRequest
+	supportsStablePlaceholder bool
 }
 
 func newMockProfileServer() *mockProfileServer {
@@ -145,8 +147,9 @@ func (s *mockProfileServer) LintProviderProfiles(_ context.Context, req *pb.Lint
 		}
 	}
 	return &pb.LintProviderProfilesResponse{
-		Diagnostics: diagnostics,
-		Valid:       valid,
+		Diagnostics:               diagnostics,
+		Valid:                     valid,
+		SupportsStablePlaceholder: s.supportsStablePlaceholder,
 	}, nil
 }
 
@@ -162,7 +165,7 @@ func (s *mockProfileServer) DeleteProviderProfile(_ context.Context, req *pb.Del
 		return nil, status.Errorf(codes.NotFound, "profile %q not found", req.GetId())
 	}
 	delete(s.profiles, req.GetId())
-	return &pb.DeleteProviderProfileResponse{Deleted: true}, nil
+	return &pb.DeleteProviderProfileResponse{Outcome: pb.DeletionOutcome_DELETION_OUTCOME_COMPLETED}, nil
 }
 
 // --- Test setup ---
@@ -219,7 +222,7 @@ func TestProfileList(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default")
+	profiles, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
 	assert.Len(t, profiles, 2)
@@ -230,9 +233,10 @@ func TestProfileList_Empty(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default")
+	profiles, err := client.ListAll(context.Background(), "default")
 
 	require.NoError(t, err)
+	assert.NotNil(t, profiles)
 	assert.Empty(t, profiles)
 }
 
@@ -242,13 +246,13 @@ func TestProfileList_WithOptions(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default", ListOptions{Limit: 10, Offset: 5})
+	profiles, err := client.ListAll(context.Background(), "default", ListOptions{PageSize: 10})
 
 	require.NoError(t, err)
 	assert.Len(t, profiles, 1)
 	require.NotNil(t, mock.lastListReq)
-	assert.Equal(t, uint32(10), mock.lastListReq.GetLimit())
-	assert.Equal(t, uint32(5), mock.lastListReq.GetOffset())
+	assert.Equal(t, int32(10), mock.lastListReq.GetPageSize())
+	assert.Empty(t, mock.lastListReq.GetPageToken())
 }
 
 func TestProfileList_Error(t *testing.T) {
@@ -257,7 +261,7 @@ func TestProfileList_Error(t *testing.T) {
 	client, cleanup := setupProfileTest(t, mock)
 	defer cleanup()
 
-	profiles, err := client.List(context.Background(), "default")
+	profiles, err := client.ListAll(context.Background(), "default")
 
 	assert.Nil(t, profiles)
 	require.Error(t, err)
@@ -319,6 +323,47 @@ func TestProfileGet_Error(t *testing.T) {
 }
 
 // --- Import tests ---
+
+func TestProfileStablePlaceholderCompatibility(t *testing.T) {
+	for _, supports := range []bool{false, true} {
+		for _, enabled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("gateway_supports=%t/enabled=%t", supports, enabled), func(t *testing.T) {
+				mock := newMockProfileServer()
+				mock.supportsStablePlaceholder = supports
+				if !enabled {
+					// Ordinary writes must not acquire a new dependency on lint.
+					mock.lintErr = status.Error(codes.Unimplemented, "legacy lint unavailable")
+				}
+				seedProfile(mock, "existing", "Existing", pb.ProviderProfileCategory_PROVIDER_PROFILE_CATEGORY_INFERENCE)
+				client, cleanup := setupProfileTest(t, mock)
+				defer cleanup()
+				item := ProfileImportItem{Profile: ProviderProfile{
+					ID:          "new",
+					Credentials: []ProfileCredential{{Name: "token", StablePlaceholder: enabled}},
+				}}
+				imported, importErr := client.Import(context.Background(), "default", []ProfileImportItem{item})
+				item.Profile.ID = "existing"
+				updated, updateErr := client.Update(context.Background(), "default", "existing", 1, item)
+				if enabled && !supports {
+					require.ErrorContains(t, importErr, "does not support stable_placeholder")
+					require.ErrorContains(t, updateErr, "does not support stable_placeholder")
+					mock.mu.Lock()
+					defer mock.mu.Unlock()
+					assert.NotContains(t, mock.profiles, "new")
+					assert.Equal(t, uint64(1), mock.profiles["existing"].GetResourceVersion())
+					assert.False(t, mock.profiles["existing"].GetCredentials()[0].GetStablePlaceholder())
+				} else {
+					require.NoError(t, importErr)
+					require.NoError(t, updateErr)
+					assert.True(t, imported.Imported)
+					assert.True(t, updated.Updated)
+					assert.Equal(t, enabled, imported.Profiles[0].Credentials[0].StablePlaceholder)
+					assert.Equal(t, enabled, updated.Profile.Credentials[0].StablePlaceholder)
+				}
+			})
+		}
+	}
+}
 
 func TestProfileImport(t *testing.T) {
 	mock := newMockProfileServer()
@@ -536,7 +581,7 @@ func TestProfileDelete(t *testing.T) {
 	deleted, err := client.Delete(context.Background(), "default", "p1")
 
 	require.NoError(t, err)
-	assert.True(t, deleted)
+	assert.Equal(t, DeletionCompleted, deleted.Outcome)
 
 	// Verify subsequent Get returns NotFound
 	profile, err := client.Get(context.Background(), "default", "p1")
@@ -552,7 +597,7 @@ func TestProfileDelete_NotFound(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "nonexistent")
 
-	assert.False(t, deleted)
+	assert.Nil(t, deleted)
 	require.Error(t, err)
 	assert.True(t, IsNotFound(err))
 }
@@ -565,6 +610,6 @@ func TestProfileDelete_Error(t *testing.T) {
 
 	deleted, err := client.Delete(context.Background(), "default", "p1")
 
-	assert.False(t, deleted)
+	assert.Nil(t, deleted)
 	require.Error(t, err)
 }

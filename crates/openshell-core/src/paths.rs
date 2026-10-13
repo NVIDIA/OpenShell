@@ -140,41 +140,9 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
-/// Normalize a filesystem path by collapsing redundant separators
-/// and removing trailing slashes, without requiring the path to exist on disk.
-///
-/// This is a lexical normalization only — it does NOT resolve symlinks or
-/// check the filesystem. `..` components are preserved verbatim; callers that
-/// need to reject parent traversal must validate separately. The normalized
-/// representation always uses `/` so sandbox policy paths are host-independent.
-pub fn normalize_path(path: &str) -> String {
-    use std::path::Component;
-
-    let p = Path::new(path);
-    let mut normalized = PathBuf::new();
-    for component in p.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            #[allow(clippy::path_buf_push_overwrite)]
-            Component::RootDir => normalized.push("/"),
-            Component::CurDir => {} // skip "."
-            Component::ParentDir => {
-                // Keep ".." — validation will catch it separately
-                normalized.push("..");
-            }
-            Component::Normal(c) => normalized.push(c),
-        }
-    }
-    let normalized = normalized.to_string_lossy();
-    #[cfg(target_os = "windows")]
-    {
-        normalized.replace('\\', "/")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        normalized.into_owned()
-    }
-}
+/// Compatibility re-export; authored policy path normalization is owned by
+/// `openshell-policy-schema`.
+pub use openshell_policy_schema::normalize_path;
 
 #[cfg(test)]
 mod tests {

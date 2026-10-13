@@ -5,7 +5,7 @@
 # Build libkrun and libkrunfw from source on Linux.
 #
 # This script builds libkrun (VMM) and libkrunfw (kernel firmware) from source
-# with OpenShell's custom kernel configuration for bridge/netfilter support.
+# with OpenShell's custom kernel configuration for sandbox enforcement.
 #
 # In addition to the platform's native .so artifacts, this script exports
 # kernel.c and ABI_VERSION metadata so that other platforms (e.g. macOS) can
@@ -29,7 +29,7 @@ source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
 # Source pinned dependency versions.
-source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env"
 
 BUILD_DIR="${ROOT}/target/libkrun-build"
 OUTPUT_DIR="${BUILD_DIR}"
@@ -133,18 +133,16 @@ echo "==> Building libkrunfw with custom kernel config..."
 ensure_python3_with_pyelftools_for_libkrunfw
 
 if [ ! -d libkrunfw ]; then
-  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF:-HEAD})..."
-  git clone https://github.com/containers/libkrunfw.git
+  echo "    Cloning libkrunfw (pinned: ${LIBKRUNFW_REF})..."
+  git clone https://github.com/libkrun/libkrunfw.git
 fi
 
 cd libkrunfw
 
 # Ensure we're on the pinned commit for reproducible builds
-if [ -n "${LIBKRUNFW_REF:-}" ]; then
-  echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
-  git fetch origin
-  git checkout "${LIBKRUNFW_REF}"
-fi
+echo "    Checking out pinned ref: ${LIBKRUNFW_REF}"
+git fetch origin
+git checkout "${LIBKRUNFW_REF}"
 
 # Copy custom kernel config fragment
 if [ -f "$KERNEL_CONFIG" ]; then
@@ -212,15 +210,36 @@ if [ -f openshell.kconfig ]; then
 
   # Verify that the key options were actually applied.
   all_ok=true
-  for opt in CONFIG_BRIDGE CONFIG_NETFILTER CONFIG_NF_NAT; do
-    val="$(grep "^${opt}=" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
-    if [ -n "$val" ]; then
-      echo "    ${opt}: ${val#*=}"
+  for opt in \
+    CONFIG_SECURITY \
+    CONFIG_SECURITY_LANDLOCK \
+    CONFIG_SECCOMP \
+    CONFIG_SECCOMP_FILTER \
+    CONFIG_HARDENED_USERCOPY \
+    CONFIG_INIT_STACK_ALL_ZERO \
+    CONFIG_INIT_ON_ALLOC_DEFAULT_ON \
+    CONFIG_SLAB_FREELIST_RANDOM; do
+    val="$(grep -E "^(# )?${opt}(=| )" "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
+    if [ "$val" = "${opt}=y" ]; then
+      echo "    ${opt}: y"
     else
-      echo "    WARNING: ${opt} not set after merge!" >&2
+      echo "    WARNING: ${opt} is not enabled after merge: ${val:-unset}" >&2
       all_ok=false
     fi
   done
+  if grep -qx '# CONFIG_INIT_ON_FREE_DEFAULT_ON is not set' "${KERNEL_SOURCES}/.config"; then
+    echo "    CONFIG_INIT_ON_FREE_DEFAULT_ON: disabled"
+  else
+    echo "    WARNING: CONFIG_INIT_ON_FREE_DEFAULT_ON is not explicitly disabled after merge!" >&2
+    all_ok=false
+  fi
+  lsm_order="$(grep '^CONFIG_LSM=' "${KERNEL_SOURCES}/.config" 2>/dev/null || true)"
+  if [[ "$lsm_order" == *landlock* ]]; then
+    echo "    CONFIG_LSM: ${lsm_order#*=}"
+  else
+    echo "    WARNING: CONFIG_LSM does not activate Landlock: ${lsm_order:-unset}" >&2
+    all_ok=false
+  fi
   if [ "$all_ok" = false ]; then
     echo "ERROR: kernel config fragment merge failed — required options missing" >&2
     exit 1
@@ -394,25 +413,19 @@ echo "==> Building libkrun..."
 ensure_cargo_for_libkrun
 ensure_libclang_for_libkrun
 
-LIBKRUN_REF="${LIBKRUN_REF:-v1.17.4}"
-
 if [ ! -d libkrun ]; then
   echo "    Cloning libkrun..."
-  git clone https://github.com/containers/libkrun.git
+  git clone https://github.com/libkrun/libkrun.git
 fi
 
 cd libkrun
 
-if [ -n "${LIBKRUN_REF:-}" ]; then
-  echo "    Checking out pinned ref: ${LIBKRUN_REF}"
-  git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
-  git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || true
-fi
-
-if [ -f init/Makefile ] || grep -q 'init/init' Makefile 2>/dev/null; then
-  echo "    Building init/init binary..."
-  make init/init
-fi
+echo "    Checking out pinned ref: ${LIBKRUN_REF}"
+git fetch origin "${LIBKRUN_REF}" 2>/dev/null || git fetch origin
+git checkout "${LIBKRUN_REF}" 2>/dev/null || git checkout "origin/${LIBKRUN_REF}" 2>/dev/null || {
+  echo "Error: could not check out LIBKRUN_REF=${LIBKRUN_REF} in $(pwd) (dirty tree or unknown ref?)" >&2
+  exit 1
+}
 
 echo "    Building libkrun with NET=1 BLK=1..."
 cargo build --release --features blk --features net --target-dir="$(pwd)/target"

@@ -6,6 +6,7 @@ package fake
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -32,6 +33,10 @@ func copySandbox(sb *types.Sandbox) *types.Sandbox {
 		t := *sb.DeletionTimestamp
 		cp.DeletionTimestamp = &t
 	}
+	if sb.CreatedFromWorkloadTemplate != nil {
+		provenance := *sb.CreatedFromWorkloadTemplate
+		cp.CreatedFromWorkloadTemplate = &provenance
+	}
 	cp.Spec = copySandboxSpec(sb.Spec)
 	cp.Status = copySandboxStatus(sb.Status)
 	return &cp
@@ -40,6 +45,7 @@ func copySandbox(sb *types.Sandbox) *types.Sandbox {
 func copySandboxSpec(s types.SandboxSpec) types.SandboxSpec {
 	s.Environment = copyStringMap(s.Environment)
 	s.Providers = copyStringSlice(s.Providers)
+	s.Command = copyStringSlice(s.Command)
 	if s.Template != nil {
 		t := copySandboxTemplate(*s.Template)
 		s.Template = &t
@@ -227,6 +233,11 @@ func copySandboxStatus(s types.SandboxStatus) types.SandboxStatus {
 		copy(conds, s.Conditions)
 		s.Conditions = conds
 	}
+	// Callers may mutate endpoint snapshots without changing the fake's storage.
+	s.EndpointStatuses = slices.Clone(s.EndpointStatuses)
+	for i := range s.EndpointStatuses {
+		s.EndpointStatuses[i].Ports = slices.Clone(s.EndpointStatuses[i].Ports)
+	}
 	return s
 }
 
@@ -255,21 +266,27 @@ func copyStringSlice(s []string) []string {
 // fakeSandboxClient implements v1.SandboxInterface backed by an in-memory
 // objectStore and watchBroadcaster.
 type fakeSandboxClient struct {
-	store       *objectStore[*types.Sandbox]
-	broadcaster *watchBroadcaster[*types.Sandbox]
-	closedFunc  func() bool
+	store         *objectStore[*types.Sandbox]
+	templateStore *objectStore[*types.SandboxWorkloadTemplate]
+	broadcaster   *watchBroadcaster[*types.Sandbox]
+	closedFunc    func() bool
 }
+
+var _ v1.SandboxInterface = (*fakeSandboxClient)(nil)
+var _ v1.SandboxTemplateCreateInterface = (*fakeSandboxClient)(nil)
 
 // newFakeSandboxClient creates a new fakeSandboxClient.
 func newFakeSandboxClient(
 	store *objectStore[*types.Sandbox],
+	templateStore *objectStore[*types.SandboxWorkloadTemplate],
 	broadcaster *watchBroadcaster[*types.Sandbox],
 	closedFunc func() bool,
 ) *fakeSandboxClient {
 	return &fakeSandboxClient{
-		store:       store,
-		broadcaster: broadcaster,
-		closedFunc:  closedFunc,
+		store:         store,
+		templateStore: templateStore,
+		broadcaster:   broadcaster,
+		closedFunc:    closedFunc,
 	}
 }
 
@@ -297,8 +314,7 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),
 		Status: types.SandboxStatus{
-			SandboxName: name,
-			Phase:       types.SandboxProvisioning,
+			Phase: types.SandboxProvisioning,
 		},
 	}
 
@@ -315,6 +331,116 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 	return result, nil
 }
 
+// CreateFromTemplate creates a new sandbox from a named template with Provisioning phase.
+func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	if templateName == "" {
+		return nil, &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template name is required"}
+	}
+	if err := validateTemplateCreateSpec(spec); err != nil {
+		return nil, err
+	}
+	template, err := c.templateStore.Get(workspace, templateName)
+	if err != nil {
+		return nil, err
+	}
+	if spec == nil {
+		spec = &types.SandboxSpec{}
+	}
+
+	var annotations map[string]string
+	if len(opts) > 0 {
+		annotations = copyStringMap(opts[0].Annotations)
+	}
+
+	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
+	resolvedSpec.Providers = copyStringSlice(spec.Providers)
+	resolvedSpec.Policy = copySandboxPolicy(spec.Policy)
+	resolvedSpec.Command = copyStringSlice(spec.Command)
+	resolvedSpec.TTY = spec.TTY
+
+	sb := &types.Sandbox{
+		Name:            name,
+		Workspace:       workspace,
+		CreatedAt:       time.Now(),
+		Labels:          copyStringMap(labels),
+		Annotations:     annotations,
+		ResourceVersion: 1,
+		Spec:            resolvedSpec,
+		CreatedFromWorkloadTemplate: &types.SandboxWorkloadTemplateProvenance{
+			Name:            template.Name,
+			ResourceVersion: fmt.Sprint(template.ResourceVersion),
+		},
+		Status: types.SandboxStatus{
+			Phase: types.SandboxProvisioning,
+		},
+	}
+
+	result, err := c.store.Create(workspace, sb)
+	if err != nil {
+		return nil, err
+	}
+
+	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
+		Type:   types.EventAdded,
+		Object: copySandbox(result),
+	}, name)
+
+	return result, nil
+}
+
+func validateTemplateCreateSpec(spec *types.SandboxSpec) error {
+	if spec == nil {
+		return nil
+	}
+	if spec.LogLevel != "" || len(spec.Environment) > 0 || spec.Template != nil || spec.GPU || spec.GPUCount != nil {
+		return &types.StatusError{Code: types.ErrorInvalidArgument, Message: "template creates only allow policy, providers, command, and tty in spec"}
+	}
+	return nil
+}
+
+func sandboxSpecFromWorkloadTemplate(template *types.SandboxWorkloadTemplate) types.SandboxSpec {
+	var spec types.SandboxSpec
+	if template == nil || template.Spec.Workload == nil {
+		return spec
+	}
+
+	workload := template.Spec.Workload
+	spec.Environment = copyStringMap(workload.Environment)
+	spec.Template = &types.SandboxTemplate{
+		Image:        workload.Image,
+		Resources:    sandboxTemplateResources(workload.Resources),
+		DriverConfig: copyAnyMap(template.Spec.DriverConfig),
+	}
+	if workload.Resources != nil && workload.Resources.GPU != nil {
+		spec.GPU = true
+		if workload.Resources.GPU.Count != nil {
+			count := *workload.Resources.GPU.Count
+			spec.GPUCount = &count
+		}
+	}
+	return spec
+}
+
+func sandboxTemplateResources(resources *types.SandboxResources) map[string]any {
+	if resources == nil {
+		return nil
+	}
+	limits := make(map[string]any)
+	if resources.CPU != "" {
+		limits["cpu"] = resources.CPU
+	}
+	if resources.Memory != "" {
+		limits["memory"] = resources.Memory
+	}
+	if len(limits) == 0 {
+		return nil
+	}
+	return map[string]any{"limits": limits}
+}
+
 // Get retrieves a sandbox by name.
 func (c *fakeSandboxClient) Get(_ context.Context, workspace, name string) (*types.Sandbox, error) {
 	if c.closedFunc() {
@@ -323,16 +449,28 @@ func (c *fakeSandboxClient) Get(_ context.Context, workspace, name string) (*typ
 	return c.store.Get(workspace, name)
 }
 
-// List returns all sandboxes. ListOptions are accepted for interface
-// compatibility but filtering is not implemented.
-func (c *fakeSandboxClient) List(_ context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+// List returns a lazy pager over sandboxes. Filtering is not implemented.
+func (c *fakeSandboxClient) List(workspace string, opts ...v1.ListOptions) (*v1.Pager[*types.Sandbox], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	if len(opts) > 0 && opts[0].AllWorkspaces {
-		return c.store.ListAll(), nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
 	}
-	return c.store.List(workspace), nil
+	items := c.store.List(workspace)
+	if len(opts) > 0 && opts[0].AllWorkspaces {
+		items = c.store.ListAll()
+	}
+	return newSlicePager(items, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxClient) ListAll(ctx context.Context, workspace string, opts ...v1.ListOptions) ([]*types.Sandbox, error) {
+	pager, err := c.List(workspace, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }
 
 // Stop transitions a sandbox to the Stopped phase.
@@ -435,15 +573,14 @@ func (c *fakeSandboxClient) WaitStopped(ctx context.Context, workspace, name str
 }
 
 // Delete removes a sandbox by name. The operation is idempotent.
-func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string) error {
+func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string, opts ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 
 	deleted, existed := c.store.DeleteAndGet(workspace, name)
 	if !existed {
-		// Not found — idempotent delete
-		return nil
+		return deletionResult(false, "", opts)
 	}
 
 	c.broadcaster.Broadcast(types.Event[*types.Sandbox]{
@@ -451,7 +588,7 @@ func (c *fakeSandboxClient) Delete(_ context.Context, workspace, name string) er
 		Object: deleted,
 	}, name)
 
-	return nil
+	return deletionResult(true, deleted.ID, opts)
 }
 
 // WaitReady transitions a sandbox to the Ready phase. In the fake
@@ -504,8 +641,8 @@ func (c *fakeSandboxClient) WaitReady(ctx context.Context, workspace, name strin
 
 // Watch registers a watcher for sandbox events. If name is non-empty, only
 // events for that sandbox are delivered. When StopOnTerminal is set, the
-// watcher auto-closes after delivering a terminal phase event (SandboxReady
-// or SandboxError).
+// watcher auto-closes after delivering a terminal phase event (SandboxReady,
+// SandboxCompleted, SandboxStopped, or SandboxError).
 func (c *fakeSandboxClient) Watch(ctx context.Context, _, name string, opts ...v1.WatchOptions) (types.WatchInterface[*types.Sandbox], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
@@ -547,7 +684,7 @@ func (c *fakeSandboxClient) Watch(ctx context.Context, _, name string, opts ...v
 				return
 			}
 			if ev.Object != nil &&
-				(ev.Object.Status.Phase == types.SandboxReady || ev.Object.Status.Phase == types.SandboxError) {
+				(ev.Object.Status.Phase == types.SandboxReady || ev.Object.Status.Phase == types.SandboxCompleted || ev.Object.Status.Phase == types.SandboxStopped || ev.Object.Status.Phase == types.SandboxError) {
 				inner.Stop()
 				return
 			}
@@ -677,11 +814,10 @@ func (c *fakeSandboxClient) GetLogs(_ context.Context, _, _ string, _ ...v1.LogO
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "GetLogs not implemented in fake client"}
 }
 
-// ListProviders returns stub Provider objects for each provider name
-// attached to the sandbox. The returned providers contain only the Name
-// field, since the fake client does not maintain a full provider registry
-// per sandbox.
-func (c *fakeSandboxClient) ListProviders(_ context.Context, workspace, sandboxName string) ([]*types.Provider, error) {
+// ListProviders returns a pager over stub Provider objects attached to the
+// sandbox. The returned providers contain only the Name field, since the fake
+// client does not maintain a full provider registry per sandbox.
+func (c *fakeSandboxClient) ListProviders(workspace, sandboxName string, opts ...v1.ListOptions) (*v1.Pager[*types.Provider], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -695,5 +831,17 @@ func (c *fakeSandboxClient) ListProviders(_ context.Context, workspace, sandboxN
 	for i, name := range sb.Spec.Providers {
 		result[i] = &types.Provider{Name: name}
 	}
-	return result, nil
+	var options v1.ListOptions
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	return newSlicePager(result, options.PageSize, options.PageToken)
+}
+
+func (c *fakeSandboxClient) ListAllProviders(ctx context.Context, workspace, sandboxName string, opts ...v1.ListOptions) ([]*types.Provider, error) {
+	pager, err := c.ListProviders(workspace, sandboxName, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return pager.All(ctx)
 }

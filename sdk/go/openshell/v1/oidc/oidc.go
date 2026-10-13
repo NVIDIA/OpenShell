@@ -13,6 +13,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 )
 
 // Login performs an interactive OIDC authorization code login.
@@ -33,9 +34,7 @@ import (
 // fallback flow is used instead.
 func Login(ctx context.Context, gatewayName string, opts ...LoginOption) (*oauth2.Token, error) {
 	cfg := &loginConfig{}
-	for _, opt := range opts {
-		opt(cfg)
-	}
+	options.Apply(cfg, opts)
 	cfg.applyDefaults()
 
 	// Apply configured timeout if the caller's context has no deadline.

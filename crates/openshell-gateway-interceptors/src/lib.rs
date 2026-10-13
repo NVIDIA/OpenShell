@@ -43,6 +43,11 @@ pub enum InterceptorError {
 
 pub type Result<T> = std::result::Result<T, InterceptorError>;
 
+/// Validate static interceptor configuration without opening a transport.
+pub fn validate_configs(configs: &[GatewayInterceptorConfig]) -> Result<()> {
+    plan::validate_interceptor_configs(configs)
+}
+
 pub(crate) type ExtensionChannel = InterceptedService<Channel, BearerTokenInterceptor>;
 
 /// Return `None` when no interceptors are configured.

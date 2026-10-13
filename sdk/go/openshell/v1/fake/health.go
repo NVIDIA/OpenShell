@@ -89,6 +89,14 @@ func copyGatewayInfo(info *types.GatewayInfo) *types.GatewayInfo {
 		cp.ComputeDrivers = make([]types.ComputeDriverInfo, len(info.ComputeDrivers))
 		copy(cp.ComputeDrivers, info.ComputeDrivers)
 	}
+	if info.Extensions != nil {
+		cp.Extensions = make([]types.ExtensionInfo, len(info.Extensions))
+		for index, extension := range info.Extensions {
+			cp.Extensions[index] = extension
+			cp.Extensions[index].SupportedCapabilities = copyStringSlice(extension.SupportedCapabilities)
+			cp.Extensions[index].RequiredCapabilities = copyStringSlice(extension.RequiredCapabilities)
+		}
+	}
 	return &cp
 }
 

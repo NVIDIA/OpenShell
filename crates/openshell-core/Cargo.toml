@@ -13,25 +13,34 @@ repository.workspace = true
 [dependencies]
 async-trait = "0.1"
 openshell-extension-core = { path = "../openshell-extension-core" }
+openshell-policy-schema = { path = "../openshell-policy-schema" }
 glob = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true, features = ["channel", "tls-ring"] }
+tonic = { workspace = true, features = ["channel", "tls-aws-lc"] }
 tonic-prost = { workspace = true }
+tonic-types = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+uuid = { workspace = true }
 ipnet = "2"
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 base64 = { workspace = true }
+jsonwebtoken = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"], optional = true }
-reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots"], optional = true }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-native-roots-no-provider"], optional = true }
 tar = { version = "0.4", optional = true }
 tempfile = { version = "3", optional = true }
+openshell-otel = { path = "../openshell-otel", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -46,6 +55,10 @@ driver-extraction = ["dep:tar", "dep:tempfile"]
 telemetry = ["dep:reqwest", "dep:chrono", "reqwest?/blocking"]
 ## OAuth2 token request helpers used by supervisor and gateway.
 oauth = ["dep:reqwest"]
+## Strict Ed25519 JWT issuance and verification for authenticated sandbox sessions.
+jwt = ["dep:jsonwebtoken", "dep:zeroize"]
+## Propagate the active W3C trace context on supervisor gateway calls.
+trace-context = ["dep:openshell-otel"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
@@ -53,6 +66,7 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { workspace = true }
 
 [lints]
 workspace = true

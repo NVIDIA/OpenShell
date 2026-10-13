@@ -23,7 +23,6 @@ RUN_MODE_OVERRIDE="${OPENSHELL_AGENT_RUN_MODE:-}"
 POLL_INTERVAL_OVERRIDE="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-}"
 MAX_TRANSIENT_FAILURES_OVERRIDE="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-}"
 RESET_REFRESH="${OPENSHELL_AGENT_RESET_REFRESH:-0}"
-BACKGROUND=0
 KEEP_SANDBOX=0
 
 usage() {
@@ -44,7 +43,6 @@ Options:
   --watch                 Keep the sandbox alive and re-run bounded cycles
   --poll-interval SECONDS Sleep duration between watch cycles
   --reset-refresh         Replace gateway-owned refresh material from host auth before rotating
-  --background            Run sandbox create in the background and write a log
   --keep                  Keep the sandbox after the harness exits
   -h, --help              Show this help
 EOF
@@ -127,10 +125,6 @@ while [[ $# -gt 0 ]]; do
             RESET_REFRESH=1
             shift
             ;;
-        --background)
-            BACKGROUND=1
-            shift
-            ;;
         --keep)
             KEEP_SANDBOX=1
             shift
@@ -207,7 +201,6 @@ emit "HARNESS_REASONING", harness_config.fetch("reasoning", "")
 emit "SANDBOX_NAME_PREFIX", manifest.dig("sandbox", "name_prefix") || manifest.fetch("id")
 emit "SANDBOX_FROM_DEFAULT", manifest.dig("sandbox", "from") || "agent://."
 emit "GATEWAY_DEFAULT", manifest.dig("sandbox", "gateway") || "docker-dev"
-emit "BACKGROUND_LOG_DIR", manifest.dig("sandbox", "background_log_dir") || "logs"
 emit "PROMPT_TEMPLATE", manifest.fetch("prompt_template")
 emit_array "PROFILE_PATHS", manifest.fetch("profile_paths", [])
 
@@ -333,12 +326,12 @@ import_provider_profile() {
     local profile_file="$2"
     local import_output current_profile resource_version update_dir update_file
 
-    openshell_cmd provider profile delete "$profile_id" >/dev/null 2>&1 || true
-    if import_output="$(openshell_cmd provider profile import --file "$profile_file" 2>&1)"; then
+    openshell_cmd profile delete "$profile_id" >/dev/null 2>&1 || true
+    if import_output="$(openshell_cmd profile import --file "$profile_file" 2>&1)"; then
         return 0
     fi
     if [[ "$import_output" == *"already exists"* ]]; then
-        if ! current_profile="$(openshell_cmd provider profile export \
+        if ! current_profile="$(openshell_cmd profile export \
             --output json "$profile_id")"; then
             echo "failed to export existing provider profile: $profile_id" >&2
             return 1
@@ -358,7 +351,7 @@ profile = YAML.load_file(profile_file) || {}
 profile["resource_version"] = Integer(resource_version, 10)
 File.write(update_file, YAML.dump(profile))
 RUBY
-        if openshell_cmd provider profile update "$profile_id" \
+        if openshell_cmd profile update "$profile_id" \
             --file "$update_file" >/dev/null; then
             rm -f "$update_file"
             rmdir "$update_dir"
@@ -551,7 +544,6 @@ done
 
 PAYLOAD_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent.XXXXXX")"
 PAYLOAD_DIR="$PAYLOAD_PARENT/payload"
-WORKSPACE_UPLOAD_DIR="$PAYLOAD_PARENT/workspace"
 PAYLOAD_IMAGE_DIR="/etc/openshell/agent-payload"
 cleanup_payload() {
     rm -rf "$PAYLOAD_PARENT"
@@ -560,7 +552,7 @@ trap 'cleanup_config; cleanup_payload' EXIT
 
 log "Preparing $AGENT_DISPLAY_NAME with harness '$HARNESS' in '$RUN_MODE' mode on gateway '$GATEWAY'."
 
-mkdir -p "$PAYLOAD_DIR" "$WORKSPACE_UPLOAD_DIR"
+mkdir -p "$PAYLOAD_DIR"
 cp -R "$SCRIPT_DIR/runtime" "$PAYLOAD_DIR/runtime"
 chmod +x "$PAYLOAD_DIR/runtime"/*.sh
 chmod +x "$PAYLOAD_DIR/runtime/harnesses/$HARNESS"/*.sh
@@ -683,7 +675,38 @@ File.open(dockerfile_path, "a") do |file|
 end
 RUBY
 
-    SANDBOX_FROM="$build_dockerfile"
+    # Build into the local engine selected by the gateway. Without this,
+    # auto-detection can choose Podman while the gateway uses Docker (or vice
+    # versa), leaving the image unavailable to the gateway.
+    local gateway_info
+    if ! gateway_info="$("$OPENSHELL_BIN" --gateway "$GATEWAY" gateway info --output json)"; then
+        fail "failed to determine compute driver for gateway '$GATEWAY'"
+    fi
+    local gateway_engine
+    if ! gateway_engine="$(printf '%s' "$gateway_info" | ruby -rjson -e '
+        drivers = JSON.parse(STDIN.read).fetch("compute_drivers", []).map { |driver| driver.fetch("name") }
+        abort "gateway must report exactly one compute driver" unless drivers.length == 1
+        puts drivers.first.downcase
+    ')"; then
+        fail "gateway '$GATEWAY' did not report exactly one compute driver"
+    fi
+    case "$gateway_engine" in
+        docker|podman) ;;
+        *) fail "gateway '$GATEWAY' uses compute driver '$gateway_engine'; agent launcher local image builds require Docker or Podman" ;;
+    esac
+    if [[ -n "${CONTAINER_ENGINE:-}" ]] && [[ "$(printf '%s' "$CONTAINER_ENGINE" | tr '[:upper:]' '[:lower:]')" != "$gateway_engine" ]]; then
+        fail "CONTAINER_ENGINE=$CONTAINER_ENGINE conflicts with gateway '$GATEWAY' compute driver '$gateway_engine'"
+    fi
+    CONTAINER_ENGINE="$gateway_engine"
+    export CONTAINER_ENGINE
+
+    # Source after setting CONTAINER_ENGINE so the helper validates the
+    # gateway-selected engine instead of auto-detecting another engine.
+    source "$ROOT_DIR/tasks/scripts/container-engine.sh"
+    local image_tag="openshell/agent-${AGENT_ID}:$(date +%s)"
+    log "Building sandbox image '$image_tag' with $CONTAINER_ENGINE."
+    ce_build --load --file "$build_dockerfile" --tag "$image_tag" "$build_context"
+    SANDBOX_FROM="$image_tag"
 }
 
 log "Staging immutable sandbox payload from '$SANDBOX_FROM'."
@@ -778,7 +801,12 @@ HARNESS_ENV_ARGS=(
 
 case "$HARNESS" in
     codex)
+        # Codex compares account IDs locally during workspace discovery. Unlike
+        # bearer tokens, this non-secret identifier must not be a placeholder.
+        [[ -n "${CODEX_AUTH_ACCOUNT_ID:-}" ]] || fail "missing Codex account ID"
+        [[ "$CODEX_AUTH_ACCOUNT_ID" != openshell:resolve:* ]] || fail "Codex account ID must be a literal identifier"
         HARNESS_ENV_ARGS+=(
+            "CODEX_ACCOUNT_ID=$CODEX_AUTH_ACCOUNT_ID"
             "CODEX_MODEL=${CODEX_MODEL:-$HARNESS_MODEL}"
             "CODEX_REASONING=${CODEX_REASONING:-$HARNESS_REASONING}"
         )
@@ -791,17 +819,15 @@ SANDBOX_CREATE_CMD=(
     --name "$SANDBOX_NAME"
     --from "$SANDBOX_FROM"
     "${PROVIDER_ARGS[@]}"
-    --upload "$WORKSPACE_UPLOAD_DIR:/sandbox"
-    --no-git-ignore
     --no-auto-providers
     --no-tty
     --detach
 )
 
-SANDBOX_EXEC_CMD=(
-    "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox exec
-    --name "$SANDBOX_NAME"
-    --no-tty
+if [[ "$KEEP_SANDBOX" != "1" ]]; then
+    SANDBOX_CREATE_CMD+=(--no-keep)
+fi
+SANDBOX_CREATE_CMD+=(
     --
     env
     "${HARNESS_ENV_ARGS[@]}"
@@ -809,33 +835,8 @@ SANDBOX_EXEC_CMD=(
 )
 
 run_agent_sandbox() {
-    local exec_status=0
-    local cleanup_status=0
-
     "${SANDBOX_CREATE_CMD[@]}"
-    "${SANDBOX_EXEC_CMD[@]}" || exec_status=$?
-
-    if [[ "$KEEP_SANDBOX" != "1" ]]; then
-        openshell_cmd sandbox delete "$SANDBOX_NAME" >/dev/null || cleanup_status=$?
-    fi
-
-    if [[ "$exec_status" -ne 0 ]]; then
-        return "$exec_status"
-    fi
-    return "$cleanup_status"
 }
 
 log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
-if [[ "$BACKGROUND" == "1" ]]; then
-    LOG_DIR="$(resolve_manifest_path "$BACKGROUND_LOG_DIR")"
-    mkdir -p "$LOG_DIR"
-    LOG_FILE="$LOG_DIR/${SANDBOX_NAME}.log"
-    trap - EXIT
-    (
-        trap 'cleanup_config; cleanup_payload' EXIT
-        run_agent_sandbox
-    ) >"$LOG_FILE" 2>&1 &
-    echo "Started in background. Log: $LOG_FILE"
-else
-    run_agent_sandbox
-fi
+run_agent_sandbox

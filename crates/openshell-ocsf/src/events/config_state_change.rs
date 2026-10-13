@@ -10,7 +10,7 @@ use crate::events::base_event::BaseEventData;
 
 /// OCSF Device Config State Change Event [5019].
 ///
-/// Policy engine and inference routing configuration changes.
+/// Policy engine and runtime configuration changes.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceConfigStateChangeEvent {
     /// Common base event fields.

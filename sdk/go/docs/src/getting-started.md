@@ -4,7 +4,7 @@ This guide walks you through installing the OpenShell Go SDK, connecting to a ga
 
 ## Prerequisites
 
-- Go 1.25 or later
+- Go 1.25.13 or later
 - Access to an OpenShell gateway (address and authentication token)
 
 ## Installation
@@ -107,11 +107,11 @@ For long-running commands, use `Stream` to receive output incrementally, or `Int
 Delete the sandbox when you are done:
 
 ```go
-    err = client.Sandboxes().Delete(ctx, "default", sandbox.Name)
+    deletion, err := client.Sandboxes().Delete(ctx, "default", sandbox.Name)
     if err != nil {
         log.Fatal(err)
     }
-    fmt.Println("Sandbox deleted")
+    fmt.Printf("Deletion outcome: %v\n", deletion.Outcome)
 }
 ```
 

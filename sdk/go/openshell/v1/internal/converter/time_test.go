@@ -8,7 +8,25 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
+
+func TestTimePtrProtoRoundTripPreservesMinimumTimestamp(t *testing.T) {
+	minimum := &timestamppb.Timestamp{Seconds: -62_135_596_800}
+
+	converted := TimePtrFromProto(minimum)
+	assert.NotNil(t, converted)
+	assert.True(t, converted.IsZero())
+	assert.Equal(t, minimum, TimestampFromTimePtr(converted))
+}
+
+func TestTimestampStringFromProtoPreservesMinimumTimestamp(t *testing.T) {
+	minimum := &timestamppb.Timestamp{Seconds: -62_135_596_800}
+
+	assert.Equal(t, "0001-01-01T00:00:00Z", TimestampStringFromProto(minimum))
+	assert.Empty(t, TimestampStringFromProto(nil))
+	assert.Empty(t, TimestampStringFromProto(&timestamppb.Timestamp{Nanos: -1}))
+}
 
 func TestTimeFromMillis(t *testing.T) {
 	ms := int64(1719475200000) // 2024-06-27T12:00:00Z

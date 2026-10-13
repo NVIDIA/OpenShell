@@ -205,8 +205,7 @@ trait — there is no separate binary, no surrogate, and no tonic adapter.
 
 #### Workload and software availability
 
-MXC does not consume the `openshell sandbox create --from Dockerfile` / OCI image
-model used by Linux container runtimes. For current support, the sandbox runs Windows
+MXC does not consume the OCI image model used by Linux container runtimes. For current support, the sandbox runs Windows
 software already present on the host or made available through explicit MXC
 filesystem grants, with the driver supplying the agent command, working
 directory, environment, credentials, and policy-derived MXC configuration.
@@ -316,7 +315,7 @@ network policy into MXC network policy. MXC receives a fail-closed redirect
 layer: `network.defaultPolicy = "block"`, empty direct allowlists, and
 `network.proxy = { localhost: N }`. The original OpenShell `network_policies`
 are preserved and handed to the host CONNECT proxy, which remains responsible
-for ports, binaries, L7 rules, `inference.local`, privacy routing, and audit.
+for ports, binaries, L7 rules, privacy routing, and audit.
 
 The coarse MXC-only mapper is a separate fallback and analysis path for cases
 where no proxy is in the loop. In that mode, MXC can roughly express literal

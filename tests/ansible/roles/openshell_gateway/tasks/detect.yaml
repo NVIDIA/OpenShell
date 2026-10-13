@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Detect tmachine container runtime
+  ansible.builtin.include_role:
+    name: tmachine_container_runtime
+
+- name: Set OpenShell gateway runtime values
+  ansible.builtin.set_fact:
+    openshell_gateway_driver: "{{ tmachine_container_runtime_name }}"
+    openshell_gateway_user: >-
+      {{ 'root' if tmachine_container_runtime_name == 'podman'
+         and not tmachine_container_runtime_is_rootless else 'tmachine' }}
+    openshell_gateway_home: >-
+      {{ '/root' if tmachine_container_runtime_name == 'podman'
+         and not tmachine_container_runtime_is_rootless else '/home/tmachine' }}
+    openshell_gateway_uid: >-
+      {{ '0' if tmachine_container_runtime_name == 'podman'
+         and not tmachine_container_runtime_is_rootless else tmachine_container_runtime_tmachine_uid.stdout }}
+    openshell_gateway_bind_address: "{{ '127.0.0.1:17670' if tmachine_container_runtime_name == 'docker' else '0.0.0.0:17670' }}"
+    openshell_runtime_socket: "{{ tmachine_container_runtime_socket }}"

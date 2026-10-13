@@ -44,6 +44,9 @@ func (f *fileClient) Upload(ctx context.Context, workspace, sandboxName string, 
 	if remotePath == "" {
 		return &StatusError{Code: ErrorInvalidArgument, Message: "remote path must not be empty"}
 	}
+	if _, err := f.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+		return err
+	}
 
 	info, err := os.Stat(localPath)
 	if err != nil {
@@ -53,13 +56,9 @@ func (f *fileClient) Upload(ctx context.Context, workspace, sandboxName string, 
 		return fmt.Errorf("local path is a directory, not a file: %s", localPath)
 	}
 
-	sb, err := f.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
-		return err
-	}
-
 	session, err := f.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		SandboxId: sb.ID,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)
@@ -86,14 +85,13 @@ func (f *fileClient) Download(ctx context.Context, workspace, sandboxName string
 	if remotePath == "" {
 		return &StatusError{Code: ErrorInvalidArgument, Message: "remote path must not be empty"}
 	}
-
-	sb, err := f.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := f.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return err
 	}
 
 	session, err := f.client.CreateSshSession(ctx, &pb.CreateSshSessionRequest{
-		SandboxId: sb.ID,
+		Sandbox:        sandboxName,
+		WorkspaceScope: namedWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return converter.FromGRPCError(err)

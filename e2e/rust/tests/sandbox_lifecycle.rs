@@ -3,17 +3,24 @@
 
 #![cfg(feature = "e2e")]
 
+#[cfg(target_os = "linux")]
+use std::fs;
 use std::process::Stdio;
 use std::time::Duration;
 
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
+use openshell_e2e::harness::cli::{
+    run_cli, wait_for_sandbox_exec_contains, wait_for_sandbox_phase,
+};
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use openshell_e2e::harness::sandbox::SandboxGuard;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard, unique_sandbox_name};
+use serial_test::serial;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Instant, sleep};
 
 const SANDBOX_PRESENCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SANDBOX_LIST_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SANDBOX_RESTART_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn normalize_output(output: &str) -> String {
     let stripped = strip_ansi(output).replace('\r', "");
@@ -107,6 +114,279 @@ async fn delete_sandbox(name: &str) {
     let _ = cmd.status().await;
 }
 
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn sandbox_exec_outlives_startup_recovery_deadline() {
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for exec recovery deadline");
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        sandbox.exec(&["sh", "-c", "sleep 31; printf past-recovery-deadline"]),
+    )
+    .await;
+    let next = sandbox.exec(&["printf", "fresh-exec"]).await;
+    sandbox.cleanup().await;
+
+    assert_eq!(
+        output.expect("exec timed out").expect("exec failed"),
+        "past-recovery-deadline",
+        "expiration must not terminate an admitted command"
+    );
+    assert_eq!(next.expect("fresh exec after expiration"), "fresh-exec");
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn sandbox_exec_large_output_is_complete() {
+    const BYTES: usize = 8 * 1024 * 1024;
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for large output");
+
+    for stderr in [false, true] {
+        let script = if stderr {
+            format!("yes A | head -c {BYTES} >&2")
+        } else {
+            format!("yes A | head -c {BYTES}")
+        };
+        let mut command = openshell_cmd();
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "sh",
+                "-c",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+            .await
+            .expect("large exec output timed out")
+            .expect("run large exec output");
+        assert!(output.status.success(), "large exec exited unsuccessfully");
+        let bytes = if stderr { output.stderr } else { output.stdout };
+        assert_eq!(bytes.len(), BYTES, "exec output was truncated");
+        assert!(bytes.chunks_exact(2).all(|pair| pair == b"A\n"));
+    }
+
+    let mut early_exit = openshell_cmd();
+    let mut early_child = early_exit
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--no-login-shell",
+            "--",
+            "head",
+            "-n1",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start early-exit exec");
+    let mut input = b"first\n".to_vec();
+    input.extend(vec![b'x'; 128 * 1024]);
+    let write_result = early_child
+        .stdin
+        .take()
+        .expect("early-exit stdin")
+        .write_all(&input)
+        .await;
+    if let Err(error) = write_result {
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+    let early_output =
+        tokio::time::timeout(Duration::from_secs(30), early_child.wait_with_output())
+            .await
+            .expect("early-exit exec timed out")
+            .expect("wait for early-exit exec");
+    assert!(early_output.status.success(), "early-exit exec failed");
+    assert_eq!(early_output.stdout, b"first\n");
+
+    let mut command = openshell_cmd();
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "sh",
+                "-c",
+                "sleep 5 & echo ok",
+            ])
+            .stdin(Stdio::null())
+            .output(),
+    )
+    .await
+    .expect("exec with background pipe holder timed out")
+    .expect("run exec with background pipe holder");
+    assert!(output.status.success(), "unexpected output failure");
+    assert_eq!(output.stdout, b"ok\n");
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn piped_exec_stdin_crosses_grpc_message_limit() {
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for streamed stdin");
+
+    for size in [5, 1_048_576, 4_194_304] {
+        let mut command = openshell_cmd();
+        command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "wc",
+                "-c",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn sandbox exec");
+        let mut input = child.stdin.take().expect("piped stdin");
+        input
+            .write_all(&vec![b'x'; size])
+            .await
+            .expect("write piped stdin");
+        drop(input);
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .expect("streamed exec timed out")
+            .expect("wait for streamed exec");
+        assert!(
+            output.status.success(),
+            "streamed exec failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            size.to_string()
+        );
+    }
+
+    let mut oversized = openshell_cmd();
+    let mut oversized_child = oversized
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--no-tty",
+            "--no-login-shell",
+            "--",
+            "wc",
+            "-c",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn oversized stdin exec");
+    oversized_child
+        .stdin
+        .take()
+        .expect("oversized stdin pipe")
+        .write_all(&vec![b'x'; 4_194_305])
+        .await
+        .expect("write oversized stdin");
+    let oversized_output = oversized_child
+        .wait_with_output()
+        .await
+        .expect("wait for oversized stdin error");
+    assert!(!oversized_output.status.success());
+    assert!(oversized_output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&oversized_output.stderr).contains("4 MiB limit"));
+
+    // A forced PTY with a small pipe must keep using the unary RPC for
+    // compatibility with older gateways.
+    let mut tty_command = openshell_cmd();
+    let mut tty_child = tty_command
+        .args([
+            "sandbox",
+            "exec",
+            "--name",
+            &sandbox.name,
+            "--tty",
+            "--no-login-shell",
+            "--",
+            "sh",
+            "-c",
+            "printf tty-ok",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn forced TTY exec");
+    tty_child
+        .stdin
+        .take()
+        .expect("piped TTY stdin")
+        .write_all(b"x")
+        .await
+        .expect("write TTY stdin");
+    let tty_output = tokio::time::timeout(Duration::from_secs(30), tty_child.wait_with_output())
+        .await
+        .expect("forced TTY exec timed out")
+        .expect("wait for forced TTY exec");
+    assert!(
+        tty_output.status.success(),
+        "forced TTY exec failed: {}",
+        String::from_utf8_lossy(&tty_output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&tty_output.stdout).contains("tty-ok"));
+
+    #[cfg(unix)]
+    {
+        let directory = std::fs::File::open("/").expect("open directory as stdin");
+        let mut command = openshell_cmd();
+        let output = command
+            .args([
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox.name,
+                "--no-tty",
+                "--no-login-shell",
+                "--",
+                "wc",
+                "-c",
+            ])
+            .stdin(Stdio::from(directory))
+            .output()
+            .await
+            .expect("run exec with unreadable stdin");
+        assert!(!output.status.success(), "stdin read error was ignored");
+        assert!(output.stdout.is_empty());
+    }
+
+    sandbox.cleanup().await;
+}
+
 async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     let mut cmd = openshell_cmd();
     cmd.args(["sandbox", operation, name])
@@ -130,15 +410,163 @@ async fn run_sandbox_lifecycle_command(operation: &str, name: &str) -> String {
     combined
 }
 
+async fn sandbox_details(name: &str) -> String {
+    let (details, exit_code) = run_cli(&["sandbox", "get", name]).await;
+    let details = normalize_output(&details);
+    assert_eq!(
+        exit_code, 0,
+        "sandbox get should succeed for {name}:\n{details}"
+    );
+    details
+}
+
+async fn reconnect_with_input_ownership(
+    sandbox_name: &str,
+) -> (tokio::process::Child, Vec<String>) {
+    let reconnect_deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0;
+
+    loop {
+        attempt += 1;
+        let token = format!("reconnect-{attempt}");
+        let mut reconnect_cmd = openshell_cmd();
+        reconnect_cmd
+            .args(["sandbox", "connect", sandbox_name])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut candidate = reconnect_cmd.spawn().expect("spawn reconnect attachment");
+        let mut candidate_stdin = candidate.stdin.take().expect("reconnect stdin");
+        candidate_stdin
+            .write_all(format!("{token}\n").as_bytes())
+            .await
+            .expect("write reconnect ownership probe");
+        candidate_stdin
+            .flush()
+            .await
+            .expect("flush reconnect ownership probe");
+
+        let reconnect_stdout = candidate.stdout.take().expect("reconnect stdout");
+        let mut reconnect_lines = BufReader::new(reconnect_stdout).lines();
+        let mut candidate_replay = Vec::new();
+        let remaining = reconnect_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "reconnect did not acquire input ownership"
+        );
+        let attempt_timeout = Duration::from_secs(2).min(remaining);
+        let acquired = tokio::time::timeout(attempt_timeout, async {
+            loop {
+                let Some(line) = reconnect_lines
+                    .next_line()
+                    .await
+                    .expect("read reconnect output")
+                else {
+                    return false;
+                };
+                if line.contains("main_pid=") {
+                    candidate_replay.push(line.clone());
+                }
+                if line.contains(&format!("input={token}")) {
+                    return true;
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        if acquired {
+            return (candidate, candidate_replay);
+        }
+
+        let _ = candidate.kill().await;
+        let _ = candidate.wait().await;
+        assert!(
+            Instant::now() < reconnect_deadline,
+            "reconnect did not acquire input ownership"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn find_process_with_args(expected_args: &[&str]) -> Option<u32> {
+    for entry in fs::read_dir("/proc").ok()?.filter_map(Result::ok) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if expected_args
+            .iter()
+            .all(|expected| args.contains(&expected.as_bytes()))
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn find_child_process_with_args(parent_pid: u32, expected_args: &[&str]) -> Option<u32> {
+    for entry in fs::read_dir("/proc").ok()?.filter_map(Result::ok) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let status = fs::read_to_string(entry.path().join("status")).unwrap_or_default();
+        let process_parent = status.lines().find_map(|line| {
+            line.strip_prefix("PPid:")
+                .and_then(|value| value.trim().parse::<u32>().ok())
+        });
+        if process_parent != Some(parent_pid) {
+            continue;
+        }
+        let cmdline = fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+        if expected_args
+            .iter()
+            .all(|expected| args.contains(&expected.as_bytes()))
+        {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_process_with_args(expected_args: &[&str]) -> u32 {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(pid) = find_process_with_args(expected_args) {
+                return pid;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("process with arguments {expected_args:?} did not start"))
+}
+
 #[tokio::test]
+#[serial(sandbox_lifecycle)]
 async fn sandbox_stop_start_preserves_workspace() {
     const SENTINEL: &str = "openshell-stop-start-sentinel";
     const SENTINEL_PATH: &str = "/sandbox/.openshell-stop-start-e2e";
+    const RUN_COUNT_PATH: &str = "/sandbox/.openshell-main-run-count";
     let write_sentinel = format!("printf '%s\\n' '{SENTINEL}' > '{SENTINEL_PATH}'");
+    let main = format!(
+        "count=0; test ! -f '{RUN_COUNT_PATH}' || count=$(cat '{RUN_COUNT_PATH}'); \
+         count=$((count + 1)); printf '%s\\n' \"$count\" > '{RUN_COUNT_PATH}'; \
+         echo lifecycle-ready-$count; exec sleep infinity"
+    );
 
-    let mut sandbox = SandboxGuard::create(&["--", "sh", "-lc", &write_sentinel])
+    let mut sandbox = SandboxGuard::create_keep(&["sh", "-c", &main], "lifecycle-ready")
         .await
-        .expect("sandbox create should write the workspace sentinel");
+        .expect("sandbox create should start a durable main process");
+    sandbox
+        .exec(&["sh", "-lc", &write_sentinel])
+        .await
+        .expect("sandbox exec should write the workspace sentinel");
 
     let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
     assert!(
@@ -183,15 +611,28 @@ async fn sandbox_stop_start_preserves_workspace() {
         sentinel.lines().any(|line| line.trim() == SENTINEL),
         "workspace sentinel should survive stop and start:\n{sentinel}",
     );
+    let run_count = sandbox
+        .exec(&["cat", RUN_COUNT_PATH])
+        .await
+        .expect("sandbox exec should read the canonical main run count");
+    assert_eq!(
+        run_count.trim(),
+        "2",
+        "start should launch a fresh canonical main instance:\n{run_count}",
+    );
 
     sandbox.cleanup().await;
 }
 
 #[tokio::test]
+#[serial(sandbox_lifecycle)]
 async fn sandbox_can_be_deleted_while_stopped() {
-    let mut sandbox = SandboxGuard::create(&["--", "true"])
-        .await
-        .expect("sandbox create should succeed");
+    let mut sandbox = SandboxGuard::create_keep(
+        &["sh", "-c", "echo stop-ready; exec sleep infinity"],
+        "stop-ready",
+    )
+    .await
+    .expect("sandbox create should start a durable main process");
 
     let stop_output = run_sandbox_lifecycle_command("stop", &sandbox.name).await;
     assert!(
@@ -200,9 +641,15 @@ async fn sandbox_can_be_deleted_while_stopped() {
     );
 
     let delete_output = run_sandbox_lifecycle_command("delete", &sandbox.name).await;
+    // Deletion may return before the owned cleanup worker finishes. Both
+    // outcomes must still reach absence, which is checked below.
     assert!(
-        delete_output.contains("Deleted sandbox"),
-        "expected delete confirmation in:\n{delete_output}",
+        delete_output.contains(&format!("Deleted sandbox {}", sandbox.name))
+            || delete_output.contains(&format!(
+                "Sandbox {} deletion accepted; cleanup is pending",
+                sandbox.name
+            )),
+        "expected completed or accepted deletion in:\n{delete_output}",
     );
 
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox.name, false).await {
@@ -220,8 +667,21 @@ async fn sandbox_can_be_deleted_while_stopped() {
 }
 
 #[tokio::test]
-async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
-    let mut cmd = openshell_tty_cmd(&["sandbox", "create", "--", "echo", "OK"]);
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_exit_zero_completes_persistent_sandbox() {
+    // Armed before create so a failed create or parse still cleans up.
+    let sandbox_name = unique_sandbox_name();
+    let _cleanup = SandboxGuard::manage_existing(sandbox_name.clone());
+
+    let mut cmd = openshell_tty_cmd(&[
+        "sandbox",
+        "create",
+        "--name",
+        &sandbox_name,
+        "--",
+        "echo",
+        "OK",
+    ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
@@ -229,15 +689,13 @@ async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
 
+    assert!(output.status.success(), "create failed:\n{combined}");
     assert!(
-        !output.status.success(),
-        "main-process exit must fail create"
+        combined.contains("OK"),
+        "main output was not streamed:\n{combined}"
     );
-    let sandbox_name =
-        extract_sandbox_name(&combined).expect("sandbox name should be present in output");
 
     if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox_name, true).await {
-        delete_sandbox(&sandbox_name).await;
         panic!(
             "sandbox {sandbox_name} should still exist by default after {SANDBOX_PRESENCE_TIMEOUT:?}; \
              last observed sandbox list: {last_sandbox_list:?}"
@@ -260,14 +718,192 @@ async fn canonical_main_exit_transitions_persistent_sandbox_to_error() {
         "sandbox get failed:\n{details}"
     );
     assert!(
-        details.contains("Phase: Error"),
+        details.contains("Phase: Completed"),
         "expected terminal sandbox phase:\n{details}"
     );
-
-    delete_sandbox(&sandbox_name).await;
 }
 
 #[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_nonzero_exit_preserves_status() {
+    // Armed before create so a failed create or parse still cleans up.
+    let sandbox_name = unique_sandbox_name();
+    let _cleanup = SandboxGuard::manage_existing(sandbox_name.clone());
+
+    let mut cmd = openshell_tty_cmd(&[
+        "sandbox",
+        "create",
+        "--name",
+        &sandbox_name,
+        "--",
+        "sh",
+        "-c",
+        "echo failed-main; exit 7",
+    ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let combined = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "unexpected result:\n{combined}"
+    );
+    assert!(
+        combined.contains("failed-main"),
+        "main output was not streamed:\n{combined}"
+    );
+
+    let mut get_cmd = openshell_cmd();
+    get_cmd
+        .args(["sandbox", "get", &sandbox_name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let details = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&get_output.stdout),
+        String::from_utf8_lossy(&get_output.stderr),
+    ));
+    assert!(
+        details.contains("Phase: Error"),
+        "unexpected phase:\n{details}"
+    );
+    assert!(
+        details.contains("Exit Code: 7"),
+        "missing exit code:\n{details}"
+    );
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn detached_canonical_main_exit_zero_reaches_completed() {
+    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-success-release";
+    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 0");
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
+        .await
+        .expect("create detached successful canonical main");
+    sandbox
+        .exec(&["touch", RELEASE_PATH])
+        .await
+        .expect("release detached successful canonical main");
+
+    wait_for_sandbox_phase(&sandbox.name, "Completed", SANDBOX_PRESENCE_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("detached successful main did not complete:\n{err}"));
+    let details = sandbox_details(&sandbox.name).await;
+    assert!(
+        details.contains("Phase: Completed"),
+        "detached successful main should retain Completed status:\n{details}"
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn detached_canonical_main_nonzero_exit_reaches_error() {
+    const RELEASE_PATH: &str = "/sandbox/.openshell-detached-failure-release";
+    let script = format!("while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 11");
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
+        .await
+        .expect("create detached failing canonical main");
+    sandbox
+        .exec(&["touch", RELEASE_PATH])
+        .await
+        .expect("release detached failing canonical main");
+
+    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("detached failing main did not reach Error:\n{err}"));
+    let details = sandbox_details(&sandbox.name).await;
+    assert!(
+        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
+        "detached failing main should retain its terminal result:\n{details}"
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_and_exec_receive_declared_environment() {
+    for mode in ["--tty", "--no-tty"] {
+        let script = r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}"; while true; do sleep 1; done"#;
+        let mut sandbox = SandboxGuard::create_keep_with_args(
+            &[
+                mode,
+                "--no-auto-providers",
+                "--env",
+                "REPRO_SENTINEL=present",
+            ],
+            &["sh", "-c", script],
+            "declared_env=",
+        )
+        .await
+        .expect("create canonical process with declared environment");
+        let initial = normalize_output(&sandbox.create_output);
+        let later = sandbox
+            .exec(&[
+                "sh",
+                "-c",
+                r#"printf 'declared_env=%s\n' "${REPRO_SENTINEL:-missing}""#,
+            ])
+            .await;
+        sandbox.cleanup().await;
+
+        assert!(
+            initial.lines().any(|line| line == "declared_env=present"),
+            "initial process must receive declared environment ({mode}): {initial}"
+        );
+        let later = normalize_output(&later.expect("exec environment probe"));
+        assert!(
+            later.lines().any(|line| line == "declared_env=present"),
+            "exec must receive the same declared environment ({mode}): {later}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn detached_main_exit_during_provisioning_is_classified_as_workload_result() {
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", "exit 11"])
+        .await
+        .expect("fast detached main exit should not be reported as a provisioning failure");
+
+    wait_for_sandbox_phase(&sandbox.name, "Error", SANDBOX_PRESENCE_TIMEOUT)
+        .await
+        .unwrap_or_else(|err| panic!("fast detached main did not reach Error:\n{err}"));
+
+    let mut get_cmd = openshell_cmd();
+    get_cmd
+        .args(["sandbox", "get", &sandbox.name])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let get_output = get_cmd.output().await.expect("spawn openshell sandbox get");
+    let details = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&get_output.stdout),
+        String::from_utf8_lossy(&get_output.stderr),
+    ));
+    assert!(
+        get_output.status.success(),
+        "sandbox get failed:\n{details}"
+    );
+    assert!(
+        details.contains("Phase: Error") && details.contains("Exit Code: 11"),
+        "fast detached main should retain its workload result:\n{details}"
+    );
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
 async fn canonical_tty_main_uses_sandbox_environment() {
     let script = r#"printf 'canonical_env home=%s user=%s term=%s\n' "$HOME" "$USER" "$TERM"; while true; do sleep 1; done"#;
     let mut sandbox =
@@ -304,9 +940,10 @@ async fn canonical_tty_main_uses_sandbox_environment() {
 }
 
 #[tokio::test]
+#[serial(sandbox_lifecycle)]
 async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() {
     const FIRST_MARKER: &str = "sequence=0001";
-    let script = r#"n=1; while true; do printf 'main_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done"#;
+    let script = r#"trap 'kill "$writer" 2>/dev/null || true' EXIT; (n=1; while true; do printf 'main_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done) & writer=$!; while IFS= read -r line; do printf 'main_pid=%s input=%s\n' "$$" "$line"; done"#;
     let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-lc", script])
         .await
         .expect("create retained canonical main process");
@@ -350,46 +987,56 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
     );
     let observer_stdout = observer.stdout.take().expect("observer stdout");
     let mut observer_lines = BufReader::new(observer_stdout).lines();
-    let observed = tokio::time::timeout(Duration::from_secs(30), observer_lines.next_line())
-        .await
-        .expect("observer output timeout")
-        .expect("read observer output")
-        .expect("observer output should remain open");
+    let observer_output_line =
+        tokio::time::timeout(Duration::from_secs(30), observer_lines.next_line())
+            .await
+            .expect("observer output timeout")
+            .expect("read observer output")
+            .expect("observer output should remain open");
     assert!(
-        observed.contains("main_pid="),
-        "read-only attachment should observe output: {observed}"
+        observer_output_line.contains("main_pid="),
+        "read-only attachment should observe output: {observer_output_line}"
     );
 
-    owner.kill().await.expect("disconnect input owner");
-    owner.wait().await.expect("wait for input owner disconnect");
-    observer.kill().await.expect("disconnect observer");
-    observer.wait().await.expect("wait for observer disconnect");
-    sleep(Duration::from_millis(600)).await;
+    observer
+        .stdin
+        .as_mut()
+        .expect("observer stdin")
+        .write_all(b"\x03")
+        .await
+        .expect("send Ctrl-C to viewer");
+    let observer_status = tokio::time::timeout(Duration::from_secs(30), observer.wait())
+        .await
+        .expect("Ctrl-C should exit viewer")
+        .expect("wait for viewer");
+    assert!(observer_status.success(), "viewer should exit successfully");
 
-    let mut reconnect_cmd = openshell_cmd();
-    reconnect_cmd
-        .args(["sandbox", "connect", &sandbox.name])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut reconnect = reconnect_cmd.spawn().expect("spawn reconnect attachment");
-    let reconnect_stdout = reconnect.stdout.take().expect("reconnect stdout");
-    let mut reconnect_lines = BufReader::new(reconnect_stdout).lines();
-    let mut replay = Vec::new();
+    owner
+        .stdin
+        .as_mut()
+        .expect("owner stdin")
+        .write_all(b"owner-after-viewer-exit\n")
+        .await
+        .expect("send input after viewer exits");
     tokio::time::timeout(Duration::from_secs(30), async {
-        while replay.len() < 5 {
-            let line = reconnect_lines
+        loop {
+            let line = owner_lines
                 .next_line()
                 .await
-                .expect("read reconnect output")
-                .expect("reconnect output should remain open");
-            if line.contains("main_pid=") {
-                replay.push(line);
+                .expect("read owner output after viewer exits")
+                .expect("main process should remain running");
+            if line.contains("input=owner-after-viewer-exit") {
+                break;
             }
         }
     })
     .await
-    .expect("reconnect history timeout");
+    .expect("owner should retain working stdin after viewer exits");
+
+    owner.kill().await.expect("disconnect input owner");
+    owner.wait().await.expect("wait for input owner disconnect");
+
+    let (mut reconnect, replay) = reconnect_with_input_ownership(&sandbox.name).await;
 
     let first_pid = owner_line
         .split_whitespace()
@@ -421,9 +1068,376 @@ async fn canonical_main_disconnect_reconnect_replays_history_for_same_process() 
     sandbox.cleanup().await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_connect_recovers_its_ssh_transport() {
+    let script = r#"trap 'kill "$writer" 2>/dev/null || true' EXIT; (n=1; while true; do printf 'transport_pid=%s sequence=%04d\n' "$$" "$n"; n=$((n + 1)); sleep 0.2; done) & writer=$!; while IFS= read -r line; do printf 'transport_pid=%s input=%s\n' "$$" "$line"; done"#;
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-lc", script])
+        .await
+        .expect("create retained canonical main process");
+
+    let mut connect_cmd = openshell_cmd();
+    connect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut connect = connect_cmd.spawn().expect("spawn supervised attachment");
+    let mut connect_stdin = connect.stdin.take().expect("connect stdin");
+    let connect_stdout = connect.stdout.take().expect("connect stdout");
+    let mut connect_lines = BufReader::new(connect_stdout).lines();
+    let connect_stderr = connect.stderr.take().expect("connect stderr");
+    let mut connect_errors = BufReader::new(connect_stderr).lines();
+
+    let initial_line = tokio::time::timeout(Duration::from_secs(30), connect_lines.next_line())
+        .await
+        .expect("initial attachment output timeout")
+        .expect("read initial attachment output")
+        .expect("initial attachment output should remain open");
+    assert!(
+        initial_line.contains("transport_pid="),
+        "unexpected initial attachment output: {initial_line}"
+    );
+
+    // Recovery intentionally starts only for an established attachment, so
+    // let the initial SSH process live beyond that setup guard before killing
+    // only its ProxyCommand transport.
+    sleep(Duration::from_secs(3)).await;
+    let proxy_pid = wait_for_process_with_args(&["ssh-proxy", "--sandbox", &sandbox.name]).await;
+    let kill_status = tokio::process::Command::new("kill")
+        .args(["-TERM", &proxy_pid.to_string()])
+        .status()
+        .await
+        .expect("terminate SSH proxy transport");
+    assert!(kill_status.success(), "terminate SSH proxy transport");
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = connect_errors
+                .next_line()
+                .await
+                .expect("read supervised attachment diagnostics")
+                .expect("supervised attachment diagnostics should remain open");
+            if normalize_output(&line).contains("Connection to sandbox lost; reconnecting") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("supervised attachment did not enter recovery");
+
+    let input_token = format!("after-transport-recovery-{:x}", rand::random::<u64>());
+    connect_stdin
+        .write_all(format!("{input_token}\n").as_bytes())
+        .await
+        .expect("write input after transport recovery");
+    connect_stdin
+        .flush()
+        .await
+        .expect("flush input after transport recovery");
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = connect_lines
+                .next_line()
+                .await
+                .expect("read recovered attachment output")
+                .expect("recovered attachment output should remain open");
+            if line.contains(&format!("input={input_token}")) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("replacement SSH session did not reattach to canonical main");
+    assert!(
+        connect
+            .try_wait()
+            .expect("inspect supervised attachment")
+            .is_none(),
+        "sandbox connect parent should remain alive after recovery"
+    );
+
+    connect
+        .kill()
+        .await
+        .expect("disconnect recovered attachment");
+    connect
+        .wait()
+        .await
+        .expect("wait for recovered attachment disconnect");
+    sandbox.cleanup().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_connect_forwards_pid_targeted_termination_and_reaps_ssh() {
+    use std::os::fd::OwnedFd;
+
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-lc", "exec sleep infinity"])
+        .await
+        .expect("create retained canonical main process");
+    let pty = nix::pty::openpty(None, None).expect("open pseudo-terminal");
+    let controller: OwnedFd = pty.master;
+    let follower: OwnedFd = pty.slave;
+
+    let mut connect_cmd = openshell_cmd();
+    connect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(
+            follower
+                .try_clone()
+                .expect("duplicate PTY follower for stdin"),
+        )
+        .stdout(
+            follower
+                .try_clone()
+                .expect("duplicate PTY follower for stdout"),
+        )
+        .stderr(
+            follower
+                .try_clone()
+                .expect("duplicate PTY follower for stderr"),
+        );
+    let mut connect = connect_cmd
+        .spawn()
+        .expect("spawn supervised PTY attachment");
+    let connect_pid = connect.id().expect("connect process ID");
+    drop(follower);
+
+    let ssh_pid = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(pid) =
+                find_child_process_with_args(connect_pid, &["-s", "sandbox", "openshell-main"])
+            {
+                return pid;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("supervised SSH child did not start");
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(i32::try_from(connect_pid).expect("connect PID fits i32")),
+        nix::sys::signal::Signal::SIGTERM,
+    )
+    .expect("send SIGTERM to only the OpenShell parent");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), connect.wait())
+        .await
+        .expect("OpenShell parent did not terminate")
+        .expect("wait for OpenShell parent");
+    assert_eq!(status.code(), Some(143));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fs::metadata(format!("/proc/{ssh_pid}")).is_ok() {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("SSH child was not reaped after parent termination");
+
+    drop(controller);
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
+    const READY_MARKER: &str = "exit-255-ready";
+    const RELEASE_PATH: &str = "/sandbox/.openshell-exit-255-release";
+    let script = format!(
+        "echo {READY_MARKER}; while [ ! -e '{RELEASE_PATH}' ]; do sleep 0.05; done; exit 255"
+    );
+    let mut sandbox = SandboxGuard::create_detached_main(&["sh", "-c", &script])
+        .await
+        .expect("create retained canonical main process");
+
+    let mut connect_cmd = openshell_cmd();
+    connect_cmd
+        .args(["sandbox", "connect", &sandbox.name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut connect = connect_cmd.spawn().expect("spawn supervised attachment");
+    let connect_stdout = connect.stdout.take().expect("connect stdout");
+    let mut connect_lines = BufReader::new(connect_stdout).lines();
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = connect_lines
+                .next_line()
+                .await
+                .expect("read attachment output")
+                .expect("attachment output should remain open");
+            if line.contains(READY_MARKER) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("attachment did not observe the canonical main process");
+
+    // Keep the attachment alive beyond the setup guard used to distinguish
+    // initial SSH failures from established transport failures.
+    sleep(Duration::from_secs(3)).await;
+    sandbox
+        .exec(&["touch", RELEASE_PATH])
+        .await
+        .expect("release canonical main process");
+
+    let status = tokio::time::timeout(Duration::from_secs(10), connect.wait()).await;
+    if status.is_err() {
+        connect.kill().await.expect("stop stuck attachment");
+    }
+    sandbox.cleanup().await;
+    let status = status
+        .expect("exit status 255 must not enter the transport recovery loop")
+        .expect("wait for canonical main attachment");
+    assert_eq!(status.code(), Some(255));
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn on_failure_policy_replaces_runtime_and_preserves_workspace() {
+    const SCRIPT: &str = r#"
+marker=/sandbox/.openshell-restart-e2e
+if [ -e "$marker" ]; then
+  printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
+  sleep 300
+else
+  touch "$marker"
+  printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
+  while [ ! -e /sandbox/.openshell-restart-release ]; do sleep 0.05; done
+  exit 17
+fi
+"#;
+
+    let mut sandbox = SandboxGuard::manage_existing(unique_sandbox_name());
+    let (output, exit_code) = run_cli(&[
+        "sandbox",
+        "create",
+        "--name",
+        &sandbox.name,
+        "--from",
+        E2E_WORKLOAD_IMAGE,
+        "--detach",
+        "--restart-policy",
+        "on-failure",
+        "--",
+        "sh",
+        "-lc",
+        SCRIPT,
+    ])
+    .await;
+    assert_eq!(
+        exit_code, 0,
+        "create sandbox with OnFailure policy: {output}"
+    );
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", "/sandbox/initial-run"],
+        "initial-",
+        SANDBOX_RESTART_TIMEOUT,
+    )
+    .await
+    .expect("initial main process should write its workspace marker");
+
+    let initial_details = sandbox_details(&sandbox.name).await;
+    let initial_instance = extract_field(&initial_details, "Main process instance")
+        .expect("initial main process instance");
+    sandbox
+        .exec(&["touch", "/sandbox/.openshell-restart-release"])
+        .await
+        .expect("release initial main process");
+
+    let deadline = Instant::now() + SANDBOX_RESTART_TIMEOUT;
+    let mut last_runs = Err("replacement is not ready".to_string());
+    let final_details = loop {
+        let details = sandbox_details(&sandbox.name).await;
+        let replacement_instance = extract_field(&details, "Main process instance")
+            .is_some_and(|instance| instance != "-" && instance != initial_instance);
+        if details.contains("Phase: Ready")
+            && extract_field(&details, "Restart count").as_deref() == Some("1")
+            && replacement_instance
+        {
+            last_runs = sandbox
+                .exec(&["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
+                .await;
+            if let Ok(runs) = &last_runs
+                && runs.contains("initial-")
+                && runs.contains("replacement-")
+            {
+                break details;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sandbox did not complete its policy-driven restart within \
+             {SANDBOX_RESTART_TIMEOUT:?}; last details:\n{details}\nworkspace: {last_runs:?}"
+        );
+        sleep(Duration::from_millis(250)).await;
+    };
+
+    assert!(
+        final_details.contains("Restart policy: on-failure"),
+        "restart policy should remain visible after replacement:\n{final_details}"
+    );
+    sandbox.cleanup().await;
+}
+
 #[tokio::test]
 async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
-    let mut cmd = openshell_tty_cmd(&["sandbox", "create", "--no-keep", "--", "echo", "OK"]);
+    let name = format!("tty-{:015x}", rand::random::<u64>() & 0x0fff_ffff_ffff_ffff);
+    // Capture startup diagnostics before --no-keep removes a failed container.
+    // This is best-effort: the lifecycle assertions also run on other drivers.
+    let log_name = name.clone();
+    let diagnostics = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let containers = tokio::process::Command::new("docker")
+                    .args(["ps", "--all", "--quiet", "--filter"])
+                    .arg(format!("label=openshell.ai/sandbox-name={log_name}"))
+                    .kill_on_drop(true)
+                    .output()
+                    .await
+                    .ok()?;
+                if !containers.status.success() {
+                    return None;
+                }
+                let ids = String::from_utf8_lossy(&containers.stdout);
+                if let Some(id) = ids.split_whitespace().next() {
+                    let logs = tokio::process::Command::new("docker")
+                        .args(["logs", "--follow", id])
+                        .kill_on_drop(true)
+                        .output()
+                        .await
+                        .ok()?;
+                    return Some(normalize_output(&format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&logs.stdout),
+                        String::from_utf8_lossy(&logs.stderr)
+                    )));
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    });
+    let mut cmd = openshell_tty_cmd(&[
+        "sandbox",
+        "create",
+        "--name",
+        &name,
+        "--no-keep",
+        "--",
+        "echo",
+        "OK",
+    ]);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let output = cmd.output().await.expect("spawn openshell sandbox create");
@@ -431,9 +1445,20 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = normalize_output(&format!("{stdout}{stderr}"));
 
+    let startup_logs = if output.status.success() {
+        diagnostics.abort();
+        None
+    } else {
+        diagnostics.await.ok().flatten()
+    };
     assert!(
-        !output.status.success(),
-        "main-process exit must fail create"
+        output.status.success(),
+        "create failed:\n{combined}\nsupervisor logs:\n{}",
+        startup_logs.as_deref().unwrap_or("unavailable")
+    );
+    assert!(
+        combined.contains("OK"),
+        "main output was not streamed:\n{combined}"
     );
     let sandbox_name =
         extract_sandbox_name(&combined).expect("sandbox name should be present in output");
@@ -442,6 +1467,48 @@ async fn sandbox_create_with_no_keep_cleans_up_after_tty_command() {
         delete_sandbox(&sandbox_name).await;
         panic!(
             "sandbox {sandbox_name} should have been deleted automatically after \
+             {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}"
+        );
+    }
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn sandbox_create_with_no_keep_preserves_failure_then_cleans_up() {
+    let mut cmd = openshell_tty_cmd(&[
+        "sandbox",
+        "create",
+        "--no-keep",
+        "--",
+        "sh",
+        "-c",
+        "echo ephemeral-failure; exit 17",
+    ]);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell sandbox create");
+    let combined = normalize_output(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+
+    assert_eq!(
+        output.status.code(),
+        Some(17),
+        "ephemeral main should preserve its failure code:\n{combined}"
+    );
+    assert!(
+        combined.contains("ephemeral-failure"),
+        "ephemeral main output was not streamed:\n{combined}"
+    );
+    let sandbox_name =
+        extract_sandbox_name(&combined).expect("sandbox name should be present in output");
+
+    if let Err(last_sandbox_list) = assert_sandbox_presence_eventually(&sandbox_name, false).await {
+        delete_sandbox(&sandbox_name).await;
+        panic!(
+            "failed ephemeral sandbox {sandbox_name} should have been deleted automatically after \
              {SANDBOX_PRESENCE_TIMEOUT:?}; last observed sandbox list: {last_sandbox_list:?}"
         );
     }

@@ -152,7 +152,7 @@ func TestFakeClient_AddSandbox_InList(t *testing.T) {
 	fc.AddSandbox("default", &types.Sandbox{Name: "sb-1"})
 	fc.AddSandbox("default", &types.Sandbox{Name: "sb-2"})
 
-	list, err := fc.Sandboxes().List(ctx, "default")
+	list, err := fc.Sandboxes().ListAll(ctx, "default")
 	require.NoError(t, err)
 	assert.Len(t, list, 2)
 }
@@ -192,6 +192,44 @@ func TestFakeClient_AddSandbox_DeepCopy(t *testing.T) {
 	got, err := fc.Sandboxes().Get(ctx, "default", "pre-seeded")
 	require.NoError(t, err)
 	assert.Equal(t, "test", got.Labels["env"])
+}
+
+func TestFakeClient_SandboxEndpointStatuses_DeepCopy(t *testing.T) {
+	fc := NewClient()
+	ctx := context.Background()
+	sb := &types.Sandbox{
+		Name: "tool-sandbox",
+		Status: types.SandboxStatus{EndpointStatuses: []types.EndpointStatus{{
+			EndpointID:     "endpoint-one",
+			Host:           "tools.example.test",
+			Ports:          []uint32{443, 8443},
+			Path:           "/mcp",
+			LastResult:     types.EndpointTransportFailed,
+			LastReportedAt: "2026-09-11T10:00:00Z",
+		}}},
+	}
+	fc.AddSandbox("default", sb)
+
+	// Neither the seed object nor returned snapshots may mutate stored endpoints.
+	sb.Status.EndpointStatuses[0].Host = "seed-changed.example.test"
+	sb.Status.EndpointStatuses[0].Ports[0] = 80
+	sb.Status.EndpointStatuses[0].LastResult = types.EndpointHTTPResponseReceived
+	got, err := fc.Sandboxes().Get(ctx, "default", "tool-sandbox")
+	require.NoError(t, err)
+	require.Equal(t, []types.EndpointStatus{{
+		EndpointID: "endpoint-one", Host: "tools.example.test", Ports: []uint32{443, 8443}, Path: "/mcp",
+		LastResult: types.EndpointTransportFailed, LastReportedAt: "2026-09-11T10:00:00Z",
+	}}, got.Status.EndpointStatuses)
+	got.Status.EndpointStatuses[0].Path = "/changed"
+	got.Status.EndpointStatuses[0].Ports[1] = 8080
+	got.Status.EndpointStatuses[0].LastReportedAt = "changed"
+
+	listed, err := fc.Sandboxes().ListAll(ctx, "default")
+	require.NoError(t, err)
+	require.Len(t, listed, 1)
+	assert.Equal(t, "/mcp", listed[0].Status.EndpointStatuses[0].Path)
+	assert.Equal(t, []uint32{443, 8443}, listed[0].Status.EndpointStatuses[0].Ports)
+	assert.Equal(t, "2026-09-11T10:00:00Z", listed[0].Status.EndpointStatuses[0].LastReportedAt)
 }
 
 func TestFakeClient_AddProvider(t *testing.T) {

@@ -230,9 +230,7 @@ create_sandbox() {
         --policy "$POLICY_FILE" \
         --upload "${RUNNER_SOURCE}:/sandbox/policy-validation-runner.sh" \
         --no-git-ignore \
-        --no-auto-providers \
-        --no-tty \
-        -- bash -lc "chmod +x /sandbox/policy-validation-runner.sh && echo sandbox ready"
+        --no-auto-providers
 }
 
 connect_ssh() {
@@ -245,6 +243,8 @@ connect_ssh() {
     local i
     for i in $(seq 1 "$retries"); do
         if ssh -F "$SSH_CONFIG" "$SSH_HOST" true >/dev/null 2>&1; then
+            ssh -F "$SSH_CONFIG" "$SSH_HOST" chmod +x /sandbox/policy-validation-runner.sh \
+                || fail "could not make uploaded policy runner executable"
             return
         fi
         sleep 2

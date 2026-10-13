@@ -3,7 +3,11 @@
 
 package types
 
-import "time"
+import (
+	"time"
+
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
+)
 
 // LogLine represents a single log entry from a sandbox.
 type LogLine struct {
@@ -71,9 +75,7 @@ func WithLogMinLevel(level string) LogOption {
 // ApplyLogOptions applies options and returns the config.
 func ApplyLogOptions(opts []LogOption) logConfig { //nolint:revive // unexported return is intentional; consumed only by v1 package
 	var cfg logConfig
-	for _, opt := range opts {
-		opt(&cfg)
-	}
+	options.Apply(&cfg, opts)
 	return cfg
 }
 

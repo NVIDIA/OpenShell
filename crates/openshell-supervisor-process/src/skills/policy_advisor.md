@@ -50,10 +50,12 @@ operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
    credential is in scope auto-approve** (see Auto-approval below). Any
    credentialed reach or capability change goes to human review — that is
    the design. L7 is still the agent-speed path because the prover can
-   precisely describe the change (which method was added on which path);
-   L4 to a credentialed host loses that precision. Use L4 only when the
-   binary's wire protocol is opaque to L7 inspection (`ssh`, `nc`,
-   `git-remote-http`) or the host has no documented REST surface.
+   precisely describe the change (which method was added on which path).
+   When a client can use the explicit proxy but its wire protocol is opaque
+   to L7 inspection (`ssh`, `nc`, `git-remote-http`), omit `protocol` and
+   retain default TLS handling. Never propose `protocol: tcp` or `tls: skip`:
+   those choices bypass application-authority inspection and require an
+   administrator to add the rule explicitly.
 5. Draft the narrowest rule: exact host, exact port, exact binary when known,
    exact method, and the smallest safe path.
 6. Submit the proposal, save `accepted_chunk_ids` from the response, and
@@ -207,6 +209,8 @@ The new submission wins by structural overlap.
   `fe80::/10`) or known metadata hostnames such as
   `metadata.google.internal`. Cloud-metadata endpoints there can hand out
   the host's credentials.
+- Do not propose `protocol: tcp` or `tls: skip`. If the task requires native
+  TCP or a raw TLS tunnel, ask an administrator to add that access explicitly.
 - Do not include query strings, tokens, credentials, or secret values in
   paths.
 - Explain uncertainty in `intent_summary` instead of widening the rule.

@@ -46,11 +46,11 @@ func (c *fakeRefreshClient) Rotate(_ context.Context, _, _, _ string) (*types.Re
 }
 
 // Delete returns Unimplemented.
-func (c *fakeRefreshClient) Delete(_ context.Context, _, _, _ string) (bool, error) {
+func (c *fakeRefreshClient) Delete(_ context.Context, _, _, _ string, _ ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return false, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return false, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
 }
 
 // Compile-time check that fakeRefreshClient implements v1.RefreshInterface.

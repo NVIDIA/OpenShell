@@ -5,13 +5,14 @@
 
 mod context;
 mod discovery;
+#[cfg(any(test, feature = "example-profiles"))]
+pub mod example_profiles;
 mod profiles;
 mod providers;
 #[cfg(test)]
 mod test_helpers;
 
 use std::collections::HashMap;
-use std::path::Path;
 
 pub use openshell_core::proto::Provider;
 
@@ -19,10 +20,20 @@ pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::{discover_from_profile, discover_with_spec};
 pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
-    builtin_profiles, is_gateway_mintable_strategy, normalize_profile_id, parse_profile_json,
-    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
-    strategy_output_env_key, strategy_output_spec, strategy_primary_env_key, validate_profile_set,
+    is_gateway_mintable_strategy, normalize_profile_id, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, strategy_output_env_key,
+    strategy_output_spec, strategy_primary_env_key, validate_profile_set,
 };
+
+pub const VERTEX_AI_PROJECT_ID_KEY: &str = "VERTEX_AI_PROJECT_ID";
+pub const VERTEX_AI_REGION_KEY: &str = "VERTEX_AI_REGION";
+pub const VERTEX_AI_CONFIG_KEY_NAMES: &[&str] = &[
+    VERTEX_AI_PROJECT_ID_KEY,
+    VERTEX_AI_REGION_KEY,
+    "GOOGLE_VERTEX_AI_BASE_URL",
+    "VERTEX_AI_BASE_URL",
+    "VERTEX_AI_PUBLISHER",
+];
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -56,20 +67,9 @@ pub struct ProviderDiscoverySpec {
     pub credential_env_vars: &'static [&'static str],
 }
 
-pub trait ProviderPlugin: Send + Sync {
-    /// Canonical provider id (for example: "claude", "gitlab").
+trait ProviderPlugin: Send + Sync {
+    /// Canonical provider id.
     fn id(&self) -> &'static str;
-
-    /// Discover provider credentials and config from the local machine.
-    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError>;
-
-    /// Return the known credential environment variable names for this provider type.
-    ///
-    /// Used by the TUI to label BYO key entry fields and to choose which
-    /// env var name to store a manually-entered credential under.
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        &[]
-    }
 
     /// Inject provider-specific environment variables into the sandbox env.
     ///
@@ -77,25 +77,6 @@ pub trait ProviderPlugin: Send + Sync {
     /// regions, SDK flags) into env vars the sandbox process will inherit.
     /// Default is a no-op; GCP and Vertex providers override this.
     fn inject_env(&self, _provider: &Provider, _env: &mut HashMap<String, String>) {}
-}
-
-/// Blanket implementation of [`ProviderPlugin`] for [`ProviderDiscoverySpec`].
-///
-/// Providers that only need standard env-var discovery can register their
-/// `SPEC` constant directly, instead of defining a dedicated struct and
-/// repeating the same three-method delegation.
-impl ProviderPlugin for ProviderDiscoverySpec {
-    fn id(&self) -> &'static str {
-        self.id
-    }
-
-    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        discover_with_spec(self, &RealDiscoveryContext)
-    }
-
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        self.credential_env_vars
-    }
 }
 
 #[derive(Default)]
@@ -107,24 +88,15 @@ impl ProviderRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register(providers::claude::SPEC);
-        registry.register(providers::codex::SPEC);
-        registry.register(providers::copilot::SPEC);
-        registry.register(providers::opencode::OpencodeProvider);
-        registry.register(providers::generic::GenericProvider);
-        registry.register(providers::openai::SPEC);
-        registry.register(providers::anthropic::SPEC);
-        registry.register(providers::nvidia::SPEC);
-        registry.register(providers::deepinfra::SPEC);
-        registry.register(providers::github::SPEC);
-        registry.register(providers::gitlab::SPEC);
+        // Keep only the legacy config projectors required to run existing
+        // Google Cloud and Vertex records. Public provider discovery is
+        // profile-driven; this registry is an internal compatibility adapter.
         registry.register(providers::google_cloud::GoogleCloudProvider);
-        registry.register(providers::outlook::OutlookProvider);
         registry.register(providers::vertex::VertexProvider);
         registry
     }
 
-    pub fn register<P>(&mut self, plugin: P)
+    fn register<P>(&mut self, plugin: P)
     where
         P: ProviderPlugin + 'static,
     {
@@ -132,145 +104,23 @@ impl ProviderRegistry {
     }
 
     #[must_use]
-    pub fn get(&self, id: &str) -> Option<&dyn ProviderPlugin> {
+    fn get(&self, id: &str) -> Option<&dyn ProviderPlugin> {
         self.plugins.get(id).map(Box::as_ref)
     }
 
-    pub fn discover_existing(&self, id: &str) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        let Some(plugin) = self.get(id) else {
-            return Err(ProviderError::UnsupportedProvider(id.to_string()));
-        };
-        plugin.discover_existing()
-    }
-
-    /// Return the known credential env var names for a provider type.
-    #[must_use]
-    pub fn credential_env_vars(&self, id: &str) -> &'static [&'static str] {
-        self.get(id)
-            .map_or(&[], ProviderPlugin::credential_env_vars)
-    }
-
-    #[must_use]
-    pub fn profile(&self, id: &str) -> Option<&'static ProviderTypeProfile> {
-        builtin_profiles()
-            .iter()
-            .find(|profile| profile.id.eq_ignore_ascii_case(id))
-    }
-
-    #[must_use]
-    pub fn profiles(&self) -> Vec<&'static ProviderTypeProfile> {
-        builtin_profiles().iter().collect()
-    }
-
-    /// Inject provider-specific env vars via the registered plugin.
+    /// Inject provider-specific config for a resolved profile ID.
     ///
-    /// Normalizes the provider type and delegates to the plugin's `inject_env`.
-    /// No-op if the provider type has no registered plugin or the plugin's
-    /// default implementation is a no-op.
-    pub fn inject_env(&self, provider: &Provider, env: &mut HashMap<String, String>) {
-        let normalized = normalize_provider_type(&provider.r#type);
-        if let Some(id) = normalized
-            && let Some(plugin) = self.get(id)
-        {
+    /// Plugins are selected by the exact ID of the profile the gateway
+    /// resolved. There is no alias table: a profile activates the plugin whose
+    /// ID it matches, and nothing else does.
+    pub fn inject_env_for_profile_id(
+        &self,
+        provider: &Provider,
+        profile_id: &str,
+        env: &mut HashMap<String, String>,
+    ) {
+        if let Some(plugin) = self.get(profile_id) {
             plugin.inject_env(provider, env);
         }
-    }
-
-    #[must_use]
-    pub fn known_types(&self) -> Vec<&'static str> {
-        let mut types = self.plugins.keys().copied().collect::<Vec<_>>();
-        types.sort_unstable();
-        types
-    }
-}
-
-#[must_use]
-pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
-    // Inference provider aliases are canonicalized in openshell-core so that
-    // openshell-server and openshell-providers agree on the same mapping.
-    if let Some(canonical) = openshell_core::inference::normalize_inference_provider_type(input) {
-        return Some(canonical);
-    }
-    let normalized = input.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "claude" | "claude-code" | "claude_code" => Some("claude-code"),
-        "codex" => Some("codex"),
-        "copilot" => Some("copilot"),
-        "opencode" => Some("opencode"),
-        "gcp" | "google-cloud" => Some("google-cloud"),
-        "generic" => Some("generic"),
-        "gitlab" | "glab" => Some("gitlab"),
-        "github" | "gh" => Some("github"),
-        "outlook" => Some("outlook"),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub fn detect_provider_from_command(command: &[String]) -> Option<&'static str> {
-    let first = command.first()?;
-    let basename = Path::new(first)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(first);
-    normalize_provider_type(basename)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{detect_provider_from_command, normalize_provider_type};
-
-    #[test]
-    fn normalizes_known_provider_aliases() {
-        assert_eq!(normalize_provider_type("gitlab"), Some("gitlab"));
-        assert_eq!(normalize_provider_type("glab"), Some("gitlab"));
-        assert_eq!(normalize_provider_type("gh"), Some("github"));
-        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude-code"));
-        assert_eq!(normalize_provider_type("claude-code"), Some("claude-code"));
-        assert_eq!(normalize_provider_type("generic"), Some("generic"));
-        assert_eq!(normalize_provider_type("openai"), Some("openai"));
-        assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
-        assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
-        assert_eq!(normalize_provider_type("copilot"), Some("copilot"));
-        assert_eq!(
-            normalize_provider_type("google-vertex-ai"),
-            Some("google-vertex-ai")
-        );
-        assert_eq!(normalize_provider_type("vertex"), Some("google-vertex-ai"));
-        assert_eq!(
-            normalize_provider_type("vertex-ai"),
-            Some("google-vertex-ai")
-        );
-        assert_eq!(normalize_provider_type("unknown"), None);
-    }
-
-    #[test]
-    fn detects_provider_from_command_token() {
-        assert_eq!(
-            detect_provider_from_command(&["claude".to_string()]),
-            Some("claude-code")
-        );
-        assert_eq!(
-            detect_provider_from_command(&["/usr/bin/glab".to_string()]),
-            Some("gitlab")
-        );
-        assert_eq!(
-            detect_provider_from_command(&["/usr/bin/bash".to_string()]),
-            None
-        );
-        // Copilot standalone binary
-        assert_eq!(
-            detect_provider_from_command(&["copilot".to_string()]),
-            Some("copilot")
-        );
-        assert_eq!(
-            detect_provider_from_command(&["/usr/local/bin/copilot".to_string()]),
-            Some("copilot")
-        );
-        // gh alone still maps to github
-        assert_eq!(
-            detect_provider_from_command(&["gh".to_string()]),
-            Some("github")
-        );
     }
 }

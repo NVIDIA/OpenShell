@@ -44,6 +44,7 @@ ${port_spec}
           - "192.168.0.0/16"
           - "fc00::/7"
         mcp:
+          versions: [${mcp_version}]
           max_body_bytes: 131072
           allow_all_known_mcp_methods: true
         rules:

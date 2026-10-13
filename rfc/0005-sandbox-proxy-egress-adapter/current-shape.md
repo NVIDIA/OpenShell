@@ -52,7 +52,6 @@ The networking surface currently includes:
 
 - CONNECT proxy traffic for HTTPS and generic TCP tunnels.
 - Forward HTTP proxy traffic for absolute-form HTTP requests.
-- `inference.local` for local inference routing.
 - `policy.local` for current policy, denial summaries, proposal submission,
   and proposal wait routes.
 - GCE metadata loopback for SDKs that bypass HTTP proxy variables.
@@ -123,7 +122,6 @@ copy, but it is still orchestrated separately from the CONNECT relay path.
 ```mermaid
 flowchart TD
     Request["Request to local name"] --> Match{"Known local route?"}
-    Match -- "inference.local" --> Inference["Inference route adapter"]
     Match -- "policy.local" --> Policy["Policy local adapter"]
     Match -- "metadata loopback" --> Metadata["Metadata credential server"]
     Match -- No --> External["Normal egress path"]
@@ -132,9 +130,7 @@ flowchart TD
     Metadata --> MetadataResp["Metadata response"]
 ```
 
-`inference.local` now covers buffered and streaming inference shapes including
-chat/completion routes, model discovery, embeddings, and provider-specific
-routes. `policy.local` supports the agentic approval loop: agents can submit
+`policy.local` supports the agentic approval loop: agents can submit
 narrow proposals and wait on approval/reload before retrying. Metadata
 loopback exists for provider credentials consumed by SDKs that do not honor
 HTTP proxy variables.
@@ -274,7 +270,6 @@ The refactor should preserve:
 - MCP Streamable HTTP method and tool policy.
 - WebSocket transport and GraphQL-over-WebSocket policy.
 - h2c rejection on inspected HTTP routes.
-- Inference routing through `inference.local`, including embeddings.
 - Agent-facing policy advisor routes through `policy.local`.
 - GCE metadata loopback for supported provider credentials.
 - Timeout and resource tracking for client, upstream, and local service work.

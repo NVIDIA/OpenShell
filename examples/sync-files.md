@@ -66,9 +66,8 @@ openshell sandbox download dev /sandbox/coverage ./coverage
 
 ## How it works
 
-File sync uses **tar-over-SSH**. The CLI streams a tar archive through the
-existing SSH proxy tunnel -- no `rsync` or other external tools required on
-your machine. The sandbox base image provides GNU `tar` for extraction.
-
-- **Push**: `tar::Builder` (Rust) -> stdin | `ssh <proxy> sandbox "tar xf - -C <dest>"`
-- **Pull**: `ssh <proxy> sandbox "tar cf - -C <dir> <path>"` | stdout -> `tar::Archive` (Rust)
+File sync uses the native OpenShell streaming file-transfer protocol. The CLI
+creates and extracts tar streams in Rust, and the sandbox performs the matching
+operation under the workload identity. Transfers use bounded frames with
+backpressure, cancellation, and explicit completion; they do not require
+`ssh`, `scp`, `rsync`, or a `tar` executable in the workload image.

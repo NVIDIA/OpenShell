@@ -9,14 +9,6 @@ use std::path::Path;
 
 use rcgen::{CertificateParams, IsCa, KeyPair};
 
-/// Install the default rustls crypto provider.
-///
-/// Must be called once at the start of any test that exercises TLS handshakes.
-/// Multiple calls are harmless (subsequent calls return an error, ignored).
-pub fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
 /// Write bytes to a file inside `dir`, panicking on failure.
 pub fn write_test_file(dir: &Path, name: &str, data: &[u8]) {
     let path = dir.join(name);

@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	"google.golang.org/grpc"
 )
@@ -36,16 +37,12 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 			Message: fmt.Sprintf("port must be in range 1-65535, got %d", port),
 		}
 	}
-
-	sb, err := t.sandboxes.Get(ctx, workspace, sandboxName)
-	if err != nil {
+	if _, err := t.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
 		return nil, err
 	}
 
 	var cfg forwardConfig
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	streamCtx, cancel := context.WithCancel(ctx)
 	stream, err := t.client.ForwardTcp(streamCtx)
@@ -57,7 +54,8 @@ func (t *tcpClient) Forward(ctx context.Context, workspace, sandboxName string, 
 	initFrame := &pb.TcpForwardFrame{
 		Payload: &pb.TcpForwardFrame_Init{
 			Init: &pb.TcpForwardInit{
-				SandboxId: sb.ID,
+				Sandbox:   sandboxName,
+				Workspace: workspace,
 				ServiceId: cfg.serviceID,
 				Target: &pb.TcpForwardInit_Tcp{
 					Tcp: &pb.TcpRelayTarget{
@@ -103,9 +101,7 @@ func (t *tcpClient) Listen(ctx context.Context, workspace, sandboxName string, r
 	}
 
 	cfg := listenConfig{bindAddress: "127.0.0.1"}
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	if cfg.useSSHTunnel && t.ssh == nil {
 		return nil, &StatusError{

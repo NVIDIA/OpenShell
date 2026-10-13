@@ -7,6 +7,7 @@ import (
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
 	sbv1 "github.com/NVIDIA/OpenShell/sdk/go/proto/sandboxv1"
+	"google.golang.org/protobuf/types/known/durationpb"
 )
 
 // --- ProfileCategory enum mapping ---
@@ -137,17 +138,18 @@ func ProfileCredentialFromProto(c *pb.ProviderProfileCredential) *types.ProfileC
 		return nil
 	}
 	return &types.ProfileCredential{
-		Name:         c.GetName(),
-		Description:  c.GetDescription(),
-		EnvVars:      CopyStringSlice(c.GetEnvVars()),
-		Required:     c.GetRequired(),
-		Secret:       c.GetRefresh() != nil,
-		Refresh:      profileCredentialRefreshFromProto(c.GetRefresh()),
-		AuthStyle:    c.GetAuthStyle(),
-		HeaderName:   c.GetHeaderName(),
-		QueryParam:   c.GetQueryParam(),
-		PathTemplate: c.GetPathTemplate(),
-		TokenGrant:   tokenGrantFromProto(c.GetTokenGrant()),
+		Name:              c.GetName(),
+		Description:       c.GetDescription(),
+		EnvVars:           CopyStringSlice(c.GetEnvVars()),
+		Required:          c.GetRequired(),
+		StablePlaceholder: c.GetStablePlaceholder(),
+		Secret:            c.GetRefresh() != nil,
+		Refresh:           profileCredentialRefreshFromProto(c.GetRefresh()),
+		AuthStyle:         c.GetAuthStyle(),
+		HeaderName:        c.GetHeaderName(),
+		QueryParam:        c.GetQueryParam(),
+		PathTemplate:      c.GetPathTemplate(),
+		TokenGrant:        tokenGrantFromProto(c.GetTokenGrant()),
 	}
 }
 
@@ -157,17 +159,32 @@ func ProfileCredentialToProto(c *types.ProfileCredential) *pb.ProviderProfileCre
 		return nil
 	}
 	return &pb.ProviderProfileCredential{
-		Name:         c.Name,
-		Description:  c.Description,
-		EnvVars:      CopyStringSlice(c.EnvVars),
-		Required:     c.Required,
-		AuthStyle:    c.AuthStyle,
-		HeaderName:   c.HeaderName,
-		QueryParam:   c.QueryParam,
-		PathTemplate: c.PathTemplate,
-		Refresh:      profileCredentialRefreshToProto(c.Refresh),
-		TokenGrant:   tokenGrantToProto(c.TokenGrant),
+		Name:              c.Name,
+		Description:       c.Description,
+		EnvVars:           CopyStringSlice(c.EnvVars),
+		Required:          c.Required,
+		StablePlaceholder: c.StablePlaceholder,
+		AuthStyle:         c.AuthStyle,
+		HeaderName:        c.HeaderName,
+		QueryParam:        c.QueryParam,
+		PathTemplate:      c.PathTemplate,
+		Refresh:           profileCredentialRefreshToProto(c.Refresh),
+		TokenGrant:        tokenGrantToProto(c.TokenGrant),
 	}
+}
+
+func profileDurationFromProto(value *durationpb.Duration) *types.ProfileDuration {
+	if value == nil {
+		return nil
+	}
+	return &types.ProfileDuration{Seconds: value.Seconds, Nanos: value.Nanos}
+}
+
+func profileDurationToProto(value *types.ProfileDuration) *durationpb.Duration {
+	if value == nil {
+		return nil
+	}
+	return &durationpb.Duration{Seconds: value.Seconds, Nanos: value.Nanos}
 }
 
 func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.ProfileCredentialRefresh {
@@ -176,8 +193,8 @@ func profileCredentialRefreshFromProto(r *pb.ProviderCredentialRefresh) *types.P
 	}
 	result := &types.ProfileCredentialRefresh{
 		Strategy: RefreshStrategyFromProto(r.GetStrategy()), TokenURL: r.GetTokenUrl(),
-		Scopes: CopyStringSlice(r.GetScopes()), RefreshBeforeSeconds: r.GetRefreshBeforeSeconds(),
-		MaxLifetimeSeconds: r.GetMaxLifetimeSeconds(),
+		Scopes: CopyStringSlice(r.GetScopes()), RefreshBefore: profileDurationFromProto(r.RefreshBefore),
+		MaxLifetime: profileDurationFromProto(r.MaxLifetime),
 	}
 	for _, material := range r.GetMaterial() {
 		result.Material = append(result.Material, types.ProfileCredentialRefreshMaterial{Name: material.GetName(), Description: material.GetDescription(), Required: material.GetRequired(), Secret: material.GetSecret()})
@@ -194,8 +211,8 @@ func profileCredentialRefreshToProto(r *types.ProfileCredentialRefresh) *pb.Prov
 	}
 	result := &pb.ProviderCredentialRefresh{
 		Strategy: RefreshStrategyToProto(r.Strategy), TokenUrl: r.TokenURL,
-		Scopes: CopyStringSlice(r.Scopes), RefreshBeforeSeconds: r.RefreshBeforeSeconds,
-		MaxLifetimeSeconds: r.MaxLifetimeSeconds,
+		Scopes: CopyStringSlice(r.Scopes), RefreshBefore: profileDurationToProto(r.RefreshBefore),
+		MaxLifetime: profileDurationToProto(r.MaxLifetime),
 	}
 	for _, material := range r.Material {
 		result.Material = append(result.Material, &pb.ProviderCredentialRefreshMaterial{Name: material.Name, Description: material.Description, Required: material.Required, Secret: material.Secret})
@@ -215,7 +232,7 @@ func tokenGrantFromProto(tg *pb.ProviderCredentialTokenGrant) *types.CredentialT
 		Audience:            tg.GetAudience(),
 		JWTSVIDAudience:     tg.GetJwtSvidAudience(),
 		Scopes:              CopyStringSlice(tg.GetScopes()),
-		CacheTTLSeconds:     tg.GetCacheTtlSeconds(),
+		CacheTTL:            profileDurationFromProto(tg.CacheTtl),
 		ClientAssertionType: tg.GetClientAssertionType(),
 		GrantType:           CredentialTokenGrantTypeFromProto(tg.GetGrantType()),
 		SubjectToken:        subjectTokenFromProto(tg.GetSubjectToken()),
@@ -239,7 +256,7 @@ func tokenGrantToProto(tg *types.CredentialTokenGrant) *pb.ProviderCredentialTok
 		Audience:            tg.Audience,
 		JwtSvidAudience:     tg.JWTSVIDAudience,
 		Scopes:              CopyStringSlice(tg.Scopes),
-		CacheTtlSeconds:     tg.CacheTTLSeconds,
+		CacheTtl:            profileDurationToProto(tg.CacheTTL),
 		ClientAssertionType: tg.ClientAssertionType,
 		GrantType:           CredentialTokenGrantTypeToProto(tg.GrantType),
 		SubjectToken:        subjectTokenToProto(tg.SubjectToken),
@@ -348,6 +365,18 @@ func ProviderProfileFromProto(p *pb.ProviderProfile) *types.ProviderProfile {
 		}
 	}
 
+	// Files
+	if files := p.GetFiles(); len(files) > 0 {
+		result.Files = make([]types.ProfileFile, len(files))
+		for i, file := range files {
+			if file != nil {
+				result.Files[i] = types.ProfileFile{
+					Path: file.GetPath(), Content: file.GetContent(), EnvVar: file.GetEnvVar(),
+				}
+			}
+		}
+	}
+
 	// Endpoints
 	if eps := p.GetEndpoints(); len(eps) > 0 {
 		result.Endpoints = make([]types.NetworkEndpoint, len(eps))
@@ -401,6 +430,16 @@ func ProviderProfileToProto(p *types.ProviderProfile) *pb.ProviderProfile {
 		result.Credentials = make([]*pb.ProviderProfileCredential, len(p.Credentials))
 		for i := range p.Credentials {
 			result.Credentials[i] = ProfileCredentialToProto(&p.Credentials[i])
+		}
+	}
+
+	// Files
+	if len(p.Files) > 0 {
+		result.Files = make([]*pb.ProviderProfileFile, len(p.Files))
+		for i, file := range p.Files {
+			result.Files[i] = &pb.ProviderProfileFile{
+				Path: file.Path, Content: file.Content, EnvVar: file.EnvVar,
+			}
 		}
 	}
 

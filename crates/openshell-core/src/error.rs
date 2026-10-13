@@ -106,8 +106,8 @@ impl Error {
 
 /// Error type shared by all compute driver implementations.
 ///
-/// Both the Podman and Kubernetes drivers map their backend-specific
-/// errors into these variants before crossing crate boundaries.
+/// Drivers map backend-specific errors into these variants before crossing
+/// crate boundaries.
 #[derive(Debug, Error)]
 pub enum ComputeDriverError {
     /// The requested sandbox already exists.

@@ -66,7 +66,7 @@ client.AddProvider(&types.Provider{
 })
 
 // List returns the seeded provider
-providers, _ := client.Providers().List(ctx, "default")
+providers, _ := client.Providers().ListAll(ctx, "default")
 // len(providers) == 1
 ```
 
@@ -87,7 +87,7 @@ sb, err = client.Sandboxes().WaitReady(ctx, "default", "my-sandbox")
 assert.Equal(t, types.SandboxReady, sb.Status.Phase)
 
 // Delete removes the sandbox
-err = client.Sandboxes().Delete(ctx, "default", "my-sandbox")
+_, err = client.Sandboxes().Delete(ctx, "default", "my-sandbox")
 assert.NoError(t, err)
 
 // Get after delete returns NotFound

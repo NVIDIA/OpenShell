@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	v1 "github.com/NVIDIA/OpenShell/sdk/go/openshell/v1"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
@@ -27,9 +28,7 @@ func NewClient(name string, opts ...ClientOption) (*v1.Client, error) {
 
 	// Apply caller options.
 	cc := &clientConfig{}
-	for _, o := range opts {
-		o(cc)
-	}
+	options.Apply(cc, opts)
 
 	// Resolve auth provider: caller override takes precedence.
 	auth := cc.auth

@@ -9,69 +9,89 @@ pub use crate::commands::common::{
 };
 use crate::commands::common::{
     ProvisioningDisplay, ProvisioningStep, confirm_global_setting_delete,
-    confirm_global_setting_takeover, format_epoch_ms, format_optional_epoch_ms,
-    format_setting_value, format_timestamp, format_timestamp_ms, handle_platform_progress_event,
-    is_provisioning_progress_event, non_empty_or, parse_cli_setting_value,
-    parse_credential_expiry_pairs, parse_credential_pairs, parse_duration_to_ms, phase_name,
+    confirm_global_setting_takeover, format_epoch_ms, format_setting_value, format_timestamp,
+    format_timestamp_ms, handle_platform_progress_event, is_provisioning_progress_event,
+    non_empty_or, parse_cli_setting_value, parse_duration_to_ms, phase_name,
     print_policy_merge_warnings, print_sandbox_header, print_sandbox_policy,
     provisioning_timeout_message, ready_false_condition_message, scrub_git_env, short_hash,
-    truncate_display, truncate_status_field,
+    truncate_status_field,
 };
 pub use crate::commands::gateway::{
     gateway_add, gateway_info, gateway_info_not_configured, gateway_list, gateway_login,
     gateway_logout, gateway_remove, gateway_select, gateway_status, gateway_use,
 };
 
+use crate::commands::provider::fetch_provider_profile_catalog;
+pub use crate::commands::provider::{
+    ProviderCreateCredentialSource, ProviderCreateOptions, ProviderRefreshConfigInput,
+    ProviderUpdateOptions, ensure_required_providers, provider_create,
+    provider_create_with_options, provider_delete, provider_get, provider_list,
+    provider_list_profiles, provider_list_profiles_text, provider_profile_delete,
+    provider_profile_describe, provider_profile_describe_text, provider_profile_export,
+    provider_profile_export_text, provider_profile_import, provider_profile_lint,
+    provider_profile_update, provider_refresh_config, provider_refresh_delete,
+    provider_refresh_status, provider_rotate, provider_update, sandbox_provider_attach,
+    sandbox_provider_detach, sandbox_provider_list,
+};
+pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provider_status};
+
+use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{TlsOptions, grpc_client, grpc_inference_client};
-use dialoguer::Confirm;
+use crate::tls::{
+    TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
+};
 use futures::StreamExt;
-use indicatif::{ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_last_sandbox_if_matches, get_gateway_metadata, save_last_sandbox,
 };
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
-    CreateSandboxRequest, CreateSshSessionRequest, DeleteInferenceRouteRequest,
-    DeleteProviderProfileRequest, DeleteProviderRefreshRequest, DeleteProviderRequest,
-    DeleteSandboxRequest, DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, BeginRootfsTarStagingRequest,
+    ClearDraftChunksRequest, CreateSandboxRequest, CreateSandboxTemplateRequest,
+    CreateSshSessionRequest, DeleteSandboxRequest, DeleteSandboxTemplateRequest,
+    DeleteServiceRequest, DeletionOutcome, EndpointResult, EndpointStatus, ExecSandboxRequest,
     ExposeServiceRequest, GetCurrentUserRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetInferenceRouteRequest, GetProviderProfileRequest,
-    GetProviderRefreshStatusRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, GpuResourceRequirements, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshRecoveryAction, ProviderCredentialRefreshStatus,
-    ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrantType, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    ResourceRequirements, RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
-    SetInferenceRouteRequest, SettingScope, StartSandboxRequest, StopSandboxRequest,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
-    UpdateProviderProfilesRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    GetGatewayConfigRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    GetSandboxTemplateRequest, GetServiceRequest, GpuResourceRequirements,
+    ListSandboxPoliciesRequest, ListSandboxTemplatesRequest, ListSandboxesRequest,
+    ListServicesRequest, PolicySource, PolicyStatus, RejectDraftChunkRequest, ResourceRequirements,
+    RevokeSshSessionRequest, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy,
+    SandboxResources, SandboxRestartPolicy, SandboxServiceExposure, SandboxServiceLevel,
+    SandboxSpec, SandboxStartup, SandboxTemplate, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+    SandboxWorkloadTemplateSpec, ServiceAuthorizationMode, ServiceEndpointResponse, SettingScope,
+    StartSandboxRequest, StopSandboxRequest, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, WatchSandboxRequest, exec_sandbox_event, tcp_forward_init,
 };
 use openshell_core::settings;
 use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
-use openshell_providers::{
-    ProviderRegistry, ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command,
-    discover_from_profile, normalize_provider_type, parse_profile_json, parse_profile_yaml,
-    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
-};
-use owo_colors::OwoColorize;
+use prost::Message;
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::{Code, Status};
+
+const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn proto_timestamp_ms(timestamp: Option<&prost_types::Timestamp>) -> i64 {
+    timestamp
+        .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+        .unwrap_or_default()
+}
+
+fn proto_execution_timeout(timeout_seconds: u32) -> Result<Option<prost_types::Duration>> {
+    if timeout_seconds == 0 {
+        return Ok(None);
+    }
+    openshell_core::time::duration_from_std(Duration::from_secs(timeout_seconds.into()))
+        .map(Some)
+        .into_diagnostic()
+}
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
@@ -90,7 +110,6 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
-    GitFilteredEmpty,
 }
 
 enum ProgressOutput {
@@ -116,6 +135,20 @@ impl ProgressOutput {
 
     fn is_plain(&self) -> bool {
         matches!(self, Self::Plain)
+    }
+}
+
+fn aggregate_delete_failures(resource: &str, failures: &[String]) -> Result<()> {
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(miette!(
+            "failed to delete {} {}{}: {}",
+            failures.len(),
+            resource,
+            if failures.len() == 1 { "" } else { "s" },
+            failures.join(", ")
+        ))
     }
 }
 
@@ -220,8 +253,38 @@ pub fn doctor_check() -> Result<()> {
     Err(miette::miette!("docker info failed: {}", stderr.trim()))
 }
 
-fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>) -> bool {
-    keep || forward.is_some()
+fn sandbox_should_persist(keep: bool, forward: Option<&ForwardSpec>, expose: Option<u16>) -> bool {
+    keep || forward.is_some() || expose.is_some()
+}
+
+fn has_main_process_result(sandbox: &Sandbox) -> bool {
+    let Some(status) = sandbox.status.as_ref() else {
+        return false;
+    };
+    if status.exit_code.is_none() {
+        return false;
+    }
+
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase != SandboxPhase::Error
+        || status.conditions.iter().any(|condition| {
+            condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason == "MainProcessFailed"
+        })
+}
+
+fn is_provisional_container_exit(sandbox: &Sandbox) -> bool {
+    let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+    phase == SandboxPhase::Error
+        && sandbox.status.as_ref().is_some_and(|status| {
+            status.exit_code.is_none()
+                && status.conditions.iter().any(|condition| {
+                    condition.r#type == "Ready"
+                        && condition.status.eq_ignore_ascii_case("false")
+                        && condition.reason == "ContainerExited"
+                })
+        })
 }
 
 fn build_sandbox_resource_limits(
@@ -339,19 +402,21 @@ async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
     persist: bool,
-    session_result: Result<()>,
+    session_result: Result<i32>,
     workspace: &str,
     tls: &TlsOptions,
     gateway: &str,
-) -> Result<()> {
+) -> Result<i32> {
     if persist {
         return session_result;
     }
 
     let names = [sandbox_name.to_string()];
     if let Err(err) = sandbox_delete(server, &names, false, workspace, tls, gateway).await {
-        if session_result.is_ok() {
-            return Err(err);
+        if let Ok(exit_code) = session_result.as_ref() {
+            return Err(miette::miette!(
+                "sandbox command exited with status {exit_code}, but ephemeral cleanup failed: {err}"
+            ));
         }
         eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
     }
@@ -367,6 +432,7 @@ async fn finalize_sandbox_create_session(
 #[derive(Debug)]
 pub struct SandboxCreateConfig<'a> {
     pub name: Option<&'a str>,
+    pub template: Option<&'a str>,
     pub from: Option<&'a str>,
     pub uploads: &'a [(String, Option<String>, bool)],
     pub keep: bool,
@@ -378,6 +444,8 @@ pub struct SandboxCreateConfig<'a> {
     pub providers: &'a [String],
     pub policy: Option<&'a str>,
     pub forward: Option<ForwardSpec>,
+    pub expose: Option<u16>,
+    pub expose_authorization_mode: ServiceAuthorizationMode,
     pub command: &'a [String],
     pub tty_override: Option<bool>,
     pub auto_providers_override: Option<bool>,
@@ -386,12 +454,15 @@ pub struct SandboxCreateConfig<'a> {
     pub approval_mode: &'a str,
     pub output: &'a str,
     pub detach: bool,
+    pub suppress_credential_warnings: bool,
+    pub restart_policy: &'a str,
 }
 
 impl Default for SandboxCreateConfig<'_> {
     fn default() -> Self {
         Self {
             name: None,
+            template: None,
             from: None,
             uploads: &[],
             keep: false,
@@ -403,6 +474,8 @@ impl Default for SandboxCreateConfig<'_> {
             providers: &[],
             policy: None,
             forward: None,
+            expose: None,
+            expose_authorization_mode: ServiceAuthorizationMode::Strip,
             command: &[],
             tty_override: None,
             auto_providers_override: None,
@@ -411,6 +484,8 @@ impl Default for SandboxCreateConfig<'_> {
             approval_mode: "manual",
             output: "table",
             detach: false,
+            suppress_credential_warnings: false,
+            restart_policy: "never",
         }
     }
 }
@@ -422,9 +497,10 @@ pub async fn sandbox_create(
     config: SandboxCreateConfig<'_>,
     workspace: &str,
     tls: &TlsOptions,
-) -> Result<()> {
+) -> Result<i32> {
     let SandboxCreateConfig {
         name,
+        template,
         from,
         uploads,
         keep,
@@ -436,6 +512,8 @@ pub async fn sandbox_create(
         providers,
         policy,
         forward,
+        expose,
+        expose_authorization_mode,
         command,
         tty_override,
         auto_providers_override,
@@ -444,6 +522,8 @@ pub async fn sandbox_create(
         approval_mode,
         output,
         detach,
+        suppress_credential_warnings,
+        restart_policy,
     } = config;
 
     if editor.is_some() && !command.is_empty() {
@@ -456,6 +536,20 @@ pub async fn sandbox_create(
             "--upload cannot be combined with a trailing main command yet because uploads complete after the canonical process starts"
         ));
     }
+    if output != "table" && !command.is_empty() && !detach {
+        return Err(miette::miette!(
+            "structured output cannot be combined with an attached trailing command; use table output to stream the command or add --detach"
+        ));
+    }
+    if expose == Some(0) {
+        return Err(miette::miette!("--expose port must be in 1..=65535"));
+    }
+
+    // Plan every upload before provisioning so a rejected one leaves no sandbox.
+    let upload_plans = uploads
+        .iter()
+        .map(|(local_path, _, git_ignore)| sandbox_upload_plan(Path::new(local_path), *git_ignore))
+        .collect::<Result<Vec<_>>>()?;
 
     // Check port availability *before* creating the sandbox so we don't
     // leave an orphaned sandbox behind when the forward would fail.
@@ -473,52 +567,76 @@ pub async fn sandbox_create(
     let effective_server = server.to_string();
     let effective_tls = tls.clone();
 
-    // Resolve the --from flag into a container image reference, building from
-    // a Dockerfile first if necessary.
-    let image: Option<String> = match from {
-        Some(val) => {
-            let resolved = resolve_from(val)?;
-            match resolved {
-                ResolvedSource::Image(img) => Some(img),
-                ResolvedSource::Dockerfile {
-                    dockerfile,
-                    context,
-                } => {
-                    let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
-                    Some(tag)
+    // Provider profiles are import-only, so the catalog lives on the gateway.
+    // Its only consumer is the credential warning, which is advisory: an
+    // unreachable catalog degrades the warning to its generic form rather than
+    // blocking sandbox creation. Nothing else derives authority from it.
+    let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
+        .await
+        .unwrap_or_default();
+    warn_credential_env_vars(&environment, &profile_catalog, suppress_credential_warnings);
+
+    if template.is_some()
+        && (from.is_some()
+            || gpu_requirements.is_some()
+            || cpu.is_some()
+            || memory.is_some()
+            || driver_config_json.is_some()
+            || !environment.is_empty())
+    {
+        return Err(miette::miette!(
+            "--template cannot be combined with inline workload flags"
+        ));
+    }
+
+    // Resolve the --from flag into a container image reference, or stage a
+    // rootfs tar on the gateway and retain its staging token. Template creates
+    // resolve workload shape on the gateway and skip --from.
+    let (image, rootfs_tar_token): (Option<String>, Option<String>) = if template.is_some() {
+        (None, None)
+    } else {
+        match from {
+            Some(val) => {
+                let resolved = resolve_from(val)?;
+                match resolved {
+                    ResolvedSource::Image(img) => (Some(img), None),
+                    ResolvedSource::RootfsTar { path } => {
+                        let token =
+                            stage_rootfs_tar(gateway_name, &mut client, workspace, &path).await?;
+                        (None, Some(token))
+                    }
                 }
             }
+            None => (None, None),
         }
-        None => None,
     };
-    let inferred_provider = inferred_provider_type(command);
-    let providers_v2_enabled =
-        if inferred_provider.is_some() && auto_providers_override != Some(false) {
-            gateway_providers_v2_enabled(&mut client).await?
-        } else {
-            false
-        };
-    let inferred_types: Vec<String> = if providers_v2_enabled {
-        Vec::new()
-    } else {
-        inferred_provider.into_iter().collect()
-    };
-    let configured_providers = ensure_required_providers(
-        &mut client,
-        providers,
-        &inferred_types,
-        auto_providers_override,
-        workspace,
-    )
-    .await?;
+    let configured_providers =
+        ensure_required_providers(&mut client, providers, auto_providers_override, workspace)
+            .await?;
 
     let policy = load_sandbox_policy(policy)?;
-    let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
-    let driver_config = driver_config_json
-        .map(parse_driver_config_json)
-        .transpose()?;
+    let resource_limits = if template.is_none() {
+        build_sandbox_resource_limits(cpu, memory)?
+    } else {
+        None
+    };
+    let mut driver_config = if template.is_none() {
+        driver_config_json
+            .map(parse_driver_config_json)
+            .transpose()?
+    } else {
+        None
+    };
 
-    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
+    if let Some(token) = &rootfs_tar_token {
+        driver_config = Some(merge_rootfs_tar_driver_config(driver_config, token)?);
+    }
+
+    let inline_template = if image.is_some()
+        || resource_limits.is_some()
+        || driver_config.is_some()
+        || rootfs_tar_token.is_some()
+    {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
@@ -533,26 +651,63 @@ pub async fn sandbox_create(
 
     let main_terminal = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
-    let main_command = if command.is_empty() {
-        vec!["/bin/bash".to_string(), "-l".to_string()]
+    // Forward the command as-is. When empty, the gateway persists it empty and
+    // the supervisor resolves the default login shell against the sandbox image
+    // (bash when present, otherwise /bin/sh on minimal images like Alpine).
+    // Baking a shell here would force a shell the image may not ship.
+    let main_command = command.to_vec();
+    let persist = sandbox_should_persist(keep, forward.as_ref(), expose);
+    let create_detaches = detach
+        || (persist
+            && command.is_empty()
+            && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()));
+    let await_main_process_attachment = output == "table" && editor.is_none() && !create_detaches;
+    let annotations = if persist {
+        HashMap::new()
     } else {
-        command.to_vec()
+        HashMap::from([(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        )])
     };
     let request = CreateSandboxRequest {
+        request_id: String::new(),
         spec: Some(SandboxSpec {
             resource_requirements,
-            environment,
+            environment: if template.is_none() {
+                environment
+            } else {
+                HashMap::new()
+            },
             policy,
             providers: configured_providers,
-            template,
+            template: inline_template,
             command: main_command,
             tty: main_terminal,
+            restart_policy: match restart_policy {
+                "never" => SandboxRestartPolicy::Never as i32,
+                "on-failure" => SandboxRestartPolicy::OnFailure as i32,
+                "always" => SandboxRestartPolicy::Always as i32,
+                value => return Err(miette::miette!("invalid restart policy '{value}'")),
+            },
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
         labels,
-        annotations: HashMap::new(),
-        workspace: workspace.to_string(),
+        annotations,
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+        await_main_process_attachment,
+        workload_template: template.unwrap_or_default().to_string(),
+        service_exposures: expose
+            .map(|target_port| SandboxServiceExposure {
+                service: String::new(),
+                target_port: u32::from(target_port),
+                authorization_mode: expose_authorization_mode as i32,
+            })
+            .into_iter()
+            .collect(),
     };
 
     let response = match client.create_sandbox(request).await {
@@ -565,13 +720,17 @@ pub async fn sandbox_create(
         }
         Err(status) => return Err(miette::miette!(status.to_string())),
     };
+    let response = response.into_inner();
+    let service_urls = response
+        .service_urls
+        .into_iter()
+        .map(|(service, url)| (service, service_url_for_gateway(&url, &effective_server)))
+        .collect::<HashMap<_, _>>();
     let sandbox = response
-        .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let persist = sandbox_should_persist(keep, forward.as_ref());
     let sandbox_name = if sandbox.object_name().is_empty() {
         "unknown".to_string()
     } else {
@@ -594,10 +753,12 @@ pub async fn sandbox_create(
         let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
         match client
             .update_config(UpdateConfigRequest {
-                name: sandbox_name.clone(),
+                sandbox: sandbox_name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
                 setting_value: Some(setting),
-                workspace: workspace.to_string(),
                 ..Default::default()
             })
             .await
@@ -648,28 +809,26 @@ pub async fn sandbox_create(
     // Non-interactive mode: track start time for timestamps.
     let provision_start = Instant::now();
 
-    // Don't use stop_on_terminal on the server — the Kubernetes CRD may
-    // briefly report a stale Ready status before the controller reconciles
-    // a newly created sandbox.  Instead we handle termination client-side:
-    // we wait until we have observed at least one non-Ready phase followed
-    // by Ready (a genuine Provisioning → Ready transition).
-    let sandbox_id = if sandbox.object_id().is_empty() {
-        "unknown".to_string()
-    } else {
-        sandbox.object_id().to_string()
-    };
+    // Handle terminal states here so a provisional container exit can wait
+    // for the supervisor's canonical-process result before cleanup.
+    let sandbox_name = sandbox.object_name().to_string();
+    let sandbox_workspace = sandbox.object_workspace().to_string();
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
-            id: sandbox_id.clone(),
+            sandbox: sandbox_name.clone(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                sandbox_workspace.clone(),
+            )),
             follow_status: true,
             follow_logs: true,
             follow_events: true,
             log_tail_lines: 200,
             event_tail: 50,
             stop_on_terminal: false,
-            log_since_ms: 0,
+            since_time: None,
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -679,8 +838,6 @@ pub async fn sandbox_create(
     let mut last_sandbox = sandbox.clone();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
-    // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -688,6 +845,12 @@ pub async fn sandbox_create(
             .unwrap_or(300),
     );
     let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
+    // The compute driver can publish ContainerExited while the supervisor's
+    // authoritative canonical-process result is waiting for the same gateway
+    // state lock. Keep watching briefly so the provisional error cannot race
+    // ephemeral cleanup, but retain a deadline for containers that exit before
+    // the supervisor can report a result.
+    let mut provisional_container_exit_deadline: Option<Instant> = None;
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
@@ -696,8 +859,15 @@ pub async fn sandbox_create(
         // longer than the default timeout pulling and preparing large images,
         // but only recognized progress events extend the idle deadline. Logs
         // and generic status churn must not keep a stuck sandbox alive forever.
-        let remaining = provisioning_idle_deadline.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let mut remaining = provisioning_idle_deadline.saturating_duration_since(now);
+        if let Some(deadline) = provisional_container_exit_deadline {
+            remaining = remaining.min(deadline.saturating_duration_since(now));
+        }
         if remaining.is_zero() {
+            if provisional_container_exit_deadline.is_some() {
+                break;
+            }
             let timeout_message = provisioning_timeout_message(
                 provision_timeout.as_secs(),
                 resource_requirements.as_ref(),
@@ -717,6 +887,7 @@ pub async fn sandbox_create(
         let item = match maybe_item {
             Ok(Some(item)) => item,
             Ok(None) => break, // stream ended
+            Err(_elapsed) if provisional_container_exit_deadline.is_some() => break,
             Err(_elapsed) => {
                 // Timeout fired — the stream was idle for too long.
                 let timeout_message = provisioning_timeout_message(
@@ -744,12 +915,20 @@ pub async fn sandbox_create(
                     last_condition_message = Some(message);
                 }
 
-                if phase != SandboxPhase::Ready {
-                    saw_non_ready = true;
+                let main_process_result = has_main_process_result(&s);
+                if matches!(
+                    phase,
+                    SandboxPhase::Completed | SandboxPhase::Error | SandboxPhase::Stopped
+                ) && main_process_result
+                {
+                    if let Some(d) = display.as_interactive_mut() {
+                        d.clear();
+                    }
+                    break;
                 }
 
-                // Capture error reason from conditions only when phase is Error
-                // to avoid showing stale transient error reasons
+                // Capture infrastructure error reasons only after excluding a
+                // canonical-command result, which must attach and drain output.
                 if phase == SandboxPhase::Error
                     && let Some(status) = &s.status
                 {
@@ -761,12 +940,19 @@ pub async fn sandbox_create(
                                 format!("{}: {}", condition.reason, condition.message);
                         }
                     }
+                    if is_provisional_container_exit(&s) {
+                        provisional_container_exit_deadline.get_or_insert_with(|| {
+                            Instant::now() + PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT
+                        });
+                        continue;
+                    }
                     break;
                 }
 
-                // Only accept Ready as terminal after we've observed a
-                // non-Ready phase, proving the controller has reconciled.
-                if saw_non_ready && phase == SandboxPhase::Ready {
+                // The gateway owns readiness. Its initial watch snapshot may
+                // already be Ready if provisioning finished before CREATE
+                // returned; requiring an earlier phase would miss that state.
+                if phase == SandboxPhase::Ready {
                     if let Some(d) = display.as_interactive_mut() {
                         d.clear();
                     }
@@ -828,7 +1014,11 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    if final_phase != SandboxPhase::Ready
+    let final_has_main_process_result = has_main_process_result(&last_sandbox);
+    if !(matches!(
+        final_phase,
+        SandboxPhase::Ready | SandboxPhase::Completed | SandboxPhase::Stopped
+    ) || final_phase == SandboxPhase::Error && final_has_main_process_result)
         && let Some(d) = display.as_interactive_mut()
     {
         if final_phase == SandboxPhase::Error {
@@ -852,7 +1042,9 @@ pub async fn sandbox_create(
             drop(client);
 
             let upload_count = uploads.len();
-            for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
+            for (idx, ((local_path, sandbox_path, _), upload_plan)) in
+                uploads.iter().zip(upload_plans).enumerate()
+            {
                 let dest = sandbox_path.as_deref();
                 let dest_display = dest.unwrap_or("~");
                 if upload_count > 1 {
@@ -868,49 +1060,23 @@ pub async fn sandbox_create(
                         "\u{2022}".dimmed(),
                     );
                 }
-                let local = Path::new(local_path);
-                match sandbox_upload_plan(local, *git_ignore)? {
-                    SandboxUploadPlan::GitAware { base_dir, files } => {
-                        sandbox_sync_up_files(
-                            &effective_server,
-                            &sandbox_name,
-                            &base_dir,
-                            &files,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::GitFilteredEmpty => {
-                        eprintln!(
-                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                            "⚠".yellow().bold(),
-                            local.display(),
-                        );
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                    SandboxUploadPlan::Regular => {
-                        sandbox_sync_up(
-                            &effective_server,
-                            &sandbox_name,
-                            local,
-                            dest,
-                            &effective_tls,
-                            workspace,
-                        )
-                        .await?;
-                    }
-                }
+                // Boxed so the upload state machine lives on the heap instead of
+                // inflating the `sandbox_create` future (clippy::large_futures).
+                Box::pin(sandbox_upload_planned(
+                    upload_plan,
+                    &effective_server,
+                    &sandbox_name,
+                    Path::new(local_path),
+                    dest,
+                    &effective_tls,
+                    workspace,
+                ))
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "Sandbox '{sandbox_name}' was created and still exists.\nRetry the upload with 'openshell sandbox upload', or remove the sandbox with 'openshell sandbox delete'",
+                    )
+                })?;
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
 
@@ -939,9 +1105,28 @@ pub async fn sandbox_create(
                 );
             }
 
+            if let Some(target_port) = expose
+                && !structured_output
+            {
+                eprintln!(
+                    "  {} Exposed sandbox {sandbox_name} service on 127.0.0.1:{target_port}",
+                    "\u{2713}".green().bold(),
+                );
+                if let Some(url) = service_urls.get("").filter(|url| !url.is_empty()) {
+                    eprintln!(
+                        "  Access at: {}",
+                        service_url_for_gateway(url, &effective_server)
+                    );
+                }
+            }
+
             if structured_output {
-                crate::output::print_output_single(output, &last_sandbox, sandbox_to_json)?;
-                return Ok(());
+                let mut value = sandbox_to_json(&last_sandbox);
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("service_urls".to_string(), serde_json::json!(service_urls));
+                }
+                crate::output::print_output_single(output, &value, Clone::clone)?;
+                return Ok(0);
             }
 
             if let Some(editor) = editor {
@@ -955,18 +1140,18 @@ pub async fn sandbox_create(
                     workspace,
                 )
                 .await?;
-                return Ok(());
+                return Ok(0);
             }
 
-            // Persistent non-interactive creates detach implicitly. An
-            // explicitly ephemeral (`--no-keep`) create must still attach so
-            // it can observe the canonical process and delete the sandbox when
-            // that session ends.
+            // An explicit trailing command is foreground regardless of TTY
+            // detection. Only --detach opts out. Scratch shells retain the
+            // non-interactive implicit-detach behavior.
             if detach
                 || (persist
+                    && command.is_empty()
                     && (!std::io::stdin().is_terminal() || !std::io::stdout().is_terminal()))
             {
-                return Ok(());
+                return Ok(0);
             }
 
             let connect_result = if persist {
@@ -992,23 +1177,69 @@ pub async fn sandbox_create(
             )
             .await
         }
-        SandboxPhase::Error => {
+        SandboxPhase::Completed | SandboxPhase::Stopped | SandboxPhase::Error
+            if final_has_main_process_result =>
+        {
             drop(stream);
             drop(client);
-            let create_result = if last_error_reason.is_empty() {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning"
-                ))
-            } else {
-                Err(miette::miette!(
-                    "sandbox entered error phase while provisioning: {}",
-                    last_error_reason
-                ))
-            };
+            if detach {
+                return Ok(0);
+            }
+            let connect_result = crate::ssh::sandbox_connect_terminal_main(
+                &effective_server,
+                &sandbox_name,
+                &effective_tls,
+                workspace,
+            )
+            .await;
             finalize_sandbox_create_session(
                 &effective_server,
                 &sandbox_name,
                 persist,
+                connect_result,
+                workspace,
+                &effective_tls,
+                gateway_name,
+            )
+            .await
+        }
+        SandboxPhase::Error => {
+            drop(stream);
+            drop(client);
+            let timed_out_provisioning = last_sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.provisioning.as_ref())
+                .filter(|record| record.timeout_time.is_some());
+            let create_result = timed_out_provisioning.map_or_else(
+                || {
+                    if last_error_reason.is_empty() {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning"
+                        ))
+                    } else {
+                        Err(miette::miette!(
+                            "sandbox entered error phase while provisioning: {}",
+                            last_error_reason
+                        ))
+                    }
+                },
+                |record| {
+                    Err(miette::miette!(
+                        "{}",
+                        retained_sandbox_timeout_message(&sandbox_name, &last_error_reason, record)
+                    ))
+                },
+            );
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist
+                    || last_sandbox
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.provisioning.as_ref())
+                        .is_some_and(|record| record.timeout_time.is_some()),
                 create_result,
                 workspace,
                 &effective_tls,
@@ -1022,186 +1253,270 @@ pub async fn sandbox_create(
     }
 }
 
+/// Use the persisted phase to select recovery guidance. Preparation may expire
+/// before any policy is evaluated, so it must not tell the user to repair policy.
+fn retained_sandbox_timeout_message(
+    sandbox_name: &str,
+    error_reason: &str,
+    record: &openshell_core::proto::SandboxProvisioning,
+) -> String {
+    let recovery = if record.preparation_deadline.is_some() && record.admission_start_time.is_none()
+    {
+        "check image preparation and supervisor startup diagnostics and the gateway's `image_preparation_timeout_seconds` budget"
+    } else {
+        "repair its configuration"
+    };
+    format!(
+        "{error_reason}\nSandbox '{sandbox_name}' was retained. Inspect it with `openshell sandbox get {sandbox_name}`; {recovery}, then run `openshell sandbox start {sandbox_name}` after cleanup completes."
+    )
+}
+
 /// Resolved source for the `--from` flag on `sandbox create`.
 #[derive(Debug)]
 enum ResolvedSource {
     /// A ready-to-use container image reference.
     Image(String),
-    /// A Dockerfile that must be built before creating the sandbox.
-    Dockerfile {
-        dockerfile: PathBuf,
-        context: PathBuf,
-    },
+    /// A flat rootfs tar archive (`.tar`, `.tar.gz`, `.tgz`) to stage for the
+    /// VM compute driver.
+    RootfsTar { path: PathBuf },
 }
 
-/// Classify the `--from` value into an image reference or a Dockerfile that
-/// needs building.
+/// Classify the `--from` value into an image reference or a rootfs tar to stage
+/// for the VM driver.
 ///
 /// Resolution order:
-/// 1. Existing file whose name contains "Dockerfile" → build from file.
-/// 2. Existing directory that contains a `Dockerfile` → build from directory.
-/// 3. Missing explicit local paths → local error, not image pull.
-/// 4. Value contains `/`, `:`, or `.` → treat as a full image reference.
-/// 5. Otherwise → community sandbox name, expanded via the registry prefix.
+/// 1. Existing file with `.tar`, `.tar.gz`, or `.tgz` extension → rootfs tar archive.
+/// 2. Local Dockerfile and directory paths → an actionable build-and-tag error.
+/// 3. Other explicit local paths → an actionable error.
+/// 4. Any other value is passed through as an explicit image reference.
 fn resolve_from(value: &str) -> Result<ResolvedSource> {
     let path = Path::new(value);
 
-    // 1. Existing file that looks like a Dockerfile.
-    if path.is_file() {
-        if filename_looks_like_dockerfile(path) {
-            let dockerfile = path
-                .canonicalize()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            let context = dockerfile
-                .parent()
-                .ok_or_else(|| miette::miette!("Dockerfile has no parent directory"))?
-                .to_path_buf();
-            return Ok(ResolvedSource::Dockerfile {
-                dockerfile,
-                context,
-            });
-        }
+    if path.is_file() && filename_looks_like_rootfs_tar(path) {
+        let tar_path = path
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+        return Ok(ResolvedSource::RootfsTar { path: tar_path });
+    }
 
-        if value_looks_like_local_source(value) {
+    if value_looks_like_local_path(value) {
+        if !path.exists() && filename_looks_like_rootfs_tar(path) {
             return Err(miette::miette!(
-                "local --from file is not a Dockerfile: {}",
+                "local --from path does not exist: {}",
                 path.display()
             ));
         }
-    }
 
-    // 2. Existing directory containing a Dockerfile.
-    if path.is_dir() {
-        let candidate = path.join("Dockerfile");
-        if candidate.is_file() {
-            let context = path
-                .canonicalize()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
-            let dockerfile = context.join("Dockerfile");
-            return Ok(ResolvedSource::Dockerfile {
-                dockerfile,
-                context,
-            });
-        }
+        let build_context = if path.is_dir() {
+            path.display().to_string()
+        } else {
+            path.parent()
+                .map(|p| p.display().to_string())
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| ".".to_string())
+        };
         return Err(miette::miette!(
-            "No Dockerfile found in directory: {}",
-            path.display()
+            "'--from' no longer builds local Dockerfiles or directories: {}\n\
+             Build and tag the image with the container engine used by the gateway, then pass the resulting image reference:\n  \
+             docker build -t <image> {}  # Docker gateway\n  \
+             podman build -t <image> {}  # Podman gateway\n  \
+             openshell sandbox create --from <image>\n\
+             If the gateway cannot access the selected engine's local image store (for example, a remote or Kubernetes gateway), push the image to a registry that the gateway can pull from.",
+            path.display(),
+            build_context,
+            build_context,
         ));
     }
 
-    if path.exists() {
-        return Err(miette::miette!(
-            "local --from path is not a regular file or directory: {}",
-            path.display()
-        ));
-    }
-
-    // 3. Missing explicit local paths should fail locally. Otherwise values
-    // like `./Dockerfile` reach the gateway as image references and fail as
-    // Docker pull errors.
-    if value_looks_like_local_source(value) {
-        return Err(miette::miette!(
-            "local --from path does not exist: {}\n\
-             Use an existing Dockerfile, a directory containing Dockerfile, or a container image reference.",
-            path.display()
-        ));
-    }
-
-    // 4. Full image reference or community sandbox name — delegate to shared
-    //    resolution in openshell-core.
-    Ok(ResolvedSource::Image(
-        openshell_core::image::resolve_community_image(value),
-    ))
+    Ok(ResolvedSource::Image(value.to_string()))
 }
 
-fn filename_looks_like_dockerfile(path: &Path) -> bool {
+#[allow(clippy::case_sensitive_file_extension_comparisons)] // already lowercased
+fn filename_looks_like_rootfs_tar(path: &Path) -> bool {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let lower = name.to_lowercase();
-    lower.contains("dockerfile") || lower.ends_with(".dockerfile")
+    lower.ends_with(".tar.gz") || lower.ends_with(".tar") || lower.ends_with(".tgz")
 }
 
-fn value_looks_like_local_source(value: &str) -> bool {
-    value_is_explicit_local_path(value) || value_looks_like_bare_dockerfile_name(value)
-}
-
-fn value_is_explicit_local_path(value: &str) -> bool {
+fn value_looks_like_local_path(value: &str) -> bool {
     let path = Path::new(value);
     path.is_absolute()
         || matches!(value, "." | "..")
         || value.starts_with("./")
         || value.starts_with("../")
         || value.starts_with("~/")
+        || value_looks_like_bare_dockerfile_name(value)
 }
 
 fn value_looks_like_bare_dockerfile_name(value: &str) -> bool {
-    !value.contains('/') && !value.contains(':') && filename_looks_like_dockerfile(Path::new(value))
+    !value.contains('/')
+        && !value.contains(':')
+        && Path::new(value)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().to_lowercase().contains("dockerfile"))
 }
 
-fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
+fn rootfs_tar_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
     !metadata.is_some_and(|metadata| metadata.is_remote)
 }
 
-/// Build a Dockerfile and return the local Docker tag.
+/// Ask the gateway for a staging slot, then copy the archive into it.
 ///
-/// Package-managed local gateways use the same Docker daemon that the CLI
-/// builds into, so the tag is passed through directly and the active compute
-/// driver resolves it.
-async fn build_from_dockerfile(
-    dockerfile: &Path,
-    context: &Path,
+/// The gateway owns the destination: it allocates a request-scoped directory
+/// and returns a single-use token. We never name a path of our own choosing,
+/// so a request cannot reach for another caller's archive or an arbitrary host
+/// file. Returns the token to pass on `CreateSandbox`.
+async fn stage_rootfs_tar(
     gateway_name: &str,
+    client: &mut crate::tls::GrpcClient,
+    workspace: &str,
+    tar_path: &Path,
 ) -> Result<String> {
     let metadata = get_gateway_metadata(gateway_name);
-    if !dockerfile_sources_supported_for_gateway(metadata.as_ref()) {
+    if !rootfs_tar_sources_supported_for_gateway(metadata.as_ref()) {
         return Err(miette!(
-            "local Dockerfile sources are only supported for local gateways; gateway '{}' is remote",
+            "local rootfs tar sources are only supported for local gateways; gateway '{}' is remote",
             gateway_name
         ));
     }
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let tag = format!("openshell/sandbox-from:{timestamp}");
+    let file_name = tar_path
+        .file_name()
+        .ok_or_else(|| miette!("rootfs tar path has no filename"))?
+        .to_string_lossy()
+        .into_owned();
+    let source_meta = tokio::fs::metadata(tar_path)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", tar_path.display()))?;
 
+    // The gateway rejects a driver that cannot take rootfs tar sources, and an
+    // archive over its configured limit, before allocating anything.
+    let slot = client
+        .begin_rootfs_tar_staging(BeginRootfsTarStagingRequest {
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            file_name,
+            size_bytes: source_meta.len(),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to allocate a rootfs tar staging slot on the gateway")?
+        .into_inner();
+
+    let staged_path = PathBuf::from(&slot.upload_path);
     eprintln!(
-        "Building image {} from {}",
-        tag.cyan(),
-        dockerfile.display()
-    );
-    eprintln!("  {} {}", "Context:".dimmed(), context.display());
-    eprintln!("  {} {}", "Gateway:".dimmed(), gateway_name);
-    eprintln!();
-
-    let mut on_log = |msg: String| {
-        eprintln!("  {msg}");
-    };
-
-    openshell_bootstrap::build::build_local_image(
-        dockerfile,
-        &tag,
-        context,
-        &HashMap::new(),
-        &mut on_log,
-    )
-    .await?;
-
-    eprintln!();
-    eprintln!(
-        "{} Image {} is available in the local Docker daemon for gateway '{}'.",
-        "✓".green().bold(),
-        tag.cyan(),
+        "Staging rootfs tar {} for gateway '{}'",
+        tar_path.display().to_string().cyan(),
         gateway_name,
     );
+    // Enforced while streaming, so an archive that grows after the size check
+    // above still cannot exceed the limit.
+    if let Err(err) = copy_with_byte_limit(tar_path, &staged_path, slot.max_bytes).await {
+        // The staging directory belongs to the gateway, which reclaims it when
+        // the slot expires. Removing it here would reach into its state.
+        return Err(miette!(
+            "failed to stage rootfs tar to {}: {err}",
+            staged_path.display()
+        ));
+    }
     eprintln!();
 
-    Ok(tag)
+    Ok(slot.staging_token)
+}
+
+/// Copy `src` to `dst`, aborting if total bytes written exceeds `limit`.
+/// A limit of 0 disables enforcement.
+async fn copy_with_byte_limit(
+    src: &Path,
+    dst: &Path,
+    limit: u64,
+) -> std::result::Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut reader = tokio::fs::File::open(src)
+        .await
+        .map_err(|e| format!("open source: {e}"))?;
+    let mut writer = tokio::fs::File::create(dst)
+        .await
+        .map_err(|e| format!("create destination: {e}"))?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        if limit > 0 && total > limit {
+            return Err(format!(
+                "{} exceeds the {} byte limit",
+                src.display(),
+                limit
+            ));
+        }
+        writer
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| format!("write: {e}"))?;
+    }
+    Ok(())
+}
+
+/// `driver_config` key for the VM compute driver. The gateway forwards only
+/// `template.driver_config.<driver_name>` to the selected driver, so VM
+/// settings must be nested under this key or they are dropped.
+const VM_DRIVER_CONFIG_KEY: &str = "vm";
+/// VM `driver_config` field naming the gateway-issued staging slot. The
+/// gateway swaps it for the resolved archive path before the driver sees it.
+const ROOTFS_TAR_TOKEN_FIELD: &str = "rootfs_tar_staging_token";
+
+/// Merge the staging token into `driver_config.vm`, preserving any VM settings
+/// the caller already supplied through `--driver-config-json`.
+fn merge_rootfs_tar_driver_config(
+    base: Option<prost_types::Struct>,
+    staging_token: &str,
+) -> Result<prost_types::Struct> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    let mut config = base.unwrap_or_default();
+    let vm = config
+        .fields
+        .entry(VM_DRIVER_CONFIG_KEY.to_string())
+        .or_insert_with(|| Value {
+            kind: Some(Kind::StructValue(Struct::default())),
+        });
+
+    let Some(Kind::StructValue(vm_config)) = vm.kind.as_mut() else {
+        return Err(miette!(
+            "--driver-config-json '{VM_DRIVER_CONFIG_KEY}' must be an object"
+        ));
+    };
+
+    if vm_config.fields.contains_key(ROOTFS_TAR_TOKEN_FIELD) {
+        return Err(miette!(
+            "--driver-config-json already sets {VM_DRIVER_CONFIG_KEY}.{ROOTFS_TAR_TOKEN_FIELD}; \
+             remove it or drop the rootfs tar from --from"
+        ));
+    }
+
+    vm_config.fields.insert(
+        ROOTFS_TAR_TOKEN_FIELD.to_string(),
+        Value {
+            kind: Some(Kind::StringValue(staging_token.to_string())),
+        },
+    );
+
+    Ok(config)
 }
 
 /// Load sandbox policy YAML.
@@ -1255,11 +1570,6 @@ pub async fn sandbox_sync_command(
     Ok(())
 }
 
-/// Fetch a sandbox by name.
-///
-/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
-/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
-/// prints sandbox metadata and the same policy with formatted YAML.
 pub async fn sandbox_get(
     server: &str,
     name: &str,
@@ -1268,12 +1578,52 @@ pub async fn sandbox_get(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let mut stdout = Vec::new();
+    sandbox_get_to_writer(
+        server,
+        name,
+        policy_only,
+        output,
+        workspace,
+        tls,
+        &mut stdout,
+    )
+    .await?;
+    if !stdout.is_empty() {
+        std::io::stdout()
+            .lock()
+            .write_all(&stdout)
+            .into_diagnostic()?;
+    }
+    Ok(())
+}
+
+/// Fetch a sandbox by name.
+///
+/// Policy always comes from [`GetSandboxConfig`] (effective active policy, sandbox
+/// or global). With `policy_only`, prints only that YAML to stdout; otherwise
+/// prints sandbox metadata and the same policy with formatted YAML.
+#[doc(hidden)]
+pub async fn sandbox_get_to_writer<W>(
+    server: &str,
+    name: &str,
+    policy_only: bool,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+    stdout: &mut W,
+) -> Result<()>
+where
+    W: Write + Send,
+{
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
         .get_sandbox(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -1282,18 +1632,28 @@ pub async fn sandbox_get(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
-    let sandbox_id = if sandbox.object_id().is_empty() {
-        return Err(miette::miette!("sandbox missing metadata"));
-    } else {
-        sandbox.object_id().to_string()
+    let config_result = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await;
+    let config = match config_result {
+        Ok(response) => response.into_inner(),
+        Err(_) if !policy_only && configuration_failure_message(&sandbox).is_some() => {
+            // An invalid desired policy must not hide the status needed to
+            // repair it. Keep payload-only reads strict.
+            GetSandboxConfigResponse {
+                configuration_error: configuration_failure_message(&sandbox)
+                    .unwrap_or_default()
+                    .to_string(),
+                ..Default::default()
+            }
+        }
+        Err(error) => return Err(error).into_diagnostic(),
     };
-
-    let config = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-
     if policy_only {
         let Some(ref policy) = config.policy else {
             return Err(miette::miette!(
@@ -1302,7 +1662,7 @@ pub async fn sandbox_get(
         };
         let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
             .wrap_err("failed to serialize policy to YAML")?;
-        print!("{yaml_str}");
+        stdout.write_all(yaml_str.as_bytes()).into_diagnostic()?;
         return Ok(());
     }
 
@@ -1326,11 +1686,65 @@ pub async fn sandbox_get(
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
+    if let Some(status) = sandbox.status.as_ref() {
+        for condition in &status.conditions {
+            if matches!(
+                condition.r#type.as_str(),
+                "ConfigurationReady" | "DesiredConfigurationReady"
+            ) && condition.status.eq_ignore_ascii_case("false")
+            {
+                println!(
+                    "  {} {}: {}",
+                    "Configuration:".dimmed(),
+                    condition.reason,
+                    condition.message
+                );
+            }
+        }
+    }
+    if let Some(exit_code) = sandbox.status.as_ref().and_then(|status| status.exit_code) {
+        println!("  {} {}", "Exit Code:".dimmed(), exit_code);
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
         sandbox.metadata.as_ref().map_or(0, |m| m.resource_version)
     );
+    println!(
+        "  {} {}",
+        "Restart policy:".dimmed(),
+        sandbox
+            .spec
+            .as_ref()
+            .map_or("never", |spec| { restart_policy_name(spec.restart_policy) })
+    );
+    if let Some(status) = sandbox.status.as_ref() {
+        println!(
+            "  {} {}",
+            "Main process instance:".dimmed(),
+            if status.main_process_instance_id.is_empty() {
+                "-"
+            } else {
+                &status.main_process_instance_id
+            }
+        );
+        println!(
+            "  {} {}",
+            "Last exit code:".dimmed(),
+            status
+                .exit_code
+                .map_or_else(|| "-".to_string(), |code| code.to_string())
+        );
+        println!("  {} {}", "Restart count:".dimmed(), status.restart_count);
+        println!(
+            "  {} {}",
+            "Next restart:".dimmed(),
+            status.next_restart_time.as_ref().map_or_else(
+                || "-".to_string(),
+                |time| format_epoch_ms(proto_timestamp_ms(Some(time))),
+            )
+        );
+    }
 
     // Display labels if present
     if let Some(metadata) = &sandbox.metadata
@@ -1353,6 +1767,45 @@ pub async fn sandbox_get(
         for (key, value) in annotations {
             println!("    {key}: {value}");
         }
+    }
+
+    if let Some(provenance) = &sandbox.created_from_workload_template {
+        println!(
+            "  {} {}@{}",
+            "Workload template:".dimmed(),
+            provenance.name,
+            provenance.resource_version
+        );
+    }
+
+    if let Some(status) = &sandbox.status
+        && !status.conditions.is_empty()
+    {
+        println!("  {}", "Conditions:".dimmed());
+        for condition in &status.conditions {
+            for (index, line) in sandbox_condition_display_lines(condition)
+                .iter()
+                .enumerate()
+            {
+                let prefix = if index == 0 { "- " } else { "  " };
+                println!("    {prefix}{line}");
+            }
+        }
+    }
+
+    if let Some(status) = &sandbox.status
+        && !status.endpoint_statuses.is_empty()
+    {
+        println!("  {}", "Tool server connections:".dimmed());
+        for endpoint in &status.endpoint_statuses {
+            for (index, line) in endpoint_status_display_lines(endpoint).iter().enumerate() {
+                let prefix = if index == 0 { "- " } else { "  " };
+                println!("    {prefix}{line}");
+            }
+        }
+        println!(
+            "    Results come from observed MCP over HTTP traffic. They do not check current availability or tool-call success."
+        );
     }
 
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
@@ -1390,13 +1843,133 @@ pub async fn sandbox_get(
     Ok(())
 }
 
-/// Maximum stdin payload size (4 MiB). Prevents the CLI from reading unbounded
-/// data into memory before the server rejects an oversized message.
-const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
+fn local_terminal_size() -> Option<(u32, u32)> {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, rows)| (u32::from(cols), u32::from(rows)))
+}
+
+const MAX_EXEC_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_EXEC_STDIN_BYTES: usize = 4 * 1024 * 1024;
+
+/// How long `sandbox exec` waits for piped stdin to reach EOF before it starts
+/// the command and streams the rest of the input as it arrives.
+///
+/// Small pipes such as `echo x | openshell sandbox exec ...` close well within
+/// this window and keep using the single-request path that older gateways
+/// need. A pipe that stays open (a CI runner, a supervisor, a harness that
+/// never closes stdin) must not block the command: after the grace period the
+/// command starts and stdin is forwarded until EOF or until the command exits.
+const EXEC_STDIN_UNARY_GRACE: Duration = Duration::from_millis(200);
+
+/// Piped stdin as collected by [`collect_piped_stdin`].
+enum PipedStdin {
+    /// stdin reached EOF within the grace period; `prefix` holds all of it.
+    Complete(Vec<u8>),
+    /// stdin is still open. `prefix` is what arrived so far; `rest` delivers
+    /// the remaining chunks until EOF.
+    Open {
+        prefix: Vec<u8>,
+        rest: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    },
+}
+
+/// Read a pipe on a detached OS thread and hand its bytes over in chunks.
+///
+/// A plain `std::thread` rather than `spawn_blocking`, so runtime shutdown
+/// never waits on a thread parked in `read(2)`. The thread exits at EOF, on a
+/// read error, or when the receiver is dropped.
+fn spawn_piped_stdin_reader(
+    mut reader: impl PipedInput,
+) -> tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<std::io::Result<Vec<u8>>>(64);
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return,
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                // Processes that inherit the same stdin share its open file
+                // description, so another process may have made it
+                // nonblocking. Wait for input instead of failing.
+                #[cfg(unix)]
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if let Err(error) = wait_until_readable(&reader) {
+                        let _ = tx.blocking_send(Err(error));
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.blocking_send(Err(error));
+                    return;
+                }
+                Ok(n) => {
+                    if tx.blocking_send(Ok(buf[..n].to_vec())).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Input the piped-stdin reader accepts. On Unix it must expose a descriptor
+/// so a nonblocking stream can be waited on.
+#[cfg(unix)]
+trait PipedInput: Read + std::os::fd::AsFd + Send + 'static {}
+#[cfg(unix)]
+impl<T: Read + std::os::fd::AsFd + Send + 'static> PipedInput for T {}
+#[cfg(not(unix))]
+trait PipedInput: Read + Send + 'static {}
+#[cfg(not(unix))]
+impl<T: Read + Send + 'static> PipedInput for T {}
+
+/// Block until `reader` has input or reaches end of file.
+#[cfg(unix)]
+fn wait_until_readable(reader: &impl std::os::fd::AsFd) -> std::io::Result<()> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(reader.as_fd(), PollFlags::POLLIN)];
+    loop {
+        match poll(&mut fds, PollTimeout::NONE) {
+            Err(nix::errno::Errno::EINTR) => {}
+            result => return result.map(drop).map_err(std::io::Error::from),
+        }
+    }
+}
+
+/// Collect piped stdin until EOF or until `grace` elapses, whichever comes
+/// first. Input beyond `limit` bytes is rejected with the upload hint.
+async fn collect_piped_stdin(
+    mut rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    grace: Duration,
+    limit: usize,
+) -> Result<PipedStdin> {
+    let deadline = tokio::time::Instant::now() + grace;
+    let mut prefix = Vec::new();
+    loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Ok(chunk))) => {
+                prefix.extend_from_slice(&chunk);
+                if prefix.len() > limit {
+                    return Err(piped_stdin_limit_error());
+                }
+            }
+            Ok(Some(Err(error))) => return Err(error).into_diagnostic(),
+            Ok(None) => return Ok(PipedStdin::Complete(prefix)),
+            Err(_elapsed) => return Ok(PipedStdin::Open { prefix, rest: rx }),
+        }
+    }
+}
+
+fn piped_stdin_limit_error() -> miette::Report {
+    miette::miette!("piped stdin exceeds the 4 MiB limit; use `sandbox upload` for larger input")
+}
 
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
-/// Returns the remote command's exit code.
+/// Returns the remote command's exit code, or an error if the event stream
+/// closes before the command reports an exit status.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn sandbox_exec_grpc(
     server: &str,
@@ -1406,19 +1979,24 @@ pub async fn sandbox_exec_grpc(
     timeout_seconds: u32,
     tty_override: Option<bool>,
     environment: &HashMap<String, String>,
+    no_login_shell: bool,
     tls: &TlsOptions,
     workspace: &str,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
+    let response = client
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        }))
         .await
-        .into_diagnostic()?
+        .into_diagnostic()?;
+    let replica = owner_replica(&response);
+    let sandbox = response
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -1432,65 +2010,104 @@ pub async fn sandbox_exec_grpc(
         ));
     }
 
-    // Read stdin if piped (not a TTY), using spawn_blocking to avoid blocking
-    // the async runtime. Cap the read at MAX_STDIN_PAYLOAD + 1 so we never
-    // buffer more than the limit into memory.
-    let stdin_payload = if std::io::stdin().is_terminal() {
-        Vec::new()
+    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
+    let stdin_is_terminal = std::io::stdin().is_terminal();
+    let tty = tty_override.unwrap_or_else(|| stdin_is_terminal && std::io::stdout().is_terminal());
+
+    // Preserve unary exec for small pipes, including older gateways whose
+    // interactive RPC closes the SSH channel when stdin reaches EOF. Retain
+    // the existing 4 MiB input cap because the supervisor's process stdin
+    // queue is unbounded; larger input should use file upload instead.
+    //
+    // Never block on stdin EOF before starting the command: a pipe that stays
+    // open (CI runners, harnesses) would otherwise hang the exec forever
+    // without the gateway ever seeing the request. After a short grace period
+    // the command starts and the remaining input streams until EOF.
+    let (stdin_prefix, stdin_rest) = if stdin_is_terminal {
+        (Vec::new(), None)
     } else {
-        tokio::task::spawn_blocking(|| {
-            let limit = (MAX_STDIN_PAYLOAD + 1) as u64;
-            let mut buf = Vec::new();
-            std::io::stdin()
-                .take(limit)
-                .read_to_end(&mut buf)
-                .into_diagnostic()?;
-            if buf.len() > MAX_STDIN_PAYLOAD {
-                return Err(miette::miette!(
-                    "stdin payload exceeds {} byte limit; pipe smaller inputs or use `sandbox upload`",
-                    MAX_STDIN_PAYLOAD
-                ));
-            }
-            Ok(buf)
-        })
-        .await
-        .into_diagnostic()?? // first ? unwraps JoinError, second ? unwraps Result
+        match collect_piped_stdin(
+            spawn_piped_stdin_reader(std::io::stdin()),
+            EXEC_STDIN_UNARY_GRACE,
+            MAX_EXEC_STDIN_BYTES,
+        )
+        .await?
+        {
+            PipedStdin::Complete(prefix) => (prefix, None),
+            PipedStdin::Open { prefix, rest } => (prefix, Some(rest)),
+        }
     };
 
-    // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise auto-detect.
-    let tty = tty_override
-        .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
+    let mut request = ExecSandboxRequest {
+        request_id: String::new(),
+        sandbox: name.to_string(),
+        workspace_scope: Some(openshell_core::proto::workspace_selector(
+            workspace.to_string(),
+        )),
+        command: command.to_vec(),
+        workdir: workdir.unwrap_or_default().to_string(),
+        environment: environment.clone(),
+        execution_timeout: proto_execution_timeout(timeout_seconds)?,
+        stdin: stdin_prefix,
+        tty,
+        cols,
+        rows,
+        no_login_shell,
+    };
 
-    if tty_override == Some(true) && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(
+    let stdin_for_size_check = std::mem::take(&mut request.stdin);
+    let start_request_bytes = request.encoded_len();
+    request.stdin = stdin_for_size_check;
+    if start_request_bytes > MAX_EXEC_REQUEST_BYTES {
+        return Err(miette::miette!(
+            "exec command or environment exceeds the gateway's 1 MiB message limit"
+        ));
+    }
+    if (tty && stdin_is_terminal)
+        || stdin_rest.is_some()
+        || request.encoded_len() > MAX_EXEC_REQUEST_BYTES
+    {
+        return sandbox_exec_streaming_grpc(
             client,
             &sandbox,
             command,
             workdir,
             timeout_seconds,
             environment,
+            no_login_shell,
+            tty,
+            stdin_is_terminal,
+            std::mem::take(&mut request.stdin),
+            stdin_rest,
+            replica.as_ref(),
         )
         .await;
     }
 
     // Make the streaming gRPC call.
-    let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
-            sandbox_id: sandbox.object_id().to_string(),
-            command: command.to_vec(),
-            workdir: workdir.unwrap_or_default().to_string(),
-            environment: environment.clone(),
-            timeout_seconds,
-            stdin: stdin_payload,
-            tty,
-            ..Default::default()
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    let retry = replica.is_some().then(|| request.clone());
+    let mut stream = match (
+        client
+            .exec_sandbox(routed_to(request, replica.as_ref()))
+            .await,
+        retry,
+    ) {
+        (Err(status), Some(request)) if retry_unrouted(replica.as_ref(), &status) => {
+            client.exec_sandbox(request).await
+        }
+        (response, _) => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
+    let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
@@ -1509,9 +2126,19 @@ pub async fn sandbox_exec_grpc(
             }
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
+                exit_seen = true;
             }
             None => {}
         }
+    }
+
+    // A stream that closes without an Exit event means we never observed the
+    // command's outcome. The server treats the same condition as a relay
+    // failure; mirror that here so exit 0 stays meaningful.
+    if !exit_seen {
+        return Err(miette::miette!(
+            "sandbox exec relay closed before the command reported an exit status"
+        ));
     }
 
     Ok(exit_code)
@@ -1529,7 +2156,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    let sandbox = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -1548,8 +2175,12 @@ pub async fn service_forward_tcp(
         name,
     );
 
-    let sandbox_id = sandbox.object_id().to_string();
+    let sandbox_name = name.to_string();
+    let sandbox_workspace = workspace.to_string();
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    // Set once this forward learns that the gateway predates principal-authorized
+    // TCP forwards and still requires a `CreateSshSession` token per connection.
+    let legacy_session_tokens = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut health_check = tokio::time::interval(Duration::from_secs(2));
     health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1559,7 +2190,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -1568,29 +2199,24 @@ pub async fn service_forward_tcp(
                     .wrap_err("failed to accept local forward connection")?;
                 set_tcp_nodelay_best_effort(&socket);
                 let mut client = client.clone();
-                let sandbox_id = sandbox_id.clone();
+                let sandbox_name = sandbox_name.clone();
+                let sandbox_workspace = sandbox_workspace.clone();
                 let target_host = target_host.to_string();
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
+                let legacy_session_tokens = legacy_session_tokens.clone();
+                let replica = replica.clone();
                 tokio::spawn(async move {
-                    let token = match create_forward_session_token(&mut client, &sandbox_id).await {
-                        Ok(token) => token,
-                        Err(err) => {
-                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
-                            if err.fatal {
-                                let _ = fatal_tx.send(err.message).await;
-                            }
-                            return;
-                        }
-                    };
                     if let Err(err) = forward_one_tcp_connection(
                         &mut client,
                         socket,
-                        sandbox_id,
+                        sandbox_name,
+                        sandbox_workspace,
                         target_host,
                         target_port,
                         service_id,
-                        token.clone(),
+                        legacy_session_tokens,
+                        replica.as_ref(),
                     )
                     .await
                     {
@@ -1599,9 +2225,6 @@ pub async fn service_forward_tcp(
                             let _ = fatal_tx.send(err.message).await;
                         }
                     }
-                    let _ = client
-                        .revoke_ssh_session(RevokeSshSessionRequest { token })
-                        .await;
                 });
             }
         }
@@ -1610,27 +2233,42 @@ pub async fn service_forward_tcp(
 
 async fn create_forward_session_token(
     client: &mut crate::tls::GrpcClient,
-    sandbox_id: &str,
+    sandbox_name: &str,
+    workspace: &str,
 ) -> std::result::Result<String, ForwardTcpConnectionError> {
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox: sandbox_name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .map_err(ForwardTcpConnectionError::from_status)?;
     Ok(response.into_inner().token)
 }
 
+/// Older gateways reject a token-less `ForwardTcp` init with this
+/// `Unauthenticated` status; newer ones authorize TCP targets on the caller's
+/// principal and only demand a token for SSH targets.
+fn forward_requires_session_token(status: &Status) -> bool {
+    status.code() == Code::Unauthenticated
+        && status.message().contains("authorization_token is required")
+}
+
+/// Confirm the sandbox is still ready, returning the replica that owns it.
 async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Sandbox> {
+) -> Result<Option<AsciiMetadataValue>> {
     let response = match client
-        .get_sandbox(GetSandboxRequest {
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        }))
         .await
     {
         Ok(response) => response,
@@ -1642,6 +2280,7 @@ async fn fetch_ready_sandbox_for_forward(
         Err(status) => return Err(status).into_diagnostic(),
     };
 
+    let replica = owner_replica(&response);
     let sandbox = response
         .into_inner()
         .sandbox
@@ -1655,7 +2294,7 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(sandbox)
+    Ok(replica)
 }
 
 #[derive(Debug)]
@@ -1711,45 +2350,143 @@ fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(Str
     Ok(("127.0.0.1".to_string(), port))
 }
 
+#[allow(clippy::too_many_arguments)] // one connection's sandbox, target, and authorization context
 async fn forward_one_tcp_connection(
     client: &mut crate::tls::GrpcClient,
     socket: tokio::net::TcpStream,
-    sandbox_id: String,
+    sandbox_name: String,
+    workspace: String,
     target_host: String,
     target_port: u16,
     service_id: String,
-    authorization_token: String,
+    legacy_session_tokens: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_stream::wrappers::ReceiverStream;
+    let mut init = TcpForwardInit {
+        sandbox: sandbox_name.clone(),
+        workspace: workspace.clone(),
+        service_id,
+        target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+            host: target_host,
+            port: u32::from(target_port),
+        })),
+        // The gateway authorizes TCP forwards on this client's credentials for
+        // every stream, so no per-connection session token is minted unless the
+        // gateway turns out to predate that (`forward_requires_session_token`),
+        // which this forward remembers in `legacy_session_tokens`.
+        authorization_token: String::new(),
+    };
 
-    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
-    tx.send(TcpForwardFrame {
-        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
-            TcpForwardInit {
-                sandbox_id,
-                service_id,
-                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
-                    host: target_host,
-                    port: u32::from(target_port),
-                })),
-                authorization_token,
-            },
-        )),
-    })
-    .await
-    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+    let mut session_token = None;
+    if legacy_session_tokens.load(std::sync::atomic::Ordering::Relaxed) {
+        match create_forward_session_token(client, &sandbox_name, &workspace).await {
+            Ok(token) => {
+                init.authorization_token.clone_from(&token);
+                session_token = Some(token);
+            }
+            Err(err) => {
+                drain_and_shutdown_local_socket(socket).await;
+                return Err(err);
+            }
+        }
+    }
 
-    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
-        Ok(response) => response.into_inner(),
+    let opened = match open_forward_tcp_stream(client, init.clone(), replica).await {
+        Ok(opened) => opened,
+        Err(status) if session_token.is_none() && forward_requires_session_token(&status) => {
+            tracing::info!(
+                "gateway requires an SSH session token per forwarded connection; \
+                 minting one per connection for the rest of this forward"
+            );
+            legacy_session_tokens.store(true, std::sync::atomic::Ordering::Relaxed);
+            let token = match create_forward_session_token(client, &sandbox_name, &workspace).await
+            {
+                Ok(token) => token,
+                Err(err) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    return Err(err);
+                }
+            };
+            init.authorization_token.clone_from(&token);
+            session_token = Some(token);
+            match open_forward_tcp_stream(client, init, replica).await {
+                Ok(opened) => opened,
+                Err(status) => {
+                    drain_and_shutdown_local_socket(socket).await;
+                    revoke_forward_session_token(client, session_token).await;
+                    return Err(ForwardTcpConnectionError::from_status(status));
+                }
+            }
+        }
         Err(status) => {
-            let err = ForwardTcpConnectionError::from_status(status);
             drain_and_shutdown_local_socket(socket).await;
-            return Err(err);
+            revoke_forward_session_token(client, session_token).await;
+            return Err(ForwardTcpConnectionError::from_status(status));
         }
     };
 
-    let (mut local_read, mut local_write) = socket.into_split();
+    let result = bridge_local_socket_to_forward_stream(socket, opened).await;
+    revoke_forward_session_token(client, session_token).await;
+    result
+}
+
+/// An open `ForwardTcp` stream: the sender for local-to-gateway frames and the
+/// gateway-to-local response stream.
+type OpenForwardTcpStream = (
+    tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    tonic::Streaming<TcpForwardFrame>,
+);
+
+async fn open_forward_tcp_stream(
+    client: &mut crate::tls::GrpcClient,
+    init: TcpForwardInit,
+    replica: Option<&AsciiMetadataValue>,
+) -> std::result::Result<OpenForwardTcpStream, Status> {
+    let init = TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            init,
+        )),
+    };
+    let (tx, response) = crate::ssh::open_forward_tcp(client, init, replica).await;
+    Ok((tx, response?.into_inner()))
+}
+
+async fn revoke_forward_session_token(client: &mut crate::tls::GrpcClient, token: Option<String>) {
+    if let Some(token) = token {
+        let _ = client
+            .revoke_ssh_session(RevokeSshSessionRequest {
+                allow_missing: true,
+                token,
+            })
+            .await;
+    }
+}
+
+async fn bridge_local_socket_to_forward_stream(
+    socket: tokio::net::TcpStream,
+    (tx, response): OpenForwardTcpStream,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
+    let (local_read, local_write) = socket.into_split();
+    relay_local_socket(local_read, local_write, tx, response).await
+}
+
+/// Relay bytes between a local socket and a forward stream.
+///
+/// When the target closes first, half-close the local socket but keep sending
+/// client data until the client closes, so a target that only half-closes
+/// still receives the rest of the request.
+async fn relay_local_socket<R, W, S>(
+    mut local_read: R,
+    mut local_write: W,
+    tx: tokio::sync::mpsc::Sender<TcpForwardFrame>,
+    mut response: S,
+) -> std::result::Result<(), ForwardTcpConnectionError>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin,
+    S: tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let to_gateway = tokio::spawn(async move {
         let mut buf = vec![0u8; 64 * 1024];
@@ -1774,8 +2511,9 @@ async fn forward_one_tcp_connection(
     });
 
     while let Some(frame) = response
-        .message()
+        .next()
         .await
+        .transpose()
         .map_err(ForwardTcpConnectionError::from_status)?
     {
         let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
@@ -1792,7 +2530,7 @@ async fn forward_one_tcp_connection(
     }
 
     let _ = local_write.shutdown().await;
-    to_gateway.abort();
+    let _ = to_gateway.await;
     Ok(())
 }
 
@@ -1825,92 +2563,181 @@ impl Drop for TaskGuard {
     }
 }
 
-async fn sandbox_exec_interactive_grpc(
+#[allow(clippy::too_many_arguments)]
+async fn sandbox_exec_streaming_grpc(
     mut client: crate::tls::GrpcClient,
     sandbox: &Sandbox,
     command: &[String],
     workdir: Option<&str>,
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
+    no_login_shell: bool,
+    tty: bool,
+    stdin_is_terminal: bool,
+    stdin_prefix: Vec<u8>,
+    stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
     use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let (cols, rows) = if tty {
+        local_terminal_size().unwrap_or((80, 24))
+    } else {
+        (0, 0)
+    };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
+    // The start message carries the exec metadata.
+    let start = ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+            request_id: String::new(),
+            sandbox: sandbox.object_name().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (sandbox.object_workspace()).to_string(),
+            )),
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment: environment.clone(),
+            no_login_shell,
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
+            stdin: Vec::new(),
+            tty,
+            cols,
+            rows,
+        })),
+    };
 
-    // Send the start message with exec metadata.
-    input_tx
-        .send(ExecSandboxInput {
-            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                sandbox_id: sandbox.object_id().to_string(),
-                command: command.to_vec(),
-                workdir: workdir.unwrap_or_default().to_string(),
-                environment: environment.clone(),
-                timeout_seconds,
-                stdin: Vec::new(),
-                tty: true,
-                cols: u32::from(cols),
-                rows: u32::from(rows),
-            })),
-        })
+    let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    input_tx.send(start.clone()).await.into_diagnostic()?;
+    let mut stream = match client
+        .exec_sandbox_interactive(routed_to(ReceiverStream::new(input_rx), replica))
         .await
-        .into_diagnostic()?;
+    {
+        Err(status) if retry_unrouted(replica, &status) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+            tx.send(start).await.into_diagnostic()?;
+            input_tx = tx;
+            client
+                .exec_sandbox_interactive(ReceiverStream::new(rx))
+                .await
+        }
+        response => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
-    let mut stream = client
-        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
-        .await
-        .into_diagnostic()?
-        .into_inner();
-
-    // Enable raw mode so keystrokes are forwarded immediately.
-    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
-    let raw_guard = RawModeGuard;
+    // Raw mode is only appropriate for an interactive terminal, not a pipe.
+    let raw_guard = if tty && stdin_is_terminal {
+        crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+        Some(RawModeGuard)
+    } else {
+        None
+    };
 
     // Stdin reader on a detached OS thread. Using std::thread (not
     // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
     // thread blocked on stdin.read(). The thread exits when the channel
     // closes (blocking_send returns Err) or stdin hits EOF.
     let stdin_tx = input_tx.clone();
-    std::thread::spawn(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
+    let (stdin_result_tx, mut stdin_result_rx) = tokio::sync::oneshot::channel();
+    if let Some(mut rest) = stdin_rest {
+        // Piped stdin that was still open when the command started: the
+        // reader thread from `spawn_piped_stdin_reader` already owns stdin,
+        // so forward its chunks here after the collected prefix. The 4 MiB
+        // cap covers the prefix and the streamed remainder together.
+        tokio::spawn(async move {
+            let mut forwarded = 0usize;
+            let result = async {
+                for chunk in stdin_prefix.chunks(4096) {
+                    forwarded += chunk.len();
+                    if stdin_tx
+                        .send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                while let Some(chunk) = rest.recv().await {
+                    let chunk = chunk?;
+                    forwarded += chunk.len();
+                    if forwarded > MAX_EXEC_STDIN_BYTES {
+                        return Err(std::io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "streamed stdin exceeds the 4 MiB limit; the command may have processed partial input; use `sandbox upload` for larger input",
+                        ));
+                    }
+                    if stdin_tx
+                        .send(ExecSandboxInput {
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk)),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let _ = stdin_result_tx.send(result);
+        });
+    } else {
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            let result = (|| {
+                for chunk in stdin_prefix.chunks(buf.len()) {
                     if stdin_tx
                         .blocking_send(ExecSandboxInput {
-                            payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
+                            payload: Some(exec_sandbox_input::Payload::Stdin(chunk.to_vec())),
                         })
                         .is_err()
                     {
-                        break;
+                        return Ok(());
                     }
                 }
-            }
-        }
-    });
+                loop {
+                    match stdin.read(&mut buf) {
+                        Ok(0) => return Ok(()),
+                        Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                        Err(error) => return Err(error),
+                        Ok(n) => {
+                            if stdin_tx
+                                .blocking_send(ExecSandboxInput {
+                                    payload: Some(exec_sandbox_input::Payload::Stdin(
+                                        buf[..n].to_vec(),
+                                    )),
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            })();
+            let _ = stdin_result_tx.send(result);
+        });
+    }
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
-    let resize_task = {
+    let resize_task = if tty && stdin_is_terminal {
         let resize_tx = input_tx.clone();
-        tokio::spawn(async move {
+        Some(tokio::spawn(async move {
             let mut sig =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
                     .expect("failed to register SIGWINCH handler");
             while sig.recv().await.is_some() {
-                if let Ok((c, r)) = crossterm::terminal::size() {
+                if let Some((cols, rows)) = local_terminal_size() {
                     let msg = ExecSandboxInput {
                         payload: Some(exec_sandbox_input::Payload::Resize(
-                            ExecSandboxWindowResize {
-                                cols: u32::from(c),
-                                rows: u32::from(r),
-                            },
+                            ExecSandboxWindowResize { cols, rows },
                         )),
                     };
                     if resize_tx.send(msg).await.is_err() {
@@ -1918,16 +2745,56 @@ async fn sandbox_exec_interactive_grpc(
                     }
                 }
             }
-        })
+        }))
+    } else {
+        None
     };
     #[cfg(unix)]
-    let _resize_guard = TaskGuard(resize_task);
+    let _resize_guard = resize_task.map(TaskGuard);
+
+    // Keep a sender until the reader confirms clean EOF. On a read error,
+    // cancel the response stream before the gateway can treat channel EOF as
+    // successful completion of a partial command.
+    let mut pipe_input_tx = Some(input_tx);
 
     let mut exit_code = 0i32;
+    let mut exit_seen = false;
     let stdout = std::io::stdout();
     let stderr = std::io::stderr();
 
-    while let Some(event) = stream.next().await {
+    let mut stdin_reader_done = false;
+    loop {
+        let event = tokio::select! {
+            result = &mut stdin_result_rx, if !stdin_reader_done => {
+                stdin_reader_done = true;
+                match result.into_diagnostic()? {
+                    Ok(()) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        drop(sender);
+                    }
+                    Err(error) => {
+                        let sender = pipe_input_tx.take().expect("stdin sender is held until EOF");
+                        // A clean request EOF would make the gateway execute
+                        // the truncated input. An invalid frame makes the
+                        // gateway abort the command instead.
+                        let abort = ExecSandboxInput { payload: None };
+                        if tokio::time::timeout(Duration::from_secs(5), sender.send(abort))
+                            .await
+                            .is_err()
+                        {
+                            // Keep the request body open if a blocked remote
+                            // stdin prevents delivery of the abort frame.
+                            std::mem::forget(sender);
+                        }
+                        drop(stream);
+                        return Err(error).into_diagnostic();
+                    }
+                }
+                continue;
+            }
+            event = stream.next() => event,
+        };
+        let Some(event) = event else { break };
         let event = event.into_diagnostic()?;
         match event.payload {
             Some(exec_sandbox_event::Payload::Stdout(out)) => {
@@ -1942,16 +2809,30 @@ async fn sandbox_exec_interactive_grpc(
             }
             Some(exec_sandbox_event::Payload::Exit(exit)) => {
                 exit_code = exit.exit_code;
-                break;
+                exit_seen = true;
+                // Process exit does not complete the RPC. Keep draining so a
+                // failing final gRPC status cannot turn partial output into
+                // a successful execution result.
             }
             None => {}
         }
     }
 
-    drop(input_tx);
-
     // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
+
+    if !stdin_reader_done && let Ok(result) = stdin_result_rx.try_recv() {
+        result.into_diagnostic()?;
+    }
+
+    // A stream that closes without an Exit event means we never observed the
+    // command's outcome. Treat it as a relay failure rather than reporting a
+    // successful (0) exit.
+    if !exit_seen {
+        return Err(miette::miette!(
+            "sandbox exec relay closed before the command reported an exit status"
+        ));
+    }
 
     Ok(exit_code)
 }
@@ -1960,8 +2841,8 @@ async fn sandbox_exec_interactive_grpc(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     ids_only: bool,
     names_only: bool,
     label_selector: Option<&str>,
@@ -1974,24 +2855,32 @@ pub async fn sandbox_list(
 
     let response = client
         .list_sandboxes(ListSandboxesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             label_selector: label_selector.unwrap_or("").to_string(),
-            workspace: if all_workspaces {
-                String::new()
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
             } else {
-                workspace.to_string()
-            },
-            all_workspaces,
+                openshell_core::proto::workspace_selector(workspace)
+            }),
         })
         .await
         .into_diagnostic()?;
 
-    let sandboxes = response.into_inner().sandboxes;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let sandboxes = response.sandboxes;
 
-    if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "sandboxes",
+        &sandboxes,
+        &next_page_token,
+        sandbox_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if sandboxes.is_empty() {
         if !ids_only && !names_only {
@@ -2059,13 +2948,26 @@ pub async fn sandbox_list(
     for sandbox in sandboxes {
         let phase = phase_name(sandbox.phase());
         let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
-            Ok(SandboxPhase::Ready) => phase.green().to_string(),
+            Ok(SandboxPhase::Ready | SandboxPhase::Completed) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
+            Ok(SandboxPhase::Stopped)
+                if sandbox
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.exit_code.is_some()) =>
+            {
+                phase.red().to_string()
+            }
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
-        let created = format_epoch_ms(sandbox.metadata.as_ref().map_or(0, |m| m.created_at_ms));
+        let created = format_epoch_ms(
+            sandbox
+                .metadata
+                .as_ref()
+                .map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref())),
+        );
         if all_workspaces {
             println!(
                 "{:<ws_width$}  {:<name_width$}  {:<created_width$}  {}",
@@ -2087,24 +2989,212 @@ pub async fn sandbox_list(
     Ok(())
 }
 
+fn configuration_failure_message(sandbox: &Sandbox) -> Option<&str> {
+    sandbox
+        .status
+        .as_ref()?
+        .configuration_admission
+        .as_ref()
+        .map(|admission| admission.error.as_str())
+        .filter(|message| !message.is_empty())
+}
+
 fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
+    use openshell_core::proto::ConfigurationAdmissionState;
+
     let meta = sandbox.metadata.as_ref();
     let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
     let annotations = meta.map_or_else(
         || serde_json::json!({}),
         |m| serde_json::json!(m.annotations),
     );
+    let created_from_workload_template =
+        sandbox
+            .created_from_workload_template
+            .as_ref()
+            .map(|provenance| {
+                serde_json::json!({
+                    "name": provenance.name,
+                    "resource_version": provenance.resource_version,
+                })
+            });
+    let conditions = sandbox.status.as_ref().map_or_else(Vec::new, |status| {
+        status
+            .conditions
+            .iter()
+            .map(sandbox_condition_to_json)
+            .collect::<Vec<_>>()
+    });
+    let endpoint_statuses = sandbox.status.as_ref().map_or_else(Vec::new, |status| {
+        status
+            .endpoint_statuses
+            .iter()
+            .map(|endpoint| {
+                serde_json::json!({
+                    "endpoint_id": endpoint.endpoint_id,
+                    "host": endpoint.host,
+                    "ports": endpoint.ports,
+                    "path": endpoint.path,
+                    "last_result": endpoint_result_name(endpoint.last_result()),
+                    "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let admission = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.configuration_admission.as_ref())
+        .map(|admission| {
+            serde_json::json!({
+                "state": match ConfigurationAdmissionState::try_from(admission.state) {
+                    Ok(ConfigurationAdmissionState::Pending) => "pending",
+                    Ok(ConfigurationAdmissionState::Accepted) => "accepted",
+                    Ok(ConfigurationAdmissionState::Rejected) => "rejected",
+                    _ => "unknown",
+                },
+                "error": admission.error,
+                "policy_version": admission.policy_version,
+                "policy_hash": admission.policy_hash,
+                "config_revision": admission.config_revision,
+                "provider_env_revision": admission.provider_env_revision,
+            })
+        });
+    let provisioning = sandbox.status.as_ref().and_then(|status| status.provisioning.as_ref())
+        .map(|record| serde_json::json!({
+            "attempt_id": record.attempt_id,
+            "configuration_change_id": record.configuration_change_id,
+            "configuration_change_time": record.configuration_change_time.as_ref().map(ToString::to_string),
+            "first_rejection_time": record.first_rejection_time.as_ref().map(ToString::to_string),
+            "phase": if record.deadline.is_none() && record.timeout_time.is_none() {
+                "ready"
+            } else if record.preparation_deadline.is_some() && record.admission_start_time.is_none() {
+                "preparation"
+            } else {
+                "admission"
+            },
+            "preparation_deadline": record.preparation_deadline.as_ref().map(ToString::to_string),
+            "admission_start_time": record.admission_start_time.as_ref().map(ToString::to_string),
+            "deadline": record.deadline.as_ref().map(ToString::to_string),
+            "timeout_time": record.timeout_time.as_ref().map(ToString::to_string),
+            "cleanup_completed_time": record.cleanup_completed_time.as_ref().map(ToString::to_string),
+            "cleanup_error": record.cleanup_error,
+            "cleanup_retry_time": record.cleanup_retry_time.as_ref().map(ToString::to_string),
+            "driver_operation_pending": record.driver_operation_pending,
+            "driver_operation_id": record.driver_operation_id,
+        }));
     serde_json::json!({
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "workspace": sandbox.object_workspace(),
+        "host_key_fingerprint": sandbox.host_key_fingerprint,
         "labels": labels,
         "annotations": annotations,
         "resource_version": meta.map_or(0, |m| m.resource_version),
-        "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
+        "created_at": format_epoch_ms(meta.map_or(0, |m| proto_timestamp_ms(m.created_time.as_ref()))),
         "phase": phase_name(sandbox.phase()),
         "current_policy_version": sandbox.current_policy_version(),
+        "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
+        "conditions": conditions,
+        "endpoint_statuses": endpoint_statuses,
+        "configuration_admission": admission,
+        "provisioning": provisioning,
+        "created_from_workload_template": created_from_workload_template,
     })
+}
+
+fn sandbox_condition_to_json(condition: &SandboxCondition) -> serde_json::Value {
+    let transition_time = condition
+        .transition_time
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    serde_json::json!({
+        "type": condition.r#type,
+        "status": condition.status,
+        "reason": condition.reason,
+        "message": condition.message,
+        "last_transition_time": transition_time,
+    })
+}
+
+fn sandbox_condition_display_lines(condition: &SandboxCondition) -> Vec<String> {
+    let reason = if condition.reason.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", condition.reason)
+    };
+    let message = if condition.message.is_empty() {
+        String::new()
+    } else {
+        format!(" - {}", condition.message)
+    };
+    let mut lines = vec![format!(
+        "{}: {}{reason}{message}",
+        condition.r#type, condition.status
+    )];
+    if let Some(transition_time) = &condition.transition_time {
+        lines.push(format!("Last transition: {transition_time}"));
+    }
+    lines
+}
+
+// These names are part of the CLI JSON/YAML contract, independent of the
+// generated Rust enum's Debug output and protobuf's prefixed wire names.
+fn endpoint_result_name(result: EndpointResult) -> &'static str {
+    match result {
+        EndpointResult::Unspecified => "Unspecified",
+        EndpointResult::NoObservedExchange => "NoObservedExchange",
+        EndpointResult::HttpResponseReceived => "HttpResponseReceived",
+        EndpointResult::PolicyDenied => "PolicyDenied",
+        EndpointResult::CredentialUnavailable => "CredentialUnavailable",
+        EndpointResult::TlsFailed => "TlsFailed",
+        EndpointResult::TransportFailed => "TransportFailed",
+        EndpointResult::UpstreamRejected => "UpstreamRejected",
+    }
+}
+
+fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
+    let ports = endpoint
+        .ports
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result = match endpoint.last_result() {
+        EndpointResult::Unspecified => "No result provided.",
+        EndpointResult::NoObservedExchange => "No exchange observed.",
+        EndpointResult::HttpResponseReceived => "Server returned an HTTP response below 400.",
+        EndpointResult::PolicyDenied => "Blocked by OpenShell policy.",
+        EndpointResult::CredentialUnavailable => {
+            "Required OpenShell-managed credential was unavailable."
+        }
+        EndpointResult::TlsFailed => "TLS connection failed.",
+        EndpointResult::TransportFailed => "Connection failed before an HTTP response arrived.",
+        EndpointResult::UpstreamRejected => "Server rejected the request (HTTP 400 or higher).",
+    };
+    // The gateway supplies acceptance time, which can follow the actual
+    // exchange. An absent timestamp means there is no accepted observation.
+    let reported_at = endpoint
+        .last_reported_time
+        .as_ref()
+        .map_or_else(|| "no report yet".to_string(), ToString::to_string);
+    vec![
+        format!(
+            "{} (ports: {ports}; path: {})",
+            endpoint.host, endpoint.path
+        ),
+        format!("Last result: {result}"),
+        format!("Reported at (gateway acceptance): {reported_at}"),
+    ]
+}
+
+fn restart_policy_name(policy: i32) -> &'static str {
+    match SandboxRestartPolicy::try_from(policy) {
+        Ok(SandboxRestartPolicy::OnFailure) => "on-failure",
+        Ok(SandboxRestartPolicy::Always) => "always",
+        Ok(SandboxRestartPolicy::Unspecified | SandboxRestartPolicy::Never) | Err(_) => "never",
+    }
 }
 
 fn sandbox_detail_to_json(
@@ -2115,6 +3205,33 @@ fn sandbox_detail_to_json(
     let obj = value
         .as_object_mut()
         .expect("sandbox_to_json returns object");
+
+    let restart_policy = sandbox
+        .spec
+        .as_ref()
+        .map_or("never", |spec| restart_policy_name(spec.restart_policy));
+    obj.insert("restart_policy".into(), serde_json::json!(restart_policy));
+    if let Some(status) = sandbox.status.as_ref() {
+        obj.insert(
+            "main_process_instance_id".into(),
+            serde_json::json!(status.main_process_instance_id),
+        );
+        obj.insert("exit_code".into(), serde_json::json!(status.exit_code));
+        obj.insert(
+            "restart_count".into(),
+            serde_json::json!(status.restart_count),
+        );
+        obj.insert(
+            "next_restart_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(status.next_restart_time.as_ref())),
+        );
+        obj.insert(
+            "main_process_started_at_ms".into(),
+            serde_json::json!(proto_timestamp_ms(
+                status.main_process_started_time.as_ref()
+            )),
+        );
+    }
 
     let policy_source = if config.policy_source == PolicySource::Global as i32 {
         "global"
@@ -2149,201 +3266,616 @@ fn sandbox_detail_to_json(
     Ok(value)
 }
 
-pub async fn sandbox_provider_list(
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
+pub async fn sandbox_template_create(
     server: &str,
     name: &str,
+    image: Option<&str>,
+    cpu: Option<&str>,
+    memory: Option<&str>,
+    gpu_requirements: Option<GpuResourceRequirements>,
+    driver_config_json: Option<&str>,
+    ready_within: Option<&str>,
+    max_burst: Option<u32>,
+    labels: HashMap<String, String>,
+    annotations: HashMap<String, String>,
+    environment: HashMap<String, String>,
+    output: &str,
+    workspace: &str,
+    tls: &TlsOptions,
+    suppress_credential_warnings: bool,
+) -> Result<()> {
+    let resources = if cpu.is_some() || memory.is_some() || gpu_requirements.is_some() {
+        Some(SandboxResources {
+            cpu: cpu
+                .map(validate_cpu_quantity)
+                .transpose()?
+                .unwrap_or_default(),
+            memory: memory
+                .map(validate_memory_quantity)
+                .transpose()?
+                .unwrap_or_default(),
+            gpu: gpu_requirements,
+        })
+    } else {
+        None
+    };
+    let driver_config = driver_config_json
+        .map(parse_driver_config_json)
+        .transpose()?;
+    let desired_service_level = build_template_service_level(ready_within, max_burst)?;
+
+    let mut client = grpc_client(server, tls).await?;
+    let profile_catalog = fetch_provider_profile_catalog(&mut client, workspace)
+        .await
+        .unwrap_or_default();
+    warn_credential_env_vars(&environment, &profile_catalog, suppress_credential_warnings);
+    let response = client
+        .create_sandbox_template(CreateSandboxTemplateRequest {
+            request_id: String::new(),
+            template: Some(SandboxWorkloadTemplate {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_time: openshell_core::time::timestamp_from_millis(0).ok(),
+                    labels,
+                    resource_version: 0,
+                    annotations,
+                    workspace: workspace.to_string(),
+                    deletion_time: None,
+                }),
+                spec: Some(SandboxWorkloadTemplateSpec {
+                    workload: Some(SandboxWorkloadConfig {
+                        image: image.unwrap_or_default().to_string(),
+                        environment,
+                        resources,
+                    }),
+                    driver_config,
+                    desired_service_level,
+                }),
+            }),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
+    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
+        return Ok(());
+    }
+    println!(
+        "{} Created sandbox template {}",
+        "✓".green().bold(),
+        template.object_name().bold()
+    );
+    Ok(())
+}
+
+fn build_template_service_level(
+    ready_within: Option<&str>,
+    max_burst: Option<u32>,
+) -> Result<Option<SandboxServiceLevel>> {
+    if ready_within.is_none() && max_burst.is_none() {
+        return Ok(None);
+    }
+    let ready_within = ready_within
+        .map(parse_duration_to_ms)
+        .transpose()?
+        .map(|ms| {
+            if ms <= 0 {
+                Err(miette!("--ready-within must be greater than zero"))
+            } else {
+                Ok(duration_ms_to_proto(ms))
+            }
+        })
+        .transpose()?;
+    Ok(Some(SandboxServiceLevel {
+        startup: Some(SandboxStartup {
+            ready_within,
+            max_burst: max_burst.unwrap_or_default(),
+        }),
+    }))
+}
+
+fn duration_ms_to_proto(ms: i64) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: ms / 1_000,
+        nanos: i32::try_from((ms % 1_000) * 1_000_000)
+            .expect("duration millisecond remainder fits in protobuf nanos"),
+    }
+}
+
+pub async fn sandbox_template_get(
+    server: &str,
+    name: &str,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
-        .list_sandbox_providers(ListSandboxProvidersRequest {
-            sandbox_name: name.to_string(),
-            workspace: workspace.to_string(),
+        .get_sandbox_template(GetSandboxTemplateRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
-    let providers = response.into_inner().providers;
+    let template = response
+        .into_inner()
+        .template
+        .ok_or_else(|| miette!("sandbox template missing from response"))?;
 
-    if providers.is_empty() {
-        println!("No providers attached to sandbox {name}.");
+    if crate::output::print_output_single(output, &template, sandbox_template_to_json)? {
         return Ok(());
     }
 
-    print_provider_attachment_table(&providers);
+    print_sandbox_template_detail(&template);
     Ok(())
 }
 
-pub async fn sandbox_provider_attach(
+#[allow(clippy::too_many_arguments)]
+pub async fn sandbox_template_list(
     server: &str,
-    name: &str,
-    provider: &str,
+    page_size: i32,
+    page_token: &str,
+    label_selector: Option<&str>,
+    names_only: bool,
+    output: &str,
     workspace: &str,
+    all_workspaces: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
+    let response = client
+        .list_sandbox_templates(ListSandboxTemplatesRequest {
+            page_size,
+            page_token: page_token.to_string(),
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
+            } else {
+                openshell_core::proto::workspace_selector(workspace)
+            }),
+            label_selector: label_selector.unwrap_or_default().to_string(),
         })
         .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+        .into_diagnostic()?;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let templates = response.templates;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
-
-    let response = match client
-        .attach_sandbox_provider(AttachSandboxProviderRequest {
-            sandbox_name: name.to_string(),
-            provider_name: provider.to_string(),
-            expected_resource_version: resource_version,
-            workspace: workspace.to_string(),
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Aborted => {
-            return Err(miette::miette!(
-                "Failed to attach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            )
-            .with_source_code(status.message().to_string()));
-        }
-        Err(e) => return Err(e).into_diagnostic(),
-    };
-
-    if response.attached {
-        println!(
-            "{} Attached provider {} to sandbox {}",
-            "✓".green().bold(),
-            provider,
-            name
-        );
-    } else {
-        println!("Provider {provider} is already attached to sandbox {name}.");
-    }
-    Ok(())
-}
-
-pub async fn sandbox_provider_detach(
-    server: &str,
-    name: &str,
-    provider: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
-
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
-
-    let response = match client
-        .detach_sandbox_provider(DetachSandboxProviderRequest {
-            sandbox_name: name.to_string(),
-            provider_name: provider.to_string(),
-            expected_resource_version: resource_version,
-            workspace: workspace.to_string(),
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        Err(status) if status.code() == Code::Aborted => {
-            return Err(miette::miette!(
-                "Failed to detach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            )
-            .with_source_code(status.message().to_string()));
-        }
-        Err(e) => return Err(e).into_diagnostic(),
-    };
-
-    if response.detached {
-        println!(
-            "{} Detached provider {} from sandbox {}",
-            "✓".green().bold(),
-            provider,
-            name
-        );
-    } else {
-        println!("Provider {provider} was not attached to sandbox {name}.");
-    }
-    Ok(())
-}
-
-fn print_provider_attachment_table(providers: &[Provider]) {
-    print!("{}", format_provider_attachment_table(providers, true));
-}
-
-fn format_provider_attachment_table(providers: &[Provider], color: bool) -> String {
-    use std::fmt::Write as _;
-
-    let name_width = providers
-        .iter()
-        .map(|provider| provider.object_name().len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let type_width = providers
-        .iter()
-        .map(|provider| provider.r#type.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-
-    let name_header = if color {
-        "NAME".bold().to_string()
-    } else {
-        "NAME".to_string()
-    };
-    let type_header = if color {
-        "TYPE".bold().to_string()
-    } else {
-        "TYPE".to_string()
-    };
-    let credential_keys_header = if color {
-        "CREDENTIAL_KEYS".bold().to_string()
-    } else {
-        "CREDENTIAL_KEYS".to_string()
-    };
-    let config_keys_header = if color {
-        "CONFIG_KEYS".bold().to_string()
-    } else {
-        "CONFIG_KEYS".to_string()
-    };
-
-    let mut output = String::new();
-    let _ = writeln!(
+    if crate::output::print_paginated_output_collection(
         output,
-        "{name_header:<name_width$}  {type_header:<type_width$}  {credential_keys_header:<16}  {config_keys_header}",
+        "templates",
+        &templates,
+        &next_page_token,
+        sandbox_template_to_json,
+    )? {
+        return Ok(());
+    }
+    crate::output::print_next_page_token(&next_page_token);
+
+    if templates.is_empty() {
+        if !names_only {
+            println!("No sandbox templates found.");
+        }
+        return Ok(());
+    }
+
+    if names_only {
+        for template in &templates {
+            if all_workspaces {
+                println!("{}/{}", template.object_workspace(), template.object_name());
+            } else {
+                println!("{}", template.object_name());
+            }
+        }
+        return Ok(());
+    }
+
+    print_sandbox_template_table(&templates, all_workspaces);
+    Ok(())
+}
+
+pub(crate) fn deletion_completed(outcome: i32) -> Result<bool> {
+    use openshell_core::proto::DeletionOutcome;
+    match DeletionOutcome::try_from(outcome) {
+        Ok(DeletionOutcome::Completed) => Ok(true),
+        Ok(DeletionOutcome::AlreadyAbsent) => Ok(false),
+        _ => Err(miette!(
+            "gateway returned an unsupported deletion outcome: {outcome}"
+        )),
+    }
+}
+
+pub async fn sandbox_template_delete(
+    server: &str,
+    names: &[String],
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    for name in names {
+        let response = client
+            .delete_sandbox_template(DeleteSandboxTemplateRequest {
+                request_id: String::new(),
+                allow_missing: true,
+                name: name.clone(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
+            })
+            .await
+            .into_diagnostic()?;
+        if deletion_completed(response.into_inner().outcome)? {
+            println!("{} Deleted sandbox template {name}", "✓".green().bold());
+        } else {
+            println!("Sandbox template {name} not found.");
+        }
+    }
+    Ok(())
+}
+
+fn sandbox_template_to_json(template: &SandboxWorkloadTemplate) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), serde_json::json!(template.object_id()));
+    obj.insert(
+        "name".to_string(),
+        serde_json::json!(template.object_name()),
+    );
+    obj.insert(
+        "workspace".to_string(),
+        serde_json::json!(template.object_workspace()),
     );
 
-    for provider in providers {
-        let provider_name = provider.object_name();
-        let provider_type = &provider.r#type;
-        let credential_keys = provider_credential_keys(provider).len();
-        let config_keys = provider.config.len();
-        let _ = writeln!(
-            output,
-            "{provider_name:<name_width$}  {provider_type:<type_width$}  {credential_keys:<16}  {config_keys}",
+    if let Some(metadata) = &template.metadata {
+        if metadata.resource_version != 0 {
+            obj.insert(
+                "resource_version".to_string(),
+                serde_json::json!(metadata.resource_version),
+            );
+        }
+        if metadata.created_time.is_some() {
+            obj.insert(
+                "created_at".to_string(),
+                serde_json::json!(format_epoch_ms(proto_timestamp_ms(
+                    metadata.created_time.as_ref()
+                ))),
+            );
+        }
+        if !metadata.labels.is_empty() {
+            obj.insert("labels".to_string(), serde_json::json!(metadata.labels));
+        }
+        if !metadata.annotations.is_empty() {
+            obj.insert(
+                "annotations".to_string(),
+                serde_json::json!(metadata.annotations),
+            );
+        }
+    }
+
+    if let Some(spec) = &template.spec {
+        if let Some(workload) = &spec.workload {
+            obj.insert("image".to_string(), serde_json::json!(workload.image));
+            if !workload.environment.is_empty() {
+                obj.insert(
+                    "environment".to_string(),
+                    serde_json::json!(workload.environment),
+                );
+            }
+            if let Some(resources) = &workload.resources {
+                let mut resources_json = serde_json::Map::new();
+                if !resources.cpu.is_empty() {
+                    resources_json.insert("cpu".to_string(), serde_json::json!(resources.cpu));
+                }
+                if !resources.memory.is_empty() {
+                    resources_json
+                        .insert("memory".to_string(), serde_json::json!(resources.memory));
+                }
+                if let Some(gpu) = &resources.gpu {
+                    let value = gpu
+                        .count
+                        .map_or_else(|| serde_json::json!("default"), serde_json::Value::from);
+                    resources_json.insert("gpu".to_string(), value);
+                }
+                if !resources_json.is_empty() {
+                    obj.insert(
+                        "resources".to_string(),
+                        serde_json::Value::Object(resources_json),
+                    );
+                }
+            }
+        }
+        if let Some(driver_config) = &spec.driver_config {
+            obj.insert(
+                "driver_config".to_string(),
+                openshell_core::proto_struct::struct_to_json_value(driver_config),
+            );
+        }
+        if let Some(service_level) = &spec.desired_service_level
+            && let Some(startup) = &service_level.startup
+        {
+            let mut startup_json = serde_json::Map::new();
+            if let Some(ready_within) = &startup.ready_within {
+                startup_json.insert(
+                    "ready_within_ms".to_string(),
+                    serde_json::json!(duration_to_ms(ready_within)),
+                );
+            }
+            if startup.max_burst != 0 {
+                startup_json.insert(
+                    "max_burst".to_string(),
+                    serde_json::json!(startup.max_burst),
+                );
+            }
+            if !startup_json.is_empty() {
+                obj.insert(
+                    "startup".to_string(),
+                    serde_json::Value::Object(startup_json),
+                );
+            }
+        }
+    }
+
+    serde_json::Value::Object(obj)
+}
+
+fn print_sandbox_template_detail(template: &SandboxWorkloadTemplate) {
+    println!("{}", "Sandbox template:".cyan().bold());
+    println!();
+    println!("  {} {}", "Name:".dimmed(), template.object_name());
+    println!(
+        "  {} {}",
+        "Workspace:".dimmed(),
+        template.object_workspace()
+    );
+    if let Some(metadata) = &template.metadata {
+        println!("  {} {}", "Id:".dimmed(), metadata.id);
+        println!(
+            "  {} {}",
+            "Resource version:".dimmed(),
+            metadata.resource_version
+        );
+        if metadata.created_time.is_some() {
+            println!(
+                "  {} {}",
+                "Created:".dimmed(),
+                format_epoch_ms(proto_timestamp_ms(metadata.created_time.as_ref()))
+            );
+        }
+        let labels = labels_display(&metadata.labels);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            non_empty_or(&labels, "<none>")
         );
     }
-    output
+    if let Some(spec) = &template.spec
+        && let Some(workload) = &spec.workload
+    {
+        println!(
+            "  {} {}",
+            "Image:".dimmed(),
+            non_empty_or(&workload.image, "<default>")
+        );
+        println!(
+            "  {} {}",
+            "Environment:".dimmed(),
+            workload.environment.len()
+        );
+        if let Some(resources) = &workload.resources {
+            println!(
+                "  {} {}",
+                "CPU:".dimmed(),
+                non_empty_or(&resources.cpu, "<default>")
+            );
+            println!(
+                "  {} {}",
+                "Memory:".dimmed(),
+                non_empty_or(&resources.memory, "<default>")
+            );
+            println!(
+                "  {} {}",
+                "GPU:".dimmed(),
+                template_resources_gpu_display(resources).unwrap_or_else(|| "<none>".to_string())
+            );
+        }
+    }
+    if let Some(startup) = template_startup(template) {
+        println!(
+            "  {} {}",
+            "Ready within:".dimmed(),
+            startup
+                .ready_within
+                .as_ref()
+                .map_or_else(|| "<default>".to_string(), duration_display)
+        );
+        println!(
+            "  {} {}",
+            "Max burst:".dimmed(),
+            if startup.max_burst == 0 {
+                "<default>".to_string()
+            } else {
+                startup.max_burst.to_string()
+            }
+        );
+    }
+}
+
+fn print_sandbox_template_table(templates: &[SandboxWorkloadTemplate], show_workspace: bool) {
+    let name_width = templates
+        .iter()
+        .map(|template| template.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let workspace_width = if show_workspace {
+        templates
+            .iter()
+            .map(|template| template.object_workspace().len())
+            .max()
+            .unwrap_or(9)
+            .max(9)
+    } else {
+        0
+    };
+    let image_width = templates
+        .iter()
+        .map(|template| template_image(template).len())
+        .max()
+        .unwrap_or(5)
+        .clamp(5, 48);
+
+    if show_workspace {
+        println!(
+            "{:<workspace_width$}  {:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+            "WORKSPACE".bold(),
+            "NAME".bold(),
+            "IMAGE".bold(),
+            "CPU".bold(),
+            "MEMORY".bold(),
+            "GPU".bold(),
+            "READY".bold(),
+            "BURST".bold(),
+            "LABELS".bold(),
+        );
+    } else {
+        println!(
+            "{:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+            "NAME".bold(),
+            "IMAGE".bold(),
+            "CPU".bold(),
+            "MEMORY".bold(),
+            "GPU".bold(),
+            "READY".bold(),
+            "BURST".bold(),
+            "LABELS".bold(),
+        );
+    }
+
+    for template in templates {
+        let resources = template_resources(template);
+        let cpu = resources
+            .map(|resources| resources.cpu.as_str())
+            .filter(|cpu| !cpu.is_empty())
+            .unwrap_or("-");
+        let memory = resources
+            .map(|resources| resources.memory.as_str())
+            .filter(|memory| !memory.is_empty())
+            .unwrap_or("-");
+        let gpu = resources
+            .and_then(template_resources_gpu_display)
+            .unwrap_or_else(|| "-".to_string());
+        let image = truncate_status_field(&template_image(template), image_width);
+        let startup = template_startup(template);
+        let ready = startup
+            .and_then(|startup| startup.ready_within.as_ref())
+            .map_or_else(|| "-".to_string(), duration_display);
+        let burst = startup
+            .map(|startup| startup.max_burst)
+            .filter(|burst| *burst != 0)
+            .map_or_else(|| "-".to_string(), |burst| burst.to_string());
+        let labels = template
+            .metadata
+            .as_ref()
+            .map_or_else(String::new, |metadata| labels_display(&metadata.labels));
+
+        if show_workspace {
+            println!(
+                "{:<workspace_width$}  {:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+                template.object_workspace(),
+                template.object_name(),
+                image,
+                cpu,
+                memory,
+                gpu,
+                ready,
+                burst,
+                labels,
+            );
+        } else {
+            println!(
+                "{:<name_width$}  {:<image_width$}  {:<10}  {:<10}  {:<5}  {:<12}  {:<5}  {}",
+                template.object_name(),
+                image,
+                cpu,
+                memory,
+                gpu,
+                ready,
+                burst,
+                labels,
+            );
+        }
+    }
+}
+
+fn template_image(template: &SandboxWorkloadTemplate) -> String {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .map_or_else(
+            || "<default>".to_string(),
+            |workload| non_empty_or(&workload.image, "<default>").to_string(),
+        )
+}
+
+fn template_resources(template: &SandboxWorkloadTemplate) -> Option<&SandboxResources> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.workload.as_ref())
+        .and_then(|workload| workload.resources.as_ref())
+}
+
+fn template_resources_gpu_display(resources: &SandboxResources) -> Option<String> {
+    if let Some(gpu) = &resources.gpu {
+        return Some(
+            gpu.count
+                .map_or_else(|| "default".to_string(), |count| count.to_string()),
+        );
+    }
+    None
+}
+
+fn template_startup(template: &SandboxWorkloadTemplate) -> Option<&SandboxStartup> {
+    template
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.desired_service_level.as_ref())
+        .and_then(|service_level| service_level.startup.as_ref())
+}
+
+fn duration_to_ms(duration: &prost_types::Duration) -> i64 {
+    duration.seconds.saturating_mul(1_000) + i64::from(duration.nanos / 1_000_000)
+}
+
+fn duration_display(duration: &prost_types::Duration) -> String {
+    let total_ms = duration_to_ms(duration);
+    if total_ms % 3_600_000 == 0 {
+        format!("{}h", total_ms / 3_600_000)
+    } else if total_ms % 60_000 == 0 {
+        format!("{}m", total_ms / 60_000)
+    } else if total_ms % 1_000 == 0 {
+        format!("{}s", total_ms / 1_000)
+    } else {
+        format!("{total_ms}ms")
+    }
+}
+
+fn labels_display(labels: &HashMap<String, String>) -> String {
+    let mut pairs = labels
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs.join(", ")
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
@@ -2358,18 +3890,25 @@ pub async fn sandbox_delete(
     let mut client = grpc_client(server, tls).await?;
 
     let names_to_delete: Vec<String> = if all {
-        // Fetch all sandboxes (use a large page size).
-        let response = client
-            .list_sandboxes(ListSandboxesRequest {
-                limit: 1000,
-                offset: 0,
-                label_selector: String::new(),
-                workspace: workspace.to_string(),
-                all_workspaces: false,
-            })
-            .await
-            .into_diagnostic()?;
-        let sandboxes = response.into_inner().sandboxes;
+        let mut page_token = String::new();
+        let mut sandboxes = Vec::new();
+        loop {
+            let response = client
+                .list_sandboxes(ListSandboxesRequest {
+                    page_size: 1000,
+                    page_token,
+                    label_selector: String::new(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
+                })
+                .await
+                .into_diagnostic()?
+                .into_inner();
+            sandboxes.extend(response.sandboxes);
+            if response.next_page_token.is_empty() {
+                break;
+            }
+            page_token = response.next_page_token;
+        }
         if sandboxes.is_empty() {
             println!("No sandboxes to delete.");
             return Ok(());
@@ -2382,9 +3921,10 @@ pub async fn sandbox_delete(
         names.to_vec()
     };
 
+    let mut failures = Vec::new();
     for name in &names_to_delete {
         // Stop any background port forwards for this sandbox before deleting.
-        if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+        if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
             for port in stopped {
                 eprintln!(
                     "{} Stopped forward of port {port} for sandbox {name}",
@@ -2393,24 +3933,50 @@ pub async fn sandbox_delete(
             }
         }
 
-        let response = client
+        let response = match client
             .delete_sandbox(DeleteSandboxRequest {
+                request_id: String::new(),
+                allow_missing: true,
                 name: name.clone(),
-                workspace: workspace.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
             })
             .await
-            .into_diagnostic()?;
+        {
+            Ok(response) => response,
+            Err(status) => {
+                eprintln!(
+                    "{} Failed to delete sandbox {name}: {status}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
+        };
 
-        let deleted = response.into_inner().deleted;
-        if deleted {
-            clear_last_sandbox_if_matches(gateway, workspace, name);
-            println!("{} Deleted sandbox {name}", "✓".green().bold());
-        } else {
-            println!("{} Sandbox {name} not found", "!".yellow());
+        match response.into_inner().outcome() {
+            DeletionOutcome::Completed => println!("{} Deleted sandbox {name}", "✓".green().bold()),
+            DeletionOutcome::Accepted => println!(
+                "{} Sandbox {name} deletion accepted; cleanup is pending",
+                "✓".green().bold()
+            ),
+            DeletionOutcome::AlreadyAbsent => {
+                println!("{} Sandbox {name} already deleted", "✓".green().bold());
+            }
+            DeletionOutcome::Unspecified => {
+                eprintln!(
+                    "{} Unsupported deletion outcome for sandbox {name}",
+                    "!".red().bold()
+                );
+                failures.push(name.clone());
+                continue;
+            }
         }
+        clear_last_sandbox_if_matches(gateway, workspace, name);
     }
 
-    Ok(())
+    aggregate_delete_failures("sandbox", &failures)
 }
 
 /// Stop a sandbox while retaining its persistent workspace.
@@ -2420,7 +3986,7 @@ pub async fn sandbox_stop(
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+    if let Ok(stopped) = stop_forwards_for_sandbox(workspace, name) {
         for port in stopped {
             eprintln!(
                 "{} Stopped forward of port {port} for sandbox {name}",
@@ -2432,8 +3998,11 @@ pub async fn sandbox_stop(
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
         .stop_sandbox(StopSandboxRequest {
+            request_id: String::new(),
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -2455,8 +4024,11 @@ pub async fn sandbox_start(
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
         .start_sandbox(StartSandboxRequest {
+            request_id: String::new(),
             name: name.to_string(),
-            workspace: workspace.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -2478,9 +4050,9 @@ async fn wait_for_lifecycle_phase(
         return Ok(sandbox);
     }
     if current == SandboxPhase::Error {
-        return Err(miette!(
-            "sandbox entered Error while waiting for {target:?}"
-        ));
+        let detail = ready_false_condition_message(sandbox.status.as_ref())
+            .unwrap_or_else(|| "sandbox entered Error".to_string());
+        return Err(miette!("{detail} while waiting for {target:?}"));
     }
 
     let timeout = Duration::from_secs(
@@ -2489,19 +4061,22 @@ async fn wait_for_lifecycle_phase(
             .and_then(|value| value.parse().ok())
             .unwrap_or(300),
     );
-    let sandbox_id = sandbox.object_id().to_string();
+    let sandbox_name = sandbox.object_name().to_string();
+    let workspace = sandbox.object_workspace().to_string();
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
-            id: sandbox_id,
+            sandbox: sandbox_name,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
             follow_status: true,
             follow_logs: false,
             follow_events: false,
             log_tail_lines: 0,
             event_tail: 0,
             stop_on_terminal: false,
-            log_since_ms: 0,
+            since_time: None,
             log_sources: Vec::new(),
             log_min_level: String::new(),
+            resume_after_cursor: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -2542,334 +4117,25 @@ async fn wait_for_lifecycle_phase(
     }
 }
 
-/// Return the provider type inferred from the trailing command, if any.
-fn inferred_provider_type(command: &[String]) -> Option<String> {
-    detect_provider_from_command(command).map(str::to_string)
-}
-
-/// Ensure all required providers exist.
-///
-/// `explicit_names` are provider **names** supplied via `--provider`. They are
-/// passed through directly; the server validates they exist at sandbox creation.
-///
-/// `inferred_types` are provider **types** inferred from the trailing command
-/// (e.g. `claude` -> type `"claude-code"`). These are resolved to provider names via
-/// a type→name lookup, and missing types may be auto-created interactively.
-///
-/// Returns a deduplicated list of provider **names** suitable for
-/// `SandboxSpec.providers`.
-pub async fn ensure_required_providers(
-    client: &mut crate::tls::GrpcClient,
-    explicit_names: &[String],
-    inferred_types: &[String],
-    auto_providers_override: Option<bool>,
-    workspace: &str,
-) -> Result<Vec<String>> {
-    if explicit_names.is_empty() && inferred_types.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut configured_names: Vec<String> = Vec::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
-
-    // ── Fetch all existing providers ─────────────────────────────────────
-    // Build both a name set (for explicit --provider lookups) and a
-    // type-to-name map (for inferred provider resolution).
-    let mut known_names: HashSet<String> = HashSet::new();
-    let mut type_to_name: HashMap<String, String> = HashMap::new();
-    {
-        let mut offset = 0_u32;
-        let limit = 100_u32;
-        loop {
-            let response = client
-                .list_providers(ListProvidersRequest {
-                    limit,
-                    offset,
-                    workspace: workspace.to_string(),
-                    all_workspaces: false,
-                })
-                .await
-                .into_diagnostic()?;
-            let providers = response.into_inner().providers;
-            for provider in &providers {
-                known_names.insert(provider.object_name().to_string());
-                if !provider.r#type.is_empty() {
-                    let type_lower = provider.r#type.to_ascii_lowercase();
-                    type_to_name
-                        .entry(type_lower)
-                        .or_insert_with(|| provider.object_name().to_string());
-                }
-            }
-            if providers.len() < limit as usize {
-                break;
-            }
-            offset = offset.saturating_add(limit);
-        }
-    }
-
-    // ── Explicit provider names ──────────────────────────────────────────
-    // If the name exists on the server, use it directly. Otherwise, if the
-    // name matches a known provider type, auto-create a provider of that
-    // type with the requested name.
-    for name in explicit_names {
-        if known_names.contains(name) {
-            if seen_names.insert(name.clone()) {
-                configured_names.push(name.clone());
-            }
-        } else if let Some(provider_type) = normalize_provider_type(name) {
-            auto_create_provider(
-                client,
-                provider_type,
-                Some(name),
-                auto_providers_override,
-                &mut seen_names,
-                &mut configured_names,
-                workspace,
-            )
-            .await?;
-            // Record the type mapping so the inferred-types pass below
-            // doesn't attempt to create a duplicate provider.
-            type_to_name
-                .entry(provider_type.to_ascii_lowercase())
-                .or_insert_with(|| name.clone());
-        } else {
-            return Err(miette::miette!(
-                "provider '{name}' not found and '{name}' is not a recognized provider type. \
-                 Create it first with `openshell provider create --type <type> --name {name}`"
-            ));
-        }
-    }
-
-    // ── Resolve inferred provider types ──────────────────────────────────
-    if !inferred_types.is_empty() {
-        // Collect resolved names for types that already have a provider.
-        for t in inferred_types {
-            if let Some(name) = type_to_name.get(&t.to_ascii_lowercase())
-                && seen_names.insert(name.clone())
-            {
-                configured_names.push(name.clone());
-            }
-        }
-
-        let missing = inferred_types
-            .iter()
-            .filter(|t| !type_to_name.contains_key(&t.to_ascii_lowercase()))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for provider_type in missing {
-            auto_create_provider(
-                client,
-                &provider_type,
-                None,
-                auto_providers_override,
-                &mut seen_names,
-                &mut configured_names,
-                workspace,
-            )
-            .await?;
-        }
-    }
-
-    Ok(configured_names)
-}
-
-/// Prompt for (or auto-confirm) creation of a provider from local credentials.
-///
-/// When `preferred_name` is `Some`, the provider is created with that exact
-/// name (used for explicit `--provider <name>` values). When `None`, the name
-/// defaults to the type and retries with suffixes on conflict (used for
-/// inferred provider types).
-async fn auto_create_provider(
-    client: &mut crate::tls::GrpcClient,
-    provider_type: &str,
-    preferred_name: Option<&str>,
-    auto_providers_override: Option<bool>,
-    seen_names: &mut HashSet<String>,
-    configured_names: &mut Vec<String>,
-    workspace: &str,
-) -> Result<()> {
-    eprintln!("Missing provider: {provider_type}");
-
-    // --no-auto-providers: skip silently.
-    if auto_providers_override == Some(false) {
-        eprintln!(
-            "{} Skipping provider '{provider_type}' (--no-auto-providers)",
-            "!".yellow(),
-        );
-        eprintln!();
-        return Ok(());
-    }
-
-    // No override and non-interactive: error.
-    if auto_providers_override.is_none() && !std::io::stdin().is_terminal() {
-        return Err(miette::miette!(
-            "missing required provider '{provider_type}'. Create it first with \
-             `openshell provider create --type {provider_type} --name {provider_type} --from-existing`, \
-             pass --auto-providers to auto-create, or set it up manually from inside the sandbox"
-        ));
-    }
-
-    // --auto-providers: auto-confirm; otherwise prompt.
-    let should_create = if auto_providers_override == Some(true) {
-        true
-    } else {
-        Confirm::new()
-            .with_prompt("Create from local credentials?")
-            .default(true)
-            .interact()
-            .into_diagnostic()?
-    };
-
-    if !should_create {
-        eprintln!("{} Skipping provider '{provider_type}'", "!".yellow());
-        eprintln!();
-        return Ok(());
-    }
-
-    let discovered = discover_existing_provider_data(client, provider_type, workspace)
-        .await
-        .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
-    let Some(discovered) = discovered else {
-        eprintln!(
-            "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
-            "!".yellow(),
-            provider_type
-        );
-        eprintln!();
-        return Ok(());
-    };
-
-    if let Some(exact_name) = preferred_name {
-        // Explicit name: create with exactly that name, no retries.
-        let request = CreateProviderRequest {
-            provider: Some(Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: exact_name.to_string(),
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                r#type: provider_type.to_string(),
-                credentials: discovered.credentials.clone(),
-                config: discovered.config.clone(),
-                credential_expires_at_ms: HashMap::new(),
-                profile_workspace: workspace.to_string(),
-                credential_handles: HashMap::new(),
-            }),
-            workspace: workspace.to_string(),
-        };
-
-        let response = client.create_provider(request).await.map_err(|status| {
-            miette::miette!("failed to create provider '{exact_name}': {status}")
-        })?;
-        let provider = response
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider missing from response"))?;
-        eprintln!(
-            "{} Created provider {} ({}) from existing local state",
-            "✓".green().bold(),
-            provider.object_name(),
-            provider.r#type
-        );
-        if seen_names.insert(provider.object_name().to_string()) {
-            configured_names.push(provider.object_name().to_string());
-        }
-    } else {
-        // Inferred type: try type as name, then suffixed variants.
-        let mut created = false;
-        for attempt in 0..5 {
-            let name = if attempt == 0 {
-                provider_type.to_string()
-            } else {
-                format!("{provider_type}-{attempt}")
-            };
-
-            let request = CreateProviderRequest {
-                provider: Some(Provider {
-                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                        id: String::new(),
-                        name: name.clone(),
-                        created_at_ms: 0,
-                        labels: HashMap::new(),
-                        resource_version: 0,
-                        annotations: HashMap::new(),
-                        workspace: workspace.to_string(),
-                        deletion_timestamp_ms: 0,
-                    }),
-                    r#type: provider_type.to_string(),
-                    credentials: discovered.credentials.clone(),
-                    config: discovered.config.clone(),
-                    credential_expires_at_ms: HashMap::new(),
-                    profile_workspace: workspace.to_string(),
-                    credential_handles: HashMap::new(),
-                }),
-                workspace: workspace.to_string(),
-            };
-
-            match client.create_provider(request).await {
-                Ok(response) => {
-                    let provider = response
-                        .into_inner()
-                        .provider
-                        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-                    eprintln!(
-                        "{} Created provider {} ({}) from existing local state",
-                        "✓".green().bold(),
-                        provider.object_name(),
-                        provider.r#type
-                    );
-                    if seen_names.insert(provider.object_name().to_string()) {
-                        configured_names.push(provider.object_name().to_string());
-                    }
-                    created = true;
-                    break;
-                }
-                Err(status) if status.code() == Code::AlreadyExists => {}
-                Err(status) => {
-                    return Err(miette::miette!(
-                        "failed to create provider for type '{provider_type}': {status}"
-                    ));
-                }
-            }
-        }
-
-        if !created {
-            return Err(miette::miette!(
-                "failed to create provider for type '{provider_type}' after name retries"
-            ));
-        }
-    }
-
-    eprintln!();
-    Ok(())
-}
-
 pub async fn service_expose(
     server: &str,
     sandbox: &str,
     service: &str,
     target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .expose_service(ExposeServiceRequest {
-            sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            target_port: u32::from(target_port),
-            domain: true,
-            workspace: workspace.to_string(),
-        })
-        .await
-        .map_err(service_expose_status_error)?
-        .into_inner();
+    let response = expose_service_endpoint(
+        server,
+        sandbox,
+        service,
+        target_port,
+        authorization_mode,
+        workspace,
+        tls,
+    )
+    .await?;
 
     if service.is_empty() {
         println!(
@@ -2894,35 +4160,83 @@ pub async fn service_expose(
     Ok(())
 }
 
-fn service_expose_status_error(status: Status) -> miette::Report {
-    service_status_error("expose service", "sandbox:write", status)
+async fn expose_service_endpoint(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    authorization_mode: ServiceAuthorizationMode,
+    workspace: &str,
+    tls: &TlsOptions,
+) -> Result<ServiceEndpointResponse> {
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .expose_service(ExposeServiceRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            name: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+            authorization_mode: authorization_mode as i32,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
+        .await
+        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))
+        .map(tonic::Response::into_inner)
 }
 
+#[allow(clippy::too_many_arguments)] // user-facing CLI command
 pub async fn service_list(
     server: &str,
     sandbox: Option<&str>,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     workspace: &str,
     all_workspaces: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_services(ListServicesRequest {
             sandbox: sandbox.unwrap_or_default().to_string(),
-            limit,
-            offset,
-            workspace: if all_workspaces {
-                String::new()
+            page_size,
+            page_token: page_token.to_string(),
+            workspace_scope: Some(if all_workspaces {
+                openshell_core::proto::all_workspaces_selector()
             } else {
-                workspace.to_string()
-            },
-            all_workspaces,
+                openshell_core::proto::workspace_selector(workspace)
+            }),
         })
         .await
-        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .map_err(|status| {
+            service_status_error(
+                "list services",
+                "sandbox:read",
+                sandbox.unwrap_or_default(),
+                status,
+            )
+        })?
         .into_inner();
+
+    let next_page_token = response.next_page_token.clone();
+    let services = response
+        .services
+        .iter()
+        .filter_map(|response| service_endpoint_to_json(response, server))
+        .collect::<Vec<_>>();
+    if crate::output::print_paginated_output_collection(
+        output,
+        "services",
+        &services,
+        &next_page_token,
+        Clone::clone,
+    )? {
+        return Ok(());
+    }
+    crate::output::print_next_page_token(&next_page_token);
 
     if response.services.is_empty() {
         if let Some(sandbox) = sandbox {
@@ -2947,12 +4261,14 @@ pub async fn service_get(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_service(GetServiceRequest {
-            sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            workspace: workspace.to_string(),
+            sandbox: (sandbox).to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            name: service.to_string(),
         })
         .await
-        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .map_err(|status| service_status_error("get service", "sandbox:read", sandbox, status))?
         .into_inner();
 
     print_service_endpoint_table(&[response], server, false);
@@ -2969,15 +4285,19 @@ pub async fn service_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .delete_service(DeleteServiceRequest {
+            request_id: String::new(),
+            allow_missing: false,
             sandbox: sandbox.to_string(),
-            service: service.to_string(),
-            workspace: workspace.to_string(),
+            name: service.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
-        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .map_err(|status| service_status_error("delete service", "sandbox:write", sandbox, status))?
         .into_inner();
 
-    if !response.deleted {
+    if !deletion_completed(response.outcome)? {
         return Err(miette!("delete service failed: service endpoint not found"));
     }
 
@@ -2998,13 +4318,23 @@ pub async fn service_delete(
     Ok(())
 }
 
-fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
+fn service_status_error(
+    action: &str,
+    required_scope: &str,
+    sandbox: &str,
+    status: Status,
+) -> miette::Report {
     let message = status.message();
     match status.code() {
         Code::PermissionDenied => {
             miette!("{action} failed: permission denied (requires {required_scope})")
         }
         Code::Unauthenticated => miette!("{action} failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" && !sandbox.is_empty() => {
+            miette!(
+                "{action} failed: sandbox \"{sandbox}\" not found (the first argument is the sandbox name, not the service name)"
+            )
+        }
         Code::NotFound if message == "sandbox not found" => {
             miette!("{action} failed: sandbox not found")
         }
@@ -3031,8 +4361,9 @@ fn print_service_endpoint_table(
                 .metadata
                 .as_ref()
                 .map_or("", |m| m.workspace.as_str());
-            let service = service_display_name(&endpoint.service_name).to_string();
+            let service = service_display_name(&endpoint.name).to_string();
             let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let authorization = service_authorization_mode_name(endpoint.authorization_mode);
             let url = if response.url.is_empty() {
                 String::new()
             } else {
@@ -3040,9 +4371,10 @@ fn print_service_endpoint_table(
             };
             Some((
                 workspace.to_string(),
-                endpoint.sandbox_name.clone(),
+                endpoint.sandbox.clone(),
                 service,
                 target,
+                authorization,
                 url,
             ))
         })
@@ -3054,7 +4386,7 @@ fn print_service_endpoint_table(
 
     let ws_width = if all_workspaces {
         rows.iter()
-            .map(|(ws, _, _, _, _)| ws.len())
+            .map(|(ws, _, _, _, _, _)| ws.len())
             .max()
             .unwrap_or(9)
             .max(9)
@@ -3063,57 +4395,91 @@ fn print_service_endpoint_table(
     };
     let sandbox_width = rows
         .iter()
-        .map(|(_, sandbox, _, _, _)| sandbox.len())
+        .map(|(_, sandbox, _, _, _, _)| sandbox.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let service_width = rows
         .iter()
-        .map(|(_, _, service, _, _)| service.len())
+        .map(|(_, _, service, _, _, _)| service.len())
         .max()
         .unwrap_or(7)
         .max(7);
     let target_width = rows
         .iter()
-        .map(|(_, _, _, target, _)| target.len())
+        .map(|(_, _, _, target, _, _)| target.len())
         .max()
         .unwrap_or(6)
         .max(6);
 
     if all_workspaces {
         println!(
-            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<ws_width$}  {:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "WORKSPACE".bold(),
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     } else {
         println!(
-            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+            "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {:<20}  {}",
             "SANDBOX".bold(),
             "SERVICE".bold(),
             "TARGET".bold(),
+            "AUTHORIZATION".bold(),
             "URL".bold(),
         );
     }
 
-    for (workspace, sandbox, service, target, url) in rows {
+    for (workspace, sandbox, service, target, authorization, url) in rows {
         if all_workspaces {
             println!(
-                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{workspace:<ws_width$}  {sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         } else {
             println!(
-                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+                "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {authorization:<20}  {url}"
             );
         }
     }
 }
 
+fn service_endpoint_to_json(
+    response: &ServiceEndpointResponse,
+    gateway_endpoint: &str,
+) -> Option<serde_json::Value> {
+    let endpoint = response.endpoint.as_ref()?;
+    let workspace = endpoint
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.workspace.as_str());
+    let url = if response.url.is_empty() {
+        String::new()
+    } else {
+        service_url_for_gateway(&response.url, gateway_endpoint)
+    };
+
+    Some(serde_json::json!({
+        "workspace": workspace,
+        "sandbox": endpoint.sandbox,
+        "service": endpoint.name,
+        "target_port": endpoint.target_port,
+        "authorization_mode": service_authorization_mode_name(endpoint.authorization_mode),
+        "url": url,
+    }))
+}
+
 fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
+}
+
+fn service_authorization_mode_name(mode: i32) -> &'static str {
+    match ServiceAuthorizationMode::try_from(mode).unwrap_or(ServiceAuthorizationMode::Strip) {
+        ServiceAuthorizationMode::BearerPassthrough => "bearer_passthrough",
+        ServiceAuthorizationMode::Unspecified | ServiceAuthorizationMode::Strip => "strip",
+    }
 }
 
 /// Read gcloud Application Default Credentials from disk.
@@ -3123,126 +4489,6 @@ fn service_display_name(service: &str) -> &str {
 /// Checks `GOOGLE_APPLICATION_CREDENTIALS` first; falls back to
 /// `$CLOUDSDK_CONFIG/application_default_credentials.json` when set, then to
 /// `~/.config/gcloud/application_default_credentials.json`.
-fn read_gcloud_adc() -> Result<(String, String, String)> {
-    let path = if let Some(env_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        PathBuf::from(env_path)
-    } else if let Some(config_dir) = std::env::var("CLOUDSDK_CONFIG")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        PathBuf::from(config_dir).join("application_default_credentials.json")
-    } else {
-        let home = std::env::var("HOME")
-            .map_err(|_| miette::miette!("HOME is not set; cannot locate gcloud ADC file"))?;
-        PathBuf::from(home)
-            .join(".config")
-            .join("gcloud")
-            .join("application_default_credentials.json")
-    };
-
-    let content = std::fs::read_to_string(&path).map_err(|err| {
-        miette::miette!(
-            "failed to read gcloud ADC file at {}: {}. \
-             Run: gcloud auth application-default login",
-            path.display(),
-            err
-        )
-    })?;
-
-    let json: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|err| miette::miette!("failed to parse gcloud ADC file: {err}"))?;
-
-    let cred_type = json.get("type").and_then(|v| v.as_str());
-    match cred_type {
-        Some("service_account") => {
-            return Err(miette::miette!(
-                "Application Default Credentials are a service account key, not user credentials. \
-                 To use a service account, create the provider with the service account JSON key \
-                 and configure gateway-managed refresh for 'GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN'. \
-                 See: openshell provider create --help"
-            ));
-        }
-        Some("authorized_user") => {}
-        Some(other) => {
-            return Err(miette::miette!(
-                "Application Default Credentials have unsupported type '{other}' \
-                 (expected 'authorized_user'). \
-                 Run: gcloud auth application-default login"
-            ));
-        }
-        None => {
-            return Err(miette::miette!(
-                "gcloud ADC file is missing the 'type' field. \
-                 The file may be malformed. \
-                 Run: gcloud auth application-default login"
-            ));
-        }
-    }
-
-    let client_id = json
-        .get("client_id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| miette::miette!("gcloud ADC file is missing 'client_id'"))?
-        .to_string();
-
-    let client_secret = json
-        .get("client_secret")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| miette::miette!("gcloud ADC file is missing 'client_secret'"))?
-        .to_string();
-
-    let refresh_token = json
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| miette::miette!("gcloud ADC file is missing 'refresh_token'"))?
-        .to_string();
-
-    Ok((client_id, client_secret, refresh_token))
-}
-
-async fn rollback_provider_create_after_gcloud_adc_failure(
-    client: &mut crate::tls::GrpcClient,
-    provider_name: &str,
-    stage: &str,
-    source: &Status,
-    workspace: &str,
-) -> Result<()> {
-    match client
-        .delete_provider(DeleteProviderRequest {
-            name: provider_name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-    {
-        Ok(_) => Err(miette!(
-            "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
-             The provider was rolled back successfully."
-        )),
-        Err(cleanup_err) => {
-            eprintln!(
-                "{} Failed to clean up provider '{}' after {} failed: {}. \
-                 Run 'openshell provider delete {}' to remove it manually.",
-                "⚠".yellow(),
-                provider_name,
-                stage,
-                cleanup_err,
-                provider_name
-            );
-            Err(miette!(
-                "failed to {stage} credentials from gcloud ADC for provider '{provider_name}': {source}. \
-                 Cleanup also failed, so the provider may still exist. \
-                 Run 'openshell provider delete {provider_name}' to remove it manually."
-            ))
-        }
-    }
-}
-
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
     let (Ok(mut service_url), Ok(gateway_endpoint)) = (
         url::Url::parse(service_url),
@@ -3259,1691 +4505,6 @@ fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String 
     }
 
     service_url.to_string()
-}
-
-async fn gateway_providers_v2_enabled(client: &mut crate::tls::GrpcClient) -> Result<bool> {
-    let response = client
-        .get_gateway_config(GetGatewayConfigRequest {})
-        .await
-        .into_diagnostic()?
-        .into_inner();
-    let Some(setting) = response.settings.get(settings::PROVIDERS_V2_ENABLED_KEY) else {
-        return Ok(false);
-    };
-    match setting.value.as_ref() {
-        Some(setting_value::Value::BoolValue(enabled)) => Ok(*enabled),
-        None => Ok(false),
-        Some(_) => Err(miette::miette!(
-            "gateway setting '{}' has invalid value type; expected bool",
-            settings::PROVIDERS_V2_ENABLED_KEY
-        )),
-    }
-}
-
-async fn fetch_provider_profile(
-    client: &mut crate::tls::GrpcClient,
-    provider_type: &str,
-    workspace: &str,
-) -> Result<ProviderProfile> {
-    let response = client
-        .get_provider_profile(GetProviderProfileRequest {
-            id: provider_type.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .map_err(|status| {
-            if status.code() == Code::NotFound {
-                miette::miette!(
-                    "provider profile '{provider_type}' not found; providers v2 discovery requires a provider profile"
-                )
-            } else {
-                miette::miette!(status.to_string())
-            }
-        })?;
-
-    response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette::miette!("provider profile '{provider_type}' missing from response"))
-}
-
-async fn discover_existing_provider_data(
-    client: &mut crate::tls::GrpcClient,
-    provider_type: &str,
-    workspace: &str,
-) -> Result<Option<openshell_providers::DiscoveredProvider>> {
-    if gateway_providers_v2_enabled(client).await? {
-        let profile = fetch_provider_profile(client, provider_type, workspace).await?;
-        let profile = ProviderTypeProfile::from_proto(&profile);
-        let mut discovered =
-            discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
-                miette::miette!("failed to discover existing provider data from profile: {err}")
-            })?;
-
-        // Vertex AI config keys (project ID, region, base URL, publisher) are not
-        // declared in the profile's discovery.credentials list, so discover_from_profile
-        // does not scan them. Scan them directly here so --from-existing captures them.
-        if provider_type == VERTEX_AI_PROVIDER_TYPE {
-            let discovered = discovered.get_or_insert_with(Default::default);
-            for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
-                if let Ok(val) = std::env::var(key) {
-                    let val = val.trim().to_string();
-                    if !val.is_empty() {
-                        discovered.config.entry(key.to_string()).or_insert(val);
-                    }
-                }
-            }
-        }
-
-        Ok(discovered)
-    } else {
-        let registry = ProviderRegistry::new();
-        registry
-            .discover_existing(provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))
-    }
-}
-
-/// Canonical provider type string for Google Vertex AI.
-const VERTEX_AI_PROVIDER_TYPE: &str = "google-vertex-ai";
-
-/// Canonical provider type string for Google Cloud (GCP APIs).
-const GOOGLE_CLOUD_PROVIDER_TYPE: &str = "google-cloud";
-
-fn missing_credentials_error(provider_type: &str) -> miette::Report {
-    if provider_type == VERTEX_AI_PROVIDER_TYPE {
-        return miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Set GOOGLE_VERTEX_AI_TOKEN, VERTEX_AI_TOKEN, \
-             GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, or VERTEX_AI_SERVICE_ACCOUNT_TOKEN; \
-             or use --from-gcloud-adc or --from-existing with those env vars set."
-        );
-    }
-
-    if provider_type == GOOGLE_CLOUD_PROVIDER_TYPE {
-        return miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Set GCP_ADC_ACCESS_TOKEN or GCP_SA_ACCESS_TOKEN; \
-             or use --from-gcloud-adc / --from-existing with those env vars set."
-        );
-    }
-
-    miette::miette!(
-        "no credentials resolved for provider type '{provider_type}'. \
-         Use --credential KEY[=VALUE], --runtime-credentials for runtime-resolved profile credentials, or --from-existing \
-         with the appropriate env vars set."
-    )
-}
-
-async fn provider_credential_from_oidc_token(
-    credentials: &[String],
-    profile: Option<&ProviderProfile>,
-    tls: &TlsOptions,
-) -> Result<(HashMap<String, String>, HashMap<String, i64>)> {
-    let credential_key = oidc_subject_credential_key(credentials, profile)?;
-
-    let gateway_name = tls.gateway_name().ok_or_else(|| {
-        miette::miette!("--from-oidc-token requires an active named OIDC gateway")
-    })?;
-    let bundle =
-        crate::oidc_auth::ensure_valid_oidc_token_bundle(gateway_name, tls.gateway_insecure)
-            .await
-            .map_err(|err| {
-                miette::miette!(
-                    "failed to load or refresh OIDC token for gateway '{gateway_name}' while preparing provider credential: {err}"
-                )
-            })?;
-
-    let mut credential_map = HashMap::new();
-    credential_map.insert(credential_key.clone(), bundle.access_token);
-
-    let mut credential_expires_at_ms = HashMap::new();
-    if let Some(expires_at) = bundle.expires_at {
-        let expires_at_ms = i64::try_from(expires_at)
-            .unwrap_or(i64::MAX / 1000)
-            .saturating_mul(1000);
-        credential_expires_at_ms.insert(credential_key, expires_at_ms);
-    }
-
-    Ok((credential_map, credential_expires_at_ms))
-}
-
-fn oidc_subject_credential_key(
-    credentials: &[String],
-    profile: Option<&ProviderProfile>,
-) -> Result<String> {
-    if credentials.len() > 1 {
-        return Err(miette::miette!(
-            "--from-oidc-token accepts at most one --credential KEY destination"
-        ));
-    }
-
-    if let Some(credential) = credentials.first() {
-        let credential = credential.trim();
-        if credential.is_empty() || credential.contains('=') {
-            return Err(miette::miette!(
-                "--from-oidc-token requires --credential KEY without an inline value"
-            ));
-        }
-        if let Some(profile) = profile {
-            ensure_profile_declares_subject_credential(profile, credential)?;
-        }
-        return Ok(credential.to_string());
-    }
-
-    let Some(profile) = profile else {
-        return Err(miette::miette!(
-            "--from-oidc-token requires --credential KEY when the provider profile is unavailable"
-        ));
-    };
-
-    infer_oidc_subject_credential_from_profile(profile)
-}
-
-fn ensure_profile_declares_subject_credential(
-    profile: &ProviderProfile,
-    credential: &str,
-) -> Result<()> {
-    let matches = token_exchange_subject_credentials(profile);
-    if matches.iter().any(|candidate| candidate == credential) {
-        return Ok(());
-    }
-    Err(miette::miette!(
-        "credential '{credential}' is not declared as a token-exchange subject credential in provider profile '{}'; expected one of: {}",
-        profile.id,
-        matches.join(", ")
-    ))
-}
-
-fn infer_oidc_subject_credential_from_profile(profile: &ProviderProfile) -> Result<String> {
-    let matches = token_exchange_subject_credentials(profile);
-    match matches.as_slice() {
-        [credential] => Ok(credential.clone()),
-        [] => Err(miette::miette!(
-            "provider profile '{}' does not declare a token-exchange subject credential; pass --credential KEY",
-            profile.id
-        )),
-        _ => Err(miette::miette!(
-            "provider profile '{}' declares multiple token-exchange subject credentials ({}); pass --credential KEY",
-            profile.id,
-            matches.join(", ")
-        )),
-    }
-}
-
-fn token_exchange_subject_credentials(profile: &ProviderProfile) -> Vec<String> {
-    let mut matches = Vec::new();
-    for credential in &profile.credentials {
-        let Some(token_grant) = credential.token_grant.as_ref() else {
-            continue;
-        };
-        if ProviderCredentialTokenGrantType::try_from(token_grant.grant_type).ok()
-            != Some(ProviderCredentialTokenGrantType::TokenExchange)
-        {
-            continue;
-        }
-        let Some(subject_token) = token_grant.subject_token.as_ref() else {
-            continue;
-        };
-        if subject_token.source != "provider_credential" || subject_token.credential.is_empty() {
-            continue;
-        }
-        if !matches.contains(&subject_token.credential) {
-            matches.push(subject_token.credential.clone());
-        }
-    }
-    matches
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_create(
-    server: &str,
-    name: &str,
-    provider_type: &str,
-    from_existing: bool,
-    credentials: &[String],
-    from_gcloud_adc: bool,
-    config: &[String],
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let credential_source = match (from_existing, from_gcloud_adc) {
-        (true, true) => {
-            return Err(miette::miette!(
-                "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
-            ));
-        }
-        (true, false) => ProviderCreateCredentialSource::Existing,
-        (false, true) => ProviderCreateCredentialSource::GcloudAdc,
-        (false, false) => ProviderCreateCredentialSource::ExplicitCredentials,
-    };
-    provider_create_with_options(ProviderCreateOptions {
-        server,
-        name,
-        provider_type,
-        credentials,
-        credential_source,
-        config,
-        workspace,
-        profile_workspace: workspace,
-        tls,
-    })
-    .await
-}
-
-pub struct ProviderCreateOptions<'a> {
-    pub server: &'a str,
-    pub name: &'a str,
-    pub provider_type: &'a str,
-    pub credentials: &'a [String],
-    pub credential_source: ProviderCreateCredentialSource,
-    pub config: &'a [String],
-    pub workspace: &'a str,
-    pub profile_workspace: &'a str,
-    pub tls: &'a TlsOptions,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ProviderCreateCredentialSource {
-    ExplicitCredentials,
-    Existing,
-    GcloudAdc,
-    OidcToken,
-    Runtime,
-}
-
-pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) -> Result<()> {
-    let ProviderCreateOptions {
-        server,
-        name,
-        provider_type,
-        credentials,
-        credential_source,
-        config,
-        workspace,
-        profile_workspace,
-        tls,
-    } = options;
-
-    let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
-    let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
-    let from_oidc_token = credential_source == ProviderCreateCredentialSource::OidcToken;
-    let runtime_credentials = credential_source == ProviderCreateCredentialSource::Runtime;
-
-    if from_gcloud_adc && !credentials.is_empty() {
-        return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing, --from-oidc-token, or --credential; it also cannot be combined with --runtime-credentials"
-        ));
-    }
-    if from_existing && !credentials.is_empty() {
-        return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential"
-        ));
-    }
-    if runtime_credentials && !credentials.is_empty() {
-        return Err(miette::miette!(
-            "--runtime-credentials cannot be combined with --credential"
-        ));
-    }
-
-    let mut client = grpc_client(server, tls).await?;
-
-    let provider_type = if let Some(provider_type) = normalize_provider_type(provider_type) {
-        provider_type.to_string()
-    } else {
-        let profile_id = provider_type.trim();
-        if profile_id.is_empty() {
-            return Err(miette::miette!("provider type is required"));
-        }
-        let response = client
-            .get_provider_profile(GetProviderProfileRequest {
-                id: profile_id.to_string(),
-                workspace: profile_workspace.to_string(),
-            })
-            .await;
-        match response {
-            Ok(response) => response
-                .into_inner()
-                .profile
-                .map(|profile| profile.id)
-                .filter(|id| !id.trim().is_empty())
-                .unwrap_or_else(|| profile_id.to_string()),
-            Err(status) if status.code() == Code::NotFound => {
-                return Err(miette::miette!(
-                    "unsupported provider type or profile: {provider_type}"
-                ));
-            }
-            Err(status) => return Err(status).into_diagnostic(),
-        }
-    };
-
-    let adc_credential_key = if from_gcloud_adc {
-        let profile = fetch_provider_profile(&mut client, &provider_type, profile_workspace)
-            .await
-            .map_err(|err| {
-                miette::miette!(
-                    "--from-gcloud-adc is not supported for '{provider_type}' providers ({err})"
-                )
-            })?;
-        let profile = ProviderTypeProfile::from_proto(&profile);
-        let adc_cred = profile.adc_credential().ok_or_else(|| {
-            miette::miette!(
-                "--from-gcloud-adc is not supported for '{provider_type}' providers \
-                 (no ADC-compatible credential in the provider profile)"
-            )
-        })?;
-        Some(
-            adc_cred
-                .env_vars
-                .first()
-                .ok_or_else(|| {
-                    miette::miette!(
-                        "ADC credential in '{provider_type}' profile has no env_vars declared"
-                    )
-                })?
-                .clone(),
-        )
-    } else {
-        None
-    };
-
-    let oidc_profile = if from_oidc_token {
-        Some(fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?)
-    } else {
-        None
-    };
-
-    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
-        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
-    } else {
-        (parse_credential_pairs(credentials)?, HashMap::new())
-    };
-    let mut config_map = parse_key_value_pairs(config, "--config")?;
-
-    if from_existing {
-        let discovered =
-            discover_existing_provider_data(&mut client, &provider_type, profile_workspace).await?;
-        let Some(discovered) = discovered else {
-            return Err(miette::miette!(
-                "no existing local credentials/config found for provider type '{provider_type}'"
-            ));
-        };
-
-        for (key, value) in discovered.credentials {
-            credential_map.entry(key).or_insert(value);
-        }
-        for (key, value) in discovered.config {
-            config_map.entry(key).or_insert(value);
-        }
-    }
-
-    if credential_map.is_empty() {
-        if from_existing {
-            return Err(missing_credentials_error(&provider_type));
-        }
-        if !from_gcloud_adc && !runtime_credentials {
-            return Err(missing_credentials_error(&provider_type));
-        }
-        let allows_empty_credentials = if runtime_credentials {
-            provider_profile_allows_empty_credentials(
-                &fetch_provider_profile(&mut client, &provider_type, profile_workspace).await?,
-            )
-        } else {
-            fetch_provider_profile(&mut client, &provider_type, profile_workspace)
-                .await
-                .ok()
-                .is_some_and(|profile| provider_profile_allows_empty_credentials(&profile))
-        };
-        if !allows_empty_credentials {
-            if runtime_credentials {
-                return Err(miette::miette!(
-                    "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
-                ));
-            }
-            return Err(missing_credentials_error(&provider_type));
-        }
-    }
-
-    // Validate and read the ADC file BEFORE creating the provider so that
-    // a bad/missing ADC does not leave an orphan provider behind. Bundle the
-    // credential key with the material so they stay coupled.
-    let gcloud_adc_bootstrap = if from_gcloud_adc {
-        let (client_id, client_secret, refresh_token) = read_gcloud_adc()?;
-        let key = adc_credential_key.expect("set when from_gcloud_adc is true");
-        Some((key, client_id, client_secret, refresh_token))
-    } else {
-        None
-    };
-
-    let response = client
-        .create_provider(CreateProviderRequest {
-            provider: Some(Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: name.to_string(),
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                r#type: provider_type.clone(),
-                credentials: credential_map,
-                config: config_map,
-                credential_expires_at_ms: oidc_credential_expires_at_ms,
-                profile_workspace: profile_workspace.to_string(),
-                credential_handles: HashMap::new(),
-            }),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-
-    let provider = response
-        .into_inner()
-        .provider
-        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-    let provider_name = provider.object_name().to_string();
-
-    if let Some((adc_credential_key, client_id, client_secret, refresh_token)) =
-        gcloud_adc_bootstrap
-    {
-        let mut material = HashMap::new();
-        material.insert("client_id".to_string(), client_id);
-        material.insert("client_secret".to_string(), client_secret);
-        material.insert("refresh_token".to_string(), refresh_token);
-
-        if let Err(configure_err) = client
-            .configure_provider_refresh(ConfigureProviderRefreshRequest {
-                provider: provider_name.clone(),
-                credential_key: adc_credential_key.clone(),
-                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
-                material,
-                secret_material_keys: vec![
-                    "client_secret".to_string(),
-                    "refresh_token".to_string(),
-                ],
-                expires_at_ms: None,
-                workspace: workspace.to_string(),
-            })
-            .await
-        {
-            return rollback_provider_create_after_gcloud_adc_failure(
-                &mut client,
-                &provider_name,
-                "configure",
-                &configure_err,
-                workspace,
-            )
-            .await;
-        }
-
-        if let Err(rotate_err) = client
-            .rotate_provider_credential(RotateProviderCredentialRequest {
-                provider: provider_name.clone(),
-                credential_key: adc_credential_key,
-                workspace: workspace.to_string(),
-            })
-            .await
-        {
-            return rollback_provider_create_after_gcloud_adc_failure(
-                &mut client,
-                &provider_name,
-                "mint the initial access token for",
-                &rotate_err,
-                workspace,
-            )
-            .await;
-        }
-
-        println!("{} Created provider {}", "✓".green().bold(), provider_name);
-        println!("Configured GCP credentials from gcloud ADC and minted the initial access token");
-        return Ok(());
-    }
-
-    println!("{} Created provider {}", "✓".green().bold(), provider_name);
-    Ok(())
-}
-
-fn provider_profile_allows_empty_credentials(profile: &ProviderProfile) -> bool {
-    ProviderTypeProfile::from_proto(profile).allows_empty_provider_credentials()
-}
-
-pub async fn provider_get(
-    server: &str,
-    name: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider(GetProviderRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-
-    let provider = response
-        .into_inner()
-        .provider
-        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-
-    let credential_keys = provider_credential_keys(&provider);
-    let config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
-
-    println!("{}", "Provider:".cyan().bold());
-    println!();
-    println!("  {} {}", "Id:".dimmed(), provider.object_id());
-    println!("  {} {}", "Name:".dimmed(), provider.object_name());
-    println!("  {} {}", "Type:".dimmed(), provider.r#type);
-    println!(
-        "  {} {}",
-        "Resource version:".dimmed(),
-        provider.metadata.as_ref().map_or(0, |m| m.resource_version)
-    );
-    println!(
-        "  {} {}",
-        "Credential keys:".dimmed(),
-        if credential_keys.is_empty() {
-            "<none>".to_string()
-        } else {
-            credential_keys.join(", ")
-        }
-    );
-    println!(
-        "  {} {}",
-        "Config keys:".dimmed(),
-        if config_keys.is_empty() {
-            "<none>".to_string()
-        } else {
-            config_keys.join(", ")
-        }
-    );
-
-    Ok(())
-}
-
-fn provider_to_json(provider: &Provider) -> serde_json::Value {
-    let mut obj = serde_json::Map::new();
-
-    // Core fields
-    obj.insert("id".to_string(), serde_json::json!(provider.object_id()));
-    obj.insert(
-        "name".to_string(),
-        serde_json::json!(provider.object_name()),
-    );
-    obj.insert(
-        "workspace".to_string(),
-        serde_json::json!(provider.object_workspace()),
-    );
-    obj.insert("type".to_string(), serde_json::json!(provider.r#type));
-
-    // Credential keys (NEVER values - security)
-    let credential_keys = provider_credential_keys(provider);
-    obj.insert(
-        "credential_keys".to_string(),
-        serde_json::json!(credential_keys),
-    );
-
-    // Config keys (keys only, not values)
-    if !provider.config.is_empty() {
-        let config_keys: Vec<String> = provider.config.keys().cloned().collect();
-        obj.insert("config_keys".to_string(), serde_json::json!(config_keys));
-    }
-
-    // Metadata fields (only if metadata exists)
-    if let Some(meta) = &provider.metadata {
-        if !meta.labels.is_empty() {
-            obj.insert("labels".to_string(), serde_json::json!(meta.labels));
-        }
-        if meta.resource_version != 0 {
-            obj.insert(
-                "resource_version".to_string(),
-                serde_json::json!(meta.resource_version),
-            );
-        }
-        if meta.created_at_ms != 0 {
-            obj.insert(
-                "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
-            );
-        }
-    }
-
-    // Credential expiration times (only if present)
-    if !provider.credential_expires_at_ms.is_empty() {
-        obj.insert(
-            "credential_expires_at_ms".to_string(),
-            serde_json::json!(provider.credential_expires_at_ms),
-        );
-    }
-
-    serde_json::Value::Object(obj)
-}
-
-fn provider_credential_keys(provider: &Provider) -> Vec<String> {
-    let mut keys: Vec<String> = provider
-        .credentials
-        .keys()
-        .chain(provider.credential_handles.keys())
-        .cloned()
-        .collect();
-    keys.sort();
-    keys.dedup();
-    keys
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn provider_list(
-    server: &str,
-    limit: u32,
-    offset: u32,
-    names_only: bool,
-    output: &str,
-    workspace: &str,
-    all_workspaces: bool,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .list_providers(ListProvidersRequest {
-            limit,
-            offset,
-            workspace: if all_workspaces {
-                String::new()
-            } else {
-                workspace.to_string()
-            },
-            all_workspaces,
-        })
-        .await
-        .into_diagnostic()?;
-    let providers = response.into_inner().providers;
-
-    // Handle structured output formats (json, yaml)
-    if crate::output::print_output_collection(output, &providers, provider_to_json)? {
-        return Ok(());
-    }
-
-    if providers.is_empty() {
-        if !names_only {
-            println!("No providers found.");
-        }
-        return Ok(());
-    }
-
-    if names_only {
-        for provider in &providers {
-            if all_workspaces {
-                println!("{}/{}", provider.object_workspace(), provider.object_name());
-            } else {
-                println!("{}", provider.object_name());
-            }
-        }
-        return Ok(());
-    }
-
-    let ws_width = if all_workspaces {
-        providers
-            .iter()
-            .map(|p| p.object_workspace().len())
-            .max()
-            .unwrap_or(9)
-            .max(9)
-    } else {
-        0
-    };
-    let name_width = providers
-        .iter()
-        .map(|provider| provider.object_name().len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let type_width = providers
-        .iter()
-        .map(|provider| provider.r#type.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-
-    if all_workspaces {
-        println!(
-            "{:<ws_width$}  {:<name_width$}  {:<type_width$}  {:<16}  {}",
-            "WORKSPACE".bold(),
-            "NAME".bold(),
-            "TYPE".bold(),
-            "CREDENTIAL_KEYS".bold(),
-            "CONFIG_KEYS".bold(),
-        );
-    } else {
-        println!(
-            "{:<name_width$}  {:<type_width$}  {:<16}  {}",
-            "NAME".bold(),
-            "TYPE".bold(),
-            "CREDENTIAL_KEYS".bold(),
-            "CONFIG_KEYS".bold(),
-        );
-    }
-
-    for provider in providers {
-        if all_workspaces {
-            println!(
-                "{:<ws_width$}  {:<name_width$}  {:<type_width$}  {:<16}  {}",
-                provider.object_workspace(),
-                provider.object_name().to_string(),
-                provider.r#type,
-                provider.credentials.len(),
-                provider.config.len(),
-            );
-        } else {
-            println!(
-                "{:<name_width$}  {:<type_width$}  {:<16}  {}",
-                provider.object_name().to_string(),
-                provider.r#type,
-                provider.credentials.len(),
-                provider.config.len(),
-            );
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn provider_list_profiles(
-    server: &str,
-    output: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .list_provider_profiles(ListProviderProfilesRequest {
-            limit: 100,
-            offset: 0,
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-    let mut profiles = response.into_inner().profiles;
-    profiles.sort_by(|left, right| {
-        left.category
-            .cmp(&right.category)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    let dto_profiles = profiles
-        .iter()
-        .map(ProviderTypeProfile::from_proto)
-        .collect::<Vec<_>>();
-
-    if crate::output::print_output_direct(
-        output,
-        || profiles_to_json(&dto_profiles).into_diagnostic(),
-        || profiles_to_yaml(&dto_profiles).into_diagnostic(),
-    )? {
-        return Ok(());
-    }
-
-    if profiles.is_empty() {
-        println!("No provider profiles found.");
-        return Ok(());
-    }
-
-    println!("{}", "Available Provider Profiles:".cyan().bold());
-    let id_width = provider_profile_id_width(&profiles);
-    let display_width = provider_profile_display_width(&profiles);
-    let source_width = provider_profile_source_width(&profiles);
-    let scope_width = provider_profile_scope_width(&profiles);
-    let mut current_category = i32::MIN;
-    for profile in &profiles {
-        if profile.category != current_category {
-            current_category = profile.category;
-            println!();
-            println!("  {}", display_provider_category(current_category).bold());
-            print_provider_type_header(id_width, scope_width, source_width, display_width);
-        }
-        print_provider_type_row(profile, id_width, scope_width, source_width, display_width);
-    }
-
-    Ok(())
-}
-
-pub async fn provider_profile_export(
-    server: &str,
-    id: &str,
-    output: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let rendered = provider_profile_export_text(server, id, output, workspace, tls).await?;
-    if output == "json" {
-        println!("{rendered}");
-    } else {
-        print!("{rendered}");
-    }
-    Ok(())
-}
-
-pub async fn provider_profile_export_text(
-    server: &str,
-    id: &str,
-    output: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<String> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider_profile(GetProviderProfileRequest {
-            id: id.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-    let profile = response
-        .into_inner()
-        .profile
-        .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
-    let profile = ProviderTypeProfile::from_proto(&profile);
-
-    match output {
-        "json" => profile_to_json(&profile).into_diagnostic(),
-        "yaml" => profile_to_yaml(&profile).into_diagnostic(),
-        "table" => Err(miette!(
-            "profile export supports '-o yaml' and '-o json'; table output is not supported"
-        )),
-        _ => Err(miette!("unsupported output format: {output}")),
-    }
-}
-
-pub async fn provider_profile_import(
-    server: &str,
-    file: Option<&Path>,
-    from: Option<&Path>,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
-    if items.is_empty() && diagnostics.is_empty() {
-        return Err(miette!("no provider profile files found"));
-    }
-    if profile_diagnostics_have_errors(&diagnostics) {
-        print_profile_diagnostics(&diagnostics);
-        return Err(miette!("provider profile import failed"));
-    }
-
-    let mut client = grpc_client(server, tls).await?;
-    if !items.is_empty() {
-        let response = client
-            .import_provider_profiles(ImportProviderProfilesRequest {
-                profiles: items,
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
-        diagnostics.extend(response.diagnostics);
-        if response.imported {
-            println!(
-                "Imported {} provider profile{}.",
-                response.profiles.len(),
-                if response.profiles.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            );
-            return Ok(());
-        }
-    }
-
-    print_profile_diagnostics(&diagnostics);
-    Err(miette!("provider profile import failed"))
-}
-
-pub async fn provider_profile_update(
-    server: &str,
-    id: &str,
-    file: &Path,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let (mut items, mut diagnostics) = load_profile_import_items(Some(file), None)?;
-    if items.is_empty() && diagnostics.is_empty() {
-        return Err(miette!("no provider profile files found"));
-    }
-    if profile_diagnostics_have_errors(&diagnostics) {
-        print_profile_diagnostics(&diagnostics);
-        return Err(miette!("provider profile update failed"));
-    }
-
-    let mut client = grpc_client(server, tls).await?;
-    if let Some(item) = items.pop() {
-        let expected_resource_version = item
-            .profile
-            .as_ref()
-            .map_or(0, |profile| profile.resource_version);
-        let response = client
-            .update_provider_profiles(UpdateProviderProfilesRequest {
-                profile: Some(item),
-                expected_resource_version,
-                id: id.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
-        diagnostics.extend(response.diagnostics);
-        if response.updated {
-            println!("Updated provider profile.");
-            return Ok(());
-        }
-    }
-
-    print_profile_diagnostics(&diagnostics);
-    Err(miette!("provider profile update failed"))
-}
-
-pub async fn provider_profile_lint(
-    server: &str,
-    file: Option<&Path>,
-    from: Option<&Path>,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let (items, mut diagnostics) = load_profile_import_items(file, from)?;
-    if items.is_empty() && diagnostics.is_empty() {
-        return Err(miette!("no provider profile files found"));
-    }
-
-    if !items.is_empty() {
-        let mut client = grpc_client(server, tls).await?;
-        let response = client
-            .lint_provider_profiles(LintProviderProfilesRequest {
-                profiles: items,
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
-        diagnostics.extend(response.diagnostics);
-    }
-
-    if profile_diagnostics_have_errors(&diagnostics) {
-        print_profile_diagnostics(&diagnostics);
-        return Err(miette!("provider profile lint failed"));
-    }
-
-    println!("Provider profile lint passed.");
-    Ok(())
-}
-
-pub async fn provider_profile_delete(
-    server: &str,
-    id: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .delete_provider_profile(DeleteProviderProfileRequest {
-            id: id.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-    if response.deleted {
-        println!("Deleted provider profile '{id}'.");
-    } else {
-        println!("Provider profile '{id}' was not deleted.");
-    }
-    Ok(())
-}
-
-pub async fn provider_refresh_status(
-    server: &str,
-    name: &str,
-    credential_key: Option<&str>,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .get_provider_refresh_status(GetProviderRefreshStatusRequest {
-            provider: name.to_string(),
-            credential_key: credential_key.unwrap_or_default().to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-
-    if response.credentials.is_empty() {
-        if let Some(credential_key) = credential_key {
-            println!(
-                "No refresh configuration found for provider '{name}' credential '{credential_key}'."
-            );
-        } else {
-            println!("No refresh configurations found for provider '{name}'.");
-        }
-        return Ok(());
-    }
-
-    println!("{}", refresh_status_header());
-    for status in response.credentials {
-        print_refresh_status_row(&status);
-    }
-    Ok(())
-}
-
-fn refresh_status_header() -> String {
-    format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
-        "PROVIDER".bold(),
-        "CREDENTIAL_KEY".bold(),
-        "STRATEGY".bold(),
-        "STATUS".bold(),
-        "RECOVERY".bold(),
-        "EXPIRES_AT".bold(),
-        "NEXT_REFRESH".bold(),
-        "LAST_REFRESH".bold(),
-        "FAILURE_CODE".bold(),
-        "LAST_ERROR".bold(),
-    )
-}
-
-pub struct ProviderRefreshConfigInput<'a> {
-    pub name: &'a str,
-    pub credential_key: &'a str,
-    pub strategy: &'a str,
-    pub material: &'a [String],
-    pub secret_material_env: &'a [String],
-    pub secret_material_keys: &'a [String],
-    pub credential_expires_at_ms: Option<i64>,
-}
-
-pub async fn provider_refresh_config(
-    server: &str,
-    input: ProviderRefreshConfigInput<'_>,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let strategy = provider_refresh_strategy(input.strategy)?;
-    let mut material = parse_key_value_pairs(input.material, "--material")?;
-    let mut secret_material_keys = input.secret_material_keys.to_vec();
-    // Env-resolved secrets are auto-marked secret; duplicate keys are an
-    // error rather than a precedence order.
-    for (key, value) in parse_secret_material_env_pairs(input.secret_material_env)? {
-        if material.contains_key(&key) {
-            return Err(miette!(
-                "duplicate material key '{key}': supplied via both --material and --secret-material-env"
-            ));
-        }
-        if !secret_material_keys.contains(&key) {
-            secret_material_keys.push(key.clone());
-        }
-        material.insert(key, value);
-    }
-    let mut client = grpc_client(server, tls).await?;
-    let status = client
-        .configure_provider_refresh(ConfigureProviderRefreshRequest {
-            provider: input.name.to_string(),
-            credential_key: input.credential_key.to_string(),
-            strategy: strategy as i32,
-            material,
-            secret_material_keys,
-            expires_at_ms: input.credential_expires_at_ms,
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .status
-        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
-
-    println!(
-        "{} Configured refresh for {} {}",
-        "✓".green().bold(),
-        status.provider_name,
-        status.credential_key
-    );
-    Ok(())
-}
-
-pub async fn provider_rotate(
-    server: &str,
-    name: &str,
-    credential_key: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let status = client
-        .rotate_provider_credential(RotateProviderCredentialRequest {
-            provider: name.to_string(),
-            credential_key: credential_key.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .status
-        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
-
-    if status.last_error.is_empty() {
-        println!(
-            "{} Rotation requested for {} {} ({})",
-            "✓".green().bold(),
-            status.provider_name,
-            status.credential_key,
-            status.status
-        );
-    } else {
-        println!(
-            "Rotation request recorded for {} {} ({}): {}",
-            status.provider_name, status.credential_key, status.status, status.last_error
-        );
-    }
-    Ok(())
-}
-
-pub async fn provider_refresh_delete(
-    server: &str,
-    name: &str,
-    credential_key: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .delete_provider_refresh(DeleteProviderRefreshRequest {
-            provider: name.to_string(),
-            credential_key: credential_key.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-
-    if response.deleted {
-        println!(
-            "{} Deleted refresh config for {} {}",
-            "✓".green().bold(),
-            name,
-            credential_key
-        );
-    } else {
-        println!("No refresh config found for provider '{name}' credential '{credential_key}'.");
-    }
-    Ok(())
-}
-
-fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefreshStrategy> {
-    match strategy {
-        "oauth2_refresh_token" => Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken),
-        "oauth2_client_credentials" => {
-            Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
-        }
-        "google_service_account_jwt" => {
-            Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
-        }
-        "aws_sts_assume_role" => Ok(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
-        _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
-    }
-}
-
-fn print_refresh_status_row(status: &ProviderCredentialRefreshStatus) {
-    println!("{}", refresh_status_row(status));
-}
-
-fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
-    let strategy = ProviderCredentialRefreshStrategy::try_from(status.strategy)
-        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-    let recovery_action = ProviderCredentialRefreshRecoveryAction::try_from(status.recovery_action)
-        .unwrap_or(ProviderCredentialRefreshRecoveryAction::Unspecified);
-    format!(
-        "{:<24}  {:<28}  {:<28}  {:<24}  {:<18}  {:<20}  {:<20}  {:<20}  {:<44}  {}",
-        status.provider_name,
-        status.credential_key,
-        provider_refresh_strategy_name(strategy),
-        status.status,
-        provider_refresh_recovery_action_name(recovery_action),
-        format_optional_epoch_ms(status.expires_at_ms),
-        format_refresh_next_at_ms(status.next_refresh_at_ms),
-        format_optional_epoch_ms(status.last_refresh_at_ms),
-        status.failure_code,
-        truncate_status_field(&status.last_error, 72),
-    )
-}
-
-fn format_refresh_next_at_ms(next_refresh_at_ms: i64) -> String {
-    if next_refresh_at_ms == i64::MAX {
-        "-".to_string()
-    } else {
-        format_optional_epoch_ms(next_refresh_at_ms)
-    }
-}
-
-fn provider_refresh_recovery_action_name(
-    action: ProviderCredentialRefreshRecoveryAction,
-) -> &'static str {
-    match action {
-        ProviderCredentialRefreshRecoveryAction::Retry => "retry",
-        ProviderCredentialRefreshRecoveryAction::Reauthorize => "reauthorize",
-        ProviderCredentialRefreshRecoveryAction::FixConfiguration => "fix_configuration",
-        ProviderCredentialRefreshRecoveryAction::Investigate => "investigate",
-        ProviderCredentialRefreshRecoveryAction::Unspecified => "-",
-    }
-}
-
-fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
-    match strategy {
-        ProviderCredentialRefreshStrategy::Static => "static",
-        ProviderCredentialRefreshStrategy::External => "external",
-        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
-        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
-        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
-        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
-        ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
-    }
-}
-
-fn load_profile_import_items(
-    file: Option<&Path>,
-    from: Option<&Path>,
-) -> Result<(
-    Vec<ProviderProfileImportItem>,
-    Vec<ProviderProfileDiagnostic>,
-)> {
-    let paths = profile_source_paths(file, from)?;
-    let mut items = Vec::new();
-    let mut diagnostics = Vec::new();
-    for path in paths {
-        match load_profile_import_item(&path) {
-            Ok(item) => items.push(item),
-            Err(diagnostic) => diagnostics.push(diagnostic),
-        }
-    }
-    Ok((items, diagnostics))
-}
-
-fn profile_source_paths(file: Option<&Path>, from: Option<&Path>) -> Result<Vec<PathBuf>> {
-    if let Some(file) = file {
-        return Ok(vec![file.to_path_buf()]);
-    }
-    let Some(from) = from else {
-        return Ok(Vec::new());
-    };
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(from)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read profile directory {}", from.display()))?
-    {
-        let entry = entry.into_diagnostic()?;
-        let path = entry.path();
-        if path.is_file() && profile_extension_supported(&path) {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    Ok(paths)
-}
-
-fn profile_extension_supported(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("yaml" | "yml" | "json")
-    )
-}
-
-fn load_profile_import_item(
-    path: &Path,
-) -> Result<ProviderProfileImportItem, ProviderProfileDiagnostic> {
-    let source = path.display().to_string();
-    let input = std::fs::read_to_string(path).map_err(|err| {
-        profile_file_diagnostic(
-            &source,
-            format!("failed to read provider profile file: {err}"),
-        )
-    })?;
-    let profile = match path.extension().and_then(|ext| ext.to_str()) {
-        Some("yaml" | "yml") => parse_profile_yaml(&input),
-        Some("json") => parse_profile_json(&input),
-        _ => {
-            return Err(profile_file_diagnostic(
-                &source,
-                "unsupported provider profile file format".to_string(),
-            ));
-        }
-    }
-    .map_err(|err| profile_file_diagnostic(&source, err.to_string()))?;
-
-    let pre_lower = profile.validate_before_lowering(&source);
-    if let Some(diag) = pre_lower.into_iter().find(|d| d.severity == "error") {
-        return Err(ProviderProfileDiagnostic {
-            source: diag.source,
-            profile_id: diag.profile_id,
-            field: diag.field,
-            message: diag.message,
-            severity: diag.severity,
-        });
-    }
-
-    Ok(ProviderProfileImportItem {
-        profile: Some(profile.to_proto()),
-        source,
-    })
-}
-
-fn profile_file_diagnostic(source: &str, message: String) -> ProviderProfileDiagnostic {
-    ProviderProfileDiagnostic {
-        source: source.to_string(),
-        profile_id: String::new(),
-        field: "file".to_string(),
-        message,
-        severity: "error".to_string(),
-    }
-}
-
-fn print_profile_diagnostics(diagnostics: &[ProviderProfileDiagnostic]) {
-    if diagnostics.is_empty() {
-        return;
-    }
-    eprintln!("{}", "Provider profile diagnostics:".red().bold());
-    for diagnostic in diagnostics {
-        let source = if diagnostic.source.is_empty() {
-            "<input>"
-        } else {
-            &diagnostic.source
-        };
-        let profile = if diagnostic.profile_id.is_empty() {
-            "-".to_string()
-        } else {
-            diagnostic.profile_id.clone()
-        };
-        eprintln!(
-            "  {} {} profile={} field={} {}",
-            diagnostic.severity.as_str().red(),
-            source,
-            profile,
-            diagnostic.field,
-            diagnostic.message
-        );
-    }
-}
-
-fn profile_diagnostics_have_errors(diagnostics: &[ProviderProfileDiagnostic]) -> bool {
-    diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.severity == "error")
-}
-
-fn display_provider_category(category: i32) -> &'static str {
-    match ProviderProfileCategory::try_from(category).unwrap_or(ProviderProfileCategory::Other) {
-        ProviderProfileCategory::Inference => "INFERENCE",
-        ProviderProfileCategory::Agent => "AGENT",
-        ProviderProfileCategory::SourceControl => "SOURCE CONTROL",
-        ProviderProfileCategory::Messaging => "MESSAGING",
-        ProviderProfileCategory::Data => "DATA",
-        ProviderProfileCategory::Knowledge => "KNOWLEDGE",
-        ProviderProfileCategory::Other | ProviderProfileCategory::Unspecified => "OTHER",
-    }
-}
-
-const PROVIDER_PROFILE_ID_MAX_WIDTH: usize = 32;
-const PROVIDER_PROFILE_DISPLAY_MAX_WIDTH: usize = 40;
-const PROVIDER_PROFILE_SOURCE_MAX_WIDTH: usize = 24;
-
-fn provider_profile_id_width(profiles: &[ProviderProfile]) -> usize {
-    profiles
-        .iter()
-        .map(|profile| {
-            profile
-                .id
-                .chars()
-                .count()
-                .min(PROVIDER_PROFILE_ID_MAX_WIDTH)
-        })
-        .max()
-        .unwrap_or(2)
-        .max(2)
-}
-
-fn provider_profile_display_width(profiles: &[ProviderProfile]) -> usize {
-    profiles
-        .iter()
-        .map(|profile| {
-            profile
-                .display_name
-                .chars()
-                .count()
-                .min(PROVIDER_PROFILE_DISPLAY_MAX_WIDTH)
-        })
-        .max()
-        .unwrap_or(4)
-        .max(4)
-}
-
-fn provider_profile_scope_width(profiles: &[ProviderProfile]) -> usize {
-    profiles
-        .iter()
-        .map(|profile| profile.scope.chars().count())
-        .max()
-        .unwrap_or(5)
-        .max(5)
-}
-
-fn provider_profile_source_width(profiles: &[ProviderProfile]) -> usize {
-    profiles
-        .iter()
-        .map(|profile| {
-            profile
-                .source
-                .chars()
-                .count()
-                .min(PROVIDER_PROFILE_SOURCE_MAX_WIDTH)
-        })
-        .max()
-        .unwrap_or(6)
-        .max(6)
-}
-
-fn print_provider_type_header(
-    id_width: usize,
-    scope_width: usize,
-    source_width: usize,
-    display_width: usize,
-) {
-    let endpoints = "ENDPOINTS";
-    println!(
-        "    {:<id_width$}  {:<scope_width$}  {:<source_width$}  {:<display_width$}  {endpoints}",
-        "ID", "SCOPE", "SOURCE", "NAME"
-    );
-}
-
-fn print_provider_type_row(
-    profile: &ProviderProfile,
-    id_width: usize,
-    scope_width: usize,
-    source_width: usize,
-    display_width: usize,
-) {
-    let inference = if profile.inference_capable {
-        " inference"
-    } else {
-        ""
-    };
-    let id = truncate_display(&profile.id, PROVIDER_PROFILE_ID_MAX_WIDTH);
-    let scope = &profile.scope;
-    let source = truncate_display(&profile.source, PROVIDER_PROFILE_SOURCE_MAX_WIDTH);
-    let display_name = truncate_display(&profile.display_name, PROVIDER_PROFILE_DISPLAY_MAX_WIDTH);
-    println!(
-        "    {id:<id_width$}  {scope:<scope_width$}  {source:<source_width$}  {display_name:<display_width$}  {:<2}{}",
-        profile.endpoints.len(),
-        inference
-    );
-}
-
-pub struct ProviderUpdateOptions<'a> {
-    pub server: &'a str,
-    pub name: &'a str,
-    pub from_existing: bool,
-    pub from_oidc_token: bool,
-    pub credentials: &'a [String],
-    pub config: &'a [String],
-    pub credential_expires_at: &'a [String],
-    pub workspace: &'a str,
-    pub tls: &'a TlsOptions,
-}
-
-pub async fn provider_update(options: ProviderUpdateOptions<'_>) -> Result<()> {
-    let ProviderUpdateOptions {
-        server,
-        name,
-        from_existing,
-        from_oidc_token,
-        credentials,
-        config,
-        credential_expires_at,
-        workspace,
-        tls,
-    } = options;
-
-    if from_existing && !credentials.is_empty() {
-        return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential"
-        ));
-    }
-    if from_existing && from_oidc_token {
-        return Err(miette::miette!(
-            "--from-existing cannot be combined with --from-oidc-token"
-        ));
-    }
-
-    let mut client = grpc_client(server, tls).await?;
-
-    let oidc_profile = if from_oidc_token {
-        let existing = client
-            .get_provider(GetProviderRequest {
-                name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-        let profile_workspace = if existing.profile_workspace.is_empty() {
-            workspace
-        } else {
-            &existing.profile_workspace
-        };
-        Some(fetch_provider_profile(&mut client, &existing.r#type, profile_workspace).await?)
-    } else {
-        None
-    };
-
-    let (mut credential_map, oidc_credential_expires_at_ms) = if from_oidc_token {
-        provider_credential_from_oidc_token(credentials, oidc_profile.as_ref(), tls).await?
-    } else {
-        (parse_credential_pairs(credentials)?, HashMap::new())
-    };
-    let mut config_map = parse_key_value_pairs(config, "--config")?;
-    let mut credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
-    credential_expires_at_ms.extend(oidc_credential_expires_at_ms);
-
-    if from_existing {
-        // Fetch the existing provider to discover its type for credential lookup.
-        let existing = client
-            .get_provider(GetProviderRequest {
-                name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner()
-            .provider
-            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
-
-        let provider_type = existing.r#type;
-        let discovered =
-            discover_existing_provider_data(&mut client, &provider_type, workspace).await?;
-        let Some(discovered) = discovered else {
-            return Err(miette::miette!(
-                "no existing local credentials/config found for provider type '{provider_type}'"
-            ));
-        };
-
-        for (key, value) in discovered.credentials {
-            credential_map.entry(key).or_insert(value);
-        }
-        for (key, value) in discovered.config {
-            config_map.entry(key).or_insert(value);
-        }
-    }
-
-    let response = client
-        .update_provider(UpdateProviderRequest {
-            provider: Some(Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: name.to_string(),
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                    annotations: HashMap::new(),
-                    workspace: workspace.to_string(),
-                    deletion_timestamp_ms: 0,
-                }),
-                r#type: String::new(),
-                credentials: credential_map,
-                config: config_map,
-                credential_expires_at_ms: HashMap::new(),
-                profile_workspace: String::new(),
-                credential_handles: HashMap::new(),
-            }),
-            credential_expires_at_ms,
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-
-    let provider = response
-        .into_inner()
-        .provider
-        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-
-    println!(
-        "{} Updated provider {}",
-        "✓".green().bold(),
-        provider.object_name()
-    );
-    Ok(())
-}
-
-pub async fn provider_delete(
-    server: &str,
-    names: &[String],
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-    for name in names {
-        let response = client
-            .delete_provider(DeleteProviderRequest {
-                name: name.clone(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?;
-        if response.into_inner().deleted {
-            println!("{} Deleted provider {name}", "✓".green().bold());
-        } else {
-            println!("{} Provider {name} not found", "!".yellow());
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4969,6 +4530,7 @@ pub async fn workspace_create(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .create_workspace(CreateWorkspaceRequest {
+            request_id: String::new(),
             name: name.to_string(),
             labels,
         })
@@ -5015,11 +4577,11 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
             "Resource version:".dimmed(),
             meta.resource_version
         );
-        if meta.created_at_ms != 0 {
+        if meta.created_time.is_some() {
             println!(
                 "  {} {}",
                 "Created:".dimmed(),
-                format_epoch_ms(meta.created_at_ms)
+                format_epoch_ms(proto_timestamp_ms(meta.created_time.as_ref()))
             );
         }
         if !meta.labels.is_empty() {
@@ -5040,8 +4602,8 @@ pub async fn workspace_get(server: &str, name: &str, tls: &TlsOptions) -> Result
 
 pub async fn workspace_list(
     server: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
     label_selector: &str,
     output: &str,
     tls: &TlsOptions,
@@ -5051,17 +4613,26 @@ pub async fn workspace_list(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_workspaces(ListWorkspacesRequest {
-            limit,
-            offset,
+            page_size,
+            page_token: page_token.to_string(),
             label_selector: label_selector.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let workspaces = response.into_inner().workspaces;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let workspaces = response.workspaces;
 
-    if crate::output::print_output_collection(output, &workspaces, workspace_to_json)? {
+    if crate::output::print_paginated_output_collection(
+        output,
+        "workspaces",
+        &workspaces,
+        &next_page_token,
+        workspace_to_json,
+    )? {
         return Ok(());
     }
+    crate::output::print_next_page_token(&next_page_token);
 
     if workspaces.is_empty() {
         println!("No workspaces found.");
@@ -5085,10 +4656,9 @@ pub async fn workspace_list(
 
     for workspace in &workspaces {
         let status = workspace_phase_display(workspace);
-        let created = workspace
-            .metadata
-            .as_ref()
-            .map_or_else(String::new, |m| format_epoch_ms(m.created_at_ms));
+        let created = workspace.metadata.as_ref().map_or_else(String::new, |m| {
+            format_epoch_ms(proto_timestamp_ms(m.created_time.as_ref()))
+        });
         let labels = workspace.metadata.as_ref().map_or_else(String::new, |m| {
             m.labels
                 .iter()
@@ -5114,10 +4684,14 @@ pub async fn workspace_delete(server: &str, names: &[String], tls: &TlsOptions) 
     let mut client = grpc_client(server, tls).await?;
     for name in names {
         let response = client
-            .delete_workspace(DeleteWorkspaceRequest { name: name.clone() })
+            .delete_workspace(DeleteWorkspaceRequest {
+                request_id: String::new(),
+                allow_missing: false,
+                name: name.clone(),
+            })
             .await
             .into_diagnostic()?;
-        if response.into_inner().deleted {
+        if deletion_completed(response.into_inner().outcome)? {
             println!("{} Deleted workspace {name}", "✓".green().bold());
         } else {
             println!("{} Workspace {name} not found", "!".yellow());
@@ -5149,7 +4723,10 @@ pub async fn workspace_member_add(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .add_workspace_member(AddWorkspaceMemberRequest {
-            workspace: workspace.to_string(),
+            request_id: String::new(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             principal_subject: subject.to_string(),
             role: role_val.into(),
         })
@@ -5183,13 +4760,17 @@ pub async fn workspace_member_remove(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .remove_workspace_member(RemoveWorkspaceMemberRequest {
-            workspace: workspace.to_string(),
+            request_id: String::new(),
+            allow_missing: true,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             principal_subject: subject.to_string(),
         })
         .await
         .into_diagnostic()?;
 
-    if response.into_inner().removed {
+    if deletion_completed(response.into_inner().outcome)? {
         println!(
             "{} Removed {} from workspace {}",
             "✓".green().bold(),
@@ -5211,22 +4792,38 @@ pub async fn workspace_member_remove(
 pub async fn workspace_member_list(
     server: &str,
     workspace: &str,
-    limit: u32,
-    offset: u32,
+    page_size: i32,
+    page_token: &str,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    use openshell_core::proto::{ListWorkspaceMembersRequest, WorkspaceRole};
+    use openshell_core::proto::ListWorkspaceMembersRequest;
 
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .list_workspace_members(ListWorkspaceMembersRequest {
-            workspace: workspace.to_string(),
-            limit,
-            offset,
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+            page_size,
+            page_token: page_token.to_string(),
         })
         .await
         .into_diagnostic()?;
-    let members = response.into_inner().members;
+    let response = response.into_inner();
+    let next_page_token = response.next_page_token;
+    let members = response.members;
+
+    if crate::output::print_paginated_output_collection(
+        output,
+        "members",
+        &members,
+        &next_page_token,
+        workspace_member_to_json,
+    )? {
+        return Ok(());
+    }
+    crate::output::print_next_page_token(&next_page_token);
 
     if members.is_empty() {
         println!("No members found in workspace {workspace}.");
@@ -5243,15 +4840,28 @@ pub async fn workspace_member_list(
     println!("{:<subject_width$}  {}", "SUBJECT".bold(), "ROLE".bold());
 
     for member in &members {
-        let role_str = match WorkspaceRole::try_from(member.role) {
-            Ok(WorkspaceRole::Admin) => "admin",
-            Ok(WorkspaceRole::User) => "user",
-            _ => "unknown",
-        };
+        let role_str = workspace_member_role_name(member.role);
         println!("{:<subject_width$}  {}", member.principal_subject, role_str);
     }
 
     Ok(())
+}
+
+fn workspace_member_role_name(role: i32) -> &'static str {
+    use openshell_core::proto::WorkspaceRole;
+
+    match WorkspaceRole::try_from(role) {
+        Ok(WorkspaceRole::Admin) => "admin",
+        Ok(WorkspaceRole::User) => "user",
+        _ => "unknown",
+    }
+}
+
+fn workspace_member_to_json(member: &openshell_core::proto::WorkspaceMember) -> serde_json::Value {
+    serde_json::json!({
+        "subject": member.principal_subject,
+        "role": workspace_member_role_name(member.role),
+    })
 }
 
 fn workspace_phase_str(workspace: &openshell_core::proto::Workspace) -> &'static str {
@@ -5285,10 +4895,12 @@ fn workspace_to_json(workspace: &openshell_core::proto::Workspace) -> serde_json
             "resource_version".to_string(),
             serde_json::json!(meta.resource_version),
         );
-        if meta.created_at_ms != 0 {
+        if meta.created_time.is_some() {
             obj.insert(
                 "created_at".to_string(),
-                serde_json::json!(format_epoch_ms(meta.created_at_ms)),
+                serde_json::json!(format_epoch_ms(proto_timestamp_ms(
+                    meta.created_time.as_ref()
+                ))),
             );
         }
         if !meta.labels.is_empty() {
@@ -5302,284 +4914,14 @@ fn workspace_to_json(workspace: &openshell_core::proto::Workspace) -> serde_json
     serde_json::Value::Object(obj)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn gateway_inference_set(
-    server: &str,
-    provider_name: &str,
-    model_id: &str,
-    route_name: &str,
-    no_verify: bool,
-    timeout_secs: u64,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let progress = if std::io::stdout().is_terminal() {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        spinner.set_message("Configuring inference...");
-        spinner.enable_steady_tick(Duration::from_millis(120));
-        Some(spinner)
-    } else {
-        None
-    };
-
-    let mut client = grpc_inference_client(server, tls).await?;
-    let response = client
-        .set_inference_route(SetInferenceRouteRequest {
-            provider_name: provider_name.to_string(),
-            model_id: model_id.to_string(),
-            route_name: route_name.to_string(),
-            verify: false,
-            no_verify,
-            timeout_secs,
-            workspace: workspace.to_string(),
-        })
-        .await;
-
-    if let Some(progress) = &progress {
-        progress.finish_and_clear();
-    }
-
-    let response = response.map_err(format_inference_status)?;
-
-    let configured = response.into_inner();
-    let label = if configured.route_name == "sandbox-system" {
-        "System inference configured:"
-    } else {
-        "Inference configured:"
-    };
-    println!("{}", label.cyan().bold());
-    println!();
-    println!("  {} {}", "Workspace:".dimmed(), configured.workspace);
-    println!("  {} {}", "Route:".dimmed(), configured.route_name);
-    println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-    println!("  {} {}", "Model:".dimmed(), configured.model_id);
-    println!("  {} {}", "Version:".dimmed(), configured.version);
-    print_timeout(configured.timeout_secs);
-    if configured.validation_performed {
-        println!("  {}", "Validated Endpoints:".dimmed());
-        for endpoint in configured.validated_endpoints {
-            println!("    - {} ({})", endpoint.url, endpoint.protocol);
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn gateway_inference_update(
-    server: &str,
-    provider_name: Option<&str>,
-    model_id: Option<&str>,
-    route_name: &str,
-    no_verify: bool,
-    timeout_secs: Option<u64>,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    if provider_name.is_none() && model_id.is_none() && timeout_secs.is_none() {
-        return Err(miette::miette!(
-            "at least one of --provider, --model, or --timeout must be specified"
-        ));
-    }
-
-    let mut client = grpc_inference_client(server, tls).await?;
-
-    // Fetch current config to use as base for the partial update.
-    let current = client
-        .get_inference_route(GetInferenceRouteRequest {
-            route_name: route_name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner();
-
-    let provider = provider_name.unwrap_or(&current.provider_name);
-    let model = model_id.unwrap_or(&current.model_id);
-    let timeout = timeout_secs.unwrap_or(current.timeout_secs);
-
-    let progress = if std::io::stdout().is_terminal() {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
-                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-        );
-        spinner.set_message("Configuring inference...");
-        spinner.enable_steady_tick(Duration::from_millis(120));
-        Some(spinner)
-    } else {
-        None
-    };
-
-    let response = client
-        .set_inference_route(SetInferenceRouteRequest {
-            provider_name: provider.to_string(),
-            model_id: model.to_string(),
-            route_name: route_name.to_string(),
-            verify: false,
-            no_verify,
-            timeout_secs: timeout,
-            workspace: workspace.to_string(),
-        })
-        .await;
-
-    if let Some(progress) = &progress {
-        progress.finish_and_clear();
-    }
-
-    let response = response.map_err(format_inference_status)?;
-
-    let configured = response.into_inner();
-    let label = if configured.route_name == "sandbox-system" {
-        "System inference updated:"
-    } else {
-        "Inference updated:"
-    };
-    println!("{}", label.cyan().bold());
-    println!();
-    println!("  {} {}", "Workspace:".dimmed(), configured.workspace);
-    println!("  {} {}", "Route:".dimmed(), configured.route_name);
-    println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-    println!("  {} {}", "Model:".dimmed(), configured.model_id);
-    println!("  {} {}", "Version:".dimmed(), configured.version);
-    print_timeout(configured.timeout_secs);
-    if configured.validation_performed {
-        println!("  {}", "Validated Endpoints:".dimmed());
-        for endpoint in configured.validated_endpoints {
-            println!("    - {} ({})", endpoint.url, endpoint.protocol);
-        }
-    }
-    Ok(())
-}
-
-pub async fn gateway_inference_get(
-    server: &str,
-    route_name: Option<&str>,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_inference_client(server, tls).await?;
-
-    if let Some(name) = route_name {
-        // Show a single route (--system was specified).
-        let response = client
-            .get_inference_route(GetInferenceRouteRequest {
-                route_name: name.to_string(),
-                workspace: workspace.to_string(),
-            })
-            .await
-            .into_diagnostic()?;
-
-        let configured = response.into_inner();
-        let label = if name == "sandbox-system" {
-            "System inference:"
-        } else {
-            "Inference:"
-        };
-        println!("{}", label.cyan().bold());
-        println!();
-        println!("  {} {}", "Workspace:".dimmed(), configured.workspace);
-        println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-        println!("  {} {}", "Model:".dimmed(), configured.model_id);
-        println!("  {} {}", "Version:".dimmed(), configured.version);
-        print_timeout(configured.timeout_secs);
-    } else {
-        // Show both routes by default.
-        print_inference_route(&mut client, "Inference", "", workspace).await;
-        println!();
-        print_inference_route(&mut client, "System inference", "sandbox-system", workspace).await;
-    }
-    Ok(())
-}
-
-pub async fn gateway_inference_delete(
-    server: &str,
-    route_name: &str,
-    workspace: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_inference_client(server, tls).await?;
-
-    let response = client
-        .delete_inference_route(DeleteInferenceRouteRequest {
-            route_name: route_name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-
-    let label = if route_name == "sandbox-system" {
-        "System inference route"
-    } else {
-        "Inference route"
-    };
-
-    if response.into_inner().deleted {
-        println!("{label} deleted.");
-    } else {
-        println!("{label} not found (already deleted).");
-    }
-    Ok(())
-}
-
-async fn print_inference_route(
-    client: &mut crate::tls::GrpcInferenceClient,
-    label: &str,
-    route_name: &str,
-    workspace: &str,
-) {
-    match client
-        .get_inference_route(GetInferenceRouteRequest {
-            route_name: route_name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-    {
-        Ok(response) => {
-            let configured = response.into_inner();
-            println!("{}", format!("{label}:").cyan().bold());
-            println!();
-            println!("  {} {}", "Workspace:".dimmed(), configured.workspace);
-            println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-            println!("  {} {}", "Model:".dimmed(), configured.model_id);
-            println!("  {} {}", "Version:".dimmed(), configured.version);
-            print_timeout(configured.timeout_secs);
-        }
-        Err(e) if e.code() == Code::NotFound => {
-            println!("{}", format!("{label}:").cyan().bold());
-            println!();
-            println!("  {}", "Not configured".dimmed());
-        }
-        Err(e) => {
-            println!("{}", format!("{label}:").cyan().bold());
-            println!();
-            println!("  {} {}", "Error:".red(), e.message());
-        }
-    }
-}
-
-fn print_timeout(timeout_secs: u64) {
-    if timeout_secs == 0 {
-        println!("  {} {}s (default)", "Timeout:".dimmed(), 60);
-    } else {
-        println!("  {} {}s", "Timeout:".dimmed(), timeout_secs);
-    }
-}
-
-fn format_inference_status(status: Status) -> miette::Report {
-    let message = status.message().trim();
-
-    if message.is_empty() {
-        return miette::miette!("inference configuration failed ({})", status.code());
-    }
-
-    miette::miette!("{message}")
-}
-
 pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
+    discover_git_repo_root(local_path)?
+        .ok_or_else(|| miette::miette!("path is outside a Git work tree: {}", local_path.display()))
+}
+
+/// Only return `None` when Git reports no repository and no ancestor has a
+/// `.git` entry. A corrupt repository can produce the same Git diagnostic.
+fn discover_git_repo_root(local_path: &Path) -> Result<Option<PathBuf>> {
     let git_dir = if local_path.is_dir() {
         local_path
     } else {
@@ -5590,6 +4932,9 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
     let mut command = Command::new("git");
     scrub_git_env(&mut command);
     let output = command
+        .env("LC_ALL", "C")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(git_dir)
         .output()
@@ -5597,6 +4942,32 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
         .wrap_err("failed to run git rev-parse")?;
 
     if !output.status.success() {
+        if output.status.code() == Some(128)
+            && String::from_utf8_lossy(&output.stderr).trim_end()
+                == "fatal: not a git repository (or any of the parent directories): .git"
+        {
+            for ancestor in git_dir.ancestors() {
+                let marker = ancestor.join(".git");
+                match std::fs::symlink_metadata(&marker) {
+                    Ok(_) => {
+                        return Err(miette::miette!(
+                            "Git repository discovery failed despite an existing .git entry: {}",
+                            marker.display()
+                        ));
+                    }
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err).into_diagnostic().wrap_err_with(|| {
+                            format!(
+                                "failed to inspect Git repository marker: {}",
+                                marker.display()
+                            )
+                        });
+                    }
+                }
+            }
+            return Ok(None);
+        }
         return Err(miette::miette!(
             "git rev-parse --show-toplevel failed with status {}",
             output.status
@@ -5610,24 +4981,21 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
         ));
     }
 
-    Ok(PathBuf::from(root))
+    Ok(Some(PathBuf::from(root)))
 }
 
 pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
-    let repo_root = std::fs::canonicalize(git_repo_root(local_path)?)
-        .into_diagnostic()
-        .wrap_err("failed to canonicalize git repository root")?;
-    let local_path = if local_path.is_absolute() {
-        local_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .into_diagnostic()
-            .wrap_err("failed to resolve current directory")?
-            .join(local_path)
-    };
     let local_path = std::fs::canonicalize(local_path)
         .into_diagnostic()
         .wrap_err("failed to canonicalize local upload path")?;
+    let repo_root = git_repo_root(&local_path)?;
+    git_sync_files_in_repo(&local_path, &repo_root)
+}
+
+fn git_sync_files_in_repo(local_path: &Path, repo_root: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let repo_root = std::fs::canonicalize(repo_root)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize git repository root")?;
     let relative_path = local_path
         .strip_prefix(&repo_root)
         .into_diagnostic()
@@ -5646,7 +5014,7 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
             .map(Path::to_path_buf)
             .ok_or_else(|| miette::miette!("path has no parent: {}", local_path.display()))?
     } else {
-        local_path.clone()
+        local_path.to_path_buf()
     };
     let pathspec = if relative_path.as_os_str().is_empty() {
         None
@@ -5713,17 +5081,72 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         }
     })?;
 
-    if git_ignore
-        && !metadata.file_type().is_symlink()
-        && let Ok((base_dir, files)) = git_sync_files(local_path)
-    {
-        if files.is_empty() {
-            return Ok(SandboxUploadPlan::GitFilteredEmpty);
-        }
-        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    if !git_ignore || metadata.file_type().is_symlink() {
+        return Ok(SandboxUploadPlan::Regular);
     }
 
-    Ok(SandboxUploadPlan::Regular)
+    let plan = git_filtered_upload_plan(local_path).wrap_err_with(|| {
+        format!(
+            "Git filtering failed for {}; upload stopped.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        )
+    })?;
+    if let SandboxUploadPlan::GitAware { files, .. } = &plan
+        && files.is_empty()
+    {
+        return Err(miette::miette!(
+            "Git filtering selected no files for {}; upload stopped.\nGit returned 0 uploadable paths: the source may be empty or all files may be ignored.\nUse --no-git-ignore to upload intentionally without filtering",
+            local_path.display(),
+        ));
+    }
+    Ok(plan)
+}
+
+fn git_filtered_upload_plan(local_path: &Path) -> Result<SandboxUploadPlan> {
+    let canonical_path = std::fs::canonicalize(local_path)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize local upload path")?;
+    let Some(repo_root) = discover_git_repo_root(&canonical_path)? else {
+        eprintln!(
+            "Warning: {} is outside a Git work tree; uploading without Git filtering (.gitignore rules are not applied).",
+            local_path.display()
+        );
+        return Ok(SandboxUploadPlan::Regular);
+    };
+    let (base_dir, files) = git_sync_files_in_repo(&canonical_path, &repo_root)?;
+    Ok(SandboxUploadPlan::GitAware { base_dir, files })
+}
+
+async fn sandbox_upload_planned(
+    plan: SandboxUploadPlan,
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: Option<&str>,
+    tls: &TlsOptions,
+    workspace: &str,
+) -> Result<Option<String>> {
+    match plan {
+        SandboxUploadPlan::GitAware { base_dir, files } => {
+            sandbox_sync_up_files(
+                server,
+                name,
+                &base_dir,
+                &files,
+                local_path,
+                sandbox_path,
+                tls,
+                workspace,
+            )
+            .await?;
+            Ok(None)
+        }
+        SandboxUploadPlan::Regular => {
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
+                .await
+                .map(Some)
+        }
+    }
 }
 
 /// Upload a local path to a sandbox.
@@ -5747,34 +5170,22 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    match upload_plan {
-        SandboxUploadPlan::GitAware { base_dir, files } => {
-            sandbox_sync_up_files(
-                server,
-                name,
-                &base_dir,
-                &files,
-                local_path,
-                sandbox_path,
-                tls,
-                workspace,
-            )
-            .await?;
-        }
-        SandboxUploadPlan::GitFilteredEmpty => {
-            eprintln!(
-                "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
-                "⚠".yellow().bold(),
-                local_path.display(),
-            );
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
-        }
-        SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await?;
-        }
-    }
+    let uploaded_path = sandbox_upload_planned(
+        upload_plan,
+        server,
+        name,
+        local_path,
+        sandbox_path,
+        tls,
+        workspace,
+    )
+    .await?;
 
-    eprintln!("{} Upload complete", "✓".green().bold());
+    if let Some(path) = uploaded_path {
+        eprintln!("{} Upload complete: {path}", "✓".green().bold());
+    } else {
+        eprintln!("{} Upload complete", "✓".green().bold());
+    }
     Ok(())
 }
 
@@ -5788,7 +5199,7 @@ pub async fn sandbox_policy_set_global(
     yes: bool,
     wait: bool,
     _timeout_secs: u64,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if wait {
@@ -5805,10 +5216,8 @@ pub async fn sandbox_policy_set_global(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: String::new(),
             policy: Some(policy),
             global: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -5836,20 +5245,12 @@ pub async fn sandbox_settings_get(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
-
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox.object_id().to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -5997,7 +5398,7 @@ pub async fn gateway_setting_set(
     key: &str,
     value: &str,
     yes: bool,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let setting_value = parse_cli_setting_value(key, value)?;
@@ -6006,11 +5407,9 @@ pub async fn gateway_setting_set(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: String::new(),
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
             global: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -6040,10 +5439,12 @@ pub async fn sandbox_setting_set(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             setting_key: key.to_string(),
             setting_value: Some(setting_value),
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -6065,7 +5466,7 @@ pub async fn gateway_setting_delete(
     server: &str,
     key: &str,
     yes: bool,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     confirm_global_setting_delete(key, yes)?;
@@ -6073,11 +5474,9 @@ pub async fn gateway_setting_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: String::new(),
             setting_key: key.to_string(),
             delete_setting: true,
             global: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -6107,10 +5506,12 @@ pub async fn sandbox_setting_delete(
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             setting_key: key.to_string(),
             delete_setting: true,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -6153,10 +5554,12 @@ pub async fn sandbox_policy_set(
     // Get current version so we can detect no-ops.
     let current_version = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             version: 0,
             global: false,
-            workspace: workspace.to_string(),
         })
         .await
         .ok()
@@ -6165,9 +5568,11 @@ pub async fn sandbox_policy_set(
 
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             policy: Some(policy),
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -6212,10 +5617,12 @@ pub async fn sandbox_policy_set(
 
         let status_resp = client
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                name: name.to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 version: resp.version,
                 global: false,
-                workspace: workspace.to_string(),
             })
             .await
             .into_diagnostic()?;
@@ -6257,6 +5664,7 @@ pub async fn sandbox_policy_set(
     }
 }
 
+/// Preview or atomically submit explicitly scoped incremental policy operations.
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_policy_update(
     server: &str,
@@ -6268,6 +5676,8 @@ pub async fn sandbox_policy_update(
     remove_rules: &[String],
     binaries: &[String],
     rule_name: Option<&str>,
+    any_binary: bool,
+    endpoint_path: Option<&str>,
     dry_run: bool,
     wait: bool,
     timeout_secs: u64,
@@ -6286,28 +5696,18 @@ pub async fn sandbox_policy_update(
         remove_rules,
         binaries,
         rule_name,
+        any_binary,
+        endpoint_path,
     )?;
 
     let mut client = grpc_client(server, tls).await?;
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette!("sandbox not found"))?;
-
-    let sandbox_id = if sandbox.object_id().is_empty() {
-        return Err(miette!("sandbox missing metadata"));
-    } else {
-        sandbox.object_id().to_string()
-    };
-
     let current = client
-        .get_sandbox_config(GetSandboxConfigRequest { sandbox_id })
+        .get_sandbox_config(GetSandboxConfigRequest {
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
+        })
         .await
         .into_diagnostic()?
         .into_inner();
@@ -6339,9 +5739,11 @@ pub async fn sandbox_policy_update(
     let current_hash = current.policy_hash.clone();
     let response = client
         .update_config(UpdateConfigRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             merge_operations: plan.merge_operations,
-            workspace: workspace.to_string(),
             ..Default::default()
         })
         .await
@@ -6386,10 +5788,12 @@ pub async fn sandbox_policy_update(
 
         let status_resp = client
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                name: name.to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 version: response.version,
                 global: false,
-                workspace: workspace.to_string(),
             })
             .await
             .into_diagnostic()?;
@@ -6494,10 +5898,12 @@ where
 
     let status_resp = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             version,
             global: false,
-            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -6531,11 +5937,21 @@ where
         writeln!(stdout, "Hash:         {}", rev.policy_hash).into_diagnostic()?;
         writeln!(stdout, "Status:       {status:?}").into_diagnostic()?;
         writeln!(stdout, "Active:       {}", inner.active_version).into_diagnostic()?;
-        if rev.created_at_ms > 0 {
-            writeln!(stdout, "Created:      {} ms", rev.created_at_ms).into_diagnostic()?;
+        if let Some(created_time) = rev.created_time.as_ref() {
+            writeln!(
+                stdout,
+                "Created:      {} ms",
+                proto_timestamp_ms(Some(created_time))
+            )
+            .into_diagnostic()?;
         }
-        if rev.loaded_at_ms > 0 {
-            writeln!(stdout, "Loaded:       {} ms", rev.loaded_at_ms).into_diagnostic()?;
+        if let Some(loaded_time) = rev.loaded_time.as_ref() {
+            writeln!(
+                stdout,
+                "Loaded:       {} ms",
+                proto_timestamp_ms(Some(loaded_time))
+            )
+            .into_diagnostic()?;
         }
         if !rev.load_error.is_empty() {
             writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
@@ -6576,24 +5992,12 @@ where
     let (stdout, _stderr) = writers;
     let mut client = grpc_client(server, tls).await?;
 
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette!("sandbox missing from response"))?;
-    let sandbox_id = sandbox.object_id();
-    if sandbox_id.is_empty() {
-        return Err(miette!("sandbox missing metadata"));
-    }
-
     let config = client
         .get_sandbox_config(GetSandboxConfigRequest {
-            sandbox_id: sandbox_id.to_string(),
+            name: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?
@@ -6681,17 +6085,17 @@ pub async fn sandbox_policy_get_global(
     version: u32,
     view: PolicyGetView,
     output: &str,
-    workspace: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let status_resp = client
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-            name: String::new(),
             version,
             global: true,
-            workspace: workspace.to_string(),
+            sandbox: String::new(),
+            workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
@@ -6713,11 +6117,14 @@ pub async fn sandbox_policy_get_global(
         println!("Version:      {}", rev.version);
         println!("Hash:         {}", rev.policy_hash);
         println!("Status:       {status:?}");
-        if rev.created_at_ms > 0 {
-            println!("Created:      {} ms", rev.created_at_ms);
+        if let Some(created_time) = rev.created_time.as_ref() {
+            println!(
+                "Created:      {} ms",
+                proto_timestamp_ms(Some(created_time))
+            );
         }
-        if rev.loaded_at_ms > 0 {
-            println!("Loaded:       {} ms", rev.loaded_at_ms);
+        if let Some(loaded_time) = rev.loaded_time.as_ref() {
+            println!("Loaded:       {} ms", proto_timestamp_ms(Some(loaded_time)));
         }
 
         if view.includes_policy() {
@@ -6773,16 +6180,16 @@ fn policy_revision_to_json(
             serde_json::json!(active_version),
         );
     }
-    if rev.created_at_ms > 0 {
+    if rev.created_time.is_some() {
         obj.insert(
             "created_at_ms".to_string(),
-            serde_json::json!(rev.created_at_ms),
+            serde_json::json!(proto_timestamp_ms(rev.created_time.as_ref())),
         );
     }
-    if rev.loaded_at_ms > 0 {
+    if rev.loaded_time.is_some() {
         obj.insert(
             "loaded_at_ms".to_string(),
-            serde_json::json!(rev.loaded_at_ms),
+            serde_json::json!(proto_timestamp_ms(rev.loaded_time.as_ref())),
         );
     }
     if !rev.load_error.is_empty() {
@@ -6819,7 +6226,9 @@ fn policy_for_view(policy: &SandboxPolicy, view: PolicyGetView) -> Cow<'_, Sandb
 pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
-    limit: u32,
+    page_size: i32,
+    page_token: &str,
+    output: &str,
     workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -6827,16 +6236,32 @@ pub async fn sandbox_policy_list(
 
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
-            name: name.to_string(),
-            limit,
-            offset: 0,
+            sandbox: name.to_string(),
+            page_size,
+            page_token: page_token.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             global: false,
-            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let resp = resp.into_inner();
+    let next_page_token = resp.next_page_token;
+    let revisions = resp.revisions;
+    let structured = policy_revision_list_json("sandbox", Some(name), &revisions)?;
+    if crate::output::print_paginated_output_collection(
+        output,
+        "revisions",
+        &structured,
+        &next_page_token,
+        Clone::clone,
+    )? {
+        return Ok(());
+    }
+    crate::output::print_next_page_token(&next_page_token);
+
     if revisions.is_empty() {
         eprintln!("No policy history found for sandbox '{name}'");
         return Ok(());
@@ -6848,24 +6273,40 @@ pub async fn sandbox_policy_list(
 
 pub async fn sandbox_policy_list_global(
     server: &str,
-    limit: u32,
-    workspace: &str,
+    page_size: i32,
+    page_token: &str,
+    output: &str,
+    _workspace: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let resp = client
         .list_sandbox_policies(ListSandboxPoliciesRequest {
-            name: String::new(),
-            limit,
-            offset: 0,
+            page_size,
+            page_token: page_token.to_string(),
             global: true,
-            workspace: workspace.to_string(),
+            sandbox: String::new(),
+            workspace_scope: None,
         })
         .await
         .into_diagnostic()?;
 
-    let revisions = resp.into_inner().revisions;
+    let resp = resp.into_inner();
+    let next_page_token = resp.next_page_token;
+    let revisions = resp.revisions;
+    let structured = policy_revision_list_json("global", None, &revisions)?;
+    if crate::output::print_paginated_output_collection(
+        output,
+        "revisions",
+        &structured,
+        &next_page_token,
+        Clone::clone,
+    )? {
+        return Ok(());
+    }
+    crate::output::print_next_page_token(&next_page_token);
+
     if revisions.is_empty() {
         eprintln!("No global policy history found");
         return Ok(());
@@ -6873,6 +6314,28 @@ pub async fn sandbox_policy_list_global(
 
     print_policy_revision_table(&revisions);
     Ok(())
+}
+
+fn policy_revision_list_json(
+    scope: &str,
+    sandbox: Option<&str>,
+    revisions: &[openshell_core::proto::SandboxPolicyRevision],
+) -> Result<Vec<serde_json::Value>> {
+    revisions
+        .iter()
+        .map(|revision| {
+            let status =
+                PolicyStatus::try_from(revision.status).unwrap_or(PolicyStatus::Unspecified);
+            policy_revision_to_json(
+                scope,
+                sandbox,
+                None,
+                revision,
+                status,
+                PolicyGetView::Metadata,
+            )
+        })
+        .collect()
 }
 
 fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicyRevision]) {
@@ -6888,7 +6351,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             &rev.policy_hash
         };
         let error_short = if rev.load_error.len() > 40 {
-            format!("{}...", &rev.load_error[..40])
+            truncate_status_field(&rev.load_error, 40)
         } else {
             rev.load_error.clone()
         };
@@ -6897,7 +6360,7 @@ fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicy
             rev.version,
             hash_short,
             format!("{status:?}"),
-            rev.created_at_ms,
+            proto_timestamp_ms(rev.created_time.as_ref()),
             error_short,
         );
     }
@@ -6920,18 +6383,6 @@ pub async fn sandbox_logs(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-
-    // Resolve sandbox name to id.
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
-        })
-        .await
-        .into_diagnostic()?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
     // Normalize "all" to empty list (server treats empty as "no filter").
     let source_filter: Vec<String> = sources
@@ -6958,16 +6409,21 @@ pub async fn sandbox_logs(
         // Streaming mode: use WatchSandbox.
         let mut stream = client
             .watch_sandbox(WatchSandboxRequest {
-                id: sandbox.object_id().to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 follow_status: false,
                 follow_logs: true,
                 follow_events: false,
                 log_tail_lines: lines,
                 event_tail: 0,
                 stop_on_terminal: false,
-                log_since_ms: since_ms,
+                since_time: openshell_core::time::optional_timestamp_from_legacy_millis(since_ms)
+                    .into_diagnostic()?,
                 log_sources: source_filter,
                 log_min_level: level.to_uppercase(),
+                resume_after_cursor: String::new(),
             })
             .await
             .into_diagnostic()?
@@ -6985,12 +6441,15 @@ pub async fn sandbox_logs(
         // One-shot mode: use GetSandboxLogs.
         let resp = client
             .get_sandbox_logs(GetSandboxLogsRequest {
-                sandbox_id: sandbox.object_id().to_string(),
+                sandbox: name.to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    workspace.to_string(),
+                )),
                 lines,
-                since_ms,
+                since_time: openshell_core::time::optional_timestamp_from_legacy_millis(since_ms)
+                    .into_diagnostic()?,
                 sources: source_filter,
                 min_level: level.to_uppercase(),
-                workspace: workspace.to_string(),
             })
             .await
             .into_diagnostic()?;
@@ -7013,18 +6472,23 @@ pub async fn sandbox_logs(
 }
 
 fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
+    println!("{}", format_log_line(log));
+}
+
+fn format_log_line(log: &openshell_core::proto::SandboxLogLine) -> String {
     let source = if log.source.is_empty() {
         "gateway"
     } else {
         &log.source
     };
-    let secs = log.timestamp_ms / 1000;
-    let millis = log.timestamp_ms % 1000;
+    let timestamp_ms = proto_timestamp_ms(log.event_time.as_ref());
+    let secs = timestamp_ms / 1000;
+    let millis = timestamp_ms % 1000;
     if log.fields.is_empty() {
-        println!(
+        format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
             log.level, log.target, log.message
-        );
+        )
     } else {
         let mut fields_str = String::new();
         let mut entries: Vec<_> = log.fields.iter().collect();
@@ -7037,10 +6501,10 @@ fn print_log_line(log: &openshell_core::proto::SandboxLogLine) {
             fields_str.push('=');
             fields_str.push_str(v);
         }
-        println!(
+        format!(
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {} {}",
             log.level, log.target, log.message, fields_str
-        );
+        )
     }
 }
 
@@ -7060,9 +6524,11 @@ pub async fn sandbox_draft_get(
 
     let response = client
         .get_draft_policy(GetDraftPolicyRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: status_filter.unwrap_or("").to_string(),
-            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -7147,8 +6613,8 @@ pub async fn sandbox_draft_get(
                 "  {} {} (first seen {}, last seen {})",
                 "Hits:".dimmed(),
                 chunk.hit_count,
-                format_epoch_ms(chunk.first_seen_ms),
-                format_epoch_ms(chunk.last_seen_ms),
+                format_epoch_ms(proto_timestamp_ms(chunk.first_seen_time.as_ref())),
+                format_epoch_ms(proto_timestamp_ms(chunk.last_seen_time.as_ref())),
             );
         }
         println!();
@@ -7168,9 +6634,11 @@ pub async fn sandbox_draft_approve(
     let mut client = grpc_client(server, tls).await?;
     let review_token = client
         .get_draft_policy(GetDraftPolicyRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: String::new(),
-            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?
@@ -7183,13 +6651,16 @@ pub async fn sandbox_draft_approve(
 
     let response = client
         .approve_draft_chunk(ApproveDraftChunkRequest {
-            name: name.to_string(),
+            request_id: String::new(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             chunk_id: chunk_id.to_string(),
-            workspace: workspace.to_string(),
             review_token,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -7200,6 +6671,23 @@ pub async fn sandbox_draft_approve(
     );
 
     Ok(())
+}
+
+/// Explain an approval the gateway refused because the proposal's evaluation
+/// changed after it was fetched. The gateway has already stored the refreshed
+/// evaluation, so the reviewer needs to look at it before approving again.
+fn draft_approval_error(status: Status, name: &str) -> miette::Report {
+    if status.code() == Code::FailedPrecondition
+        && status.message().contains("refetch and review again")
+    {
+        return miette::miette!(
+            help = format!(
+                "review it with `openshell rule get {name} --status pending`, then approve again"
+            ),
+            "the sandbox policy or its inputs changed after this rule was fetched, so the gateway re-evaluated it"
+        );
+    }
+    miette::Report::from_err(status)
 }
 
 /// Reject a network rule.
@@ -7215,10 +6703,13 @@ pub async fn sandbox_draft_reject(
 
     client
         .reject_draft_chunk(RejectDraftChunkRequest {
-            name: name.to_string(),
+            request_id: String::new(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             chunk_id: chunk_id.to_string(),
             reason: reason.to_string(),
-            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?;
@@ -7239,9 +6730,11 @@ pub async fn sandbox_draft_approve_all(
     let mut client = grpc_client(server, tls).await?;
     let approvals = client
         .get_draft_policy(GetDraftPolicyRequest {
-            name: name.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             status_filter: "pending".to_string(),
-            workspace: workspace.to_string(),
         })
         .await
         .into_diagnostic()?
@@ -7256,13 +6749,16 @@ pub async fn sandbox_draft_approve_all(
 
     let response = client
         .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
-            name: name.to_string(),
+            request_id: String::new(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
             include_security_flagged,
-            workspace: workspace.to_string(),
             approvals,
         })
         .await
-        .into_diagnostic()?;
+        .map_err(|status| draft_approval_error(status, name))?;
 
     let inner = response.into_inner();
     println!(
@@ -7287,8 +6783,11 @@ pub async fn sandbox_draft_clear(
 
     let response = client
         .clear_draft_chunks(ClearDraftChunksRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
+            request_id: String::new(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -7314,8 +6813,10 @@ pub async fn sandbox_draft_history(
 
     let response = client
         .get_draft_history(GetDraftHistoryRequest {
-            name: name.to_string(),
-            workspace: workspace.to_string(),
+            sandbox: name.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                workspace.to_string(),
+            )),
         })
         .await
         .into_diagnostic()?;
@@ -7340,7 +6841,7 @@ pub async fn sandbox_draft_history(
 
         println!(
             "  {} {} [{}] {}",
-            format_timestamp_ms(entry.timestamp_ms).dimmed(),
+            format_timestamp_ms(proto_timestamp_ms(entry.event_time.as_ref())).dimmed(),
             event_colored,
             entry.chunk_id.get(..8).unwrap_or(&entry.chunk_id),
             entry.description,
@@ -7381,8 +6882,11 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
     };
     tags.push(layer_tag.to_string());
 
-    if !endpoint.access.is_empty() {
-        tags.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        tags.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
 
     for r in &endpoint.rules {
@@ -7404,37 +6908,72 @@ fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String 
 #[cfg(test)]
 mod tests {
     use super::{
-        PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
-        dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_provider_attachment_table, git_sync_files, inferred_provider_type,
-        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, parse_driver_config_json, parse_secret_material_env_pairs,
-        policy_revision_to_json, provider_profile_allows_empty_credentials,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
-        service_expose_status_error, service_url_for_gateway,
+        ForwardTcpConnectionError, PolicyGetView, ProvisioningStep, build_sandbox_resource_limits,
+        format_endpoint, format_log_line, forward_requires_session_token, git_sync_files,
+        has_main_process_result, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_driver_config_json, parse_secret_material_env_pairs, policy_revision_list_json,
+        policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
+        ready_false_condition_message, relay_local_socket, resolve_from,
+        rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
+        service_endpoint_to_json, service_status_error, service_url_for_gateway,
+        workspace_member_to_json,
     };
+    use openshell_core::proto::TcpForwardFrame;
+
+    #[test]
+    fn draft_approval_error_explains_refreshed_evaluation() {
+        use super::draft_approval_error;
+        use tonic::Status;
+
+        let refreshed = draft_approval_error(
+            Status::failed_precondition(
+                "proposal inputs changed; evaluation refreshed, refetch and review again",
+            ),
+            "my-agent",
+        );
+        assert!(refreshed.to_string().contains("re-evaluated"));
+        let help = refreshed.help().expect("help text").to_string();
+        assert!(help.contains("openshell rule get my-agent --status pending"));
+
+        let other = draft_approval_error(Status::not_found("chunk not found"), "my-agent");
+        assert!(other.to_string().contains("chunk not found"));
+        assert!(other.help().is_none());
+    }
+
+    #[test]
+    fn zero_exec_timeout_is_omitted() {
+        assert!(proto_execution_timeout(0).unwrap().is_none());
+        assert_eq!(
+            proto_execution_timeout(30).unwrap().unwrap(),
+            prost_types::Duration {
+                seconds: 30,
+                nanos: 0,
+            }
+        );
+    }
     use crate::TEST_ENV_LOCK;
-    use crate::commands::common::progress_step_from_metadata;
-    use crate::test_utils::EnvVarGuard;
+    use crate::commands::common::{
+        parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
+    };
+    use crate::test_utils::Environment;
+    use openshell_bootstrap::GatewayMetadata;
     use std::fs;
-    use std::io::Write;
     use std::path::Path;
     use std::process::Command;
     use tonic::Status;
 
-    use openshell_bootstrap::GatewayMetadata;
     use openshell_core::progress::{
         PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        GetSandboxConfigResponse, GpuResourceRequirements, PolicySource, PolicyStatus, Provider,
-        ProviderCredentialRefresh, ProviderCredentialRefreshRecoveryAction,
-        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
-        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
-        ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicyRevision,
-        SandboxStatus, datamodel::v1::ObjectMeta,
+        EndpointResult, EndpointStatus, GetSandboxConfigResponse, GpuResourceRequirements,
+        PolicySource, PolicyStatus, ResourceRequirements, Sandbox, SandboxCondition, SandboxPhase,
+        SandboxPolicy, SandboxPolicyRevision, SandboxResources, SandboxRestartPolicy, SandboxSpec,
+        SandboxStatus, SandboxWorkloadConfig, SandboxWorkloadTemplate,
+        SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec, ServiceAuthorizationMode,
+        ServiceEndpoint, ServiceEndpointResponse, WorkspaceMember, WorkspaceRole,
+        datamodel::v1::ObjectMeta,
     };
 
     #[test]
@@ -7466,6 +7005,137 @@ mod tests {
     }
 
     #[test]
+    fn policy_list_json_reuses_metadata_contract() {
+        let load_error = "policy failed after checking café.example/非常に長いパス";
+        let revisions = vec![SandboxPolicyRevision {
+            version: 7,
+            policy_hash: "0123456789abcdef".to_string(),
+            status: PolicyStatus::Failed as i32,
+            load_error: load_error.to_string(),
+            created_time: openshell_core::time::timestamp_from_millis(100).ok(),
+            loaded_time: openshell_core::time::timestamp_from_millis(200).ok(),
+            policy: Some(SandboxPolicy::default()),
+            provenance: std::collections::HashMap::from([(
+                "source".to_string(),
+                "provider-composition".to_string(),
+            )]),
+        }];
+
+        let values = policy_revision_list_json("sandbox", Some("dev"), &revisions)
+            .expect("policy list JSON");
+
+        assert_eq!(
+            values[0],
+            serde_json::json!({
+                "scope": "sandbox",
+                "sandbox": "dev",
+                "version": 7,
+                "hash": "0123456789abcdef",
+                "status": "failed",
+                "created_at_ms": 100,
+                "loaded_at_ms": 200,
+                "load_error": load_error,
+                "provenance": {"source": "provider-composition"},
+            })
+        );
+        assert!(values[0].get("policy").is_none());
+        assert!(values[0].get("active_version").is_none());
+
+        let unknown = policy_revision_list_json(
+            "global",
+            None,
+            &[SandboxPolicyRevision {
+                version: 8,
+                status: 999,
+                ..Default::default()
+            }],
+        )
+        .expect("global policy list JSON");
+        assert_eq!(unknown[0]["scope"], "global");
+        assert_eq!(unknown[0]["status"], "unspecified");
+        assert!(unknown[0].get("sandbox").is_none());
+    }
+
+    #[test]
+    fn policy_revision_table_handles_unicode_load_errors() {
+        // Stored diagnostics can contain Unicode paths. Byte 40 splits the
+        // character in the 40-scalar case; longer errors must also remain safe.
+        let revisions = [
+            String::new(),
+            "a".repeat(40),
+            "a".repeat(41),
+            format!("{}é", "a".repeat(39)),
+            format!("{}éz", "a".repeat(39)),
+        ]
+        .into_iter()
+        .map(|load_error| SandboxPolicyRevision {
+            version: 1,
+            status: PolicyStatus::Failed as i32,
+            load_error,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+
+        super::print_policy_revision_table(&revisions);
+    }
+
+    #[test]
+    fn service_endpoint_json_has_raw_fields_and_normalized_url() {
+        let response = ServiceEndpointResponse {
+            endpoint: Some(ServiceEndpoint {
+                metadata: Some(ObjectMeta {
+                    workspace: "team-a".to_string(),
+                    ..Default::default()
+                }),
+                sandbox: "api".to_string(),
+                name: String::new(),
+                target_port: 8080,
+                authorization_mode: ServiceAuthorizationMode::BearerPassthrough as i32,
+                ..Default::default()
+            }),
+            url: "https://api.openshell.localhost:3000/".to_string(),
+        };
+
+        let value = service_endpoint_to_json(&response, "https://gateway.example:17670")
+            .expect("service endpoint JSON");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "workspace": "team-a",
+                "sandbox": "api",
+                "service": "",
+                "target_port": 8080,
+                "authorization_mode": "bearer_passthrough",
+                "url": "https://api.openshell.localhost:17670/",
+            })
+        );
+        assert!(service_endpoint_to_json(&ServiceEndpointResponse::default(), "unused").is_none());
+    }
+
+    #[test]
+    fn workspace_member_json_uses_stable_role_names() {
+        for (role, expected) in [
+            (WorkspaceRole::Admin as i32, "admin"),
+            (WorkspaceRole::User as i32, "user"),
+            (999, "unknown"),
+        ] {
+            let value = workspace_member_to_json(&WorkspaceMember {
+                metadata: Some(ObjectMeta {
+                    id: "internal-id".to_string(),
+                    ..Default::default()
+                }),
+                principal_subject: "oidc-subject".to_string(),
+                role,
+            });
+            assert_eq!(
+                value,
+                serde_json::json!({"subject": "oidc-subject", "role": expected})
+            );
+            assert!(!value.to_string().contains("internal-id"));
+        }
+    }
+
+    #[test]
     fn parse_credential_pairs_accepts_key_value_form() {
         let parsed = parse_credential_pairs(&["API_KEY=abc123".to_string()]).expect("parse");
         assert_eq!(parsed.get("API_KEY"), Some(&"abc123".to_string()));
@@ -7473,81 +7143,97 @@ mod tests {
 
     #[test]
     fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
-
-        let parsed =
-            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
-            Some(&"from-env".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env")
+            .run(|| {
+                let parsed = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()])
+                    .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
+                    Some(&"from-env".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
-            .expect_err("missing env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .remove("NAV_PARSE_CREDENTIAL_MISSING")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
+                    .expect_err("missing env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
-            .expect_err("empty env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_EMPTY", "")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
+                    .expect_err("empty env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
-
-        let parsed =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+        Environment::new()
+            .set("NAV_PARSE_SME_NAMED", "pem-material")
+            .run(|| {
+                let parsed = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_NAMED".to_string()
+                ])
                 .expect("parse");
-        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+                assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
-
-        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
-            .expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
-            Some(&"key-only-material".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_KEY_ONLY", "key-only-material")
+            .run(|| {
+                let parsed =
+                    parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+                        .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+                    Some(&"key-only-material".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_missing_environment() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
-
-        let err =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
-                .expect_err("missing env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
-        ));
+        Environment::new().remove("NAV_PARSE_SME_MISSING").run(|| {
+            let err =
+                parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                    .expect_err("missing env should error");
+            assert!(err.to_string().contains(
+                "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+            ));
+        });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
-
-        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
-            .expect_err("blank env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
-        ));
+        Environment::new()
+            .set("NAV_PARSE_SME_EMPTY", "   ")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_EMPTY".to_string()
+                ])
+                .expect_err("blank env should error");
+                assert!(err.to_string().contains(
+                    "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+                ));
+            });
     }
 
     #[test]
@@ -7559,17 +7245,19 @@ mod tests {
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
-
-        let err = parse_secret_material_env_pairs(&[
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-        ])
-        .expect_err("duplicate key should error");
-        assert!(
-            err.to_string()
-                .contains("key 'private_key' supplied more than once")
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_DUP", "value")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                ])
+                .expect_err("duplicate key should error");
+                assert!(
+                    err.to_string()
+                        .contains("key 'private_key' supplied more than once")
+                );
+            });
     }
 
     #[test]
@@ -7615,43 +7303,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_attachment_table_formats_provider_counts() {
-        let output = format_provider_attachment_table(
-            &[Provider {
-                metadata: Some(ObjectMeta {
-                    name: "work-custom".to_string(),
-                    ..Default::default()
-                }),
-                r#type: "custom-api".to_string(),
-                credentials: [
-                    ("CUSTOM_API_KEY".to_string(), "REDACTED".to_string()),
-                    ("CUSTOM_API_SECRET".to_string(), "REDACTED".to_string()),
-                ]
-                .into_iter()
-                .collect(),
-                config: std::iter::once((
-                    "BASE_URL".to_string(),
-                    "https://api.custom.example".to_string(),
-                ))
-                .collect(),
-                credential_expires_at_ms: std::collections::HashMap::new(),
-                profile_workspace: String::new(),
-                credential_handles: std::collections::HashMap::new(),
-            }],
-            false,
-        );
-
-        assert!(output.contains("NAME"));
-        assert!(output.contains("TYPE"));
-        assert!(output.contains("CREDENTIAL_KEYS"));
-        assert!(output.contains("CONFIG_KEYS"));
-        assert!(output.contains("work-custom"));
-        assert!(output.contains("custom-api"));
-        assert!(output.contains('2'));
-        assert!(output.contains('1'));
-    }
-
-    #[test]
     fn progress_step_metadata_values_map_to_cli_steps() {
         assert_eq!(
             progress_step_from_metadata(PROGRESS_STEP_REQUESTING_SANDBOX),
@@ -7666,118 +7317,6 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
-    }
-
-    #[test]
-    fn refresh_status_table_includes_operational_fields() {
-        let header = refresh_status_header();
-        assert!(header.contains("NEXT_REFRESH"));
-        assert!(header.contains("LAST_REFRESH"));
-        assert!(header.contains("RECOVERY"));
-        assert!(header.contains("FAILURE_CODE"));
-        assert!(header.contains("LAST_ERROR"));
-
-        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
-            provider_name: "my-graph".to_string(),
-            provider_id: "provider-id".to_string(),
-            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-            strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
-            status: "error".to_string(),
-            expires_at_ms: 1_767_225_600_000,
-            next_refresh_at_ms: i64::MAX,
-            last_refresh_at_ms: 1_767_225_000_000,
-            last_error: "token endpoint returned a very long error message that should be truncated for table readability"
-                .to_string(),
-            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
-            failure_code: "oauth_rotated_refresh_token_handle_missing".to_string(),
-            provider_error_subtype: "invalid_rapt".to_string(),
-            last_error_at_ms: 1_767_225_000_000,
-        });
-
-        assert!(row.contains("my-graph"));
-        assert!(row.contains("MS_GRAPH_ACCESS_TOKEN"));
-        assert!(row.contains("oauth2_client_credentials"));
-        assert!(row.contains("error"));
-        assert!(row.contains("reauthorize"));
-        assert!(row.contains("oauth_rotated_refresh_token_handle_missing"));
-        assert!(row.contains("2026-01-01 00:00:00"));
-        assert!(!row.contains("292278994"));
-        assert!(row.contains("..."));
-    }
-
-    #[test]
-    fn empty_provider_credentials_require_all_required_credentials_to_be_runtime_resolvable() {
-        let refresh_token_profile = ProviderProfile {
-            credentials: vec![ProviderProfileCredential {
-                name: "MS_GRAPH_ACCESS_TOKEN".to_string(),
-                required: true,
-                refresh: Some(ProviderCredentialRefresh {
-                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert!(provider_profile_allows_empty_credentials(
-            &refresh_token_profile
-        ));
-
-        let token_grant_profile = ProviderProfile {
-            credentials: vec![ProviderProfileCredential {
-                name: "ACCESS_TOKEN".to_string(),
-                required: true,
-                token_grant: Some(ProviderCredentialTokenGrant {
-                    token_endpoint: "https://auth.example.com/token".to_string(),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert!(provider_profile_allows_empty_credentials(
-            &token_grant_profile
-        ));
-
-        let mixed_static_profile = ProviderProfile {
-            credentials: vec![
-                ProviderProfileCredential {
-                    name: "ACCESS_TOKEN".to_string(),
-                    required: true,
-                    refresh: Some(ProviderCredentialRefresh {
-                        strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                ProviderProfileCredential {
-                    name: "STATIC_API_KEY".to_string(),
-                    required: true,
-                    refresh: None,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        assert!(!provider_profile_allows_empty_credentials(
-            &mixed_static_profile
-        ));
-
-        let optional_refresh_profile = ProviderProfile {
-            credentials: vec![ProviderProfileCredential {
-                name: "OPTIONAL_TOKEN".to_string(),
-                required: false,
-                refresh: Some(ProviderCredentialRefresh {
-                    strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert!(provider_profile_allows_empty_credentials(
-            &optional_refresh_profile
-        ));
     }
 
     #[test]
@@ -7911,100 +7450,137 @@ mod tests {
     }
 
     #[test]
-    fn inferred_provider_type_returns_type_for_known_command() {
-        let result = inferred_provider_type(&["claude".to_string(), "--help".to_string()]);
-        assert_eq!(result, Some("claude-code".to_string()));
-    }
-
-    #[test]
-    fn inferred_provider_type_returns_none_for_unknown_command() {
-        let result = inferred_provider_type(&["bash".to_string()]);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn inferred_provider_type_returns_none_for_empty_command() {
-        let result = inferred_provider_type(&[]);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn inferred_provider_type_normalizes_aliases() {
-        // `glab` should resolve to `gitlab`
-        let result = inferred_provider_type(&["glab".to_string()]);
-        assert_eq!(result, Some("gitlab".to_string()));
-
-        // `gh` should resolve to `github`
-        let result = inferred_provider_type(&["gh".to_string()]);
-        assert_eq!(result, Some("github".to_string()));
-    }
-
-    #[test]
-    fn inferred_provider_type_handles_full_path() {
-        let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
-        assert_eq!(result, Some("claude-code".to_string()));
-    }
-
-    #[test]
     fn sandbox_should_persist_defaults_to_persistent() {
-        assert!(sandbox_should_persist(true, None));
+        assert!(sandbox_should_persist(true, None, None));
     }
 
     #[test]
     fn sandbox_should_not_persist_when_no_keep_is_set() {
-        assert!(!sandbox_should_persist(false, None));
+        assert!(!sandbox_should_persist(false, None, None));
     }
 
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
-        assert!(sandbox_should_persist(false, Some(&spec)));
+        assert!(sandbox_should_persist(false, Some(&spec), None));
     }
 
     #[test]
-    fn resolve_from_classifies_existing_dockerfile_path() {
+    fn sandbox_should_persist_when_service_exposure_is_requested() {
+        assert!(sandbox_should_persist(false, None, Some(8080)));
+    }
+
+    #[test]
+    fn infrastructure_error_with_observed_exit_is_not_a_main_process_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(137),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "ComputeResourceMissing".to_string(),
+                    message: "sandbox runtime disappeared".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(!has_main_process_result(&sandbox));
+    }
+
+    #[test]
+    fn main_process_failed_condition_identifies_command_result() {
+        let mut sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                exit_code: Some(7),
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: "MainProcessFailed".to_string(),
+                    message: "canonical main process exited with status 7".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Error as i32);
+
+        assert!(has_main_process_result(&sandbox));
+    }
+
+    #[test]
+    fn resolve_from_rejects_existing_dockerfile_path() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
         let dockerfile = temp.path().join("Dockerfile");
         fs::write(&dockerfile, "FROM scratch\n").expect("failed to write Dockerfile");
 
-        match resolve_from(dockerfile.to_str().expect("temp path is not UTF-8"))
-            .expect("expected Dockerfile source")
-        {
-            super::ResolvedSource::Dockerfile {
-                dockerfile: resolved,
-                context,
-            } => {
-                assert_eq!(
-                    resolved,
-                    dockerfile
-                        .canonicalize()
-                        .expect("failed to canonicalize Dockerfile")
-                );
-                assert_eq!(
-                    context,
-                    temp.path()
-                        .canonicalize()
-                        .expect("failed to canonicalize context")
-                );
-            }
-            super::ResolvedSource::Image(image) => {
-                panic!("expected Dockerfile source, got image {image}");
-            }
-        }
+        let err = resolve_from(dockerfile.to_str().expect("temp path is not UTF-8"))
+            .expect_err("expected local Dockerfile path to be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("no longer builds local Dockerfiles or directories"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("docker build -t <image>"),
+            "expected actionable build guidance: {err}"
+        );
+        assert!(
+            err.to_string().contains("podman build -t <image>"),
+            "expected Podman build guidance: {err}"
+        );
     }
 
     #[test]
-    fn resolve_from_rejects_missing_explicit_dockerfile_path() {
+    fn resolve_from_rejects_missing_explicit_local_path() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
         let missing = temp.path().join("Dockerfile");
 
         let err = resolve_from(missing.to_str().expect("temp path is not UTF-8"))
-            .expect_err("expected missing Dockerfile path to be rejected");
+            .expect_err("expected missing explicit local path to be rejected");
 
         assert!(
-            err.to_string().contains("local --from path does not exist"),
+            err.to_string()
+                .contains("no longer builds local Dockerfiles or directories"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_from_rejects_bare_dockerfile_name() {
+        let err = resolve_from("Dockerfile").expect_err("expected bare Dockerfile to be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("no longer builds local Dockerfiles or directories"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_from_keeps_bare_image_reference_when_local_directory_matches() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("create tempdir");
+        fs::create_dir(temp.path().join("python")).expect("create matching directory");
+        let original_dir = std::env::current_dir().expect("read current directory");
+        std::env::set_current_dir(temp.path()).expect("enter tempdir");
+
+        let result = resolve_from("python");
+
+        std::env::set_current_dir(original_dir).expect("restore current directory");
+        match result.expect("bare image reference should not be a local path") {
+            super::ResolvedSource::Image(image) => assert_eq!(image, "python"),
+            other @ super::ResolvedSource::RootfsTar { .. } => {
+                panic!("expected image source, got {other:?}");
+            }
+        }
     }
 
     #[test]
@@ -8013,14 +7589,195 @@ mod tests {
 
         match resolve_from(image_ref).expect("expected image source") {
             super::ResolvedSource::Image(image) => assert_eq!(image, image_ref),
-            super::ResolvedSource::Dockerfile { .. } => {
-                panic!("expected image ref, got Dockerfile source");
+            other @ super::ResolvedSource::RootfsTar { .. } => {
+                panic!("expected image ref, got {other:?}");
             }
         }
     }
 
     #[test]
-    fn dockerfile_sources_are_rejected_for_remote_gateways() {
+    fn resolve_from_classifies_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tar");
+        fs::write(&archive, b"fake tar content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other @ super::ResolvedSource::Image(_) => {
+                panic!("expected RootfsTar source, got {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tar_gz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tar.gz");
+        fs::write(&archive, b"fake tar.gz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other @ super::ResolvedSource::Image(_) => {
+                panic!("expected RootfsTar source, got {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_from_classifies_tgz_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let archive = temp.path().join("rootfs.tgz");
+        fs::write(&archive, b"fake tgz content").expect("failed to write archive");
+
+        match resolve_from(archive.to_str().expect("temp path is not UTF-8"))
+            .expect("expected RootfsTar source")
+        {
+            super::ResolvedSource::RootfsTar { path } => {
+                assert_eq!(
+                    path,
+                    archive
+                        .canonicalize()
+                        .expect("failed to canonicalize archive")
+                );
+            }
+            other @ super::ResolvedSource::Image(_) => {
+                panic!("expected RootfsTar source, got {other:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_from_rejects_missing_tar_archive() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        let missing = temp.path().join("missing.tar");
+
+        let err = resolve_from(missing.to_str().expect("temp path is not UTF-8"))
+            .expect_err("expected missing archive to be rejected");
+
+        assert!(
+            err.to_string().contains("local --from path does not exist"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn filename_looks_like_rootfs_tar_detects_extensions() {
+        use super::filename_looks_like_rootfs_tar;
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tar.gz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("rootfs.tgz")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("IMAGE.TAR")));
+        assert!(filename_looks_like_rootfs_tar(Path::new("my-image.TAR.GZ")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("Dockerfile")));
+        assert!(!filename_looks_like_rootfs_tar(Path::new("image.zip")));
+    }
+
+    /// The gateway forwards only `template.driver_config.<driver_name>` to the
+    /// selected driver, so a top-level key is silently dropped and the archive
+    /// never reaches the VM driver.
+    #[test]
+    fn rootfs_tar_driver_config_nests_under_vm_key() {
+        use prost_types::value::Kind;
+
+        let config =
+            super::merge_rootfs_tar_driver_config(None, "tok-abc").expect("merge should succeed");
+
+        assert_eq!(
+            config.fields.keys().collect::<Vec<_>>(),
+            vec!["vm"],
+            "rootfs tar config must live under the vm driver key"
+        );
+        let Some(Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref() else {
+            panic!("vm entry must be an object");
+        };
+        let Some(Kind::StringValue(token)) = vm.fields["rootfs_tar_staging_token"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_staging_token must be a string");
+        };
+        assert_eq!(token, "tok-abc");
+        assert!(
+            !vm.fields.contains_key("rootfs_tar_path"),
+            "the CLI never names a host path; the gateway resolves one"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_preserves_existing_vm_settings() {
+        use prost_types::value::Kind;
+
+        let base = parse_driver_config_json(
+            r#"{"vm":{"gpu_device_ids":["0000:2d:00.0"]},"docker":{"userns":"host"}}"#,
+        )
+        .expect("valid driver config json");
+
+        let config = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect("merge should succeed");
+
+        // The sibling driver block survives untouched.
+        assert!(config.fields.contains_key("docker"));
+
+        let Some(Kind::StructValue(vm)) = config.fields["vm"].kind.as_ref() else {
+            panic!("vm entry must be an object");
+        };
+        assert!(
+            vm.fields.contains_key("gpu_device_ids"),
+            "pre-existing vm settings must not be clobbered"
+        );
+        let Some(Kind::StringValue(token)) = vm.fields["rootfs_tar_staging_token"].kind.as_ref()
+        else {
+            panic!("rootfs_tar_staging_token must be a string");
+        };
+        assert_eq!(token, "tok-abc");
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_rejects_caller_supplied_token() {
+        let base = parse_driver_config_json(r#"{"vm":{"rootfs_tar_staging_token":"stolen"}}"#)
+            .expect("valid driver config json");
+
+        let err = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect_err("a caller-supplied staging token must not be silently overwritten");
+
+        assert!(
+            err.to_string()
+                .contains("already sets vm.rootfs_tar_staging_token"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_driver_config_rejects_non_object_vm_block() {
+        let base = parse_driver_config_json(r#"{"vm":"nonsense"}"#).expect("valid json object");
+
+        let err = super::merge_rootfs_tar_driver_config(Some(base), "tok-abc")
+            .expect_err("a non-object vm block must be rejected");
+
+        assert!(
+            err.to_string().contains("must be an object"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rootfs_tar_sources_are_rejected_for_remote_gateways() {
         let metadata = GatewayMetadata {
             name: "remote".to_string(),
             gateway_endpoint: "https://gateway.example.com".to_string(),
@@ -8035,11 +7792,11 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(!dockerfile_sources_supported_for_gateway(Some(&metadata)));
+        assert!(!rootfs_tar_sources_supported_for_gateway(Some(&metadata)));
     }
 
     #[test]
-    fn dockerfile_sources_are_allowed_for_local_gateways() {
+    fn rootfs_tar_sources_are_allowed_for_local_gateways() {
         let metadata = GatewayMetadata {
             name: "local".to_string(),
             gateway_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -8054,8 +7811,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
-        assert!(dockerfile_sources_supported_for_gateway(None));
+        assert!(rootfs_tar_sources_supported_for_gateway(Some(&metadata)));
+        assert!(rootfs_tar_sources_supported_for_gateway(None));
     }
 
     #[test]
@@ -8103,10 +7860,13 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_status_error_mentions_required_scope() {
-        let report = service_expose_status_error(Status::permission_denied(
-            "scope 'sandbox:write' required",
-        ));
+    fn service_status_error_mentions_required_scope() {
+        let report = service_status_error(
+            "expose service",
+            "sandbox:write",
+            "demo",
+            Status::permission_denied("scope 'sandbox:write' required"),
+        );
 
         assert_eq!(
             report.to_string(),
@@ -8115,16 +7875,61 @@ mod tests {
     }
 
     #[test]
+    fn service_status_error_names_missing_sandbox() {
+        let report = service_status_error(
+            "delete service",
+            "sandbox:write",
+            "web-http",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "delete service failed: sandbox \"web-http\" not found \
+             (the first argument is the sandbox name, not the service name)"
+        );
+    }
+
+    #[test]
+    fn service_status_error_omits_empty_sandbox_name() {
+        let report = service_status_error(
+            "list services",
+            "sandbox:read",
+            "",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "list services failed: sandbox not found"
+        );
+    }
+
+    #[test]
+    fn service_status_error_keeps_missing_service_message() {
+        let report = service_status_error(
+            "get service",
+            "sandbox:read",
+            "demo",
+            Status::not_found("service endpoint not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "get service failed: service endpoint not found"
+        );
+    }
+
+    #[test]
     fn ready_false_condition_message_prefers_reason_and_message() {
         let status = SandboxStatus {
-            sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
                 reason: "Unschedulable".to_string(),
                 message: "Another GPU sandbox may already be using the available GPU.".to_string(),
-                last_transition_time: String::new(),
+                transition_time: None,
             }],
             ..Default::default()
         };
@@ -8138,14 +7943,13 @@ mod tests {
     #[test]
     fn ready_false_condition_message_ignores_non_ready_conditions() {
         let status = SandboxStatus {
-            sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),
                 status: "True".to_string(),
                 reason: "Scheduled".to_string(),
                 message: "Sandbox scheduled".to_string(),
-                last_transition_time: String::new(),
+                transition_time: None,
             }],
             ..Default::default()
         };
@@ -8295,7 +8099,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+    fn sandbox_upload_plan_rejects_empty_filtered_selections() {
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         let repo = tmpdir.path().join("repo");
         fs::create_dir_all(repo.join("runs")).expect("create repo");
@@ -8303,14 +8107,126 @@ mod tests {
         fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
         fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
 
-        let plan =
-            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+        fs::create_dir(repo.join("empty")).expect("create empty directory");
+
+        for path in [
+            repo.join("runs"),
+            repo.join("runs/test.json"),
+            repo.join("empty"),
+        ] {
+            let err =
+                sandbox_upload_plan(&path, true).expect_err("empty selection must stop upload");
+            let message = err.to_string();
+            assert!(message.contains("filtering selected no files"), "{message}");
+            assert!(
+                message.contains("Git returned 0 uploadable paths"),
+                "{message}"
+            );
+            assert!(message.contains("--no-git-ignore"), "{message}");
+            assert_eq!(
+                sandbox_upload_plan(&path, false).expect("explicit unfiltered upload"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_allows_paths_outside_git_repository() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        fs::write(tmpdir.path().join("file.txt"), "hello").expect("write file");
+
+        for path in [tmpdir.path().to_path_buf(), tmpdir.path().join("file.txt")] {
+            assert_eq!(
+                sandbox_upload_plan(&path, true).expect("upload outside a repository"),
+                super::SandboxUploadPlan::Regular,
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_upload_plan_selects_only_unignored_files() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path();
+        init_git_repo(repo);
+        fs::write(repo.join(".gitignore"), "*.log\n").expect("write .gitignore");
+        fs::create_dir(repo.join("files")).expect("create files directory");
+        fs::write(repo.join("files/keep.txt"), "keep").expect("write included file");
+        fs::write(repo.join("files/skip.log"), "skip").expect("write ignored file");
 
         assert_eq!(
-            plan,
-            super::SandboxUploadPlan::GitFilteredEmpty,
-            "gitignored directory should fall back with GitFilteredEmpty"
+            sandbox_upload_plan(&repo.join("files"), true).expect("filtered upload"),
+            super::SandboxUploadPlan::GitAware {
+                base_dir: fs::canonicalize(repo.join("files")).expect("canonical path"),
+                files: vec!["keep.txt".to_string()],
+            },
         );
+    }
+
+    #[test]
+    fn sandbox_upload_plan_filters_linked_worktrees_and_separate_git_dirs() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir(&repo).expect("create repo");
+        init_git_repo(&repo);
+        let mut commit = Command::new("git");
+        super::scrub_git_env(&mut commit);
+        assert!(
+            commit
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "initial",
+                ])
+                .current_dir(&repo)
+                .status()
+                .expect("initial commit")
+                .success()
+        );
+
+        let worktree = tmpdir.path().join("worktree");
+        let mut add = Command::new("git");
+        super::scrub_git_env(&mut add);
+        assert!(
+            add.args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .current_dir(&repo)
+                .status()
+                .expect("add worktree")
+                .success()
+        );
+
+        let separate = tmpdir.path().join("separate");
+        let mut init = Command::new("git");
+        super::scrub_git_env(&mut init);
+        assert!(
+            init.args(["init", "--separate-git-dir"])
+                .arg(tmpdir.path().join("metadata"))
+                .arg(&separate)
+                .status()
+                .expect("initialize separate git directory")
+                .success()
+        );
+
+        for source in [worktree, separate] {
+            assert!(source.join(".git").is_file());
+            fs::write(source.join(".gitignore"), ".env\n").expect("write ignore rule");
+            fs::write(source.join(".env"), "dummy").expect("write ignored file");
+            fs::write(source.join("keep.txt"), "keep").expect("write included file");
+            let super::SandboxUploadPlan::GitAware { mut files, .. } =
+                sandbox_upload_plan(&source, true).expect("filter gitfile worktree")
+            else {
+                panic!("a gitfile worktree must be filtered");
+            };
+            files.sort();
+            assert_eq!(files, vec![".gitignore", "keep.txt"]);
+        }
     }
 
     #[test]
@@ -8326,17 +8242,19 @@ mod tests {
         fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
         fs::write(repo.join("top.txt"), "top").expect("write top.txt");
 
-        let _git_dir = EnvVarGuard::set("GIT_DIR", "/tmp/not-the-test-repo/.git");
-        let _git_work_tree = EnvVarGuard::set("GIT_WORK_TREE", "/tmp/not-the-test-repo");
+        Environment::new()
+            .set("GIT_DIR", "/tmp/not-the-test-repo/.git")
+            .set("GIT_WORK_TREE", "/tmp/not-the-test-repo")
+            .run(|| {
+                let result = git_sync_files(&repo.join("nested"));
+                let (base_dir, files) = result.expect("git_sync_files should succeed");
 
-        let result = git_sync_files(&repo.join("nested"));
-        let (base_dir, files) = result.expect("git_sync_files should succeed");
-
-        assert_eq!(
-            base_dir,
-            fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
-        );
-        assert_eq!(files, vec!["file.txt"]);
+                assert_eq!(
+                    base_dir,
+                    fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
+                );
+                assert_eq!(files, vec!["file.txt"]);
+            });
     }
 
     #[test]
@@ -8354,7 +8272,7 @@ mod tests {
             host: "host.example.test".to_string(),
             port: 443,
             protocol: "rest".to_string(),
-            access: "read-only".to_string(),
+            access: openshell_core::proto::NetworkAccessPreset::ReadOnly as i32,
             ..Default::default()
         };
         assert_eq!(
@@ -8387,391 +8305,229 @@ mod tests {
     }
 
     #[test]
-    fn read_gcloud_adc_missing_file_errors() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "/nonexistent/path/to/adc.json",
-        );
-        let err = super::read_gcloud_adc().expect_err("missing file should error");
-        assert!(
-            err.to_string().contains("failed to read gcloud ADC file"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn read_gcloud_adc_wrong_type_errors() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let json = serde_json::json!({
-            "type": "service_account",
-            "project_id": "my-project",
-            "private_key_id": "key123"
-        });
-        Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let err = super::read_gcloud_adc().expect_err("wrong type should error");
-        // The service_account type gets a targeted message directing the user
-        // to the real Vertex service-account credential flow instead of the
-        // generic authorized_user hint.
-        assert!(
-            err.to_string()
-                .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
-            "error should mention the service-account token key, got: {err}"
-        );
-    }
-
-    #[test]
-    fn read_gcloud_adc_parses_user_creds() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let json = serde_json::json!({
-            "type": "authorized_user",
-            "client_id": "test-client-id.apps.googleusercontent.com",
-            "client_secret": "test-client-secret",
-            "refresh_token": "test-refresh-token"
-        });
-        Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let (client_id, client_secret, refresh_token) =
-            super::read_gcloud_adc().expect("valid ADC should parse");
-        assert_eq!(client_id, "test-client-id.apps.googleusercontent.com");
-        assert_eq!(client_secret, "test-client-secret");
-        assert_eq!(refresh_token, "test-refresh-token");
-    }
-
-    #[test]
-    fn read_gcloud_adc_uses_cloudsdk_config_fallback() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let dir = tempfile::tempdir().expect("tempdir");
-        let adc_path = dir.path().join("application_default_credentials.json");
-        let json = serde_json::json!({
-            "type": "authorized_user",
-            "client_id": "cloudsdk-client-id.apps.googleusercontent.com",
-            "client_secret": "cloudsdk-client-secret",
-            "refresh_token": "cloudsdk-refresh-token"
-        });
-        fs::write(&adc_path, json.to_string()).expect("write adc file");
-        let _adc_guard = EnvVarGuard::unset("GOOGLE_APPLICATION_CREDENTIALS");
-        let _cloudsdk_guard =
-            EnvVarGuard::set("CLOUDSDK_CONFIG", dir.path().to_str().expect("config path"));
-
-        let (client_id, client_secret, refresh_token) =
-            super::read_gcloud_adc().expect("valid CLOUDSDK_CONFIG ADC should parse");
-        assert_eq!(client_id, "cloudsdk-client-id.apps.googleusercontent.com");
-        assert_eq!(client_secret, "cloudsdk-client-secret");
-        assert_eq!(refresh_token, "cloudsdk-refresh-token");
-    }
-
-    #[test]
-    fn read_gcloud_adc_malformed_json_errors() {
-        let _lock = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        Write::write_all(&mut tmp.as_file(), b"not valid json at all {{{{")
-            .expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let result = super::read_gcloud_adc();
-        assert!(
-            result.is_err(),
-            "malformed JSON should produce an error, got: {result:?}"
-        );
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("parse")
-                || msg.contains("JSON")
-                || msg.contains("json")
-                || msg.contains("invalid")
-                || msg.contains("failed"),
-            "error message should mention parse/JSON failure, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn empty_provider_credentials_allow_oauth2_refresh_token() {
-        use openshell_core::proto::{
-            ProviderCredentialRefresh, ProviderCredentialRefreshStrategy, ProviderProfile,
-            ProviderProfileCredential,
+    fn sandbox_template_to_json_includes_metadata_labels_and_annotations() {
+        let template = SandboxWorkloadTemplate {
+            metadata: Some(ObjectMeta {
+                id: "template-123".to_string(),
+                name: "gpu-kata".to_string(),
+                labels: std::collections::HashMap::from([(
+                    "team".to_string(),
+                    "runtime".to_string(),
+                )]),
+                annotations: std::collections::HashMap::from([(
+                    "owner".to_string(),
+                    "platform".to_string(),
+                )]),
+                workspace: "default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
         };
 
-        let strategy = ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32;
-        let profile = ProviderProfile {
-            credentials: vec![ProviderProfileCredential {
-                required: true,
-                refresh: Some(ProviderCredentialRefresh {
-                    strategy,
+        let json = super::sandbox_template_to_json(&template);
+
+        assert_eq!(json["labels"]["team"], "runtime");
+        assert_eq!(json["annotations"]["owner"], "platform");
+    }
+
+    #[test]
+    fn sandbox_template_to_json_formats_default_gpu_like_display_output() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: None }),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 }),
                 ..Default::default()
-            }],
-            ..Default::default()
-        };
-        assert!(
-            provider_profile_allows_empty_credentials(&profile),
-            "Oauth2RefreshToken should be allowed for refresh bootstrap"
-        );
-    }
-
-    #[test]
-    fn provider_to_json_includes_core_fields() {
-        let metadata = ObjectMeta {
-            id: "prov-123".to_string(),
-            name: "test-provider".to_string(),
+            }),
             ..Default::default()
         };
 
-        let provider = Provider {
-            metadata: Some(metadata),
-            r#type: "anthropic".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
+        let json = super::sandbox_template_to_json(&template);
 
-        let json = super::provider_to_json(&provider);
-
-        assert_eq!(json["id"], "prov-123");
-        assert_eq!(json["name"], "test-provider");
-        assert_eq!(json["workspace"], "");
-        assert_eq!(json["type"], "anthropic");
+        assert_eq!(json["resources"]["gpu"], "default");
     }
 
     #[test]
-    fn provider_to_json_exposes_credential_keys_not_values() {
-        let mut credentials = std::collections::HashMap::new();
-        credentials.insert("ANTHROPIC_API_KEY".to_string(), "secret-value".to_string());
-        credentials.insert("OTHER_KEY".to_string(), "other-secret".to_string());
-
-        let provider = Provider {
-            metadata: Some(ObjectMeta::default()),
-            r#type: "anthropic".to_string(),
-            credentials,
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
-
-        let json = super::provider_to_json(&provider);
-        let json_str = json.to_string();
-
-        // Assert credential keys are present
-        let keys = json["credential_keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 2);
-        assert!(keys.iter().any(|k| k.as_str() == Some("ANTHROPIC_API_KEY")));
-        assert!(keys.iter().any(|k| k.as_str() == Some("OTHER_KEY")));
-
-        // Assert credential values are NOT in the output (SECURITY)
-        assert!(
-            !json_str.contains("secret-value"),
-            "credential values must not be exposed"
-        );
-        assert!(
-            !json_str.contains("other-secret"),
-            "credential values must not be exposed"
-        );
-    }
-
-    #[test]
-    fn provider_to_json_exposes_config_keys_not_values() {
-        let mut config = std::collections::HashMap::new();
-        config.insert("region".to_string(), "us-west".to_string());
-        config.insert(
-            "endpoint".to_string(),
-            "https://api.example.com".to_string(),
-        );
-
-        let provider = Provider {
-            metadata: Some(ObjectMeta::default()),
-            r#type: "custom".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config,
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
-
-        let json = super::provider_to_json(&provider);
-        let json_str = json.to_string();
-
-        // Assert config keys are present
-        let keys = json["config_keys"].as_array().unwrap();
-        assert_eq!(keys.len(), 2);
-        assert!(keys.iter().any(|k| k.as_str() == Some("region")));
-        assert!(keys.iter().any(|k| k.as_str() == Some("endpoint")));
-
-        // Assert config values are NOT in the output (SECURITY)
-        assert!(
-            !json_str.contains("us-west"),
-            "config values must not be exposed"
-        );
-        assert!(
-            !json_str.contains("https://api.example.com"),
-            "config values must not be exposed"
-        );
-    }
-
-    #[test]
-    fn provider_to_json_omits_empty_config() {
-        let provider = Provider {
-            metadata: Some(ObjectMeta::default()),
-            r#type: "anthropic".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(), // Empty config
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
-
-        let json = super::provider_to_json(&provider);
-
-        assert!(
-            json.get("config_keys").is_none(),
-            "empty config_keys should be omitted"
-        );
-    }
-
-    #[test]
-    fn provider_to_json_includes_metadata_fields_when_present() {
-        let mut labels = std::collections::HashMap::new();
-        labels.insert("env".to_string(), "prod".to_string());
-
-        let metadata = ObjectMeta {
-            id: "prov-123".to_string(),
-            name: "test-provider".to_string(),
-            resource_version: 42,
-            created_at_ms: 1_234_567_890_000,
-            labels,
-            annotations: std::collections::HashMap::new(),
-            workspace: String::new(),
-            deletion_timestamp_ms: 0,
-        };
-
-        let provider = Provider {
-            metadata: Some(metadata),
-            r#type: "anthropic".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
-
-        let json = super::provider_to_json(&provider);
-
-        assert_eq!(json["resource_version"], 42);
-        assert_eq!(json["created_at"], "2009-02-13 23:31:30");
-        assert_eq!(json["labels"]["env"], "prod");
-    }
-
-    #[test]
-    fn provider_to_json_omits_zero_metadata_fields() {
-        let metadata = ObjectMeta {
-            id: "prov-123".to_string(),
-            name: "test-provider".to_string(),
-            // resource_version and created_at_ms are 0
-            // labels is empty
+    fn sandbox_template_to_json_preserves_explicit_gpu_count_as_number() {
+        let template = SandboxWorkloadTemplate {
+            spec: Some(SandboxWorkloadTemplateSpec {
+                workload: Some(SandboxWorkloadConfig {
+                    resources: Some(SandboxResources {
+                        gpu: Some(GpuResourceRequirements { count: Some(2) }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
-        let provider = Provider {
-            metadata: Some(metadata),
-            r#type: "anthropic".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
+        let json = super::sandbox_template_to_json(&template);
 
-        let json = super::provider_to_json(&provider);
+        assert_eq!(json["resources"]["gpu"], 2);
+    }
 
+    #[test]
+    fn provisioning_json_exposes_deadline_and_cleanup_separately() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Error.into());
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                attempt_id: "attempt".into(),
+                timeout_time: openshell_core::time::timestamp_from_millis(300_000).ok(),
+                cleanup_error: "Compute reclamation is pending; the gateway will retry".into(),
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["attempt_id"], "attempt");
+        assert!(json["provisioning"]["deadline"].is_null());
+        assert!(json["provisioning"]["cleanup_completed_time"].is_null());
+        assert_eq!(json["provisioning"]["timeout_time"], "1970-01-01T00:05:00Z");
         assert!(
-            json.get("resource_version").is_none(),
-            "zero resource_version should be omitted"
-        );
-        assert!(
-            json.get("created_at").is_none(),
-            "zero created_at should be omitted"
-        );
-        assert!(
-            json.get("labels").is_none(),
-            "empty labels should be omitted"
+            json["provisioning"]["cleanup_error"]
+                .as_str()
+                .unwrap()
+                .contains("pending")
         );
     }
 
     #[test]
-    fn provider_to_json_includes_credential_expiration() {
-        let mut credential_expires_at_ms = std::collections::HashMap::new();
-        credential_expires_at_ms.insert("ACCESS_TOKEN".to_string(), 1_234_567_890);
-
-        let provider = Provider {
-            metadata: Some(ObjectMeta::default()),
-            r#type: "oauth".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms,
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
+    fn retained_sandbox_timeout_message_matches_expired_phase() {
+        let mut record = openshell_core::proto::SandboxProvisioning {
+            preparation_deadline: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            timeout_time: openshell_core::time::timestamp_from_millis(1_800_000).ok(),
+            ..Default::default()
         };
+        let message = super::retained_sandbox_timeout_message(
+            "cold-image",
+            "ImagePreparationTimedOut: preparation expired",
+            &record,
+        );
+        assert!(message.starts_with("ImagePreparationTimedOut: preparation expired\n"));
+        assert!(message.contains("Sandbox 'cold-image' was retained"));
+        assert!(message.contains("image preparation and supervisor startup diagnostics"));
+        assert!(message.contains("image_preparation_timeout_seconds"));
+        assert!(!message.contains("repair its configuration"));
+        assert!(message.contains("openshell sandbox get cold-image"));
+        assert!(message.contains("openshell sandbox start cold-image` after cleanup completes"));
 
-        let json = super::provider_to_json(&provider);
+        // An admission timeout retains preparation timestamps. Its completed
+        // transition must select configuration repair rather than a larger budget.
+        record.admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        let admission_without_preparation = openshell_core::proto::SandboxProvisioning {
+            timeout_time: record.timeout_time,
+            ..Default::default()
+        };
+        for admission_record in [&record, &admission_without_preparation] {
+            let message = super::retained_sandbox_timeout_message(
+                "invalid-policy",
+                "ProvisioningTimedOut: repair window expired",
+                admission_record,
+            );
+            assert!(message.contains("repair its configuration"));
+            assert!(!message.contains("image_preparation_timeout_seconds"));
+            assert!(
+                message.contains("openshell sandbox start invalid-policy` after cleanup completes")
+            );
+        }
+    }
 
+    #[test]
+    fn provisioning_json_exposes_pending_driver_operation() {
+        for pending in [true, false] {
+            let mut sandbox = Sandbox::default();
+            sandbox.set_phase(SandboxPhase::Provisioning.into());
+            sandbox.status.as_mut().unwrap().provisioning =
+                Some(openshell_core::proto::SandboxProvisioning {
+                    driver_operation_pending: pending,
+                    driver_operation_id: "operation-1".into(),
+                    ..Default::default()
+                });
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_pending"],
+                pending
+            );
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["provisioning"]["driver_operation_id"],
+                "operation-1"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_json_distinguishes_preparation_and_admission() {
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning.into());
+        let ceiling = openshell_core::time::timestamp_from_millis(1_800_000).ok();
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(openshell_core::proto::SandboxProvisioning {
+                preparation_deadline: ceiling,
+                deadline: ceiling,
+                ..Default::default()
+            });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["provisioning"]["phase"], "preparation");
         assert_eq!(
-            json["credential_expires_at_ms"]["ACCESS_TOKEN"],
-            1_234_567_890
+            json["provisioning"]["preparation_deadline"],
+            "1970-01-01T00:30:00Z"
+        );
+        assert!(json["provisioning"]["admission_start_time"].is_null());
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .provisioning
+            .as_mut()
+            .unwrap()
+            .admission_start_time = openshell_core::time::timestamp_from_millis(600_000).ok();
+        assert_eq!(
+            super::sandbox_to_json(&sandbox)["provisioning"]["phase"],
+            "admission"
         );
     }
 
     #[test]
-    fn provider_to_json_formats_created_at_as_human_readable() {
-        let metadata = ObjectMeta {
-            id: "prov-123".to_string(),
-            name: "test-provider".to_string(),
-            created_at_ms: 1_609_459_200_000, // 2021-01-01 00:00:00
+    fn sandbox_json_exposes_repair_diagnostic_and_accepted_generation() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+
+        let mut sandbox = Sandbox::default();
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        let status = sandbox.status.as_mut().unwrap();
+        status.configuration_admission = Some(SandboxConfigurationAdmission {
+            state: ConfigurationAdmissionState::Rejected as i32,
+            error: "rule image_api requires L7 inspection".to_string(),
+            policy_hash: "candidate-hash".to_string(),
             ..Default::default()
-        };
-
-        let provider = Provider {
-            metadata: Some(metadata),
-            r#type: "anthropic".to_string(),
-            credentials: std::collections::HashMap::new(),
-            config: std::collections::HashMap::new(),
-            credential_expires_at_ms: std::collections::HashMap::new(),
-            profile_workspace: String::new(),
-            credential_handles: std::collections::HashMap::new(),
-        };
-
-        let json = super::provider_to_json(&provider);
-
-        // Should format as human-readable datetime, not raw milliseconds
-        assert_eq!(json["created_at"], "2021-01-01 00:00:00");
-        assert!(
-            json.get("created_at_ms").is_none(),
-            "raw milliseconds field should not exist"
+        });
+        status.conditions.push(SandboxCondition {
+            r#type: "ConfigurationReady".to_string(),
+            status: "False".to_string(),
+            reason: "ConfigurationInvalid".to_string(),
+            message: "rule image_api requires L7 inspection".to_string(),
+            ..Default::default()
+        });
+        let json = super::sandbox_to_json(&sandbox);
+        assert_eq!(json["configuration_admission"]["state"], "rejected");
+        assert_eq!(json["conditions"][0]["reason"], "ConfigurationInvalid");
+        assert_eq!(
+            super::configuration_failure_message(&sandbox),
+            Some("rule image_api requires L7 inspection")
         );
+        sandbox
+            .status
+            .as_mut()
+            .unwrap()
+            .configuration_admission
+            .as_mut()
+            .unwrap()
+            .error
+            .clear();
+        assert_eq!(super::configuration_failure_message(&sandbox), None);
     }
 
     #[test]
@@ -8781,13 +8537,33 @@ mod tests {
                 id: "sb-123".to_string(),
                 name: "test-sb".to_string(),
                 resource_version: 5,
-                created_at_ms: 1_609_459_200_000,
+                created_time: openshell_core::time::timestamp_from_millis(1_609_459_200_000).ok(),
                 ..Default::default()
+            }),
+            created_from_workload_template: Some(SandboxWorkloadTemplateProvenance {
+                name: "gpu-kata".to_string(),
+                resource_version: "7".to_string(),
             }),
             ..Default::default()
         };
         sandbox.set_phase(SandboxPhase::Ready as i32);
         sandbox.set_current_policy_version(2);
+        sandbox.spec = Some(SandboxSpec {
+            restart_policy: SandboxRestartPolicy::OnFailure as i32,
+            ..Default::default()
+        });
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Starting as i32,
+            main_process_instance_id: "main-2".to_string(),
+            exit_code: Some(9),
+            restart_count: 2,
+            next_restart_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            main_process_started_time: openshell_core::time::timestamp_from_millis(
+                1_699_999_000_000,
+            )
+            .ok(),
+            ..Default::default()
+        });
 
         let config = GetSandboxConfigResponse {
             policy_source: PolicySource::Global as i32,
@@ -8799,10 +8575,21 @@ mod tests {
 
         assert_eq!(json["id"], "sb-123");
         assert_eq!(json["name"], "test-sb");
-        assert_eq!(json["phase"], "Ready");
+        assert_eq!(json["phase"], "Starting");
+        assert_eq!(json["restart_policy"], "on-failure");
+        assert_eq!(json["main_process_instance_id"], "main-2");
+        assert_eq!(json["exit_code"], 9);
+        assert_eq!(json["restart_count"], 2);
+        assert_eq!(json["next_restart_at_ms"], 1_700_000_000_000_i64);
+        assert_eq!(json["main_process_started_at_ms"], 1_699_999_000_000_i64);
         assert_eq!(json["policy_source"], "global");
         assert_eq!(json["revision"], 3);
         assert!(json["policy"].is_null());
+        assert_eq!(json["created_from_workload_template"]["name"], "gpu-kata");
+        assert_eq!(
+            json["created_from_workload_template"]["resource_version"],
+            "7"
+        );
     }
 
     #[test]
@@ -8826,5 +8613,504 @@ mod tests {
         assert_eq!(json["policy_source"], "sandbox");
         assert!(json["revision"].is_null());
         assert!(json["policy"].is_null());
+    }
+
+    #[test]
+    fn sandbox_detail_keeps_failed_endpoint_separate_from_ready_conditions_in_json_and_yaml() {
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                phase: SandboxPhase::Ready as i32,
+                endpoint_statuses: vec![EndpointStatus {
+                    endpoint_id: "endpoint:example".to_string(),
+                    host: "tools.example.test".to_string(),
+                    ports: vec![443, 8443],
+                    path: "/mcp".to_string(),
+                    last_result: EndpointResult::TransportFailed as i32,
+                    last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
+                }],
+                conditions: vec![SandboxCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: "DependenciesReady".to_string(),
+                    message: "Supervisor session connected".to_string(),
+                    transition_time: "2026-09-05T10:00:00Z".parse().ok(),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let json = super::sandbox_detail_to_json(
+            &sandbox,
+            &GetSandboxConfigResponse {
+                policy_source: PolicySource::Sandbox as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Both formats preserve the complete endpoint record and independent
+        // lifecycle condition without requiring a join.
+        let yaml = serde_yml::to_string(&json).unwrap();
+        let from_yaml: serde_json::Value = serde_yml::from_str(&yaml).unwrap();
+        for output in [json, from_yaml] {
+            assert_eq!(output["phase"], "Ready");
+            assert_eq!(
+                output["conditions"],
+                serde_json::json!([{
+                    "type": "Ready",
+                    "status": "True",
+                    "reason": "DependenciesReady",
+                    "message": "Supervisor session connected",
+                    "last_transition_time": "2026-09-05T10:00:00Z",
+                }])
+            );
+            assert_eq!(
+                output["endpoint_statuses"],
+                serde_json::json!([{
+                    "endpoint_id": "endpoint:example",
+                    "host": "tools.example.test",
+                    "ports": [443, 8443],
+                    "path": "/mcp",
+                    "last_result": "TransportFailed",
+                    "last_reported_at": "2026-09-05T10:01:00Z",
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_status_display_explains_failure_and_report_time() {
+        let endpoint = EndpointStatus {
+            endpoint_id: "endpoint:example".to_string(),
+            host: "tools.example.test".to_string(),
+            ports: vec![443, 8443],
+            path: "/mcp".to_string(),
+            last_result: EndpointResult::TransportFailed as i32,
+            last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
+        };
+
+        assert_eq!(
+            super::endpoint_status_display_lines(&endpoint),
+            vec![
+                "tools.example.test (ports: 443, 8443; path: /mcp)",
+                "Last result: Connection failed before an HTTP response arrived.",
+                "Reported at (gateway acceptance): 2026-09-05T11:01:00Z",
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_status_preserves_address_without_an_observation() {
+        let endpoint = EndpointStatus {
+            endpoint_id: "endpoint:reset".to_string(),
+            host: "tools.example.test".to_string(),
+            ports: vec![443],
+            path: "/**".to_string(),
+            last_result: EndpointResult::NoObservedExchange as i32,
+            last_reported_time: None,
+        };
+
+        assert_eq!(
+            super::endpoint_status_display_lines(&endpoint),
+            vec![
+                "tools.example.test (ports: 443; path: /**)",
+                "Last result: No exchange observed.",
+                "Reported at (gateway acceptance): no report yet",
+            ]
+        );
+        let sandbox = Sandbox {
+            status: Some(SandboxStatus {
+                endpoint_statuses: vec![endpoint],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let output = super::sandbox_to_json(&sandbox);
+        assert_eq!(
+            output["endpoint_statuses"],
+            serde_json::json!([{
+                "endpoint_id": "endpoint:reset",
+                "host": "tools.example.test",
+                "ports": [443],
+                "path": "/**",
+                "last_result": "NoObservedExchange",
+                "last_reported_at": "",
+            }])
+        );
+        assert_eq!(output["conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn endpoint_status_http_response_does_not_claim_a_successful_tool_call() {
+        let endpoint = EndpointStatus {
+            host: "tools.example.test".to_string(),
+            ports: vec![443],
+            path: "/mcp".to_string(),
+            last_result: EndpointResult::HttpResponseReceived as i32,
+            last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::endpoint_status_display_lines(&endpoint)[1],
+            "Last result: Server returned an HTTP response below 400."
+        );
+    }
+
+    #[test]
+    fn endpoint_status_structured_output_uses_stable_result_names() {
+        for (result, name) in [
+            (EndpointResult::Unspecified, "Unspecified"),
+            (EndpointResult::NoObservedExchange, "NoObservedExchange"),
+            (EndpointResult::HttpResponseReceived, "HttpResponseReceived"),
+            (EndpointResult::PolicyDenied, "PolicyDenied"),
+            (
+                EndpointResult::CredentialUnavailable,
+                "CredentialUnavailable",
+            ),
+            (EndpointResult::TlsFailed, "TlsFailed"),
+            (EndpointResult::TransportFailed, "TransportFailed"),
+            (EndpointResult::UpstreamRejected, "UpstreamRejected"),
+        ] {
+            let sandbox = Sandbox {
+                status: Some(SandboxStatus {
+                    endpoint_statuses: vec![EndpointStatus {
+                        last_result: result as i32,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(
+                super::sandbox_to_json(&sandbox)["endpoint_statuses"][0]["last_result"],
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_condition_display_leaves_lifecycle_conditions_unchanged() {
+        let ordinary = SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "DependenciesReady".to_string(),
+            message: "Supervisor session connected".to_string(),
+            transition_time: None,
+        };
+        assert_eq!(
+            super::sandbox_condition_display_lines(&ordinary),
+            vec!["Ready: True (DependenciesReady) - Supervisor session connected".to_string()]
+        );
+    }
+
+    fn log_line(
+        level: &str,
+        target: &str,
+        message: &str,
+        source: &str,
+        fields: &[(&str, &str)],
+    ) -> openshell_core::proto::SandboxLogLine {
+        openshell_core::proto::SandboxLogLine {
+            sandbox_id: "sb-1".to_string(),
+            event_time: openshell_core::time::timestamp_from_millis(1_234_567).ok(),
+            level: level.to_string(),
+            target: target.to_string(),
+            message: message.to_string(),
+            source: source.to_string(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn format_log_line_without_fields() {
+        let log = log_line("INFO", "openshell_server", "hello world", "sandbox", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [openshell_server] hello world"
+        );
+    }
+
+    #[test]
+    fn format_log_line_empty_source_defaults_to_gateway() {
+        let log = log_line("WARN", "t", "msg", "", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [gateway] [WARN ] [t] msg"
+        );
+    }
+
+    #[test]
+    fn format_log_line_pads_source_and_level() {
+        let log = log_line("OCSF", "ocsf", "NET:OPEN", "gateway", &[]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [gateway] [OCSF ] [ocsf] NET:OPEN"
+        );
+
+        let short_source = log_line("ERROR", "t", "m", "vm", &[]);
+        assert_eq!(
+            format_log_line(&short_source),
+            "[1234.567] [vm     ] [ERROR] [t] m"
+        );
+    }
+
+    #[test]
+    fn format_log_line_sorts_fields_alphabetically() {
+        let log = log_line(
+            "INFO",
+            "ocsf",
+            "CONNECT",
+            "sandbox",
+            &[("dst_port", "443"), ("action", "allow"), ("dst_host", "x")],
+        );
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [ocsf] CONNECT action=allow dst_host=x dst_port=443"
+        );
+    }
+
+    #[test]
+    fn format_log_line_keeps_empty_field_values() {
+        let log = log_line("INFO", "t", "m", "sandbox", &[("a", ""), ("b", "1")]);
+        assert_eq!(
+            format_log_line(&log),
+            "[1234.567] [sandbox] [INFO ] [t] m a= b=1"
+        );
+    }
+
+    #[test]
+    fn format_log_line_renders_empty_target_as_empty_brackets() {
+        let log = log_line("INFO", "", "m", "sandbox", &[]);
+        assert_eq!(format_log_line(&log), "[1234.567] [sandbox] [INFO ] [] m");
+    }
+
+    #[test]
+    fn format_log_line_zero_pads_millis() {
+        let mut log = log_line("INFO", "t", "m", "sandbox", &[]);
+        log.event_time = openshell_core::time::timestamp_from_millis(1_000_007).ok();
+        assert_eq!(format_log_line(&log), "[1000.007] [sandbox] [INFO ] [t] m");
+
+        log.event_time = None;
+        assert_eq!(format_log_line(&log), "[0.000] [sandbox] [INFO ] [t] m");
+    }
+
+    #[test]
+    fn format_log_line_preserves_message_verbatim() {
+        // OCSF shorthand must pass through unchanged.
+        let message = "NET:OPEN [MED] DENIED /usr/bin/curl(4711) -> api.example.com:443";
+        let log = log_line("OCSF", "ocsf", message, "sandbox", &[]);
+        assert!(format_log_line(&log).ends_with(message));
+    }
+
+    fn forward_data(bytes: &[u8]) -> TcpForwardFrame {
+        TcpForwardFrame {
+            payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                bytes.to_vec(),
+            )),
+        }
+    }
+
+    struct Relay {
+        client: tokio::io::DuplexStream,
+        to_gateway: tokio::sync::mpsc::Receiver<TcpForwardFrame>,
+        response: tokio::sync::mpsc::Sender<Result<TcpForwardFrame, Status>>,
+        task: tokio::task::JoinHandle<Result<(), ForwardTcpConnectionError>>,
+    }
+
+    fn start_relay() -> Relay {
+        let (client, local) = tokio::io::duplex(4096);
+        let (local_read, local_write) = tokio::io::split(local);
+        let (tx, to_gateway) = tokio::sync::mpsc::channel(16);
+        let (response, resp_rx) = tokio::sync::mpsc::channel(16);
+        let task = tokio::spawn(relay_local_socket(
+            local_read,
+            local_write,
+            tx,
+            tokio_stream::wrappers::ReceiverStream::new(resp_rx),
+        ));
+        Relay {
+            client,
+            to_gateway,
+            response,
+            task,
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_keeps_client_upload_after_target_half_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut relay = start_relay();
+        relay
+            .response
+            .send(Ok(forward_data(b"ready")))
+            .await
+            .unwrap();
+        drop(relay.response);
+
+        let mut greeting = [0u8; 5];
+        relay.client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(&greeting, b"ready");
+
+        relay.client.write_all(b"upload").await.unwrap();
+        relay.client.shutdown().await.unwrap();
+
+        let mut uploaded = Vec::new();
+        while let Some(frame) = relay.to_gateway.recv().await {
+            if let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) =
+                frame.payload
+            {
+                uploaded.extend(data);
+            }
+        }
+        assert_eq!(uploaded, b"upload");
+        relay.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_half_closes_local_socket_when_target_closes() {
+        use tokio::io::AsyncReadExt;
+
+        let mut relay = start_relay();
+        relay.response.send(Ok(forward_data(b"bye"))).await.unwrap();
+        drop(relay.response);
+
+        let mut received = Vec::new();
+        relay.client.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"bye");
+
+        drop(relay.client);
+        relay.task.await.unwrap().unwrap();
+    }
+
+    use std::io::Write as _;
+    use std::time::{Duration, Instant};
+
+    fn exec_stdin_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    }
+
+    #[test]
+    fn piped_stdin_that_closes_quickly_goes_in_one_request() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"hi\n").unwrap();
+        drop(writer);
+        let collected = exec_stdin_runtime().block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_secs(5),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        match collected.expect("collect") {
+            super::PipedStdin::Complete(prefix) => assert_eq!(prefix, b"hi\n"),
+            super::PipedStdin::Open { .. } => panic!("closed pipe must complete"),
+        }
+    }
+
+    #[test]
+    fn piped_stdin_that_stays_open_does_not_block_the_command() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(b"early").unwrap();
+        let grace = Duration::from_millis(100);
+        let started = Instant::now();
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            grace,
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let elapsed = started.elapsed();
+        assert!(elapsed >= grace, "must wait the grace period: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "must not wait for EOF: {elapsed:?}"
+        );
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert_eq!(prefix, b"early");
+        // The remainder keeps flowing after the command has started.
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn piped_stdin_left_nonblocking_by_another_process_still_streams() {
+        // Processes that inherit the same stdin share one open file
+        // description, so any of them can make it nonblocking for all. A
+        // read with no input yet then fails with EAGAIN instead of waiting.
+        use std::os::fd::AsRawFd as _;
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        nix::fcntl::fcntl(
+            reader.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .expect("make the shared pipe nonblocking");
+        let runtime = exec_stdin_runtime();
+        let collected = runtime.block_on(super::collect_piped_stdin(
+            super::spawn_piped_stdin_reader(reader),
+            Duration::from_millis(100),
+            super::MAX_EXEC_STDIN_BYTES,
+        ));
+        let super::PipedStdin::Open { prefix, mut rest } = collected.expect("collect") else {
+            panic!("an open pipe must start the command before EOF");
+        };
+        assert!(prefix.is_empty());
+        writer.write_all(b"late").unwrap();
+        drop(writer);
+        let next = runtime
+            .block_on(rest.recv())
+            .expect("late chunk")
+            .expect("read");
+        assert_eq!(next, b"late");
+        assert!(
+            runtime.block_on(rest.recv()).is_none(),
+            "EOF closes the channel"
+        );
+    }
+
+    #[test]
+    fn piped_stdin_over_the_limit_is_rejected_with_the_upload_hint() {
+        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        writer.write_all(&[0u8; 8]).unwrap();
+        drop(writer);
+        let error = exec_stdin_runtime()
+            .block_on(super::collect_piped_stdin(
+                super::spawn_piped_stdin_reader(reader),
+                Duration::from_secs(5),
+                4,
+            ))
+            .err()
+            .expect("over the limit must fail");
+        assert!(error.to_string().contains("sandbox upload"), "{error}");
+    }
+
+    #[test]
+    fn forward_requires_session_token_matches_only_the_legacy_gateway_error() {
+        assert!(forward_requires_session_token(&Status::unauthenticated(
+            "authorization_token is required for ForwardTcp"
+        )));
+        assert!(!forward_requires_session_token(&Status::unauthenticated(
+            "SSH session token not found"
+        )));
+        assert!(!forward_requires_session_token(&Status::permission_denied(
+            "authorization_token is required for ForwardTcp"
+        )));
     }
 }

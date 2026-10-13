@@ -44,8 +44,6 @@ pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
 pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
 pub const TLS_CLIENT_DIR: &str = "/etc/openshell/tls/client";
 pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-proxy";
 pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
@@ -60,11 +58,34 @@ pub const SUPERVISOR_CA_CERT_PATH: &str = "/etc/openshell-tls/openshell-ca.pem";
 pub const SUPERVISOR_CA_BUNDLE_PATH: &str = "/etc/openshell-tls/ca-bundle.pem";
 
 pub const VM_GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
-pub const VM_GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
-pub const VM_GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 pub const VM_GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
 pub const VM_GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
 pub const VM_GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
+
+/// Guest path for the corporate upstream-proxy credential in VM sandboxes.
+///
+/// The VM driver stages the `user:pass` credential here (mode `0600`,
+/// root-only) inside the per-sandbox overlay upperdir, and passes only this
+/// path on the supervisor's argv. A microVM has no bind mounts or container
+/// secrets, so this is the same delivery the per-sandbox JWT already uses.
+pub const VM_GUEST_UPSTREAM_PROXY_AUTH_PATH: &str = "/opt/openshell/auth/upstream-proxy";
+
+/// Guest path for the corporate proxy CA bundle staged by the VM driver.
+///
+/// The bundle is operator-owned but not secret. The driver validates it and
+/// writes it into each sandbox overlay with mode `0644`, then passes only this
+/// guest path to the supervisor.
+pub const VM_GUEST_PROXY_CA_PATH: &str = "/opt/openshell/tls/proxy-ca.pem";
+
+/// Guest path for the driver-authored supervisor argument list in VM sandboxes.
+///
+/// Podman and Kubernetes build the supervisor's command line directly; the VM
+/// guest init script execs a fixed argv, so driver-owned arguments travel
+/// through this file instead. The driver writes it into the overlay upperdir
+/// on every launch — empty when it has no arguments to pass — so a sandbox
+/// image can neither forge entries nor shadow the driver's copy, and the
+/// guest appends exactly what it finds there and nothing else.
+pub const VM_GUEST_SUPERVISOR_ARGS_PATH: &str = "/opt/openshell/supervisor-args";
 pub const VM_UMOCI_PATH: &str = "/opt/openshell/bin/umoci";
 pub const VM_SANDBOX_OWNER_NORMALIZED_MARKER: &str = "/opt/openshell/.sandbox-owner-normalized";
 
@@ -84,8 +105,6 @@ mod tests {
             SUPERVISOR_CONTAINER_BINARY,
             TLS_CLIENT_DIR,
             TLS_CA_MOUNT_PATH,
-            TLS_CERT_MOUNT_PATH,
-            TLS_KEY_MOUNT_PATH,
             SANDBOX_TOKEN_MOUNT_PATH,
             UPSTREAM_PROXY_AUTH_MOUNT_PATH,
             CONTAINER_POLICY_PATH,
@@ -98,11 +117,12 @@ mod tests {
             SUPERVISOR_CA_CERT_PATH,
             SUPERVISOR_CA_BUNDLE_PATH,
             VM_GUEST_TLS_CA_PATH,
-            VM_GUEST_TLS_CERT_PATH,
-            VM_GUEST_TLS_KEY_PATH,
             VM_GUEST_SANDBOX_TOKEN_PATH,
+            VM_GUEST_UPSTREAM_PROXY_AUTH_PATH,
+            VM_GUEST_PROXY_CA_PATH,
             VM_GUEST_INIT_DROPIN_DIR,
             VM_GUEST_INIT_DROPIN_MANIFEST,
+            VM_GUEST_SUPERVISOR_ARGS_PATH,
             VM_UMOCI_PATH,
             VM_SANDBOX_OWNER_NORMALIZED_MARKER,
         ];

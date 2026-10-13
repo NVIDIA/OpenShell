@@ -124,32 +124,38 @@ pub fn is_token_expired(bundle: &OidcTokenBundle) -> bool {
     now + 30 >= expires_at
 }
 
+/// Check whether the stored access token has actually expired.
+///
+/// Unlike [`is_token_expired`], this does not include the 30-second refresh
+/// window. Tokens without expiry metadata are treated as valid.
+pub fn is_token_actually_expired(bundle: &OidcTokenBundle) -> bool {
+    let Some(expires_at) = bundle.expires_at else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now >= expires_at
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = crate::XDG_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce(&std::path::Path)) {
+        crate::test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .run(|| {
+                let root = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+                f(&root);
+            });
     }
 
     #[test]
     fn oidc_token_paths_reject_multi_component_gateway_names() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             let bundle = OidcTokenBundle {
                 access_token: "token".to_string(),
                 refresh_token: None,
@@ -164,9 +170,33 @@ mod tests {
     }
 
     #[test]
+    fn expiry_checks_distinguish_refresh_window_from_actual_expiry() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bundle = OidcTokenBundle {
+            access_token: "token".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 10),
+            issuer: "https://issuer.example.com".to_string(),
+            client_id: "openshell-cli".to_string(),
+        };
+
+        assert!(is_token_expired(&bundle));
+        assert!(!is_token_actually_expired(&bundle));
+
+        let expired = OidcTokenBundle {
+            expires_at: Some(now.saturating_sub(1)),
+            ..bundle
+        };
+        assert!(is_token_actually_expired(&expired));
+    }
+
+    #[test]
     fn oidc_login_prompt_marker_is_per_gateway() {
         let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
+        with_tmp_xdg(tmp.path(), |_| {
             assert!(!oidc_login_prompt_required("alpha"));
             assert!(!oidc_login_prompt_required("beta"));
 

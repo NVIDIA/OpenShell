@@ -14,7 +14,7 @@ inputs:
   images:
     description: Space-separated OpenShell image components to load
     required: false
-    default: gateway supervisor
+    default: gateway sandbox supervisor
   registry:
     description: Container registry and namespace
     required: false
@@ -28,7 +28,7 @@ inputs:
   mise-version:
     description: mise release to install
     required: false
-    default: v2026.4.25
+    default: v2026.9.9
 
 runs:
   using: composite
@@ -71,7 +71,7 @@ runs:
         set -euo pipefail
         for component in $IMAGE_COMPONENTS; do
           case "$component" in
-            gateway | supervisor) ;;
+            gateway | sandbox | supervisor) ;;
             *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
           esac
           image="${REGISTRY}/${component}:${IMAGE_TAG}"
@@ -80,3 +80,16 @@ runs:
           docker image save --platform linux/amd64 --output "$archive" "$image"
           kind load image-archive "$archive" --name "$CLUSTER_NAME"
         done
+
+    - name: Preload default sandbox image into kind
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+        SANDBOX_IMAGE: nvcr.io/nvidia/base/ubuntu:24.04
+      run: |
+        set -euo pipefail
+        archive="${RUNNER_TEMP:-/tmp}/openshell-default-sandbox-linux-amd64.tar"
+        docker pull --platform linux/amd64 "$SANDBOX_IMAGE"
+        docker image inspect "$SANDBOX_IMAGE" --format 'default sandbox image: {{join .RepoDigests ", "}}'
+        docker image save --platform linux/amd64 --output "$archive" "$SANDBOX_IMAGE"
+        kind load image-archive "$archive" --name "$CLUSTER_NAME"

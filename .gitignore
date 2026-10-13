@@ -6,6 +6,9 @@
 /target/
 e2e/rust/target/
 target/
+
+# Test result artifacts (JUnit XML, etc.)
+/results/
 debug/
 release/
 
@@ -67,6 +70,9 @@ pip-delete-this-directory.txt
 coverage.out
 coverage/
 htmlcov/
+
+# Trivy scan reports (tasks/scripts/trivy-scan-*.sh)
+/reports/
 .tox/
 .nox/
 .coverage
@@ -183,6 +189,9 @@ temp/
 *.tmp
 e2e/gpu/images/.build/
 
+# Ansible Galaxy roles
+/tests/ansible/.roles/
+
 # Secrets/credentials (should never be committed)
 *.pem
 *.key
@@ -214,6 +223,7 @@ artifacts/
 mise.local.toml
 
 # Ignore plans for now
+/plans
 architecture/plans
 
 rfc.md

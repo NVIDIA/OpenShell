@@ -10,7 +10,7 @@ When an operation returns a classified status error, inspect it directly or use 
 var se *v1.StatusError
 if errors.As(err, &se) {
     fmt.Printf("code: %s, message: %s\n", se.Code, se.Message)
-    // se.Details contains optional structured metadata
+    // se.ErrorInfo and se.FieldViolations contain optional structured details.
 }
 ```
 
@@ -18,7 +18,14 @@ if errors.As(err, &se) {
 |-----------|-------------------|--------------------------------------|
 | `Code`    | `ErrorCode`       | Machine-readable error classification |
 | `Message` | `string`          | Human-readable error description      |
-| `Details` | `map[string]string` | Optional structured metadata        |
+| `GRPCCode` | `int32` | Original gRPC code before SDK classification |
+| `FieldViolations` | `[]FieldViolation` | Rejected request fields and descriptions |
+| `ErrorInfo` | `*ErrorInfo` | Server reason, domain, and metadata |
+| `RetryDelay` | `*time.Duration` | Suggested minimum delay for an otherwise safe retry |
+| `Cause` | `error` | Original gRPC error, including unknown details |
+
+Use `status.FromError(err)` to inspect the complete gRPC status through the SDK's
+error wrapper. A delay does not prove that a timed-out mutation was not applied.
 
 ## Predicate Functions
 

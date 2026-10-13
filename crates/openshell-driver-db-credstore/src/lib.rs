@@ -17,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use aws_lc_rs::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD},
@@ -26,8 +28,6 @@ use openshell_core::proto::credentials::v1::{
     DeleteCredentialRequest, ResolveCredentialRequest, ResolvedCredential, StoreCredentialRequest,
 };
 use openshell_core::{Error, Result as CoreResult};
-use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tonic::Status;
@@ -164,7 +164,7 @@ impl DbCredstoreCredentialDriver {
         )?
         .to_string();
         let provider_name =
-            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider_name)?
+            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?
                 .to_string();
 
         if let Some(existing_handle) = request.existing_handle.as_ref() {
@@ -230,7 +230,7 @@ impl DbCredstoreCredentialDriver {
             EncryptedGatewayCredentialStoreCrypto::handle_from_request("delete", request.handle)?;
         let id = EncryptedGatewayCredentialStoreCrypto::id_from_handle(&handle)?;
         let provider_name =
-            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider_name)?;
+            EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?;
         let credential_key = EncryptedGatewayCredentialStoreCrypto::validate_credential_key(
             &request.credential_key,
         )?;
@@ -293,9 +293,7 @@ impl DbCredstoreCredentialDriver {
             EncryptedGatewayCredentialStoreCrypto::ensure_envelope_owner(
                 &envelope,
                 &id,
-                EncryptedGatewayCredentialStoreCrypto::validate_provider_name(
-                    &request.provider_name,
-                )?,
+                EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?,
                 EncryptedGatewayCredentialStoreCrypto::validate_credential_key(
                     &request.credential_key,
                 )?,
@@ -304,7 +302,7 @@ impl DbCredstoreCredentialDriver {
             Ok::<_, Status>(ResolvedCredential {
                 request_id: request.request_id,
                 value,
-                expires_at_ms: 0,
+                expiration_time: None,
             })
         });
         futures::future::try_join_all(futures).await
@@ -933,6 +931,46 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tonic::Code;
 
+    #[test]
+    fn persisted_aes_gcm_ciphertexts_remain_compatible() {
+        // Fixed, non-secret ciphertexts produced by the previous crypto backend.
+        let cases = [
+            (
+                [0x11; KEY_LEN],
+                [0x22; NONCE_LEN],
+                dek_aad("fixture", "provider", "api_key"),
+                vec![0x33; KEY_LEN],
+                "JMQ0evP8rGzWDO0Pe5Xa5iyg/tFZsp94YXw52zrSVjCoSMvKkAYj5kygMADT9jIW",
+            ),
+            (
+                [0x33; KEY_LEN],
+                [0x44; NONCE_LEN],
+                value_aad("fixture", "provider", "api_key"),
+                b"fixture-secret".to_vec(),
+                "Vvi85r906kbT58fgk+mUIc/KA4ar8d3Syu8Jz5h1",
+            ),
+        ];
+        for (key, nonce, aad, plaintext, ciphertext) in cases {
+            let encrypted = EncryptedBytes {
+                nonce: BASE64.encode(nonce),
+                ciphertext: ciphertext.to_string(),
+            };
+            assert_eq!(decrypt_bytes(&key, &aad, &encrypted).unwrap(), plaintext);
+            let mut sealed = plaintext;
+            aead_key(&key)
+                .unwrap()
+                .seal_in_place_append_tag(
+                    Nonce::assume_unique_for_key(nonce),
+                    Aad::from(aad.as_slice()),
+                    &mut sealed,
+                )
+                .unwrap();
+            assert_eq!(BASE64.encode(sealed), ciphertext);
+            assert!(decrypt_bytes(&key, b"wrong-aad", &encrypted).is_err());
+            assert!(decrypt_bytes(&[0xff; KEY_LEN], &aad, &encrypted).is_err());
+        }
+    }
+
     #[derive(Debug, Default)]
     struct MemoryObjectStore {
         objects: Mutex<HashMap<String, StoredCredentialObject>>,
@@ -1029,7 +1067,7 @@ mod tests {
         existing_handle: Option<CredentialHandle>,
     ) -> StoreCredentialRequest {
         StoreCredentialRequest {
-            provider_name: provider_name.to_string(),
+            provider: provider_name.to_string(),
             credential_key: credential_key.to_string(),
             value: value.to_string(),
             existing_handle,
@@ -1047,7 +1085,7 @@ mod tests {
     ) -> ResolveCredentialRequest {
         ResolveCredentialRequest {
             request_id: request_id.to_string(),
-            provider_name: provider_name.to_string(),
+            provider: provider_name.to_string(),
             credential_key: credential_key.to_string(),
             handle: Some(handle),
             workspace: "test-workspace".to_string(),
@@ -1121,7 +1159,7 @@ mod tests {
 
         driver
             .delete_credential(DeleteCredentialRequest {
-                provider_name: "openai-local".to_string(),
+                provider: "openai-local".to_string(),
                 credential_key: "OPENAI_API_KEY".to_string(),
                 handle: Some(updated.clone()),
                 workspace: "test-workspace".to_string(),

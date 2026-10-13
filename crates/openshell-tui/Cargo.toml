@@ -17,6 +17,7 @@ openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 
 base64 = { workspace = true }
+futures = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 terminal-colorsaurus = { workspace = true }
@@ -27,6 +28,7 @@ owo-colors = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
 indexmap = { workspace = true }
+shell-words = { workspace = true }
 
 [lints]
 workspace = true

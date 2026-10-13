@@ -1,6 +1,8 @@
 ---
 name: review-github-pr
 description: Review a GitHub pull request by summarizing its diff and key design decisions. Use when the user wants to review a PR, understand changes in a branch, or get a code review summary. Trigger keywords - review PR, review pull request, summarize PR, summarize diff, code review, review branch, PR summary, diff summary.
+metadata:
+  internal: true
 ---
 
 # Review GitHub Pull Request
@@ -37,10 +39,27 @@ gh pr list --head "<branch>" --state open
 Retrieve the PR metadata:
 
 ```bash
-gh pr view <number> --json title,body,state,headRefName,baseRefName,labels,author
+gh pr view <number> --json title,body,state,headRefName,baseRefName,labels,author,closingIssuesReferences
 ```
 
 Record the **title**, **body**, **headRefName**, and **baseRefName** for use in later steps.
+
+### Check Issue Acceptance
+
+Inspect every closing issue reference (paginate as needed) and fetch its current
+repository and labels. Verify the PR author's permission in the target repository:
+
+```bash
+gh api repos/OWNER/REPO/collaborators/AUTHOR/permission --jq .permission
+```
+
+Call out each linked issue missing `state:accepted`, with an issue link. Verified
+`write`, `maintain`, or `admin` access permits the exception; report it as context,
+not a blocking concern. Other authors need at least one target-repository issue,
+and every linked issue must be accepted; report violations under **Potential
+Concerns**. PR body text such as `No issue required` does not bypass this gate.
+Report failed lookups as unverified and continue the code review. For a branch
+without a PR, note that issue acceptance was not verified.
 
 ## Step 3: Generate the Diff
 
@@ -171,9 +190,9 @@ User says: "Review PR #456"
 
 ### Review by branch name
 
-User says: "Review branch `feature/add-pagination`"
+User says: "Review branch `feat/1234-add-pagination/octocat`"
 
-1. Look up PR with `gh pr list --head "feature/add-pagination"`
+1. Look up PR with `gh pr list --head "feat/1234-add-pagination/octocat"`
 2. If found, fetch PR metadata and diff
 3. If not found, diff against main locally
 4. Produce summary

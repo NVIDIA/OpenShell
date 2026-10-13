@@ -1,6 +1,8 @@
 ---
 name: test-release-canary
 description: Manually dispatch and iterate on the Release Canary workflow that smoke-tests published OpenShell artifacts (install.sh on macOS/Ubuntu/Fedora, Helm chart on kind) after each Release Dev publish. Use when changing `.github/workflows/release-canary.yml`, validating a release before tagging, debugging a canary failure, or reproducing a canary job locally. Trigger keywords - release canary, release-canary, canary failed, canary dispatch, test release canary, post-release smoke, install.sh canary, helm chart canary, kind canary, dispatch canary.
+metadata:
+  internal: true
 ---
 
 # Test Release Canary
@@ -11,17 +13,35 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 
 | Job | Runner | Verifies |
 |---|---|---|
-| `macos` | `macos-latest-xlarge` | `install.sh` resolves the Homebrew formula, brew installs the cask, and `openshell status` reaches the brew-services–backed local gateway with the VM driver. |
-| `ubuntu` | `ubuntu-latest` | `install.sh` installs the Debian package, the post-install systemd user service starts, and `openshell status` reaches the local gateway with the Docker driver. |
-| `fedora` | `fedora:latest` container | `install.sh` installs the RPM packages, the local gateway starts under Podman, and `openshell status` succeeds. |
-| `kubernetes` | `ubuntu-latest` + kind | `helm install oci://ghcr.io/nvidia/openshell/helm-chart --version 0.0.0-dev` succeeds in a kind cluster, the gateway pod becomes Ready, port-forward exposes 8080, and the released CLI registers the in-cluster gateway and runs `openshell status` against it. |
+| `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
+| `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
+| `ubuntu-snap-system-docker` | `ubuntu-latest` | Uses `install.sh` to install the snap from `latest/edge`, reuses system Docker, verifies the packaged prover version and a local policy boundary check, reaches the Docker gateway, creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
+| `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that `install.sh` rejects the OpenShell snap path when Docker is absent or supplied by the Docker snap, without installing OpenShell. |
+| `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
 `OPENSHELL_TELEMETRY_ENABLED=false` through the service environment, and the
 Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
-`install.sh` defaults to the *latest tagged* release — the canary is therefore checking that the most recent public release still installs, not the just-published `dev` build. The `kubernetes` job is the exception: it pins to `0.0.0-dev` chart + `:dev` images.
+The workflow sets `OPENSHELL_VERSION=dev` for every `install.sh` job. Positive
+jobs consume the rolling dev release produced by the triggering workflow. The
+system-Docker snap lane tracks `latest/edge`; the missing-Docker lane exits
+before installing a snap. The Debian and Kubernetes CLI lanes remove snapd so
+they continue to exercise the dev Debian package. Kubernetes pins the matching
+`0.0.0-dev` chart and `:dev` images.
+
+RPM package installation also has tmachine conformance coverage in
+`Branch E2E Checks` (with `test:e2e`), `Release Dev`, and `Release Tag`. Those
+lanes use the `rpm` installer on `fedora-podman-rootful` and
+`fedora-podman-rootless` with candidate CLI and
+gateway RPMs and matching runtime images. Branch RPM package builds run on
+every approved branch run, independently of optional E2E labels.
+
+The host-package jobs exercise fresh installs, not upgrades from a persisted
+schema-v1 gateway config. Validate Homebrew and RPM exact-default migration with
+the release-tooling and package lifecycle tests before relying on the canary.
 
 The canary does not install or import `@nvidia/openshell-sdk`. TypeScript SDK
 validation lives in the `TypeScript SDK` branch check, including a publish
@@ -69,16 +89,16 @@ gh run view <run-id> --log-failed
 
 ## Iterating on the canary itself
 
-When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published artifacts* (`0.0.0-dev` chart, `:dev` images, latest tagged install.sh assets). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
+When you change `release-canary.yml` on a branch, a manual dispatch on that branch tests *your branch's workflow logic* against *main's published dev artifacts* (`0.0.0-dev` chart, `:dev` images, and the `dev` GitHub release). This is what you want for iterating on the canary — you're validating that the canary still works against known-good artifacts.
 
-Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though the binaries it downloads are from the latest public tag.
+Note `install.sh` is pulled from `raw.githubusercontent.com/NVIDIA/OpenShell/${head_sha}/install.sh`, so changes to `install.sh` on your branch *are* exercised even though packages come from the latest public dev release and the snap comes from `latest/edge`.
 
 ## Testing artifacts from a specific SHA
 
 `Release Dev` publishes two chart versions for every dev build (see `.github/actions/release-helm-oci/action.yml:89-102`):
 
 - `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` — floating, overwritten on every main push.
-- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls `ghcr.io/nvidia/openshell/gateway:<sha>` and `:supervisor:<sha>`.
+- `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev.<sha>` — immutable, `appVersion` set to the same SHA so it pulls the matching `gateway`, `sandbox`, and `supervisor` images.
 
 To smoke-test the chart for a specific dev build, dispatch `Release Dev` on the branch first, then run the kind canary steps locally pointed at the SHA-pinned chart (see "Local kind reproduction" below). The release-canary workflow itself does not currently expose `chart_version` / `image_tag` inputs.
 
@@ -120,8 +140,12 @@ Loopback registration auto-derives the gateway name to `openshell` if `--name` i
 
 | Symptom | Likely cause | Where to look |
 |---|---|---|
-| `macos`/`ubuntu`/`fedora` job fails on `install.sh` | Latest tagged release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
-| `macos`/`ubuntu`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_DRIVERS` env in the "Ensure …" step. |
+| `macos`/`ubuntu-deb`/`fedora` job fails on `install.sh` | Dev release missing an asset, checksum mismatch, or `install.sh` regression on this branch. | Job log around the `curl … install.sh \| sh` step. |
+| Sandbox create or exec fails | Published sandbox and supervisor artifacts are missing, incompatible, or cannot establish the protected runtime channel. | Gateway logs plus Docker, Podman, VM, snap, or Kubernetes runtime diagnostics for the job. |
+| `macos`/`ubuntu-deb`/`fedora` job fails on `openshell status` | Local gateway service did not start (systemd/brew/podman). Often a driver issue. | Service logs in the job log; `OPENSHELL_COMPUTE_DRIVER` env in the "Ensure …" step. |
+| `ubuntu-snap-system-docker` fails during `install.sh` | System Docker was unavailable to the runner user, the edge revision or automatic interfaces were unavailable, or the user gateway did not become reachable. | Failure diagnostics dump system Docker, snap service/connection/change state, user and legacy gateway journals, snap logs, and port 17670 listeners. |
+| `ubuntu-snap-system-docker` fails during the prover checks | The prover artifact is missing or packaged for the wrong architecture, `openshell.prover` is not exposed or confined to read the test policies, or its solver linkage is not runnable. | The `Install and check status` and `Check a policy boundary with the snap prover` steps, plus `snap info openshell` and `snap connections openshell`. |
+| `ubuntu-snap-docker-preflight` unexpectedly succeeds | The installer no longer fails before installing the OpenShell snap when Docker is absent or supplied by the Docker snap. | Inspect `install.log`, `docker-snap.log`, `snap list`, and snapd changes. |
 | `kubernetes` job fails on `helm install --wait` | Chart did not deploy in 5 min — usually image pull failure or readiness probe failing. | "Diagnostics on failure" step dumps `helm status`, manifest, pod describe, pod logs. |
 | `kubernetes` job fails on `kubectl wait` | Gateway pod stuck `CrashLoopBackOff` or `ImagePullBackOff`. | Diagnostics dump; check `:dev` image existence at `ghcr.io/nvidia/openshell/gateway`. |
 | `kubernetes` job fails on `openshell gateway add` or `status` | Port-forward not reachable, or CLI/gateway proto mismatch. | `port-forward.log` and `openshell gateway list` in the diagnostics dump. |

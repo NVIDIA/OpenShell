@@ -282,8 +282,20 @@ pub fn draw_detail_popup(
     );
     let denied_seen = format!(
         "(first {} / last {})",
-        format_short_time(chunk.first_seen_ms),
-        format_short_time(chunk.last_seen_ms),
+        format_short_time(
+            chunk
+                .first_seen_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or_default(),
+        ),
+        format_short_time(
+            chunk
+                .last_seen_time
+                .as_ref()
+                .and_then(|value| openshell_core::time::timestamp_to_millis(value).ok())
+                .unwrap_or_default(),
+        ),
     );
     let denied_width = display_width(denied_label)
         + display_width(&denied_count)
@@ -562,7 +574,7 @@ fn display_width(text: &str) -> usize {
 ///
 /// A word wider than `width` is hard-broken rather than allowed to overflow.
 /// Always returns at least one row so callers can index the first row safely.
-fn wrap_value(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_value(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
@@ -818,8 +830,11 @@ fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {
     };
 
     let mut tags = vec![endpoint_layer_label(endpoint).to_string()];
-    if !endpoint.access.is_empty() {
-        tags.push(format!("access={}", endpoint.access));
+    if endpoint.access != 0 {
+        tags.push(format!(
+            "access={}",
+            openshell_policy::network_access_preset_to_str(endpoint.access).unwrap_or("unknown")
+        ));
     }
     for rule in &endpoint.rules {
         if let Some(allow) = &rule.allow {
@@ -839,11 +854,18 @@ fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
     if !endpoint.path.is_empty() {
         details.push(format!("Path scope: {}", endpoint.path));
     }
-    if !endpoint.tls.is_empty() {
-        details.push(format!("TLS: {}", endpoint.tls));
+    if endpoint.tls != 0 {
+        details.push(format!(
+            "TLS: {}",
+            openshell_policy::network_tls_mode_to_str(endpoint.tls).unwrap_or("unknown")
+        ));
     }
-    if !endpoint.enforcement.is_empty() {
-        details.push(format!("Enforcement: {}", endpoint.enforcement));
+    if endpoint.enforcement != 0 {
+        details.push(format!(
+            "Enforcement: {}",
+            openshell_policy::network_enforcement_mode_to_str(endpoint.enforcement)
+                .unwrap_or("unknown")
+        ));
     }
     if endpoint.request_body_credential_rewrite {
         details.push("Request body credential rewrite".to_string());
@@ -1301,8 +1323,8 @@ mod tests {
             rule_name: "allow-github".to_string(),
             confidence: 0.82,
             hit_count: 3,
-            first_seen_ms: 1_700_000_000_000,
-            last_seen_ms: 1_700_000_100_000,
+            first_seen_time: openshell_core::time::timestamp_from_millis(1_700_000_000_000).ok(),
+            last_seen_time: openshell_core::time::timestamp_from_millis(1_700_000_100_000).ok(),
             ..Default::default()
         }
     }

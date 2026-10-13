@@ -1,0 +1,155 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Python SDK"
+sidebar-title: "Python"
+description: "Install the OpenShell Python SDK, reuse a registered gateway, and manage a sandbox."
+keywords: "OpenShell, SDK, Python, PyPI, gRPC, Sandbox"
+position: 3
+---
+
+Use the Python SDK to manage sandboxes from applications, notebooks, and
+automation. It can reuse gateway registration and authentication state created
+by the OpenShell CLI. Use the SDK and gateway from the same OpenShell release
+when possible.
+
+## Install the SDK
+
+The package requires Python 3.11 or later. Add it to your project with `uv`:
+
+```shell
+uv add openshell
+```
+
+The `openshell` package contains the SDK. It does not install the OpenShell CLI.
+
+## Connect to a Registered Gateway
+
+Register and select a gateway with the CLI first. Then construct the client from
+the active gateway:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    health = client.health()
+    print(health.version)
+```
+
+`from_active_cluster()` reads the selected gateway endpoint, TLS files, and
+OIDC token state. It refreshes an expiring OIDC token by default and writes the
+rotated bundle back for other OpenShell processes.
+
+For a direct local plaintext connection, pass a `host:port` endpoint:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient("127.0.0.1:8080") as client:
+    print(client.health().version)
+```
+
+For service automation against an OIDC gateway, use
+`ClientCredentialsAuth`. Non-loopback endpoints require TLS:
+
+```python
+import os
+
+from openshell import ClientCredentialsAuth, SandboxClient
+
+auth = ClientCredentialsAuth(
+    issuer="https://idp.example.com/realms/openshell",
+    client_id="openshell-service",
+    client_secret=lambda: os.environ["OPENSHELL_OIDC_CLIENT_SECRET"],
+    audience="openshell-gateway",
+)
+
+with SandboxClient.from_active_cluster(client_credentials=auth) as client:
+    print(client.health().version)
+```
+
+## Retrieve Provider Credentials
+
+Connect directly with a trusted `OU=operator` client certificate after enabling
+[operator authentication](/how-it-works/gateways/authentication#mtls-operators).
+Do not supply a bearer token or use an OIDC login for this connection. No sandbox
+creation or provider attachment is required.
+
+```python
+from datetime import timedelta
+from pathlib import Path
+
+from openshell import SandboxClient, TlsConfig
+
+tls = TlsConfig(
+    ca_path=Path("ca.crt"),
+    cert_path=Path("operator.crt"),
+    key_path=Path("operator.key"),
+)
+with SandboxClient("gateway.example.com:443", tls=tls) as client:
+    credentials = client.providers().get_credentials(
+        "my-graph",
+        ["MS_GRAPH_ACCESS_TOKEN"],
+        workspace="production",
+        minimum_remaining_lifetime=timedelta(minutes=5),
+    )
+    token = credentials["MS_GRAPH_ACCESS_TOKEN"].value
+```
+
+`ProviderClient` also accepts an existing `grpc.Channel`. Its
+`get_credentials()` method requires an explicit workspace and key selection.
+It returns a dictionary of `ProviderCredentialValue` objects with `value` and
+optional `expiration_time`, a UTC `datetime`. Pass a `timedelta` for
+`minimum_remaining_lifetime`; omission or zero uses the gateway default.
+The helper uses the connection's timeout and does not retry or cache exports.
+Gateway failures raise `GatewayError`; invalid local selections raise `ValueError`.
+
+The value is excluded from the object's `repr`, but serialization still exposes
+it. Keep exported secrets out of logs and shared output. See
+[Retrieve Runtime Credentials](/how-it-works/providers/overview#retrieve-runtime-credentials)
+for freshness, supported credentials, and the export security boundary.
+
+## Create and Use a Sandbox
+
+Python SDK methods take an explicit workspace. This example creates a sandbox,
+waits for readiness, runs a command, and waits for deletion:
+
+```python
+from openshell import SandboxClient
+
+with SandboxClient.from_active_cluster() as client:
+    sandbox = client.create(
+        workspace="default",
+        name="sdk-example",
+    )
+    client.wait_ready(
+        sandbox.name,
+        workspace="default",
+        timeout_seconds=120,
+    )
+
+    result = client.exec(
+        sandbox.name,
+        ["python", "-c", "print('hello from OpenShell')"],
+        workspace="default",
+    )
+    print(result.stdout, end="")
+
+    deletion = client.delete(sandbox.name, workspace="default")
+    client.wait_deleted(
+        sandbox.name,
+        workspace="default",
+        expected_sandbox_id=deletion.sandbox_id,
+    )
+```
+
+Use `create_session()` when you want an object that retains the sandbox name and
+workspace for repeated exec, stop, start, and delete operations. List methods
+return lazy `Pager` instances; use `list_all()` only when you want to fetch the
+complete collection.
+
+## Next Steps
+
+- Review [Manage Sandboxes](/how-it-works/sandboxes/overview) for labels, templates, services, and Python SDK examples.
+- Review [Gateway Authentication](/how-it-works/gateways/authentication) for OIDC and client credentials.
+- Review [API Errors](/sdk/api-errors) for structured error handling.

@@ -9,7 +9,9 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
-use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit, sanitize_reason_for_audit,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -85,7 +87,7 @@ const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
 #[derive(Debug)]
 pub struct PolicyLocalContext {
-    current_policy: Arc<RwLock<Option<ProtoSandboxPolicy>>>,
+    current_policy: Arc<RwLock<Option<Arc<ProtoSandboxPolicy>>>>,
     agent_proposals: AgentProposals,
     gateway_endpoint: Option<String>,
     sandbox_name: Option<String>,
@@ -120,7 +122,7 @@ impl PolicyLocalContext {
         workspace_rx: tokio::sync::watch::Receiver<String>,
     ) -> Self {
         Self {
-            current_policy: Arc::new(RwLock::new(current_policy)),
+            current_policy: Arc::new(RwLock::new(current_policy.map(Arc::new))),
             agent_proposals,
             gateway_endpoint,
             sandbox_name,
@@ -130,7 +132,10 @@ impl PolicyLocalContext {
     }
 
     pub async fn set_current_policy(&self, policy: ProtoSandboxPolicy) {
-        *self.current_policy.write().await = Some(policy);
+        // Every successful reload receives a distinct Arc, including an
+        // identical policy installed again. Waiters use pointer identity to
+        // decide whether the installed snapshot needs another coverage scan.
+        *self.current_policy.write().await = Some(Arc::new(policy));
     }
 
     pub fn workspace(&self) -> String {
@@ -668,48 +673,45 @@ fn emit_policy_decision_event(chunk: &PolicyChunk) {
     }
 }
 
-/// Sanitize a free-form reviewer-typed string before it lands in the OCSF
-/// audit surface. The agent still reads the raw text via the API — this is
-/// audit-side defense only.
-fn sanitize_reason_for_audit(raw: &str) -> String {
-    const MAX_CHARS: usize = 200;
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .take(MAX_CHARS)
-        .collect();
-    if raw.chars().count() > MAX_CHARS {
-        format!("{cleaned}…")
-    } else {
-        cleaned
-    }
-}
-
 /// One-line audit description of a chunk's target: binary, host, port, and
-/// L7 method/path if present. Used by both the propose and approve/reject
-/// audit events so the trace can be grepped by endpoint without parsing
-/// JSON.
+/// L7 method/path allows for every endpoint. Used by both the propose and
+/// approve/reject audit events so the trace can be grepped by endpoint
+/// without parsing JSON.
 fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
     let Some(rule) = chunk.proposed_rule.as_ref() else {
         return format!("rule_name:{}", chunk.rule_name);
     };
-    let endpoint = rule.endpoints.first().map_or_else(
-        || "unknown".to_string(),
-        |ep| format!("{}:{}", ep.host, ep.port),
-    );
-    let l7 = rule
-        .endpoints
-        .first()
-        .and_then(|ep| ep.rules.first())
-        .and_then(|r| r.allow.as_ref())
-        .map(|a| format!(" {} {}", a.method, a.path))
-        .unwrap_or_default();
+    let endpoints = if rule.endpoints.is_empty() {
+        "unknown".to_string()
+    } else {
+        rule.endpoints
+            .iter()
+            .map(summarize_endpoint_for_audit)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let binary = if chunk.binary.is_empty() {
         String::new()
     } else {
         format!(" by {}", chunk.binary)
     };
-    format!("on {endpoint}{l7}{binary}")
+    format!("on {endpoints}{binary}")
+}
+
+fn summarize_endpoint_for_audit(endpoint: &NetworkEndpoint) -> String {
+    let allows = endpoint
+        .rules
+        .iter()
+        .filter_map(|r| r.allow.as_ref())
+        .map(|a| format!("{} {}", a.method, a.path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = format!("{}:{}", endpoint.host, endpoint.port);
+    if allows.is_empty() {
+        target
+    } else {
+        format!("{target} [{allows}]")
+    }
 }
 
 /// `GET /v1/proposals/{chunk_id}` — immediate state. One gateway call, no loop.
@@ -887,18 +889,41 @@ async fn wait_for_local_policy_to_cover(
     proposed_rule: &NetworkPolicyRule,
     deadline: tokio::time::Instant,
 ) -> bool {
+    wait_for_local_policy_to_cover_with(
+        ctx,
+        proposed_rule,
+        deadline,
+        openshell_policy::policy_covers_rule,
+    )
+    .await
+}
+
+async fn wait_for_local_policy_to_cover_with<F>(
+    ctx: &PolicyLocalContext,
+    proposed_rule: &NetworkPolicyRule,
+    deadline: tokio::time::Instant,
+    covers_rule: F,
+) -> bool
+where
+    F: Fn(&ProtoSandboxPolicy, &NetworkPolicyRule) -> bool,
+{
     const TICK: std::time::Duration = std::time::Duration::from_millis(200);
+    let mut checked_snapshot: Option<Arc<ProtoSandboxPolicy>> = None;
     loop {
-        // Clone the snapshot out of the RwLock before running coverage —
-        // otherwise the read guard is held across `policy_covers_rule`'s
-        // iteration of `network_policies`, serializing a writer (supervisor
-        // reload) on the very thing we're waiting for. Clone-per-tick on
-        // a few-KB struct is cheap for the bounded wait window here.
+        // Clone only the Arc while holding the lock. Coverage runs once for
+        // each installed snapshot and never holds the read guard, so reloads
+        // cannot block behind a full network-policy scan.
         let snapshot = ctx.current_policy.read().await.clone();
         if let Some(policy) = snapshot.as_ref()
-            && openshell_policy::policy_covers_rule(policy, proposed_rule)
+            && checked_snapshot
+                .as_ref()
+                .is_none_or(|checked| !Arc::ptr_eq(checked, policy))
         {
-            return true;
+            let covered = covers_rule(policy, proposed_rule);
+            checked_snapshot = Some(Arc::clone(policy));
+            if covered {
+                return true;
+            }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -1051,13 +1076,13 @@ fn policy_chunk_from_add_rule(
         security_notes: String::new(),
         confidence: 0.75,
         denial_summary_ids: vec![],
-        created_at_ms: 0,
-        decided_at_ms: 0,
+        created_time: None,
+        decided_time: None,
         stage: "agent".to_string(),
         supersedes_chunk_id: String::new(),
         hit_count: 1,
-        first_seen_ms: 0,
-        last_seen_ms: 0,
+        first_seen_time: None,
+        last_seen_time: None,
         binary,
         validation_result: String::new(),
         rejection_reason: String::new(),
@@ -1084,19 +1109,7 @@ fn network_rule_from_json(
     let binaries = rule
         .binaries
         .into_iter()
-        .map(|binary| {
-            let mut proposal_binary = NetworkBinary {
-                path: binary.path,
-                ..Default::default()
-            };
-            // The deprecated harness bit is ignored by policy YAML, but OPA
-            // maps it to advisor_proposed to preserve the SSRF two-step flow.
-            #[allow(deprecated)]
-            {
-                proposal_binary.harness = true;
-            }
-            proposal_binary
-        })
+        .map(|binary| NetworkBinary { path: binary.path })
         .collect();
 
     Ok(NetworkPolicyRule {
@@ -1111,6 +1124,19 @@ fn network_endpoint_from_json(
 ) -> std::result::Result<NetworkEndpoint, String> {
     if endpoint.host.trim().is_empty() {
         return Err("endpoint.host is required".to_string());
+    }
+    if let Some(reason) =
+        openshell_policy::agent_authored_transport_rejection(&endpoint.protocol, &endpoint.tls)
+    {
+        return Err(reason.to_string());
+    }
+    let mode_errors = openshell_policy::validate_endpoint_modes(
+        &endpoint.tls,
+        &endpoint.enforcement,
+        &endpoint.access,
+    );
+    if !mode_errors.is_empty() {
+        return Err(mode_errors.join("; "));
     }
 
     let mut ports = endpoint.ports;
@@ -1164,12 +1190,18 @@ fn network_endpoint_from_json(
         .collect();
 
     Ok(NetworkEndpoint {
+        token_grant_owner: String::new(),
         host: endpoint.host,
         port,
         protocol: endpoint.protocol,
-        tls: endpoint.tls,
-        enforcement: endpoint.enforcement,
-        access: endpoint.access,
+        tls: openshell_policy::network_tls_mode_from_str(&endpoint.tls)
+            .ok_or_else(|| format!("unknown tls value '{}'", endpoint.tls))? as i32,
+        enforcement: openshell_policy::network_enforcement_mode_from_str(&endpoint.enforcement)
+            .ok_or_else(|| format!("unknown enforcement value '{}'", endpoint.enforcement))?
+            as i32,
+        access: openshell_policy::network_access_preset_from_str(&endpoint.access)
+            .ok_or_else(|| format!("unknown access value '{}'", endpoint.access))?
+            as i32,
         rules,
         allowed_ips: endpoint.allowed_ips,
         ports,
@@ -1405,7 +1437,6 @@ mod tests {
                                     "host": "api.github.com",
                                     "port": 443,
                                     "protocol": "rest",
-                                    "tls": "terminate",
                                     "enforcement": "enforce",
                                     "rules": [
                                         {
@@ -1440,10 +1471,8 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
-        #[allow(deprecated)]
-        {
-            assert!(rule.binaries[0].harness);
-        }
+        assert!(rule.endpoints[0].advisor_proposed);
+        assert_eq!(rule.binaries[0].path, "/usr/bin/gh");
         assert_eq!(
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
             "/user/repos"
@@ -1481,6 +1510,72 @@ mod tests {
         let error = proposal_chunks_from_body(body).unwrap_err();
         assert!(error.contains("query strings"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_native_tcp_and_tls_skip() {
+        for endpoint in [
+            r#"{"host":"db.example.com","port":5432,"protocol":"tcp"}"#,
+            r#"{"host":"api.example.com","port":443,"tls":"skip"}"#,
+        ] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "raw_transport",
+                            "rule": {{"endpoints": [{endpoint}]}}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(error.contains("administrator"), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_rejects_removed_tls_values() {
+        for tls in ["terminate", "passthrough"] {
+            let body = format!(
+                r#"{{
+                    "operations": [{{
+                        "addRule": {{
+                            "ruleName": "bad_mode",
+                            "rule": {{"endpoints": [{{"host":"api.example.com","port":443,"tls":"{tls}"}}]}}
+                        }}
+                    }}]
+                }}"#
+            );
+
+            let error = proposal_chunks_from_body(body.as_bytes()).unwrap_err();
+            assert!(
+                error.contains(&format!("unknown tls value '{tls}'")),
+                "tls: {tls} unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn proposal_chunks_from_body_accepts_omitted_protocol_with_default_tls() {
+        let body = br#"{
+            "operations": [{
+                "addRule": {
+                    "ruleName": "explicit_proxy",
+                    "rule": {
+                        "endpoints": [{"host":"api.example.com","port":443}]
+                    }
+                }
+            }]
+        }"#;
+
+        let chunks = proposal_chunks_from_body(body).unwrap();
+        let endpoint = &chunks[0].proposed_rule.as_ref().unwrap().endpoints[0];
+        assert!(endpoint.protocol.is_empty());
+        assert_eq!(
+            endpoint.tls,
+            openshell_core::proto::NetworkTlsMode::Unspecified as i32
+        );
     }
 
     #[test]
@@ -1947,7 +2042,6 @@ mod tests {
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
                 }],
             }),
             ..Default::default()
@@ -1956,6 +2050,42 @@ mod tests {
         assert!(summary.contains("api.github.com:443"));
         assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
         assert!(summary.contains("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn summarize_chunk_for_audit_lists_every_endpoint_and_allow() {
+        let allow = |method: &str, path: &str| L7Rule {
+            allow: Some(L7Allow {
+                method: method.to_string(),
+                path: path.to_string(),
+                ..Default::default()
+            }),
+        };
+        let chunk = PolicyChunk {
+            binary: "/usr/bin/perl".to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: "two".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "ports.ubuntu.com".to_string(),
+                        port: 80,
+                        rules: vec![allow("GET", "/ubuntu-ports/**"), allow("HEAD", "/x")],
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "169.254.169.254".to_string(),
+                        port: 80,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            summarize_chunk_for_audit(&chunk),
+            "on ports.ubuntu.com:80 [GET /ubuntu-ports/**, HEAD /x], 169.254.169.254:80 by /usr/bin/perl"
+        );
     }
 
     // Helpers — synthetic proposed rule + policy with that rule already
@@ -1971,7 +2101,6 @@ mod tests {
             }],
             binaries: vec![NetworkBinary {
                 path: "/usr/bin/curl".to_string(),
-                ..Default::default()
             }],
         }
     }
@@ -2036,7 +2165,7 @@ mod tests {
             let policy = ctx.current_policy.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                *policy.write().await = Some(policy_with_rule(NetworkPolicyRule {
+                *policy.write().await = Some(Arc::new(policy_with_rule(NetworkPolicyRule {
                     name: "unrelated".to_string(),
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
@@ -2046,9 +2175,8 @@ mod tests {
                     }],
                     binaries: vec![NetworkBinary {
                         path: "/usr/bin/curl".to_string(),
-                        ..Default::default()
                     }],
-                }));
+                })));
             })
         };
 
@@ -2089,7 +2217,7 @@ mod tests {
             let target = proposed.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                *policy.write().await = Some(policy_with_rule(target));
+                *policy.write().await = Some(Arc::new(policy_with_rule(target)));
             })
         };
 
@@ -2138,27 +2266,79 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sanitize_reason_for_audit_strips_control_chars_and_caps_length() {
-        // Tabs and newlines are stripped; ordinary printable chars survive;
-        // multi-byte characters count as one char in the cap.
-        let raw = "line one\nline\ttwo\u{0001}\u{0007}";
-        let cleaned = sanitize_reason_for_audit(raw);
-        assert!(!cleaned.contains('\n'));
-        assert!(!cleaned.contains('\t'));
-        assert!(!cleaned.contains('\u{0001}'));
-        assert!(cleaned.contains("line one"));
-        assert!(cleaned.contains("linetwo"));
+    #[tokio::test(start_paused = true)]
+    async fn wait_checks_unchanged_policy_snapshot_once() {
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        );
+        let checks = std::cell::Cell::new(0_u32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(650);
 
-        // Length cap with ellipsis marker so a downstream reader can tell
-        // the audit string is truncated.
-        let long: String = "x".repeat(500);
-        let capped = sanitize_reason_for_audit(&long);
-        assert!(capped.chars().count() <= 201);
-        assert!(capped.ends_with('…'));
+        let reloaded = wait_for_local_policy_to_cover_with(&ctx, &proposed, deadline, |_, _| {
+            checks.set(checks.get() + 1);
+            false
+        })
+        .await;
 
-        // Empty input maps to empty output (caller renders "(no guidance)").
-        assert_eq!(sanitize_reason_for_audit(""), "");
+        assert!(!reloaded);
+        assert_eq!(
+            checks.get(),
+            1,
+            "an unchanged snapshot must be checked once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_checks_each_installed_snapshot_once() {
+        let proposed = proposed_curl_rule_for_github();
+        let empty_policy = ProtoSandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let ctx = Arc::new(PolicyLocalContext::new(
+            Some(empty_policy.clone()),
+            None,
+            None,
+            AgentProposals::new(false),
+            test_workspace_rx(),
+        ));
+        let reloads = Arc::clone(&ctx);
+        let covering_rule = proposed.clone();
+        let installations = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            reloads.set_current_policy(empty_policy).await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            reloads
+                .set_current_policy(policy_with_rule(covering_rule))
+                .await;
+        });
+        let checks = std::cell::Cell::new(0_u32);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let reloaded =
+            wait_for_local_policy_to_cover_with(&ctx, &proposed, deadline, |policy, rule| {
+                checks.set(checks.get() + 1);
+                openshell_policy::policy_covers_rule(policy, rule)
+            })
+            .await;
+        installations
+            .await
+            .expect("policy installation task must complete");
+
+        assert!(reloaded, "the covering snapshot must complete the wait");
+        assert_eq!(
+            checks.get(),
+            3,
+            "initial, identical replacement, and covering snapshots need one check each"
+        );
     }
 
     #[test]

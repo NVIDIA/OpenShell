@@ -5,7 +5,7 @@
 
 # Gator sandbox image.
 #
-# This mirrors the OpenShell Community base image's core system and developer
+# This installs the core system and developer
 # tooling, but keeps the initial agent surface focused on Codex + GitHub tooling
 # for the gator-gate workflow.
 
@@ -17,7 +17,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 WORKDIR /sandbox
 
-# Core system dependencies copied from the community base sandbox image.
+# Core system dependencies required by the gator workload.
 # iproute2: network namespace management (ip netns, veth pairs)
 # iptables: legacy bypass detection (kept for transition)
 # nftables: bypass detection; log + reject rules for direct connection diagnostics
@@ -43,7 +43,7 @@ RUN groupadd -r supervisor && useradd -r -g supervisor -s /usr/sbin/nologin supe
 FROM system AS devtools
 
 # Node.js 22 + build toolchain. Keep the default apt installs aligned with the
-# community base image, then add the small CLI tools gator commonly needs.
+# workload, then add the small CLI tools gator commonly needs.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends \
         build-essential \

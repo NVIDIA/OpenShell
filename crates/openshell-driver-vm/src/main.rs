@@ -6,10 +6,11 @@ use futures::Stream;
 use miette::{IntoDiagnostic, Result};
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_vm::otel_tracing::compute_driver_rpc_layer;
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
-use openshell_driver_vm::{VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, procguard, run_vm};
+use openshell_driver_vm::{
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VsockPortMap, procguard, run_vm,
+};
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -18,16 +19,24 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::prelude::*;
 
 #[derive(Parser, Debug)]
 #[command(name = "openshell-driver-vm")]
 #[command(version = VERSION)]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Operator-owned JSON policy; omitted means driver config disabled and labels required.
+    #[arg(
+        long,
+        env = "OPENSHELL_DRIVER_ADMISSION_CONFIG_JSON",
+        default_value = "{}"
+    )]
+    admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
+
+    #[arg(long, hide = true)]
+    internal_prepare_image: Option<PathBuf>,
 
     #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
     vm_root_disk: Option<PathBuf>,
@@ -94,8 +103,8 @@ struct Args {
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
-    openshell_endpoint: Option<String>,
+    #[arg(long = "grpc-endpoint", env = "OPENSHELL_GRPC_ENDPOINT")]
+    grpc_endpoint: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
     default_image: String,
@@ -113,11 +122,59 @@ struct Args {
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
 
+    /// Deprecated; client certificates are rejected.
     #[arg(long = "guest-tls-cert", env = "OPENSHELL_VM_TLS_CERT")]
     guest_tls_cert: Option<PathBuf>,
 
+    /// Deprecated; client private keys are rejected.
     #[arg(long = "guest-tls-key", env = "OPENSHELL_VM_TLS_KEY")]
     guest_tls_key: Option<PathBuf>,
+
+    /// Corporate forward proxy for supervisor TLS egress.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
+    upstream_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_NO_PROXY")]
+    upstream_no_proxy: Option<String>,
+
+    /// Root-owned gateway-host file containing `user:pass` proxy credentials.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_FILE")]
+    upstream_proxy_auth_file: Option<PathBuf>,
+
+    /// Explicitly acknowledge cleartext Basic authentication to an http proxy.
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_UPSTREAM_PROXY_AUTH_ALLOW_INSECURE",
+        default_value_t = false
+    )]
+    upstream_proxy_auth_allow_insecure: bool,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_VM_UPSTREAM_PROXY_CONNECT_BY_HOSTNAME",
+        default_value_t = false
+    )]
+    upstream_proxy_connect_by_hostname: bool,
+
+    /// Gateway-host PEM CA bundle trusted for the corporate proxy and for
+    /// server certificates re-signed by a TLS-intercepting proxy.
+    #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY_CA_BUNDLE")]
+    upstream_proxy_ca_bundle: Option<PathBuf>,
+
+    /// Guest-reachable SPIFFE Workload API endpoint (`tcp:IP:port`).
+    #[arg(
+        long = "provider-spiffe-workload-api-tcp-endpoint",
+        env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_TCP_ENDPOINT"
+    )]
+    provider_spiffe_workload_api_tcp_endpoint: Option<String>,
+
+    /// Explicit acknowledgement that the configured Workload API listener is exposed to VM guests.
+    #[arg(
+        long,
+        env = "OPENSHELL_PROVIDER_SPIFFE_ALLOW_GUEST_TCP",
+        default_value_t = false
+    )]
+    provider_spiffe_allow_guest_tcp: bool,
 
     #[arg(long, env = "OPENSHELL_VM_KRUN_LOG_LEVEL", default_value_t = 1)]
     krun_log_level: u32,
@@ -146,6 +203,36 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_SANDBOX_GID")]
     sandbox_gid: Option<u32>,
 
+    // Corporate forward proxy for sandbox egress. Operator-owned: these reach
+    // the host supervisor on its argv, which the sandbox image and the
+    // user-supplied environment cannot influence.
+    #[arg(long, env = "OPENSHELL_VM_HTTPS_PROXY")]
+    https_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_NO_PROXY")]
+    no_proxy: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_FILE")]
+    proxy_auth_file: Option<String>,
+
+    // Value-taking rather than a presence flag so an explicit `false` in
+    // `[openshell.drivers.vm]` survives the gateway -> driver hop and still
+    // trips the "acknowledgement without a credential" check.
+    #[arg(long, env = "OPENSHELL_VM_PROXY_AUTH_ALLOW_INSECURE")]
+    proxy_auth_allow_insecure: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CONNECT_BY_HOSTNAME")]
+    proxy_connect_by_hostname: Option<bool>,
+
+    #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
+    proxy_ca_bundle: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
+    rootfs_tar_staging_dir: Option<PathBuf>,
+
+    #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_MAX_BYTES")]
+    rootfs_tar_max_bytes: Option<u64>,
+
     #[arg(long, hide = true)]
     vm_backend: Option<String>,
 
@@ -153,60 +240,42 @@ struct Args {
     vm_gpu_bdf: Option<String>,
 
     #[arg(long, hide = true)]
-    vm_tap_device: Option<String>,
-
-    #[arg(long, hide = true)]
-    vm_guest_ip: Option<String>,
-
-    #[arg(long, hide = true)]
-    vm_host_ip: Option<String>,
-
-    #[arg(long, hide = true)]
     vm_vsock_cid: Option<u32>,
 
     #[arg(long, hide = true)]
-    vm_guest_mac: Option<String>,
+    vm_vsock_control_port: Option<u32>,
 
     #[arg(long, hide = true)]
-    vm_gateway_port: Option<u16>,
+    vm_vsock_control_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(request) = args.internal_prepare_image {
+        openshell_driver_vm::driver::run_image_preparation_worker(&request)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        return Ok(());
+    }
     if args.internal_run_vm {
-        // We intentionally defer procguard arming until `run_vm()` so
-        // that the only arm is the one that knows how to clean up
-        // gvproxy. Racing two watchers against the same parent-death
-        // event causes the bare arm's `exit(1)` to win, skipping the
-        // gvproxy cleanup and leaking the helper. The risk window
-        // before `run_vm` arms procguard is ~a few syscalls long
-        // (`build_vm_launch_config`, `configured_runtime_dir`), which
-        // is negligible next to the parent gRPC server's uptime.
+        // The VM launcher arms procguard after resolving its runtime so its
+        // libkrun worker cannot outlive the launcher.
         maybe_reexec_internal_vm_with_runtime_env()?;
         let config = build_vm_launch_config(&args).map_err(|err| miette::miette!("{err}"))?;
         run_vm(&config).map_err(|err| miette::miette!("{err}"))?;
         return Ok(());
     }
 
-    let (tracer_provider, setup_error) = openshell_driver_vm::otel_tracing::provider_for(
-        args.otlp_endpoint.as_deref(),
-        args.gateway_name.as_deref(),
+    let _tracing = openshell_otel::install_driver_tracing(
+        openshell_driver_vm::otel_tracing::TRACING,
+        openshell_otel::DriverTracingConfig {
+            endpoint: args.otlp_endpoint.as_deref(),
+            gateway_name: args.gateway_name.as_deref(),
+            service_version: VERSION,
+            log_level: &args.log_level,
+        },
     );
-    tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)))
-        .with(tracing_subscriber::fmt::layer())
-        .with(
-            tracer_provider
-                .as_ref()
-                .map(openshell_driver_vm::otel_tracing::layer),
-        )
-        .init();
-    if let Some(error) = setup_error {
-        tracing::error!(%error, "OTLP exporting could not be started");
-    } else if let Some(endpoint) = &args.otlp_endpoint {
-        info!(endpoint, "OTLP exporting enabled");
-    }
 
     let listen_mode = compute_driver_listen_mode(&args).map_err(|err| miette::miette!("{err}"))?;
 
@@ -214,7 +283,7 @@ async fn main() -> Result<()> {
     // we also die. Without this the driver is reparented to init and
     // keeps its per-sandbox VM launchers alive forever. Launchers have
     // their own procguards (armed in `run_vm`) which cascade cleanup of
-    // gvproxy and the libkrun worker the moment this driver exits.
+    // the libkrun worker the moment this driver exits.
     if let Err(err) = procguard::die_with_parent() {
         tracing::warn!(
             error = %err,
@@ -223,9 +292,12 @@ async fn main() -> Result<()> {
     }
 
     let driver = VmDriver::new(VmDriverConfig {
-        openshell_endpoint: args
-            .openshell_endpoint
+        allow_driver_config: args.admission_config_json.allow_driver_config,
+        resource_admission: args.admission_config_json.resource_admission.clone(),
+        grpc_endpoint: args
+            .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
@@ -238,15 +310,30 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
+        upstream_proxy: openshell_core::UpstreamProxyConfig {
+            https_proxy: args.upstream_proxy.clone(),
+            no_proxy: args.upstream_no_proxy.clone(),
+            proxy_auth_file: args.upstream_proxy_auth_file.clone(),
+            proxy_auth_allow_insecure: args.upstream_proxy_auth_allow_insecure.then_some(true),
+            proxy_connect_by_hostname: args.upstream_proxy_connect_by_hostname.then_some(true),
+        },
+        proxy_ca_bundle: args.upstream_proxy_ca_bundle.clone(),
+        provider_spiffe_workload_api_tcp_endpoint: args
+            .provider_spiffe_workload_api_tcp_endpoint
+            .clone(),
+        provider_spiffe_allow_guest_tcp: args.provider_spiffe_allow_guest_tcp,
         gpu_enabled: args.gpu,
         gpu_mem_mib: args.gpu_mem_mib,
         gpu_vcpus: args.gpu_vcpus,
         sandbox_uid: args.sandbox_uid,
         sandbox_gid: args.sandbox_gid,
+        rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
+        rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
 
+    let socket_cleanup = driver.clone();
     let result = match listen_mode {
         ComputeDriverListenMode::Unix {
             socket_path,
@@ -258,7 +345,7 @@ async fn main() -> Result<()> {
             let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
             restrict_socket_permissions(&socket_path).map_err(|err| miette::miette!("{err}"))?;
             let result = tonic::transport::Server::builder()
-                .layer(compute_driver_rpc_layer())
+                .layer(openshell_otel::compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
                 .serve_with_incoming_shutdown(
                     AuthenticatedUnixIncoming::new(listener, expected_peer_pid),
@@ -272,18 +359,14 @@ async fn main() -> Result<()> {
         ComputeDriverListenMode::Tcp(bind_address) => {
             info!(address = %bind_address, "Starting unauthenticated dev vm compute driver");
             tonic::transport::Server::builder()
-                .layer(compute_driver_rpc_layer())
+                .layer(openshell_otel::compute_driver_rpc_layer())
                 .add_service(ComputeDriverServer::new(driver))
                 .serve_with_shutdown(bind_address, shutdown_signal())
                 .await
                 .into_diagnostic()
         }
     };
-    if let Some(provider) = &tracer_provider
-        && let Err(error) = provider.shutdown()
-    {
-        tracing::warn!(%error, "OTLP tracer provider shutdown failed");
-    }
+    socket_cleanup.remove_socket_root();
     result
 }
 
@@ -550,12 +633,24 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         console_output,
         backend,
         gpu_bdf: args.vm_gpu_bdf.clone(),
-        tap_device: args.vm_tap_device.clone(),
-        guest_ip: args.vm_guest_ip.clone(),
-        host_ip: args.vm_host_ip.clone(),
         vsock_cid: args.vm_vsock_cid,
-        guest_mac: args.vm_guest_mac.clone(),
-        gateway_port: args.vm_gateway_port,
+        vsock_port_map: match (
+            args.vm_vsock_control_port,
+            args.vm_vsock_control_socket.clone(),
+        ) {
+            (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
+                guest_port,
+                host_socket,
+                host_initiated: true,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(
+                    "--vm-vsock-control-port and --vm-vsock-control-socket must be set together"
+                        .to_string(),
+                );
+            }
+        },
     })
 }
 
@@ -619,6 +714,53 @@ mod tests {
     };
     use clap::Parser;
     use std::path::PathBuf;
+
+    #[test]
+    fn corporate_proxy_flags_parse_into_driver_settings() {
+        let args = Args::parse_from([
+            "openshell-driver-vm",
+            "--upstream-proxy",
+            "http://proxy.corp.com:8080",
+            "--upstream-no-proxy",
+            "10.0.0.0/8,.svc.cluster.local",
+            "--upstream-proxy-auth-file",
+            "/etc/openshell/secrets/proxy-auth",
+            "--upstream-proxy-auth-allow-insecure",
+            "--upstream-proxy-connect-by-hostname",
+            "--upstream-proxy-ca-bundle",
+            "/etc/openshell/tls/proxy-ca.pem",
+        ]);
+
+        assert_eq!(
+            args.upstream_proxy.as_deref(),
+            Some("http://proxy.corp.com:8080")
+        );
+        assert_eq!(
+            args.upstream_no_proxy.as_deref(),
+            Some("10.0.0.0/8,.svc.cluster.local")
+        );
+        assert_eq!(
+            args.upstream_proxy_auth_file.as_deref(),
+            Some(PathBuf::from("/etc/openshell/secrets/proxy-auth").as_path())
+        );
+        assert!(args.upstream_proxy_auth_allow_insecure);
+        assert!(args.upstream_proxy_connect_by_hostname);
+        assert_eq!(
+            args.upstream_proxy_ca_bundle.as_deref(),
+            Some(PathBuf::from("/etc/openshell/tls/proxy-ca.pem").as_path())
+        );
+    }
+
+    #[test]
+    fn corporate_proxy_settings_default_to_unset() {
+        let args = Args::parse_from(["openshell-driver-vm"]);
+        assert!(args.upstream_proxy.is_none());
+        assert!(args.upstream_no_proxy.is_none());
+        assert!(args.upstream_proxy_auth_file.is_none());
+        assert!(!args.upstream_proxy_auth_allow_insecure);
+        assert!(!args.upstream_proxy_connect_by_hostname);
+        assert!(args.upstream_proxy_ca_bundle.is_none());
+    }
 
     #[test]
     fn peer_authorization_accepts_matching_uid_and_pid() {
@@ -693,6 +835,28 @@ mod tests {
         let args = Args::parse_from(["openshell-driver-vm"]);
         let err = compute_driver_listen_mode(&args).expect_err("default TCP should be disabled");
         assert!(err.contains("--bind-socket is required"));
+    }
+
+    #[test]
+    fn accepts_canonical_grpc_endpoint_flag() {
+        let args = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--grpc-endpoint",
+            "http://127.0.0.1:8080",
+        ])
+        .unwrap();
+        assert_eq!(args.grpc_endpoint.as_deref(), Some("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn rejects_legacy_openshell_endpoint_flag() {
+        let error = Args::try_parse_from([
+            "openshell-driver-vm",
+            "--openshell-endpoint",
+            "http://127.0.0.1:8080",
+        ])
+        .expect_err("legacy --openshell-endpoint must be rejected");
+        assert!(error.to_string().contains("--openshell-endpoint"));
     }
 
     #[test]

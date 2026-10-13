@@ -22,13 +22,12 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use openshell_e2e::harness::binary::openshell_cmd;
 use serde_json::Value;
+use serial_test::serial;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use url::Url;
 
 static SANDBOX_LIFECYCLE_LOCK: Mutex<()> = Mutex::const_new(());
-
-const DURABLE_MAIN_SCRIPT: &str = r#"echo "$1"; exec sleep infinity"#;
 
 #[derive(Clone, Copy)]
 struct IdentityScenario {
@@ -66,6 +65,7 @@ struct LoginSession {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_list_sandboxes() {
     let session = login_identity(ADMIN).await;
     assert_allowed(
@@ -77,6 +77,7 @@ async fn admin_can_list_sandboxes() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_can_report_gateway_validated_identity() {
     let session = login_identity(USER).await;
     let output = assert_allowed(
@@ -104,6 +105,7 @@ async fn user_can_report_gateway_validated_identity() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_can_list_sandboxes() {
     const WORKSPACE: &str = "oidc-user-list-sb";
     let user = login_identity(USER).await;
@@ -120,6 +122,7 @@ async fn user_can_list_sandboxes() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_create_sandbox() {
     let session = login_identity(ADMIN).await;
     let _lifecycle = SANDBOX_LIFECYCLE_LOCK.lock().await;
@@ -127,6 +130,7 @@ async fn admin_can_create_sandbox() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_can_create_sandbox() {
     const WORKSPACE: &str = "oidc-user-create";
     let user = login_identity(USER).await;
@@ -137,23 +141,21 @@ async fn user_can_create_sandbox() {
     delete_workspace(&admin, WORKSPACE).await;
 }
 
-/// Workspace users must be able to create sandboxes with inferred-provider
-/// commands (e.g. `claude`). The CLI calls `GetGatewayConfig` to check
-/// `providers_v2_enabled` before sandbox creation; that RPC must not be
-/// gated to Platform Admin or the workspace-user flow breaks.
+/// Workspace users must be able to resolve a provider profile when naming a
+/// provider with `--provider`, without requiring Platform Admin access.
 #[tokio::test]
-async fn user_can_create_sandbox_with_inferred_provider_command() {
-    const WORKSPACE: &str = "oidc-inferred-cmd";
+#[serial(oidc_pkce)]
+async fn user_can_resolve_provider_profile_for_sandbox() {
+    const WORKSPACE: &str = "oidc-named-provider";
     let user = login_identity(USER).await;
     let admin = login_identity(ADMIN).await;
     prepare_workspace(&admin, &user, WORKSPACE, "user").await;
     let _lifecycle = SANDBOX_LIFECYCLE_LOCK.lock().await;
 
-    // Use `claude` as the command so the CLI infers provider type
-    // `claude-code` and calls `GetGatewayConfig` to check
-    // `providers_v2_enabled`. The sandbox won't actually start (no
-    // provider credentials), but we only care that the
-    // `GetGatewayConfig` call itself succeeds for a workspace user.
+    // `claude-code` names no existing provider, so the CLI has to look up the
+    // profile of that id before it can auto-create one. The lane imported the
+    // example profiles at platform scope; reaching them from a workspace is
+    // what this test guards.
     let output = run_workspace_cli(
         &user,
         WORKSPACE,
@@ -161,21 +163,22 @@ async fn user_can_create_sandbox_with_inferred_provider_command() {
             "sandbox",
             "create",
             "--name",
-            "oidc-inferred-cmd",
+            "oidc-named-provider",
             "--no-tty",
-            "--",
-            "claude",
+            "--provider",
+            "claude-code",
         ],
     )
     .await;
     let combined = combined_output(&output);
 
-    // The sandbox won't start because there are no provider credentials,
-    // but the error must be about the missing provider — NOT a
-    // platform-admin gate on GetGatewayConfig.
+    // The provider cannot be auto-created without a terminal to confirm at,
+    // so creation stops there. That error proves the profile lookup
+    // succeeded; a permission error would mean the workspace user was gated
+    // out of the catalog.
     assert!(
         !combined.to_ascii_lowercase().contains("platform admin"),
-        "workspace user hit a platform-admin gate on an inferred-provider command:\n{combined}"
+        "workspace user hit a platform-admin gate while resolving a provider profile:\n{combined}"
     );
     assert!(
         combined.contains("missing required provider"),
@@ -185,13 +188,14 @@ async fn user_can_create_sandbox_with_inferred_provider_command() {
     let _ = run_workspace_cli(
         &user,
         WORKSPACE,
-        &["sandbox", "delete", "oidc-inferred-cmd"],
+        &["sandbox", "delete", "oidc-named-provider"],
     )
     .await;
     delete_workspace(&admin, WORKSPACE).await;
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_delete_sandbox() {
     let session = login_identity(ADMIN).await;
     let _lifecycle = SANDBOX_LIFECYCLE_LOCK.lock().await;
@@ -199,6 +203,7 @@ async fn admin_can_delete_sandbox() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_can_delete_sandbox() {
     const WORKSPACE: &str = "oidc-user-delete";
     let user = login_identity(USER).await;
@@ -210,6 +215,7 @@ async fn user_can_delete_sandbox() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_inspect_gateway() {
     let session = login_identity(ADMIN).await;
     let output = assert_allowed(&session, &["gateway", "info"], "inspect gateway info").await;
@@ -224,6 +230,7 @@ async fn admin_can_inspect_gateway() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_cannot_inspect_gateway() {
     let session = login_identity(USER).await;
     let output = run_session_cli(&session, &["gateway", "info"]).await;
@@ -240,6 +247,7 @@ async fn user_cannot_inspect_gateway() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_list_providers() {
     let session = login_identity(ADMIN).await;
     assert_allowed(
@@ -251,6 +259,7 @@ async fn admin_can_list_providers() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_can_list_providers() {
     const WORKSPACE: &str = "oidc-user-list-pr";
     let user = login_identity(USER).await;
@@ -267,6 +276,7 @@ async fn user_can_list_providers() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_manage_provider() {
     const PROVIDER: &str = "oidc-pkce-admin-provider";
     let session = login_identity(ADMIN).await;
@@ -279,9 +289,9 @@ async fn admin_can_manage_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create a provider",
     )
@@ -303,6 +313,7 @@ async fn admin_can_manage_provider() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_cannot_create_provider() {
     const WORKSPACE: &str = "oidc-user-no-create";
     let user = login_identity(USER).await;
@@ -317,9 +328,9 @@ async fn user_cannot_create_provider() {
             "--name",
             "oidc-pkce-user-provider",
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
     )
     .await;
@@ -328,6 +339,7 @@ async fn user_cannot_create_provider() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_cannot_delete_provider() {
     const PROVIDER: &str = "oidc-pkce-user-delete-target";
     const WORKSPACE: &str = "oidc-user-no-delete";
@@ -343,9 +355,9 @@ async fn user_cannot_delete_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create the provider deletion target",
     )
@@ -365,6 +377,7 @@ async fn user_cannot_delete_provider() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_create_workspace() {
     const WORKSPACE: &str = "oidc-admin-create";
     let admin = login_identity(ADMIN).await;
@@ -386,6 +399,7 @@ async fn admin_can_create_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_cannot_create_workspace() {
     let user = login_identity(USER).await;
     let denied = run_session_cli(
@@ -397,6 +411,7 @@ async fn user_cannot_create_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn admin_can_delete_workspace() {
     const WORKSPACE: &str = "oidc-admin-delete";
     let admin = login_identity(ADMIN).await;
@@ -411,6 +426,7 @@ async fn admin_can_delete_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn user_cannot_delete_workspace() {
     const WORKSPACE: &str = "oidc-user-del-deny";
     let admin = login_identity(ADMIN).await;
@@ -428,6 +444,7 @@ async fn user_cannot_delete_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_can_read_workspace() {
     const WORKSPACE: &str = "oidc-ws-user-read";
     let user = login_identity(USER).await;
@@ -459,6 +476,7 @@ async fn workspace_user_can_read_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_cannot_manage_members() {
     const WORKSPACE: &str = "oidc-ws-user-deny";
     let user = login_identity(USER).await;
@@ -484,6 +502,7 @@ async fn workspace_user_cannot_manage_members() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_read_workspace() {
     const WORKSPACE: &str = "oidc-wsa-read";
     let user = login_identity(USER).await;
@@ -501,6 +520,7 @@ async fn workspace_admin_can_read_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_create_sandbox() {
     const WORKSPACE: &str = "oidc-wsa-create-sb";
     let user = login_identity(USER).await;
@@ -512,6 +532,7 @@ async fn workspace_admin_can_create_sandbox() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_delete_sandbox() {
     const WORKSPACE: &str = "oidc-wsa-delete-sb";
     let user = login_identity(USER).await;
@@ -523,6 +544,7 @@ async fn workspace_admin_can_delete_sandbox() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_create_provider() {
     const WORKSPACE: &str = "oidc-wsa-create-pr";
     const PROVIDER: &str = "oidc-wsa-create-provider";
@@ -538,9 +560,9 @@ async fn workspace_admin_can_create_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create a provider as workspace admin",
     )
@@ -557,6 +579,7 @@ async fn workspace_admin_can_create_provider() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_delete_provider() {
     const WORKSPACE: &str = "oidc-wsa-delete-pr";
     const PROVIDER: &str = "oidc-wsa-delete-provider";
@@ -572,9 +595,9 @@ async fn workspace_admin_can_delete_provider() {
             "--name",
             PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
         "create the provider deletion target",
     )
@@ -590,6 +613,7 @@ async fn workspace_admin_can_delete_provider() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_add_user_member() {
     const WORKSPACE: &str = "oidc-wsa-add-user";
     let workspace_admin = login_identity(USER).await;
@@ -624,6 +648,7 @@ async fn workspace_admin_can_add_user_member() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_can_remove_user_member() {
     const WORKSPACE: &str = "oidc-wsa-rm-user";
     let workspace_admin = login_identity(USER).await;
@@ -667,6 +692,7 @@ async fn workspace_admin_can_remove_user_member() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_grant_admin() {
     const WORKSPACE: &str = "oidc-ws-admin-deny";
     let user = login_identity(USER).await;
@@ -692,6 +718,7 @@ async fn workspace_admin_cannot_grant_admin() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_create_workspace() {
     const WORKSPACE: &str = "oidc-wsa-no-create";
     let user = login_identity(USER).await;
@@ -705,6 +732,7 @@ async fn workspace_admin_cannot_create_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_delete_workspace() {
     const WORKSPACE: &str = "oidc-wsa-no-delete";
     let user = login_identity(USER).await;
@@ -717,6 +745,7 @@ async fn workspace_admin_cannot_delete_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_inspect_gateway() {
     const WORKSPACE: &str = "oidc-wsa-no-gw-info";
     let user = login_identity(USER).await;
@@ -729,6 +758,7 @@ async fn workspace_admin_cannot_inspect_gateway() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_read_another_workspace() {
     const WORKSPACE_A: &str = "oidc-wsa-xread-a";
     const WORKSPACE_B: &str = "oidc-wsa-xread-b";
@@ -743,6 +773,7 @@ async fn workspace_admin_cannot_read_another_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_manage_another_workspace_members() {
     const WORKSPACE_A: &str = "oidc-wsa-xmem-a";
     const WORKSPACE_B: &str = "oidc-wsa-xmem-b";
@@ -774,9 +805,11 @@ async fn workspace_admin_cannot_manage_another_workspace_members() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_admin_cannot_manage_another_workspace_providers() {
     const WORKSPACE_A: &str = "oidc-wsa-xprov-a";
     const WORKSPACE_B: &str = "oidc-wsa-xprov-b";
+    const PROVIDER: &str = "oidc-wsa-xprovider";
     let (admin, workspace_admin, _user_b) =
         prepare_isolated_workspaces_with_admin(WORKSPACE_A, WORKSPACE_B).await;
 
@@ -787,17 +820,58 @@ async fn workspace_admin_cannot_manage_another_workspace_providers() {
             "provider",
             "create",
             "--name",
-            "oidc-wsa-xprovider",
+            PROVIDER,
             "--type",
-            "generic",
+            "openai",
             "--credential",
-            "TOKEN=e2e-test-value",
+            "OPENAI_API_KEY=e2e-test-value",
         ],
     )
     .await;
-    assert_non_member_denial(
-        &denied,
-        "manage another workspace's providers as workspace admin",
+    let diagnostic = combined_output(&denied);
+    let compact: String = diagnostic
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect();
+    // Profile lookup redacts backend diagnostics. Check the permission code and
+    // safe recovery guidance without requiring the server's membership details.
+    assert!(
+        !denied.status.success()
+            && compact.contains("PERMISSION_DENIED")
+            && compact.contains("verifyworkspacemembershipandrequiredpermissions"),
+        "cross-workspace provider creation did not report a safe permission denial:\n{diagnostic}"
+    );
+    assert!(!diagnostic.contains("e2e-test-value"));
+
+    // Query with an independent authorized identity so a failed command alone
+    // cannot hide a provider created before the denial was returned.
+    let listed = assert_workspace_allowed(
+        &admin,
+        WORKSPACE_B,
+        &["provider", "list", "--output", "json"],
+        "verify denied creation left the target workspace empty",
+    )
+    .await;
+    // CLI startup diagnostics may precede the JSON object on stdout.
+    let stdout = String::from_utf8(listed.stdout).expect("provider list output should be UTF-8");
+    let json_start = stdout
+        .find('{')
+        .expect("provider list output should contain JSON");
+    let json_end = stdout
+        .rfind('}')
+        .expect("provider list output should contain a complete JSON object");
+    let listing: Value = serde_json::from_str(&stdout[json_start..=json_end])
+        .expect("provider list --output json should return JSON on stdout");
+    assert_eq!(
+        listing["next_page_token"], "",
+        "provider listing is incomplete"
+    );
+    assert!(
+        listing["providers"]
+            .as_array()
+            .expect("provider collection")
+            .is_empty(),
+        "denied creation added a provider to the isolated target workspace"
     );
 
     delete_workspace(&admin, WORKSPACE_B).await;
@@ -805,6 +879,7 @@ async fn workspace_admin_cannot_manage_another_workspace_providers() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn membership_removal_revokes_workspace_access() {
     const WORKSPACE: &str = "oidc-ws-revoke";
     let user = login_identity(USER).await;
@@ -830,6 +905,7 @@ async fn membership_removal_revokes_workspace_access() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_cannot_read_another_users_workspace() {
     const WORKSPACE_A: &str = "oidc-xread-a";
     const WORKSPACE_B: &str = "oidc-xread-b";
@@ -843,6 +919,7 @@ async fn workspace_user_cannot_read_another_users_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn second_workspace_user_cannot_read_first_users_workspace() {
     const WORKSPACE_A: &str = "oidc-xread2-a";
     const WORKSPACE_B: &str = "oidc-xread2-b";
@@ -856,6 +933,7 @@ async fn second_workspace_user_cannot_read_first_users_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_list_hides_another_users_workspace() {
     const WORKSPACE_A: &str = "oidc-xlist-a";
     const WORKSPACE_B: &str = "oidc-xlist-b";
@@ -882,6 +960,7 @@ async fn workspace_list_hides_another_users_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_cannot_list_another_workspace_sandboxes() {
     const WORKSPACE_A: &str = "oidc-xsbox-a";
     const WORKSPACE_B: &str = "oidc-xsbox-b";
@@ -900,6 +979,7 @@ async fn workspace_user_cannot_list_another_workspace_sandboxes() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_cannot_create_sandbox_in_another_workspace() {
     const WORKSPACE_A: &str = "oidc-xcreate-a";
     const WORKSPACE_B: &str = "oidc-xcreate-b";
@@ -915,10 +995,7 @@ async fn workspace_user_cannot_create_sandbox_in_another_workspace() {
             "oidc-xcreate-denied",
             "--no-tty",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
+            "echo",
             "denied",
         ],
     )
@@ -930,6 +1007,7 @@ async fn workspace_user_cannot_create_sandbox_in_another_workspace() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_cannot_list_another_workspace_providers() {
     const WORKSPACE_A: &str = "oidc-xprov-a";
     const WORKSPACE_B: &str = "oidc-xprov-b";
@@ -948,6 +1026,7 @@ async fn workspace_user_cannot_list_another_workspace_providers() {
 }
 
 #[tokio::test]
+#[serial(oidc_pkce)]
 async fn workspace_user_cannot_list_another_workspace_members() {
     const WORKSPACE_A: &str = "oidc-xmember-a";
     const WORKSPACE_B: &str = "oidc-xmember-b";
@@ -1377,8 +1456,10 @@ async fn delete_workspace(admin: &LoginSession, workspace: &str) {
     }
 }
 
+// Keep RBAC fixtures running until cleanup so authorization checks do not also
+// exercise fast canonical-process completion. That lifecycle belongs to the
+// dedicated sandbox_lifecycle suite.
 async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sandbox_name: &str) {
-    let marker = format!("{sandbox_name}-ready");
     let create = run_workspace_cli(
         session,
         workspace,
@@ -1390,11 +1471,8 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
             "--no-tty",
             "--detach",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
-            &marker,
+            "sleep",
+            "infinity",
         ],
     )
     .await;
@@ -1425,7 +1503,6 @@ async fn assert_can_create_sandbox(session: &LoginSession, workspace: &str, sand
 }
 
 async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sandbox_name: &str) {
-    let marker = format!("{sandbox_name}-ready");
     let create = run_workspace_cli(
         session,
         workspace,
@@ -1437,11 +1514,8 @@ async fn assert_can_delete_sandbox(session: &LoginSession, workspace: &str, sand
             "--no-tty",
             "--detach",
             "--",
-            "sh",
-            "-c",
-            DURABLE_MAIN_SCRIPT,
-            "_",
-            &marker,
+            "sleep",
+            "infinity",
         ],
     )
     .await;
@@ -1567,11 +1641,15 @@ fn assert_platform_admin_denial(output: &Output, action: &str) {
 
 fn assert_non_member_denial(output: &Output, action: &str) {
     let denied = combined_output(output);
+    let compact_denial: String = denied
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect();
     assert!(
         !output.status.success()
-            && denied
+            && compact_denial
                 .to_ascii_lowercase()
-                .contains("not a member of workspace"),
+                .contains("notamemberofworkspace"),
         "non-member unexpectedly authorized to {action}, or denial omitted membership context:\n{denied}"
     );
 }

@@ -11,10 +11,16 @@ use tokio::sync::mpsc;
 use tonic::{Request, Response, Status};
 
 use crate::proto::{
-    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, MiddlewareManifest,
-    RequestContext, SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
+    HttpHeader, HttpRequestEvaluation, HttpRequestResult, HttpRequestTarget, HttpResponseEvent,
+    HttpResponseEventResult, MiddlewareDescribeRequest, MiddlewareManifest, RequestContext,
+    SupervisorMiddlewarePhase, ValidateConfigRequest, ValidateConfigResponse,
     WebSocketSessionEvent, WebSocketSessionEventResult,
 };
+
+/// Transport-neutral result stream for one HTTP response middleware stage.
+pub type HttpResponseResultStream = Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<HttpResponseEventResult, Status>> + Send + 'static>,
+>;
 
 /// Transport-neutral response stream for one WebSocket middleware stage.
 pub type WebSocketResponseStream = Pin<
@@ -31,7 +37,10 @@ pub type WebSocketResponseStream = Pin<
 /// whether invocations are direct calls or serialized gRPC requests.
 #[tonic::async_trait]
 pub trait SupervisorMiddlewareEndpoint: Send + Sync {
-    async fn describe(&self, request: Request<()>) -> Result<Response<MiddlewareManifest>, Status>;
+    async fn describe(
+        &self,
+        request: Request<MiddlewareDescribeRequest>,
+    ) -> Result<Response<MiddlewareManifest>, Status>;
 
     async fn validate_config(
         &self,
@@ -47,6 +56,15 @@ pub trait SupervisorMiddlewareEndpoint: Send + Sync {
         &self,
         requests: mpsc::Receiver<WebSocketSessionEvent>,
     ) -> Result<WebSocketResponseStream, Status>;
+
+    async fn open_http_response_pre_return(
+        &self,
+        _requests: mpsc::Receiver<HttpResponseEvent>,
+    ) -> Result<HttpResponseResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP response pre-return evaluation",
+        ))
+    }
 }
 
 /// Borrowed request state exposed to one in-process middleware invocation.
@@ -175,9 +193,15 @@ impl<'a> HttpRequestView<'a> {
 ///                 operation: SupervisorMiddlewareOperation::HttpRequest as i32,
 ///                 phase: SupervisorMiddlewarePhase::PreCredentials as i32,
 ///                 max_payload_bytes: 1024,
-///                 timeout: String::new(),
+///                 request_timeout: None,
 ///             }],
 ///             expected_audience: String::new(),
+///             extension: Some(openshell_core::extension_protocol::extension_metadata(
+///                 openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+///                 "example/audit",
+///                 "1",
+///                 [],
+///             )),
 ///         }
 ///     }
 ///
@@ -240,6 +264,18 @@ pub trait InProcessMiddleware: Send + Sync {
     ) -> std::result::Result<WebSocketResponseStream, Status> {
         Err(Status::unimplemented(
             "middleware does not implement WebSocket sessions",
+        ))
+    }
+
+    /// Open one HTTP response pre-return stream.
+    ///
+    /// Request-only implementations may keep the default unsupported response.
+    async fn open_http_response_pre_return(
+        &self,
+        _requests: mpsc::Receiver<HttpResponseEvent>,
+    ) -> std::result::Result<HttpResponseResultStream, Status> {
+        Err(Status::unimplemented(
+            "middleware does not implement HTTP response pre-return evaluation",
         ))
     }
 }

@@ -31,6 +31,14 @@ type mockHealthServer struct {
 	currentUserErr  error
 }
 
+func TestExtensionKindConstantsAreReexported(t *testing.T) {
+	assert.Equal(t, ExtensionKind("ComputeDriver"), ExtensionKindComputeDriver)
+	assert.Equal(t, ExtensionKind("CredentialDriver"), ExtensionKindCredentialDriver)
+	assert.Equal(t, ExtensionKind("GatewayInterceptor"), ExtensionKindGatewayInterceptor)
+	assert.Equal(t, ExtensionKind("SupervisorMiddleware"), ExtensionKindSupervisorMiddleware)
+	assert.Equal(t, ExtensionKind("Unknown"), ExtensionKindUnknown)
+}
+
 func (s *mockHealthServer) Health(_ context.Context, _ *pb.HealthRequest) (*pb.HealthResponse, error) {
 	if s.err != nil {
 		return nil, s.err

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -35,7 +35,6 @@ async fn failed_store_calls_are_marked_on_the_span() {
 /// the span must stay clean — otherwise every lease a replica does not win, and
 /// every gateway restart, exports as a failure.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn expected_conflicts_leave_the_span_unmarked() {
     use crate::otel_tracing::test_exporter;
 
@@ -66,6 +65,7 @@ async fn expected_conflicts_leave_the_span_unmarked() {
         .await
         .expect_err("the name is already taken");
 
+    traced.wait_for_span("store.put_if").await;
     let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
 
     assert_eq!(
@@ -79,7 +79,6 @@ async fn expected_conflicts_leave_the_span_unmarked() {
 /// Span names stay low-cardinality so they group across object types; what
 /// each call touched is carried as attributes.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_spans_record_what_they_touched_as_attributes() {
     use crate::otel_tracing::test_exporter;
 
@@ -97,6 +96,13 @@ async fn store_spans_record_what_they_touched_as_attributes() {
         .unwrap();
     store.list("sandbox", "default", 10, 0).await.unwrap();
 
+    traced
+        .wait_for_spans(|spans| {
+            ["store.get", "store.get_by_name", "store.list"]
+                .iter()
+                .all(|name| spans.iter().any(|span| &span.name == name))
+        })
+        .await;
     let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
     assert_eq!(
         test_exporter::attribute(&by_name, "object_type").as_deref(),
@@ -125,11 +131,155 @@ async fn sqlite_put_get_round_trip() {
 }
 
 #[tokio::test]
+async fn collect_records_exhausts_multiple_keyset_pages_exactly_once() {
+    let store = test_store().await;
+    let expected = 1005_usize;
+    for index in 0..expected {
+        let id = format!("collect-{index:04}");
+        let name = format!("sandbox-{index:04}");
+        store
+            .put("sandbox", &id, &name, "collect-test", b"payload", None)
+            .await
+            .unwrap();
+    }
+
+    let records = store
+        .collect_records("sandbox", ObjectListQuery::Workspace("collect-test"))
+        .await
+        .unwrap();
+    let ids = records
+        .iter()
+        .map(|record| record.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(records.len(), expected);
+    assert_eq!(ids.len(), expected, "every record is visited exactly once");
+}
+
+#[tokio::test]
 async fn sqlite_connect_runs_embedded_migrations() {
     let store = test_store().await;
 
     let records = store.list("sandbox", "default", 10, 0).await.unwrap();
     assert!(records.is_empty());
+}
+
+#[tokio::test]
+async fn sqlite_inference_route_removal_migration_deletes_only_managed_routes() {
+    use sqlx::{Connection, SqliteConnection};
+
+    let migration = super::sqlite::embedded_migration_sql(7)
+        .expect("SQLite migrator must embed removal migration 007");
+    let mut connection = SqliteConnection::connect("sqlite::memory:")
+        .await
+        .expect("connect to migration test database");
+    sqlx::raw_sql(
+        "CREATE TABLE objects (object_type TEXT NOT NULL, id TEXT NOT NULL);\
+         INSERT INTO objects VALUES ('inference_route', 'managed-route');\
+         INSERT INTO objects VALUES ('sandbox', 'preserved-sandbox');",
+    )
+    .execute(&mut connection)
+    .await
+    .expect("seed pre-migration objects");
+
+    sqlx::raw_sql(migration)
+        .execute(&mut connection)
+        .await
+        .expect("run SQLite removal migration");
+
+    let remaining: Vec<(String, String)> =
+        sqlx::query_as("SELECT object_type, id FROM objects ORDER BY object_type, id")
+            .fetch_all(&mut connection)
+            .await
+            .expect("read migrated objects");
+    assert_eq!(
+        remaining,
+        vec![("sandbox".to_string(), "preserved-sandbox".to_string())],
+        "removal migration must purge managed routes without touching other objects"
+    );
+}
+
+#[test]
+fn embedded_migrators_include_inference_route_removal() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(7)),
+        ("postgres", super::postgres::embedded_migration_sql(7)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 007"));
+        assert!(
+            sql.contains("DELETE FROM objects WHERE object_type = 'inference_route'"),
+            "{backend} migration 007 must purge managed inference route objects"
+        );
+    }
+}
+
+#[test]
+fn embedded_migrators_include_pagination_indexes() {
+    for (backend, migration) in [
+        ("sqlite", super::sqlite::embedded_migration_sql(8)),
+        ("postgres", super::postgres::embedded_migration_sql(8)),
+    ] {
+        let sql =
+            migration.unwrap_or_else(|| panic!("{backend} migrator is missing migration 008"));
+        assert!(
+            sql.contains("objects_workspace_page_idx")
+                && sql.contains("objects_all_workspaces_page_idx"),
+            "{backend} migration 008 must add both keyset pagination indexes"
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
+    for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
+        let store = super::sqlite::SqliteStore::connect(url)
+            .await
+            .expect("connect to in-memory SQLite");
+        store.migrate().await.expect("migrate in-memory SQLite");
+        store
+            .put(
+                "sandbox",
+                "before-replacement",
+                "before-replacement",
+                "default",
+                b"before",
+                None,
+            )
+            .await
+            .expect("write before connection replacement");
+
+        super::sqlite::replace_pool_connection(&store)
+            .await
+            .expect("replace operational pool connection");
+
+        let preserved = store
+            .get("sandbox", "before-replacement")
+            .await
+            .expect("schema survives connection replacement")
+            .expect("existing object survives connection replacement");
+        assert_eq!(preserved.payload, b"before", "database URL: {url}");
+
+        store
+            .put(
+                "sandbox",
+                "after-replacement",
+                "after-replacement",
+                "default",
+                b"after",
+                None,
+            )
+            .await
+            .expect("write after connection replacement");
+        assert!(
+            store
+                .get("sandbox", "after-replacement")
+                .await
+                .expect("read after connection replacement")
+                .is_some(),
+            "database URL: {url}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -180,14 +330,265 @@ async fn sqlite_connect_tightens_existing_db_file_permissions() {
     assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
 }
 
+fn on_disk_store_url(db_path: &std::path::Path) -> String {
+    format!("sqlite:{}?mode=rwc", db_path.display())
+}
+
+async fn connect_on_disk_sqlite(url: &str) -> super::SqliteStore {
+    match Store::connect(url).await.expect("connect to sqlite") {
+        Store::Sqlite(store) => store,
+        Store::Postgres(_) => unreachable!("sqlite URL must select the SQLite store"),
+    }
+}
+
+async fn file_journal_mode(db_path: &std::path::Path) -> String {
+    use sqlx::{Connection, SqliteConnection};
+
+    let mut connection = SqliteConnection::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .expect("open database file directly");
+    let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read journal_mode");
+    connection.close().await.expect("close direct connection");
+    journal_mode
+}
+
+#[tokio::test]
+async fn sqlite_connect_enables_wal_and_full_synchronous_on_disk() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = on_disk_store_url(&db_path);
+
+    let store = connect_on_disk_sqlite(&url).await;
+
+    let (journal_mode, synchronous) = super::sqlite::journal_settings(&store)
+        .await
+        .expect("read journal settings through the pool");
+    assert_eq!(journal_mode, "wal", "on-disk stores must run in WAL mode");
+    // FULL (2), not NORMAL (1): acknowledged commits such as SSH session
+    // revocations must survive a power loss.
+    assert_eq!(
+        synchronous, 2,
+        "on-disk stores must run with synchronous=FULL (2), got {synchronous}"
+    );
+    let (relaxed_journal_mode, relaxed_synchronous) =
+        super::sqlite::relaxed_journal_settings(&store)
+            .await
+            .expect("read journal settings through the relaxed pool");
+    assert_eq!(relaxed_journal_mode, "wal");
+    assert_eq!(
+        relaxed_synchronous, 1,
+        "the relaxed pool must run with synchronous=NORMAL (1), got {relaxed_synchronous}"
+    );
+
+    // Force a write so the WAL sidecars exist on disk, then confirm they are
+    // owner-only like the main file.
+    store
+        .put(
+            "sandbox",
+            "wal-probe",
+            "wal-probe",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .expect("write through the store");
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+    assert!(wal_path.exists(), "WAL sidecar should exist after a write");
+    assert!(shm_path.exists(), "SHM sidecar should exist after a write");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&db_path, &wal_path, &shm_path] {
+            let mode = std::fs::metadata(path)
+                .expect("sidecar metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{}: expected 0600, got {mode:04o}",
+                path.display()
+            );
+        }
+    }
+
+    store.close().await;
+    assert_eq!(
+        file_journal_mode(&db_path).await,
+        "wal",
+        "WAL must persist in the database file after the store closes"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_create_relaxed_is_must_create_visible_to_durable_writes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let store = Store::connect(&on_disk_store_url(&db_path))
+        .await
+        .expect("connect to sqlite");
+
+    let created = store
+        .create_relaxed("ssh_session", "tok", "tok", "default", b"issued", None)
+        .await
+        .expect("relaxed create");
+    assert_eq!(created.resource_version, 1);
+
+    let duplicate = store
+        .create_relaxed("ssh_session", "tok", "tok", "default", b"again", None)
+        .await
+        .expect_err("relaxed create must reject an existing object");
+    assert!(
+        matches!(duplicate, PersistenceError::UniqueViolation { .. }),
+        "expected UniqueViolation, got {duplicate:?}"
+    );
+
+    // The durable pool sees the relaxed insert and can revoke it with CAS.
+    store
+        .put_if(
+            "ssh_session",
+            "tok",
+            "tok",
+            "default",
+            b"revoked",
+            None,
+            super::WriteCondition::MatchResourceVersion(1),
+        )
+        .await
+        .expect("durable revoke of a relaxed insert");
+    let record = store
+        .get("ssh_session", "tok")
+        .await
+        .expect("get")
+        .expect("record present");
+    assert_eq!(record.payload, b"revoked");
+    assert_eq!(record.resource_version, 2);
+}
+
+#[tokio::test]
+async fn sqlite_connect_switches_existing_rollback_journal_database_to_wal() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{Connection, SqliteConnection};
+    use std::str::FromStr;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = on_disk_store_url(&db_path);
+
+    // A database created by an older gateway, or by any sqlx 0.8 default
+    // connection, is in rollback-journal (`delete`) mode.
+    {
+        let options = SqliteConnectOptions::from_str(&url)
+            .expect("parse url")
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options)
+            .await
+            .expect("create legacy database");
+        sqlx::query("CREATE TABLE legacy_probe (x INTEGER)")
+            .execute(&mut connection)
+            .await
+            .expect("write legacy database");
+        connection.close().await.expect("close legacy connection");
+    }
+    assert_eq!(file_journal_mode(&db_path).await, "delete");
+
+    let store = connect_on_disk_sqlite(&url).await;
+    let (journal_mode, _) = super::sqlite::journal_settings(&store)
+        .await
+        .expect("read journal settings");
+    assert_eq!(
+        journal_mode, "wal",
+        "connect must switch existing files to WAL"
+    );
+    store.close().await;
+    assert_eq!(file_journal_mode(&db_path).await, "wal");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_file_backed_reads_and_writes_proceed_concurrently() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = on_disk_store_url(&db_path);
+    let store = std::sync::Arc::new(Store::connect(&url).await.expect("connect to sqlite"));
+
+    store
+        .put("sandbox", "seed", "seed", "default", b"seed", None)
+        .await
+        .expect("seed object");
+
+    // Mirror the forward-service pattern: many independent autocommit writes
+    // (a relaxed insert and a durable update per "connection", so the two
+    // pools contend for the writer lock) while readers keep fetching. Every operation must complete; no caller may observe a
+    // "database is locked" error even though the writes contend for the
+    // single SQLite writer.
+    let writers = (0..8).map(|writer| {
+        let store = store.clone();
+        tokio::spawn(async move {
+            for index in 0..25 {
+                let id = format!("session-{writer}-{index}");
+                store
+                    .create_relaxed("ssh_session", &id, &id, "default", b"issued", None)
+                    .await
+                    .expect("insert session");
+                store
+                    .put_if(
+                        "ssh_session",
+                        &id,
+                        &id,
+                        "default",
+                        b"revoked",
+                        None,
+                        super::WriteCondition::MatchResourceVersion(1),
+                    )
+                    .await
+                    .expect("revoke session");
+            }
+        })
+    });
+    let readers = (0..4).map(|_| {
+        let store = store.clone();
+        tokio::spawn(async move {
+            for _ in 0..100 {
+                let record = store
+                    .get("sandbox", "seed")
+                    .await
+                    .expect("read while writers are active")
+                    .expect("seed object present");
+                assert_eq!(record.payload, b"seed");
+            }
+        })
+    });
+
+    for handle in writers.chain(readers) {
+        handle.await.expect("task completed");
+    }
+
+    let sessions = store
+        .list("ssh_session", "default", 1000, 0)
+        .await
+        .expect("list sessions");
+    assert_eq!(sessions.len(), 200, "every session write must be durable");
+    assert!(
+        sessions.iter().all(|record| record.payload == b"revoked"),
+        "every session must have been revoked by its follow-up write"
+    );
+}
+
 // The next three tests cover `restrict_db_file_permissions` against the
 // WAL/SHM sidecars at increasing levels of fidelity:
 //
 // 1. `_tightens_main_and_wal_and_shm_files`: synthetic empty files, proves
 //    the chmod loop walks all three paths.
-// 2. `_skips_missing_sidecars`: proves the `exists()` guard, which is the
-//    actual production path today (sqlx 0.8 doesn't default to WAL and
-//    doesn't accept `journal_mode` as a URL parameter).
+// 2. `_skips_missing_sidecars`: proves the `exists()` guard for databases
+//    that have not been written yet or were created before the adapter
+//    enabled WAL (sqlx 0.8 doesn't default to WAL and doesn't accept
+//    `journal_mode` as a URL parameter; `SqliteStore::connect` opts in
+//    through the builder API).
 // 3. `_handles_real_sqlite_wal_files`: opens a real sqlx pool with
 //    `SqliteJournalMode::Wal` via the builder API so SQLite materializes
 //    real `-wal` and `-shm` files, then checks the helper tightens them.
@@ -364,6 +765,116 @@ async fn sqlite_delete_behavior() {
 
     let deleted_again = store.delete("sandbox", "missing").await.unwrap();
     assert!(!deleted_again);
+}
+
+#[tokio::test]
+async fn delete_many_is_bounded_idempotent_and_type_scoped() {
+    let store = test_store().await;
+    let mut ids = Vec::new();
+    for idx in 0..(super::DELETE_MANY_BATCH_SIZE + 12) {
+        let id = format!("sandbox-{idx}");
+        store
+            .put(
+                "sandbox",
+                &id,
+                &format!("name-{idx}"),
+                "default",
+                b"payload",
+                None,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    store
+        .put(
+            "provider",
+            "other-type",
+            "other-type",
+            "default",
+            b"payload",
+            None,
+        )
+        .await
+        .unwrap();
+
+    ids.extend([
+        "missing".to_string(),
+        "other-type".to_string(),
+        "sandbox-0".to_string(),
+    ]);
+    let expected = u64::try_from(super::DELETE_MANY_BATCH_SIZE + 12).unwrap();
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), expected);
+    assert_eq!(store.delete_many("sandbox", &ids).await.unwrap(), 0);
+    assert_eq!(store.delete_many("sandbox", &[]).await.unwrap(), 0);
+    assert!(store.get("provider", "other-type").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn file_backed_sqlite_bulk_delete_allows_concurrent_control_reads() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = format!("sqlite:{}?mode=rwc", tmp.path().join("bulk.db").display());
+    let store = Store::connect(&url)
+        .await
+        .expect("connect file-backed store");
+    store
+        .put(
+            "provider",
+            "control-row",
+            "control-row",
+            "default",
+            b"control",
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut ids = Vec::new();
+    for idx in 0..500 {
+        let id = format!("session-{idx}");
+        store
+            .put("ssh_session", &id, &id, "default", b"payload", None)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let read_store = store.clone();
+    let read_stop = stop.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let reader = tokio::spawn(async move {
+        let mut reads = 0_usize;
+        let mut started_tx = Some(started_tx);
+        while !read_stop.load(Ordering::Relaxed) {
+            read_store
+                .get("provider", "control-row")
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "control row disappeared".to_string())?;
+            reads += 1;
+            if let Some(started_tx) = started_tx.take() {
+                let _ = started_tx.send(());
+            }
+            tokio::task::yield_now().await;
+        }
+        Ok::<usize, String>(reads)
+    });
+    started_rx.await.expect("reader started");
+
+    assert_eq!(store.delete_many("ssh_session", &ids).await.unwrap(), 500);
+    stop.store(true, Ordering::Relaxed);
+    assert!(reader.await.unwrap().unwrap() > 0);
+    assert!(
+        store
+            .get("provider", "control-row")
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -828,7 +1339,7 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
         metadata: Some(ProtoObjectMeta {
             id: id.to_string(),
             name: name.to_string(),
-            created_at_ms: 1,
+            created_time: openshell_core::time::timestamp_from_millis(1).ok(),
             workspace: "default".to_string(),
             ..Default::default()
         }),
@@ -1689,6 +2200,83 @@ async fn cas_concurrent_updates_one_succeeds() {
     assert_eq!(record.resource_version, 2);
 }
 
+/// Write `payload` to the shared `sandbox-1` row under `condition`.
+async fn put_sandbox_1(
+    store: &Store,
+    payload: &str,
+    condition: super::WriteCondition,
+) -> Result<super::WriteResult, PersistenceError> {
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            "default",
+            payload.as_bytes(),
+            None,
+            condition,
+        )
+        .await
+}
+
+/// Each write must report the version it produced, even while other writers
+/// race on the same row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_writes_return_their_own_resource_version() {
+    use super::WriteCondition;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    const WRITERS: u64 = 8;
+    const WRITES: u64 = 25;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = on_disk_store_url(&tmp.path().join("openshell.db"));
+    let store = Arc::new(Store::connect(&url).await.expect("connect to sqlite"));
+    put_sandbox_1(&store, "initial", WriteCondition::MustCreate)
+        .await
+        .unwrap();
+
+    let writers = (0..WRITERS).map(|writer| {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut versions = Vec::new();
+            for write in 0..WRITES {
+                let payload = format!("{writer}-{write}");
+                let unconditional = put_sandbox_1(&store, &payload, WriteCondition::Unconditional)
+                    .await
+                    .unwrap();
+                versions.push(unconditional.resource_version);
+
+                // Retry the version-checked update until it wins a race.
+                loop {
+                    let current = store.get("sandbox", "id-1").await.unwrap().unwrap();
+                    let condition = WriteCondition::MatchResourceVersion(current.resource_version);
+                    match put_sandbox_1(&store, &payload, condition).await {
+                        Ok(result) => {
+                            versions.push(result.resource_version);
+                            break;
+                        }
+                        Err(PersistenceError::Conflict { .. }) => {}
+                        Err(err) => panic!("unexpected error: {err}"),
+                    }
+                }
+            }
+            versions
+        })
+    });
+
+    let mut seen = BTreeSet::new();
+    for handle in futures::future::join_all(writers).await {
+        for version in handle.unwrap() {
+            assert!(seen.insert(version), "version {version} returned twice");
+        }
+    }
+
+    let total = WRITERS * WRITES * 2;
+    assert_eq!(seen, (2..=total + 1).collect::<BTreeSet<_>>());
+}
+
 #[tokio::test]
 async fn cas_update_message_cas_succeeds() {
     use openshell_core::proto::Sandbox;
@@ -1700,15 +2288,16 @@ async fn cas_update_message_cas_succeeds() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1731,6 +2320,61 @@ async fn cas_update_message_cas_succeeds() {
 }
 
 #[tokio::test]
+async fn cas_update_message_cas_internal_updates_survive_concurrent_writers() {
+    use openshell_core::proto::Sandbox;
+    use std::sync::Arc;
+
+    let store = Arc::new(test_store().await);
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "test-id".to_string(),
+            name: "test-sandbox".to_string(),
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+            annotations: std::collections::HashMap::new(),
+            workspace: "default".to_string(),
+            deletion_time: None,
+        }),
+        ..Sandbox::default()
+    };
+    store.put_message(&sandbox).await.unwrap();
+
+    let handles: Vec<_> = (0..5)
+        .map(|i| {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move {
+                store
+                    .update_message_cas::<Sandbox, _>("test-id", 0, move |s| {
+                        s.metadata
+                            .as_mut()
+                            .unwrap()
+                            .annotations
+                            .insert(format!("writer-{i}"), "done".to_string());
+                    })
+                    .await
+            })
+        })
+        .collect();
+    for result in futures::future::join_all(handles).await {
+        result
+            .unwrap()
+            .expect("internal update must not surface a conflict");
+    }
+
+    let stored = store
+        .get_message::<Sandbox>("test-id")
+        .await
+        .unwrap()
+        .unwrap();
+    let metadata = stored.metadata.unwrap();
+    assert_eq!(metadata.resource_version, 6);
+    for i in 0..5 {
+        assert_eq!(metadata.annotations[&format!("writer-{i}")], "done");
+    }
+}
+
+#[tokio::test]
 async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
     use openshell_core::proto::Sandbox;
     use std::sync::Arc;
@@ -1742,15 +2386,16 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "test-id".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1812,15 +2457,16 @@ async fn cas_update_message_cas_rejects_workspace_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "ws-immutable".to_string(),
             name: "test-sandbox".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "alpha".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1854,15 +2500,16 @@ async fn cas_update_message_cas_rejects_name_change() {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: "name-immutable".to_string(),
             name: "original".to_string(),
-            created_at_ms: 1000,
+            created_time: openshell_core::time::timestamp_from_millis(1000).ok(),
             labels: std::collections::HashMap::new(),
             annotations: std::collections::HashMap::new(),
             resource_version: 0,
             workspace: "default".to_string(),
-            deletion_timestamp_ms: 0,
+            deletion_time: None,
         }),
         spec: None,
         status: None,
+        ..Sandbox::default()
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -2243,7 +2890,6 @@ async fn membership_selector_escapes_adversarial_label_key() {
 /// so a trace decomposes an RPC into the storage work it did rather than
 /// bottoming out at the request boundary.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_operations_export_spans_with_parents() {
     use tracing::Instrument as _;
 
@@ -2263,7 +2909,7 @@ async fn store_operations_export_spans_with_parents() {
     .await;
     drop(request_span);
 
-    let root = traced.span_named("request");
+    let root = traced.wait_for_span("request").await;
     let spans = traced.finished_spans();
     let child = spans
         .iter()

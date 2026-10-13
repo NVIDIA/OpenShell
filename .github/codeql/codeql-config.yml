@@ -11,5 +11,7 @@ paths:
   - python/openshell
 
 paths-ignore:
+  # Integration-test targets are not removed by the Rust cfg override.
+  - crates/*/tests
   - python/openshell/_proto
   - sdk/typescript/src/gen

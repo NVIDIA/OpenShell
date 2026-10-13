@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Build multi-arch gateway + supervisor images and push to a container registry.
+# Build multi-arch gateway, sandbox, and supervisor images and push them.
 # Requires DOCKER_REGISTRY to be set (e.g. ghcr.io/myorg).
 
 set -euo pipefail
@@ -47,6 +47,10 @@ _publish_multiarch_docker() {
   tasks/scripts/docker-build-image.sh gateway
 
   echo
+  echo "Building multi-arch sandbox image..."
+  tasks/scripts/docker-build-image.sh sandbox
+
+  echo
   echo "Building multi-arch supervisor image..."
   tasks/scripts/docker-build-image.sh supervisor
 
@@ -56,7 +60,7 @@ _publish_multiarch_docker() {
   fi
 
   if [[ ${#TAGS_TO_APPLY[@]} -gt 0 ]]; then
-    for component in gateway supervisor; do
+    for component in gateway sandbox supervisor; do
       full_image="${REGISTRY}/${component}"
       for tag in "${TAGS_TO_APPLY[@]}"; do
         [[ "${tag}" == "${IMAGE_TAG}" ]] && continue
@@ -79,7 +83,7 @@ _publish_multiarch_podman() {
   # Split comma-separated platforms into an array.
   IFS=',' read -ra PLATFORM_LIST <<< "${PLATFORMS}"
 
-  for component in gateway supervisor; do
+  for component in gateway sandbox supervisor; do
     local full_image="${REGISTRY}/${component}"
     local manifest_name="${full_image}:${IMAGE_TAG}"
 
@@ -145,6 +149,7 @@ fi
 echo
 echo "Done! Multi-arch images pushed to ${REGISTRY}:"
 echo "  ${REGISTRY}/gateway:${IMAGE_TAG}"
+echo "  ${REGISTRY}/sandbox:${IMAGE_TAG}"
 echo "  ${REGISTRY}/supervisor:${IMAGE_TAG}"
 if [[ "${TAG_LATEST}" == "true" ]]; then
   echo "  (all also tagged :latest)"

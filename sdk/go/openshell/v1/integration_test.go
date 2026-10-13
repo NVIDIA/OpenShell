@@ -44,7 +44,7 @@ func TestIntegration_SandboxExecSmoke(t *testing.T) {
 
 	image := os.Getenv("OPENSHELL_GO_SDK_TEST_IMAGE")
 	if image == "" {
-		image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+		image = "nvcr.io/nvidia/base/ubuntu:24.04"
 	}
 	name := fmt.Sprintf("go-smoke-%09d", time.Now().UnixNano()%1_000_000_000)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)

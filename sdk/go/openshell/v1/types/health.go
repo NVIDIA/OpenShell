@@ -25,6 +25,31 @@ type GatewayInfo struct {
 	Status         ServiceStatus
 	Version        string
 	ComputeDrivers []ComputeDriverInfo
+	Extensions     []ExtensionInfo
+}
+
+// ExtensionKind identifies one supported extension family.
+type ExtensionKind string
+
+// Extension kind constants.
+const (
+	ExtensionKindComputeDriver        ExtensionKind = "ComputeDriver"
+	ExtensionKindCredentialDriver     ExtensionKind = "CredentialDriver"
+	ExtensionKindGatewayInterceptor   ExtensionKind = "GatewayInterceptor"
+	ExtensionKindSupervisorMiddleware ExtensionKind = "SupervisorMiddleware"
+	ExtensionKindUnknown              ExtensionKind = "Unknown"
+)
+
+// ExtensionInfo describes one successful gateway/extension negotiation.
+type ExtensionInfo struct {
+	Kind                  ExtensionKind
+	ConfiguredName        string
+	ImplementationName    string
+	ImplementationVersion string
+	ProtocolMajor         uint32
+	ProtocolMinor         uint32
+	SupportedCapabilities []string
+	RequiredCapabilities  []string
 }
 
 // ComputeDriverInfo describes a compute backend available on the gateway.

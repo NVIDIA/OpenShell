@@ -14,6 +14,11 @@
 # HTTPS endpoint-only mode is intentionally unsupported here. Use a named
 # gateway config when mTLS materials are needed.
 #
+# Supervisor image overrides:
+#   SUPERVISOR_IMAGE=... (common test-wrapper override)
+#   OPENSHELL_SUPERVISOR_IMAGE=... (existing compatibility override)
+#   SANDBOX_IMAGE=... (trusted sandbox runtime override)
+#
 # Set OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS to override the managed gateway's
 # Podman sandbox stop timeout. The harness default is intentionally shorter
 # than the production driver default to keep CI teardown bounded.
@@ -28,6 +33,8 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
+# shellcheck source=e2e/support/podman-gateway-config.sh
+source "${ROOT}/e2e/support/podman-gateway-config.sh"
 
 require_container_engine_lane() {
   local lane=$1
@@ -80,7 +87,11 @@ with_podman_config() {
 }
 
 podman_cmd() {
-  with_podman_config podman "$@"
+  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+    with_podman_config podman --url "unix://${OPENSHELL_PODMAN_SOCKET}" "$@"
+  else
+    with_podman_config podman "$@"
+  fi
 }
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
@@ -93,19 +104,24 @@ if [ "${OPENSHELL_E2E_SPIFFE_FIXTURE:-0}" = "1" ]; then
   if [ -z "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
     OPENSHELL_E2E_PROVIDER_SPIFFE_PORT="$(e2e_pick_port)"
     export OPENSHELL_E2E_PROVIDER_SPIFFE_LISTEN="0.0.0.0:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
-    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:169.254.1.2:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
+    # Podman supervisors run with host networking, so reach the host-side
+    # Workload API fixture over loopback rather than the workload bridge.
+    export OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET="tcp:127.0.0.1:${OPENSHELL_E2E_PROVIDER_SPIFFE_PORT}"
   fi
 fi
 GATEWAY_BIN=""
 CLI_BIN=""
 GATEWAY_PID=""
 GATEWAY_LOG="${WORKDIR}/gateway.log"
+export OPENSHELL_E2E_GATEWAY_LOG="${GATEWAY_LOG}"
 GATEWAY_PID_FILE="${WORKDIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${WORKDIR}/gateway.args"
 DRIVER_BIN=""
 DRIVER_PID=""
 DRIVER_LOG="${WORKDIR}/podman-driver.log"
 DRIVER_SOCKET="${WORKDIR}/compute-driver.sock"
+DRIVER_DATA_HOME="${WORKDIR}/driver-data"
+mkdir -p "${DRIVER_DATA_HOME}"
 E2E_NAMESPACE=""
 PODMAN_NETWORK_NAME=""
 PODMAN_NETWORK_MANAGED=0
@@ -160,9 +176,24 @@ cleanup() {
     for id in ${sandbox_ids}; do
       local sandbox_id
       sandbox_id="$(podman_cmd inspect --format '{{ index .Config.Labels "openshell.ai/sandbox-id" }}' "${id}" 2>/dev/null || true)"
-      podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
+        # Only the companion is attached to the test network. Remove it first
+        # (it depends on the workload user namespace), then locate the isolated
+        # network=none workload by this test sandbox's immutable label.
+        podman_cmd rm -f "openshell-supervisor-${sandbox_id}" >/dev/null 2>&1 || true
+        local workload_ids workload_id
+        workload_ids="$(podman_cmd ps -aq --filter "label=openshell.managed=true" \
+          --filter "label=openshell.ai/sandbox-id=${sandbox_id}" \
+          --filter "label=openshell.ai/isolation-role=sandbox" 2>/dev/null || true)"
+        for workload_id in ${workload_ids}; do
+          podman_cmd rm -f "${workload_id}" >/dev/null 2>&1 || true
+        done
+        podman_cmd volume rm "openshell-channel-${sandbox_id}" >/dev/null 2>&1 || true
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
+        local secret_prefix
+        for secret_prefix in openshell-token openshell-proxy-auth openshell-resolver openshell-tls-ca openshell-tls-cert openshell-tls-key; do
+          podman_cmd secret rm "${secret_prefix}-${sandbox_id}" >/dev/null 2>&1 || true
+        done
       fi
     done
   fi
@@ -234,6 +265,7 @@ default_podman_socket_path() {
 
 ensure_podman_api_socket() {
   if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
     return 0
   fi
 
@@ -241,8 +273,9 @@ ensure_podman_api_socket() {
   default_socket="$(default_podman_socket_path || true)"
   if [ -n "${default_socket}" ] \
      && [ -S "${default_socket}" ] \
-     && podman_cmd --url "unix://${default_socket}" info >/dev/null 2>&1; then
+     && with_podman_config podman --url "unix://${default_socket}" info >/dev/null 2>&1; then
     export OPENSHELL_PODMAN_SOCKET="${default_socket}"
+    export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
     return 0
   fi
 
@@ -266,12 +299,13 @@ ensure_podman_api_socket() {
     >"${PODMAN_SERVICE_LOG}" 2>&1 &
   PODMAN_SERVICE_PID=$!
   export OPENSHELL_PODMAN_SOCKET="${PODMAN_SOCKET}"
+  export CONTAINER_HOST="${CONTAINER_HOST:-unix://${OPENSHELL_PODMAN_SOCKET}}"
 
   local elapsed=0
   local timeout=30
   while [ "${elapsed}" -lt "${timeout}" ]; do
     if [ -S "${PODMAN_SOCKET}" ] \
-       && podman_cmd --url "unix://${PODMAN_SOCKET}" info >/dev/null 2>&1; then
+       && podman_cmd info >/dev/null 2>&1; then
       return 0
     fi
 
@@ -296,6 +330,16 @@ resolve_podman_supervisor_image() {
     return 0
   fi
 
+  if [ -n "${SUPERVISOR_IMAGE:-}" ]; then
+    if [ -n "${CI:-}" ] && [ -z "${IMAGE_TAG:-}" ] \
+       && ! e2e_image_reference_is_complete "${SUPERVISOR_IMAGE}"; then
+      echo "ERROR: IMAGE_TAG must be set in CI when SUPERVISOR_IMAGE is repository-only." >&2
+      exit 2
+    fi
+    printf '%s\n' "$(e2e_resolve_image_reference "${SUPERVISOR_IMAGE}" "${IMAGE_TAG:-dev}")"
+    return 0
+  fi
+
   if [ -n "${CI:-}" ]; then
     if [ -z "${IMAGE_TAG:-}" ]; then
       echo "ERROR: IMAGE_TAG must be set in CI when no Podman supervisor image override is provided." >&2
@@ -308,6 +352,30 @@ resolve_podman_supervisor_image() {
   fi
 
   printf '%s\n' "openshell/supervisor:dev"
+}
+
+resolve_podman_sandbox_runtime_image() {
+  if [ -n "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ]; then
+    printf '%s\n' "${OPENSHELL_SANDBOX_RUNTIME_IMAGE}"
+    return 0
+  fi
+  if [ -n "${SANDBOX_IMAGE:-}" ]; then
+    printf '%s\n' "$(e2e_resolve_image_reference "${SANDBOX_IMAGE}" "${IMAGE_TAG:-dev}")"
+    return 0
+  fi
+
+  if [ -n "${CI:-}" ]; then
+    if [ -z "${IMAGE_TAG:-}" ]; then
+      echo "ERROR: IMAGE_TAG must be set in CI when no Podman sandbox runtime image override is provided." >&2
+      exit 2
+    fi
+
+    local registry="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+    printf '%s/sandbox:%s\n' "${registry%/}" "${IMAGE_TAG}"
+    return 0
+  fi
+
+  printf '%s\n' "openshell/sandbox:dev"
 }
 
 ensure_podman_supervisor_image() {
@@ -337,7 +405,38 @@ ensure_podman_supervisor_image() {
   fi
 
   echo "ERROR: supervisor image '${image}' is not available." >&2
-  echo "       Build it, push it, or set OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  echo "       Build it, push it, or set SUPERVISOR_IMAGE/OPENSHELL_SUPERVISOR_IMAGE to a pullable image." >&2
+  exit 2
+}
+
+ensure_podman_sandbox_runtime_image() {
+  local image=$1
+
+  if [ "${image}" = "openshell/sandbox:dev" ] \
+     && [ -z "${OPENSHELL_SANDBOX_RUNTIME_IMAGE:-}" ] \
+     && [ -z "${CI:-}" ]; then
+    echo "Building local Podman sandbox runtime image ${image}..."
+    with_podman_config env CONTAINER_ENGINE=podman IMAGE_TAG=dev \
+      bash "${ROOT}/tasks/scripts/docker-build-image.sh" sandbox
+    if podman_cmd image exists "${image}" 2>/dev/null; then
+      return 0
+    fi
+
+    echo "ERROR: expected sandbox runtime image '${image}' after local build." >&2
+    exit 2
+  fi
+
+  if podman_cmd image exists "${image}" 2>/dev/null; then
+    return 0
+  fi
+
+  echo "Pulling Podman sandbox runtime image ${image}..."
+  if podman_cmd pull "${image}"; then
+    return 0
+  fi
+
+  echo "ERROR: sandbox runtime image '${image}' is not available." >&2
+  echo "       Build it, push it, or set OPENSHELL_SANDBOX_RUNTIME_IMAGE to a pullable image." >&2
   exit 2
 }
 
@@ -370,19 +469,22 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ]; then
   exit $?
 fi
 
+EXTERNAL_DRIVER_PULL_POLICY="if_not_present"
+
 # Preflight for managed Podman gateway mode.
 if ! command -v podman >/dev/null 2>&1; then
   echo "ERROR: podman CLI is required to run Podman-backed e2e tests" >&2
   exit 2
 fi
+ensure_podman_api_socket
 if ! podman_cmd info >/dev/null 2>&1; then
   echo "ERROR: podman service is not reachable (podman info failed)" >&2
   echo "       Start it with 'podman machine start' on macOS, or the user service on Linux." >&2
   exit 2
 fi
-ensure_podman_api_socket
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
+export OPENSHELL_BIN="${CLI_BIN}"
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   e2e_build_external_driver \
     "${ROOT}" openshell-driver-podman openshell-driver-podman DRIVER_BIN
@@ -392,17 +494,22 @@ SUPERVISOR_IMAGE="$(resolve_podman_supervisor_image)"
 ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
 echo "Using Podman supervisor image: ${SUPERVISOR_IMAGE}"
 
-DEFAULT_SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-SANDBOX_IMAGE="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
+SANDBOX_BOUNDARY_IMAGE="$(resolve_podman_sandbox_runtime_image)"
+ensure_podman_sandbox_runtime_image "${SANDBOX_BOUNDARY_IMAGE}"
+echo "Using Podman sandbox runtime image: ${SANDBOX_BOUNDARY_IMAGE}"
+
+DEFAULT_SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04"
+SANDBOX_IMAGE_REQUEST="${OPENSHELL_E2E_PODMAN_SANDBOX_IMAGE:-${OPENSHELL_SANDBOX_IMAGE:-${DEFAULT_SANDBOX_IMAGE}}}"
 PODMAN_STOP_TIMEOUT_SECS="${OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS:-15}"
 if ! [[ "${PODMAN_STOP_TIMEOUT_SECS}" =~ ^[0-9]+$ ]]; then
   echo "ERROR: OPENSHELL_E2E_PODMAN_STOP_TIMEOUT_SECS must be a non-negative integer." >&2
   exit 2
 fi
-if ! podman_cmd image exists "${SANDBOX_IMAGE}" 2>/dev/null; then
-  echo "Pulling ${SANDBOX_IMAGE}..."
-  podman_cmd pull "${SANDBOX_IMAGE}"
+if ! podman_cmd image exists "${SANDBOX_IMAGE_REQUEST}" 2>/dev/null; then
+  echo "Pulling ${SANDBOX_IMAGE_REQUEST}..."
+  podman_cmd pull "${SANDBOX_IMAGE_REQUEST}"
 fi
+echo "Using Podman sandbox image: ${SANDBOX_IMAGE_REQUEST}"
 
 PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
@@ -410,16 +517,9 @@ export OPENSHELL_E2E_GATEWAY_CA_CERT="${PKI_DIR}/ca.crt"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
-if [ "$(uname -s)" = "Darwin" ]; then
-  # Podman Machine reserves IPv4 loopback for its callback-only listener.
-  PRIMARY_BIND_IP="::1"
-  CLI_ENDPOINT_HOST="localhost"
-  HEALTH_ENDPOINT_HOST="[::1]"
-else
-  PRIMARY_BIND_IP="127.0.0.1"
-  CLI_ENDPOINT_HOST="127.0.0.1"
-  HEALTH_ENDPOINT_HOST="127.0.0.1"
-fi
+PRIMARY_BIND_IP="127.0.0.1"
+CLI_ENDPOINT_HOST="127.0.0.1"
+HEALTH_ENDPOINT_HOST="127.0.0.1"
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 export XDG_STATE_HOME="${STATE_DIR}"
@@ -436,80 +536,45 @@ export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
 e2e_generate_gateway_jwt "${JWT_DIR}"
 
-# Driver-specific options moved from CLI flags into a TOML config table
-# (commit 560550d2). Synthesize a minimal config here and pass --config.
-# Quote a value as a TOML basic string: see with-docker-gateway.sh for
-# the same helper (kept duplicated to avoid sourcing across e2e scripts).
-toml_string() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  printf '"%s"' "${value}"
-}
-
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
-
-# Start from the RPM default template so this e2e test exercises the same TOML
-# config path that RPM users get on first start. The template leaves
-# bind_address unset and sets compute_drivers = ["podman"]. On Podman Machine,
-# the driver reserves IPv4 loopback for its callback-only listener, so the
-# primary listener uses IPv6 loopback. Native Linux keeps the IPv4 default.
-#
-# We append the driver-specific table and override the port via CLI flag
-# (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
-cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
-{
-  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
-  if [ "${OIDC_MODE}" != "1" ]; then
-    e2e_write_gateway_mtls_auth_config
-    if [ -n "${OPENSHELL_OIDC_ISSUER:-}" ]; then
-      e2e_write_gateway_oidc_config "${OPENSHELL_OIDC_ISSUER}"
-    fi
-  fi
-  printf '\n[openshell.drivers.podman]\n'
-  if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
-    printf 'socket_path = %s\n' "$(toml_string "${DRIVER_SOCKET}")"
-  else
-  # The Podman driver scopes isolation by network rather than namespace.
-  printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
-  printf 'gateway_port = %s\n'   "${HOST_PORT}"
-  printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
-  printf 'image_pull_policy = "missing"\n'
-  # Keep CI teardown bounded while the production Podman driver default stays
-  # conservative for real user workloads.
-  printf 'stop_timeout_secs = %s\n' "${PODMAN_STOP_TIMEOUT_SECS}"
-  printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
-  printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
-  printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
-  printf 'enable_bind_mounts = true\n'
-  if [ -n "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" ]; then
-    printf 'provider_spiffe_workload_api_socket = %s\n' "$(toml_string "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET}")"
-  fi
-  # The in-process Podman driver reads `socket_path` from TOML only — the
-  # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
-  # binary, not the in-process driver used here. Pin the socket to the one
-  # the harness discovered (e.g. via `podman machine inspect` on macOS) so
-  # we don't fall back to the driver's stale macOS default.
-  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
-    printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
-  fi
-  fi
-} >> "${GATEWAY_CONFIG}"
-
+e2e_write_podman_gateway_config \
+  "${GATEWAY_CONFIG}" \
+  "${ROOT}" \
+  "${PKI_DIR}" \
+  "${JWT_DIR}" \
+  "openshell-e2e-podman-${HOST_PORT}" \
+  "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" \
+  "${DRIVER_SOCKET}" \
+  "${PODMAN_NETWORK_NAME}" \
+  "${HOST_PORT}" \
+  "${SANDBOX_IMAGE_REQUEST}" \
+  "${PODMAN_STOP_TIMEOUT_SECS}" \
+  "${SUPERVISOR_IMAGE}" \
+  "${SANDBOX_BOUNDARY_IMAGE}" \
+  "${OPENSHELL_E2E_PROVIDER_SPIFFE_SOCKET:-}" \
+  "${OPENSHELL_PODMAN_SOCKET:-}" \
+  "${OIDC_MODE}" \
+  "${OPENSHELL_OIDC_ISSUER:-}"
+EXTERNAL_DRIVER_GRPC_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
+EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS=10
+EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS=true
+EXTERNAL_DRIVER_TLS_CA="${PKI_DIR}/ca.crt"
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
+  env -i \
+  XDG_DATA_HOME="${DRIVER_DATA_HOME}" \
   OPENSHELL_COMPUTE_DRIVER_SOCKET="${DRIVER_SOCKET}" \
   OPENSHELL_PODMAN_SOCKET="${OPENSHELL_PODMAN_SOCKET:-}" \
-  OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE}" \
-  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="missing" \
+  OPENSHELL_SANDBOX_IMAGE="${SANDBOX_IMAGE_REQUEST}" \
+  OPENSHELL_SANDBOX_IMAGE_PULL_POLICY="${EXTERNAL_DRIVER_PULL_POLICY}" \
+  OPENSHELL_HEALTH_CHECK_INTERVAL_SECS="${EXTERNAL_DRIVER_HEALTH_CHECK_INTERVAL_SECS}" \
+  OPENSHELL_GRPC_ENDPOINT="${EXTERNAL_DRIVER_GRPC_ENDPOINT}" \
   OPENSHELL_GATEWAY_PORT="${HOST_PORT}" \
   OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   OPENSHELL_STOP_TIMEOUT="${PODMAN_STOP_TIMEOUT_SECS}" \
+  OPENSHELL_SANDBOX_RUNTIME_IMAGE="${SANDBOX_BOUNDARY_IMAGE}" \
   OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
-  OPENSHELL_PODMAN_TLS_CA="${PKI_DIR}/ca.crt" \
-  OPENSHELL_PODMAN_TLS_CERT="${PKI_DIR}/client/tls.crt" \
-  OPENSHELL_PODMAN_TLS_KEY="${PKI_DIR}/client/tls.key" \
-  OPENSHELL_ENABLE_BIND_MOUNTS=true \
+  OPENSHELL_PODMAN_TLS_CA="${EXTERNAL_DRIVER_TLS_CA}" \
+  OPENSHELL_ENABLE_BIND_MOUNTS="${EXTERNAL_DRIVER_ENABLE_BIND_MOUNTS}" \
     "${DRIVER_BIN}" >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -518,13 +583,15 @@ fi
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  # compute_drivers comes from the RPM template. Override the loopback address
-  # and port so Podman Machine can keep its IPv4 callback listener distinct.
+  # compute_driver comes from the RPM template. Override the loopback port for
+  # this isolated test gateway.
   --bind-address "${PRIMARY_BIND_IP}"
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
+  # edge_tunnel_e2e exercises the opt-in WebSocket tunnel.
+  --enable-websocket-tunnel true
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
   --log-level info
 )
@@ -535,6 +602,11 @@ if [ "${OIDC_MODE}" = "1" ]; then
     --oidc-audience openshell-cli
     --oidc-scopes-claim scope
   )
+  case "${OIDC_ISSUER}" in
+    http://127.*|http://\[::1\]*)
+      GATEWAY_ARGS+=(--oidc-dangerously-allow-insecure-http true)
+      ;;
+  esac
 else
   GATEWAY_ARGS+=(
     --tls-client-ca "${PKI_DIR}/ca.crt"
@@ -548,6 +620,7 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_LOG}" \
   "${GATEWAY_PID_FILE}"
 
+OPENSHELL_LOCAL_TLS_DIR="${PKI_DIR}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &
@@ -597,6 +670,24 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
   echo "ERROR: gateway did not become healthy within ${timeout}s"
   exit 1
 fi
+
+# Seed the example profiles the provider tests rely on. The mTLS lanes already
+# have a registered gateway identity; the OIDC lanes deliberately skip
+# registration and have no token yet, so establish an administrator session
+# first rather than importing unauthenticated.
+if [ "${OIDC_MODE}" = "1" ]; then
+  e2e_register_oidc_admin_session \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${CLI_GATEWAY_ENDPOINT}" \
+    "${HOST_PORT}" \
+    "${OIDC_ISSUER}" \
+    "${OPENSHELL_E2E_OIDC_USERNAME:-admin@test}" \
+    "${OPENSHELL_E2E_OIDC_PASSWORD:-admin}" \
+    "${PKI_DIR}" \
+    "${CLI_BIN}" || exit 1
+fi
+e2e_import_example_provider_profiles "${CLI_BIN}" "${ROOT}" || exit 1
 
 echo "Running e2e command against ${CLI_GATEWAY_ENDPOINT}: $*"
 "$@"

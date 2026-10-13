@@ -3,12 +3,18 @@
 
 //! Endpoint-bound dynamic token grant injection for HTTP relay paths.
 
+#[cfg(test)]
+mod multiple_grants;
+
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
+use openshell_core::dynamic_credential_key::{credential_identity, endpoint_selector};
 use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
+use openshell_core::provider_credentials::ProviderCredentialSnapshot;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
     StatusId, Url as OcsfUrl, ctx::ctx as ocsf_ctx, ocsf_emit,
@@ -25,7 +31,7 @@ pub struct TokenGrantRequest<'a> {
     pub client_assertion_type: &'a str,
     pub audience: &'a str,
     pub scopes: &'a [String],
-    pub cache_ttl_seconds: i64,
+    pub cache_ttl: Option<std::time::Duration>,
     pub grant_type: i32,
     pub requested_token_type: &'a str,
 }
@@ -54,7 +60,7 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                     client_assertion_type: request.client_assertion_type,
                     audience: request.audience,
                     scopes: request.scopes,
-                    cache_ttl_override: request.cache_ttl_seconds,
+                    cache_ttl_override: request.cache_ttl,
                     grant_type: request.grant_type,
                     requested_token_type: request.requested_token_type,
                 },
@@ -68,98 +74,221 @@ pub fn default_resolver() -> Arc<dyn TokenGrantResolver> {
     Arc::new(SpiffeTokenGrantResolver)
 }
 
-/// Checks for endpoint-bound token grant credentials and injects an
-/// Authorization header before forwarding the request upstream.
+/// Resolves one endpoint-bound grant per protected header before rewriting a request.
+///
+/// Each header independently uses its most-specific matching binding. Every selected
+/// grant must succeed; callers must not forward the request when this returns an error.
 pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7Request> {
     let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
-    let token_grant_credential = ctx.dynamic_credentials.as_ref().and_then(|dyn_creds| {
-        dyn_creds.read().map_or(None, |creds_guard| {
-            creds_guard
-                .iter()
-                .filter_map(|(key, cred)| {
-                    let score =
-                        dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
-                    cred.token_grant
-                        .is_some()
-                        .then(|| (score, key.clone(), cred.clone()))
-                })
-                .max_by_key(|(score, key, _)| (*score, key.clone()))
-                .map(|(_, key, cred)| (key, cred))
+    let credentials = match ctx.dynamic_credentials.as_ref() {
+        Some(dynamic_credentials) => {
+            let credentials = dynamic_credentials
+                .read()
+                .map_err(|_| miette!("dynamic credential snapshot unavailable"))?;
+            select_token_grants(token_grant_candidates(
+                &credentials,
+                ctx,
+                request_path,
+                None,
+            )?)?
+        }
+        None => Vec::new(),
+    };
+    inject_selected(req, ctx, credentials).await
+}
+
+/// Inject only grants owned by endpoints that admitted the inspected request.
+/// An empty owner set permits no acquisition, including audit-only forwarding.
+/// L4-only forwarding continues to use `inject_if_needed` with its existing
+/// endpoint-selector contract; it has no per-request L7 admission decision.
+///
+/// Credentials come from the pinned `snapshot`, and each selected key is scoped
+/// to its revision and installation after selection so the one-grant-per-header
+/// ambiguity check still compares the original credential identities.
+pub(super) async fn inject_for_admitted_owners(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    snapshot: &ProviderCredentialSnapshot,
+    admitted_owners: &HashSet<String>,
+) -> Result<L7Request> {
+    let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
+    if snapshot
+        .dynamic_credentials
+        .iter()
+        .any(|(key, credential)| {
+            credential.token_grant.is_some()
+                && credential.token_grant_owners.is_empty()
+                && dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)
+                    .is_some()
         })
-    });
-
-    if let Some((provider_key, cred)) = token_grant_credential
-        && let Some(ref token_grant) = cred.token_grant
     {
-        let resolver = ctx
-            .token_grant_resolver
-            .as_ref()
-            .ok_or_else(|| miette!("token grant resolver unavailable"))?;
-        let request = token_grant_request(&provider_key, token_grant);
+        return Err(miette!(
+            "dynamic token grant is missing endpoint ownership metadata; upgrade the gateway before the supervisor"
+        ));
+    }
+    let candidates = token_grant_candidates(
+        &snapshot.dynamic_credentials,
+        ctx,
+        request_path,
+        Some(admitted_owners),
+    )?;
+    let credentials = select_token_grants(candidates)?
+        .into_iter()
+        .map(|(key, cred)| (snapshot.scoped_key(&key), cred))
+        .collect();
+    inject_selected(req, ctx, credentials).await
+}
 
-        match resolver.obtain(request).await {
-            Ok(access_token) => {
-                let modified_raw_header =
-                    inject_token_grant_header(&req.raw_header, &cred, &access_token)?;
-                let provider_key = ocsf_message_field(&provider_key);
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Other)
-                        .action(ActionId::Allowed)
-                        .disposition(DispositionId::Allowed)
-                        .severity(SeverityId::Informational)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant successful for {} to {}:{}",
-                            provider_key, ctx.host, ctx.port
-                        ))
-                        .build()
-                );
-                return Ok(L7Request {
-                    action: req.action,
-                    target: req.target,
-                    query_params: req.query_params,
-                    raw_header: modified_raw_header,
-                    body_length: req.body_length,
-                });
-            }
-            Err(e) => {
-                warn!(
-                    host = %ctx.host,
-                    port = ctx.port,
-                    provider = %provider_key,
-                    error = %e,
-                    "Token grant failed: {e}"
-                );
-                let provider_key = ocsf_message_field(&provider_key);
-                ocsf_emit!(
-                    HttpActivityBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .action(ActionId::Denied)
-                        .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .http_request(HttpRequest::new(
-                            &req.action,
-                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-                        ))
-                        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                        .message(format!(
-                            "Token grant failed for {} to {}:{}: {}",
-                            provider_key, ctx.host, ctx.port, e
-                        ))
-                        .build()
-                );
-                return Err(miette!("Token grant failed: {}", e));
-            }
+/// Acquires every selected grant and rewrites the request headers.
+///
+/// An empty selection forwards the request unchanged. Any failed acquisition
+/// returns an error before any header is written.
+async fn inject_selected(
+    req: L7Request,
+    ctx: &L7EvalContext,
+    credentials: Vec<(String, ProviderProfileCredential)>,
+) -> Result<L7Request> {
+    let request_path = req.target.split('?').next().unwrap_or(req.target.as_str());
+    if credentials.is_empty() {
+        return Ok(req);
+    }
+    let resolver = ctx
+        .token_grant_resolver
+        .as_ref()
+        .ok_or_else(|| miette!("token grant resolver unavailable"))?;
+
+    // Release the credential snapshot lock before acquisition. Keep all token values
+    // local until every selected grant and header has been validated, so a later
+    // failure cannot expose a partially authenticated request to a relay caller.
+    let mut headers = Vec::with_capacity(credentials.len());
+    for (provider_key, cred) in &credentials {
+        let token_grant = cred
+            .token_grant
+            .as_ref()
+            .ok_or_else(|| miette!("selected credential has no token grant"))?;
+        let request = token_grant_request(provider_key, token_grant)?;
+        if let Ok(access_token) = resolver.obtain(request).await {
+            crate::token_grant::validate_access_token(&access_token)?;
+            headers.push(token_grant_header(cred, &access_token)?);
+        } else {
+            // An issuer may echo credentials in its error description. Only the
+            // binding identity is safe to include in diagnostics or relay errors.
+            let provider_key = ocsf_message_field(provider_key);
+            warn!(
+                host = %ctx.host,
+                port = ctx.port,
+                provider = %provider_key,
+                "Token grant failed"
+            );
+            ocsf_emit!(
+                HttpActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .http_request(HttpRequest::new(
+                        &req.action,
+                        OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message(format!(
+                        "Token grant failed for {} to {}:{}",
+                        provider_key, ctx.host, ctx.port
+                    ))
+                    .build()
+            );
+            return Err(miette!("Token grant failed"));
         }
     }
 
-    Ok(req)
+    let mut raw_header = req.raw_header;
+    for (name, value) in headers {
+        raw_header = inject_header(&raw_header, &name, &value)?;
+    }
+    for (provider_key, _) in credentials {
+        ocsf_emit!(
+            HttpActivityBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Allowed)
+                .severity(SeverityId::Informational)
+                .http_request(HttpRequest::new(
+                    &req.action,
+                    OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .message(format!(
+                    "Token grant successful for {} to {}:{}",
+                    ocsf_message_field(&provider_key),
+                    ctx.host,
+                    ctx.port
+                ))
+                .build()
+        );
+    }
+    Ok(L7Request { raw_header, ..req })
+}
+
+fn select_token_grants(
+    mut candidates: Vec<(u32, String, ProviderProfileCredential)>,
+) -> Result<Vec<(String, ProviderProfileCredential)>> {
+    // Examine the strongest bindings first. The complete binding key stays with
+    // its grant because the resolver uses it to separate cache entries and revisions.
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    let mut selected = BTreeMap::<String, (u32, String, ProviderProfileCredential)>::new();
+    for (score, key, credential) in candidates {
+        let identity =
+            credential_identity(&key).ok_or_else(|| miette!("invalid dynamic credential key"))?;
+        let header = token_grant_header_name(&credential)?.to_ascii_lowercase();
+        if let Some((selected_score, selected_key, _)) = selected.get(&header) {
+            // Equal-specificity selectors of the same credential can overlap. A
+            // different credential cannot win a tie for the same protected header.
+            let selected_identity = credential_identity(selected_key);
+            if score == *selected_score && Some(identity) != selected_identity {
+                return Err(miette!("ambiguous dynamic token grants for one header"));
+            }
+            continue;
+        }
+        selected.insert(header, (score, key, credential));
+    }
+    Ok(selected
+        .into_values()
+        .map(|(_, key, cred)| (key, cred))
+        .collect())
+}
+
+/// Collects token-grant credentials whose endpoint binding matches the request.
+///
+/// With `admitted_owners`, a credential is a candidate only when one of its
+/// owners admitted the request. Filtering happens before specificity ranking, so
+/// a narrower sibling cannot lend its grant to an allow from another endpoint.
+fn token_grant_candidates(
+    credentials: &HashMap<String, ProviderProfileCredential>,
+    ctx: &L7EvalContext,
+    request_path: &str,
+    admitted_owners: Option<&HashSet<String>>,
+) -> Result<Vec<(u32, String, ProviderProfileCredential)>> {
+    credentials
+        .iter()
+        .filter_map(|(key, cred)| {
+            if cred.token_grant.is_none()
+                || admitted_owners.is_some_and(|owners| {
+                    !cred
+                        .token_grant_owners
+                        .iter()
+                        .any(|owner| owners.contains(owner))
+                })
+            {
+                return None;
+            }
+            if endpoint_selector(key).is_none() {
+                return Some(Err(miette!("invalid dynamic credential endpoint key")));
+            }
+            let score = dynamic_credential_key_match_score(key, &ctx.host, ctx.port, request_path)?;
+            Some(Ok((score, key.clone(), cred.clone())))
+        })
+        .collect()
 }
 
 fn ocsf_message_field(value: &str) -> String {
@@ -172,18 +301,24 @@ fn ocsf_message_field(value: &str) -> String {
 fn token_grant_request<'a>(
     provider_key: &'a str,
     token_grant: &'a ProviderCredentialTokenGrant,
-) -> TokenGrantRequest<'a> {
-    TokenGrantRequest {
+) -> Result<TokenGrantRequest<'a>> {
+    let cache_ttl = token_grant
+        .cache_ttl
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|error| miette!("invalid token grant cache_ttl: {error}"))?;
+    Ok(TokenGrantRequest {
         provider_key,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
         client_assertion_type: &token_grant.client_assertion_type,
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
-        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        cache_ttl,
         grant_type: token_grant.grant_type,
         requested_token_type: &token_grant.requested_token_type,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -197,25 +332,21 @@ fn dynamic_credential_key_match_score(
     port: u16,
     request_path: &str,
 ) -> Option<u32> {
-    let mut parts = key.splitn(4, '\t');
-    let endpoint_host = parts.next()?;
-    let endpoint_port = parts.next()?;
-    let endpoint_path = parts.next()?;
-    let _provider_key = parts.next()?;
+    let selector = endpoint_selector(key)?;
 
-    if endpoint_port.parse::<u16>().ok() != Some(port) {
+    if selector.port.parse::<u16>().ok() != Some(port) {
         return None;
     }
 
-    if !openshell_core::host_pattern::host_matches(endpoint_host, host).unwrap_or(false)
-        || !crate::l7::endpoint_path_matches(endpoint_path, request_path)
+    if !openshell_core::host_pattern::host_matches(selector.host, host).unwrap_or(false)
+        || !crate::l7::endpoint_path_matches(selector.path, request_path)
     {
         return None;
     }
 
     Some(
-        host_pattern_specificity(&endpoint_host.to_ascii_lowercase())
-            + endpoint_path_specificity(endpoint_path),
+        host_pattern_specificity(&selector.host.to_ascii_lowercase())
+            + endpoint_path_specificity(selector.path),
     )
 }
 
@@ -240,6 +371,7 @@ fn count_as_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
+#[cfg(test)]
 fn inject_token_grant_header(
     raw_header: &[u8],
     credential: &ProviderProfileCredential,
@@ -254,6 +386,16 @@ fn token_grant_header(
     credential: &ProviderProfileCredential,
     access_token: &str,
 ) -> Result<(String, String)> {
+    let header_name = token_grant_header_name(credential)?;
+    let header_value = if credential.auth_style.trim().eq_ignore_ascii_case("header") {
+        access_token.to_string()
+    } else {
+        format!("Bearer {access_token}")
+    };
+    Ok((header_name.to_string(), header_value))
+}
+
+fn token_grant_header_name(credential: &ProviderProfileCredential) -> Result<&str> {
     match credential.auth_style.trim().to_ascii_lowercase().as_str() {
         "" | "bearer" => {
             let header_name = if credential.header_name.trim().is_empty() {
@@ -262,7 +404,7 @@ fn token_grant_header(
                 credential.header_name.trim()
             };
             validate_header_name(header_name)?;
-            Ok((header_name.to_string(), format!("Bearer {access_token}")))
+            Ok(header_name)
         }
         "header" => {
             let header_name = credential.header_name.trim();
@@ -272,7 +414,7 @@ fn token_grant_header(
                 ));
             }
             validate_header_name(header_name)?;
-            Ok((header_name.to_string(), access_token.to_string()))
+            Ok(header_name)
         }
         other => Err(miette!(
             "token grant auth_style '{other}' is not supported; use bearer or header"
@@ -365,7 +507,7 @@ pub mod test_support {
 
     struct FakeTokenGrantResolver {
         requests: Arc<Mutex<Vec<OwnedTokenGrantRequest>>>,
-        response: std::result::Result<String, String>,
+        responses: Arc<Mutex<HashMap<String, std::result::Result<String, String>>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,7 +518,7 @@ pub mod test_support {
         client_assertion_type: String,
         audience: String,
         scopes: Vec<String>,
-        cache_ttl_seconds: i64,
+        cache_ttl: Option<std::time::Duration>,
         grant_type: i32,
         requested_token_type: String,
     }
@@ -385,9 +527,21 @@ pub mod test_support {
         dynamic_credentials: Arc<std::sync::RwLock<HashMap<String, ProviderProfileCredential>>>,
         resolver: Arc<dyn TokenGrantResolver>,
         requests: Arc<Mutex<Vec<OwnedTokenGrantRequest>>>,
+        responses: Arc<Mutex<HashMap<String, std::result::Result<String, String>>>>,
+        /// Revision-scoped key -> installed key, so assertions can name the key a
+        /// test installed even when injection requests its scoped form.
+        scoped_keys: Mutex<HashMap<String, String>>,
     }
 
     impl TokenGrantTestFixture {
+        fn installed_key(&self, requested: &str) -> String {
+            self.scoped_keys
+                .lock()
+                .unwrap()
+                .get(requested)
+                .map_or_else(|| requested.to_string(), Clone::clone)
+        }
+
         pub fn success(key: &str, token: &str) -> Self {
             Self::new(key, Ok(token))
         }
@@ -414,15 +568,20 @@ pub mod test_support {
             token_grant: ProviderCredentialTokenGrant,
         ) -> Self {
             let requests = Arc::new(Mutex::new(Vec::new()));
+            let responses = Arc::new(Mutex::new(HashMap::from([(
+                key.to_string(),
+                response.map(str::to_string).map_err(str::to_string),
+            )])));
             let resolver = Arc::new(FakeTokenGrantResolver {
                 requests: requests.clone(),
-                response: response.map(str::to_string).map_err(str::to_string),
+                responses: responses.clone(),
             });
 
             let mut dynamic_credentials = HashMap::new();
             dynamic_credentials.insert(
                 key.to_string(),
                 ProviderProfileCredential {
+                    token_grant_owners: vec!["test-owner".to_string()],
                     name: "access_token".to_string(),
                     auth_style: "bearer".to_string(),
                     header_name: "Authorization".to_string(),
@@ -435,7 +594,64 @@ pub mod test_support {
                 dynamic_credentials: Arc::new(std::sync::RwLock::new(dynamic_credentials)),
                 resolver,
                 requests,
+                responses,
+                scoped_keys: Mutex::new(HashMap::new()),
             }
+        }
+
+        pub fn add_credential(
+            &self,
+            key: &str,
+            credential: ProviderProfileCredential,
+            response: std::result::Result<&str, &str>,
+        ) {
+            self.dynamic_credentials
+                .write()
+                .unwrap()
+                .insert(key.to_string(), credential);
+            self.responses.lock().unwrap().insert(
+                key.to_string(),
+                response.map(str::to_string).map_err(str::to_string),
+            );
+        }
+
+        pub fn assert_requested_keys(&self, expected: &[&str]) {
+            let requests = self.requests.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|r| self.installed_key(&r.provider_key))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+
+        pub fn assert_request_configuration(
+            &self,
+            key: &str,
+            grant: &ProviderCredentialTokenGrant,
+        ) {
+            let requests = self.requests.lock().unwrap();
+            let request = requests
+                .iter()
+                .find(|r| self.installed_key(&r.provider_key) == key)
+                .expect("grant was requested");
+            assert_eq!(request.token_endpoint, grant.token_endpoint);
+            assert_eq!(request.jwt_svid_audience, grant.jwt_svid_audience);
+            assert_eq!(request.client_assertion_type, grant.client_assertion_type);
+            assert_eq!(request.audience, grant.audience);
+            assert_eq!(request.scopes, grant.scopes);
+            assert_eq!(
+                request.cache_ttl,
+                grant
+                    .cache_ttl
+                    .as_ref()
+                    .map(openshell_core::time::duration_to_std)
+                    .transpose()
+                    .unwrap()
+            );
+            assert_eq!(request.grant_type, grant.grant_type);
+            assert_eq!(request.requested_token_type, grant.requested_token_type);
         }
 
         pub fn dynamic_credentials(
@@ -446,6 +662,32 @@ pub mod test_support {
 
         pub fn resolver(&self) -> Arc<dyn TokenGrantResolver> {
             self.resolver.clone()
+        }
+
+        /// Installs this fixture's credentials as a pinned provider-credential
+        /// snapshot. Admission-gated injection requests grants by revision-scoped
+        /// key, so each scripted response is also registered under that key.
+        pub fn provider_credentials(
+            &self,
+        ) -> openshell_core::provider_credentials::ProviderCredentialState {
+            let credentials = self.dynamic_credentials.read().unwrap().clone();
+            let state =
+                openshell_core::provider_credentials::ProviderCredentialState::from_environment(
+                    1,
+                    HashMap::new(),
+                    HashMap::new(),
+                    credentials.clone(),
+                );
+            let snapshot = state.snapshot();
+            let mut responses = self.responses.lock().unwrap();
+            for key in credentials.keys() {
+                let scoped = snapshot.scoped_key(key);
+                if let Some(response) = responses.get(key).cloned() {
+                    responses.insert(scoped.clone(), response);
+                }
+                self.scoped_keys.lock().unwrap().insert(scoped, key.clone());
+            }
+            state
         }
 
         pub fn assert_no_requests(&self) {
@@ -464,7 +706,10 @@ pub mod test_support {
             assert_eq!(requests.len(), 1);
 
             let request = &requests[0];
-            assert_eq!(request.provider_key, expected_provider_key);
+            assert_eq!(
+                self.installed_key(&request.provider_key),
+                expected_provider_key
+            );
             assert_eq!(request.token_endpoint, "https://auth.example.com/token");
             assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
             assert_eq!(
@@ -473,7 +718,7 @@ pub mod test_support {
             );
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
-            assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(request.cache_ttl, Some(std::time::Duration::from_mins(5)));
             assert_eq!(
                 request.grant_type,
                 ProviderCredentialTokenGrantType::ClientCredentials as i32
@@ -489,7 +734,10 @@ pub mod test_support {
             assert_eq!(requests.len(), 1);
 
             let request = &requests[0];
-            assert_eq!(request.provider_key, expected_provider_key);
+            assert_eq!(
+                self.installed_key(&request.provider_key),
+                expected_provider_key
+            );
             assert_eq!(request.token_endpoint, "https://auth.example.com/token");
             assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
             assert_eq!(
@@ -498,7 +746,7 @@ pub mod test_support {
             );
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
-            assert_eq!(request.cache_ttl_seconds, 300);
+            assert_eq!(request.cache_ttl, Some(std::time::Duration::from_mins(5)));
             assert_eq!(
                 request.grant_type,
                 ProviderCredentialTokenGrantType::TokenExchange as i32
@@ -518,7 +766,10 @@ pub mod test_support {
             client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
                 .to_string(),
             scopes: vec!["read".to_string()],
-            cache_ttl_seconds: 300,
+            cache_ttl: Some(prost_types::Duration {
+                seconds: 300,
+                nanos: 0,
+            }),
             audience_overrides: Vec::new(),
             grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
             subject_token: None,
@@ -553,7 +804,7 @@ pub mod test_support {
                 client_assertion_type: request.client_assertion_type.to_string(),
                 audience: request.audience.to_string(),
                 scopes: request.scopes.to_vec(),
-                cache_ttl_seconds: request.cache_ttl_seconds,
+                cache_ttl: request.cache_ttl,
                 grant_type: request.grant_type,
                 requested_token_type: request.requested_token_type.to_string(),
             };
@@ -562,7 +813,16 @@ pub mod test_support {
                     .lock()
                     .expect("fake token grant requests lock poisoned")
                     .push(owned);
-                self.response.clone().map_err(|err| miette!("{err}"))
+                // Keep acquisition pending once so joined request tests exercise
+                // overlapping grants instead of completing each branch in one poll.
+                tokio::task::yield_now().await;
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .get(request.provider_key)
+                    .expect("fake grant response configured")
+                    .clone()
+                    .map_err(|err| miette!("{err}"))
             })
         }
     }
@@ -824,7 +1084,7 @@ mod tests {
         let req = L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
-            query_params: std::collections::HashMap::new(),
+            query_params: HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         };
@@ -862,7 +1122,7 @@ mod tests {
         let req = L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
-            query_params: std::collections::HashMap::new(),
+            query_params: HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         };
@@ -901,7 +1161,7 @@ mod tests {
         let req = L7Request {
             action: "GET".to_string(),
             target: "/v1/projects".to_string(),
-            query_params: std::collections::HashMap::new(),
+            query_params: HashMap::new(),
             raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
             body_length: BodyLength::None,
         };

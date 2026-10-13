@@ -104,7 +104,7 @@ cmd_start() {
     local elapsed=0
     while [ $elapsed -lt $HEALTH_TIMEOUT ]; do
         if curl -sf \
-            "http://localhost:${KEYCLOAK_PORT}/realms/openshell/.well-known/openid-configuration" \
+            "http://127.0.0.1:${KEYCLOAK_PORT}/realms/openshell/.well-known/openid-configuration" \
             >/dev/null 2>&1; then
             echo "Keycloak is ready."
             print_info
@@ -146,7 +146,7 @@ cmd_status() {
 }
 
 print_info() {
-    local issuer="http://localhost:${KEYCLOAK_PORT}/realms/openshell"
+    local issuer="http://127.0.0.1:${KEYCLOAK_PORT}/realms/openshell"
     echo ""
     echo "  Issuer URL:     $issuer"
     echo "  Discovery:      ${issuer}/.well-known/openid-configuration"

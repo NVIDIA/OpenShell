@@ -1,6 +1,24 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/github.yaml
+#   openshell provider profile import -f providers/github.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   gh, git (git's git-remote-https helper matches by ancestry).
+# Reference layout:  gh and git on PATH at /usr/bin or /usr/local/bin
+#                    (Debian/Ubuntu `apt install git gh`, Alpine `apk add git github-cli`).
+# Credential scope:  GITHUB_TOKEN or GH_TOKEN, sent as a bearer authorization
+#                    header to the endpoints below and nowhere else.
+# Endpoint access:   api.github.com REST and GraphQL read-only; github.com
+#                    clone/fetch only. Push (git-receive-pack) stays denied.
+# Smoke test:        openshell sandbox create --provider <name> -- \
+#                      git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw
+
 id: github
 display_name: GitHub
 description: GitHub API and Git operations

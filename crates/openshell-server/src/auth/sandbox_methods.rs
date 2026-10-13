@@ -26,11 +26,9 @@ mod tests {
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         assert!(is_sandbox_callable("/openshell.v1.OpenShell/RelayStream"));
+        assert!(!is_sandbox_callable("/openshell.v1.OpenShell/PeerRelay"));
         assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/GetSandboxConfig"
-        ));
-        assert!(is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
         ));
         assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
@@ -52,12 +50,6 @@ mod tests {
         ));
         assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/ApproveDraftChunk"
-        ));
-        assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/GetInferenceRoute"
-        ));
-        assert!(!is_sandbox_callable(
-            "/openshell.inference.v1.Inference/SetInferenceRoute"
         ));
     }
 }

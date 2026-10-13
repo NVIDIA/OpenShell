@@ -27,8 +27,8 @@ after the shared contracts are authoritative.
   `exec.path` cannot satisfy binary-scoped policy while identity is required.
 - Cover static credential injection, token grants, REST body rewrite,
   WebSocket text-frame rewrite and policy, GraphQL, JSON-RPC, and MCP behavior.
-- Cover `inference.local`, `policy.local`, metadata loopback, and unchanged
-  nftables bypass reject/log behavior.
+- Cover `policy.local`, metadata loopback, and unchanged nftables bypass
+  reject/log behavior.
 - Capture stable OCSF event class, activity/action/disposition, severity,
   status, destination, actor, firewall rule, message, and status detail for
   representative allow and deny paths.
@@ -154,8 +154,6 @@ single flag-day cutover.
 
 ## Phase 7 - Existing Local Services And Cleanup
 
-- Keep `inference.local` as a local adapter with its existing TLS, route,
-  provider-auth, streaming/buffered limit, and OCSF behavior.
 - Keep `policy.local` as a local adapter for current policy, bounded denial
   summaries, proposals, and proposal wait.
 - Decide whether metadata loopback remains orchestrated by `openshell-sandbox`
@@ -249,8 +247,8 @@ series.
   then reuse the same suite for transparent TCP when Phase 8 lands.
 - Integration-test HTTP keep-alive/pipelining, REST, GraphQL, JSON-RPC, MCP,
   WebSocket, credentials, token grants, middleware, and TLS/raw-TCP selection.
-- Integration-test `inference.local`, `policy.local`, and metadata loopback body
-  limits, timeouts, redaction, and local denial responses.
+- Integration-test `policy.local` and metadata loopback body limits, timeouts,
+  redaction, and local denial responses.
 - Compare OCSF fixtures before and after each migration subphase.
 - Exercise policy reload between L4 decision, endpoint materialization, relay
   startup, and long-lived per-request evaluation.

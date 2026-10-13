@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fresh installations use the per-user gateway. The configure hook applies the
+# service selection after this transaction commits.
+
+set -eu
+
+snapctl set gateway-mode=user

@@ -1,7 +1,6 @@
 {
   "globs": [
     "*.md",
-    "architecture/**/*.md",
     "crates/**/*.md",
     "deploy/**/*.md",
     "docs/**/*.md",
@@ -16,6 +15,7 @@
     ".claude/**",
     ".opencode/**",
     ".github/**",
+    "plans/**",
     "architecture/plans/**",
     "**/node_modules/**",
     "target/**",

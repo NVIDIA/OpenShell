@@ -6,9 +6,12 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
-use crate::app::{App, CreateProviderPhase, ProviderKeyField, UpdateProviderField};
+use crate::app::{
+    App, CreateProviderPhase, ProviderKeyField, ProviderProfileYaml, UpdateProviderField,
+};
 
 use indexmap::IndexMap;
+use std::ops::Range;
 
 use super::centered_rect;
 
@@ -76,31 +79,67 @@ fn draw_select_type(
         chunks[0],
     );
 
-    let lines: Vec<Line<'_>> = form
-        .types
-        .iter()
-        .enumerate()
-        .map(|(i, ty)| {
-            let is_cursor = i == form.type_cursor;
-            let marker = if is_cursor { ">" } else { " " };
-            let style = if is_cursor { t.accent } else { t.text };
-            Line::from(vec![
-                Span::styled(format!("  {marker} "), style),
-                Span::styled(ty.as_str(), style),
-            ])
-        })
-        .collect();
+    let visible_range = visible_type_range(
+        form.types.len(),
+        form.type_cursor,
+        usize::from(chunks[2].height),
+    );
+    let lines: Vec<Line<'_>> = if form.types.is_empty() {
+        vec![Line::from(Span::styled(
+            form.status
+                .as_deref()
+                .unwrap_or("No provider profiles available."),
+            t.status_warn,
+        ))]
+    } else {
+        form.types
+            .iter()
+            .enumerate()
+            .skip(visible_range.start)
+            .take(visible_range.len())
+            .map(|(i, ty)| {
+                let is_cursor = i == form.type_cursor;
+                let marker = if is_cursor { ">" } else { " " };
+                let style = if is_cursor { t.accent } else { t.text };
+                Line::from(vec![
+                    Span::styled(format!("  {marker} "), style),
+                    Span::styled(ty.as_str(), style),
+                ])
+            })
+            .collect()
+    };
     frame.render_widget(Paragraph::new(lines), chunks[2]);
 
     let hint = Line::from(vec![
         Span::styled("[j/k]", t.key_hint),
         Span::styled(" Navigate ", t.muted),
+        Span::styled(
+            format!(
+                "[{}/{}] ",
+                form.type_cursor.saturating_add(1).min(form.types.len()),
+                form.types.len()
+            ),
+            t.muted,
+        ),
         Span::styled("[Enter]", t.key_hint),
         Span::styled(" Select ", t.muted),
         Span::styled("[Esc]", t.key_hint),
         Span::styled(" Cancel", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[4]);
+}
+
+fn visible_type_range(total: usize, cursor: usize, visible_rows: usize) -> Range<usize> {
+    if total == 0 || visible_rows == 0 {
+        return 0..0;
+    }
+
+    let visible_rows = visible_rows.min(total);
+    let cursor = cursor.min(total - 1);
+    let start = cursor
+        .saturating_sub(visible_rows - 1)
+        .min(total - visible_rows);
+    start..start + visible_rows
 }
 
 // ---------------------------------------------------------------------------
@@ -565,7 +604,7 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let title = if detail.show_raw_provider {
         " Provider Object YAML "
-    } else if detail.show_raw_profile {
+    } else if detail.show_raw_profile && detail.raw_profile_yaml.yaml().is_some() {
         " Provider Profile YAML "
     } else {
         " Provider Detail "
@@ -592,13 +631,12 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    if detail.show_raw_profile {
+    if detail.show_raw_profile
+        && let Some(raw) = detail.raw_profile_yaml.yaml()
+    {
         draw_raw_yaml(
             frame,
-            detail
-                .raw_profile_yaml
-                .as_deref()
-                .unwrap_or("No provider profile is available for this provider."),
+            raw,
             detail.raw_profile_scroll,
             "Summary",
             "y",
@@ -639,6 +677,18 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
             t.status_warn,
         )));
     }
+    if matches!(detail.raw_profile_yaml, ProviderProfileYaml::Invalid) {
+        // Fixed diagnostics bound the display and never expose values echoed by
+        // the serializer, even when malformed profile fields contain secrets.
+        lines.push(Line::from(Span::styled(
+            "Profile YAML unavailable: serialization failed.",
+            t.status_warn,
+        )));
+        lines.push(Line::from(Span::styled(
+            "Correct the profile at its source, then reopen this view.",
+            t.status_warn,
+        )));
+    }
     if let Some(description) = &detail.profile_description {
         lines.push(Line::from(vec![
             Span::styled("Description: ", t.muted),
@@ -667,7 +717,7 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("[o]", t.key_hint),
         Span::styled(" Object YAML  ", t.muted),
     ];
-    if detail.raw_profile_yaml.is_some() {
+    if detail.raw_profile_yaml.yaml().is_some() {
         hint_spans.extend([
             Span::styled("[y]", t.key_hint),
             Span::styled(" Profile YAML  ", t.muted),
@@ -1092,5 +1142,25 @@ fn render_status(
             Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
             area,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_type_range;
+
+    #[test]
+    fn type_list_window_follows_cursor_past_visible_rows() {
+        assert_eq!(visible_type_range(25, 0, 10), 0..10);
+        assert_eq!(visible_type_range(25, 9, 10), 0..10);
+        assert_eq!(visible_type_range(25, 10, 10), 1..11);
+        assert_eq!(visible_type_range(25, 24, 10), 15..25);
+    }
+
+    #[test]
+    fn type_list_window_handles_short_and_empty_lists() {
+        assert_eq!(visible_type_range(3, 2, 10), 0..3);
+        assert_eq!(visible_type_range(0, 0, 10), 0..0);
+        assert_eq!(visible_type_range(3, 2, 0), 0..0);
     }
 }

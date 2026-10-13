@@ -12,17 +12,8 @@ use openshell_e2e::harness::cli::run_cli;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 const CREDENTIAL_KEY: &str = "OPENAI_API_KEY";
-const VAULT_POLICY: &str = r#"path "secret/data/openshell/provider-credentials/*" {
-  capabilities = ["create", "read", "update", "delete"]
-}
-
-path "secret/metadata/openshell/provider-credentials/*" {
-  capabilities = ["read", "delete", "list"]
-}
-"#;
 
 fn unique_suffix() -> String {
     let millis = SystemTime::now()
@@ -41,6 +32,12 @@ fn credential_driver() -> String {
         .unwrap_or_else(|_| "kubernetes-secrets".to_string())
 }
 
+#[derive(Debug)]
+struct ProviderIdentity {
+    id: String,
+    workspace: String,
+}
+
 fn vault_namespace() -> String {
     std::env::var("OPENSHELL_E2E_VAULT_NAMESPACE").unwrap_or_else(|_| "vault".to_string())
 }
@@ -53,23 +50,28 @@ fn vault_token() -> String {
     std::env::var("OPENSHELL_E2E_VAULT_TOKEN").unwrap_or_else(|_| "root".to_string())
 }
 
-fn managed_kubernetes_secret_name(provider_name: &str) -> String {
+fn managed_credential_hash(identity: &ProviderIdentity, provider_name: &str) -> String {
+    // This test stores an ordinary provider credential, whose storage object ID is
+    // the provider ID, so both managed drivers use these four identity fields.
     let mut hasher = Sha256::new();
+    hasher.update(identity.workspace.as_bytes());
+    hasher.update([0]);
+    hasher.update(identity.id.as_bytes());
+    hasher.update([0]);
     hasher.update(provider_name.as_bytes());
     hasher.update([0]);
     hasher.update(CREDENTIAL_KEY.as_bytes());
     let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+    format!("{digest:x}")
+}
+
+fn managed_kubernetes_secret_name(identity: &ProviderIdentity, provider_name: &str) -> String {
+    let hex = managed_credential_hash(identity, provider_name);
     format!("openshell-cred-{}", &hex[..40])
 }
 
-fn managed_vault_path(provider_name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(provider_name.as_bytes());
-    hasher.update([0]);
-    hasher.update(CREDENTIAL_KEY.as_bytes());
-    let digest = hasher.finalize();
-    let hex = format!("{digest:x}");
+fn managed_vault_path(identity: &ProviderIdentity, provider_name: &str) -> String {
+    let hex = managed_credential_hash(identity, provider_name);
     format!("openshell/provider-credentials/{}", &hex[..40])
 }
 
@@ -142,49 +144,6 @@ async fn bao(args: &[&str]) -> Result<String, String> {
     Ok(combined)
 }
 
-async fn bao_with_stdin(args: &[&str], stdin: &str) -> Result<String, String> {
-    let namespace = vault_namespace();
-    let pod = vault_pod();
-    let token = vault_token();
-    let token_env = format!("BAO_TOKEN={token}");
-    let mut command = kubectl_command();
-    command.args([
-        "-n", &namespace, "exec", "-i", &pod, "--", "env", &token_env, "bao",
-    ]);
-    command.args(args);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .map_err(|err| format!("failed to spawn bao {args:?}: {err}"))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "failed to open bao stdin".to_string())?;
-    child_stdin
-        .write_all(stdin.as_bytes())
-        .await
-        .map_err(|err| format!("failed to write bao stdin: {err}"))?;
-    drop(child_stdin);
-
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|err| format!("failed to wait for bao {args:?}: {err}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let combined = format!("{stdout}{stderr}");
-    if !output.status.success() {
-        return Err(format!(
-            "bao {args:?} failed (exit {:?}):\n{combined}",
-            output.status.code()
-        ));
-    }
-    Ok(combined)
-}
-
 async fn delete_provider(name: &str) {
     let mut cmd = openshell_cmd();
     cmd.arg("provider")
@@ -217,6 +176,33 @@ async fn create_provider(name: &str, secret_value: &str) -> Result<String, Strin
     Ok(clean)
 }
 
+async fn provider_identity(provider_name: &str) -> Result<ProviderIdentity, String> {
+    let (output, code) = run_cli(&["provider", "list", "--output", "json"]).await;
+    let clean = strip_ansi(&output);
+    if code != 0 {
+        return Err(format!("provider list failed (exit {code}):\n{clean}"));
+    }
+    let listing: serde_json::Value = serde_json::from_str(&clean)
+        .map_err(|err| format!("failed to parse provider list JSON: {err}\n{clean}"))?;
+    let provider = listing["providers"]
+        .as_array()
+        .ok_or_else(|| format!("provider list JSON has no providers array:\n{clean}"))?
+        .iter()
+        .find(|provider| provider["name"].as_str() == Some(provider_name))
+        .ok_or_else(|| format!("provider '{provider_name}' was not returned by provider list"))?;
+    let id = provider["id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| format!("provider '{provider_name}' did not include an ID"))?;
+    let workspace = provider["workspace"]
+        .as_str()
+        .ok_or_else(|| format!("provider '{provider_name}' did not include a workspace"))?;
+    Ok(ProviderIdentity {
+        id: id.to_string(),
+        workspace: workspace.to_string(),
+    })
+}
+
 async fn assert_provider_get_does_not_expose_secret(
     provider_name: &str,
     secret_value: &str,
@@ -241,12 +227,11 @@ async fn assert_provider_placeholder_available_in_sandbox(
     sandbox_name: &str,
     secret_value: &str,
 ) -> Result<(), String> {
-    let guard = SandboxGuard::create(&[
+    let mut guard = SandboxGuard::create(&[
         "--name",
         sandbox_name,
         "--provider",
         provider_name,
-        "--no-keep",
         "--no-auto-providers",
         "--no-tty",
         "--",
@@ -256,6 +241,9 @@ async fn assert_provider_placeholder_available_in_sandbox(
     ])
     .await?;
     let clean = strip_ansi(&guard.create_output);
+    // Delete the sandbox before returning: the gateway refuses to delete a
+    // provider that is still attached to a sandbox.
+    guard.cleanup().await;
     if !contains_placeholder_for_env_key(&clean, CREDENTIAL_KEY) {
         return Err(format!(
             "sandbox {sandbox_name} did not receive provider credential placeholder:\n{clean}"
@@ -269,39 +257,13 @@ async fn assert_provider_placeholder_available_in_sandbox(
     Ok(())
 }
 
-async fn configure_vault_storage() -> Result<(), String> {
-    let _ = bao(&["secrets", "enable", "-path=secret", "kv-v2"]).await;
-    let _ = bao(&["auth", "enable", "kubernetes"]).await;
-    bao(&[
-        "write",
-        "auth/kubernetes/config",
-        "kubernetes_host=https://kubernetes.default.svc",
-        "kubernetes_ca_cert=@/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-    ])
-    .await?;
-    bao_with_stdin(
-        &["policy", "write", "openshell-provider-storage", "-"],
-        VAULT_POLICY,
-    )
-    .await?;
-    bao(&[
-        "write",
-        "auth/kubernetes/role/openshell-gateway",
-        "bound_service_account_names=openshell",
-        &format!("bound_service_account_namespaces={}", namespace()),
-        "policies=openshell-provider-storage",
-        "ttl=1h",
-    ])
-    .await?;
-    Ok(())
-}
-
 async fn assert_kubernetes_secret_stored(
+    identity: &ProviderIdentity,
     provider_name: &str,
     secret_value: &str,
 ) -> Result<(), String> {
     let namespace = namespace();
-    let secret_name = managed_kubernetes_secret_name(provider_name);
+    let secret_name = managed_kubernetes_secret_name(identity, provider_name);
     let encoded = kubectl(&[
         "-n",
         &namespace,
@@ -323,9 +285,12 @@ async fn assert_kubernetes_secret_stored(
     Ok(())
 }
 
-async fn assert_kubernetes_secret_deleted(provider_name: &str) -> Result<(), String> {
+async fn assert_kubernetes_secret_deleted(
+    identity: &ProviderIdentity,
+    provider_name: &str,
+) -> Result<(), String> {
     let namespace = namespace();
-    let secret_name = managed_kubernetes_secret_name(provider_name);
+    let secret_name = managed_kubernetes_secret_name(identity, provider_name);
     match kubectl(&["-n", &namespace, "get", "secret", &secret_name]).await {
         Ok(output) => Err(format!(
             "Kubernetes Secret '{secret_name}' still exists after provider deletion:\n{output}"
@@ -334,8 +299,12 @@ async fn assert_kubernetes_secret_deleted(provider_name: &str) -> Result<(), Str
     }
 }
 
-async fn assert_vault_secret_stored(provider_name: &str, secret_value: &str) -> Result<(), String> {
-    let logical_path = managed_vault_path(provider_name);
+async fn assert_vault_secret_stored(
+    identity: &ProviderIdentity,
+    provider_name: &str,
+    secret_value: &str,
+) -> Result<(), String> {
+    let logical_path = managed_vault_path(identity, provider_name);
     let output = bao(&[
         "kv",
         "get",
@@ -349,8 +318,11 @@ async fn assert_vault_secret_stored(provider_name: &str, secret_value: &str) -> 
     Ok(())
 }
 
-async fn assert_vault_secret_deleted(provider_name: &str) -> Result<(), String> {
-    let logical_path = managed_vault_path(provider_name);
+async fn assert_vault_secret_deleted(
+    identity: &ProviderIdentity,
+    provider_name: &str,
+) -> Result<(), String> {
+    let logical_path = managed_vault_path(identity, provider_name);
     match bao(&[
         "kv",
         "get",
@@ -368,20 +340,27 @@ async fn assert_vault_secret_deleted(provider_name: &str) -> Result<(), String> 
 
 async fn assert_backend_stored(
     driver: &str,
+    identity: &ProviderIdentity,
     provider_name: &str,
     secret_value: &str,
 ) -> Result<(), String> {
     match driver {
-        "kubernetes-secrets" => assert_kubernetes_secret_stored(provider_name, secret_value).await,
-        "vault" => assert_vault_secret_stored(provider_name, secret_value).await,
+        "kubernetes-secrets" => {
+            assert_kubernetes_secret_stored(identity, provider_name, secret_value).await
+        }
+        "vault" => assert_vault_secret_stored(identity, provider_name, secret_value).await,
         other => Err(format!("unsupported credential driver '{other}'")),
     }
 }
 
-async fn assert_backend_deleted(driver: &str, provider_name: &str) -> Result<(), String> {
+async fn assert_backend_deleted(
+    driver: &str,
+    identity: &ProviderIdentity,
+    provider_name: &str,
+) -> Result<(), String> {
     match driver {
-        "kubernetes-secrets" => assert_kubernetes_secret_deleted(provider_name).await,
-        "vault" => assert_vault_secret_deleted(provider_name).await,
+        "kubernetes-secrets" => assert_kubernetes_secret_deleted(identity, provider_name).await,
+        "vault" => assert_vault_secret_deleted(identity, provider_name).await,
         other => Err(format!("unsupported credential driver '{other}'")),
     }
 }
@@ -400,33 +379,34 @@ async fn provider_credentials_are_stored_in_configured_backend() {
     let suffix = unique_suffix();
     let driver_slug = driver.replace('-', "");
     let provider_name = format!("cred-storage-{driver_slug}-{suffix}");
-    let sandbox_name = format!("cred-storage-sandbox-{driver_slug}-{suffix}");
+    // Sandbox names are DNS-routable and limited to 19 characters.
+    let sandbox_name = format!(
+        "cred-{}-{}",
+        &driver_slug[..1],
+        &suffix[suffix.len() - 10..]
+    );
     let secret_value = format!("example-e2e-{driver_slug}-{suffix}");
 
     delete_provider(&provider_name).await;
-    if driver == "vault" {
-        configure_vault_storage()
-            .await
-            .expect("configure Vault storage fixture");
-    }
 
-    let result: Result<(), String> = async {
+    let result: Result<ProviderIdentity, String> = async {
         create_provider(&provider_name, &secret_value).await?;
         assert_provider_get_does_not_expose_secret(&provider_name, &secret_value).await?;
-        assert_backend_stored(&driver, &provider_name, &secret_value).await?;
+        let identity = provider_identity(&provider_name).await?;
+        assert_backend_stored(&driver, &identity, &provider_name, &secret_value).await?;
         assert_provider_placeholder_available_in_sandbox(
             &provider_name,
             &sandbox_name,
             &secret_value,
         )
         .await?;
-        Ok(())
+        Ok(identity)
     }
     .await;
 
     delete_provider(&provider_name).await;
-    assert_backend_deleted(&driver, &provider_name)
+    let identity = result.expect("credential storage e2e failed");
+    assert_backend_deleted(&driver, &identity, &provider_name)
         .await
         .expect("credential backend object should be deleted with provider");
-    result.expect("credential storage e2e failed");
 }

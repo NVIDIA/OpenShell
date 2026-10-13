@@ -5,9 +5,9 @@
 
 use std::io::Write;
 use std::process::Stdio;
-use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::container::is_e2e_driver;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use tokio::io::AsyncReadExt;
@@ -15,13 +15,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
-const INFERENCE_PROVIDER_NAME: &str = "e2e-host-inference";
-const INFERENCE_PROVIDER_UNREACHABLE_NAME: &str = "e2e-host-inference-unreachable";
 const BINDING_PROVIDER_A_NAME: &str = "e2e-static-endpoint-binding-provider-a";
 const BINDING_PROVIDER_B_NAME: &str = "e2e-static-endpoint-binding-provider-b";
 const BINDING_PROFILE_A_ID: &str = "e2e-static-endpoint-binding-a";
 const BINDING_PROFILE_B_ID: &str = "e2e-static-endpoint-binding-b";
-static INFERENCE_ROUTE_LOCK: Mutex<()> = Mutex::new(());
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
     let mut cmd = openshell_cmd();
@@ -178,7 +175,7 @@ endpoints:
     protocol: rest
     access: full
     enforcement: enforce
-binaries: [/usr/bin/curl]
+binaries: [/usr/bin/bash]
 "#
     );
     file.write_all(profile.as_bytes())
@@ -195,7 +192,7 @@ fn write_binding_policy(port: u16) -> Result<NamedTempFile, String> {
 
 filesystem_policy:
   include_workdir: true
-  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_only: [/bin, /usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
   read_write: [/sandbox, /tmp, /dev/null]
 
 landlock:
@@ -222,7 +219,7 @@ network_policies:
         access: full
         enforcement: enforce
     binaries:
-      - path: /usr/bin/curl
+      - path: /usr/bin/bash
 "#
     );
     file.write_all(policy.as_bytes())
@@ -238,16 +235,6 @@ impl Drop for HostServer {
     }
 }
 
-async fn provider_exists(name: &str) -> bool {
-    let mut cmd = openshell_cmd();
-    cmd.arg("provider")
-        .arg("get")
-        .arg(name)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    cmd.status().await.is_ok_and(|status| status.success())
-}
-
 async fn delete_provider(name: &str) {
     let mut cmd = openshell_cmd();
     cmd.arg("provider")
@@ -260,29 +247,12 @@ async fn delete_provider(name: &str) {
 
 async fn delete_provider_profile(id: &str) {
     let mut cmd = openshell_cmd();
-    cmd.arg("provider")
-        .arg("profile")
+    cmd.arg("profile")
         .arg("delete")
         .arg(id)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
-}
-
-async fn create_openai_provider(name: &str, base_url: &str) -> Result<String, String> {
-    run_cli(&[
-        "provider",
-        "create",
-        "--name",
-        name,
-        "--type",
-        "openai",
-        "--credential",
-        "OPENAI_API_KEY=dummy",
-        "--config",
-        &format!("OPENAI_BASE_URL={base_url}"),
-    ])
-    .await
 }
 
 fn write_policy(port: u16) -> Result<NamedTempFile, String> {
@@ -294,6 +264,7 @@ filesystem_policy:
   include_workdir: true
   read_only:
     - /usr
+    - /bin
     - /lib
     - /proc
     - /dev/urandom
@@ -324,7 +295,7 @@ network_policies:
           - "192.168.0.0/16"
           - "fc00::/7"
     binaries:
-      - path: /usr/bin/curl
+      - path: /usr/bin/bash
 "#
     );
     file.write_all(policy.as_bytes())
@@ -346,16 +317,17 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         .expect("temp policy path should be utf-8")
         .to_string();
 
+    let command = format!(
+        r#"exec 3<>/dev/tcp/host.openshell.internal/{0}; printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{0}\r\nConnection: close\r\n\r\n' >&3; while IFS= read -r line <&3 || [[ -n $line ]]; do printf '%s\n' "$line"; done"#,
+        server.port
+    );
     let guard = SandboxGuard::create(&[
         "--policy",
         &policy_path,
         "--",
-        "curl",
-        "--silent",
-        "--show-error",
-        "--max-time",
-        "15",
-        &format!("http://host.openshell.internal:{}/", server.port),
+        "/usr/bin/bash",
+        "-c",
+        &command,
     ])
     .await
     .expect("sandbox create with host.openshell.internal echo request");
@@ -367,6 +339,78 @@ async fn sandbox_reaches_host_openshell_internal_via_host_gateway_alias() {
         "expected sandbox to receive host echo response:\n{}",
         guard.create_output
     );
+}
+
+#[tokio::test]
+async fn sandbox_receives_eof_after_closing_http_response() {
+    for response in [
+        "HTTP/1.0 200 OK\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 3\r\n\r\nOK\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nOK\n\r\n0\r\n\r\n",
+    ] {
+        let listener = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = HostServer {
+            port,
+            task: tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                stream.set_nodelay(true).expect("disable Nagle on fixture");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }),
+        };
+        let policy = write_policy(server.port).unwrap();
+        let command = format!(
+            r#"set -eu
+exec 3<>/dev/tcp/host.openshell.internal/{port}
+printf 'GET / HTTP/1.1\r\nHost: host.openshell.internal:{port}\r\n\r\n' >&3
+while true; do
+  line=
+  if IFS= read -r -t 5 line <&3; then
+    printf '%s\n' "$line"
+  else
+    status=$?
+    [ "$status" -eq 1 ] || {{ echo EOF_TIMEOUT; exit 1; }}
+    [ -z "$line" ] || printf '%s\n' "$line"
+    break
+  fi
+done
+printf 'RESPONSE_EOF\n'
+"#,
+        );
+        let mut sandbox = SandboxGuard::create(&[
+            "--policy",
+            policy.path().to_str().unwrap(),
+            "--no-auto-providers",
+            "--",
+            "/usr/bin/bash",
+            "-c",
+            &command,
+        ])
+        .await
+        .expect("closing response must finish without a client timeout");
+        assert!(
+            sandbox.create_output.lines().any(|line| line == "OK"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            sandbox.create_output.contains("RESPONSE_EOF"),
+            "{}",
+            sandbox.create_output
+        );
+        assert!(
+            !sandbox.create_output.contains("EOF_TIMEOUT"),
+            "{}",
+            sandbox.create_output
+        );
+        sandbox.cleanup().await;
+    }
 }
 
 #[tokio::test]
@@ -399,10 +443,10 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     delete_provider(BINDING_PROVIDER_B_NAME).await;
     delete_provider_profile(BINDING_PROFILE_A_ID).await;
     delete_provider_profile(BINDING_PROFILE_B_ID).await;
-    run_cli(&["provider", "profile", "import", "--file", &profile_a_path])
+    run_cli(&["profile", "import", "--file", &profile_a_path])
         .await
         .expect("import provider A endpoint-binding profile");
-    run_cli(&["provider", "profile", "import", "--file", &profile_b_path])
+    run_cli(&["profile", "import", "--file", &profile_b_path])
         .await
         .expect("import provider B endpoint-binding profile");
     run_cli(&[
@@ -431,8 +475,32 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     .expect("create endpoint-bound provider B");
 
     let command = format!(
-        r#"allowed=$(curl --silent --show-error --max-time 15 -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/allowed/check); host_denied=$(curl --silent --show-error --max-time 15 -o /tmp/host-denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.docker.internal:{}/allowed/check); path_denied=$(curl --silent --show-error --max-time 15 -o /tmp/path-denied-body -w "%{{http_code}}" -H "Authorization: Bearer $BOUND_TOKEN_A" http://host.openshell.internal:{}/other/check); printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied""#,
-        server.port, server.port, server.port
+        r#"
+http_request() {{
+  local host="$1" path="$2" status_line line
+  HTTP_STATUS= HTTP_BODY=
+  if ! exec 3<>"/dev/tcp/$host/{port}"; then
+    HTTP_STATUS=connect-denied
+    return 1
+  fi
+  printf 'GET %s HTTP/1.1\r\nHost: %s:{port}\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' "$path" "$host" "$BOUND_TOKEN_A" >&3
+  IFS= read -r status_line <&3 || return 1
+  status_line="${{status_line%$'\r'}}"
+  HTTP_STATUS="${{status_line#* }}"
+  HTTP_STATUS="${{HTTP_STATUS%% *}}"
+  while IFS= read -r line <&3; do
+    line="${{line%$'\r'}}"
+    [[ -z "$line" ]] && break
+  done
+  while IFS= read -r line <&3 || [[ -n "$line" ]]; do HTTP_BODY+="$line"; done
+  exec 3>&- 3<&-
+}}
+http_request host.openshell.internal /allowed/check; allowed="$HTTP_BODY"
+http_request host.docker.internal /allowed/check || true; host_denied="$HTTP_STATUS"
+http_request host.openshell.internal /other/check; path_denied="$HTTP_STATUS"
+printf 'ALLOWED=%s HOST_DENIED=%s PATH_DENIED=%s\n' "$allowed" "$host_denied" "$path_denied"
+"#,
+        port = server.port,
     );
     let mut guard = SandboxGuard::create(&[
         "--policy",
@@ -443,7 +511,7 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         BINDING_PROVIDER_B_NAME,
         "--no-auto-providers",
         "--",
-        "sh",
+        "/usr/bin/bash",
         "-c",
         &command,
     ])
@@ -463,8 +531,13 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
         "credential should resolve at the bound endpoint:\n{}\nlogs:\n{logs}",
         guard.create_output,
     );
+    let expected_host_denial = if is_e2e_driver("podman") {
+        "HOST_DENIED=connect-denied"
+    } else {
+        "HOST_DENIED=403"
+    };
     assert!(
-        guard.create_output.contains("HOST_DENIED=403"),
+        guard.create_output.contains(expected_host_denial),
         "same placeholder must be denied at an unbound host:\n{}",
         guard.create_output
     );
@@ -492,147 +565,4 @@ async fn static_provider_credentials_are_bound_to_profile_endpoints() {
     delete_provider(BINDING_PROVIDER_B_NAME).await;
     delete_provider_profile(BINDING_PROFILE_A_ID).await;
     delete_provider_profile(BINDING_PROFILE_B_ID).await;
-}
-
-#[tokio::test]
-async fn sandbox_inference_local_routes_to_host_openshell_internal() {
-    let _inference_lock = INFERENCE_ROUTE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    let current_inference = run_cli(&["inference", "get"])
-        .await
-        .expect("read current inference config");
-    if !current_inference.contains("Not configured") {
-        eprintln!("Skipping test: existing inference config would make shared state unsafe");
-        return;
-    }
-
-    let server = HostServer::start(
-        r#"{"id":"chatcmpl-test","object":"chat.completion","created":1,"model":"host-echo","choices":[{"index":0,"message":{"role":"assistant","content":"hello-from-host"},"finish_reason":"stop"}]}"#,
-    )
-    .await
-    .expect("start host inference echo server");
-
-    if provider_exists(INFERENCE_PROVIDER_NAME).await {
-        delete_provider(INFERENCE_PROVIDER_NAME).await;
-    }
-
-    create_openai_provider(
-        INFERENCE_PROVIDER_NAME,
-        &format!("http://host.openshell.internal:{}/v1", server.port),
-    )
-    .await
-    .expect("create host-backed OpenAI provider");
-
-    let inference_output = run_cli(&[
-        "inference",
-        "set",
-        "--provider",
-        INFERENCE_PROVIDER_NAME,
-        "--model",
-        "host-echo-model",
-        "--no-verify",
-    ])
-    .await
-    .expect("point inference.local at host-backed provider");
-
-    assert!(
-        !inference_output.contains("Validated Endpoints:"),
-        "did not expect local CLI verification for host-only alias:\n{inference_output}"
-    );
-
-    let guard = SandboxGuard::create(&[
-        "--",
-        "curl",
-        "--silent",
-        "--show-error",
-        "--max-time",
-        "15",
-        "https://inference.local/v1/chat/completions",
-        "--json",
-        r#"{"messages":[{"role":"user","content":"hello"}]}"#,
-    ])
-    .await
-    .expect("sandbox create with inference.local request");
-
-    assert!(
-        guard
-            .create_output
-            .contains("\"object\":\"chat.completion\""),
-        "expected sandbox to receive inference response:\n{}",
-        guard.create_output
-    );
-    assert!(
-        guard.create_output.contains("hello-from-host"),
-        "expected sandbox to receive echoed inference content:\n{}",
-        guard.create_output
-    );
-}
-
-#[tokio::test]
-async fn inference_set_supports_no_verify_for_unreachable_endpoint() {
-    let _inference_lock = INFERENCE_ROUTE_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-    let current_inference = run_cli(&["inference", "get"])
-        .await
-        .expect("read current inference config");
-    if !current_inference.contains("Not configured") {
-        eprintln!("Skipping test: existing inference config would make shared state unsafe");
-        return;
-    }
-
-    if provider_exists(INFERENCE_PROVIDER_UNREACHABLE_NAME).await {
-        delete_provider(INFERENCE_PROVIDER_UNREACHABLE_NAME).await;
-    }
-
-    create_openai_provider(
-        INFERENCE_PROVIDER_UNREACHABLE_NAME,
-        "http://host.openshell.internal:9/v1",
-    )
-    .await
-    .expect("create unreachable OpenAI provider");
-
-    let verify_err = run_cli(&[
-        "inference",
-        "set",
-        "--provider",
-        INFERENCE_PROVIDER_UNREACHABLE_NAME,
-        "--model",
-        "host-echo-model",
-    ])
-    .await
-    .expect_err("default verification should fail for unreachable endpoint");
-
-    assert!(
-        verify_err.contains("failed to verify inference endpoint"),
-        "expected verification failure output:\n{verify_err}"
-    );
-    let normalized_verify_err: String = verify_err
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '│')
-        .collect();
-    assert!(
-        normalized_verify_err.contains("--no-verify"),
-        "expected retry hint in failure output:\n{verify_err}"
-    );
-
-    let no_verify_output = run_cli(&[
-        "inference",
-        "set",
-        "--provider",
-        INFERENCE_PROVIDER_UNREACHABLE_NAME,
-        "--model",
-        "host-echo-model",
-        "--no-verify",
-    ])
-    .await
-    .expect("no-verify should bypass validation");
-
-    assert!(
-        !no_verify_output.contains("Validated Endpoints:"),
-        "did not expect validation output when bypassing verification:\n{no_verify_output}"
-    );
 }

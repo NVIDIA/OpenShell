@@ -66,6 +66,16 @@ pub fn discover_from_profile(
         }
     }
 
+    if profile.id == "google-vertex-ai" {
+        for key in crate::VERTEX_AI_CONFIG_KEY_NAMES {
+            if let Some(value) = context.env_var(key)
+                && !value.trim().is_empty()
+            {
+                discovered.config.entry((*key).to_string()).or_insert(value);
+            }
+        }
+    }
+
     if discovered.is_empty() {
         Ok(None)
     } else {
@@ -82,6 +92,7 @@ mod tests {
 
     fn profile() -> ProviderTypeProfile {
         ProviderTypeProfile {
+            files: Vec::new(),
             id: "custom".to_string(),
             resource_version: 0,
             annotations: std::collections::HashMap::new(),
@@ -93,6 +104,7 @@ mod tests {
                     name: "api_key".to_string(),
                     env_vars: vec!["CUSTOM_API_KEY".to_string(), "CUSTOM_API_TOKEN".to_string()],
                     required: true,
+                    stable_placeholder: false,
                     description: String::new(),
                     auth_style: String::new(),
                     header_name: String::new(),
@@ -105,6 +117,7 @@ mod tests {
                     name: "secondary".to_string(),
                     env_vars: vec!["CUSTOM_API_KEY".to_string()],
                     required: false,
+                    stable_placeholder: false,
                     description: String::new(),
                     auth_style: String::new(),
                     header_name: String::new(),
@@ -164,5 +177,28 @@ mod tests {
                 credential_name
             } if profile_id == "custom" && credential_name == "missing"
         ));
+    }
+
+    #[test]
+    fn vertex_profile_discovery_includes_supported_configuration() {
+        let mut profile = profile();
+        profile.id = "google-vertex-ai".to_string();
+        let ctx = MockDiscoveryContext::new()
+            .with_env("CUSTOM_API_KEY", "vertex-token")
+            .with_env("VERTEX_AI_PROJECT_ID", "project-a")
+            .with_env("VERTEX_AI_REGION", "us-central1");
+
+        let discovered = discover_from_profile(&profile, &ctx)
+            .expect("discovery should succeed")
+            .expect("provider should be discovered");
+
+        assert_eq!(
+            discovered.config.get("VERTEX_AI_PROJECT_ID"),
+            Some(&"project-a".to_string())
+        );
+        assert_eq!(
+            discovered.config.get("VERTEX_AI_REGION"),
+            Some(&"us-central1".to_string())
+        );
     }
 }

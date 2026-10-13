@@ -242,10 +242,10 @@ impl ReconcilerLease {
 
 /// Derive a stable replica identity for lease ownership.
 ///
-/// Kubernetes sets `HOSTNAME` to the pod name, Docker sets it to the
-/// container ID, and systemd units inherit the machine hostname.
-/// `OPENSHELL_REPLICA_ID` allows explicit override. The UUID fallback
-/// handles edge cases where neither env var is set.
+/// Managed workloads commonly receive a stable runtime identity through
+/// `HOSTNAME`, while systemd units inherit the machine hostname.
+/// `OPENSHELL_REPLICA_ID` allows an explicit override. The UUID fallback
+/// handles environments where neither variable is set.
 pub fn replica_id() -> String {
     std::env::var("OPENSHELL_REPLICA_ID")
         .or_else(|_| std::env::var("HOSTNAME"))
@@ -505,7 +505,7 @@ mod tests {
         l2.renew(&mut guard2).await.unwrap();
 
         // Replica-1 cannot re-acquire (lease exists)
-        let l1_retry = lease(store.clone(), "replica-1", Duration::from_secs(60));
+        let l1_retry = lease(store.clone(), "replica-1", Duration::from_mins(1));
         let err = l1_retry.try_acquire().await.unwrap_err();
         assert!(matches!(err, LeaseError::AlreadyHeld));
 

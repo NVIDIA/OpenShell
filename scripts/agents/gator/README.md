@@ -4,10 +4,11 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 
 ## Prerequisites
 
-- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell` and `NVIDIA/OpenShell-Community`.
+- `gh` is authenticated on the host and has access to `NVIDIA/OpenShell`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
-- A local gateway is available when using the default local Dockerfile source.
+- A local gateway and either Docker or Podman are available to build the
+  default sandbox image.
 
 ## Usage
 
@@ -19,7 +20,11 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox source. Local gateways build `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
+By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox image source. It builds `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
+
+The launcher queries the selected gateway and builds with its Docker or Podman
+compute driver. If `CONTAINER_ENGINE` is set, it must match that driver. Other
+gateway drivers cannot run this local-image launcher.
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
@@ -32,12 +37,18 @@ The launcher:
 - Scans `profile_paths` in manifest order and imports or updates `providers/github-gator.yaml`.
 - Creates or updates the `github-gator` provider from `gh auth token`.
 - Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
+- Builds with the latest Codex CLI by default. Docker can reuse the cached install layer; rebuild with that layer's cache disabled to fetch a newer release.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
-- Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
+- Passes the non-secret Codex account ID from host auth as `CODEX_ACCOUNT_ID`. The harness writes it literally into `auth.json` for local workspace discovery; access tokens remain opaque provider placeholders and refresh tokens remain gateway-only.
+- Enables `agent_policy_proposals_enabled` and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Installs the gator-specific `gh` wrapper from `gator/bin/gh` as `/usr/local/bin/gh` to fail closed when same-head-SHA history cannot be checked, prevent duplicate dispositions, and require versioned review payloads.
 - Installs `gator/bin/review-feedback-ledger` as `/usr/local/bin/review-feedback-ledger` so reviews receive tree- and patch-aware scope, prior summaries and findings, resolution state, convergence telemetry, and the three-round Warning budget.
+  Patch identity uses fetched merge-base/head trees in a temporary bare Git
+  repository, avoiding GitHub's full-diff size limit without checking out PR
+  code. If those trees cannot be fetched, the ledger retains feedback and
+  exact-SHA history but disables rebase-equivalence shortcuts.
 - Installs `gator/bin/resolve-gator-review-threads` so a follow-up commit that
   demonstrably fixes a Gator inline finding can resolve the corresponding
   Gator-owned GitHub review thread without touching human review threads.

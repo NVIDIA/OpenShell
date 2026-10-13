@@ -286,7 +286,7 @@ policy_signature_for_sandbox() {
 profile_signature_for_profile() {
   local profile_id="$1"
 
-  "${CLI[@]}" provider profile export "$profile_id" -o json \
+  "${CLI[@]}" profile export "$profile_id" -o json \
     | awk -F'"' '/"openshell.nvidia.com\/profile-signature":/ { print $4; exit }'
 }
 
@@ -300,7 +300,7 @@ wait_for_profile() {
   } >>"$SETUP_LOG"
 
   for _ in {1..60}; do
-    if "${CLI[@]}" provider profile export "$profile_id" -o yaml >>"$SETUP_LOG" 2>&1; then
+    if "${CLI[@]}" profile export "$profile_id" -o yaml >>"$SETUP_LOG" 2>&1; then
       printf 'INFO %s\n' "$label"
       return
     fi
@@ -325,7 +325,7 @@ generate_gateway_jwt_bundle() {
 write_gateway_config() {
   cat >"$GATEWAY_CONFIG" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
 provider_profile_sources = [
@@ -340,7 +340,6 @@ signing_key_path = "$JWT_DIR/signing.pem"
 public_key_path = "$JWT_DIR/public.pem"
 kid_path = "$JWT_DIR/kid"
 gateway_id = "$RUN_ID"
-ttl_secs = 0
 
 [[openshell.gateway.interceptors]]
 name = "provider-governance"
@@ -395,7 +394,7 @@ start_interceptor() {
 
 start_gateway() {
   printf 'INFO starting gateway\n'
-  env -u OPENSHELL_DRIVERS "$ROOT/target/debug/openshell-gateway" \
+  env -u OPENSHELL_COMPUTE_DRIVER "$ROOT/target/debug/openshell-gateway" \
     --config "$GATEWAY_CONFIG" \
     --bind-address 127.0.0.1 \
     --port "$GATEWAY_PORT" \
@@ -434,18 +433,28 @@ configure_gateway() {
     --gateway-endpoint "$GATEWAY_ENDPOINT"
   )
 
-  run_setup_step "enabling provider profile policy composition" "${CLI[@]}" settings set --global --key providers_v2_enabled --value true --yes
   wait_for_profile "github"
   wait_for_profile "slack"
 }
 
 run_suite() {
-  expect_output_contains "lists github profile" "github" "${CLI[@]}" provider list-profiles
-  expect_output_contains "lists slack profile" "slack" "${CLI[@]}" provider list-profiles
-  expect_output_not_contains "hides codex profile" "codex" "${CLI[@]}" provider list-profiles
-  expect_output_not_contains "hides google cloud profile" "google-cloud" "${CLI[@]}" provider list-profiles
-  expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" provider profile export github -o json
-  expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" provider profile export github -o json
+  expect_output_contains "lists github profile" "github" "${CLI[@]}" profile list
+  expect_output_contains "lists slack profile" "slack" "${CLI[@]}" profile list
+  # The interceptor is the only configured source, so a profile imported into
+  # the user source stays out of the catalog.
+  cat >"$TMPDIR/unvended-profile.yaml" <<'EOF'
+id: unvended-api
+display_name: Unvended API
+category: other
+endpoints:
+  - host: api.unvended.example
+    port: 443
+binaries: [/usr/bin/curl]
+EOF
+  "${CLI[@]}" profile import -f "$TMPDIR/unvended-profile.yaml" --global >/dev/null 2>&1 || true
+  expect_output_not_contains "hides profiles the interceptor does not vend" "unvended-api" "${CLI[@]}" profile list
+  expect_output_contains "github profile has governance profile signature" "openshell.nvidia.com/profile-signature" "${CLI[@]}" profile export github -o json
+  expect_output_contains "github profile has governance profile hash" "openshell.nvidia.com/profile-hash" "${CLI[@]}" profile export github -o json
 
   cat >"$TMPDIR/disallowed-profile.yaml" <<'EOF'
 id: custom-slack
@@ -457,8 +466,8 @@ endpoints: []
 binaries: []
 EOF
 
-  expect_failure "denies provider profile delete" "${CLI[@]}" provider profile delete slack
-  expect_failure "denies disallowed provider profile import" "${CLI[@]}" provider profile import -f "$TMPDIR/disallowed-profile.yaml"
+  expect_failure "denies provider profile delete" "${CLI[@]}" profile delete slack
+  expect_failure "denies disallowed provider profile import" "${CLI[@]}" profile import -f "$TMPDIR/disallowed-profile.yaml"
 
   run_step "allows github provider create" "${CLI[@]}" provider create --name github --type github --credential GITHUB_TOKEN=dummy
   run_step "allows slack provider create" "${CLI[@]}" provider create --name slack --type slack --credential SLACK_BOT_TOKEN=dummy
@@ -584,7 +593,7 @@ endpoints:
     enforcement: enforce
 binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
 EOF
-  wait_for_output_contains "gateway sees github profile reload" "profile-reload.example" "${CLI[@]}" provider profile export github -o yaml
+  wait_for_output_contains "gateway sees github profile reload" "profile-reload.example" "${CLI[@]}" profile export github -o yaml
   wait_for_output_contains "effective policy has reloaded github profile" "profile-reload.example" "${CLI[@]}" policy get "$SANDBOX_NAME" --full -o json
   local reloaded_github_profile_signature=""
   {
@@ -650,7 +659,7 @@ wait_until_stopped() {
 
 cd "$ROOT"
 
-run_setup_step "building gateway" cargo build --quiet -p openshell-server --bin openshell-gateway
+run_setup_step "building gateway" cargo build --quiet -p openshell-gateway --bin openshell-gateway
 run_setup_step "building governance interceptor" cargo build --quiet --manifest-path "$EXAMPLE_DIR/Cargo.toml"
 run_setup_step "building CLI" cargo build --quiet -p openshell-cli --bin openshell
 

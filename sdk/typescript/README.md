@@ -34,15 +34,37 @@ const client = await OpenShellClient.connect({
 })
 
 const sandbox = await client.sandbox.create({
-  image: 'ghcr.io/nvidia/openshell-community/sandboxes/python:latest',
+  image: 'registry.example.com/agents/python:latest',
+  serviceExposures: [{ targetPort: 8080 }],
 })
+console.log(sandbox.serviceUrls[''])
 await client.sandbox.waitReady(sandbox.name, 120)
 
 const result = await client.sandbox.exec(sandbox.name, ['/bin/sh', '-c', 'echo hello'])
 console.log(result.stdout.toString())
 
-await client.sandbox.delete(sandbox.name)
+const deletion = await client.sandbox.delete(sandbox.name)
+console.log(deletion.outcome) // completed, accepted, or already_absent
+if (deletion.outcome === 'accepted') {
+  await client.sandbox.waitDeleted(sandbox.name, 60, {
+    expectedSandboxId: deletion.sandboxId,
+  })
+}
 ```
+
+Deletion returns a typed result, not a boolean. `accepted` means cleanup is
+pending; `unspecified` and unknown outcomes do not establish completion.
+`sandboxId` identifies the original sandbox. Missing targets are errors unless
+you pass `{ allowMissing: true }`; this does not suppress missing parents or make
+retries safe when names are reused. Upgrade gateway and SDK together for this
+pre-1.0 API change.
+
+`waitDeleted` with `expectedSandboxId` completes when the name is absent or
+resolves to a different ID. Without that option, it waits for name absence,
+including any same-name replacement. Pass the same `workspace` to deletion and
+its wait when using a non-default workspace.
+
+Sandbox refs from `create`, `get`, and `list` carry `createdAtMs` (epoch milliseconds), absent when the gateway omits it.
 
 `connect()` constructs a lazy client; call `health()` when startup must verify
 gateway reachability. Static `oidcToken` and `edgeToken` values remain fixed for
@@ -95,6 +117,36 @@ const sandbox = await SandboxClient.connect({ gateway, oidcToken })
 await sandbox.create({ image })
 ```
 
+## Provider credential retrieval
+
+`client.providers.getCredentials(name, keys, options)` exports selected runtime
+credentials using direct gateway mTLS with a trusted `OU=operator` certificate.
+Enable operator authentication at the gateway and omit OIDC and edge tokens.
+No sandbox or provider attachment is required.
+
+```ts
+import { ProviderClient } from '@nvidia/openshell-sdk'
+
+const providers = await ProviderClient.connect({ gateway, caCert, clientCert, clientKey })
+const credentials = await providers.getCredentials(
+  'my-graph',
+  ['MS_GRAPH_ACCESS_TOKEN'],
+  { workspace: 'production', minimumRemainingLifetimeSecs: 300 },
+)
+const token = credentials.MS_GRAPH_ACCESS_TOKEN!.value
+```
+
+The workspace and a nonempty selection are required. The result maps keys to
+`ProviderCredentialValue` objects with `value` and optional `expirationTime`
+(`Date`, truncating sub-millisecond precision). Lifetime is in seconds, including
+fractions; omission or zero uses the gateway's five-minute margin, up to a
+24-hour requested maximum. `signal` and `timeoutMs` bound the RPC, but canceling
+delivery does not roll back an already-started refresh. The helper does not
+retry or cache exports. Do not log the result: the values can be used outside
+sandbox policy enforcement. See the published
+[SDK example](https://docs.nvidia.com/openshell/latest/sdk/typescript#retrieve-provider-credentials)
+and [provider reference](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview#retrieve-runtime-credentials).
+
 ## Streaming and interactive exec
 
 `execStream` yields stdout/stderr chunks as they arrive, so long or chatty commands surface output incrementally instead of buffering until exit. The stream ends with a terminal `{ type: 'exit', exitCode }` event, yielded in-band so a failing command cannot look successful under `for await`. Discriminate it with `'type' in event`. If the gateway closes the stream without an exit event, `execStream` throws. `exec` drains `execStream` internally, so its buffered `ExecResult` is unchanged.
@@ -106,7 +158,20 @@ for await (const event of client.sandbox.execStream(name, ['pytest', '-q'])) {
 }
 ```
 
-`execInteractive` is the TTY + stdin transport primitive. Drive it by consuming `output`, which yields the same chunk/exit events; `done` resolves with the exit code once the stream reaches its exit event and rejects if it ends without one. It ships raw bytes only; raw mode, signal forwarding, and SIGWINCH stay with the caller.
+`execInteractive` is the TTY + stdin transport primitive. Consume `output` concurrently with awaiting `done`. The helper yields its terminal exit event and resolves `done` only after receiving an exit event and successful final gRPC status. If transport completion fails, `done` rejects and `session.exitCode` retains any observed process exit code. Duplicate exit events and output after exit are errors.
+
+The RPC starts immediately when the session is created, even before you consume
+`output`. A background receiver observes transport errors and buffers up to 1 MiB
+of output in 64 KiB chunks. Once the queue fills, receiving waits for the caller
+to drain it; cancellation interrupts that wait. The bound excludes the transport's
+current response frame and its own buffers.
+
+Call `closeInput()` (or its compatibility alias `close()`) to end stdin and resize input while continuing to receive output. Later writes and resizes throw. Call `cancel()` to abort the RPC. Both close and cancel are idempotent. The helper ships raw bytes only; raw mode, signal forwarding, and SIGWINCH stay with the caller. Input closure is not a terminal Ctrl-D keystroke.
+
+`execInteractive()` returns `ExecInteractiveSessionControl`, which extends the
+original `ExecInteractiveSession` with `closeInput()`, `cancel()`, and `exitCode`.
+Existing mocks and wrappers can keep implementing the original interface without
+adding those members. Use the extended type when a wrapper exposes the new controls.
 
 ```ts
 const session = await client.sandbox.execInteractive(name, ['bash'])
@@ -152,13 +217,67 @@ await client.sandbox.setSetting(name, 'feature.enabled', { value: { case: 'boolV
 
 Sandbox-scoped `setPolicy` may only change `networkPolicies`; static fields (`filesystem`, `landlock`, `process`) must match the create-time policy. Sandbox-scoped setting deletes are rejected by the gateway, so only upsert (`setSetting`) is exposed here.
 
+## Sandbox templates
+
+Sandbox workload templates are reusable, workspace-scoped runtime shapes. They
+own image, environment, resource, and driver-specific settings; sandbox creation
+from a template can still attach labels, providers, and create-time policy.
+
+```ts
+import { OpenShellClient, type SandboxWorkloadTemplate } from '@nvidia/openshell-sdk'
+
+const client = await OpenShellClient.connect({ gateway, oidcToken })
+
+const template: SandboxWorkloadTemplate = await client.sandboxTemplates.create(
+  {
+    metadata: { name: 'python', labels: { team: 'runtime' } },
+    spec: {
+      workload: {
+        image: 'registry.example.com/agents/python:latest',
+        environment: { FEATURE_FLAG: 'on' },
+        resources: { cpu: '1', memory: '512Mi' },
+      },
+      driverConfig: { kubernetes: { pod: { runtime_class_name: 'kata-containers' } } },
+    },
+  },
+  { workspace: 'default' },
+)
+
+const sandbox = await client.sandbox.createFromTemplate({
+  workloadTemplate: template.metadata!.name,
+  workspace: 'default',
+  providers: ['github'],
+  policy: { version: 1, networkPolicies: {} },
+})
+
+await client.sandboxTemplates.get('python', { workspace: 'default' })
+await client.sandboxTemplates.listAll({ workspace: 'default', pageSize: 100 })
+await client.sandboxTemplates.delete('python', { workspace: 'default' })
+```
+
+Use `allWorkspaces: true` on `list()` for a platform-admin view. The
+discriminated option type makes `workspace` and `allWorkspaces` mutually
+exclusive. Omitting both options explicitly selects the `default` workspace.
+List methods follow continuation tokens through a lazy `Pager`; each advance
+fetches one RPC page. Use `listAll()` only
+when you want to exhaust the collection. `pageSize` controls one request and
+`pageToken` resumes a saved traversal.
+
+```ts
+const pages = client.sandbox.list({ workspace: 'default', pageSize: 100 })
+for await (const page of pages) {
+  for (const sandbox of page.items) console.log(sandbox.name)
+}
+```
+
 ## Surface and roadmap
 
 The SDK's goal is agent parity: anything the OpenShell gateway can do should be reachable from typed code, not only the CLI. The API is organized as scoped sub-clients over one shared connection, mirroring the CLI's verbs.
 
 - `client.sandbox` (`SandboxClient`) is available today: sandbox lifecycle, exec, forward, SSH, sandbox-scoped providers, config, and policy.
+- `client.sandboxTemplates` (`SandboxTemplateClient`) is available today: reusable sandbox workload template CRUD.
 - `client.gateway` (`GatewayClient`) is planned: gateway-scoped config and settings, health, and cluster status.
-- `client.providers` (`ProviderClient`) is planned: gateway-scoped provider CRUD and profiles.
+- `client.providers` (`ProviderClient`) is available today for operator-only credential retrieval. Provider CRUD and profile helpers remain planned.
 
 `health()` lives at the root today and will move under `client.gateway` (with a root alias) when that lands.
 
@@ -169,14 +288,24 @@ Curated methods are added deliberately, so some gateway RPCs are not yet wrapped
 `client.raw` is a generated client for every gateway RPC, including surface the curated sub-clients do not wrap yet (gateway config, provider CRUD, policy status, watch, logs, and the full observed `Sandbox`). `client.transport` is the shared connection, so extra clients reuse one socket. Generated request and response types live at `@nvidia/openshell-sdk/raw`.
 
 ```ts
+import { create } from '@bufbuild/protobuf'
 import { OpenShellClient } from '@nvidia/openshell-sdk'
+import { WorkspaceSelectorSchema } from '@nvidia/openshell-sdk/raw'
 import type { GetGatewayConfigResponse } from '@nvidia/openshell-sdk/raw'
 
 const client = await OpenShellClient.connect({ gateway, oidcToken })
 
 // Reach RPCs the curated surface does not wrap yet:
 const cfg: GetGatewayConfigResponse = await client.raw.getGatewayConfig({})
-const status = await client.raw.getSandboxPolicyStatus({ name: 'my-sandbox', version: 0, global: false })
+const defaultWorkspace = create(WorkspaceSelectorSchema, {
+  selection: { case: 'workspace', value: 'default' },
+})
+const status = await client.raw.getSandboxPolicyStatus({
+  sandbox: 'my-sandbox',
+  version: 0,
+  global: false,
+  workspaceScope: defaultWorkspace,
+})
 ```
 
 The raw layer returns the generated wire messages verbatim, preserving proto distinctions (an omitted optional versus an explicitly empty map) that the curated types may smooth over. As curated sub-clients land, prefer them; `raw` stays as the always-available floor.
@@ -200,6 +329,7 @@ mise run sdk:ts:lint        # Biome: lint + format check (read-only)
 mise run sdk:ts:typecheck   # tsc --noEmit
 mise run sdk:ts:test        # Vitest unit tests with an 80% line-coverage gate
 mise run sdk:ts:build       # emit dist/
+mise run e2e:sdk:ts:exec    # public interactive helper against an isolated Docker gateway
 ```
 
 Formatting and linting are handled by [Biome](https://biomejs.dev) (`biome.json`): 2-space indent, single quotes, semicolons, 120-column width. Generated `src/gen/` is excluded. `sdk:ts:lint` runs in CI as part of `sdk:ts:ci`.

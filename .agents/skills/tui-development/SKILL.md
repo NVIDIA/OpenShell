@@ -1,6 +1,8 @@
 ---
 name: tui-development
 description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, openshell-tui, tui development, tui feature, tui bug.
+metadata:
+  internal: true
 ---
 
 # OpenShell TUI Development Guide
@@ -14,7 +16,7 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
 - **Launched via:** `openshell term` or `mise run term`
 - **Crate:** `crates/openshell-tui/`
 - **Key dependencies:**
-  - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
+  - `ratatui` (workspace version) — uses `frame.area()` for the drawable terminal area
   - `crossterm` (workspace version) — terminal backend and event polling
   - `tonic` with TLS — gRPC client for the OpenShell gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
@@ -43,8 +45,8 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 
 - **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, local/remote flag, and source label.
 - **Workspaces** are fetched via `ListWorkspaces`. The user cycles through workspaces with `[w]`, or views all workspaces at once. The current workspace scopes provider and sandbox lists.
-- **Provider Profiles** are fetched per-workspace via `ListProviderProfiles` when `providers_v2_enabled` is true. Profiles are cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)` and matched to providers by type. They provide category, credential metadata, endpoint/binary counts, and inference capability.
-- **Providers** are fetched via `ListProviders` scoped to the current workspace. Each `ProviderListEntry` pairs a provider with its optional cached profile. When `providers_v2_enabled` is true, CRUD operations are read-only in the TUI; when false, the TUI supports create/update/delete.
+- **Provider Profiles** are fetched per-workspace via `ListProviderProfiles`. Profiles are cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)` and matched to providers by type. They provide category, credential metadata, endpoint/binary counts, and inference capability.
+- **Providers** are fetched via `ListProviders` scoped to the current workspace. Each `ProviderListEntry` pairs a provider with its optional cached profile. The TUI supports profile-backed create, update, and delete operations.
 - **Global Settings** are fetched via `GetGatewayConfig` and displayed in a tabbed pane alongside providers on the dashboard. Each setting is a registered key with a typed value (bool/int/string). Platform-admin access is required; `PermissionDenied` disables the pane.
 - **Sandboxes** belong to the active gateway and workspace. Fetched via `ListSandboxes` with a periodic tick refresh.
 - **Sandbox Settings** are effective settings returned by `GetSandboxConfig`, each with a scope (sandbox, global, or unset). Globally-managed settings are blocked from sandbox-level edits.
@@ -53,7 +55,7 @@ Gateway (discovered via openshell_bootstrap::list_gateways())
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- OpenShell │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
+ OpenShell v<version> │ Current Gateway: <name> [source] (<status>) │ Workspace: <name|all> │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -100,7 +102,7 @@ match app.screen {
 }
 ```
 
-Within the `Sandbox` screen, the top 20% renders sandbox metadata (`sandbox_detail`), and the bottom 80% dispatches based on focus and tab state:
+Within the `Sandbox` screen, `sandbox_detail::required_height` sizes the metadata and restart status pane to its contents. The remaining area dispatches based on focus and tab state:
 
 ```rust
 match app.focus {
@@ -142,8 +144,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
-- Sandbox detail: ` >_ OpenShell  ALPHA  | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
+- Dashboard: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: default | Dashboard`
+- Sandbox detail: ` >_ OpenShell v<version> | Current Gateway: openshell [local] (Healthy) | Workspace: team-a | Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -168,13 +170,15 @@ Phase 1: GetSandboxLogs  →  500 initial lines  →  send via Event::LogLines
 Phase 2: WatchSandbox(follow_logs: true)  →  live tail  →  send via Event::LogLines
 ```
 
-**Sandboxes**: Fetched via `ListSandboxes` on a 2-second tick, scoped to the current workspace (or all workspaces).
+**Sandboxes**: Fetched via `ListSandboxes` in a background collection-refresh task scheduled from the 2-second tick, scoped to the current workspace (or all workspaces). Follow `next_page_token` until empty so the dashboard reflects the complete collection. The NOTES column summarizes active `ConfigurationInvalid` readiness conditions as `Invalid config` before port forwards and clears the note on refresh after repair. Full diagnostics remain available through `openshell sandbox get <name> -o json`. Timed-out provisioning attempts show `Provisioning timed out` with cleanup pending or compute reclaimed, preserving port forwards. The sandbox detail pane wraps the full configuration error in its Notes field.
 
-**Providers**: Fetched via `ListProviders` on each tick. When `providers_v2_enabled` is true, provider profiles are also fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`.
+**Providers**: Fetched via `ListProviders` in the background collection-refresh task. Provider profiles are fetched per-workspace via `ListProviderProfiles` and cached in a `ProviderProfileCache` keyed by `(workspace, profile_id)`. Follow each list RPC's `next_page_token` until empty.
 
 **Settings**: Global settings are fetched via `GetGatewayConfig` on each tick. Sandbox settings are fetched alongside the sandbox policy via `GetSandboxConfig` and refreshed on each tick when viewing a sandbox.
 
-**Workspaces**: The workspace list is fetched via `ListWorkspaces` on each tick.
+**Workspaces**: The workspace list is fetched via `ListWorkspaces` in the background collection-refresh task, following `next_page_token` until empty.
+
+Only one collection-refresh task may run at a time. Workspace and gateway changes abort the active task, and refresh results carry their gateway/workspace context so stale results are discarded.
 
 ### Never block the event loop
 
@@ -258,7 +262,7 @@ The `Theme` struct has 16 `Style` fields, accessed at runtime via `app.theme`:
 | `border` | EVERGLADE fg | Light sage fg | Unfocused panel borders |
 | `border_focused` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Focused panel borders |
 | `status_ok` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Healthy, INFO, Ready |
-| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning |
+| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning, Starting |
 | `status_err` | Red fg | Dark red fg | Unhealthy, ERROR |
 | `key_hint` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Keyboard shortcut labels |
 | `log_cursor` | EVERGLADE bg | Light green bg | Selected log line highlight |
@@ -293,7 +297,7 @@ fn draw_detail_popup(frame: &mut Frame<'_>, data: &MyData, area: Rect, theme: &T
 
 - **Selected row**: Green `▌` left-border marker on the selected row. Active gateway also gets a green `●` dot.
 - **Focused panel**: Border changes from `border` to `border_focused` style.
-- **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/warn, red for unhealthy/error.
+- **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/starting/warn, red for unhealthy/error.
 - **Separators**: Muted `│` characters between title bar segments and nav bar sections.
 - **Log source labels**: `"sandbox"` source renders in `accent` (green), `"gateway"` in `muted`.
 
@@ -321,10 +325,12 @@ TUI actions should parallel `openshell` CLI commands so users have familiar ment
 | `openshell sandbox connect` | `[s]` on sandbox policy view to launch SSH shell |
 | `openshell logs <name>` | `[l]` on sandbox detail to open log viewer |
 | `openshell provider list` | Provider table on Dashboard (middle pane) |
-| `openshell provider create` | `[c]` on provider panel (when not providers_v2) |
+| `openshell provider create` | `[c]` on provider panel |
 | `openshell status` | Status in title bar + gateway list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
+
+The create form parses the optional Command field as shell words before starting creation. Preserve the parsed argument vector through post-create execution and shell-escape each argument at the SSH boundary. Quoting groups arguments; expansions and operators remain literal unless the user explicitly invokes a shell such as `sh -c`. Invalid quoting must leave the form open with an error and must not queue sandbox creation.
 
 ### Scrollable views follow k9s conventions
 
@@ -383,11 +389,8 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 **Dashboard (Gateways focus):**
 `[Tab] Switch Panel  [Enter] Select  [j/k] Navigate  │  [:] Command  [q] Quit`
 
-**Dashboard (Providers focus, providers_v2):**
-`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  read-only  │  [:] Command  [q] Quit`
-
-**Dashboard (Providers focus, legacy):**
-`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  │  [:] Command  [q] Quit`
+**Dashboard (Providers focus):**
+`[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Detail  [c] Create  [u] Update  [d] Delete  [w] Workspace  │  [:] Command  [q] Quit`
 
 **Dashboard (Global Settings focus):**
 `[Tab] Switch Panel  [h/l] Switch Tab  [j/k] Navigate  [Enter] Edit  [d] Delete  │  [:] Command  [q] Quit`
@@ -412,9 +415,9 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 | File | Purpose |
 | --- | --- |
 | `crates/openshell-tui/Cargo.toml` | Crate manifest — dependencies on `openshell-core`, `openshell-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_data`, `refresh_providers`, `refresh_global_settings`, `refresh_workspaces`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`, `fetch_providers_v2_setting`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
+| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, background collection refresh (`spawn_list_refresh`), gRPC calls (`refresh_global_settings`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building, provider CRUD spawners, settings CRUD spawners, draft approval spawners |
 | `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter`/`MiddlePaneTab`/`SandboxPolicyTab` enums, `LogLine`/`GatewayEntry`/`GlobalSettingEntry`/`SandboxSettingEntry`/`ProviderListEntry`/`ProviderDetailView` structs, create sandbox/provider form state, all key handling logic |
-| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
+| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Redraw`, `Resize`, `LogLines`, `ListRefreshCompleted`, `CreateResult`, `ProviderCreateResult`, `ProviderDetailFetched`, `ProviderUpdateResult`, `ProviderDeleteResult`, `DraftActionResult`, `GlobalSettingsFetched`, `GlobalSettingSetResult`, `GlobalSettingDeleteResult`, `SandboxSettingSetResult`, `SandboxSettingDeleteResult`, `ForwardWarnings`), `EventHandler` with mpsc channels and crossterm polling |
 | `crates/openshell-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
 | `crates/openshell-tui/src/clipboard.rs` | Clipboard copy support for log lines |
 | `crates/openshell-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar` (with workspace display), `draw_nav_bar`, `draw_command_bar`, screen routing, shared setting-edit overlay, modal helpers |
@@ -422,7 +425,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 | `crates/openshell-tui/src/ui/providers.rs` | Provider list table with profile-aware columns: Name, Category, Type, Credentials, Workspace |
 | `crates/openshell-tui/src/ui/global_settings.rs` | Global settings table: Key, Type, Value. Includes edit overlay, confirm-set, and confirm-delete popups |
 | `crates/openshell-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image, Workspace, Notes |
-| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, providers, policy version |
+| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox metadata view — name, status, image, created, age, restart policy/status, providers, policy version |
 | `crates/openshell-tui/src/ui/sandbox_policy.rs` | Policy viewer — rendered policy lines with scroll support, tab title |
 | `crates/openshell-tui/src/ui/sandbox_settings.rs` | Sandbox settings table: Key, Type, Value, Scope. Includes edit overlay and confirm popups |
 | `crates/openshell-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter, visual selection mode, clipboard copy |
@@ -470,33 +473,63 @@ Proto types come from `openshell-core` which generates them from `OUT_DIR` via `
 
 ```rust
 use openshell_core::proto::openshell_client::OpenShellClient;
-use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
+use openshell_core::proto::{
+    all_workspaces_selector, workspace_selector, GetSandboxLogsRequest,
+    ListSandboxesRequest, ...
+};
 ```
 
 ### Proto field gotchas
 
-- `DeleteSandboxRequest` uses the `name` field (not `id`):
+- `DeleteSandboxRequest` uses `name` for the primary sandbox and an explicit
+  workspace selector:
   ```rust
-  let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
+  let req = openshell_core::proto::DeleteSandboxRequest {
+      name: sandbox_name,
+      workspace_scope: Some(workspace_selector(workspace)),
+      allow_missing: true,
+      ..Default::default()
+  };
   ```
+- Delete responses carry `DeletionOutcome`: distinguish `Accepted` (cleanup
+  pending), `Completed`, and `AlreadyAbsent`. Treat unspecified or unknown
+  outcomes as unconfirmed, not completed.
 - `WatchSandboxRequest` has extra fields beyond what you might need — always use `..Default::default()`:
   ```rust
   let req = openshell_core::proto::WatchSandboxRequest {
-      id: sandbox_id,
+      sandbox: sandbox_name,
       follow_status: false,
       follow_logs: true,
       follow_events: false,
       log_tail_lines: 0,
+      workspace_scope: Some(workspace_selector(workspace)),
       ..Default::default()
   };
   ```
-- `SandboxLogLine` proto fields: `sandbox_id`, `timestamp_ms`, `level`, `target`, `message`, `source`, `fields` (HashMap<String, String>).
-- `GetSandboxLogsRequest` fields: `sandbox_id`, `lines` (u32), `since_ms` (i64), `sources` (Vec<String>), `min_level` (String), `workspace` (String).
-- `ListSandboxesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String), `workspace` (String), `all_workspaces` (bool).
-- `ListProvidersRequest` fields: `limit` (i64), `offset` (i64), `workspace` (String), `all_workspaces` (bool).
-- `ListWorkspacesRequest` fields: `limit` (i64), `offset` (i64), `label_selector` (String).
-- `UpdateConfigRequest` fields: `name` (String, sandbox name or empty for global), `setting_key`, `setting_value`, `delete_setting` (bool), `global` (bool), `workspace`.
-- Most resource requests include a `workspace` field that scopes the operation to the current workspace.
+- `SandboxLogLine` proto fields: `sandbox_id`, `event_time` (`Option<prost_types::Timestamp>`), `level`, `target`, `message`, `source`, `fields` (`HashMap<String, String>`).
+- Workspace-scoped requests use
+  `workspace_scope: Option<WorkspaceSelector>`. Select one workspace with
+  `Some(workspace_selector(name))`. Collection list requests that explicitly
+  support cross-workspace access also accept
+  `Some(all_workspaces_selector())`; do not use that marker on other requests.
+- `GetSandboxLogsRequest` fields: `sandbox`, `lines` (u32), `since_time` (`Option<prost_types::Timestamp>`),
+  `sources` (Vec<String>), `min_level` (String), `workspace_scope`.
+- `ListSandboxesRequest` fields: `page_size` (i32), `page_token` (String),
+  `label_selector` (String), `workspace_scope`.
+- `ListProvidersRequest` fields: `page_size` (i32), `page_token` (String),
+  `workspace_scope`.
+- `ListWorkspacesRequest` fields: `page_size` (i32), `page_token` (String),
+  `label_selector` (String).
+- Paginated list responses return `next_page_token`. Continue with the same
+  request parameters and that token until it is empty; changing filters or
+  scope invalidates the token.
+- `UpdateConfigRequest` fields include `sandbox` (String, canonical sandbox name),
+  `setting_key`, `setting_value`, `delete_setting` (bool), `global` (bool), and
+  `workspace_scope`. Sandbox-scoped updates require canonical `sandbox` and a
+  named selector; gateway-global updates leave `sandbox` empty and
+  `workspace_scope` as `None`.
+- Most workspace-scoped requests require an explicit named selector, including
+  the `default` workspace. An omitted selector is not an implicit default.
 
 ### gRPC timeouts
 
@@ -526,23 +559,21 @@ The connect timeout for gateway switching is 10 seconds with HTTP/2 keepalive at
 4. On success:
    - `app.client` is replaced with a new intercepted client
    - `reset_sandbox_state()` clears all sandbox/log/draft/policy data
-   - `fetch_providers_v2_setting()` probes the new gateway's `GetGatewayConfig` to determine whether providers_v2 mode is enabled, so provider CRUD controls render correctly
-   - `refresh_data()` runs the full capability refresh sequence: `refresh_health` → `refresh_global_settings` → `refresh_workspaces` → `refresh_providers` → `refresh_sandboxes`
+   - health and global settings are refreshed, then `spawn_list_refresh()` starts the cancellable workspace/provider/sandbox refresh task
 5. On failure: `status_text` shows the error
 
 ### Initial startup lifecycle
 
 On launch, before the event loop starts:
 
-1. `fetch_providers_v2_setting()` — probe gateway capability
-2. `refresh_gateway_list()` — discover gateways from disk
-3. `refresh_data()` — full refresh (health, global settings, workspaces, providers, sandboxes)
+1. `refresh_gateway_list()` — discover gateways from disk
+2. Refresh health and global settings, then start `spawn_list_refresh()` for workspaces, providers, and sandboxes
 
 ### Workspace switching lifecycle
 
-1. User presses `[w]` on the sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
+1. User presses `[w]` on the providers or sandboxes panel → `cycle_workspace()` advances through discovered workspace names, then "all"
 2. `pending_workspace_refresh = true` is set, cursor indices are reset
-3. Event loop calls `refresh_providers()` and `refresh_sandboxes()` with the new workspace scope
+3. Event loop cancels any in-flight collection refresh and starts `spawn_list_refresh()` with the new workspace scope
 
 ### Settings CRUD lifecycle (global and sandbox)
 
@@ -576,13 +607,9 @@ cargo fmt -p openshell-tui
 cargo clippy -p openshell-tui
 ```
 
-### Pre-commit
+### Verification
 
-Always run before committing:
-
-```bash
-mise run pre-commit
-```
+Follow Choose Verification for the Change in `CONTRIBUTING.md`. Select format, lint, and tests for the affected TUI behavior and its dependencies. Use `mise run pre-commit` when its broader scope is warranted.
 
 ### Gateway changes
 

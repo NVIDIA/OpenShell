@@ -5,7 +5,11 @@
 package converter
 
 import (
+	"maps"
+	"time"
+
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -48,9 +52,33 @@ func FromGRPCError(err error) error {
 		code = types.ErrorInternal
 	}
 
-	return &types.StatusError{
-		Code:    code,
-		Message: st.Message(),
-		Cause:   err,
+	result := &types.StatusError{
+		Code:     code,
+		Message:  st.Message(),
+		Cause:    err,
+		GRPCCode: int32(st.Code()),
 	}
+	for _, detail := range st.Details() {
+		switch detail := detail.(type) {
+		case *errdetails.BadRequest:
+			for _, violation := range detail.GetFieldViolations() {
+				result.FieldViolations = append(result.FieldViolations, types.FieldViolation{
+					Field: violation.GetField(), Description: violation.GetDescription(),
+				})
+			}
+		case *errdetails.ErrorInfo:
+			result.ErrorInfo = &types.ErrorInfo{
+				Reason: detail.GetReason(), Domain: detail.GetDomain(),
+				Metadata: maps.Clone(detail.GetMetadata()),
+			}
+		case *errdetails.RetryInfo:
+			delay := detail.GetRetryDelay()
+			if delay != nil && delay.CheckValid() == nil && delay.GetSeconds() >= 0 && delay.GetNanos() >= 0 {
+				// AsDuration saturates values that exceed time.Duration's range.
+				value := time.Duration(delay.AsDuration())
+				result.RetryDelay = &value
+			}
+		}
+	}
+	return result
 }

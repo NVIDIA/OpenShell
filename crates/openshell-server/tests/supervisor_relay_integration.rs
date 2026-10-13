@@ -22,8 +22,10 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
+use metrics::LocalRecorderGuard;
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
+    GatewayMessage, PeerRelayFrame, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -48,10 +50,54 @@ struct RelayGateway {
 
 #[tonic::async_trait]
 impl OpenShell for RelayGateway {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -74,6 +120,44 @@ impl OpenShell for RelayGateway {
     }
 
     // ------ unused stubs ------
+
+    async fn create_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::CreateSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn get_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::SandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_sandbox_templates(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListSandboxTemplatesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListSandboxTemplatesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_sandbox_template(
+        &self,
+        _request: tonic::Request<openshell_core::proto::DeleteSandboxTemplateRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxTemplateResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    type PeerRelayStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send>>;
+
+    async fn peer_relay(
+        &self,
+        _: tonic::Request<tonic::Streaming<PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     type ConnectSupervisorStream = ReceiverStream<Result<GatewayMessage, Status>>;
     async fn connect_supervisor(
@@ -197,6 +281,22 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("provider readiness"))
+    }
+
     async fn get_sandbox_provider_environment(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,
@@ -261,6 +361,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ProviderResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn get_provider_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        Err(Status::unimplemented("not used by this mock"))
+    }
+
     async fn get_provider(
         &self,
         _: tonic::Request<openshell_core::proto::GetProviderRequest>,
@@ -367,6 +474,13 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn report_sandbox_configuration(
+        &self,
+        _: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
@@ -551,6 +665,38 @@ fn register_session_with_capacity(
         shutdown_tx,
     );
     rx
+}
+
+/// Captures metrics recorded on this test's thread. `#[tokio::test]` is current-thread, so the
+/// in-process gateway tasks record here too. Do not pass it into async helper fns (it is !Send).
+struct MetricsCapture {
+    handle: PrometheusHandle,
+    _guard: LocalRecorderGuard<'static>,
+}
+
+impl MetricsCapture {
+    fn install() -> Self {
+        // Leaked (test only) so the guard can borrow the recorder for 'static.
+        let recorder: &'static PrometheusRecorder =
+            Box::leak(Box::new(PrometheusBuilder::new().build_recorder()));
+        let handle = recorder.handle();
+        let guard = metrics::set_default_local_recorder(recorder);
+        Self {
+            handle,
+            _guard: guard,
+        }
+    }
+
+    fn render(&self) -> String {
+        self.handle.render()
+    }
+
+    /// Integer value of one exact series, or `None` when it was never emitted.
+    fn value(&self, series: &str) -> Option<i64> {
+        self.render()
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+    }
 }
 
 /// Mock supervisor that opens a `RelayStream`, sends `Init`, then echoes every
@@ -754,6 +900,7 @@ async fn concurrent_relays_multiplex_independently() {
 /// rather than racing the pending map into an inconsistent state.
 #[tokio::test]
 async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
+    let metrics = MetricsCapture::install();
     let registry = Arc::new(SupervisorSessionRegistry::new());
     let _channel = spawn_gateway(Arc::clone(&registry)).await;
     // Oversized mpsc so the session doesn't backpressure the burst — the cap,
@@ -789,6 +936,23 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
     }
     assert_eq!(ok, 32, "exactly per-sandbox cap should succeed");
     assert_eq!(exhausted, 32, "overflow should be rejected, not dropped");
+    // The successful receivers were dropped, so their entries stay pending
+    // until they are claimed or reaped.
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(32));
+    assert_eq!(
+        metrics.value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}"),
+        Some(32)
+    );
+    assert_eq!(
+        metrics
+            .value("openshell_server_relay_rejected_total{reason=\"replica_capacity\"}")
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        metrics.value("openshell_server_supervisor_sessions"),
+        Some(1)
+    );
 
     // A different sandbox still has headroom — the per-sandbox cap doesn't
     // leak onto unrelated tenants.
@@ -797,6 +961,107 @@ async fn open_relay_enforces_per_sandbox_cap_under_concurrent_burst() {
         .open_relay("sbx-other", Duration::from_secs(1))
         .await
         .expect("other sandbox should not be affected by sbx cap");
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(33));
+    assert_eq!(
+        metrics.value("openshell_server_supervisor_sessions"),
+        Some(2)
+    );
+}
+
+/// Bursts more `open_relay` calls than the replica cap allows, spread so that
+/// no sandbox reaches its own cap, and asserts the replica ceiling and its
+/// metrics.
+#[tokio::test]
+async fn open_relay_enforces_replica_cap_under_concurrent_burst() {
+    let metrics = MetricsCapture::install();
+    let registry = Arc::new(SupervisorSessionRegistry::new());
+    let _channel = spawn_gateway(Arc::clone(&registry)).await;
+    let sandbox_ids: Vec<String> = (0..9).map(|i| format!("sbx-{i}")).collect();
+    let _session_rxs: Vec<_> = sandbox_ids
+        .iter()
+        .map(|id| register_session_with_capacity(&registry, id, 64))
+        .collect();
+
+    // 9 x 32 = 288 opens against a replica cap of 256. No sandbox gets more
+    // than its cap of 32 attempts and the replica check runs first, so exactly
+    // 32 opens hit the replica cap.
+    let mut handles = Vec::with_capacity(288);
+    for id in &sandbox_ids {
+        for _ in 0..32 {
+            let r = Arc::clone(&registry);
+            let id = id.clone();
+            handles.push(tokio::spawn(async move {
+                r.open_relay(&id, Duration::from_secs(1)).await
+            }));
+        }
+    }
+
+    let mut ok = 0usize;
+    let mut exhausted = 0usize;
+    for h in handles {
+        match h.await.expect("task joined") {
+            Ok(_pair) => ok += 1,
+            Err(status) if status.code() == tonic::Code::ResourceExhausted => {
+                assert!(
+                    status.message().contains("gateway relay capacity"),
+                    "expected replica capacity error message, got: {}",
+                    status.message()
+                );
+                exhausted += 1;
+            }
+            Err(other) => panic!("unexpected open_relay error: {other:?}"),
+        }
+    }
+    assert_eq!(ok, 256, "exactly the replica cap should succeed");
+    assert_eq!(exhausted, 32, "overflow should be rejected, not dropped");
+
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(256));
+    assert_eq!(
+        metrics.value("openshell_server_relay_rejected_total{reason=\"replica_capacity\"}"),
+        Some(32)
+    );
+    assert_eq!(
+        metrics
+            .value("openshell_server_relay_rejected_total{reason=\"sandbox_capacity\"}")
+            .unwrap_or(0),
+        0
+    );
+    assert_eq!(
+        metrics.value("openshell_server_supervisor_sessions"),
+        Some(9)
+    );
+    let rendered = metrics.render();
+    for forbidden in ["sandbox_id=", "channel_id=", "sbx-0", "endpoint="] {
+        assert!(
+            !rendered.contains(forbidden),
+            "metric labels must not carry identifiers ({forbidden})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn relay_claim_releases_pending_slot_and_records_claim_latency() {
+    let metrics = MetricsCapture::install();
+    let registry = Arc::new(SupervisorSessionRegistry::new());
+    let channel = spawn_gateway(Arc::clone(&registry)).await;
+    let _session_rx = register_session(&registry, "sbx");
+
+    let (channel_id, relay_rx) = registry
+        .open_relay("sbx", Duration::from_secs(2))
+        .await
+        .expect("open_relay");
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(1));
+
+    tokio::spawn(run_echo_supervisor(channel, channel_id));
+    let _relay = relay_rx.await.expect("relay result").expect("relay duplex");
+
+    // The claim releases the pending slot under the pending lock, before it
+    // wakes the waiter.
+    assert_eq!(metrics.value("openshell_server_relay_pending"), Some(0));
+    assert_eq!(
+        metrics.value("openshell_server_relay_claim_duration_seconds_count"),
+        Some(1)
+    );
 }
 
 /// Build an in-memory store sufficient for wiring `health_router` in tests

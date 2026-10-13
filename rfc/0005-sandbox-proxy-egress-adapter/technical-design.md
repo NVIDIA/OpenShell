@@ -549,9 +549,6 @@ which protocol milestone is sufficient to call the validated connector.
 
 Local services are network surfaces but not normal external egress:
 
-- `inference.local` terminates local client traffic, validates known inference
-  routes, strips caller auth, injects provider routing/auth, and applies
-  streaming or buffered limits based on route type.
 - `policy.local` serves policy snapshots, denial summaries, proposal
   submission, and proposal wait. It should never expose secrets or provider
   rules as editable policy.

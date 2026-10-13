@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
+const DEFAULT_WINDOW: Duration = Duration::from_mins(1);
 const DEFAULT_MAX_PER_WINDOW: u32 = 10;
 
 /// Number of tracked sandboxes above which expired windows are pruned.
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn allows_a_burst_then_refuses_within_the_window() {
-        let limiter = ExtensionMintLimiter::new(Duration::from_secs(60), 3);
+        let limiter = ExtensionMintLimiter::new(Duration::from_mins(1), 3);
         let start = Instant::now();
 
         for _ in 0..3 {
@@ -113,17 +113,17 @@ mod tests {
 
     #[test]
     fn window_rollover_restores_capacity() {
-        let limiter = ExtensionMintLimiter::new(Duration::from_secs(60), 1);
+        let limiter = ExtensionMintLimiter::new(Duration::from_mins(1), 1);
         let start = Instant::now();
 
         assert!(limiter.try_acquire_at("sandbox-a", start));
         assert!(!limiter.try_acquire_at("sandbox-a", start + Duration::from_secs(59)));
-        assert!(limiter.try_acquire_at("sandbox-a", start + Duration::from_secs(60)));
+        assert!(limiter.try_acquire_at("sandbox-a", start + Duration::from_mins(1)));
     }
 
     #[test]
     fn sandboxes_are_limited_independently() {
-        let limiter = ExtensionMintLimiter::new(Duration::from_secs(60), 1);
+        let limiter = ExtensionMintLimiter::new(Duration::from_mins(1), 1);
         let start = Instant::now();
 
         assert!(limiter.try_acquire_at("sandbox-a", start));
@@ -147,7 +147,7 @@ mod tests {
 
     #[test]
     fn a_zero_bound_disables_limiting() {
-        let limiter = ExtensionMintLimiter::new(Duration::from_secs(60), 0);
+        let limiter = ExtensionMintLimiter::new(Duration::from_mins(1), 0);
         let start = Instant::now();
         for _ in 0..1_000 {
             assert!(limiter.try_acquire_at("sandbox-a", start));

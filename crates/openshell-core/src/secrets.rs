@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#[path = "secrets_body.rs"]
+pub mod body;
+
 use crate::time::now_ms;
 use base64::Engine as _;
 use std::collections::{HashMap, HashSet};
@@ -52,6 +55,38 @@ pub fn contains_reserved_credential_marker(value: &str) -> bool {
     }
     let decoded = percent_decode(value);
     contains_raw_reserved_marker(&decoded)
+}
+
+/// Return whether an HTTP header value contains syntax reserved for credential
+/// placeholder rewriting, including the decoded value of Basic authentication.
+pub fn header_value_contains_reserved_credential_marker(value: &str) -> bool {
+    let trimmed = value.trim();
+    if contains_reserved_credential_marker(trimmed) {
+        return true;
+    }
+
+    let Some(decoded) = decode_basic_auth_value(trimmed) else {
+        return false;
+    };
+    contains_raw_reserved_marker(&decoded)
+}
+
+fn basic_auth_token(value: &str) -> Option<&str> {
+    value
+        .strip_prefix("Basic ")
+        .or_else(|| value.strip_prefix("basic "))
+        .map(str::trim)
+}
+
+fn decode_basic_auth_value(value: &str) -> Option<String> {
+    decode_basic_auth_token(basic_auth_token(value)?)
+}
+
+fn decode_basic_auth_token(encoded: &str) -> Option<String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 pub fn contains_reserved_credential_marker_bytes(value: &[u8]) -> bool {
@@ -209,11 +244,11 @@ impl SecretResolver {
     }
 
     /// Build workload environment and resolver snapshots with gateway-issued
-    /// stable handles for selected refresh-managed credentials.
+    /// stable handles for selected credentials.
     ///
     /// Stable credentials are registered only in the current resolver. Their
     /// previous values never enter the bounded revision-generation queue, so a
-    /// revoked or replaced handle cannot resolve an older access token.
+    /// revoked or replaced handle cannot resolve an older secret value.
     pub(crate) fn from_provider_env_for_current_revision_with_stable_handles(
         provider_env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
@@ -396,14 +431,17 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
+        // Normalize aliases before identity checks so a wrapped revision or stable
+        // handle retains the original endpoint, epoch, and expiration constraints.
+        let canonical_alias = alias_env_key(value).map(placeholder_for_env_key);
+        let value = canonical_alias.as_deref().unwrap_or(value);
         if placeholder_env_key(value).is_some_and(|key| self.identity_bound_env_keys.contains(key))
             && revisioned_placeholder_parts(value).is_none()
             && stable_placeholder_parts(value).is_none()
         {
-            // Canonical placeholders and provider-shaped aliases carry no
-            // credential identity. Endpoint-bound request input must use the
-            // revision-scoped placeholder issued to the workload so a stale
-            // process cannot resolve a replacement provider's credential.
+            // Unversioned placeholders carry no credential identity. Endpoint-bound
+            // request input must retain the issued revision or stable handle so a
+            // stale process cannot resolve a replacement provider's credential.
             return None;
         }
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
@@ -414,7 +452,7 @@ impl SecretResolver {
             // credential refresh. For endpoint-bound credentials, permit that
             // fallback only when the exact opaque revision belongs to the
             // current provider-identity epoch.
-            let key = revisioned_placeholder_env_key(value).or_else(|| alias_env_key(value))?;
+            let key = revisioned_placeholder_env_key(value)?;
             if let Some((revision, key)) = revisioned_placeholder_parts(value)
                 && self.identity_bound_env_keys.contains(key)
                 && self
@@ -494,10 +532,7 @@ impl SecretResolver {
 
         // Basic auth decoding: `Basic <base64>` where the decoded content
         // contains a placeholder (e.g. `user:openshell:resolve:env:PASS`).
-        if let Some(encoded) = trimmed
-            .strip_prefix("Basic ")
-            .or_else(|| trimmed.strip_prefix("basic "))
-            .map(str::trim)
+        if let Some(encoded) = basic_auth_token(trimmed)
             && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)?
         {
             return Ok(Some(format!("Basic {rewritten}")));
@@ -633,18 +668,15 @@ impl SecretResolver {
         encoded: &str,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
         let b64 = base64::engine::general_purpose::STANDARD;
-        let Some(decoded_bytes) = b64.decode(encoded.trim()).ok() else {
-            return Ok(None);
-        };
-        let Some(decoded) = std::str::from_utf8(&decoded_bytes).ok() else {
+        let Some(decoded) = decode_basic_auth_token(encoded.trim()) else {
             return Ok(None);
         };
 
-        if !contains_raw_reserved_marker(decoded) {
+        if !contains_raw_reserved_marker(&decoded) {
             return Ok(None);
         }
 
-        let mut rewritten = decoded.to_string();
+        let mut rewritten = decoded;
         let replacements = self.rewrite_text_placeholders(&mut rewritten, "header")?;
 
         if replacements == 0 {
@@ -753,7 +785,13 @@ fn placeholder_env_key(token: &str) -> Option<&str> {
         .map(|(_, key)| key)
         .or_else(|| revisioned_placeholder_env_key(token))
         .or_else(|| token.strip_prefix(PLACEHOLDER_PREFIX))
-        .or_else(|| alias_env_key(token))
+        .or_else(|| {
+            alias_env_key(token).map(|suffix| {
+                split_stable_env_key(suffix)
+                    .or_else(|| split_revisioned_env_key(suffix))
+                    .map_or(suffix, |(_, key)| key)
+            })
+        })
 }
 
 pub fn uses_reserved_revision_namespace(key: &str) -> bool {
@@ -1411,6 +1449,28 @@ mod tests {
         assert!(!contains_reserved_credential_marker_bytes(&[
             0xff, 0x00, 0x01, 0x02
         ]));
+    }
+
+    #[test]
+    fn header_value_marker_detection_covers_rewrite_forms() {
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode("user:openshell:resolve:env:API_KEY");
+
+        for value in [
+            "openshell:resolve:env:API_KEY".to_string(),
+            "Bearer openshell:resolve:env:API_KEY".to_string(),
+            "provider-OPENSHELL-RESOLVE-ENV-API_KEY".to_string(),
+            "openshell%3Aresolve%3Aenv%3AAPI_KEY".to_string(),
+            format!("Basic {basic}"),
+        ] {
+            assert!(
+                header_value_contains_reserved_credential_marker(&value),
+                "reserved credential marker in {value:?}"
+            );
+        }
+        assert!(!header_value_contains_reserved_credential_marker(
+            "Bearer ordinary-token"
+        ));
     }
 
     fn fully_percent_encoded(marker: &str) -> String {

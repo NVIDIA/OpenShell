@@ -28,6 +28,8 @@ grpcRoute:
 server:
   # Envoy terminates TLS at the edge; the gateway listens plaintext behind it.
   disableTls: true
-  oidc:
+
+gatewayConfig:
+  openshell.gateway.oidc:
     issuer: "https://keycloak.example.com/realms/openshell"
     audience: "openshell-cli"

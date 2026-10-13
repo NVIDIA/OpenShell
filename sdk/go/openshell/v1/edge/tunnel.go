@@ -17,6 +17,7 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
@@ -107,9 +108,7 @@ func NewTunnelProxy(gatewayURL, edgeToken string, opts ...TunnelOption) (*Tunnel
 	cfg := tunnelConfig{
 		closeTimeout: defaultCloseTimeout,
 	}
-	for _, o := range opts {
-		o(&cfg)
-	}
+	options.Apply(&cfg, opts)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

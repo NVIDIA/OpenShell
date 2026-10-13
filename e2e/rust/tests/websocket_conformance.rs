@@ -69,7 +69,7 @@ async fn delete_provider(name: &str) {
 
 async fn delete_provider_profile(id: &str) {
     let mut cmd = openshell_cmd();
-    cmd.args(["provider", "profile", "delete", id])
+    cmd.args(["profile", "delete", id])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
@@ -364,7 +364,6 @@ import os
 import socket
 import struct
 import time
-import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
@@ -413,34 +412,15 @@ def read_frame(sock):
         payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     return first, payload
 
-def proxy_parts():
-    names = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
-    proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
-    if not proxy_url:
-        raise RuntimeError("proxy environment is not configured")
-    parsed = urllib.parse.urlparse(proxy_url)
-    if not parsed.hostname:
-        raise RuntimeError(f"invalid proxy URL: {{proxy_url!r}}")
-    return parsed.hostname, parsed.port or 80
-
-def proxy_socket_with_retry(host, port, mode, timeout_seconds=20):
-    proxy_host, proxy_port = proxy_parts()
-    target = f"{{host}}:{{port}}"
+def transparent_socket_with_retry(host, port, timeout_seconds=20):
     deadline = time.monotonic() + timeout_seconds
     last_error = None
     while time.monotonic() < deadline:
         sock = None
         try:
-            sock = socket.create_connection((proxy_host, proxy_port), timeout=5)
-            if mode == "connect":
-                request = f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n"
-                sock.sendall(request.encode("ascii"))
-                response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
-                if not (response.startswith("HTTP/1.1 200") or response.startswith("HTTP/1.0 200")):
-                    first_line = response.splitlines()[0] if response else "<empty response>"
-                    raise RuntimeError(f"proxy CONNECT failed: {{first_line}}")
+            sock = socket.create_connection((host, port), timeout=5)
             return sock
-        except (OSError, RuntimeError) as error:
+        except OSError as error:
             if sock is not None:
                 sock.close()
             last_error = error
@@ -449,27 +429,25 @@ def proxy_socket_with_retry(host, port, mode, timeout_seconds=20):
 
 token = os.environ[TOKEN_ENV]
 payload = json.dumps({{"authorization": "Bearer " + token}}, sort_keys=True)
-results = {{}}
-for mode in ("connect", "forward"):
-    key = base64.b64encode(os.urandom(16)).decode("ascii")
-    with proxy_socket_with_retry(HOST, PORT, mode) as sock:
-        request_target = "/ws" if mode == "connect" else f"http://{{HOST}}:{{PORT}}/ws"
-        request = (
-            f"GET {{request_target}} HTTP/1.1\r\n"
-            f"Host: {{HOST}}:{{PORT}}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {{key}}\r\n"
-            "Sec-WebSocket-Version: 13\r\n"
-            "\r\n"
-        )
-        sock.sendall(request.encode("ascii"))
-        response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
-        if not response.startswith("HTTP/1.1 101"):
-            raise RuntimeError(f"{{mode}} websocket upgrade failed: {{response!r}}")
-        sock.sendall(masked_text_frame(payload))
-        _, response_payload = read_frame(sock)
-        results[mode] = json.loads(response_payload.decode("utf-8"))
+key = base64.b64encode(os.urandom(16)).decode("ascii")
+with transparent_socket_with_retry(HOST, PORT) as sock:
+    request = (
+        "GET /ws HTTP/1.1\r\n"
+        f"Host: {{HOST}}:{{PORT}}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {{key}}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n"
+    )
+    sock.sendall(request.encode("ascii"))
+    response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
+    if not response.startswith("HTTP/1.1 101"):
+        raise RuntimeError(f"websocket upgrade failed: {{response!r}}")
+    sock.sendall(masked_text_frame(payload))
+    _, response_payload = read_frame(sock)
+    result = json.loads(response_payload.decode("utf-8"))
+results = {{"transparent": result}}
 print(json.dumps(results, sort_keys=True))
 "#,
         host = host,
@@ -479,7 +457,7 @@ print(json.dumps(results, sort_keys=True))
 }
 
 #[tokio::test]
-async fn websocket_text_placeholder_is_rewritten_through_both_adapters() {
+async fn websocket_text_placeholder_is_rewritten_transparently() {
     let _provider_lock = PROVIDER_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -491,7 +469,7 @@ async fn websocket_text_placeholder_is_rewritten_through_both_adapters() {
         let server = WebSocketProbeServer::start().await?;
         let profile = write_credential_profile(server.port)?;
         let profile_path = profile.path().to_string_lossy().into_owned();
-        run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+        run_cli(&["profile", "import", "--file", &profile_path]).await?;
         create_bound_provider(PROVIDER_NAME).await?;
         let policy = write_websocket_policy(TEST_SERVER_HOST, server.port)?;
         let policy_path = policy
@@ -522,14 +500,7 @@ async fn websocket_text_placeholder_is_rewritten_through_both_adapters() {
     assert!(
         guard
             .create_output
-            .contains(r#""connect": {"saw_placeholder": false, "saw_secret": true}"#),
-        "expected CONNECT upstream to see only the resolved secret marker:\n{}",
-        guard.create_output
-    );
-    assert!(
-        guard
-            .create_output
-            .contains(r#""forward": {"saw_placeholder": false, "saw_secret": true}"#),
+            .contains(r#""transparent": {"saw_placeholder": false, "saw_secret": true}"#),
         "expected upstream to see only the resolved secret marker:\n{}",
         guard.create_output
     );

@@ -8,7 +8,7 @@
 //! and either forwards or denies the request.
 
 use crate::l7::middleware::{
-    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain,
+    MiddlewareApplyResult, UninspectableTrafficGate, apply_middleware_chain_with_request_id,
     emit_middleware_uninspectable, middleware_network_input, uninspectable_traffic_gate,
 };
 #[cfg(test)]
@@ -18,10 +18,11 @@ use crate::l7::middleware::{
 };
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
-use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
+use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
+use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
@@ -30,9 +31,15 @@ use openshell_ocsf::{
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
+
+#[cfg(test)]
+mod token_grant_ownership_tests;
+
+const CONNECTION_READ_AHEAD_BYTES: usize = 8 * 1024;
 
 /// Context for L7 request policy evaluation.
 #[derive(Clone)]
@@ -64,6 +71,11 @@ pub struct L7EvalContext {
     /// resolver. Used to reject a request if credentials change again before
     /// its first upstream write.
     pub(crate) provider_credential_revision: Option<u64>,
+    /// Installation that supplied an inspected request's dynamic credentials.
+    /// Repairs may retain the revision, so keep this identity across the grant
+    /// await and the final static-credential scoping before the upstream write.
+    pub(crate) provider_credential_installation_id: Option<String>,
+    pub(crate) body_classifier: Option<Arc<secrets::body::BodyCredentialClassifier>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
     /// Dynamic credentials (token grants) keyed by endpoint-bound provider metadata.
@@ -79,6 +91,8 @@ pub struct L7EvalContext {
         Option<Arc<dyn crate::l7::token_grant_injection::TokenGrantResolver>>,
     /// Shared feature state for agent-driven policy proposals.
     pub(crate) agent_proposals: openshell_core::proposals::AgentProposals,
+    /// Bounded, nonblocking sink for privacy-safe tool server endpoint outcomes.
+    pub(crate) endpoint_observation_tx: Option<EndpointObservationSender>,
 }
 
 fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
@@ -99,13 +113,19 @@ fn scoped_context_for_request(
         // credential use. Clearing the resolver makes any placeholder or
         // signing attempt fail closed before an upstream write.
         scoped.secret_resolver = None;
-        scoped.provider_credential_revision = None;
+        scoped.body_classifier = None;
+        // A dynamic grant may already be installed on this request. Keep its
+        // generation pin across body buffering even without static authority.
+        if scoped.provider_credential_installation_id.is_none() {
+            scoped.provider_credential_revision = None;
+        }
         return Some(scoped);
     }
     let credentials = ctx.provider_credentials.as_ref()?;
-    let (resolver, revision) =
-        credentials.resolver_for_endpoint_with_revision(&ctx.host, ctx.port, &request.target);
+    let (resolver, classifier, revision) =
+        credentials.resolver_and_body_classifier_for_endpoint(&ctx.host, ctx.port, &request.target);
     scoped.secret_resolver = resolver;
+    scoped.body_classifier = classifier;
     scoped.provider_credential_revision = Some(revision);
     Some(scoped)
 }
@@ -113,10 +133,88 @@ fn scoped_context_for_request(
 fn credential_generation_guard(
     ctx: &L7EvalContext,
 ) -> Option<crate::l7::rest::CredentialGenerationGuard<'_>> {
-    Some(crate::l7::rest::CredentialGenerationGuard::new(
-        ctx.provider_credentials.as_ref()?,
-        ctx.provider_credential_revision?,
-    ))
+    Some(
+        crate::l7::rest::CredentialGenerationGuard::new(
+            ctx.provider_credentials.as_ref()?,
+            ctx.provider_credential_revision?,
+        )
+        .with_installation_id(ctx.provider_credential_installation_id.as_deref()),
+    )
+}
+
+/// Resolve a grant from the provider installation and policy owners admitted
+/// for this request. Provider refresh is independent of tunnel lifetime: the
+/// connection's original dynamic map cannot authorize a later request.
+pub(crate) async fn prepare_inspected_request(
+    req: crate::l7::provider::L7Request,
+    ctx: &L7EvalContext,
+    engine: &TunnelPolicyEngine,
+    config: &L7EndpointConfig,
+    request_info: &L7RequestInfo,
+) -> Result<(crate::l7::provider::L7Request, L7EvalContext)> {
+    let mut scoped = ctx.clone();
+    let snapshot = ctx
+        .provider_credentials
+        .as_ref()
+        .map(openshell_core::provider_credentials::ProviderCredentialState::snapshot);
+    if let Some(snapshot) = &snapshot {
+        scoped.provider_credential_revision = Some(snapshot.revision);
+        scoped.provider_credential_installation_id = Some(snapshot.installation_id.clone());
+    }
+    // Admission-gated injection reads credentials only from the pinned snapshot,
+    // so a context without one never acquires a grant.
+    let grant_snapshot = snapshot.as_deref().filter(|snapshot| {
+        snapshot
+            .dynamic_credentials
+            .values()
+            .any(|credential| credential.token_grant.is_some())
+    });
+    let req = if let Some(snapshot) = grant_snapshot {
+        // Middleware can replace an inspected body. Recompute owner admission for
+        // the body that will be sent, even when another endpoint allowed both the
+        // original and transformed requests. Request method/path/query are immutable.
+        let mut current_info = request_info.clone();
+        match config.protocol {
+            L7Protocol::Graphql => {
+                let body = req
+                    .raw_header
+                    .windows(4)
+                    .position(|bytes| bytes == b"\r\n\r\n")
+                    .and_then(|end| req.raw_header.get(end + 4..))
+                    .unwrap_or_default();
+                current_info.graphql = Some(crate::l7::graphql::classify_request(&req, body));
+            }
+            L7Protocol::JsonRpc | L7Protocol::Mcp => {
+                let mut options = crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
+                if let Some(revision) = request_info
+                    .jsonrpc
+                    .as_ref()
+                    .and_then(|info| info.mcp_revision)
+                {
+                    options = options.with_mcp_revision(revision);
+                }
+                current_info.jsonrpc = Some(
+                    crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(&req, options)?,
+                );
+            }
+            L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => {}
+        }
+        let owners = admitted_token_grant_owners(engine, &scoped, &current_info)?;
+        crate::l7::token_grant_injection::inject_for_admitted_owners(
+            req, &scoped, snapshot, &owners,
+        )
+        .await?
+    } else {
+        req
+    };
+    if engine.is_stale() {
+        return Err(miette!("policy changed during token grant resolution"));
+    }
+    if let Some(guard) = credential_generation_guard(&scoped) {
+        guard.ensure_current()?;
+    }
+    let scoped = scoped_context_for_request(&scoped, &req).unwrap_or(scoped);
+    Ok((req, scoped))
 }
 
 fn request_authority_matches_endpoint(
@@ -144,7 +242,18 @@ fn normalized_endpoint_host(host: &str) -> &str {
         .trim_end_matches('.')
 }
 
-async fn reject_request_authority_mismatch<W>(client: &mut W, ctx: &L7EvalContext) -> Result<()>
+fn method_only_request(method: &str) -> HttpRequest {
+    HttpRequest {
+        http_method: method.parse().expect("HTTP method parsing is infallible"),
+        url: None,
+    }
+}
+
+async fn reject_request_authority_mismatch<W>(
+    client: &mut W,
+    ctx: &L7EvalContext,
+    method: &str,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -159,14 +268,218 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_request_authority_mismatch_event(ctx));
+    ocsf_emit!(build_request_authority_mismatch_event(ctx, method));
     ocsf_emit!(build_request_authority_mismatch_finding(ctx));
     Ok(())
 }
 
-fn build_request_authority_mismatch_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
+/// Return the selected revision's inspection for policy evaluation, or emit a
+/// rejection and return `None`. Non-MCP adapters retain their original inspection.
+/// Record local rejections before client response delivery can fail.
+pub(crate) async fn enforce_mcp_protocol_version<W>(
+    config: &L7EndpointConfig,
+    request: &crate::l7::provider::L7Request,
+    mut info: crate::l7::jsonrpc::JsonRpcRequestInfo,
+    client: &mut W,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+    observer: Option<&EndpointObserver>,
+) -> Result<Option<crate::l7::jsonrpc::JsonRpcRequestInfo>>
+where
+    W: AsyncWrite + Unpin,
+{
+    if config.protocol != L7Protocol::Mcp {
+        return Ok(Some(info));
+    }
+
+    match crate::l7::mcp::select_request_protocol_version(request, &info, &config.mcp_versions) {
+        Ok(crate::l7::mcp::McpRequestProtocolVersion::Initialization) => Ok(Some(info)),
+        Ok(crate::l7::mcp::McpRequestProtocolVersion::Selected(version)) => {
+            debug!(mcp_protocol_version = %version, "Selected MCP request protocol version");
+            info = crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+                request,
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                    version,
+                    config.mcp_strict_tool_names,
+                ),
+            )?;
+            // A bodyless receive stream has nothing for the JSON-RPC parser to
+            // classify, but later middleware re-evaluation must still retain
+            // the exact transport-selected revision.
+            info.mcp_revision = Some(version);
+
+            if let Some(error) = info.error.as_ref() {
+                if let Some(observer) = observer {
+                    // A selected revision's schema rejection is a local denial,
+                    // even when the caller disconnects before receiving it.
+                    observer.observe(EndpointResult::PolicyDenied);
+                }
+                let reason = format!(
+                    "{error}; {}",
+                    crate::l7::mcp::selected_revision_context(request, version)
+                );
+                let summary = l7_protocol_log_summary(None, Some(&info));
+                ocsf_emit!(build_l7_request_event(
+                    ctx,
+                    &request.action,
+                    redacted_target,
+                    "deny",
+                    "l7-mcp",
+                    &reason,
+                    summary.as_deref(),
+                ));
+                emit_activity(ctx, true, "l7_parse_rejection");
+                let body = serde_json::json!({
+                    "error": "invalid_mcp_request",
+                    "detail": reason,
+                    "policy": ctx.policy_name,
+                    "layer": "l7",
+                    "protocol": "mcp",
+                    "method": request.action,
+                    "path": redacted_target,
+                });
+                crate::l7::rest::send_json_response(
+                    &ctx.policy_name,
+                    body,
+                    client,
+                    "400 Bad Request",
+                )
+                .await?;
+                return Ok(None);
+            }
+
+            if let Err(error) = crate::l7::mcp::validate_request_metadata(request, &info) {
+                reject_mcp_protocol_version(
+                    error,
+                    request,
+                    &info,
+                    client,
+                    ctx,
+                    redacted_target,
+                    observer,
+                )
+                .await?;
+                return Ok(None);
+            }
+
+            Ok(Some(info))
+        }
+        Err(error) => {
+            reject_mcp_protocol_version(
+                error,
+                request,
+                &info,
+                client,
+                ctx,
+                redacted_target,
+                observer,
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Emit the same transport or policy rejection at initial and final inspection.
+async fn reject_mcp_protocol_version<W>(
+    error: crate::l7::mcp::McpProtocolVersionError,
+    request: &crate::l7::provider::L7Request,
+    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+    client: &mut W,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+    observer: Option<&EndpointObserver>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(observer) = observer {
+        // Version, metadata, and method rejections are local to this endpoint.
+        // Record the denial before client delivery can fail.
+        observer.observe(EndpointResult::PolicyDenied);
+    }
+    let reason = error.rejection_detail(request);
+    let summary = l7_protocol_log_summary(None, Some(info));
+    ocsf_emit!(build_l7_request_event(
+        ctx,
+        &request.action,
+        redacted_target,
+        "deny",
+        "l7-mcp",
+        &reason,
+        summary.as_deref(),
+    ));
+    let deny_group = match error {
+        crate::l7::mcp::McpProtocolVersionError::NotAllowed(_) => "l7_policy",
+        crate::l7::mcp::McpProtocolVersionError::InvalidHeader
+        | crate::l7::mcp::McpProtocolVersionError::UnsupportedHeaderValue
+        | crate::l7::mcp::McpProtocolVersionError::InvalidRequestMetadata
+        | crate::l7::mcp::McpProtocolVersionError::MethodNotAllowed => "l7_parse_rejection",
+    };
+    emit_activity(ctx, true, deny_group);
+    let body = serde_json::json!({
+        "error": error.response_code(),
+        "detail": reason,
+        "policy": ctx.policy_name,
+        "layer": "l7",
+        "protocol": "mcp",
+        "method": request.action,
+        "path": redacted_target,
+    });
+    let allowed_methods =
+        (error == crate::l7::mcp::McpProtocolVersionError::MethodNotAllowed).then_some("POST");
+    crate::l7::rest::send_json_response_with_allow(
+        &ctx.policy_name,
+        body,
+        client,
+        error.http_status(),
+        allowed_methods,
+    )
+    .await?;
+    Ok(())
+}
+
+/// Reinspect the buffered outgoing MCP request after request transformations.
+/// The forwarding adapter must call this before any upstream request write.
+pub(crate) async fn enforce_final_mcp_protocol_version<W>(
+    config: &L7EndpointConfig,
+    request: &crate::l7::provider::L7Request,
+    client: &mut W,
+    ctx: &L7EvalContext,
+    redacted_target: &str,
+    observer: Option<&EndpointObserver>,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin,
+{
+    if config.protocol != L7Protocol::Mcp {
+        return Ok(true);
+    }
+    let info = crate::l7::jsonrpc::inspect_buffered_jsonrpc_http_request(
+        request,
+        crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
+    )?;
+    Ok(enforce_mcp_protocol_version(
+        config,
+        request,
+        info,
+        client,
+        ctx,
+        redacted_target,
+        observer,
+    )
+    .await?
+    .is_some())
+}
+
+fn build_request_authority_mismatch_event(
+    ctx: &L7EvalContext,
+    method: &str,
+) -> openshell_ocsf::OcsfEvent {
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
+        .activity(ActivityId::for_http_method(method))
+        .http_request(method_only_request(method))
+        .http_response(openshell_ocsf::HttpResponse { code: 403 })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(SeverityId::High)
@@ -203,10 +516,16 @@ fn build_request_authority_mismatch_finding(ctx: &L7EvalContext) -> openshell_oc
 
 fn build_credential_resolution_event(
     ctx: &L7EvalContext,
+    method: &str,
     endpoint_mismatch: bool,
 ) -> openshell_ocsf::OcsfEvent {
+    let response_code = if endpoint_mismatch { 403 } else { 500 };
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
-        .activity(ActivityId::Fail)
+        .activity(ActivityId::for_http_method(method))
+        .http_request(method_only_request(method))
+        .http_response(openshell_ocsf::HttpResponse {
+            code: response_code,
+        })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(if endpoint_mismatch {
@@ -248,6 +567,7 @@ fn build_credential_endpoint_mismatch_finding(ctx: &L7EvalContext) -> openshell_
 pub(crate) async fn reject_credential_resolution<W>(
     client: &mut W,
     ctx: &L7EvalContext,
+    method: &str,
     error: &secrets::UnresolvedPlaceholderError,
 ) -> Result<()>
 where
@@ -274,12 +594,128 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
 
-    ocsf_emit!(build_credential_resolution_event(ctx, endpoint_mismatch));
+    ocsf_emit!(build_credential_resolution_event(
+        ctx,
+        method,
+        endpoint_mismatch
+    ));
 
     if endpoint_mismatch {
         ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
     }
     Ok(())
+}
+
+pub(crate) async fn reject_body_credential<C: AsyncWrite + Unpin>(
+    client: &mut C,
+    error: secrets::body::BodyCredentialError,
+) -> Result<()> {
+    let body = serde_json::json!({"error": {
+        "code": "credential_placeholder_in_request_body",
+        "reason": error.reason(),
+        "message": "A credential placeholder in the request body cannot be forwarded. Remove the reference from conversation history or restore provider access; body credential rewriting is disabled."
+    }}).to_string();
+    let response = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    client
+        .write_all(response.as_bytes())
+        .await
+        .into_diagnostic()?;
+    client.flush().await.into_diagnostic()
+}
+
+struct InspectedForwarding<'a> {
+    config: &'a L7EndpointConfig,
+    engine: &'a TunnelPolicyEngine,
+    request_info: &'a L7RequestInfo,
+    request_id: &'a str,
+    response_chain: &'a [openshell_supervisor_middleware::ChainEntry],
+    websocket_middleware: bool,
+    observation_context: Option<&'a openshell_core::endpoint_status::EndpointObservationContext>,
+}
+
+// Every inspected HTTP relay enters here after policy and request middleware.
+// Keep credential preparation and the guarded upstream write together so new
+// protocol relays cannot accidentally forward without required authentication.
+async fn forward_inspected_request<C, U>(
+    request: crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &mut L7EvalContext,
+    forwarding: InspectedForwarding<'_>,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    let InspectedForwarding {
+        config,
+        engine,
+        request_info,
+        request_id,
+        response_chain,
+        websocket_middleware,
+        observation_context,
+    } = forwarding;
+    let (request, grant_ctx) =
+        match prepare_inspected_request(request, ctx, engine, config, request_info).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(error = %error, "Token grant failed before forwarding");
+                write_bad_gateway_response(client).await?;
+                return Ok(None);
+            }
+        };
+    *ctx = grant_ctx;
+    let observer = EndpointObserver::begin_captured(
+        ctx.endpoint_observation_tx.as_ref(),
+        config,
+        observation_context,
+        ctx.provider_credential_revision,
+        Some(engine.generation_guard()),
+    );
+    relay_http_request_with_credential_rejection_observed(
+        &request,
+        client,
+        upstream,
+        crate::l7::rest::RelayRequestOptions {
+            resolver: ctx.secret_resolver.as_deref(),
+            body_classifier: ctx.body_classifier.as_deref(),
+            mcp_request_validation: (config.protocol == L7Protocol::Mcp).then_some(
+                crate::l7::rest::McpRequestValidation {
+                    config,
+                    ctx,
+                    redacted_target: &request_info.target,
+                },
+            ),
+            credential_generation: credential_generation_guard(ctx),
+            generation_guard: Some(engine.generation_guard()),
+            websocket_extensions: websocket_extension_mode(config, websocket_middleware),
+            request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                && config.request_body_credential_rewrite,
+            deny_uninspected_credentials: config
+                .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
+            credential_signing: config.credential_signing,
+            signing_service: &config.signing_service,
+            signing_region: &config.signing_region,
+            host: &ctx.host,
+            port: ctx.port,
+        },
+        ctx,
+        Some(http_response_middleware_relay(
+            &request,
+            ctx,
+            "https",
+            request_id,
+            response_chain,
+            engine.middleware_runner(),
+            Some(engine.generation_guard()),
+        )),
+        observer.as_ref(),
+    )
+    .await
 }
 
 async fn relay_http_request_with_credential_rejection<C, U>(
@@ -288,24 +724,163 @@ async fn relay_http_request_with_credential_rejection<C, U>(
     upstream: &mut U,
     options: crate::l7::rest::RelayRequestOptions<'_>,
     ctx: &L7EvalContext,
+    response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
 ) -> Result<Option<RelayOutcome>>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    match crate::l7::rest::relay_http_request_with_options_guarded(
-        request, client, upstream, options,
+    relay_http_request_with_credential_rejection_observed(
+        request,
+        client,
+        upstream,
+        options,
+        ctx,
+        response_middleware,
+        None,
+    )
+    .await
+}
+
+async fn relay_http_request_with_credential_rejection_observed<C, U>(
+    request: &crate::l7::provider::L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: crate::l7::rest::RelayRequestOptions<'_>,
+    ctx: &L7EvalContext,
+    response_middleware: Option<crate::l7::rest::HttpResponseMiddlewareRelay<'_>>,
+    observer: Option<&EndpointObserver>,
+) -> Result<Option<RelayOutcome>>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    match Box::pin(
+        crate::l7::rest::relay_http_request_with_response_middleware_guarded_observed(
+            request,
+            client,
+            upstream,
+            options,
+            response_middleware,
+            observer,
+        ),
     )
     .await
     {
         Ok(outcome) => Ok(Some(outcome)),
         Err(report) => {
-            if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>() {
-                reject_credential_resolution(client, ctx, error).await?;
+            if let Some(error) = report.downcast_ref::<secrets::body::BodyCredentialError>() {
+                // Body classification includes credentials for other destinations,
+                // so denial does not establish that this endpoint lacks credentials.
+                // Record the local decision before cleanup or client I/O can fail.
+                if let Some(observer) = observer {
+                    observer.observe(EndpointResult::PolicyDenied);
+                }
+                let _ = upstream.shutdown().await;
+                reject_body_credential(client, *error).await?;
                 Ok(None)
+            } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
+            {
+                if let Some(observer) = observer {
+                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                }
+                reject_credential_resolution(client, ctx, &request.action, error).await?;
+                Ok(None)
+            } else if report
+                .downcast_ref::<crate::l7::rest::CredentialUnavailableError>()
+                .is_some()
+            {
+                if let Some(observer) = observer {
+                    observer.observe_credential_failure(false);
+                }
+                Err(report)
             } else {
                 Err(report)
             }
+        }
+    }
+}
+
+pub(crate) fn http_response_middleware_relay<'a>(
+    request: &crate::l7::provider::L7Request,
+    ctx: &'a L7EvalContext,
+    scheme: &str,
+    request_id: &str,
+    chain: &'a [openshell_supervisor_middleware::ChainEntry],
+    runner: &'a openshell_supervisor_middleware::ChainRunner,
+    generation_guard: Option<&'a PolicyGenerationGuard>,
+) -> crate::l7::rest::HttpResponseMiddlewareRelay<'a> {
+    let sandbox = openshell_ocsf::ctx::ctx();
+    crate::l7::rest::HttpResponseMiddlewareRelay {
+        chain,
+        runner,
+        request_context: openshell_core::proto::RequestContext {
+            request_id: request_id.to_string(),
+            sandbox_id: sandbox.sandbox_id.clone(),
+            sandbox: sandbox.sandbox_name.clone(),
+            workspace: ctx.workspace.clone(),
+            originating_process: None,
+        },
+        target: openshell_core::proto::HttpRequestTarget {
+            scheme: scheme.to_string(),
+            host: ctx.host.clone(),
+            port: u32::from(ctx.port),
+            method: request.action.clone(),
+            path: request.target.clone(),
+            query: policy_safe_response_query(&request.query_params),
+        },
+        policy_name: &ctx.policy_name,
+        generation_guard,
+        whole_body_timeout: super::rest::DEFAULT_HTTP_RESPONSE_WHOLE_BODY_TIMEOUT,
+    }
+}
+
+pub(super) fn policy_safe_response_query(
+    query_params: &std::collections::HashMap<String, Vec<String>>,
+) -> String {
+    let mut parameters: Vec<_> = query_params.iter().collect();
+    parameters.sort_by_key(|(name, _)| *name);
+    let mut output = String::new();
+    for (name, values) in parameters {
+        let empty_value = String::new();
+        let values = if values.is_empty() {
+            std::slice::from_ref(&empty_value)
+        } else {
+            values.as_slice()
+        };
+        for value in values {
+            if !output.is_empty() {
+                output.push('&');
+            }
+            let name = if secrets::contains_reserved_credential_marker(name) {
+                "[REDACTED]"
+            } else {
+                name
+            };
+            let value = if secrets::contains_reserved_credential_marker(value) {
+                "[REDACTED]"
+            } else {
+                value
+            };
+            push_form_component(&mut output, name);
+            output.push('=');
+            push_form_component(&mut output, value);
+        }
+    }
+    output
+}
+
+fn push_form_component(output: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            output.push(char::from(byte));
+        } else if byte == b' ' {
+            output.push('+');
+        } else {
+            output.push('%');
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
         }
     }
 }
@@ -408,34 +983,45 @@ fn engine_type_for_protocol(protocol: L7Protocol) -> &'static str {
     }
 }
 
-async fn deny_h2c_upgrade_if_requested<C>(
+/// Refuses an upgrade the endpoint cannot inspect and reports whether the
+/// request was answered.
+///
+/// Every L7 request loop calls this before the L7 policy decision. A refusal
+/// records a policy denial for the endpoint, emits a parse-rejection event,
+/// and answers `403` regardless of enforcement mode; see
+/// `unsupported_upgrade_detail` for which upgrades each protocol refuses. The
+/// response carries the `unsupported_l7_protocol` error rather than the
+/// policy-denial body, because no policy rule can allow the request.
+async fn deny_unsupported_upgrade_if_requested<C>(
     req: &crate::l7::provider::L7Request,
     config: &L7EndpointConfig,
     ctx: &L7EvalContext,
+    observer: Option<&EndpointObserver>,
     client: &mut C,
 ) -> Result<bool>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    if !crate::l7::rest::request_is_h2c_upgrade(&req.raw_header) {
+    let Some(detail) =
+        crate::l7::rest::unsupported_upgrade_detail(&req.raw_header, config.protocol)
+    else {
         return Ok(false);
-    }
+    };
 
-    emit_parse_rejection(
-        ctx,
-        crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
-        engine_type_for_protocol(config.protocol),
-    );
-    crate::l7::rest::RestProvider::default()
-        .deny_with_redacted_target(
-            req,
-            &ctx.policy_name,
-            crate::l7::rest::UNSUPPORTED_H2C_UPGRADE_DETAIL,
-            client,
-            None,
-            Some(crate::l7::rest::DenyResponseContext::from_l7_context(ctx)),
-        )
-        .await?;
+    if let Some(observer) = observer {
+        observer.observe(EndpointResult::PolicyDenied);
+    }
+    emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
+    crate::l7::rest::send_json_response(
+        &ctx.policy_name,
+        serde_json::json!({
+            "error": "unsupported_l7_protocol",
+            "detail": detail,
+        }),
+        client,
+        "403 Forbidden",
+    )
+    .await?;
     Ok(true)
 }
 
@@ -457,6 +1043,17 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Keep read-ahead state for the lifetime of the inspected connection. An
+    // HTTP parser may fetch bytes from the next pipelined request while
+    // finishing the current one; retaining them here ensures the next request
+    // still passes through its own policy decision.
+    let mut client_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let mut upstream_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, upstream);
+    let client = &mut client_buffer;
+    let upstream = &mut upstream_buffer;
+
     match config.protocol {
         L7Protocol::Rest | L7Protocol::Websocket => {
             relay_rest(config, &engine, client, upstream, ctx).await
@@ -516,6 +1113,15 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    // Route selection also owns the full keep-alive loop, so buffered bytes
+    // remain available across per-request parsing and authorization.
+    let mut client_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, client);
+    let mut upstream_buffer =
+        tokio::io::BufReader::with_capacity(CONNECTION_READ_AHEAD_BYTES, upstream);
+    let client = &mut client_buffer;
+    let upstream = &mut upstream_buffer;
+
     let provider =
         crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
             allow_encoded_slash: configs.iter().any(|config| config.allow_encoded_slash),
@@ -527,6 +1133,12 @@ where
             return Ok(());
         }
 
+        // Pin observation authority before parsing can await or a later
+        // provider lookup can select state from another installation.
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         let mut req = match provider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
@@ -547,14 +1159,14 @@ where
             }
         };
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
 
         let route_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -573,6 +1185,13 @@ where
                 .await?;
             return Ok(());
         };
+        let observer = EndpointObserver::begin_captured(
+            ctx.endpoint_observation_tx.as_ref(),
+            config,
+            observation_context.as_ref(),
+            ctx.provider_credential_revision,
+            Some(engine.generation_guard()),
+        );
         // The request was canonicalized before the matching config was known,
         // so `allow_encoded_slash` was taken permissively across every config
         // on this host:port. Re-check it against the config that actually
@@ -586,6 +1205,9 @@ where
             && crate::l7::path::canonical_path_has_encoded_slash(&req.target)
         {
             let detail = "request-target contains an encoded '/' (%2F) which is not allowed on this endpoint";
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             emit_parse_rejection(ctx, detail, engine_type_for_protocol(config.protocol));
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
@@ -599,7 +1221,9 @@ where
                 .await?;
             return Ok(());
         }
-        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, observer.as_ref(), client)
+            .await?
+        {
             return Ok(());
         }
 
@@ -631,7 +1255,7 @@ where
         } else {
             None
         };
-        let jsonrpc_info = if config.protocol.is_jsonrpc_family() {
+        let mut jsonrpc_info = if config.protocol.is_jsonrpc_family() {
             if crate::l7::jsonrpc::jsonrpc_receive_stream_request(&req) {
                 Some(crate::l7::jsonrpc::JsonRpcRequestInfo::receive_stream())
             } else {
@@ -676,11 +1300,30 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                if let Some(observer) = observer.as_ref() {
+                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                }
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
 
+        if let Some(info) = jsonrpc_info.take() {
+            let Some(inspected) = enforce_mcp_protocol_version(
+                config,
+                &req,
+                info,
+                client,
+                ctx,
+                &redacted_target,
+                observer.as_ref(),
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            jsonrpc_info = Some(inspected);
+        }
         let request_info = L7RequestInfo {
             action: req.action.clone(),
             target: redacted_target.clone(),
@@ -736,13 +1379,15 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // Route selection resolved `config` per request, so re-check the
             // body against that protocol's policy after every transforming
             // stage (a no-op for REST and websocket, whose policy inputs the
             // chain cannot mutate).
             let validate = transformed_body_validator(config, &engine, ctx, &request_info);
-            let middleware_result = apply_middleware_chain(
+            let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -750,11 +1395,15 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                &request_id,
             )
             .await;
             let req = match middleware_result? {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
+                    if let Some(observer) = observer.as_ref() {
+                        observer.observe(EndpointResult::PolicyDenied);
+                    }
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -790,8 +1439,6 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
             let mut middleware_session = if let Some(chain) = websocket_chain.as_deref() {
                 let preflight = websocket_middleware_preflight(
                     &req,
@@ -825,37 +1472,31 @@ where
             } else {
                 None
             };
-            let outcome_result = relay_http_request_with_credential_rejection(
-                &req,
+            let query_params = req.query_params.clone();
+            let mut forwarding_ctx = ctx.clone();
+            let outcome_result = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine: &engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: middleware_session.is_some(),
+                    observation_context: observation_context.as_ref(),
                 },
-                ctx,
             )
             .await;
+            let ctx = &forwarding_ctx;
             let outcome_result = match outcome_result {
                 Ok(Some(outcome)) => Ok(outcome),
                 Ok(None) => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                             .await;
                     }
                     return Ok(());
@@ -875,14 +1516,14 @@ where
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                 }
                 RelayOutcome::Consumed => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                     return Ok(());
@@ -892,12 +1533,33 @@ where
                     websocket_permessage_deflate,
                     websocket_subprotocol,
                 } => {
+                    // Protocols whose rules apply to individual HTTP requests
+                    // never upgrade (see `upgrade_refusal_for_protocol`). No
+                    // current path forwards upgrade headers for them: the
+                    // request-side refusal rejects them, and request
+                    // middleware cannot add upgrade or connection headers. If
+                    // a later change lets such a request reach an upstream
+                    // that answers `101`, close instead of relaying frames
+                    // that no rule would inspect.
+                    if crate::l7::rest::upgrade_refusal_for_protocol(config.protocol).is_some() {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            "closing per-request L7 connection after unexpected protocol upgrade"
+                        );
+                        if let Some(session) = middleware_session.take() {
+                            session
+                                .end(openshell_core::proto::MiddlewareSessionEndReason::ProtocolError)
+                                .await;
+                        }
+                        return Ok(());
+                    }
                     let mut options = upgrade_options(
                         config,
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req.query_params,
+                        &query_params,
                         Some(&engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -910,6 +1572,9 @@ where
                 }
             }
         } else {
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1051,10 +1716,10 @@ pub(crate) async fn websocket_middleware_preflight(
 
 /// Build the WebSocket preflight input from the sandbox and evaluation
 /// contexts. Kept separate from `websocket_middleware_preflight` (and taking an
-/// explicit `SandboxContext`) so the identifier copy is unit-testable with a
+/// explicit `EventContext`) so the identifier copy is unit-testable with a
 /// real sandbox name, mirroring `middleware_request_input` on the HTTP path.
 fn websocket_preflight_input(
-    sandbox: &openshell_ocsf::SandboxContext,
+    sandbox: &openshell_ocsf::EventContext,
     ctx: &L7EvalContext,
     req: &crate::l7::provider::L7Request,
     scheme: &str,
@@ -1217,7 +1882,7 @@ where
         emit_policy_reload(guard, host, port, &options.policy_name);
         if let Some(session) = options.middleware_session.take() {
             session
-                .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                 .await;
         }
         send_websocket_close(client, upstream, 1012).await;
@@ -1354,10 +2019,10 @@ where
             }
         };
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
-        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, None, client).await? {
             return Ok(());
         }
 
@@ -1370,7 +2035,7 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -1461,11 +2126,13 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             let websocket_chain = websocket_request.then(|| chain.clone());
             // REST and websocket-upgrade policy evaluates only the method,
             // path, and query, which a middleware result cannot mutate, so no
             // per-stage body re-check is needed.
-            let middleware_result = apply_middleware_chain(
+            let middleware_result = apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -1473,6 +2140,7 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                &request_id,
             )
             .await;
             let req = match middleware_result? {
@@ -1546,55 +2214,31 @@ where
             } else {
                 None
             };
-            let req_with_auth =
-                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
-                    Ok(req) => req,
-                    Err(e) => {
-                        warn!(
-                            host = %ctx.host,
-                            port = ctx.port,
-                            error = %e,
-                            "Token grant failed in L7 relay"
-                        );
-                        write_bad_gateway_response(client).await?;
-                        return Ok(());
-                    }
-                };
-            let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-
-            // Forward request to upstream and relay response
-            let outcome_result = relay_http_request_with_credential_rejection(
-                &req_with_auth,
+            let query_params = req.query_params.clone();
+            let mut forwarding_ctx = ctx.clone();
+            let outcome_result = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    websocket_extensions: websocket_extension_mode(
-                        config,
-                        middleware_session.is_some(),
-                    ),
-                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
-                        && config.request_body_credential_rewrite,
-                    deny_uninspected_credentials: config
-                        .deny_uninspected_body_credentials(ctx.secret_resolver.is_some()),
-                    credential_signing: config.credential_signing,
-                    signing_service: &config.signing_service,
-                    signing_region: &config.signing_region,
-                    host: &ctx.host,
-                    port: ctx.port,
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: middleware_session.is_some(),
+                    observation_context: None,
                 },
-                ctx,
             )
             .await;
+            let ctx = &forwarding_ctx;
             let outcome_result = match outcome_result {
                 Ok(Some(outcome)) => Ok(outcome),
                 Ok(None) => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::Cancellation)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                             .await;
                     }
                     return Ok(());
@@ -1614,14 +2258,14 @@ where
                 RelayOutcome::Reusable => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                 }
                 RelayOutcome::Consumed => {
                     if let Some(session) = middleware_session.take() {
                         session
-                            .end(openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected)
+                            .end(openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure)
                             .await;
                     }
                     debug!(
@@ -1641,7 +2285,7 @@ where
                         ctx,
                         websocket_request,
                         &redacted_target,
-                        &req_with_auth.query_params,
+                        &query_params,
                         Some(engine),
                     );
                     options.websocket.permessage_deflate = websocket_permessage_deflate;
@@ -1720,7 +2364,7 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
                 emit_policy_reload(guard, host, port, policy_name);
                 if let Some(session) = session.take() {
                     session
-                        .end(openshell_core::proto::WebSocketSessionEndReason::PolicyReload)
+                        .end(openshell_core::proto::MiddlewareSessionEndReason::PolicyReload)
                         .await;
                 }
                 Err(error)
@@ -1731,9 +2375,9 @@ pub(crate) async fn finalize_websocket_pre_upgrade(
         Err(error) => {
             let reason = if guard.is_stale() {
                 emit_policy_reload(guard, host, port, policy_name);
-                openshell_core::proto::WebSocketSessionEndReason::PolicyReload
+                openshell_core::proto::MiddlewareSessionEndReason::PolicyReload
             } else {
-                openshell_core::proto::WebSocketSessionEndReason::UpstreamRejected
+                openshell_core::proto::MiddlewareSessionEndReason::UpstreamFailure
             };
             if let Some(session) = session.take() {
                 session.end(reason).await;
@@ -1759,9 +2403,12 @@ where
             return Ok(());
         }
 
-        // Future MCP version-profile request checks should hook here before OPA
-        // evaluation. See McpOptions in proto/sandbox.proto for the policy
-        // roadmap and source documentation.
+        // Body inspection may await the caller while policy or provider state
+        // changes; a completed parse must retain its original authority.
+        let observation_context = ctx
+            .endpoint_observation_tx
+            .as_ref()
+            .and_then(EndpointObservationSender::capture);
         let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
             client,
             config.json_rpc_max_body_bytes,
@@ -1794,8 +2441,23 @@ where
 
         let req = parsed.request;
         let jsonrpc_info = parsed.info;
+        let observer = EndpointObserver::begin_captured(
+            ctx.endpoint_observation_tx.as_ref(),
+            config,
+            observation_context.as_ref(),
+            ctx.provider_credential_revision,
+            Some(engine.generation_guard()),
+        );
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
+            return Ok(());
+        }
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, observer.as_ref(), client)
+            .await?
+        {
             return Ok(());
         }
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -1805,9 +2467,26 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                if let Some(observer) = observer.as_ref() {
+                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                }
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
+        };
+
+        let Some(jsonrpc_info) = enforce_mcp_protocol_version(
+            config,
+            &req,
+            jsonrpc_info,
+            client,
+            ctx,
+            &redacted_target,
+            observer.as_ref(),
+        )
+        .await?
+        else {
+            return Ok(());
         };
 
         let request_info = L7RequestInfo {
@@ -1875,12 +2554,14 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain(
+            let req = match apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -1888,11 +2569,15 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                &request_id,
             )
             .await?
             {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
+                    if let Some(observer) = observer.as_ref() {
+                        observer.observe(EndpointResult::PolicyDenied);
+                    }
                     let denied_request = crate::l7::provider::L7Request {
                         action: request_info.action.clone(),
                         target: redacted_target.clone(),
@@ -1928,24 +2613,21 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            // Future MCP response/SSE introspection or rewrite would hook here
-            // before returning upstream bytes. The current policy schema has no
-            // trusted-annotations or version-profile field, so MCP responses and
-            // SSE streams are relayed unchanged; see McpOptions in
-            // proto/sandbox.proto for planned policy extensions.
-            let Some(outcome) = relay_http_request_with_credential_rejection(
-                &req,
+            let mut forwarding_ctx = ctx.clone();
+            let Some(outcome) = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    ..Default::default()
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: false,
+                    observation_context: observation_context.as_ref(),
                 },
-                ctx,
             )
             .await?
             else {
@@ -1966,6 +2648,9 @@ where
                 }
             }
         } else {
+            if let Some(observer) = observer.as_ref() {
+                observer.observe(EndpointResult::PolicyDenied);
+            }
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1992,22 +2677,22 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let provider =
+        crate::l7::rest::RestProvider::with_options(crate::l7::path::CanonicalizeOptions {
+            allow_encoded_slash: config.allow_encoded_slash,
+            ..Default::default()
+        });
+
     loop {
         if close_if_stale(engine.generation_guard(), ctx) {
             return Ok(());
         }
 
-        let parsed = match crate::l7::graphql::parse_graphql_http_request(
-            client,
-            config.graphql_max_body_bytes,
-            crate::l7::path::CanonicalizeOptions {
-                allow_encoded_slash: config.allow_encoded_slash,
-                ..Default::default()
-            },
-        )
-        .await
-        {
-            Ok(Some(parsed)) => parsed,
+        // Validate the head, including body framing, before deciding whether
+        // this endpoint can inspect the requested protocol. Upgrade refusal
+        // must not wait for a body or depend on its inspection size limit.
+        let mut req = match provider.parse_request(client).await {
+            Ok(Some(req)) => req,
             Ok(None) => return Ok(()),
             Err(e) => {
                 if is_benign_connection_error(&e) {
@@ -2026,13 +2711,44 @@ where
             }
         };
 
-        let req = parsed.request;
-        let graphql_info = parsed.info;
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
-        if deny_h2c_upgrade_if_requested(&req, config, ctx, client).await? {
+        if deny_unsupported_upgrade_if_requested(&req, config, ctx, None, client).await? {
+            return Ok(());
+        }
+
+        let graphql_info = match crate::l7::graphql::inspect_graphql_request(
+            client,
+            &mut req,
+            config.graphql_max_body_bytes,
+        )
+        .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "GraphQL L7 connection closed"
+                    );
+                } else {
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7-graphql");
+                }
+                return Ok(());
+            }
+        };
+
+        // Inspection appends the body to raw_header. An HTTP/1.0 request
+        // without Host must still be denied if that body contains reserved
+        // credential markers, so repeat the authority check on the full request.
+        if !request_authority_matches_endpoint(&req, ctx) {
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
 
@@ -2043,7 +2759,7 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -2115,12 +2831,14 @@ where
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
             let chain = engine.query_middleware_chain(&middleware_network_input(ctx))?;
+            let response_chain = chain.clone();
+            let request_id = uuid::Uuid::new_v4().to_string();
             // Policy admitted the original body above; re-check the body
             // against the same body-aware policy after every transforming
             // stage so a middleware cannot smuggle a denied operation to the
             // upstream or the next stage.
             let validate = transformed_body_validator(config, engine, ctx, &request_info);
-            let req = match apply_middleware_chain(
+            let req = match apply_middleware_chain_with_request_id(
                 req,
                 client,
                 ctx,
@@ -2128,6 +2846,7 @@ where
                 engine.middleware_runner(),
                 engine.generation_guard(),
                 openshell_supervisor_middleware::TransformedBodyPolicy::Reevaluate(&validate),
+                &request_id,
             )
             .await?
             {
@@ -2168,19 +2887,21 @@ where
                     return Ok(());
                 }
             };
-            let scoped_ctx = scoped_context_for_request(ctx, &req);
-            let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
-            let Some(outcome) = relay_http_request_with_credential_rejection(
-                &req,
+            let mut forwarding_ctx = ctx.clone();
+            let Some(outcome) = forward_inspected_request(
+                req,
                 client,
                 upstream,
-                crate::l7::rest::RelayRequestOptions {
-                    resolver: ctx.secret_resolver.as_deref(),
-                    credential_generation: credential_generation_guard(ctx),
-                    generation_guard: Some(engine.generation_guard()),
-                    ..Default::default()
+                &mut forwarding_ctx,
+                InspectedForwarding {
+                    config,
+                    engine,
+                    request_info: &request_info,
+                    request_id: &request_id,
+                    response_chain: &response_chain,
+                    websocket_middleware: false,
+                    observation_context: None,
                 },
-                ctx,
             )
             .await?
             else {
@@ -2196,25 +2917,20 @@ where
                     );
                     return Ok(());
                 }
-                RelayOutcome::Upgraded {
-                    overflow,
-                    websocket_permessage_deflate,
-                    ..
-                } => {
-                    let options = UpgradeRelayOptions {
-                        assembly_budget: Some(
-                            crate::l7::websocket::WebSocketAssemblyBudget::default(),
-                        ),
-                        websocket: WebSocketUpgradeBehavior {
-                            permessage_deflate: websocket_permessage_deflate,
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    return handle_upgrade(
-                        client, upstream, overflow, &ctx.host, ctx.port, options,
-                    )
-                    .await;
+                RelayOutcome::Upgraded { .. } => {
+                    // GraphQL rules apply to individual HTTP requests. No
+                    // current path forwards upgrade headers here: the
+                    // request-side refusal rejects them, and request
+                    // middleware cannot add upgrade or connection headers. If
+                    // a later change lets such a request reach an upstream
+                    // that answers `101`, close instead of relaying frames
+                    // that no GraphQL rule would inspect.
+                    warn!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "closing GraphQL connection after unexpected protocol upgrade"
+                    );
+                    return Ok(());
                 }
             }
         } else {
@@ -2418,6 +3134,8 @@ fn evaluate_jsonrpc_l7_request_for_log(
                 is_batch: true,
                 receive_stream: false,
                 has_response: false,
+                mcp_revision: jsonrpc.mcp_revision,
+                mcp_http_metadata: None,
                 error: None,
             },
         });
@@ -2441,6 +3159,8 @@ fn jsonrpc_request_for_call(
         is_batch: false,
         receive_stream: false,
         has_response: false,
+        mcp_revision: request.jsonrpc.as_ref().and_then(|info| info.mcp_revision),
+        mcp_http_metadata: None,
         error: None,
     });
     item_request
@@ -2476,10 +3196,20 @@ fn reevaluate_transformed_body(
         // unimplemented SQL relay.
         L7Protocol::Rest | L7Protocol::Websocket | L7Protocol::Sql => return Ok(None),
         L7Protocol::JsonRpc | L7Protocol::Mcp => {
-            let info = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
-                body,
-                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config),
-            );
+            let mut inspection_options =
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::for_config(config);
+            if let Some(revision) = request_info
+                .jsonrpc
+                .as_ref()
+                .and_then(|info| info.mcp_revision)
+            {
+                // Inspect the replacement under the revision authorized on entry.
+                // The final forwarding check validates the resulting header-selected
+                // profile and body/header mirrors after any header mutations.
+                inspection_options = inspection_options.with_mcp_revision(revision);
+            }
+            let info =
+                crate::l7::jsonrpc::parse_jsonrpc_body_with_options(body, inspection_options);
             let mut transformed_info = request_info.clone();
             transformed_info.jsonrpc = Some(info);
             (jsonrpc_engine_type(config.protocol), transformed_info)
@@ -2580,6 +3310,8 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
         "method": call.map(|call| call.method.as_str()),
         "params": call.map(|call| &call.params),
         "tool": call.and_then(|call| call.tool.as_deref()),
+        "mcp_method_classification": call
+            .and_then(|call| call.mcp_classification),
         "receive_stream": info.receive_stream,
         "has_response": info.has_response,
         // Rust keeps the inspection failure kind typed. Rego's stable boundary is
@@ -2588,6 +3320,85 @@ fn jsonrpc_policy_input(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> serde_
             .error
             .as_ref()
             .map(crate::l7::jsonrpc::JsonRpcInspectionError::detail),
+    })
+}
+
+/// A batch may be allowed by several endpoints, but one credential owner must
+/// admit every member before its token can authenticate the combined request.
+fn admitted_token_grant_owners(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<HashSet<String>> {
+    if let Some(jsonrpc) = &request.jsonrpc
+        && jsonrpc.is_batch
+        && !jsonrpc.calls.is_empty()
+    {
+        let mut owners = if jsonrpc.has_response {
+            Some(admitted_token_grant_owners_once(engine, ctx, request)?)
+        } else {
+            None
+        };
+        for call in &jsonrpc.calls {
+            let admitted = admitted_token_grant_owners_once(
+                engine,
+                ctx,
+                &jsonrpc_request_for_call(request, call),
+            )?;
+            if let Some(owners) = &mut owners {
+                owners.retain(|owner| admitted.contains(owner));
+            } else {
+                owners = Some(admitted);
+            }
+        }
+        return Ok(owners.unwrap_or_default());
+    }
+    admitted_token_grant_owners_once(engine, ctx, request)
+}
+
+fn admitted_token_grant_owners_once(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<HashSet<String>> {
+    if engine.is_stale() {
+        return Err(miette!("policy changed before token grant selection"));
+    }
+    let mut engine = engine
+        .engine()
+        .lock()
+        .map_err(|_| miette!("OPA engine lock poisoned"))?;
+    crate::opa::set_regorus_input(&mut engine, l7_request_policy_input(ctx, request))?;
+    let owners = engine
+        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+        .map_err(|error| miette!("{error}"))?;
+    let regorus::Value::Array(owners) = owners else {
+        return Err(miette!("invalid credential owner admission result"));
+    };
+    owners
+        .iter()
+        .map(|owner| match owner {
+            regorus::Value::String(owner) => Ok(owner.to_string()),
+            _ => Err(miette!("invalid credential owner identity")),
+        })
+        .collect()
+}
+
+fn l7_request_policy_input(ctx: &L7EvalContext, request: &L7RequestInfo) -> serde_json::Value {
+    serde_json::json!({
+        "network": { "host": ctx.host, "port": ctx.port },
+        "exec": {
+            "path": ctx.binary_path,
+            "ancestors": ctx.ancestors,
+            "cmdline_paths": ctx.cmdline_paths,
+        },
+        "request": {
+            "method": request.action,
+            "path": request.target,
+            "query_params": request.query_params.clone(),
+            "graphql": request.graphql.clone(),
+            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
+        }
     })
 }
 
@@ -2604,24 +3415,7 @@ fn evaluate_l7_request_once(
         ));
     }
 
-    let input = serde_json::json!({
-        "network": {
-            "host": ctx.host,
-            "port": ctx.port,
-        },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
-        },
-        "request": {
-            "method": request.action,
-            "path": request.target,
-            "query_params": request.query_params.clone(),
-            "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(jsonrpc_policy_input),
-        }
-    });
+    let input = l7_request_policy_input(ctx, request);
 
     let mut engine = engine
         .engine()
@@ -2693,7 +3487,7 @@ where
             }
         };
         if !request_authority_matches_endpoint(&req, ctx) {
-            reject_request_authority_mismatch(client, ctx).await?;
+            reject_request_authority_mismatch(client, ctx, &req.action).await?;
             return Ok(());
         }
         if close_if_stale(generation_guard, ctx) {
@@ -2706,7 +3500,7 @@ where
         let redacted_target = match secrets::redact_target_for_policy(&req.target) {
             Ok(target) => target,
             Err(error) => {
-                reject_credential_resolution(client, ctx, &error).await?;
+                reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
             }
         };
@@ -2733,6 +3527,8 @@ where
             ocsf_emit!(event);
         }
 
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let mut response_selection = None;
         let req = if let Some(engine) = middleware_engine {
             let input = middleware_network_input(ctx);
             let (chain, generation) = engine.query_middleware_chain_with_generation(&input)?;
@@ -2740,19 +3536,24 @@ where
                 return Ok(());
             }
             let runner = engine.middleware_runner()?;
+            let exchange = crate::l7::middleware::HttpMiddlewareExchange::new(
+                request_id.clone(),
+                chain,
+                runner,
+                generation_guard.clone(),
+            );
             // The passthrough path enforces no L7 policy, so there is no
             // body-aware decision to re-check after a transformation.
-            match apply_middleware_chain(
-                req,
-                client,
-                ctx,
-                chain,
-                &runner,
-                generation_guard,
-                openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
-            )
-            .await?
-            {
+            let result = exchange
+                .apply_request(
+                    req,
+                    client,
+                    ctx,
+                    "http",
+                    openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+                )
+                .await?;
+            let request = match result {
                 MiddlewareApplyResult::Allowed(request) => request,
                 MiddlewareApplyResult::Denied { denial, .. } => {
                     let denied_request = crate::l7::provider::L7Request {
@@ -2789,7 +3590,9 @@ where
                     .await?;
                     return Ok(());
                 }
-            }
+            };
+            response_selection = Some(exchange);
+            request
         } else {
             req
         };
@@ -2811,6 +3614,9 @@ where
         let scoped_ctx = scoped_context_for_request(ctx, &req_with_auth);
         let ctx = scoped_ctx.as_ref().unwrap_or(ctx);
         let resolver = ctx.secret_resolver.as_deref();
+        let response_middleware = response_selection
+            .as_ref()
+            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, "http"));
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
@@ -2826,6 +3632,7 @@ where
                 ..Default::default()
             },
             ctx,
+            response_middleware,
         )
         .await?
         else {
@@ -2876,8 +3683,179 @@ mod tests {
     use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
     use openshell_core::provider_credentials::ProviderCredentialState;
     use std::collections::HashMap as TestHashMap;
+    use std::fmt::Write as _;
     use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn body_denial_returns_actionable_local_json() {
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(), target: "/v1/responses".into(), query_params: TestHashMap::new(),
+            raw_header: b"POST /v1/responses HTTP/1.1\r\nHost: api.openai.com\r\nContent-Length: 25\r\n\r\nopenshell:resolve:env:KEY".to_vec(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(25),
+        };
+        let (mut client, mut caller) = tokio::io::duplex(4096);
+        let (mut upstream, mut server) = tokio::io::duplex(4096);
+        let outcome = relay_http_request_with_credential_rejection(
+            &req,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                deny_uninspected_credentials: true,
+                ..Default::default()
+            },
+            &L7EvalContext::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_none());
+        drop(client);
+        let mut response = String::new();
+        caller.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        let body: serde_json::Value =
+            serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(
+            body["error"]["code"],
+            "credential_placeholder_in_request_body"
+        );
+        assert_eq!(body["error"]["reason"], "classification_unavailable");
+        let mut sent = String::new();
+        server.read_to_string(&mut sent).await.unwrap();
+        assert!(!sent.contains("openshell:resolve:"));
+    }
+
+    async fn assert_body_denial_observation(
+        token: &str,
+        classifier: Option<&secrets::body::BodyCredentialClassifier>,
+        expected_reason: &str,
+        disconnect_client: bool,
+    ) {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointStatusCommand,
+            endpoint_status_channel,
+        };
+
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: "policy".into(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: "endpoint:v1:body-test".into(),
+                    uses_provider_credentials: true,
+                }],
+            )
+            .await
+            .expect("install endpoint inventory");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(EndpointStatusCommand::Reset { .. })
+        ));
+        let value = regorus::Value::from_json_str(
+            r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:body-test","policy_hash":"policy","provider_credentialed":true}"#,
+        )
+        .expect("parse endpoint configuration");
+        let config = crate::l7::parse_l7_config(&value).expect("parse MCP configuration");
+        let observer = EndpointObserver::begin(Some(&sender), &config).expect("begin observation");
+
+        let body = format!(r#"{{"input":"{token}"}}"#);
+        let req = crate::l7::provider::L7Request {
+            action: "POST".into(),
+            target: "/mcp".into(),
+            query_params: TestHashMap::new(),
+            raw_header: format!(
+                "POST /mcp HTTP/1.1\r\nHost: tools.example.test\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut client, caller) = tokio::io::duplex(4096);
+        let mut caller = Some(caller);
+        if disconnect_client {
+            // The denial must survive failure to deliver the local HTTP response.
+            drop(caller.take());
+        }
+        let (mut upstream, mut server) = tokio::io::duplex(4096);
+        let outcome = relay_http_request_with_credential_rejection_observed(
+            &req,
+            &mut client,
+            &mut upstream,
+            crate::l7::rest::RelayRequestOptions {
+                body_classifier: classifier,
+                deny_uninspected_credentials: true,
+                host: "tools.example.test",
+                port: 443,
+                ..Default::default()
+            },
+            &L7EvalContext::default(),
+            None,
+            Some(&observer),
+        )
+        .await;
+        if disconnect_client {
+            assert!(outcome.is_err());
+        } else {
+            assert!(outcome.expect("reject body locally").is_none());
+        }
+        drop(client);
+        if let Some(mut caller) = caller {
+            let mut response = String::new();
+            caller.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+            let body: serde_json::Value =
+                serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+            assert_eq!(body["error"]["reason"], expected_reason);
+            assert!(!response.contains(token));
+        }
+        let mut sent = String::new();
+        server.read_to_string(&mut sent).await.unwrap();
+        assert!(!sent.contains("openshell:resolve:"));
+        assert!(!sent.contains("403 Forbidden"));
+        assert!(matches!(
+            receiver.try_recv().expect("body denial observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::PolicyDenied,
+                ..
+            }
+        ));
+        assert!(receiver.try_recv().is_err(), "only one result per exchange");
+    }
+
+    #[tokio::test]
+    async fn body_denial_observation_reports_policy_denied_before_client_io() {
+        for disconnect_client in [false, true] {
+            assert_body_denial_observation(
+                "openshell:resolve:env:KEY",
+                None,
+                "classification_unavailable",
+                disconnect_client,
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn body_denial_observation_does_not_attribute_unrelated_unavailable_credential() {
+        let (state, _) = endpoint_mismatch_resolver(TestHashMap::from([(
+            "API_TOKEN".into(),
+            "private-test-secret".into(),
+        )]));
+        let (_, classifier, _) =
+            state.resolver_and_body_classifier_for_endpoint("tools.example.test", 443, "/mcp");
+        let classifier = classifier.expect("body classifier");
+        // This stale token belongs to allowed.example.test, not the observed server.
+        let token = "openshell:resolve:env:v999_API_TOKEN";
+        assert_eq!(
+            classifier.check(token),
+            Err(secrets::body::BodyCredentialError::KnownUnavailable)
+        );
+        assert_body_denial_observation(token, Some(&classifier), "known_unavailable", false).await;
+    }
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
@@ -2916,8 +3894,48 @@ mod tests {
     }
 
     #[test]
+    fn early_http_rejections_include_method_and_response() {
+        use openshell_ocsf::validation::{
+            load_class_schema, validate_enum_value, validate_required_fields,
+        };
+        let ctx = L7EvalContext {
+            host: "example.com".into(),
+            port: 443,
+            ..Default::default()
+        };
+        let schema = load_class_schema("http_activity");
+        for (event, method, response_code) in [
+            (
+                build_request_authority_mismatch_event(&ctx, "GET"),
+                "GET",
+                403,
+            ),
+            (
+                build_credential_resolution_event(&ctx, "POST", true),
+                "POST",
+                403,
+            ),
+            (
+                build_credential_resolution_event(&ctx, "HEAD", false),
+                "HEAD",
+                500,
+            ),
+        ] {
+            let json = event.to_json().unwrap();
+            assert_eq!(json["class_uid"], 4002);
+            assert_eq!(json["dst_endpoint"]["domain"], "example.com");
+            assert_eq!(json["action_id"], 2);
+            assert_eq!(json["http_request"]["http_method"], method);
+            assert!(json["http_request"].get("url").is_none());
+            assert_eq!(json["http_response"]["code"], response_code);
+            validate_required_fields(&json, &schema);
+            validate_enum_value(&json, "activity_id", &schema);
+        }
+    }
+
+    #[test]
     fn websocket_preflight_input_carries_real_sandbox_name() {
-        let sandbox = openshell_ocsf::SandboxContext {
+        let sandbox = openshell_ocsf::EventContext {
             sandbox_id: "sbx-123".into(),
             sandbox_name: "nightly-build".into(),
             container_image: String::new(),
@@ -2925,6 +3943,7 @@ mod tests {
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         };
 
         let eval = L7EvalContext {
@@ -3092,7 +4111,7 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(ctx, true)
+        let activity = build_credential_resolution_event(ctx, "GET", true)
             .to_json()
             .expect("serialize credential mismatch activity");
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
@@ -3132,6 +4151,7 @@ mod tests {
                 ..options
             },
             &ctx,
+            None,
         )
         .await
         .expect("typed credential denial");
@@ -3153,7 +4173,7 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(&ctx, true)
+        let activity = build_credential_resolution_event(&ctx, "GET", true)
             .to_json()
             .unwrap();
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
@@ -3306,6 +4326,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
@@ -3353,6 +4374,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -3386,6 +4408,7 @@ network_policies:
             }
         };
         ctx.dynamic_credentials = Some(fixture.dynamic_credentials());
+        ctx.provider_credentials = Some(fixture.provider_credentials());
         ctx.token_grant_resolver = Some(fixture.resolver());
 
         (config, tunnel_engine, ctx, fixture)
@@ -3517,7 +4540,7 @@ network_policies:
 
         async fn describe(
             &self,
-            _request: tonic::Request<()>,
+            _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
         ) -> std::result::Result<
             tonic::Response<openshell_core::proto::MiddlewareManifest>,
             tonic::Status,
@@ -3534,9 +4557,18 @@ network_policies:
                             as i32,
                         max_payload_bytes:
                             openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES as u64,
-                        timeout: "2s".into(),
+                        request_timeout: Some(prost_types::Duration {
+                            seconds: 2,
+                            nanos: 0,
+                        }),
                     }],
                     expected_audience: String::new(),
+                    extension: Some(openshell_core::extension_protocol::extension_metadata(
+                        openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                        "openshell/test-middleware",
+                        "test",
+                        [],
+                    )),
                 },
             ))
         }
@@ -3646,7 +4678,10 @@ network_policies:
                 grpc_endpoint: format!("http://{address}"),
                 max_payload_bytes: openshell_supervisor_middleware::MAX_MIDDLEWARE_PAYLOAD_BYTES
                     as u64,
-                timeout: "2s".into(),
+                request_timeout: Some(prost_types::Duration {
+                    seconds: 2,
+                    nanos: 0,
+                }),
                 tls_ca_cert_pem: Vec::new(),
                 audience: String::new(),
                 allow_insecure_transport: false,
@@ -3669,6 +4704,7 @@ network_policies:
       - host: api.example.test
         port: 8080
         protocol: rest
+        token_grant_owner: test-owner
         enforcement: enforce
         rules:
           - allow:
@@ -3708,6 +4744,7 @@ network_policies:
             policy_name: "rest_api".into(),
             binary_path: "/usr/bin/curl".into(),
             dynamic_credentials: Some(fixture.dynamic_credentials()),
+            provider_credentials: Some(fixture.provider_credentials()),
             token_grant_resolver: Some(fixture.resolver()),
             ..Default::default()
         };
@@ -3883,7 +4920,8 @@ network_policies:
     }
 
     fn mcp_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
-        let data = r"
+        mcp_relay_context_from_data(
+            r"
 network_policies:
   mcp_api:
     name: mcp_api
@@ -3898,8 +4936,48 @@ network_policies:
               method: initialize
     binaries:
       - { path: /usr/bin/python3 }
-";
-        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+",
+        )
+    }
+
+    fn mcp_sessionless_test_relay_context() -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext)
+    {
+        mcp_relay_context_from_data(
+            r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2026-07-28"]
+          allow_all_known_mcp_methods: true
+        rules:
+          - allow: {}
+          - allow:
+              method: vendor/inspect
+        deny_rules:
+          - method: tools/call
+            tool: blocked
+    binaries:
+      - { path: /usr/bin/python3 }
+"#,
+        )
+    }
+
+    fn mcp_relay_context_from_data(
+        data: &str,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
+        mcp_relay_context_from_engine(OpaEngine::from_strings(TEST_POLICY, data).unwrap())
+    }
+
+    fn mcp_relay_context_from_engine(
+        engine: OpaEngine,
+    ) -> (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext) {
         let input = NetworkInput {
             host: "mcp.example.test".into(),
             port: 8000,
@@ -4083,6 +5161,132 @@ network_policies:
             parse_rejection_detail(error, ParseRejectionMode::L7Endpoint),
             error
         );
+    }
+
+    #[tokio::test]
+    async fn l7_rest_tls_relay_injects_multiple_grants() {
+        assert_multiple_grants_tls_relay(Ok("identity-token")).await;
+    }
+
+    #[tokio::test]
+    async fn l7_rest_tls_relay_second_grant_failure_forwards_nothing() {
+        assert_multiple_grants_tls_relay(Err("issuer echoed identity-secret")).await;
+    }
+
+    async fn token_grant_tls_pair() -> (
+        tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
+        tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
+    ) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["api.example.test".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.der().clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.der().clone()).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let (client, server) = tokio::io::duplex(16384);
+        let (client, server) = tokio::join!(
+            connector.connect("api.example.test".try_into().unwrap(), client),
+            acceptor.accept(server),
+        );
+        (client.unwrap(), server.unwrap())
+    }
+
+    async fn assert_multiple_grants_tls_relay(identity_result: std::result::Result<&str, &str>) {
+        let (config, tunnel_engine, mut ctx, fixture) =
+            rest_token_grant_relay_context(Ok("service-token"));
+        let service_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let identity_key = "api.example.test\t8080\t/v1/**\tprovider:identity";
+        let mut identity = fixture.dynamic_credentials().read().unwrap()[service_key].clone();
+        identity.name = "identity".into();
+        identity.auth_style = "header".into();
+        identity.header_name = "X-Workload-Jwt".into();
+        fixture.add_credential(identity_key, identity, identity_result);
+        // The context's snapshot predates the second credential; pin a new one.
+        ctx.provider_credentials = Some(fixture.provider_credentials());
+        // Both sides verify a synthetic certificate: the test exercises encrypted
+        // application traffic, inspection and credential injection, then upstream TLS.
+        let (mut app, mut relay_client) = token_grant_tls_pair().await;
+        let (mut relay_upstream, mut upstream) = token_grant_tls_pair().await;
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        app.write_all(b"GET /v1/projects HTTP/1.1\r\nHost: api.example.test\r\nAuthorization: Bearer agent-token\r\nX-Workload-Jwt: agent-identity\r\nConnection: close\r\n\r\n")
+            .await.unwrap();
+        if identity_result.is_ok() {
+            let mut request = [0u8; 2048];
+            let n = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                upstream.read(&mut request),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request = String::from_utf8_lossy(&request[..n]);
+            assert!(request.contains("Authorization: Bearer service-token\r\n"));
+            assert!(request.contains("X-Workload-Jwt: identity-token\r\n"));
+            assert!(!request.contains("agent-token"));
+            assert!(!request.contains("agent-identity"));
+            upstream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        }
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), app.read(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(response.contains(if identity_result.is_ok() {
+            "204 No Content"
+        } else {
+            "502 Bad Gateway"
+        }));
+        assert!(!response.contains("service-token"));
+        assert!(!response.contains("identity-secret"));
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if identity_result.is_err() {
+            let mut request = [0u8; 128];
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                upstream.read(&mut request),
+            )
+            .await
+            .unwrap()
+            {
+                Ok(n) => assert_eq!(n, 0, "failed grant must send no request bytes"),
+                Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof),
+            }
+        }
+        fixture.assert_requested_keys(&[service_key, identity_key]);
     }
 
     #[tokio::test]
@@ -4745,7 +5949,7 @@ network_policies:
             forwarded.is_empty(),
             "mismatched request authority must not write upstream"
         );
-        let activity = build_request_authority_mismatch_event(&event_ctx)
+        let activity = build_request_authority_mismatch_event(&event_ctx, "GET")
             .to_json()
             .expect("serialize authority mismatch activity");
         assert_eq!(activity["status_detail"], "request_authority_mismatch");
@@ -5344,9 +6548,15 @@ network_policies:
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -5491,9 +6701,15 @@ network_policies:
                         as i32,
                     phase: openshell_core::proto::SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: 8192,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -5962,9 +7178,15 @@ network_policies:
                     operation: SupervisorMiddlewareOperation::HttpRequest as i32,
                     phase: SupervisorMiddlewarePhase::PreCredentials as i32,
                     max_payload_bytes: self.max_body_bytes,
-                    timeout: String::new(),
+                    request_timeout: None,
                 }],
                 expected_audience: String::new(),
+                extension: Some(openshell_core::extension_protocol::extension_metadata(
+                    openshell_core::extension_protocol::ExtensionFamily::SupervisorMiddleware,
+                    "openshell/test-middleware",
+                    "test",
+                    [],
+                )),
             }
         }
 
@@ -6055,7 +7277,7 @@ network_policies:
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
         app.write_all(&body).await.unwrap();
 
-        let result = crate::l7::middleware::apply_middleware_chain_for_scheme(
+        let result = crate::l7::middleware::apply_middleware_chain_for_scheme_with_request_id(
             req,
             &mut relay_client,
             &ctx,
@@ -6064,6 +7286,7 @@ network_policies:
             &runner,
             tunnel_engine.generation_guard(),
             openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
+            "test-request-id",
         )
         .await
         .expect("apply middleware chain");
@@ -6189,6 +7412,50 @@ network_policies:
         );
 
         assert_eq!(input.scheme, "http");
+    }
+
+    #[test]
+    fn response_middleware_context_reuses_exchange_request_id() {
+        let req = crate::l7::provider::L7Request {
+            action: "GET".into(),
+            target: "/v1/data".into(),
+            query_params: std::collections::HashMap::from([
+                ("cursor".into(), vec!["next page".into()]),
+                (
+                    "token".into(),
+                    vec!["openshell:resolve:env:API_TOKEN".into()],
+                ),
+            ]),
+            raw_header: b"GET /v1/data?cursor=next+page&token=sk-live-secret HTTP/1.1\r\nHost: api.example.test\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            workspace: "workspace-1".into(),
+            policy_name: "api".into(),
+            ..Default::default()
+        };
+        let runner = openshell_supervisor_middleware::ChainRunner::default();
+        let chain = Vec::new();
+        let response = http_response_middleware_relay(
+            &req,
+            &ctx,
+            "https",
+            "exchange-123",
+            &chain,
+            &runner,
+            None,
+        );
+
+        assert_eq!(response.request_context.request_id, "exchange-123");
+        assert_eq!(
+            response.target.query,
+            "cursor=next+page&token=%5BREDACTED%5D"
+        );
+        assert!(!response.target.query.contains("sk-live-secret"));
+        assert!(!response.target.query.contains("API_TOKEN"));
+        assert_eq!(response.target.scheme, "https");
     }
 
     #[test]
@@ -6859,7 +8126,7 @@ network_policies:
     }
 
     #[test]
-    fn jsonrpc_inspection_error_opa_projection_remains_string_or_null() {
+    fn jsonrpc_inspection_opa_projection_uses_stable_values() {
         let invalid_json = crate::l7::jsonrpc::parse_jsonrpc_body(
             b"{",
             crate::l7::jsonrpc::JsonRpcInspectionMode::JsonRpc,
@@ -6882,6 +8149,29 @@ network_policies:
             serde_json::json!("missing or non-string 'jsonrpc' field")
         );
         assert!(jsonrpc_policy_input(&accepted)["error"].is_null());
+
+        let available = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                true,
+            ),
+        );
+        let extension = crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/vendor"}"#,
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                true,
+            ),
+        );
+        assert_eq!(
+            jsonrpc_policy_input(&available)["mcp_method_classification"],
+            serde_json::json!("available")
+        );
+        assert_eq!(
+            jsonrpc_policy_input(&extension)["mcp_method_classification"],
+            serde_json::json!("extension")
+        );
     }
 
     #[test]
@@ -7111,9 +8401,12 @@ network_policies:
             target: "/mcp".into(),
             query_params: std::collections::HashMap::new(),
             graphql: None,
-            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
                 br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#,
-                crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+                crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                    openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                    true,
+                ),
             )),
         };
 
@@ -7131,9 +8424,12 @@ network_policies:
         assert!(allowed_message.contains("rule_methods=tools/call"));
         assert!(allowed_message.contains("tools=read_status"));
 
-        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body_with_options(
             br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"workspace/main"}}}"#,
-            crate::l7::jsonrpc::JsonRpcInspectionMode::Mcp,
+            crate::l7::jsonrpc::JsonRpcInspectionOptions::mcp_selected(
+                openshell_core::mcp::McpProtocolVersion::V2025_11_25,
+                true,
+            ),
         ));
         let parsed = request.jsonrpc.as_ref().expect("parsed MCP request");
         assert!(
@@ -7317,6 +8613,136 @@ network_policies:
             .unwrap();
     }
 
+    async fn assert_endpoint_path_deny(selector: &str, method: &str, path: &str, denied: bool) {
+        let data = format!(
+            r#"
+network_policies:
+  route_api:
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: "{selector}"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: "*", path: "**" }}
+        deny_rules:
+          - {{ method: POST, path: "**" }}
+      - host: gateway.example.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: {{ method: "*", path: "**" }}
+    binaries:
+      - {{ path: /usr/bin/node }}
+"#,
+        );
+        let engine = OpaEngine::from_strings(TEST_POLICY, &data)
+            .expect("compatible overlapping endpoints must be accepted");
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoints, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let configs: Vec<_> = endpoints
+            .iter()
+            .map(|endpoint| crate::l7::parse_l7_config(endpoint).unwrap())
+            .collect();
+        assert_eq!(configs.len(), 2);
+        if denied {
+            assert_eq!(
+                select_l7_config_for_path(&configs, path).unwrap().path,
+                selector
+            );
+        }
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            request_default_port: Some(443),
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ..Default::default()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        // Respond to any forwarded request so a bypass produces an observable
+        // 200, rather than a timeout that could hide the authorization result.
+        let server = tokio::spawn(async move {
+            let mut request = [0u8; 8192];
+            let n = upstream.read(&mut request).await.unwrap();
+            if n != 0 {
+                upstream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            n
+        });
+        app.write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: gateway.example.test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_http_headers(&mut app),
+        )
+        .await
+        .expect("relay must answer the request");
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(5), relay)
+            .await
+            .expect("relay must finish")
+            .unwrap()
+            .unwrap();
+        let forwarded_bytes = server.await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        let status = if denied { "403 Forbidden" } else { "200 OK" };
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status}")),
+            "selector={selector}, request={method} {path}: {response}"
+        );
+        assert_eq!(forwarded_bytes == 0, denied);
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_deny_covers_subtree_root() {
+        assert_endpoint_path_deny("/p/**", "POST", "/p", true).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_deny_covers_multisegment_star() {
+        assert_endpoint_path_deny("/v1/*", "POST", "/v1/a/b", true).await;
+    }
+
+    #[tokio::test]
+    async fn endpoint_path_deny_preserves_matching_and_nonmatching_controls() {
+        assert_endpoint_path_deny("/p/**", "POST", "/p/child", true).await;
+        assert_endpoint_path_deny("/v1/*", "POST", "/v1/a", true).await;
+        assert_endpoint_path_deny("/p/**", "GET", "/p", false).await;
+        assert_endpoint_path_deny("/p/**", "POST", "/public", false).await;
+        assert_endpoint_path_deny("/p/**", "POST", "/prefix", false).await;
+    }
+
     /// Policy allowing GET on both `/repos/**` and `/admin/**` for the same
     /// host:port, so an encoded-slash denial can only come from the
     /// per-endpoint `allow_encoded_slash` scoping.
@@ -7351,12 +8777,15 @@ network_policies:
     fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {
         let rest = |path: &str, allow_encoded_slash: bool| L7EndpointConfig {
             protocol: L7Protocol::Rest,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: path.into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash,
             websocket_credential_rewrite: false,
             request_body_credential_rewrite: false,
@@ -7731,7 +9160,7 @@ network_policies:
             .await
         });
 
-        let scenario = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let scenario = tokio::time::timeout(std::time::Duration::from_mins(1), async {
             app.write_all(
                 b"GET /ws HTTP/1.1\r\nHost: api.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
             )
@@ -7795,12 +9224,15 @@ network_policies:
             .unwrap();
         let configs = vec![L7EndpointConfig {
             protocol: L7Protocol::Rest,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: "/ws".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -7997,12 +9429,15 @@ network_policies:
             .unwrap();
         let configs = vec![L7EndpointConfig {
             protocol: L7Protocol::Websocket,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: "/ws".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -8123,12 +9558,15 @@ network_policies:
             .unwrap();
         let configs = vec![L7EndpointConfig {
             protocol: L7Protocol::Websocket,
+            endpoint_id: String::new(),
+            policy_hash: String::new(),
             path: "/graphql".into(),
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
             json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             mcp_strict_tool_names: true,
+            mcp_versions: Vec::new(),
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -8224,6 +9662,726 @@ network_policies:
         drop(app);
         drop(upstream);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    /// A `tools/call` that no JSON-RPC-family fixture below allows.
+    const UNALLOWED_TOOL_CALL: &[u8] =
+        br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource","arguments":{}}}"#;
+
+    /// A receive-stream GET that also asks to switch to WebSocket.
+    const JSONRPC_WEBSOCKET_UPGRADE_REQUEST: &[u8] = b"GET /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    /// Builds two endpoints on one host and port so every request goes
+    /// through per-request route selection: a JSON-RPC-family endpoint at
+    /// `/mcp` that allows only `initialize`, and a REST endpoint at `/api/**`.
+    fn jsonrpc_and_rest_route_configs(
+        protocol: &str,
+        enforcement: &str,
+    ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_policies:
+  shared_api:
+    name: shared_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: "/mcp"
+        protocol: {protocol}
+        enforcement: {enforcement}
+        rules:
+          - allow:
+              method: initialize
+      - host: mcp.example.test
+        port: 8000
+        path: "/api/**"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+        );
+        two_endpoint_route_configs(&data, "mcp.example.test", "shared_api")
+    }
+
+    /// Builds per-request route selection for a GraphQL endpoint at
+    /// `/graphql` that allows only `query { viewer }`, and a REST endpoint at
+    /// `/api/**`, on the same host and port.
+    fn graphql_and_rest_route_configs(
+        enforcement: &str,
+    ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
+        let data = format!(
+            r#"
+network_policies:
+  shared_graphql:
+    name: shared_graphql
+    endpoints:
+      - host: graphql.example.test
+        port: 8000
+        path: "/graphql"
+        protocol: graphql
+        enforcement: {enforcement}
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer]
+      - host: graphql.example.test
+        port: 8000
+        path: "/api/**"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+        );
+        two_endpoint_route_configs(&data, "graphql.example.test", "shared_graphql")
+    }
+
+    /// Loads `data` and returns the two L7 configs that share `host:8000`
+    /// for `/usr/bin/python3`, with a matching tunnel engine and context.
+    fn two_endpoint_route_configs(
+        data: &str,
+        host: &str,
+        policy_name: &str,
+    ) -> (Vec<L7EndpointConfig>, TunnelPolicyEngine, L7EvalContext) {
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: host.into(),
+            port: 8000,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_configs, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let configs: Vec<L7EndpointConfig> = endpoint_configs
+            .iter()
+            .map(|config| crate::l7::parse_l7_config(config).unwrap())
+            .collect();
+        assert_eq!(configs.len(), 2, "both endpoints must share the route");
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: host.into(),
+            port: 8000,
+            request_default_port: Some(8000),
+            policy_name: policy_name.into(),
+            binary_path: "/usr/bin/python3".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            ..Default::default()
+        };
+        (configs, tunnel_engine, ctx)
+    }
+
+    /// Result of sending one upgrade request through a relay whose upstream
+    /// accepts every upgrade it receives.
+    struct UpgradeScenario {
+        /// The response head the client received, or empty if none arrived.
+        response: String,
+        /// The response body of a non-`101` response.
+        body: String,
+        /// Every byte the upstream received.
+        upstream_seen: Vec<u8>,
+    }
+
+    /// Sends `request`, answers any forwarded upgrade with a valid `101`, and
+    /// after a `101` writes `frame` as a WebSocket text message. The upstream
+    /// never refuses, so a relay that forwards the upgrade and then copies
+    /// bytes delivers `frame` to it.
+    async fn run_upgrade_scenario<F>(request: &[u8], frame: &[u8], relay: F) -> UpgradeScenario
+    where
+        F: FnOnce(
+            tokio::io::DuplexStream,
+            tokio::io::DuplexStream,
+        ) -> tokio::task::JoinHandle<Result<()>>,
+    {
+        let (mut app, relay_client) = tokio::io::duplex(8192);
+        let (relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = relay(relay_client, relay_upstream);
+        let upstream_task = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            let mut answered = false;
+            loop {
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    upstream.read(&mut buf),
+                )
+                .await;
+                let Ok(Ok(n)) = read else { break };
+                if n == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&buf[..n]);
+                if !answered && seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    answered = true;
+                    let _ = upstream
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+                        )
+                        .await;
+                }
+            }
+            seen
+        });
+
+        app.write_all(request).await.unwrap();
+        let mut response = Vec::new();
+        let mut byte = [0u8; 1];
+        while !response.ends_with(b"\r\n\r\n") {
+            let read =
+                tokio::time::timeout(std::time::Duration::from_secs(2), app.read(&mut byte)).await;
+            let Ok(Ok(1)) = read else { break };
+            response.push(byte[0]);
+        }
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let mut body = Vec::new();
+        if response.starts_with("HTTP/1.1 101") {
+            let _ = app.write_all(&masked_text_frame(frame)).await;
+        } else {
+            // Refusals close the connection after the body.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                app.read_to_end(&mut body),
+            )
+            .await;
+        }
+        drop(app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay).await;
+        let upstream_seen = upstream_task.await.unwrap();
+        UpgradeScenario {
+            response,
+            body: String::from_utf8_lossy(&body).into_owned(),
+            upstream_seen,
+        }
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    fn assert_upgrade_denied_before_forwarding(scenario: &UpgradeScenario) {
+        assert_upgrade_refused_before_forwarding(
+            scenario,
+            UNALLOWED_TOOL_CALL,
+            crate::l7::rest::UNSUPPORTED_JSONRPC_UPGRADE_DETAIL,
+        );
+    }
+
+    /// Asserts that the relay answered the upgrade with the `detail` refusal
+    /// and that neither the request nor `frame` reached the upstream.
+    fn assert_upgrade_refused_before_forwarding(
+        scenario: &UpgradeScenario,
+        frame: &[u8],
+        detail: &str,
+    ) {
+        assert!(
+            !contains_bytes(&scenario.upstream_seen, &masked_text_frame(frame)),
+            "an uninspected frame reached the upstream"
+        );
+        assert!(
+            scenario.upstream_seen.is_empty(),
+            "the upgrade request must not reach the upstream, got: {}",
+            String::from_utf8_lossy(&scenario.upstream_seen)
+        );
+        assert!(
+            scenario.response.starts_with("HTTP/1.1 403"),
+            "expected a 403 denial, got: {}",
+            scenario.response
+        );
+        assert!(
+            scenario.body.contains("\"unsupported_l7_protocol\"") && scenario.body.contains(detail),
+            "expected the upgrade refusal, got: {}",
+            scenario.body
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_websocket_upgrade_refusal_records_policy_denied() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for route_selected in [false, true] {
+            let (mut config, tunnel_engine, mut ctx) = mcp_test_relay_context();
+            let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+            let scenario = run_upgrade_scenario(
+                JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+                UNALLOWED_TOOL_CALL,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                tunnel_engine,
+                                &mut client,
+                                &mut upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(
+                                &config,
+                                tunnel_engine,
+                                &mut client,
+                                &mut upstream,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    })
+                },
+            )
+            .await;
+            assert_upgrade_denied_before_forwarding(&scenario);
+            assert!(
+                matches!(
+                    receiver.try_recv(),
+                    Ok(EndpointStatusCommand::Observe {
+                        result: EndpointResult::PolicyDenied,
+                        ..
+                    })
+                ),
+                "route_selected={route_selected}: refusal must record a policy denial"
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "route_selected={route_selected}: one result per exchange"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_mcp_websocket_upgrade_is_denied_before_forwarding() {
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let scenario = run_upgrade_scenario(
+            JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_TOOL_CALL,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert_upgrade_denied_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn route_selected_audit_jsonrpc_websocket_upgrade_is_denied_before_forwarding() {
+        // Audit mode forwards requests that policy would deny, so the upgrade
+        // refusal must not depend on the policy decision.
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("json-rpc", "audit");
+        let scenario = run_upgrade_scenario(
+            JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_TOOL_CALL,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert_upgrade_denied_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_mcp_websocket_upgrade_is_denied_before_forwarding() {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let scenario = run_upgrade_scenario(
+            JSONRPC_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_TOOL_CALL,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_inspection(&config, tunnel_engine, &mut client, &mut upstream, &ctx)
+                        .await
+                })
+            },
+        )
+        .await;
+        assert_upgrade_denied_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn route_selected_rest_websocket_upgrade_still_relays_beside_mcp() {
+        // The refusal follows the selected endpoint's protocol: a REST
+        // upgrade on the same host and port keeps its documented raw relay.
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let frame = br#"{"type":"ping"}"#;
+        let scenario = run_upgrade_scenario(
+            b"GET /api/ws HTTP/1.1\r\nHost: mcp.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            frame,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert!(
+            scenario.response.starts_with("HTTP/1.1 101"),
+            "REST upgrade should still switch protocols, got: {}",
+            scenario.response
+        );
+        assert!(contains_bytes(
+            &scenario.upstream_seen,
+            &masked_text_frame(frame)
+        ));
+    }
+
+    #[tokio::test]
+    async fn route_selected_mcp_receive_stream_without_upgrade_is_still_forwarded() {
+        let (configs, tunnel_engine, ctx) = jsonrpc_and_rest_route_configs("mcp", "enforce");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAccept: text/event-stream\r\nMCP-Protocol-Version: 2025-11-25\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let forwarded = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_headers(&mut upstream),
+        )
+        .await
+        .expect("receive-stream GET should reach the upstream");
+        let forwarded = String::from_utf8_lossy(&forwarded);
+        assert!(forwarded.starts_with("GET /mcp HTTP/1.1\r\n"));
+        assert!(!forwarded.to_ascii_lowercase().contains("upgrade"));
+        relay.abort();
+        let _ = relay.await;
+    }
+
+    /// A GraphQL-over-WebSocket message that no GraphQL fixture allows.
+    const UNALLOWED_GRAPHQL_MUTATION: &[u8] =
+        br#"{"id":"1","type":"subscribe","payload":{"query":"mutation { deleteRepository }"}}"#;
+
+    /// A GET whose query the GraphQL fixtures allow, plus WebSocket upgrade
+    /// headers.
+    const GRAPHQL_WEBSOCKET_UPGRADE_REQUEST: &[u8] = b"GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: graphql.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+    fn assert_graphql_upgrade_refused_before_forwarding(scenario: &UpgradeScenario) {
+        assert_upgrade_refused_before_forwarding(
+            scenario,
+            UNALLOWED_GRAPHQL_MUTATION,
+            crate::l7::rest::UNSUPPORTED_GRAPHQL_UPGRADE_DETAIL,
+        );
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_graphql_websocket_upgrade_is_denied_before_forwarding() {
+        let (config, tunnel_engine, ctx) = graphql_test_relay_context();
+        let scenario = run_upgrade_scenario(
+            GRAPHQL_WEBSOCKET_UPGRADE_REQUEST,
+            UNALLOWED_GRAPHQL_MUTATION,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_inspection(&config, tunnel_engine, &mut client, &mut upstream, &ctx)
+                        .await
+                })
+            },
+        )
+        .await;
+        assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_upgrade_is_refused_before_body_read() {
+        // Send only the complete head. Neither an oversized declaration nor
+        // an incomplete allowed-size body may delay the upgrade refusal.
+        for content_length in [65537, 16] {
+            for enforcement in [EnforcementMode::Enforce, EnforcementMode::Audit] {
+                for upgrade in ["websocket", "custom"] {
+                    let (mut config, engine, ctx) = graphql_test_relay_context();
+                    config.enforcement = enforcement;
+                    assert_eq!(config.graphql_max_body_bytes, 65536);
+                    let request = format!(
+                        "POST /graphql HTTP/1.1\r\nHost: graphql.example.test:8000\r\nContent-Type: application/json\r\nConnection: Upgrade\r\nUpgrade: {upgrade}\r\nContent-Length: {content_length}\r\n\r\n"
+                    );
+                    let started = tokio::time::Instant::now();
+                    let scenario = run_upgrade_scenario(
+                        request.as_bytes(),
+                        UNALLOWED_GRAPHQL_MUTATION,
+                        move |mut client, mut upstream| {
+                            tokio::spawn(async move {
+                                relay_with_inspection(
+                                    &config,
+                                    engine,
+                                    &mut client,
+                                    &mut upstream,
+                                    &ctx,
+                                )
+                                .await
+                            })
+                        },
+                    )
+                    .await;
+                    assert_graphql_upgrade_refused_before_forwarding(&scenario);
+                    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_upgrade_preserves_head_validation() {
+        // Framing errors are rejected by the HTTP parser, and authority
+        // mismatches retain their specific denial before upgrade handling.
+        for (host, framing, expected) in [
+            (
+                "graphql.example.test:8000",
+                "Content-Length: 16\r\nTransfer-Encoding: chunked\r\n",
+                "",
+            ),
+            (
+                "graphql.example.test:8000",
+                "Content-Length: 16\r\nContent-Length: 17\r\n",
+                "",
+            ),
+            (
+                "other.example.test:8000",
+                "Content-Length: 16\r\n",
+                "request_authority_mismatch",
+            ),
+        ] {
+            let (config, engine, ctx) = graphql_test_relay_context();
+            let request = format!(
+                "POST /graphql HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: custom\r\n{framing}\r\n"
+            );
+            let scenario = run_upgrade_scenario(
+                request.as_bytes(),
+                UNALLOWED_GRAPHQL_MUTATION,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                            .await
+                    })
+                },
+            )
+            .await;
+            assert!(scenario.upstream_seen.is_empty());
+            if expected.is_empty() {
+                assert!(scenario.response.is_empty());
+            } else {
+                assert!(scenario.response.starts_with("HTTP/1.1 403"));
+                assert!(scenario.body.contains(expected));
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn single_endpoint_graphql_post_still_inspects_body() {
+        for (field, host, token) in [
+            ("viewer", "graphql.example.test:8000", ""),
+            ("admin", "graphql.example.test:8000", ""),
+            ("viewer", "", ""),
+            ("viewer", "", "openshell:resolve:env:v1_API_TOKEN"),
+        ] {
+            let (config, engine, ctx) = graphql_test_relay_context();
+            let (mut app, mut client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_with_inspection(&config, engine, &mut client, &mut relay_upstream, &ctx).await
+            });
+            let body = format!(r#"{{"query":"{{{field}}}","variables":{{"token":"{token}"}}}}"#);
+            let (version, authority) = if host.is_empty() {
+                ("HTTP/1.0", String::new())
+            } else {
+                ("HTTP/1.1", format!("Host: {host}\r\n"))
+            };
+            let request = format!(
+                "POST /graphql {version}\r\n{authority}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            let mut forwarded = Vec::new();
+            if field == "viewer" && token.is_empty() {
+                let headers = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    read_http_headers(&mut upstream),
+                )
+                .await
+                .expect("allowed POST head must reach upstream");
+                assert!(headers.starts_with(format!("POST /graphql {version}\r\n").as_bytes()));
+                let mut bytes = vec![0; body.len()];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    upstream.read_exact(&mut bytes),
+                )
+                .await
+                .expect("allowed POST must reach upstream")
+                .unwrap();
+                assert_eq!(bytes, body.as_bytes());
+            } else {
+                let mut response = Vec::new();
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    app.read_to_end(&mut response),
+                )
+                .await
+                .expect("unlisted field or credential marker without Host must be denied")
+                .unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 403"));
+                if !token.is_empty() {
+                    assert!(
+                        String::from_utf8_lossy(&response).contains("request_authority_mismatch")
+                    );
+                }
+                upstream.read_to_end(&mut forwarded).await.unwrap();
+                assert!(forwarded.is_empty());
+            }
+            relay.abort();
+            let _ = relay.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_graphql_websocket_upgrade_is_denied_before_forwarding() {
+        // Audit mode forwards requests that policy would deny, so the upgrade
+        // refusal must not depend on the policy decision.
+        for enforcement in ["enforce", "audit"] {
+            let (configs, tunnel_engine, ctx) = graphql_and_rest_route_configs(enforcement);
+            let scenario = run_upgrade_scenario(
+                GRAPHQL_WEBSOCKET_UPGRADE_REQUEST,
+                UNALLOWED_GRAPHQL_MUTATION,
+                move |mut client, mut upstream| {
+                    tokio::spawn(async move {
+                        relay_with_route_selection(
+                            &configs,
+                            tunnel_engine,
+                            &mut client,
+                            &mut upstream,
+                            &ctx,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await;
+            assert_graphql_upgrade_refused_before_forwarding(&scenario);
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_audit_graphql_upgrade_with_denied_query_is_refused() {
+        // Audit mode forwards a query the policy denies. The refusal must
+        // still fire, because it runs before the policy decision.
+        let (configs, tunnel_engine, ctx) = graphql_and_rest_route_configs("audit");
+        let scenario = run_upgrade_scenario(
+            b"GET /graphql?query=%7Badmin%7D HTTP/1.1\r\nHost: graphql.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            UNALLOWED_GRAPHQL_MUTATION,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_route_selection(
+                        &configs,
+                        tunnel_engine,
+                        &mut client,
+                        &mut upstream,
+                        &ctx,
+                    )
+                    .await
+                })
+            },
+        )
+        .await;
+        assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn single_endpoint_graphql_subscription_handshake_gets_upgrade_refusal() {
+        // A standard GraphQL-over-WebSocket handshake carries no query. It
+        // must receive the refusal that names the supported alternative, not
+        // a policy denial that suggests adding a rule.
+        let (config, tunnel_engine, ctx) = graphql_test_relay_context();
+        let scenario = run_upgrade_scenario(
+            b"GET /graphql HTTP/1.1\r\nHost: graphql.example.test:8000\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: graphql-transport-ws\r\n\r\n",
+            UNALLOWED_GRAPHQL_MUTATION,
+            move |mut client, mut upstream| {
+                tokio::spawn(async move {
+                    relay_with_inspection(&config, tunnel_engine, &mut client, &mut upstream, &ctx)
+                        .await
+                })
+            },
+        )
+        .await;
+        assert_graphql_upgrade_refused_before_forwarding(&scenario);
+    }
+
+    #[tokio::test]
+    async fn route_selected_graphql_query_without_upgrade_is_still_forwarded() {
+        let (configs, tunnel_engine, ctx) = graphql_and_rest_route_configs("enforce");
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\nHost: graphql.example.test:8000\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let forwarded = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_headers(&mut upstream),
+        )
+        .await
+        .expect("allowed GraphQL GET should reach the upstream");
+        let forwarded = String::from_utf8_lossy(&forwarded);
+        assert!(forwarded.starts_with("GET /graphql?query=%7Bviewer%7D HTTP/1.1\r\n"));
+        assert!(!forwarded.to_ascii_lowercase().contains("upgrade"));
+        relay.abort();
+        let _ = relay.await;
     }
 
     fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
@@ -8571,6 +10729,1644 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn mcp_relay_forwards_standalone_initialize_without_version_header() {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut upstream_bytes = vec![0; 2048];
+        let count = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut upstream_bytes),
+        )
+        .await
+        .expect("standalone initialize should reach upstream")
+        .unwrap();
+        let upstream_request = String::from_utf8_lossy(&upstream_bytes[..count]);
+        assert!(upstream_request.contains(r#""method":"initialize""#));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}",
+            )
+            .await
+            .unwrap();
+        let mut response = [0; 512];
+        let count =
+            tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+                .await
+                .expect("initialize response should reach client")
+                .unwrap();
+        assert!(String::from_utf8_lossy(&response[..count]).contains("200 OK"));
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete")
+            .unwrap()
+            .unwrap();
+    }
+
+    fn sessionless_mcp_body(method: &str, mut params: serde_json::Value) -> String {
+        params["_meta"] = serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {}
+        });
+        serde_json::json!({"jsonrpc":"2.0", "id":1, "method":method, "params":params}).to_string()
+    }
+
+    async fn run_sessionless_mcp_relay(
+        route_selected: bool,
+        headers: &str,
+        body: &str,
+        upstream_response: &str,
+    ) -> (String, Vec<u8>) {
+        run_mcp_relay_case(
+            mcp_sessionless_test_relay_context(),
+            route_selected,
+            headers,
+            body,
+            upstream_response,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn chunked_http_pipeline_authorizes_each_request() {
+        for protocol in ["mcp", "json-rpc", "graphql", "rest"] {
+            for route_selected in [false, true] {
+                for second_allowed in [false, true] {
+                    let rules = match protocol {
+                        "mcp" => "method: tools/call, tool: echo",
+                        "json-rpc" => "method: echo",
+                        "graphql" => "operation_type: query, fields: [echo]",
+                        "rest" => "method: POST, path: /mcp/allowed",
+                        _ => unreachable!(),
+                    };
+                    let endpoint_path = if protocol == "rest" {
+                        "/mcp/**"
+                    } else {
+                        "/mcp"
+                    };
+                    let data = format!(
+                        r"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: {endpoint_path}
+        protocol: {protocol}
+        enforcement: enforce
+        rules:
+          - allow: {{ {rules} }}
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"
+                    );
+                    let (config, tunnel_engine, ctx) = mcp_relay_context_from_data(&data);
+                    let body = |id, name| {
+                        match protocol {
+                            "mcp" => serde_json::json!({
+                                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                                "params": {"name": name, "arguments": {}}
+                            }),
+                            "json-rpc" => {
+                                serde_json::json!({"jsonrpc": "2.0", "id": id, "method": name})
+                            }
+                            "graphql" => {
+                                serde_json::json!({"query": format!("query {{ {name} }}")})
+                            }
+                            "rest" => serde_json::json!({"id": id, "value": name}),
+                            _ => unreachable!(),
+                        }
+                        .to_string()
+                    };
+                    let first = body(1, "echo");
+                    let second = body(2, if second_allowed { "echo" } else { "blocked" });
+                    let mut wire = String::new();
+                    for (index, body) in [&first, &second].into_iter().enumerate() {
+                        let target = if protocol == "rest" {
+                            if index == 0 || second_allowed {
+                                "/mcp/allowed"
+                            } else {
+                                "/mcp/blocked"
+                            }
+                        } else {
+                            "/mcp"
+                        };
+                        write!(
+                            wire,
+                            "POST {target} HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
+                    }
+                    let (mut app, mut relay_client) = tokio::io::duplex(8192);
+                    let (mut relay_upstream, upstream) = tokio::io::duplex(8192);
+                    // Queue both requests before the relay reads. A normal
+                    // sequential exchange cannot expose chunked read-ahead loss.
+                    app.write_all(wire.as_bytes()).await.unwrap();
+                    app.shutdown().await.unwrap();
+                    let relay = async move {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(
+                                &config,
+                                tunnel_engine,
+                                &mut relay_client,
+                                &mut relay_upstream,
+                                &ctx,
+                            )
+                            .await
+                        }
+                    };
+                    let server = async move {
+                        let mut upstream = tokio::io::BufReader::new(upstream);
+                        let provider = crate::l7::rest::RestProvider::with_options(
+                            crate::l7::path::CanonicalizeOptions::default(),
+                        );
+                        let mut forwarded = Vec::new();
+                        while let Some(mut request) =
+                            provider.parse_request(&mut upstream).await.unwrap()
+                        {
+                            // REST streams chunked framing; the body inspectors
+                            // normalize the same message to Content-Length.
+                            if protocol == "rest" {
+                                assert!(matches!(
+                                    request.body_length,
+                                    crate::l7::provider::BodyLength::Chunked
+                                ));
+                            } else {
+                                assert!(matches!(
+                                    request.body_length,
+                                    crate::l7::provider::BodyLength::ContentLength(_)
+                                ));
+                            }
+                            let body = crate::l7::http::read_body_for_inspection(
+                                &mut upstream,
+                                &mut request,
+                                1024,
+                            )
+                            .await
+                            .unwrap();
+                            forwarded.push(String::from_utf8(body).unwrap());
+                            upstream
+                                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                                .await
+                                .unwrap();
+                        }
+                        forwarded
+                    };
+                    let client = async move {
+                        let mut response = String::new();
+                        app.read_to_string(&mut response).await.unwrap();
+                        response
+                    };
+                    let (result, forwarded, response) = Box::pin(tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        async { tokio::join!(relay, server, client) },
+                    ))
+                    .await
+                    .expect("pipelined requests must finish without losing a request");
+                    result.unwrap();
+                    let expected = if second_allowed {
+                        vec![first, second]
+                    } else {
+                        vec![first]
+                    };
+                    assert_eq!(
+                        forwarded, expected,
+                        "{protocol}, route_selected={route_selected}"
+                    );
+                    assert_eq!(
+                        response.matches("HTTP/1.1 204 No Content").count(),
+                        if second_allowed { 2 } else { 1 },
+                        "{response}"
+                    );
+                    assert_eq!(
+                        response.contains("403 Forbidden"),
+                        !second_allowed,
+                        "{response}"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn run_mcp_relay_case(
+        context: (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
+        route_selected: bool,
+        headers: &str,
+        body: &str,
+        upstream_response: &str,
+    ) -> (String, Vec<u8>) {
+        run_mcp_method_relay_case(
+            context,
+            route_selected,
+            "POST",
+            headers,
+            body,
+            upstream_response,
+        )
+        .await
+    }
+
+    async fn run_mcp_method_relay_case(
+        (config, tunnel_engine, ctx): (L7EndpointConfig, TunnelPolicyEngine, L7EvalContext),
+        route_selected: bool,
+        method: &str,
+        headers: &str,
+        body: &str,
+        upstream_response: &str,
+    ) -> (String, Vec<u8>) {
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            if route_selected {
+                relay_with_route_selection(
+                    &[config],
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            } else {
+                relay_with_inspection(
+                    &config,
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            }
+        });
+        let upstream_response = upstream_response.to_string();
+        let server = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            let mut bytes = [0; 2048];
+            loop {
+                let count = upstream.read(&mut bytes).await.unwrap();
+                if count == 0 {
+                    return forwarded;
+                }
+                forwarded.extend_from_slice(&bytes[..count]);
+                if let Some(header_end) = forwarded
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                {
+                    // Middleware can change the body length. Wait for the
+                    // complete forwarded representation, not the input size.
+                    let header = std::str::from_utf8(&forwarded[..header_end]).unwrap();
+                    let body_len = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("MCP fixture requests include Content-Length");
+                    if forwarded.len() < header_end + 4 + body_len {
+                        continue;
+                    }
+                    upstream
+                        .write_all(upstream_response.as_bytes())
+                        .await
+                        .unwrap();
+                    return forwarded;
+                }
+            }
+        });
+        let request = format!(
+            "{method} /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        // A relayed SSE response can leave the client half of the duplex
+        // open. Read this fixture's complete HTTP response, then close it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut bytes = [0; 2048];
+            loop {
+                let count = app.read(&mut bytes).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                response.extend_from_slice(&bytes[..count]);
+                if let Some(header_end) =
+                    response.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let header = std::str::from_utf8(&response[..header_end]).unwrap();
+                    let length = header
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .expect("fixture responses include Content-Length");
+                    if response.len() >= header_end + 4 + length {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("timed out receiving response for {body}; received {response:?}")
+        });
+        drop(app);
+        relay.await.unwrap().unwrap();
+        (String::from_utf8(response).unwrap(), server.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn mcp_legacy_receive_stream_get_does_not_admit_tool_bodies_or_delete() {
+        let data = r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: enforce
+        mcp:
+          versions: ["2025-11-25"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - { path: /usr/bin/python3 }
+"#;
+        let tool_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_resource","arguments":{}}}"#;
+        let allowed_tool_body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_status","arguments":{}}}"#;
+        let event = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n";
+        let upstream_response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{event}",
+            event.len()
+        );
+        for route_selected in [false, true] {
+            for (method, body, status) in [
+                ("GET", "", "200 OK"),
+                ("GET", tool_body, "403 Forbidden"),
+                ("GET", allowed_tool_body, "403 Forbidden"),
+                ("DELETE", "", "400 Bad Request"),
+            ] {
+                let (response, forwarded) = run_mcp_method_relay_case(
+                    mcp_relay_context_from_data(data),
+                    route_selected,
+                    method,
+                    "MCP-Protocol-Version: 2025-11-25\r\n",
+                    body,
+                    &upstream_response,
+                )
+                .await;
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}")),
+                    "{method}, body={body}, route_selected={route_selected}: {response}"
+                );
+                if status == "200 OK" {
+                    // The GET receive-stream exception applies only without a
+                    // client operation body. Preserve its complete SSE response.
+                    let forwarded = String::from_utf8(forwarded).unwrap();
+                    let (headers, forwarded_body) = forwarded.split_once("\r\n\r\n").unwrap();
+                    assert!(headers.starts_with("GET /mcp HTTP/1.1\r\n"));
+                    assert!(forwarded_body.is_empty());
+                    assert!(
+                        response.ends_with(event),
+                        "receive-stream event changed: {response}"
+                    );
+                } else {
+                    assert!(
+                        forwarded.is_empty(),
+                        "{method}: rejected request reached upstream"
+                    );
+                    if method == "DELETE" {
+                        // Legacy cleanup is unsupported: an empty DELETE is
+                        // rejected as an invalid MCP body, not as sessionless 405.
+                        assert!(response.contains("invalid_mcp_request"), "{response}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replaces a tool call and its sessionless name mirror in one real stage.
+    struct McpToolReplacingService {
+        replacement: Vec<u8>,
+        tool_name: &'static str,
+        sessionless: bool,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[tonic::async_trait]
+    impl openshell_core::middleware::InProcessMiddleware for McpToolReplacingService {
+        async fn describe(&self) -> openshell_core::proto::MiddlewareManifest {
+            openshell_core::middleware::InProcessMiddleware::describe(&BodyReplacingService {
+                replacement: b"",
+            })
+            .await
+        }
+
+        async fn validate_config(
+            &self,
+            _middleware_name: &str,
+            _config: &prost_types::Struct,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn evaluate_http_request(
+            &self,
+            request: openshell_core::middleware::HttpRequestView<'_>,
+        ) -> Result<openshell_core::proto::HttpRequestResult> {
+            use openshell_core::proto::{
+                Decision, ExistingHeaderAction, HeaderMutation, HttpRequestResult, WriteHeader,
+                header_mutation,
+            };
+            let original: serde_json::Value = serde_json::from_slice(request.body()).unwrap();
+            assert_eq!(original["params"]["name"], "read_status");
+            self.invocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let header_mutations = if self.sessionless {
+                vec![HeaderMutation {
+                    operation: Some(header_mutation::Operation::Write(WriteHeader {
+                        name: "Mcp-Name".into(),
+                        value: self.tool_name.into(),
+                        on_existing: ExistingHeaderAction::Overwrite as i32,
+                    })),
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(HttpRequestResult {
+                decision: Decision::Allow as i32,
+                body: self.replacement.clone(),
+                has_body: true,
+                header_mutations,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_middleware_tool_rewrites_obey_policy_with_matching_metadata() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for route_selected in [false, true] {
+            // A shared allowlist must preserve the selected revision's request
+            // profile as well as its membership in the permitted revisions.
+            for (version, configured_versions) in [
+                ("2025-06-18", &["2025-06-18"][..]),
+                ("2025-11-25", &["2025-11-25"][..]),
+                ("2026-07-28", &["2026-07-28"][..]),
+                ("2025-11-25", &["2025-11-25", "2026-07-28"][..]),
+                ("2026-07-28", &["2025-11-25", "2026-07-28"][..]),
+            ] {
+                let configured_versions = serde_json::to_string(configured_versions).unwrap();
+                let sessionless = version == "2026-07-28";
+                let body_for = |name, arguments| {
+                    let params = serde_json::json!({"name": name, "arguments": arguments});
+                    if sessionless {
+                        sessionless_mcp_body("tools/call", params)
+                    } else {
+                        serde_json::json!({
+                            "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": params
+                        })
+                        .to_string()
+                    }
+                };
+                let original = body_for("read_status", serde_json::json!({}));
+                let mut headers = format!("MCP-Protocol-Version: {version}\r\n");
+                if sessionless {
+                    headers.push_str("Mcp-Method: tools/call\r\nMcp-Name: read_status\r\n");
+                }
+                for enforcement in ["enforce", "audit"] {
+                    for tool_name in ["read_status", "delete_resource"] {
+                        // A changed argument marker makes the allowed control
+                        // prove that the replacement, not the original, arrived.
+                        let replacement =
+                            body_for(tool_name, serde_json::json!({"rewritten": true}));
+                        assert_ne!(original.len(), replacement.len());
+                        let invocations = Arc::new(AtomicUsize::new(0));
+                        let data = format!(
+                            r#"
+network_middlewares:
+  rewriter:
+    middleware: test/rewriter
+    on_error: fail_closed
+    endpoints:
+      include: ["mcp.example.test"]
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: {enforcement}
+        mcp:
+          versions: {configured_versions}
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+                        );
+                        let engine = OpaEngine::from_strings(TEST_POLICY, &data).unwrap();
+                        engine.set_middleware_runner_for_tests(
+                            openshell_supervisor_middleware::ChainRunner::new(Arc::new(
+                                McpToolReplacingService {
+                                    replacement: replacement.as_bytes().to_vec(),
+                                    tool_name,
+                                    sessionless,
+                                    invocations: Arc::clone(&invocations),
+                                },
+                            )),
+                        );
+                        let (response, forwarded) = run_mcp_relay_case(
+                            mcp_relay_context_from_engine(engine),
+                            route_selected,
+                            &headers,
+                            &original,
+                            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+                        if tool_name == "delete_resource" && enforcement == "enforce" {
+                            assert_middleware_failure_response(&response, "mcp_api");
+                            assert!(
+                                forwarded.is_empty(),
+                                "rewritten denied tool reached upstream"
+                            );
+                            continue;
+                        }
+                        // Audit permits policy denials, while final revision and
+                        // metadata checks still apply to the rewritten request.
+                        assert!(
+                            response.starts_with("HTTP/1.1 204 No Content"),
+                            "{response}"
+                        );
+                        let forwarded = String::from_utf8(forwarded).unwrap();
+                        let (header, body) = forwarded.split_once("\r\n\r\n").unwrap();
+                        assert_eq!(body, replacement);
+                        let content_length = header
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                            .expect("rewritten request includes Content-Length");
+                        assert_eq!(content_length, replacement.len());
+                        if sessionless {
+                            let names = header
+                                .lines()
+                                .filter_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("mcp-name").then(|| value.trim())
+                                })
+                                .collect::<Vec<_>>();
+                            assert_eq!(names, [tool_name]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_march_batches_authorize_every_member_before_forwarding() {
+        let call = |id, name| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": {"name": name, "arguments": {}}
+            })
+        };
+        let allowed = call(1, "read_status");
+        let denied = call(2, "delete_resource");
+        let malformed = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": 7, "arguments": {}}
+        });
+        let cases = [
+            (
+                "allowed",
+                serde_json::json!([allowed, call(2, "read_status")]),
+                false,
+                false,
+            ),
+            (
+                "deny last",
+                serde_json::json!([allowed, denied]),
+                true,
+                false,
+            ),
+            (
+                "deny first",
+                serde_json::json!([denied, allowed]),
+                true,
+                false,
+            ),
+            (
+                "malformed last",
+                serde_json::json!([allowed, malformed]),
+                false,
+                true,
+            ),
+        ];
+        for route_selected in [false, true] {
+            for enforcement in ["enforce", "audit"] {
+                let data = format!(
+                    r#"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: mcp
+        enforcement: {enforcement}
+        mcp:
+          versions: ["2025-03-26"]
+        rules:
+          - allow:
+              method: tools/call
+              tool: read_status
+        deny_rules:
+          - method: tools/call
+            tool: delete_resource
+    binaries:
+      - {{ path: /usr/bin/python3 }}
+"#
+                );
+                for (case, members, policy_denied, malformed) in &cases {
+                    let body = members.to_string();
+                    let (response, forwarded) = run_mcp_relay_case(
+                        mcp_relay_context_from_data(&data),
+                        route_selected,
+                        "MCP-Protocol-Version: 2025-03-26\r\n",
+                        &body,
+                        "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+                    // Audit forwards policy denials, but never malformed MCP.
+                    // Capturing the whole upstream exchange also catches partial
+                    // forwarding of an allowed prefix before a later denial.
+                    let should_forward = !*malformed && (!*policy_denied || enforcement == "audit");
+                    let status = if *malformed {
+                        "400 Bad Request"
+                    } else if should_forward {
+                        "204 No Content"
+                    } else {
+                        "403 Forbidden"
+                    };
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{case}, route_selected={route_selected}, {enforcement}: {response}"
+                    );
+                    if should_forward {
+                        assert!(
+                            forwarded.ends_with(body.as_bytes()),
+                            "{case}: batch changed"
+                        );
+                    } else {
+                        assert!(
+                            forwarded.is_empty(),
+                            "{case}: rejected batch reached upstream"
+                        );
+                    }
+                    if *malformed {
+                        assert!(response.contains("invalid_mcp_request"), "{response}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_sessionless_relays_discovery_tools_extensions_and_subscription_sse() {
+        for route_selected in [false, true] {
+            for (method, params, name, sse) in [
+                ("server/discover", serde_json::json!({}), None, false),
+                (
+                    "tools/call",
+                    serde_json::json!({"name":"echo", "arguments":{}}),
+                    Some("echo"),
+                    false,
+                ),
+                ("vendor/inspect", serde_json::json!({}), None, false),
+                (
+                    "subscriptions/listen",
+                    serde_json::json!({"notifications":{"toolsListChanged":true}}),
+                    None,
+                    true,
+                ),
+            ] {
+                let mut headers =
+                    format!("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {method}\r\n");
+                if let Some(name) = name {
+                    write!(headers, "Mcp-Name: {name}\r\n").unwrap();
+                }
+                let body = sessionless_mcp_body(method, params);
+                let content_type = if sse {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let response_body = if sse {
+                    "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n"
+                } else {
+                    "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}"
+                };
+                let upstream_response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let (response, forwarded) =
+                    run_sessionless_mcp_relay(route_selected, &headers, &body, &upstream_response)
+                        .await;
+                assert!(
+                    response.starts_with("HTTP/1.1 200 OK"),
+                    "{method}: {response}"
+                );
+                assert!(
+                    response.ends_with(response_body),
+                    "{method}: response changed"
+                );
+                let forwarded = String::from_utf8(forwarded).unwrap();
+                assert!(forwarded.contains(&headers), "{method}: headers changed");
+                assert!(forwarded.ends_with(&body), "{method}: body changed");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_sessionless_relays_apply_metadata_and_method_policy() {
+        for route_selected in [false, true] {
+            for (method, params, header_method, name, status) in [
+                (
+                    "tools/list",
+                    serde_json::json!({}),
+                    "server/discover",
+                    None,
+                    "400 Bad Request",
+                ),
+                (
+                    "tools/call",
+                    serde_json::json!({"name":"echo"}),
+                    "tools/call",
+                    None,
+                    "400 Bad Request",
+                ),
+                (
+                    "tools/call",
+                    serde_json::json!({"name":"blocked"}),
+                    "tools/call",
+                    Some("blocked"),
+                    "403 Forbidden",
+                ),
+                (
+                    "vendor/unlisted",
+                    serde_json::json!({}),
+                    "vendor/unlisted",
+                    None,
+                    "403 Forbidden",
+                ),
+            ] {
+                let mut headers =
+                    format!("MCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {header_method}\r\n");
+                if let Some(name) = name {
+                    write!(headers, "Mcp-Name: {name}\r\n").unwrap();
+                }
+                let body = sessionless_mcp_body(method, params);
+                let (response, forwarded) =
+                    run_sessionless_mcp_relay(route_selected, &headers, &body, "").await;
+                assert!(
+                    response.starts_with(&format!("HTTP/1.1 {status}")),
+                    "{method}: {response}"
+                );
+                assert!(
+                    forwarded.is_empty(),
+                    "{method}: rejected request was forwarded"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn final_mcp_sessionless_check_validates_transformed_headers_and_body() {
+        let (config, _, ctx) = mcp_sessionless_test_relay_context();
+        for (header_method, valid) in [("tools/list", true), ("server/discover", false)] {
+            let body = sessionless_mcp_body("tools/list", serde_json::json!({}));
+            let request = crate::l7::provider::L7Request {
+                action: "POST".to_string(),
+                target: "/mcp".to_string(),
+                query_params: std::collections::HashMap::new(),
+                raw_header: format!("POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {header_method}\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+                body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+            };
+            let mut response = Vec::new();
+            let allowed = enforce_final_mcp_protocol_version(
+                &config,
+                &request,
+                &mut response,
+                &ctx,
+                "/mcp",
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(allowed, valid);
+            if !valid {
+                assert!(
+                    String::from_utf8(response)
+                        .unwrap()
+                        .contains("invalid_mcp_request_metadata")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_sessionless_get_advertises_post_in_method_rejection() {
+        let (config, _, ctx) = mcp_sessionless_test_relay_context();
+        let request = crate::l7::provider::L7Request {
+            action: "GET".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nAccept: text/event-stream\r\n\r\n".to_vec(),
+            body_length: crate::l7::provider::BodyLength::None,
+        };
+        let mut response = Vec::new();
+        assert!(
+            !enforce_final_mcp_protocol_version(
+                &config,
+                &request,
+                &mut response,
+                &ctx,
+                "/mcp",
+                None
+            )
+            .await
+            .unwrap()
+        );
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(response.contains("\r\nAllow: POST\r\n"));
+    }
+
+    #[tokio::test]
+    async fn mcp_sessionless_rest_revalidates_outgoing_metadata_before_write() {
+        let (config, _, ctx) = mcp_sessionless_test_relay_context();
+        let body = sessionless_mcp_body("tools/list", serde_json::json!({}));
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: format!("POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: server/discover\r\nAuthorization: Bearer fixture\r\nContent-Length: {}\r\n\r\n{body}", body.len()).into_bytes(),
+            body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut client, mut relay_client) = tokio::io::duplex(2048);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(2048);
+        let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
+            &request,
+            &mut relay_client,
+            &mut relay_upstream,
+            crate::l7::rest::RelayRequestOptions {
+                mcp_request_validation: Some(crate::l7::rest::McpRequestValidation {
+                    config: &config,
+                    ctx: &ctx,
+                    redacted_target: "/mcp",
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        drop(relay_client);
+        drop(relay_upstream);
+        let mut response = String::new();
+        client.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("invalid_mcp_request_metadata"));
+        let mut forwarded = Vec::new();
+        upstream.read_to_end(&mut forwarded).await.unwrap();
+        assert!(forwarded.is_empty());
+    }
+
+    async fn run_rejected_mcp_request(
+        route_selected: bool,
+        version_headers: &str,
+        body: &[u8],
+    ) -> (String, Vec<u8>) {
+        let (config, tunnel_engine, ctx) = mcp_test_relay_context();
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            if route_selected {
+                relay_with_route_selection(
+                    &[config],
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            } else {
+                relay_with_inspection(
+                    &config,
+                    tunnel_engine,
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                )
+                .await
+            }
+        });
+
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{version_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read_to_end(&mut response),
+        )
+        .await
+        .expect("MCP version rejection should close the client response")
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete after version rejection")
+            .unwrap()
+            .unwrap();
+
+        let mut forwarded = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut forwarded),
+        )
+        .await
+        .expect("version rejection should close upstream without forwarding")
+        .unwrap();
+        (
+            String::from_utf8(response).expect("UTF-8 response"),
+            forwarded,
+        )
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_rejects_invalid_disallowed_and_missing_versions_without_forwarding() {
+        for (headers, status, code, remedy) in [
+            (
+                "MCP-Protocol-Version: 2026-07-29\r\n",
+                "400 Bad Request",
+                "unsupported_mcp_protocol_version",
+                "use a supported client/server revision permitted by mcp.versions",
+            ),
+            (
+                "MCP-Protocol-Version: 2025-11-25\r\nMCP-Protocol-Version: 2025-11-25\r\n",
+                "400 Bad Request",
+                "invalid_mcp_protocol_version_header",
+                "send exactly one revision",
+            ),
+            (
+                "MCP-Protocol-Version: 2025-06-18\r\n",
+                "403 Forbidden",
+                "mcp_protocol_version_not_allowed",
+                "selected MCP revision 2025-06-18 from MCP-Protocol-Version",
+            ),
+            (
+                "",
+                "403 Forbidden",
+                "mcp_protocol_version_not_allowed",
+                "missing MCP-Protocol-Version header fallback; send the client/server revision explicitly",
+            ),
+        ] {
+            let (response, forwarded) = run_rejected_mcp_request(
+                false,
+                headers,
+                br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
+            )
+            .await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert!(response.contains(code), "{response}");
+            assert!(response.contains(remedy), "{response}");
+            assert!(forwarded.is_empty(), "rejected request reached upstream");
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_mcp_relay_enforces_request_version_before_forwarding() {
+        let (response, forwarded) = run_rejected_mcp_request(
+            true,
+            "MCP-Protocol-Version: 2026-07-29\r\n",
+            br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#,
+        )
+        .await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(
+            response.contains("unsupported_mcp_protocol_version"),
+            "{response}"
+        );
+        assert!(forwarded.is_empty(), "rejected request reached upstream");
+    }
+
+    const MCP_VERSION_DENIALS: &[(&str, &str, &str)] = &[
+        ("", "403 Forbidden", "mcp_protocol_version_not_allowed"),
+        (
+            "MCP-Protocol-Version: \r\n",
+            "400 Bad Request",
+            "invalid_mcp_protocol_version_header",
+        ),
+        (
+            "MCP-Protocol-Version: 2025-11-25\r\nMCP-Protocol-Version: 2025-11-25\r\n",
+            "400 Bad Request",
+            "invalid_mcp_protocol_version_header",
+        ),
+        (
+            "MCP-Protocol-Version: 2099-01-01\r\n",
+            "400 Bad Request",
+            "unsupported_mcp_protocol_version",
+        ),
+        (
+            "MCP-Protocol-Version: 2026-07-28\r\n",
+            "403 Forbidden",
+            "mcp_protocol_version_not_allowed",
+        ),
+        (
+            "MCP-Protocol-Version: 2025-06-18\r\n",
+            "403 Forbidden",
+            "mcp_protocol_version_not_allowed",
+        ),
+    ];
+
+    #[tokio::test]
+    async fn endpoint_observation_binds_scoped_provider_revision() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for route_selected in [false, true] {
+            for scoped_revision in [1, 2] {
+                let scenario = format!(
+                    "route_selected={route_selected}, inventory_revision=1, parent_revision=1, scoped_revision={scoped_revision}"
+                );
+                let (mut config, engine, mut ctx) = mcp_test_relay_context();
+                config.provider_credentialed = true;
+                let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                // The tunnel retains revision 1 while request scoping may obtain
+                // revision 2 before its replacement inventory has been published.
+                ctx.provider_credential_revision = Some(1);
+                let credentials = ProviderCredentialState::from_bound_environment(
+                    scoped_revision,
+                    TestHashMap::from([("API_TOKEN".into(), "scoped-secret".into())]),
+                    TestHashMap::new(),
+                    TestHashMap::new(),
+                    TestHashMap::from([(
+                        "API_TOKEN".into(),
+                        StaticCredentialBinding {
+                            endpoints: vec![StaticCredentialEndpointBinding {
+                                host: ctx.host.clone(),
+                                port: u32::from(ctx.port),
+                                path: "/mcp".into(),
+                            }],
+                            credential_identity: "provider:API_TOKEN".into(),
+                            workload_credential_handle: String::new(),
+                        },
+                    )]),
+                    Vec::new(),
+                )
+                .unwrap_or_else(|error| panic!("{scenario}: invalid provider fixture: {error}"));
+                // Endpoint-bound input must use the workload-issued handle;
+                // a canonical alias carries no authorized credential identity.
+                let placeholder = credentials.snapshot().child_env["API_TOKEN"].clone();
+                ctx.provider_credentials = Some(credentials);
+                let (mut app, mut client) = tokio::io::duplex(8192);
+                let (mut upstream, mut server) = tokio::io::duplex(8192);
+                let relay = tokio::spawn(async move {
+                    if route_selected {
+                        relay_with_route_selection(
+                            &[config],
+                            engine,
+                            &mut client,
+                            &mut upstream,
+                            &ctx,
+                        )
+                        .await
+                    } else {
+                        relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                            .await
+                    }
+                });
+                let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+                let request = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nAuthorization: Bearer {placeholder}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                app.write_all(request.as_bytes()).await.unwrap();
+                app.write_all(body).await.unwrap();
+                let mut forwarded = Vec::new();
+                tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while !forwarded.ends_with(body) {
+                        let mut buffer = [0; 1024];
+                        let count = server.read(&mut buffer).await.unwrap();
+                        assert_ne!(
+                            count, 0,
+                            "{scenario}: request closed before forwarding its body"
+                        );
+                        forwarded.extend_from_slice(&buffer[..count]);
+                    }
+                })
+                .await
+                .unwrap_or_else(|error| panic!("{scenario}: upstream exchange timed out: {error}"));
+                assert!(
+                    String::from_utf8_lossy(&forwarded)
+                        .contains("Authorization: Bearer scoped-secret\r\n"),
+                    "{scenario}: endpoint-scoped credential was not injected"
+                );
+                server
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                    .await
+                    .unwrap_or_else(|error| panic!("{scenario}: relay timed out: {error}"))
+                    .unwrap_or_else(|error| panic!("{scenario}: relay task failed: {error}"))
+                    .unwrap_or_else(|error| panic!("{scenario}: relay failed: {error}"));
+
+                if scoped_revision == 1 {
+                    assert!(
+                        matches!(
+                            receiver.try_recv().unwrap_or_else(|error| panic!(
+                                "{scenario}: matching revision observation missing: {error}"
+                            )),
+                            EndpointStatusCommand::Observe {
+                                result: EndpointResult::HttpResponseReceived,
+                                ..
+                            }
+                        ),
+                        "{scenario}: matching revision produced an unexpected observation"
+                    );
+                }
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "{scenario}: another provider revision cannot supply this inventory's result"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_mcp_version_policy_denial() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for &(version_headers, status, response_code) in MCP_VERSION_DENIALS {
+            for route_selected in [false, true] {
+                for disconnect_client in [false, true] {
+                    let (mut config, engine, mut ctx) = mcp_test_relay_context();
+                    let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                    let (mut app, mut client) = tokio::io::duplex(8192);
+                    let (mut upstream, mut server) = tokio::io::duplex(8192);
+                    let body = br#"{"jsonrpc":"2.0","id":7,"result":{"ok":true}}"#;
+                    let request = format!(
+                        "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{version_headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    app.write_all(request.as_bytes()).await.unwrap();
+                    app.write_all(body).await.unwrap();
+                    let mut app = Some(app);
+                    if disconnect_client {
+                        // The buffered request remains readable after its caller
+                        // disconnects, but delivering the local denial must fail.
+                        drop(app.take());
+                    }
+
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                        if route_selected {
+                            relay_with_route_selection(
+                                &[config],
+                                engine,
+                                &mut client,
+                                &mut upstream,
+                                &ctx,
+                            )
+                            .await
+                        } else {
+                            relay_with_inspection(&config, engine, &mut client, &mut upstream, &ctx)
+                                .await
+                        }
+                    })
+                    .await
+                    .expect("version policy must reject before upstream I/O");
+                    assert_eq!(result.is_err(), disconnect_client);
+                    drop(client);
+                    drop(upstream);
+                    if let Some(mut app) = app {
+                        let mut response = String::new();
+                        app.read_to_string(&mut response).await.unwrap();
+                        assert!(
+                            response.starts_with(&format!("HTTP/1.1 {status}")),
+                            "{response}"
+                        );
+                        assert!(response.contains(response_code), "{response}");
+                    }
+                    let mut sent = Vec::new();
+                    server.read_to_end(&mut sent).await.unwrap();
+                    assert!(sent.is_empty(), "disallowed version reached upstream");
+                    assert!(matches!(
+                        receiver
+                            .try_recv()
+                            .expect("version policy denial observation"),
+                        EndpointStatusCommand::Observe {
+                            result: EndpointResult::PolicyDenied,
+                            ..
+                        }
+                    ));
+                    assert!(receiver.try_recv().is_err(), "one result per exchange");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_typed_mcp_rejections_before_delivery() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for (method, header_method, body, status, response_code) in [
+            (
+                "POST",
+                "tools/call",
+                sessionless_mcp_body("tools/call", serde_json::json!({})),
+                "400 Bad Request",
+                "invalid_mcp_request",
+            ),
+            (
+                "POST",
+                "server/discover",
+                sessionless_mcp_body("tools/list", serde_json::json!({})),
+                "400 Bad Request",
+                "invalid_mcp_request_metadata",
+            ),
+            (
+                "GET",
+                "tools/list",
+                String::new(),
+                "405 Method Not Allowed",
+                "mcp_http_method_not_allowed",
+            ),
+        ] {
+            for disconnect_client in [false, true] {
+                let (mut config, _, mut ctx) = mcp_sessionless_test_relay_context();
+                let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                config.mcp_versions = vec![openshell_core::mcp::McpProtocolVersion::V2026_07_28];
+                let observer =
+                    EndpointObserver::begin(ctx.endpoint_observation_tx.as_ref(), &config)
+                        .expect("begin typed rejection observation");
+                let request = crate::l7::provider::L7Request {
+                    action: method.into(),
+                    target: "/mcp".into(),
+                    query_params: TestHashMap::new(),
+                    raw_header: format!(
+                        "{method} /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nMCP-Protocol-Version: 2026-07-28\r\nMcp-Method: {header_method}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes(),
+                    body_length: crate::l7::provider::BodyLength::ContentLength(body.len() as u64),
+                };
+                let (mut client, app) = tokio::io::duplex(2048);
+                let mut app = Some(app);
+                if disconnect_client {
+                    // Observation must survive a failed write of the denial response.
+                    drop(app.take());
+                }
+                let result = enforce_final_mcp_protocol_version(
+                    &config,
+                    &request,
+                    &mut client,
+                    &ctx,
+                    "/mcp",
+                    Some(&observer),
+                )
+                .await;
+                if disconnect_client {
+                    assert!(
+                        result.is_err(),
+                        "{response_code}: denial delivery must fail"
+                    );
+                } else {
+                    assert!(!result.expect("typed request rejection"));
+                }
+                drop(client);
+                if let Some(mut app) = app {
+                    let mut response = String::new();
+                    app.read_to_string(&mut response).await.unwrap();
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{response}"
+                    );
+                    assert!(
+                        response.contains(&format!("\"{response_code}\"")),
+                        "{response}"
+                    );
+                }
+                assert!(matches!(
+                    receiver.try_recv().expect("typed rejection observation"),
+                    EndpointStatusCommand::Observe {
+                        result: EndpointResult::PolicyDenied,
+                        ..
+                    }
+                ));
+                assert!(receiver.try_recv().is_err(), "one result per exchange");
+            }
+        }
+    }
+
+    async fn install_mcp_test_observation(
+        config: &mut L7EndpointConfig,
+        ctx: &mut L7EvalContext,
+    ) -> openshell_core::endpoint_status::EndpointStatusReceiver {
+        use openshell_core::endpoint_status::{
+            EndpointConfigVersion, EndpointInventoryEntry, EndpointStatusCommand,
+            endpoint_status_channel,
+        };
+
+        config.endpoint_id = "endpoint:v1:mcp-version".into();
+        config.policy_hash = "mcp-version-policy".into();
+        config.mcp_versions = vec![openshell_core::mcp::McpProtocolVersion::V2025_11_25];
+        let (sender, mut receiver) = endpoint_status_channel();
+        sender
+            .reset(
+                EndpointConfigVersion {
+                    policy_hash: config.policy_hash.clone(),
+                    provider_env_revision: 1,
+                },
+                vec![EndpointInventoryEntry {
+                    endpoint_id: config.endpoint_id.clone(),
+                    uses_provider_credentials: config.provider_credentialed,
+                }],
+            )
+            .await
+            .expect("install MCP endpoint inventory");
+        assert!(matches!(
+            receiver.recv().await,
+            Some(EndpointStatusCommand::Reset { .. })
+        ));
+        ctx.endpoint_observation_tx = Some(sender);
+        receiver
+    }
+
+    #[tokio::test]
+    async fn endpoint_observation_records_final_mcp_version_policy_denial() {
+        use openshell_core::endpoint_status::EndpointStatusCommand;
+
+        for &(version_headers, status, response_code) in MCP_VERSION_DENIALS {
+            for disconnect_client in [false, true] {
+                let (mut config, _, mut ctx) = mcp_test_relay_context();
+                let mut receiver = install_mcp_test_observation(&mut config, &mut ctx).await;
+                // One request handle survives initialize's version exemption and
+                // the final check after a middleware changes the outgoing body.
+                let observer =
+                    EndpointObserver::begin(ctx.endpoint_observation_tx.as_ref(), &config)
+                        .expect("begin transformed request observation");
+                let buffered_request = |body: &[u8], headers: &str| {
+                    let mut raw_header = format!(
+                    "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                    raw_header.extend_from_slice(body);
+                    crate::l7::provider::L7Request {
+                        action: "POST".into(),
+                        target: "/mcp".into(),
+                        query_params: TestHashMap::new(),
+                        raw_header,
+                        body_length: crate::l7::provider::BodyLength::ContentLength(
+                            body.len() as u64
+                        ),
+                    }
+                };
+                let initialize = buffered_request(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#,
+                "",
+            );
+                let (mut client, app) = tokio::io::duplex(2048);
+                assert!(
+                    enforce_final_mcp_protocol_version(
+                        &config,
+                        &initialize,
+                        &mut client,
+                        &ctx,
+                        "/mcp",
+                        Some(&observer),
+                    )
+                    .await
+                    .expect("initialize version exemption")
+                );
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "allowed request is not a terminal result"
+                );
+                let rewritten = buffered_request(
+                    br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                    version_headers,
+                );
+                let mut app = Some(app);
+                if disconnect_client {
+                    // Dropping the peer makes the final rejection undeliverable.
+                    drop(app.take());
+                }
+                let result = enforce_final_mcp_protocol_version(
+                    &config,
+                    &rewritten,
+                    &mut client,
+                    &ctx,
+                    "/mcp",
+                    Some(&observer),
+                )
+                .await;
+                if disconnect_client {
+                    assert!(
+                        result.is_err(),
+                        "local denial cannot reach a disconnected client"
+                    );
+                } else {
+                    assert!(!result.expect("reject rewritten request version"));
+                }
+                drop(client);
+                if let Some(mut app) = app {
+                    let mut response = String::new();
+                    app.read_to_string(&mut response).await.unwrap();
+                    assert!(
+                        response.starts_with(&format!("HTTP/1.1 {status}")),
+                        "{response}"
+                    );
+                    assert!(response.contains(response_code), "{response}");
+                }
+                assert!(matches!(
+                    receiver
+                        .try_recv()
+                        .expect("final version policy denial observation"),
+                    EndpointStatusCommand::Observe {
+                        result: EndpointResult::PolicyDenied,
+                        ..
+                    }
+                ));
+                assert!(receiver.try_recv().is_err(), "one result per exchange");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_rejects_body_outside_selected_profile_before_policy() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"tools/list"}
+        ]"#;
+        let (response, forwarded) =
+            run_rejected_mcp_request(false, "MCP-Protocol-Version: 2025-11-25\r\n", body).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains("invalid_mcp_request"), "{response}");
+        assert!(
+            response.contains("does not permit top-level JSON-RPC batches"),
+            "{response}"
+        );
+        assert!(response.contains("send each JSON-RPC message in a separate request"));
+        assert!(response.contains("selected MCP revision 2025-11-25 from MCP-Protocol-Version"));
+        assert!(
+            forwarded.is_empty(),
+            "profile-invalid request reached upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_relay_explains_unavailable_method_without_reflecting_params() {
+        // tasks/update is known to the parser but absent from the selected
+        // core revision. The diagnostic must not suggest adding an allow rule.
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tasks/update","params":{"taskId":"private-task-marker","inputResponses":{"secret":"private-argument-marker"}}}"#;
+        for route_selected in [false, true] {
+            let (response, forwarded) = run_rejected_mcp_request(
+                route_selected,
+                "MCP-Protocol-Version: 2025-11-25\r\n",
+                body,
+            )
+            .await;
+            assert!(
+                response.starts_with("HTTP/1.1 400 Bad Request"),
+                "{response}"
+            );
+            assert!(response.contains("invalid_mcp_request"), "{response}");
+            assert!(response.contains("`tasks/update` is unavailable in revision 2025-11-25"));
+            assert!(response.contains("allow_all_known_mcp_methods cannot enable"));
+            assert!(response.contains("from MCP-Protocol-Version"));
+            assert!(!response.contains("private-task-marker"));
+            assert!(!response.contains("private-argument-marker"));
+            assert!(forwarded.is_empty(), "unavailable method reached upstream");
+        }
+    }
+
+    #[tokio::test]
+    async fn final_mcp_version_check_reclassifies_a_rewritten_initialize_body() {
+        let (config, _, ctx) = mcp_test_relay_context();
+        let final_body = br#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#;
+        let mut raw_header = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            final_body.len()
+        )
+        .into_bytes();
+        raw_header.extend_from_slice(final_body);
+        let request = crate::l7::provider::L7Request {
+            action: "POST".to_string(),
+            target: "/mcp".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header,
+            body_length: crate::l7::provider::BodyLength::ContentLength(final_body.len() as u64),
+        };
+        let (mut client, mut relay_client) = tokio::io::duplex(2048);
+
+        let allowed = enforce_final_mcp_protocol_version(
+            &config,
+            &request,
+            &mut relay_client,
+            &ctx,
+            "/mcp",
+            None,
+        )
+        .await
+        .expect("final request inspection");
+        assert!(
+            !allowed,
+            "rewritten non-initialize request must require a version"
+        );
+        drop(relay_client);
+
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).expect("UTF-8 response");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(
+            response.contains("mcp_protocol_version_not_allowed"),
+            "{response}"
+        );
+    }
+
+    #[tokio::test]
     async fn mcp_relay_forwards_jsonrpc_response_frame() {
         let (config, tunnel_engine, ctx) = mcp_test_relay_context();
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -8588,7 +12384,7 @@ network_policies:
 
         let body = br#"{"jsonrpc":"2.0","id":7,"result":{"action":"accept","content":{}}}"#;
         let request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nMCP-Protocol-Version: 2025-11-25\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         app.write_all(request.as_bytes()).await.unwrap();

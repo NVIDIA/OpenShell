@@ -12,259 +12,94 @@
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 [![Security Policy](https://img.shields.io/badge/Security-Report%20a%20Vulnerability-red)](SECURITY.md)
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
-[![Project Status](https://img.shields.io/badge/status-alpha-orange)](https://docs.nvidia.com/openshell/latest/about/release-notes.html)
 
-OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
+> [!IMPORTANT]
+> **New in OpenShell 0.1.x:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
 
-OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
-
-## Quickstart
-
-### Prerequisites
-
-- **A supported host** — Linux, macOS (Apple Silicon), or Windows with WSL 2 (experimental).
-- **A local runtime** — Docker, Podman, or host virtualization enabled for MicroVM-backed sandboxes.
-
-### Install
-
-**Binary (recommended):**
-
-```bash
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-```
-
-The installer installs the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
-
-The `openshell` package on PyPI provides the Python SDK only. It does not install the `openshell` CLI. Add the SDK to a Python project with [uv](https://docs.astral.sh/uv/):
-
-```bash
-uv add openshell
-```
-
-**Helm chart:**
-
-> **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
-
-Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
-```
-
-See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.
-
-For deploying OpenShell on OpenShift, see [`deploy/helm/openshell/README.md#install-on-openshift`](deploy/helm/openshell/README.md#install-on-openshift).
-
-### Create a sandbox
-
-```bash
-openshell sandbox create -- claude  # or opencode, codex, copilot
-```
-
-The sandbox container includes the following tools by default:
-
-| Category   | Tools                                                    |
-| ---------- | -------------------------------------------------------- |
-| Agent      | `claude`, `opencode`, `codex`, `copilot`                 |
-| Language   | `python` (3.14), `node` (22)                             |
-| Developer  | `gh`, `git`, `vim`, `nano`                               |
-| Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
-
-For more details see https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base.
-
-### See network policy in action
-
-Every sandbox starts with **minimal outbound access**. You open additional access with a short YAML policy that the proxy enforces at the HTTP method and path level, without restarting anything.
-
-```bash
-# 1. Create a sandbox (starts with minimal outbound access)
-openshell sandbox create
-
-# 2. Inside the sandbox — blocked
-sandbox$ curl -sS https://api.github.com/zen
-curl: (56) Received HTTP code 403 from proxy after CONNECT
-
-# 3. Back on the host — apply a read-only GitHub API policy
-sandbox$ exit
-openshell policy set demo --policy examples/sandbox-policy-quickstart/policy.yaml --wait
-
-# 4. Reconnect — GET allowed, POST blocked by L7
-openshell sandbox connect demo
-sandbox$ curl -sS https://api.github.com/zen
-Anything added dilutes everything else.
-
-sandbox$ curl -sS -X POST https://api.github.com/repos/octocat/hello-world/issues -d '{"title":"oops"}'
-{"error":"policy_denied","detail":"POST /repos/octocat/hello-world/issues not permitted by policy"}
-```
-
-See the [full walkthrough](examples/sandbox-policy-quickstart/) or run the automated demo:
-
-```bash
-bash examples/sandbox-policy-quickstart/demo.sh
-```
+OpenShell is the safe, private runtime for fleets of autonomous AI agents. Agents are most useful when they can read files, install packages, call APIs, and use credentials. OpenShell gives them that capability without giving them unrestricted access to your data, secrets, or network. You declare what each agent can touch in a policy, and OpenShell enforces it.
 
 ## How It Works
 
-OpenShell isolates each sandbox in its own container with policy-enforced egress routing. A lightweight gateway coordinates sandbox lifecycle, and every outbound connection is intercepted by the policy engine, which does one of three things:
+OpenShell governs what agents can do in two ways: it instruments the kernel to enforce policy on every file access, system call, and network connection at runtime, and it uses formal verification to check what a policy change would allow before it is applied.
 
-- **Allows** — the destination and binary match a policy block.
-- **Routes for inference** — strips caller credentials, injects backend credentials, and forwards to the managed model.
-- **Denies** — blocks the request and logs it.
+- **Kernel-level enforcement.** Each agent runs in an isolated sandbox. Kernel controls confine which files it can access and which system calls it can make, and every network connection passes through a policy check before it leaves the sandbox. Agents never see real credentials; OpenShell adds them only to requests bound for approved endpoints.
+- **Formally verified policy changes.** Before a policy change is approved, OpenShell uses formal verification to flag risky new access it would grant, such as reaching a new host with credentials or calling a new API method, so those changes wait for human review.
 
-| Component          | Role                                                                                         |
-| ------------------ | -------------------------------------------------------------------------------------------- |
-| **Gateway**        | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary.          |
-| **Sandbox**        | Isolated runtime with container supervision and policy-enforced egress routing.              |
-| **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
-| **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
+See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture) for how the gateway, supervisor, and sandbox fit together.
 
-OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes.
+## Quickstart
 
-## Protection Layers
+You need Linux, macOS on Apple Silicon, or Windows with WSL 2 (experimental), plus Docker, Podman, or host virtualization. See the [Support Matrix](https://docs.nvidia.com/openshell/latest/about/support-matrix) for details.
 
-OpenShell applies defense in depth across four policy domains:
-
-| Layer      | What it protects                                    | When it applies             |
-| ---------- | --------------------------------------------------- | --------------------------- |
-| Filesystem | Prevents reads/writes outside allowed paths.        | Locked at sandbox creation. |
-| Network    | Blocks unauthorized outbound connections.           | Hot-reloadable at runtime.  |
-| Process    | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
-| Inference  | Reroutes model API calls to controlled backends.    | Hot-reloadable at runtime.  |
-
-Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
-
-## Providers
-
-Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
-
-## GPU Support (Experimental)
-
-> **Experimental** — GPU passthrough works on supported hosts but is under active development. Expect rough edges and breaking changes.
-
-OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or any GPU workload. Add `--gpu` when creating a sandbox:
-
-```bash
-openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+openshell sandbox create --name demo
 ```
 
-Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall back to Docker's NVIDIA GPU request path (`--gpus all`).
+The installer sets up the CLI and a local gateway. The default sandbox image is minimal Ubuntu with no agent installed. To run a real agent, follow [Run Your First Agent](https://docs.nvidia.com/openshell/latest/about/run-your-first-agent): it runs OpenCode against a free OpenRouter model and shows how to approve new access as the agent needs it.
 
-**Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
+## Explore Further
 
-## Supported Agents
+- [Sandboxes](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview): images, runtimes, GPUs, and lifecycle.
+- [Policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview): filesystem, network, and process rules, with the [advisor](https://docs.nvidia.com/openshell/latest/how-it-works/policies/advisor) and [prover](https://docs.nvidia.com/openshell/latest/how-it-works/policies/prover) for reviewing changes.
+- [Providers](https://docs.nvidia.com/openshell/latest/how-it-works/providers/overview): credentials that work only at approved endpoints, including [inference](https://docs.nvidia.com/openshell/latest/how-it-works/inference).
+- [Gateways](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview): the control plane for sandboxes, policy, and access.
+- [Kubernetes](https://docs.nvidia.com/openshell/latest/kubernetes/setup): deploy the gateway with Helm. Your CNI must enforce `NetworkPolicy`.
+- [Extensibility](https://docs.nvidia.com/openshell/latest/extensibility/overview): middleware, interceptors, and compute drivers.
+- [Tutorials](https://docs.nvidia.com/openshell/latest/tutorials/first-network-policy): step-by-step policy and agent walkthroughs.
+- [Prerelease and development builds](https://docs.nvidia.com/openshell/latest/about/installation#prerelease-and-development-builds): try an upcoming release or the latest commit on `main`.
 
-| Agent                                                         | Source                                                                           | Notes                                                                         |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `ANTHROPIC_API_KEY`.                      |
-| [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
-| [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
-| [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with managed inference using NemoClaw.       |
-| [Hermes Agent](https://github.com/NousResearch/hermes-agent)   | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run Hermes Agent more securely inside NVIDIA OpenShell with managed inference using NemoClaw.   |
-| [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
-| [Pi](https://pi.dev/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from pi`.                         |
+### Test the gRPC API with grpcurl
 
-## Key Commands
+The gateway serves the gRPC reflection v1 protocol. After starting a local
+plaintext gateway, use `grpcurl` without checking out or supplying the proto
+files:
 
-| Command                                                    | Description                                     |
-| ---------------------------------------------------------- | ----------------------------------------------- |
-| `openshell sandbox create -- <agent>`                      | Create a sandbox and launch an agent.           |
-| `openshell sandbox connect [name]`                         | SSH into a running sandbox.                     |
-| `openshell sandbox list`                                   | List all sandboxes.                             |
-| `openshell provider create --type [type] --from-existing`  | Create a credential provider from env vars.     |
-| `openshell policy set <name> --policy file.yaml`           | Apply or update a policy on a running sandbox.  |
-| `openshell policy get <name>`                              | Show the active policy.                         |
-| `openshell inference set --provider <p> --model <m>`       | Configure the `inference.local` endpoint.       |
-| `openshell logs [name] --tail`                             | Stream sandbox logs.                            |
-| `openshell term`                                           | Launch the real-time terminal UI for debugging. |
-
-See the [full documentation](https://docs.nvidia.com/openshell/latest) for command guides, tutorials, and reference material.
-
-## Terminal UI
-
-OpenShell includes a real-time terminal dashboard for monitoring gateways, sandboxes, and providers — inspired by [k9s](https://k9scli.io/).
-
-```bash
-openshell term
+```shell
+grpcurl -plaintext localhost:18080 list
+grpcurl -plaintext localhost:18080 describe openshell.v1.OpenShell
+grpcurl -plaintext -d '{}' localhost:18080 openshell.v1.OpenShell/Health
 ```
 
-<p align="center">
-  <img src="fern/assets/images/openshell-terminal.png" alt="OpenShell Terminal UI">
-</p>
+The service list contains the public `openshell.v1.OpenShell` API. Reflection
+does not advertise the gateway's internal compute-driver, credential-driver,
+interceptor, or middleware services. For a TLS gateway, omit `-plaintext` and
+supply the CA and client certificate options required by the deployment.
 
-The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Gateway health and sandbox status auto-refresh every two seconds.
+## Agent Skills
 
-## Community Sandboxes and BYOC
+Install the public OpenShell skills for your coding agent:
 
-Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, a local directory, or a container image:
-
-```bash
-openshell sandbox create --from gemini             # community catalog
-openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
-openshell sandbox create --from registry.io/img:v1 # container image
+```shell
+npx skills add NVIDIA/OpenShell
 ```
 
-See the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
+The skills teach your agent to drive the OpenShell CLI, write sandbox policies, and debug gateways and inference routing. They live in [`skills/`](skills/) and work without an OpenShell source checkout.
 
-## Explore with Your Agent
+## SDKs
 
-Clone the repo and point your coding agent at it. The project includes agent skills that can answer questions, walk you through workflows, and diagnose problems — no issue filing required.
+SDKs connect applications to an OpenShell gateway. They do not install the CLI. Use the same OpenShell release for the SDK and the gateway when possible.
 
-```bash
-git clone https://github.com/NVIDIA/OpenShell.git   # or git@github.com:NVIDIA/OpenShell.git
-cd OpenShell
-# Point your agent here — it will discover the skills in .agents/skills/ automatically
-```
+| Language | Install | Docs |
+|---|---|---|
+| Python | `uv add openshell` | [README](python/openshell/) |
+| TypeScript | `npm install @nvidia/openshell-sdk` (GitHub Packages) | [README](sdk/typescript/README.md) |
+| Go | `go get github.com/NVIDIA/OpenShell/sdk/go@latest` | [README](sdk/go/README.md) |
+| Rust | `cargo add openshell-sdk --git https://github.com/NVIDIA/OpenShell --tag <release-tag>` | [Installation and usage](docs/sdk/rust.mdx) |
 
-Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
-
-## Built With Agents
-
-OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
-
-- **Spike and build:** Investigate a problem with `create-spike`; a human accepts it with `state:accepted` or [roadmap](https://github.com/orgs/NVIDIA/projects/233) placement, or declines it. Accepted work can remain human-owned or enter the optional, human-gated `agent:*` planning and implementation workflow.
-- **Triage and route:** Community issues are assessed with `triage-issue`. Agents establish technical validity and impact; humans decide whether the project should act and where the work sits on the roadmap.
-- **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
-- **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
-
-All agent implementation work is human-gated: maintainers explicitly request a plan, agents propose it, maintainers approve it, and agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
-
-## Getting Help
+## Community
 
 - **Questions and discussion:** [GitHub Discussions](https://github.com/NVIDIA/OpenShell/discussions)
-- **Bug reports:** [GitHub Issues](https://github.com/NVIDIA/OpenShell/issues) — use the bug report template
-- **Security vulnerabilities:** See [SECURITY.md](SECURITY.md) — do not use GitHub Issues
-- **Agent-assisted help:** Clone the repo and use the agent skills in `.agents/skills/` for self-service diagnostics
+- **Bug reports and feature requests:** [GitHub Issues](https://github.com/NVIDIA/OpenShell/issues), using the issue templates
+- **Security vulnerabilities:** follow [SECURITY.md](SECURITY.md). Do not open a GitHub issue.
+- **Roadmap:** [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) and the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6)
+- **Try it in the cloud:** [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg)
 
-## Learn More
-
-- [Full Documentation](https://docs.nvidia.com/openshell/latest/index.html) — overview, architecture, tutorials, and reference
-- [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
-- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/get-started/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
-- [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
-- [Roadmap](https://github.com/orgs/NVIDIA/projects/233) — planned work and project priorities
-- [RFC Board](https://github.com/orgs/NVIDIA/projects/233/views/6) — RFC proposals tracked on the OpenShell Roadmap with the `rfc` label
-- [Support Matrix](https://docs.nvidia.com/openshell/latest/reference/support-matrix) — platforms, versions, and kernel requirements
-- [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
-- [Agent Instructions](AGENTS.md) — system prompt and workflow documentation for agent contributors
-
-## Contributing
-
-OpenShell is built agent-first. Issues should include a user story, problem statement, impact, and acceptance criteria. The impact should explain the consequences of the current behavior and why existing workarounds are insufficient. Feature requests also require a workflow-level proposed design and alternatives; bug reports add reproduction steps, environment details, and relevant logs. Once maintainers accept work, contributors should use the skills in `.agents/skills/` to investigate the current code and behavior, implement the change, and verify it. If an issue contains earlier diagnostics, verify them rather than relying on them. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+OpenShell is built agent-first: it is developed with the same agent-driven workflows it enables. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the contribution workflow, and [AGENTS.md](AGENTS.md) for repository coding conventions.
 
 ## Telemetry
 
-OpenShell collects anonymous telemetry to help improve the project for developers. This data is not used to track individual user behavior. It helps us understand aggregate usage of sandbox, provider, and policy workflows so we can prioritize product improvements and share usage trends with the community.
-
-Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. For Helm installs, set `server.telemetryEnabled=false`. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
-
-You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building with `--no-default-features` produces binaries that contain no telemetry endpoint, no telemetry HTTP client, and no emission code. Build telemetry-free artifacts with, for example, `cargo build --release -p openshell-server --no-default-features` (gateway) and the equivalent for `openshell-sandbox` and `openshell-driver-vm`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
-
-Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
-
-Opting out applies only to telemetry emitted by OpenShell. Third-party services, model providers, inference endpoints, agents, or tools that you configure and use with OpenShell may have their own terms and privacy practices.
-
-We publish aggregate usage trends from this telemetry every two weeks. See the [community telemetry reports](telemetry/README.md) for the latest summary.
+OpenShell collects anonymous telemetry, limited to operational categories and counts, to help improve the project. It does not collect sandbox names, hostnames, file paths, prompts, credentials, provider or model names, or user content. To disable it, set `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway, or `server.telemetryEnabled=false` for Helm installs. You can also compile telemetry out entirely. See [Telemetry](https://docs.nvidia.com/openshell/latest/observability/telemetry) for details and the [community telemetry reports](telemetry/README.md) for published usage trends.
 
 ## Notice and Disclaimer
 

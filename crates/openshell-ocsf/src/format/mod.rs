@@ -3,5 +3,6 @@
 
 //! OCSF event formatters: shorthand (human-readable) and JSONL.
 
+pub mod downgrade;
 pub mod jsonl;
 pub mod shorthand;

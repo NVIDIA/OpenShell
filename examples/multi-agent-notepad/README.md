@@ -85,6 +85,7 @@ for this demo, or one you're comfortable with the demo creating files in.
 export DEMO_GITHUB_OWNER=<owner>
 export DEMO_GITHUB_REPO=<repo>
 export DEMO_GITHUB_TOKEN="$(gh auth token)"
+export DEMO_AGENT_IMAGE="registry.example.com/your-org/codex-agent:latest"
 
 bash examples/multi-agent-notepad/demo.sh
 ```
@@ -93,9 +94,9 @@ bash examples/multi-agent-notepad/demo.sh
 usually broader than `contents:write`. If you'd rather use a scope-limited
 PAT, set `DEMO_GITHUB_TOKEN` to that value instead.
 
-By default the script launches five worker agents and one synthesis agent in
-the OpenShell `base` image, where Codex is preinstalled. To run a faster
-smoke test:
+The selected image must contain Codex, `curl`, and Bash. The script launches
+five worker agents and one synthesis agent by default. To run a faster smoke
+test:
 
 ```bash
 export DEMO_AGENT_COUNT=2
@@ -139,7 +140,7 @@ values never sit in the sandbox filesystem.
 The script renders `policy.template.yaml` for the configured GitHub
 repository and run id. The policy allows:
 
-- Codex traffic to OpenAI and ChatGPT endpoints used by the community base
+- Codex traffic to OpenAI and ChatGPT endpoints used by the selected workload
   image
 - Limited Codex plugin metadata reads from `github.com/openai/plugins.git`
 - GitHub REST `GET` and `PUT` calls scoped to

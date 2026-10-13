@@ -2,6 +2,14 @@
 
 Kubernetes-backed compute driver for OpenShell cluster deployments.
 
+Caller driver config is disabled by default. External resource references need
+administrator-controlled approval labels in every workspace mode, including
+before restart and scheduling-gate release. GPU devices are temporarily exempt.
+Image-pull Secrets are operator-selected gateway configuration rather than caller
+attachments. Managed mode stages an immutable copy for each sandbox runtime
+generation.
+See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:
@@ -9,8 +17,12 @@ workspace namespace modes via `workspace_mode`:
 - **Shared** (default): All sandboxes render into a single static namespace.
   Resource names use `{workspace}--{name}` for collision avoidance.
 - **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
-  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
-  and copies OpenShift SCC annotations from the gateway namespace when present.
+  (`openshell-{gateway_id}-{workspace_name}`) and creates a ServiceAccount in
+  each. On OpenShift, it leaves SCC annotations to the namespace allocator and
+  waits for the namespace's own MCS, UID-range, and supplemental-group
+  annotations before provisioning sandbox resources. An existing namespace with
+  a UID range but no MCS must be recreated so OpenShift can allocate a complete
+  set of SCC annotations.
 - **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
@@ -33,7 +45,7 @@ annotation. An OTLP-enabled Agent Sandbox controller can therefore attach its
 asynchronous reconciliation spans to the originating OpenShell create trace.
 
 Workspace namespace modes assume exclusive control of the sandbox identity
-resource chain. In shared and managed modes, only the gateway and its trusted
+resource chain. In shared and managed modes, only the driver and its trusted
 Agent Sandbox controller may administer the sandbox namespace, Sandbox CRs,
 sandbox pods, or configured sandbox ServiceAccount. In operator mode, the
 platform operator owns namespace lifecycle but must prevent other principals
@@ -45,9 +57,63 @@ not a tenant isolation boundary.
 ## Runtime Model
 
 The gateway stores platform state and delegates sandbox workload creation to
-this driver. Kubernetes owns scheduling and pod lifecycle. The
-`openshell-sandbox` supervisor inside each workload owns agent isolation,
-credential injection, policy polling, logs, and the gateway relay.
+this driver. Kubernetes owns scheduling and pod lifecycle. The workload Pod
+stages the statically linked musl `openshell-sandbox` binary from
+`sandbox_runtime_image`, while a directly managed Pod runs the dynamically
+linked glibc `openshell-supervisor` from `supervisor_image`.
+
+The sandbox owns the agent process, applies Landlock and child seccomp filters,
+identifies the binary behind each network syscall, and relays mediated streams
+to the supervisor. The supervisor authenticates to the gateway with a JWT,
+loads policy and provider state, performs destination and L7 authorization, and
+opens upstream connections. The workload receives no gateway credential,
+provider identity socket, or corporate-proxy credential.
+
+Both Pods run as the namespace-resolved non-root UID/GID with
+`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, and the runtime
+default seccomp profile. The sandbox installs a nested seccomp user-notification
+filter without requesting a capability in the Pod spec. Startup fails closed
+when the runtime blocks the required seccomp or Landlock operations.
+
+The supervisor Pod has a direct, non-controller owner reference to the Sandbox
+resource. This links its garbage-collection lifecycle to the sandbox without
+competing with the Agent Sandbox controller for workload-Pod ownership.
+
+When the gateway exports OTLP traces, the driver sets
+`OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
+`TRACEPARENT` to the trace context of the operation that created the Pod. The
+supervisor exports its spans there and parents its startup span on that
+context. The endpoint is not configurable in driver TOML.
+
+The driver creates one namespace-wide `NetworkPolicy` before it releases any
+workload Pod. It selects every OpenShell workload, denies all workload egress,
+and permits OpenShell supervisor Pods to reach the sandbox TLS port. The
+authenticated Sandbox Protocol binds each connection to the exact sandbox and
+supervisor Pod identities. Supervisors have normal egress for gateway, DNS,
+and policy-approved upstream connections unless an operator policy restricts
+them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
+sandbox namespace. Kubernetes accepts policy objects without confirming
+enforcement, so operators must verify CNI support before running sandboxes.
+
+Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
+container stages the sandbox bootstrap into memory, and the sandbox removes it
+before starting untrusted code. The other Secret is mounted only by the
+supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
+corporate proxy CA bundle, which the gateway reads from its own filesystem so
+the anchor stays in the gateway's trust domain rather than the sandbox
+namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
+supervisor Pod, and shared network-policy identities. Stop deletes the workload
+and supervisor Pods. Start rotates both Secrets and creates a new supervisor
+Pod before releasing a new workload Pod. It also renders the trusted init
+container again from gateway config, so a sandbox created by an older gateway
+starts with the current sandbox runtime image. The shared network fence
+remains for the lifetime of the namespace.
+
+Kubernetes policies are additive, and the API does not attest that the CNI
+enforces them. Keep sandbox namespaces administrative: untrusted principals
+must not create permissive policies, create Pods, read bootstrap Secrets, or
+spoof the OpenShell role labels. Exact supervisor-to-sandbox authorization is
+still enforced by TLS, JWT claims, session generation, and recorded Pod UIDs.
 
 ## Sandbox Resource
 
@@ -60,7 +126,11 @@ state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
-indefinitely when the API server is slow or unavailable.
+indefinitely when the API server is slow or unavailable. The request client's
+timeout starts when each request is sent, so time a pooled connection spends
+idle does not shorten it. Resource and Event
+watches recover in place with API-friendly backoff after transient watcher
+errors, avoiding a gateway-side watch restart and its associated watch gap.
 
 ## Workspace Persistence
 
@@ -77,9 +147,9 @@ its pod. The driver sets `spec.operatingMode: Suspended` for `v1beta1` or
 `spec.replicas: 0` for `v1alpha1`. Start sets `Running` or one replica for the
 same resource, so the replacement pod mounts the existing claim. Delete is the
 only lifecycle operation that removes the Sandbox resource and its owned
-storage. The driver confirms the stop from the published `Suspended`
-condition when available. Legacy `v1alpha1` controllers omit a zero replica
-count from status, so the driver confirms that their backing pod is gone.
+storage. The driver confirms the stop from both the published `Suspended`
+condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
+a usable stopped condition, so pod deletion alone confirms their stop.
 
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
@@ -93,69 +163,45 @@ mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
 
 ## Credentials, TLS, and Relay
 
-The driver injects gateway callback configuration, sandbox identity, TLS client
-material, and the supervisor SSH socket path into the workload. Driver-owned
-values must override image-provided environment variables.
+Both Pods set `automountServiceAccountToken: false`. The supervisor receives an
+explicit audience-bound projected token for the one-shot `IssueSandboxToken`
+exchange. The driver verifies that token and returns an opaque runtime identity
+derived from the namespace, immutable Sandbox resource UID, and supervisor Pod
+UID. Restart requires exactly one matching Sandbox resource and preserves its
+namespace and UID while rotating the supervisor Pod UID. The gateway requires
+the authenticated identity to match the durable binding before returning the
+generation-bound session JWT used by the supervisor. The sandbox Pod receives
+neither token. For HTTPS gateway connections, the supervisor reads only the
+CA from the configured TLS Secret. Shared mode projects `ca.crt` directly;
+managed and operator modes stage only the CA into the supervisor bootstrap
+Secret. User client certificates and private keys are not mounted into either Pod.
 
-Sandbox pods run as `service_account_name` and keep
-`automountServiceAccountToken: false`. The only Kubernetes token exposed to the
-supervisor is an explicit, audience-bound projected token mounted at
-`/var/run/secrets/openshell/token` for the one-shot `IssueSandboxToken`
-bootstrap exchange.
+The gateway uses the supervisor relay for connect, exec, logs, and file sync.
+Sandbox Pods do not need direct external ingress for SSH.
 
-The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
-pods do not need direct external ingress for SSH.
-
-The driver forwards the canonical main-process specification to the process
-supervisor and sets pod `restartPolicy: Never`. Main-process environment
-overrides stay local to that child; the sidecar bootstrap retains the unmodified
-provider environment used by later exec, editor, and SFTP sessions.
+The driver sends the canonical main-process specification only to the
+supervisor. The supervisor passes admitted launch state over the protected
+channel. Provider environment updates apply to future exec sessions.
 
 ## Container Security Context
 
-The default `combined` supervisor topology grants the sandbox agent container
-the Linux capabilities the supervisor needs for namespace setup and process,
-filesystem, and network policy enforcement.
+The sandbox, trusted bootstrap init container, and supervisor request no added
+Linux capability. They run as the same numeric non-root identity, disable
+privilege escalation, drop all capabilities, and inherit `RuntimeDefault`
+seccomp. The sandbox and agent must use the same complete UID, GID, and
+supplementary-group identity because the capability-free sandbox cannot change
+credentials after launch and must inspect its same-identity descendants.
 
-The `sidecar` supervisor topology moves pod-level network setup into a root init
-container. In the default process/binary-aware mode, the long-lived network
-sidecar runs as UID 0 with `allowPrivilegeEscalation: false`, drops default
-Linux capabilities, and adds only `SYS_PTRACE` plus `DAC_READ_SEARCH` for
-cross-UID workload `/proc` inspection. The agent container also runs as the
-resolved sandbox UID/GID with `allowPrivilegeEscalation: false` and
-`capabilities.drop: ["ALL"]`.
-Set `sidecar.process_binary_aware_network_policy = false` to run the network
-sidecar as the configured non-root `sidecar.proxy_uid`, omit the extra `/proc`
-inspection capabilities, and enforce endpoint/L7 network policy without
-matching `policy.binaries`.
-In this mode OpenShell preserves gateway session and SSH behavior, but the
-process supervisor does not perform root-to-sandbox privilege dropping or
-supervisor identity mount isolation. It still applies Landlock filesystem policy
-and child seccomp filters where the kernel/runtime supports them. Network
-endpoint and L7 policy remain enforced by the network sidecar, and
-sidecar pods use a shared process namespace so the network sidecar can resolve
-process/binary identity through `/proc/<entrypoint-pid>`.
+The workload Pod does not share host network, PID, IPC, or process namespaces.
+The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
+into the bootstrap claims before kubelet starts it.
 
-Sidecar mode keeps gateway credentials in the network sidecar. The agent
-container does not mount the projected service-account token used for sandbox
-token bootstrap, does not mount the sandbox client TLS secret, and does not get
-gateway callback environment variables. The process supervisor receives policy
-and provider environment state from the sidecar over a local control socket in
-the shared sidecar state volume. The sidecar accepts only the pre-workload
-process-supervisor connection, authenticates its UID/GID/PID with peer
-credentials, and removes the listener afterward. SSH relays use a Linux
-abstract socket whose peer PID must match that authenticated supervisor. Both
-supervisors exit if the control connection closes, coupling their container
-restart lifecycle before a new authoritative client can be established.
-
-The driver can request a Kubernetes AppArmor profile through
-`app_armor_profile`.
-
-Supported values are `Unconfined`, `RuntimeDefault`, and
-`Localhost/<profile-name>`. An empty or unset value omits
-`securityContext.appArmorProfile`. Helm deployments default sandbox agent
-containers to `Unconfined` because runtime/default AppArmor profiles can block
-the supervisor's network namespace mount setup on AppArmor-enabled nodes.
+Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
+across clones of the driver. Reconciliation skips busy sandboxes and refreshes
+the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
+snapshot cannot delete a supervisor created by a concurrent restart in the same
+driver instance. The gate preserves concurrency across sandboxes; it does not
+provide distributed exclusion between separate gateway or driver processes.
 
 ## GPU Support
 

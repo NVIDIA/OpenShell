@@ -12,8 +12,8 @@ Usage:
   nix run .#test-guest-cache -- --distro DISTRO [OPTIONS]
 
 Options:
-  --distro NAME       Base distro: ubuntu, centos, fedora, or rocky
-  --with NAME         Apply a configuration; repeatable (docker, podman, selinux)
+  --distro NAME       Base distro: ubuntu-24-04, ubuntu-26-04, centos, fedora, or rocky
+  --with NAME         Apply a configuration; repeatable (docker, podman-rootful, podman-rootless, selinux, snapd)
   --repository REF    OCI repository without a tag
   --digest DIGEST     Trusted OCI manifest digest required for pulls
   --cache-dir PATH    Override the local prepared-disk cache directory
@@ -380,7 +380,8 @@ build_local() {
 	for configuration in "${configurations[@]}"; do
 		case "${configuration}" in
 		docker) validation+='; docker info >/dev/null' ;;
-		podman) validation+='; podman info >/dev/null' ;;
+		podman-rootful) validation+='; sudo podman --url unix:///run/podman/podman.sock info >/dev/null; test "$(cat /etc/openshell-test-guest/podman-mode)" = rootful' ;;
+		podman-rootless) validation+='; podman info >/dev/null; test "$(cat /etc/openshell-test-guest/podman-mode)" = rootless' ;;
 		selinux) validation+='; test "$(getenforce)" = Enforcing' ;;
 		esac
 	done

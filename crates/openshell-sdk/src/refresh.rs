@@ -175,7 +175,7 @@ impl TokenSource {
             })),
             refresher,
             flight: Arc::new(Mutex::new(Flight::default())),
-            skew: Duration::from_secs(60),
+            skew: Duration::from_mins(1),
         }
     }
 

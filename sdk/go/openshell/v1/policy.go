@@ -87,11 +87,11 @@ var WithVersion = types.WithVersion
 // ListPolicyOption configures a List call.
 type ListPolicyOption = types.ListPolicyOption
 
-// WithLimit sets the maximum number of revisions to return.
-var WithLimit = types.WithLimit
+// WithPageSize sets the maximum revisions requested per page.
+var WithPageSize = types.WithPageSize
 
-// WithOffset sets the pagination offset.
-var WithOffset = types.WithOffset
+// WithPageToken resumes listing from an opaque token returned by a previous page.
+var WithPageToken = types.WithPageToken
 
 // WithListGlobal enables global policy mode on List. When true, the query
 // retrieves gateway-global policy revisions instead of sandbox-scoped ones.
@@ -111,7 +111,8 @@ type PolicyInterface interface {
 	ClearDraftChunks(ctx context.Context, workspace, sandboxName string) (*ClearResult, error)
 	GetDraftHistory(ctx context.Context, workspace, sandboxName string) ([]DraftHistoryEntry, error)
 	GetStatus(ctx context.Context, workspace, sandboxName string, opts ...GetStatusOption) (*PolicyStatusResult, error)
-	List(ctx context.Context, workspace string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error)
+	List(workspace, sandboxName string, opts ...ListPolicyOption) (*Pager[SandboxPolicyRevision], error)
+	ListAll(ctx context.Context, workspace, sandboxName string, opts ...ListPolicyOption) ([]SandboxPolicyRevision, error)
 	EditDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string, proposedRule *NetworkPolicyRule) error
 	UndoDraftChunk(ctx context.Context, workspace, sandboxName, chunkID string) (*UndoResult, error)
 }

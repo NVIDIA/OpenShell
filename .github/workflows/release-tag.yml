@@ -12,8 +12,8 @@ on:
         type: string
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+  packages: read
 
 # Resolve the tag once: prefer the workflow_dispatch input, fall back to the
 # push-event ref.  Every job references this via env.RELEASE_TAG.
@@ -33,7 +33,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -48,11 +48,13 @@ jobs:
       semver: ${{ steps.v.outputs.semver }}
       # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
       source_sha: ${{ steps.v.outputs.source_sha }}
+      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -64,96 +66,142 @@ jobs:
         id: v
         run: |
           set -euo pipefail
-          echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
-          echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)" >> "$GITHUB_OUTPUT"
-          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
-          echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)" >> "$GITHUB_OUTPUT"
-          echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)" >> "$GITHUB_OUTPUT"
-          echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
+            is_prerelease=true
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            is_prerelease=false
+          else
+            echo "Unsupported release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          {
+            echo "is_prerelease=${is_prerelease}"
+            echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
+            echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
+            echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
+            echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)"
+            echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)"
+            echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)"
+            echo "semver=${RELEASE_TAG#v}"
+            echo "source_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
-  build-cli:
+  build-binaries:
     needs: compute-versions
     permissions:
       contents: read
-    uses: ./.github/workflows/build-cli-binaries.yml
+    uses: ./.github/workflows/build-binaries.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.semver }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
-
-  build-gateway:
-    needs: compute-versions
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-gateway-binaries.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.semver }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
-
-  build-sandbox:
-    needs: compute-versions
-    permissions:
-      contents: read
-    uses: ./.github/workflows/build-sandbox-binaries.yml
-    with:
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.semver }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-vm-driver:
-    needs: [compute-versions, build-sandbox]
+    needs: [compute-versions, build-binaries]
     permissions:
       contents: read
     uses: ./.github/workflows/build-vm-driver.yml
     with:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-      image-tag: ${{ needs.compute-versions.outputs.semver }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
-    needs: [build-cli, build-gateway, build-sandbox, build-vm-driver]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     permissions:
       actions: read
       contents: read
     uses: ./.github/workflows/package-release-binaries.yml
+    with:
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-  build-gateway-image:
-    needs: [compute-versions, build-gateway]
+  build-images:
+    needs: [compute-versions, build-binaries]
     permissions:
       contents: read
       packages: write
-    uses: ./.github/workflows/docker-build.yml
+    uses: ./.github/workflows/build-images.yml
     with:
-      component: gateway
-      binary: openshell-gateway
-      target-suffix: unknown-linux-gnu
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-  build-supervisor-image:
-    needs: [compute-versions, build-sandbox]
+  security:
+    name: Security Scan
+    needs: [compute-versions, build-images]
     permissions:
+      actions: read
       contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/security-scan.yml
     with:
-      component: supervisor
-      binary: openshell-sandbox
-      target-suffix: unknown-linux-musl
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
+      candidate_ref: ${{ inputs.tag || github.ref_name }}
+      fail-on-static-findings: false
+      images: |
+        ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/openshell/sandbox:${{ needs.compute-versions.outputs.source_sha }}
+        ghcr.io/nvidia/openshell/supervisor:${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  prepare-integration:
+    needs: [compute-versions, build-binaries, build-deb, build-images, build-rpm]
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      source-sha: ${{ needs.compute-versions.outputs.source_sha }}
+      deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
+
+  conformance-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: conformance
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+        ]
+
+  feature-specific-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: feature-specific
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
+        ]
 
   docker-e2e:
-    needs: [compute-versions, build-cli, build-gateway, build-supervisor-image]
+    needs: [compute-versions, build-binaries, build-images]
     permissions:
       actions: read
       contents: read
@@ -161,56 +209,128 @@ jobs:
     uses: ./.github/workflows/e2e-docker-test.yml
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
       runner: linux-arm64-cpu8
 
-  podman-e2e:
-    needs: [compute-versions, build-cli, build-gateway, build-supervisor-image]
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
-    with:
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-
   vm-e2e:
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     permissions:
       actions: read
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
-      checkout-ref: ${{ inputs.tag || github.ref }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-  tag-ghcr-release:
-    name: Tag GHCR Images for Release
-    needs: [compute-versions, build-gateway-image, build-supervisor-image, release]
+  protobuf-compatibility:
+    name: Protobuf Compatibility
+    needs: compute-versions
     runs-on: linux-amd64-cpu8
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-      - name: Tag images with version and latest
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+  compatibility-review:
+    name: Compatibility Review (advisory)
+    needs: compute-versions
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/codex-compatibility.yml
+    with:
+      candidate_ref: ${{ inputs.tag || github.ref_name }}
+      source_sha: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
+  qualification-result:
+    name: Release Qualification
+    if: always()
+    needs:
+      - compute-versions
+      - protobuf-compatibility
+      - security
+      - conformance-integration
+      - feature-specific-integration
+      - docker-e2e
+      - vm-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      artifact-name: ${{ steps.summary.outputs.artifact-name }}
+      current-profile-passed: ${{ steps.summary.outputs.current-profile-passed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha || github.sha }}
+
+      - name: Record qualification result
+        id: summary
+        env:
+          CONFORMANCE_RESULT: ${{ needs.conformance-integration.result }}
+          DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
+          FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
+          IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          PROTO_COMPATIBILITY_RESULT: ${{ needs.protobuf-compatibility.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
+          VM_E2E_RESULT: ${{ needs.vm-e2e.result }}
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/openshell"
-          VERSION="${{ needs.compute-versions.outputs.semver }}"
-          SOURCE_TAG="${{ needs.compute-versions.outputs.source_sha }}"
-          for component in gateway supervisor; do
-            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION} and latest..."
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:${VERSION}" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:latest" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
-          done
+          current_profile_passed=$(tasks/scripts/generate-qualification-summary.sh qualification-summary.json)
+          artifact_name="qualification-${RELEASE_TAG}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          run_url=$(jq -r '.run.url' qualification-summary.json)
+
+          {
+            echo "artifact-name=${artifact_name}"
+            echo "current-profile-passed=${current_profile_passed}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Release qualification"
+            echo
+            echo "- Candidate: \`${RELEASE_TAG}\` (\`${SOURCE_SHA}\`)"
+            echo "- Current qualification profile passed: **${current_profile_passed}**"
+            echo "- RFC-0014 qualification coverage complete: **false**"
+            echo "- Run: [${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}](${run_url})"
+            echo
+            echo "| Suite | Result |"
+            echo "| --- | --- |"
+            echo "| Protobuf API compatibility | ${PROTO_COMPATIBILITY_RESULT} |"
+            echo "| Security | ${SECURITY_RESULT} |"
+            echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
+            echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
+            echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
+            echo "| VM E2E | ${VM_E2E_RESULT} |"
+            echo
+            echo "Advisory compatibility review runs independently and does not gate publication."
+            echo "See the Compatibility Review job and compatibility-review-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT} artifact in [this run](${run_url})."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload qualification result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.summary.outputs.artifact-name }}
+          path: qualification-summary.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Require current qualification profile before publication
+        if: steps.summary.outputs.current-profile-passed != 'true'
+        run: |
+          echo "Release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
+          exit 1
 
   build-python-wheel:
     name: Build Python Wheel
@@ -218,7 +338,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -228,8 +348,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -252,175 +373,54 @@ jobs:
 
   build-deb:
     name: Build Debian Packages
-    needs: [compute-versions, build-cli, build-gateway, build-vm-driver]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     uses: ./.github/workflows/deb-package.yml
     with:
       deb-version: ${{ needs.compute-versions.outputs.deb_version }}
-      checkout-ref: ${{ inputs.tag || github.ref }}
-    secrets: inherit
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-cli, build-gateway, build-sandbox]
+    needs: [compute-versions, build-binaries]
     uses: ./.github/workflows/snap-package.yml
     with:
-      checkout-ref: ${{ inputs.tag || github.ref }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+  build-rpm:
+    name: Build RPM Packages
+    needs: [compute-versions, build-binaries]
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+      rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
+      rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+
+  publish-snap:
+    name: Publish Snap
+    needs: [compute-versions, release, qualification-result]
+    if: needs.compute-versions.outputs.is_prerelease != 'true' && needs.qualification-result.outputs.current-profile-passed == 'true'
+    uses: ./.github/workflows/snap-publish.yml
+    with:
       upload-channel: latest/stable
       github-environment: latest/stable
     secrets:
       publish-credentials: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
 
-  build-rpm:
-    name: Build RPM Packages
-    needs: [compute-versions, build-cli, build-gateway]
-    uses: ./.github/workflows/rpm-package.yml
-    with:
-      checkout-ref: ${{ inputs.tag || github.ref }}
-      rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
-      rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
-      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
-    secrets: inherit
-
-  smoke-linux-release-artifacts:
-    name: Smoke Linux Release Artifacts (${{ matrix.name }})
-    needs: [package-binaries, build-deb, build-rpm, build-python-wheel]
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: ubuntu-20.04-binaries
-            runner: linux-amd64-cpu8
-            image: ubuntu:20.04
-            kind: binary
-            artifact_arch: amd64
-            rpm_arch: x86_64
-            target: x86_64-unknown-linux-gnu
-          - name: ubuntu-20.04-binaries-arm64
-            runner: linux-arm64-cpu8
-            image: ubuntu:20.04
-            kind: binary
-            artifact_arch: arm64
-            rpm_arch: aarch64
-            target: aarch64-unknown-linux-gnu
-          - name: ubuntu-22.04-deb
-            runner: linux-amd64-cpu8
-            image: ubuntu:22.04
-            kind: deb
-            artifact_arch: amd64
-            rpm_arch: x86_64
-            target: x86_64-unknown-linux-gnu
-          - name: ubuntu-22.04-deb-arm64
-            runner: linux-arm64-cpu8
-            image: ubuntu:22.04
-            kind: deb
-            artifact_arch: arm64
-            rpm_arch: aarch64
-            target: aarch64-unknown-linux-gnu
-          - name: fedora-rpm
-            runner: linux-amd64-cpu8
-            image: fedora:latest
-            kind: rpm
-            artifact_arch: amd64
-            rpm_arch: x86_64
-            target: x86_64-unknown-linux-gnu
-          - name: fedora-rpm-aarch64
-            runner: linux-arm64-cpu8
-            image: fedora:latest
-            kind: rpm
-            artifact_arch: arm64
-            rpm_arch: aarch64
-            target: aarch64-unknown-linux-gnu
-          - name: python-wheel
-            runner: linux-amd64-cpu8
-            image: python:3.12-slim
-            kind: wheel
-    runs-on: ${{ matrix.runner }}
-    container:
-      image: ${{ matrix.image }}
-    steps:
-      - name: Download gateway binary artifact
-        if: matrix.kind == 'binary'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: gateway-binary-linux-${{ matrix.artifact_arch }}
-          path: smoke-input/
-
-      - name: Download VM driver binary artifact
-        if: matrix.kind == 'binary'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: driver-vm-linux-${{ matrix.artifact_arch }}
-          path: smoke-input/
-
-      - name: Smoke binary artifacts
-        if: matrix.kind == 'binary'
-        run: |
-          set -euo pipefail
-          apt-get update
-          mkdir -p smoke-bin
-          tar -xzf smoke-input/openshell-gateway-${{ matrix.target }}.tar.gz -C smoke-bin
-          tar -xzf smoke-input/openshell-driver-vm-${{ matrix.target }}.tar.gz -C smoke-bin
-          LD_BIND_NOW=1 smoke-bin/openshell-gateway --version
-          smoke-bin/openshell-driver-vm --version
-
-      - name: Download Debian package artifact
-        if: matrix.kind == 'deb'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: deb-linux-${{ matrix.artifact_arch }}
-          path: package-input/
-
-      - name: Smoke Debian package
-        if: matrix.kind == 'deb'
-        run: |
-          set -euo pipefail
-          apt-get update
-          apt-get install -y --no-install-recommends ./package-input/*.deb
-          LD_BIND_NOW=1 openshell-gateway --version
-          /usr/libexec/openshell/openshell-driver-vm --version
-
-      - name: Download RPM package artifacts
-        if: matrix.kind == 'rpm'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: rpm-linux-${{ matrix.rpm_arch }}
-          path: package-input/
-
-      - name: Smoke RPM packages
-        if: matrix.kind == 'rpm'
-        run: |
-          set -euo pipefail
-          dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
-          LD_BIND_NOW=1 openshell-gateway --version
-
-      - name: Download Python wheel artifact
-        if: matrix.kind == 'wheel'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: python-wheel
-          path: wheel-input/
-
-      - name: Smoke Python wheel
-        if: matrix.kind == 'wheel'
-        run: |
-          set -euo pipefail
-          python -m venv /tmp/openshell-wheel-smoke
-          /tmp/openshell-wheel-smoke/bin/pip install --no-cache-dir wheel-input/*.whl
-          /tmp/openshell-wheel-smoke/bin/python - <<'PY'
-          import importlib
-          for name in ("openshell", "openshell._proto", "openshell.sandbox"):
-              importlib.import_module(name)
-              print(name, "OK")
-          PY
-          test ! -e /tmp/openshell-wheel-smoke/bin/openshell
-
   # ---------------------------------------------------------------------------
-  # Create a tagged GitHub Release with CLI, gateway, driver, and wheels
+  # Assemble release artifacts after the current qualification profile passes.
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, package-binaries, build-python-wheel, docker-e2e, podman-e2e, vm-e2e, build-deb, build-rpm, build-snap, smoke-linux-release-artifacts]
+    if: needs.qualification-result.outputs.current-profile-passed == 'true'
+    needs:
+      - compute-versions
+      - package-binaries
+      - build-python-wheel
+      - qualification-result
+      - build-deb
+      - build-rpm
+      - build-snap
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -433,7 +433,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
 
       - name: Download all CLI artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -456,12 +457,32 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download sandbox binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sandbox-binary-*
+          path: release/
+          merge-multiple: true
+
       - name: Download VM driver artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: driver-vm-*
           path: release/
           merge-multiple: true
+
+      - name: Download prover binary artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: prover-binary-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download prover checksums
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prover-checksums
+          path: release/
 
       - name: Download wheel artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -507,7 +528,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          sha256sum \
+          sha256sum -- \
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
@@ -518,15 +539,19 @@ jobs:
             openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
-          sha256sum \
+          sha256sum -- \
             openshell-gateway-x86_64-unknown-linux-gnu.tar.gz \
             openshell-gateway-aarch64-unknown-linux-gnu.tar.gz \
             openshell-gateway-aarch64-apple-darwin.tar.gz > openshell-gateway-checksums-sha256.txt
           cat openshell-gateway-checksums-sha256.txt
-          sha256sum \
+          sha256sum -- \
             openshell-sandbox-x86_64-unknown-linux-musl.tar.gz \
             openshell-sandbox-aarch64-unknown-linux-musl.tar.gz > openshell-sandbox-checksums-sha256.txt
           cat openshell-sandbox-checksums-sha256.txt
+          sha256sum -- \
+            openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz \
+            openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz > openshell-supervisor-checksums-sha256.txt
+          cat openshell-supervisor-checksums-sha256.txt
 
       - name: Generate Homebrew formula
         run: |
@@ -537,7 +562,8 @@ jobs:
             --output release/openshell.rb
           cat release/openshell.rb
 
-      - name: Attest VM driver artifacts
+      - name: Attest release artifacts
+        id: attest
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: |
@@ -547,6 +573,7 @@ jobs:
             release/*.whl
 
       - name: Prune removed VM checksum asset
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
@@ -569,6 +596,7 @@ jobs:
             }
 
       - name: Create GitHub Release
+        if: needs.compute-versions.outputs.is_prerelease != 'true'
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           name: OpenShell ${{ env.RELEASE_TAG }}
@@ -596,58 +624,249 @@ jobs:
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
             release/openshell-sandbox-x86_64-unknown-linux-musl.tar.gz
             release/openshell-sandbox-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-supervisor-x86_64-unknown-linux-gnu.tar.gz
+            release/openshell-supervisor-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/openshell-prover-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-prover-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-prover-aarch64-apple-darwin.tar.gz
             release/*.whl
             release/openshell.rb
             release/openshell-checksums-sha256.txt
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
+            release/openshell-supervisor-checksums-sha256.txt
+            release/openshell-prover-checksums-sha256.txt
 
-  publish-fern-docs:
-    name: Publish Fern Docs
-    needs: [release]
+      - name: Upload amd64 Debian prerelease package
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-amd64-deb
+          path: |
+            release/openshell_*_amd64.deb
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload arm64 Debian prerelease package
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-arm64-deb
+          path: |
+            release/openshell_*_arm64.deb
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload x86_64 RPM prerelease packages
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-x86_64-rpm
+          path: |
+            release/openshell-*.x86_64.rpm
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload aarch64 RPM prerelease packages
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-linux-aarch64-rpm
+          path: |
+            release/openshell-*.aarch64.rpm
+            release/openshell-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Upload macOS prerelease packages
+        if: needs.compute-versions.outputs.is_prerelease == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: openshell-${{ env.RELEASE_TAG }}-macos-arm64
+          path: |
+            release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell-gateway-aarch64-apple-darwin.tar.gz
+            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/openshell-prover-aarch64-apple-darwin.tar.gz
+            release/openshell.rb
+            release/openshell-checksums-sha256.txt
+            release/openshell-gateway-checksums-sha256.txt
+            release/openshell-prover-checksums-sha256.txt
+          retention-days: 90
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish OCI artifacts. build-images creates the commit-addressed candidate
+  # images; these jobs add versioned image tags and charts, and publish the
+  # qualification summary independently from the release artifacts.
+  # ---------------------------------------------------------------------------
+  tag-ghcr-release:
+    name: Tag GHCR Images
+    needs: [compute-versions, build-images, release]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 10
+    permissions:
+      packages: write
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Tag images with release version
+        env:
+          IS_PRERELEASE: ${{ needs.compute-versions.outputs.is_prerelease }}
+          SOURCE_TAG: ${{ needs.compute-versions.outputs.source_sha }}
+          VERSION: ${{ needs.compute-versions.outputs.semver }}
+        run: |
+          set -euo pipefail
+          REGISTRY="ghcr.io/nvidia/openshell"
+          for component in gateway sandbox supervisor; do
+            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
+            docker buildx imagetools create \
+              --prefer-index=false \
+              -t "${REGISTRY}/${component}:${VERSION}" \
+              "${REGISTRY}/${component}:${SOURCE_TAG}"
+            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
+              docker buildx imagetools create \
+                --prefer-index=false \
+                -t "${REGISTRY}/${component}:latest" \
+                "${REGISTRY}/${component}:${SOURCE_TAG}"
+            fi
+          done
+
+  release-helm:
+    name: Release Helm Chart (OCI)
+    needs: [compute-versions, release, tag-ghcr-release]
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
+    permissions:
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: ./.github/actions/release-helm-oci
         with:
-          node-version: "24"
+          chart-version: ${{ needs.compute-versions.outputs.semver }}
+          app-version: ${{ needs.compute-versions.outputs.semver }}
+          release-kind: public
 
-      - name: Install Fern CLI
-        run: |
-          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
-          npm install -g "fern-api@${FERN_VERSION}"
+  publish-qualification:
+    name: Publish Qualification Summary (OCI)
+    if: >-
+      !cancelled()
+      && needs.release.result == 'success'
+      && needs.qualification-result.result == 'success'
+      && needs.qualification-result.outputs.current-profile-passed == 'true'
+    needs: [compute-versions, qualification-result, release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - name: Download qualification result
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.qualification-result.outputs.artifact-name }}
 
-      - name: Publish Fern docs
+      - name: Install ORAS
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.0
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish qualification summary
         env:
-          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-        working-directory: ./fern
-        run: fern generate --docs
+          SOURCE_SHA: ${{ needs.compute-versions.outputs.source_sha }}
+          VERSION: ${{ needs.compute-versions.outputs.semver }}
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          oras push "${ref}" \
+            --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            qualification-summary.json:application/vnd.nvidia.openshell.qualification.summary.v1+json
+
+          echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
+
+  notify-prerelease-failure:
+    name: Notify Prerelease Failure
+    needs: [release-helm, publish-qualification]
+    if: failure() && contains(inputs.tag || github.ref_name, '-pre.')
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Send Slack notification
+        continue-on-error: true
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::notice::SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL is unset; skipping Slack notification."
+            exit 0
+          fi
+
+          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT})."
+          if [[ -n "${SLACK_MENTION}" ]]; then
+            message+=" ${SLACK_MENTION}"
+          fi
+          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
+            '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"
+
+  publish-fern-docs:
+    name: Sync and Publish Fern Docs
+    needs: [compute-versions, release, publish-sdk-typescript, release-helm, trigger-wheel-publish]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/sync-docs.yml
+    with:
+      operation: sync
+      channel: stable
+      source_ref: ${{ needs.compute-versions.outputs.source_sha }}
+      release_version: ${{ needs.compute-versions.outputs.semver }}
+      version_slug: v${{ needs.compute-versions.outputs.semver }}
+      display_name: Latest (v${{ needs.compute-versions.outputs.semver }})
+      publish: true
+    secrets:
+      FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
 
   publish-sdk-typescript:
     name: Publish TypeScript SDK
     needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: linux-amd64-cpu8
     timeout-minutes: 15
     permissions:
       contents: read
       packages: write
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -660,6 +879,8 @@ jobs:
         run: |
           {
             echo "@nvidia:registry=https://npm.pkg.github.com"
+            # Keep the token reference literal for npm to expand at publish time.
+            # shellcheck disable=SC2016
             echo '//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}'
           } > .npmrc
 
@@ -669,27 +890,10 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: mise run sdk:ts:publish
 
-  release-helm:
-    name: Release Helm Chart (OCI)
-    needs: [compute-versions, release, tag-ghcr-release]
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-
-      - uses: ./.github/actions/release-helm-oci
-        with:
-          chart-version: ${{ needs.compute-versions.outputs.semver }}
-          app-version: ${{ needs.compute-versions.outputs.semver }}
-          release-kind: public
-
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release]
+    if: needs.compute-versions.outputs.is_prerelease != 'true'
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:

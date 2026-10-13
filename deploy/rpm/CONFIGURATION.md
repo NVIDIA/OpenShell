@@ -17,26 +17,31 @@ The defaults are tuned for rootless Podman use:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["podman"]
+compute_driver = "podman"
 ```
 
 The RPM does not override `bind_address`. The primary listener uses the
-built-in `127.0.0.1:17670` default. The Podman driver reports the callback
-interface it needs, and the gateway adds a separate listener scoped to that
-interface. This keeps the general API off unrelated host interfaces.
+built-in `127.0.0.1:17670` default. Host-networked Podman supervisors connect
+to this same loopback listener, so the gateway does not expose another host
+interface.
 
-`compute_drivers = ["podman"]` pins the compute driver to Podman. Without
+`compute_driver = "podman"` pins the compute driver to Podman. Without
 this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
 prevents unexpected driver selection if Docker is also installed on the host.
 
 ### Customizing the configuration
 
-Edit `~/.config/openshell/gateway.toml` directly. The template at
-`/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
-and is not overwritten by RPM upgrades.
+Edit `~/.config/openshell/gateway.toml` directly. The package-owned template at
+`/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime and
+may change during an RPM upgrade. The active user copy is preserved. During a
+schema-v2 upgrade, the service replaces only the recognized package-generated
+v1 copy; it never rewrites an edited configuration. Before generating
+certificates or starting the gateway, the service runs
+`openshell-gateway config preflight` against the effective configuration and
+stops if validation fails.
 
 To apply environment variable overrides that persist across upgrades without
 editing the TOML file, add them to `~/.config/openshell/gateway.env`:
@@ -45,6 +50,21 @@ editing the TOML file, add them to `~/.config/openshell/gateway.env`:
 # Example: explicitly expose the primary listener on one host interface
 OPENSHELL_BIND_ADDRESS=192.168.1.10
 ```
+
+To select exact trusted runtime artifacts across the built-in Docker, Podman,
+or Kubernetes driver, set complete tagged or digest-pinned references:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor@sha256:<digest>
+```
+
+`OPENSHELL_SANDBOX_RUNTIME_IMAGE` and `OPENSHELL_SUPERVISOR_IMAGE` take
+precedence over explicit image fields in the selected driver's TOML table; the
+driver TOML takes precedence over the compiled release default. Preflight and
+startup use the same resolution. These values are trusted operator inputs, not
+sandbox request fields. Keep registry credentials in Podman's credential store
+rather than embedding them in image references.
 
 To override the path to the TOML config file entirely:
 
@@ -61,10 +81,9 @@ systemctl --user edit openshell-gateway
 
 ## TLS (mTLS)
 
-The RPM enables mutual TLS by default. The gateway requires a valid
-client certificate for all API connections. Its primary listener uses
-`127.0.0.1:17670`; Podman callback traffic uses the additional listener
-described in "Default configuration" above.
+The RPM enables mTLS user authentication by default. CLI clients present a valid
+client certificate; supervisors use the gateway CA and sandbox-scoped bearer tokens. Its primary listener uses
+`127.0.0.1:17670`; Podman supervisor sessions use that same listener.
 
 ### Auto-generated certificates
 
@@ -172,25 +191,20 @@ To disable TLS (not recommended for production):
 
 ## Sandbox TLS
 
-When mTLS is enabled, the Podman driver bind-mounts the client
-certificates into each sandbox container so the supervisor process can
-establish an mTLS connection back to the gateway.
+When TLS is enabled, the Podman driver bind-mounts the gateway CA into each
+supervisor container to authenticate the gateway. Supervisors authenticate their
+RPCs with sandbox-scoped bearer tokens. The user client certificate and private
+key are not mounted into supervisor or workload containers.
 
-The following TOML fields control the host-side paths of the client
-certificates that are mounted into sandbox containers:
+The following TOML field controls the host-side CA path:
 
 ```toml
 [openshell.gateway]
 guest_tls_ca = "/home/user/.local/state/openshell/tls/ca.crt"
-guest_tls_cert = "/home/user/.local/state/openshell/tls/client/tls.crt"
-guest_tls_key = "/home/user/.local/state/openshell/tls/client/tls.key"
 ```
 
-Inside the container, the supervisor reads them from:
-
-- `/etc/openshell/tls/client/ca.crt`
-- `/etc/openshell/tls/client/tls.crt`
-- `/etc/openshell/tls/client/tls.key`
+Inside the supervisor container, the CA is mounted at
+`/etc/openshell/tls/client/ca.crt`.
 
 On SELinux-enabled systems, the Podman driver automatically applies the
 `:z` relabel option to these bind mounts. No manual SELinux
@@ -215,15 +229,20 @@ overrides that persist across package upgrades.
 | TOML option | Default | Description |
 |-------------|---------|-------------|
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
-| `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
-| `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
-| `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
-| `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
+| `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
+| `[openshell.drivers.podman].default_image` | `nvcr.io/nvidia/base/ubuntu:24.04` | Default sandbox image. |
+| `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Trusted sandbox runtime image. `OPENSHELL_SANDBOX_RUNTIME_IMAGE` overrides this field. |
+| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Trusted supervisor image. `OPENSHELL_SUPERVISOR_IMAGE` overrides this field. |
+| `[openshell.gateway].guest_tls_ca` | auto-generated path | Gateway CA injected into the selected local driver for supervisor-to-gateway TLS. Sandbox identity uses a bearer token. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 
 The database URL is not accepted in TOML. When `OPENSHELL_DB_URL` is unset,
 the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
+The SQLite database runs in WAL mode with `synchronous=FULL` (SSH session
+issuance alone uses `NORMAL`), so
+`openshell.db-wal` and `openshell.db-shm` sit next to it and must be kept
+together with it; back it up with `sqlite3 openshell.db ".backup <copy>"`.
 
 ### Driver TOML settings
 
@@ -232,39 +251,42 @@ settings:
 
 ```toml
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway]
-compute_drivers = ["podman"]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+compute_driver = "podman"
 
 [openshell.drivers.podman]
-image_pull_policy = "missing"
 network_name = "openshell"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
+image_pull_policy = "if_not_present"
+health_check_interval_secs = 10
 stop_timeout_secs = 10
 ```
 
 ### Image management
 
 The gateway pulls container images automatically on first sandbox
-creation. The default pull policy is `missing`, which means images are
+creation. The default pull policy is `if_not_present`, which means images are
 pulled once and then cached by Podman.
 
 To update cached images:
 
 ```shell
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
-podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+podman pull nvcr.io/nvidia/base/ubuntu:24.04
 ```
 
 Or set `image_pull_policy = "always"` in
 `[openshell.drivers.podman]` to pull on every sandbox creation.
 
-To pin specific image versions instead of `:latest`:
+To pin specific image versions instead of `:latest`, set these values in
+`[openshell.drivers.podman]`:
 
-```shell
+```toml
+sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:v0.0.37"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:v0.0.37"
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37"
+default_image = "nvcr.io/nvidia/base/ubuntu:24.04"
 ```
 
 For air-gapped environments:
@@ -273,9 +295,9 @@ For air-gapped environments:
 
    ```shell
    podman pull ghcr.io/nvidia/openshell/supervisor:latest
-   podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman pull nvcr.io/nvidia/base/ubuntu:24.04
    podman save -o supervisor.tar ghcr.io/nvidia/openshell/supervisor:latest
-   podman save -o sandbox.tar ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+   podman save -o sandbox.tar nvcr.io/nvidia/base/ubuntu:24.04
    ```
 
 1. Transfer the tarballs to the air-gapped host and load them:

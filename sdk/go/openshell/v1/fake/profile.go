@@ -22,11 +22,19 @@ func newFakeProfileClient(closedFunc func() bool) *fakeProfileClient {
 }
 
 // List returns Unimplemented.
-func (c *fakeProfileClient) List(_ context.Context, _ string, _ ...v1.ListOptions) ([]*types.ProviderProfile, error) {
+func (c *fakeProfileClient) List(_ string, _ ...v1.ListOptions) (*v1.Pager[*types.ProviderProfile], error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
 	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "List is not supported by the fake client"}
+}
+
+// ListAll returns Unimplemented.
+func (c *fakeProfileClient) ListAll(_ context.Context, _ string, _ ...v1.ListOptions) ([]*types.ProviderProfile, error) {
+	if c.closedFunc() {
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+	}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "ListAll is not supported by the fake client"}
 }
 
 // Get returns Unimplemented.
@@ -62,11 +70,11 @@ func (c *fakeProfileClient) Lint(_ context.Context, _ string, _ []types.ProfileI
 }
 
 // Delete returns Unimplemented.
-func (c *fakeProfileClient) Delete(_ context.Context, _, _ string) (bool, error) {
+func (c *fakeProfileClient) Delete(_ context.Context, _, _ string, _ ...v1.DeleteOptions) (*types.DeletionResult, error) {
 	if c.closedFunc() {
-		return false, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
+		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
-	return false, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
+	return nil, &types.StatusError{Code: types.ErrorUnimplemented, Message: "Delete is not supported by the fake client"}
 }
 
 // Compile-time check that fakeProfileClient implements v1.ProfileInterface.

@@ -5,6 +5,7 @@ package v1
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/converter"
 	pb "github.com/NVIDIA/OpenShell/sdk/go/proto/openshellv1"
@@ -19,37 +20,41 @@ func newProfileClient(conn grpc.ClientConnInterface) *profileClient {
 	return &profileClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (p *profileClient) List(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
-	req := &pb.ListProviderProfilesRequest{
-		Workspace: workspace,
-	}
-	if len(opts) > 0 {
-		if opts[0].Limit < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "limit must not be negative"}
-		}
-		if opts[0].Offset < 0 {
-			return nil, &StatusError{Code: ErrorInvalidArgument, Message: "offset must not be negative"}
-		}
-		req.Limit = uint32(opts[0].Limit)
-		req.Offset = uint32(opts[0].Offset)
-	}
-
-	resp, err := p.client.ListProviderProfiles(ctx, req)
+func (p *profileClient) List(workspace string, opts ...ListOptions) (*Pager[*ProviderProfile], error) {
+	pageSize, err := listPageSize(opts)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
+	var pageToken string
+	if len(opts) > 0 {
+		pageToken = opts[0].PageToken
+	}
+	return newPager(pageToken, func(ctx context.Context, pageToken string) (*Page[*ProviderProfile], error) {
+		req := &pb.ListProviderProfilesRequest{WorkspaceScope: profileWorkspaceScope(workspace), PageSize: pageSize, PageToken: pageToken}
+		resp, err := p.client.ListProviderProfiles(ctx, req)
+		if err != nil {
+			return nil, converter.FromGRPCError(err)
+		}
+		profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
+		for _, profile := range resp.GetProfiles() {
+			profiles = append(profiles, converter.ProviderProfileFromProto(profile))
+		}
+		return &Page[*ProviderProfile]{Items: profiles, NextPageToken: resp.GetNextPageToken()}, nil
+	}), nil
+}
 
-	profiles := make([]*ProviderProfile, 0, len(resp.GetProfiles()))
-	for _, pp := range resp.GetProfiles() {
-		profiles = append(profiles, converter.ProviderProfileFromProto(pp))
+func (p *profileClient) ListAll(ctx context.Context, workspace string, opts ...ListOptions) ([]*ProviderProfile, error) {
+	pager, err := p.List(workspace, opts...)
+	if err != nil {
+		return nil, err
 	}
-	return profiles, nil
+	return pager.All(ctx)
 }
 
 func (p *profileClient) Get(ctx context.Context, workspace, id string) (*ProviderProfile, error) {
 	resp, err := p.client.GetProviderProfile(ctx, &pb.GetProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+		Id:             id,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -62,10 +67,15 @@ func (p *profileClient) Import(ctx context.Context, workspace string, items []Pr
 	for i := range items {
 		pbItems[i] = converter.ProfileImportItemToProto(&items[i])
 	}
+	if profilesRequireStablePlaceholders(pbItems) {
+		if _, err := p.lint(ctx, workspace, pbItems); err != nil {
+			return nil, err
+		}
+	}
 
 	resp, err := p.client.ImportProviderProfiles(ctx, &pb.ImportProviderProfilesRequest{
-		Profiles:  pbItems,
-		Workspace: workspace,
+		Profiles:       pbItems,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -91,11 +101,17 @@ func (p *profileClient) Import(ctx context.Context, workspace string, items []Pr
 }
 
 func (p *profileClient) Update(ctx context.Context, workspace, id string, expectedResourceVersion uint64, item ProfileImportItem) (*UpdateResult, error) {
+	pbItem := converter.ProfileImportItemToProto(&item)
+	if items := []*pb.ProviderProfileImportItem{pbItem}; profilesRequireStablePlaceholders(items) {
+		if _, err := p.lint(ctx, workspace, items); err != nil {
+			return nil, err
+		}
+	}
 	resp, err := p.client.UpdateProviderProfiles(ctx, &pb.UpdateProviderProfilesRequest{
 		Id:                      id,
-		Profile:                 converter.ProfileImportItemToProto(&item),
+		Profile:                 pbItem,
 		ExpectedResourceVersion: expectedResourceVersion,
-		Workspace:               workspace,
+		WorkspaceScope:          profileWorkspaceScope(workspace),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
@@ -121,12 +137,9 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 		pbItems[i] = converter.ProfileImportItemToProto(&items[i])
 	}
 
-	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{
-		Profiles:  pbItems,
-		Workspace: workspace,
-	})
+	resp, err := p.lint(ctx, workspace, pbItems)
 	if err != nil {
-		return nil, converter.FromGRPCError(err)
+		return nil, err
 	}
 
 	result := &LintResult{
@@ -142,13 +155,41 @@ func (p *profileClient) Lint(ctx context.Context, workspace string, items []Prof
 	return result, nil
 }
 
-func (p *profileClient) Delete(ctx context.Context, workspace, id string) (bool, error) {
-	resp, err := p.client.DeleteProviderProfile(ctx, &pb.DeleteProviderProfileRequest{
-		Id:        id,
-		Workspace: workspace,
+func profilesRequireStablePlaceholders(items []*pb.ProviderProfileImportItem) bool {
+	for _, item := range items {
+		for _, credential := range item.GetProfile().GetCredentials() {
+			if credential.GetStablePlaceholder() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Lint acknowledges feature support before an opt-in is persisted. Legacy
+// gateways can otherwise silently discard unknown credential fields.
+func (p *profileClient) lint(ctx context.Context, workspace string, items []*pb.ProviderProfileImportItem) (*pb.LintProviderProfilesResponse, error) {
+	resp, err := p.client.LintProviderProfiles(ctx, &pb.LintProviderProfilesRequest{
+		Profiles:       items,
+		WorkspaceScope: profileWorkspaceScope(workspace),
 	})
 	if err != nil {
-		return false, converter.FromGRPCError(err)
+		return nil, converter.FromGRPCError(err)
 	}
-	return resp.GetDeleted(), nil
+	if profilesRequireStablePlaceholders(items) && !resp.GetSupportsStablePlaceholder() {
+		return nil, fmt.Errorf("gateway does not support stable_placeholder; upgrade the gateway before enabling it")
+	}
+	return resp, nil
+}
+
+func (p *profileClient) Delete(ctx context.Context, workspace, id string, opts ...DeleteOptions) (*DeletionResult, error) {
+	resp, err := p.client.DeleteProviderProfile(ctx, &pb.DeleteProviderProfileRequest{
+		AllowMissing:   allowMissing(opts),
+		Id:             id,
+		WorkspaceScope: profileWorkspaceScope(workspace),
+	})
+	if err != nil {
+		return nil, converter.FromGRPCError(err)
+	}
+	return &DeletionResult{Outcome: DeletionOutcome(resp.GetOutcome())}, nil
 }

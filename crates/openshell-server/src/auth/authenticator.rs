@@ -13,9 +13,10 @@
 //! the chain — fail-closed.
 //!
 //! Live authenticators slotting into the chain:
-//! - [`super::sandbox_jwt::SandboxJwtAuthenticator`] — gateway-minted JWTs
-//! - [`super::k8s_sa::K8sServiceAccountAuthenticator`] — K8s projected SA
-//!   tokens (path-scoped to `IssueSandboxToken`)
+//! - [`super::sandbox_jwt::SandboxSessionJwtAuthenticator`] — generation-bound
+//!   gateway session JWTs
+//! - [`super::compute_driver::ComputeDriverAuthenticator`] — driver-native
+//!   sandbox bootstrap credentials (path-scoped to `IssueSandboxToken`)
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
 use super::principal::Principal;
 use async_trait::async_trait;
@@ -44,6 +45,17 @@ pub trait Authenticator: Send + Sync + 'static {
         headers: &http::HeaderMap,
         path: &str,
     ) -> Result<Option<Principal>, Status>;
+}
+
+/// Bearer credential from the request's `authorization` header, if any.
+///
+/// The scheme is matched case-insensitively. Non-Bearer or non-UTF-8 headers
+/// yield `None` so the chain falls through.
+pub fn bearer_credential(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get(http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(openshell_core::auth::strip_bearer_scheme)
 }
 
 /// First-match-wins authenticator chain.
@@ -147,6 +159,22 @@ mod tests {
                 provider: IdentityProvider::Oidc,
             },
         })
+    }
+
+    #[test]
+    fn bearer_credential_matches_scheme_case_insensitively() {
+        for scheme in ["Bearer", "bearer", "BEARER"] {
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::AUTHORIZATION,
+                format!("{scheme} abc").parse().unwrap(),
+            );
+            assert_eq!(bearer_credential(&headers), Some("abc"), "{scheme}");
+        }
+        let mut headers = http::HeaderMap::new();
+        assert_eq!(bearer_credential(&headers), None);
+        headers.insert(http::header::AUTHORIZATION, "Basic abc".parse().unwrap());
+        assert_eq!(bearer_credential(&headers), None);
     }
 
     #[tokio::test]

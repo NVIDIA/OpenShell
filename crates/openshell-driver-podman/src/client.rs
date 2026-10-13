@@ -88,6 +88,8 @@ pub fn validate_name(name: &str) -> Result<(), PodmanApiError> {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerInspect {
+    #[serde(default)]
+    pub mounts: Option<Vec<Value>>,
     pub id: String,
     pub name: String,
     pub state: ContainerState,
@@ -115,6 +117,14 @@ pub struct ContainerState {
     pub started_at: Option<String>,
     #[serde(default)]
     pub finished_at: Option<String>,
+    /// A driver-local diagnostic derived from a narrowly allow-listed
+    /// container-log marker. It is never deserialized from Podman.
+    #[serde(skip)]
+    pub startup_diagnostic: Option<String>,
+    /// Exit status of the sandbox's supervisor companion when it stopped
+    /// before the workload. It is never deserialized from Podman.
+    #[serde(skip)]
+    pub supervisor_exit_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -160,6 +170,8 @@ pub struct PortBinding {
 pub struct ContainerConfig {
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub user: String,
 }
 
 /// Immutable image metadata needed to bind OCI identity inspection to launch.
@@ -173,10 +185,12 @@ pub struct ImageInspect {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(default, rename_all = "PascalCase")]
 pub struct ImageConfig {
-    #[serde(default)]
     pub user: String,
+    pub env: Vec<String>,
+    pub working_dir: String,
+    pub volumes: Option<HashMap<String, Value>>,
 }
 
 /// A container summary returned by the list API.
@@ -218,9 +232,53 @@ pub struct PortMappingEntry {
 #[serde(rename_all = "PascalCase")]
 pub struct VolumeInspect {
     #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub labels: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
     pub driver: String,
     #[serde(default)]
     pub options: HashMap<String, String>,
+}
+
+impl VolumeInspect {
+    /// Whether metadata matches a managed local volume with the exact labels
+    /// and requested ownership options. This does not inspect filesystem ownership.
+    pub(crate) fn matches_managed_volume(
+        &self,
+        labels: &HashMap<String, String>,
+        requested_owner: Option<(u32, u32)>,
+    ) -> bool {
+        self.driver == "local"
+            && self.labels.as_ref() == Some(labels)
+            && self.options_match_requested_owner(requested_owner)
+    }
+
+    /// Whether option metadata matches the requested owner. `None` means no
+    /// ownership options were requested and requires an empty options map.
+    /// This does not inspect filesystem ownership. Podman records the parsed
+    /// `UID` and `GID` next to the raw `o` option.
+    pub(crate) fn options_match_requested_owner(
+        &self,
+        requested_owner: Option<(u32, u32)>,
+    ) -> bool {
+        let Some((uid, gid)) = requested_owner else {
+            return self.options.is_empty();
+        };
+        self.options.get("o").map(String::as_str) == Some(format!("uid={uid},gid={gid}").as_str())
+            && self.options.iter().all(|(key, value)| match key.as_str() {
+                "o" => true,
+                "UID" => *value == uid.to_string(),
+                "GID" => *value == gid.to_string(),
+                _ => false,
+            })
+    }
+
+    pub(crate) fn admission_identity(&self) -> Value {
+        serde_json::json!({"name": self.name, "driver": self.driver, "options": self.options, "created_at": self.created_at})
+    }
 }
 
 /// A Podman event from the events stream.
@@ -272,9 +330,13 @@ pub struct HostInfo {
 /// Podman returns `host.security.rootless: true` when the daemon is
 /// running without root privileges (rootless mode).
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SecurityInfo {
     #[serde(default)]
     pub rootless: bool,
+    /// Whether the Podman host has `AppArmor` support enabled.
+    #[serde(default)]
+    pub apparmor_enabled: bool,
 }
 
 // ── Client ───────────────────────────────────────────────────────────────
@@ -446,6 +508,93 @@ impl PodmanClient {
             .await
     }
 
+    pub(crate) async fn create_typed_container(
+        &self,
+        spec: &(impl serde::Serialize + Sync),
+    ) -> Result<String, PodmanApiError> {
+        #[derive(serde::Deserialize)]
+        struct Created {
+            #[serde(rename = "Id", alias = "ID")]
+            id: String,
+        }
+        let body =
+            serde_json::to_vec(spec).map_err(|error| PodmanApiError::Json(error.to_string()))?;
+        let (status, bytes) = self
+            .request_raw(
+                hyper::Method::POST,
+                "/libpod/containers/create",
+                "application/json",
+                body.into(),
+            )
+            .await?;
+        if !status.is_success() {
+            return Err(error_from_response(status.as_u16(), &bytes));
+        }
+        let created: Created = serde_json::from_slice(&bytes)
+            .map_err(|error| PodmanApiError::Json(error.to_string()))?;
+        validate_name(&created.id)?;
+        Ok(created.id)
+    }
+
+    pub(crate) async fn copy_to_container(
+        &self,
+        name: &str,
+        destination: &str,
+        archive: Vec<u8>,
+    ) -> Result<(), PodmanApiError> {
+        validate_name(name)?;
+        let (status, bytes) = self
+            .request_raw(
+                hyper::Method::PUT,
+                &format!(
+                    "/libpod/containers/{name}/archive?path={}",
+                    url_encode(destination)
+                ),
+                "application/x-tar",
+                archive.into(),
+            )
+            .await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
+        }
+    }
+
+    pub(crate) async fn verify_isolation_fence(&self, id: &str) -> Result<(), PodmanApiError> {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct HostConfig {
+            network_mode: String,
+            privileged: bool,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct FenceInspect {
+            host_config: HostConfig,
+            network_settings: NetworkSettings,
+        }
+        validate_name(id)?;
+        let inspected: FenceInspect = self
+            .request_json(
+                hyper::Method::GET,
+                &format!("/libpod/containers/{id}/json"),
+                None,
+            )
+            .await?;
+        if inspected.host_config.network_mode != "none"
+            || inspected.host_config.privileged
+            || inspected
+                .network_settings
+                .networks
+                .keys()
+                .any(|name| name != "none")
+        {
+            return Err(PodmanApiError::InvalidInput("sandbox requires an unprivileged container with network mode none and no attached networks".into()));
+        }
+        Ok(())
+    }
+
     /// Start a container by name or ID.
     pub async fn start_container(&self, name: &str) -> Result<(), PodmanApiError> {
         validate_name(name)?;
@@ -550,6 +699,28 @@ impl PodmanClient {
         .await
     }
 
+    /// Read a bounded tail of a container's combined output.
+    ///
+    /// Callers must treat this as sensitive workload output. The Podman
+    /// watcher uses it only to recognize fixed, driver-owned startup markers;
+    /// it never forwards the raw output to the gateway.
+    pub async fn container_logs(&self, name: &str) -> Result<Bytes, PodmanApiError> {
+        validate_name(name)?;
+        let (status, bytes) = self
+            .request(
+                hyper::Method::GET,
+                &format!("/libpod/containers/{name}/logs?stdout=true&stderr=true&tail=200"),
+                None,
+                API_TIMEOUT,
+            )
+            .await?;
+        if status.is_success() {
+            Ok(bytes)
+        } else {
+            Err(error_from_response(status.as_u16(), &bytes))
+        }
+    }
+
     /// List containers matching label filters (e.g. `&["openshell.managed=true"]`).
     pub async fn list_containers(
         &self,
@@ -567,11 +738,71 @@ impl PodmanClient {
 
     // ── Volume operations ────────────────────────────────────────────────
 
-    /// Create a named volume. Idempotent (conflict is ignored).
-    pub async fn create_volume(&self, name: &str) -> Result<(), PodmanApiError> {
+    /// Create and inspect a local volume. HTTP 409 conflicts also proceed to
+    /// inspection; callers must verify the returned labels and options.
+    async fn create_volume(
+        &self,
+        name: &str,
+        labels: &HashMap<String, String>,
+        options: &HashMap<String, String>,
+    ) -> Result<VolumeInspect, PodmanApiError> {
         validate_name(name)?;
-        self.create_ignore_conflict("/libpod/volumes/create", &serde_json::json!({"Name": name}))
-            .await
+        let mut body = serde_json::json!({
+            "Name": name,
+            "Driver": "local",
+            "Labels": labels,
+        });
+        if !options.is_empty() {
+            body["Options"] = serde_json::json!(options);
+        }
+        self.create_ignore_conflict("/libpod/volumes/create", &body)
+            .await?;
+        self.inspect_volume(name).await
+    }
+
+    /// Never adopt an unrelated existing volume on a private provisioning path.
+    ///
+    /// With `owner`, Podman creates the volume root owned by that UID and GID,
+    /// so a non-root workload can use it without a privileged chown.
+    pub(crate) async fn create_owned_volume(
+        &self,
+        name: &str,
+        sandbox_id: &str,
+        workspace: &str,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(), PodmanApiError> {
+        let labels = HashMap::from([
+            (
+                openshell_core::driver_utils::LABEL_SANDBOX_ID.to_string(),
+                sandbox_id.to_string(),
+            ),
+            (
+                openshell_core::driver_utils::LABEL_SANDBOX_WORKSPACE.to_string(),
+                workspace.to_string(),
+            ),
+        ]);
+        match self.inspect_volume(name).await {
+            Ok(existing) => {
+                if !existing.matches_managed_volume(&labels, owner) {
+                    return Err(PodmanApiError::InvalidInput(
+                        "private volume name collides with an unrelated resource".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(PodmanApiError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let options = owner.map_or_else(HashMap::new, |(uid, gid)| {
+            HashMap::from([("o".to_string(), format!("uid={uid},gid={gid}"))])
+        });
+        let created = self.create_volume(name, &labels, &options).await?;
+        if !created.matches_managed_volume(&labels, owner) {
+            return Err(PodmanApiError::InvalidInput(
+                "private volume ownership verification failed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Remove a named volume. Idempotent (not-found is ignored).
@@ -674,26 +905,6 @@ impl PodmanClient {
         .await
     }
 
-    /// Inspect a network and return the gateway IP of its first subnet.
-    ///
-    /// The gateway IP is the host's address on the bridge network, used by
-    /// sandbox containers to call back to the gateway server.
-    pub async fn network_gateway_ip(&self, name: &str) -> Result<Option<String>, PodmanApiError> {
-        validate_name(name)?;
-        let encoded = url_encode(name);
-        let path = format!("/libpod/networks/{encoded}/json");
-        let resp: Value = self.request_json(hyper::Method::GET, &path, None).await?;
-        // The response has "subnets": [{"gateway": "10.89.1.1", "subnet": "..."}]
-        let gateway = resp
-            .get("subnets")
-            .and_then(|s| s.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|sub| sub.get("gateway"))
-            .and_then(|g| g.as_str())
-            .map(String::from);
-        Ok(gateway)
-    }
-
     // ── Image operations ────────────────────────────────────────────────
 
     /// Pull an image if it is not already present locally.
@@ -719,7 +930,7 @@ impl PodmanClient {
             url_encode(policy),
         );
         // Image pulls can be slow — use a generous timeout.
-        let pull_timeout = Duration::from_secs(600);
+        let pull_timeout = Duration::from_mins(10);
         let (status, bytes) = self
             .request(hyper::Method::POST, &path, None, pull_timeout)
             .await?;
@@ -959,13 +1170,17 @@ mod tests {
                     "cgroupVersion": "v2",
                     "networkBackend": "netavark",
                     "rootlessNetworkCmd": "pasta",
-                    "security": {"rootless": true}
+                    "security": {
+                        "rootless": true,
+                        "apparmorEnabled": true
+                    }
                 }
             }"#,
         )
         .unwrap();
 
         assert!(info.host.security.rootless);
+        assert!(info.host.security.apparmor_enabled);
         assert_eq!(info.host.rootless_network_cmd, "pasta");
     }
 
@@ -999,12 +1214,102 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn inspect_image_reads_immutable_id_and_oci_user() {
+    async fn create_owned_volume_verifies_requested_options() {
+        let labels =
+            r#"{"openshell.ai/sandbox-id":"sandbox-1","openshell.ai/sandbox-workspace":"team-a"}"#;
+        for (owner, options, accepted) in [
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","UID":"1234","GID":"1235"}"#,
+                true,
+            ),
+            (Some((1234, 1235)), r#"{"o":"uid=1234,gid=1235"}"#, true),
+            // Podman accepts either order, but OpenShell always requests uid first.
+            (Some((1234, 1235)), r#"{"o":"gid=1235,uid=1234"}"#, false),
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","UID":"0","GID":"1235"}"#,
+                false,
+            ),
+            (
+                Some((1234, 1235)),
+                r#"{"o":"uid=1234,gid=1235","device":"/srv/work"}"#,
+                false,
+            ),
+            (Some((1234, 1235)), "{}", false),
+            (None, "{}", true),
+            (None, r#"{"o":"uid=1234,gid=1235"}"#, false),
+            (None, r#"{"o":"bind","device":"/srv/work"}"#, false),
+        ] {
+            for existing in [false, true] {
+                let inspected = || {
+                    StubResponse::new(
+                        StatusCode::OK,
+                        format!(
+                            r#"{{"Name":"work","Driver":"local","Options":{options},"Labels":{labels}}}"#
+                        ),
+                    )
+                };
+                let responses = if existing {
+                    vec![inspected()]
+                } else {
+                    vec![
+                        StubResponse::new(StatusCode::NOT_FOUND, ""),
+                        StubResponse::new(StatusCode::CREATED, "{}"),
+                        inspected(),
+                    ]
+                };
+                let (socket_path, request_log, handle) =
+                    spawn_podman_stub("owned-volume", responses);
+                let result = PodmanClient::new(socket_path.clone())
+                    .create_owned_volume("work", "sandbox-1", "team-a", owner)
+                    .await;
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "owner {owner:?}, options {options}, existing {existing}: {result:?}"
+                );
+                handle.await.expect("stub task should finish");
+                let expected_requests = if existing {
+                    vec!["GET /v5.0.0/libpod/volumes/work/json"]
+                } else {
+                    vec![
+                        "GET /v5.0.0/libpod/volumes/work/json",
+                        "POST /v5.0.0/libpod/volumes/create",
+                        "GET /v5.0.0/libpod/volumes/work/json",
+                    ]
+                };
+                assert_eq!(
+                    request_log.lock().expect("request log lock").as_slice(),
+                    expected_requests,
+                );
+                let _ = std::fs::remove_file(socket_path);
+            }
+        }
+    }
+
+    #[test]
+    fn image_config_defaults_missing_oci_fields() {
+        let empty: ImageConfig = serde_json::from_str("{}").unwrap();
+        assert!(empty.user.is_empty());
+        assert!(empty.env.is_empty());
+        assert!(empty.working_dir.is_empty());
+        assert!(empty.volumes.is_none());
+
+        let partial: ImageConfig = serde_json::from_str(r#"{"User":"app:staff"}"#).unwrap();
+        assert_eq!(partial.user, "app:staff");
+        assert!(partial.env.is_empty());
+        assert!(partial.working_dir.is_empty());
+        assert!(partial.volumes.is_none());
+    }
+
+    #[tokio::test]
+    async fn inspect_image_reads_immutable_id_and_oci_config() {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "inspect-image",
             vec![StubResponse::new(
                 StatusCode::OK,
-                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff"}}"#,
+                r#"{"Id":"sha256:immutable","Config":{"User":"app:staff","Env":["A=one"],"WorkingDir":"/workspace/project","Volumes":{"/workspace/project/cache":{}}}}"#,
             )],
         );
         let client = PodmanClient::new(socket_path.clone());
@@ -1015,9 +1320,15 @@ mod tests {
             .expect("image inspect should parse");
 
         assert_eq!(image.id, "sha256:immutable");
-        assert_eq!(
-            image.config.as_ref().map(|config| config.user.as_str()),
-            Some("app:staff")
+        let config = image.config.expect("fixture image config");
+        assert_eq!(config.user, "app:staff");
+        assert_eq!(config.env, vec!["A=one"]);
+        assert_eq!(config.working_dir, "/workspace/project");
+        assert!(
+            config
+                .volumes
+                .as_ref()
+                .is_some_and(|volumes| volumes.contains_key("/workspace/project/cache"))
         );
         handle.await.expect("stub task should finish");
         assert_eq!(

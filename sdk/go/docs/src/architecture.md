@@ -76,8 +76,29 @@ exec := client.Exec()
 Some sub-clients have their own sub-clients. `ProviderInterface` exposes `Profiles()` and `Refresh()`:
 
 ```go
-profiles, err := client.Providers().Profiles().List(ctx, "default")
+profiles, err := client.Providers().Profiles().ListAll(ctx, "default")
 status, err := client.Providers().Refresh().GetStatus(ctx, "default", "openai", "api-key")
+```
+
+## Functional Options
+
+Many SDK entry points accept variadic option parameters that configure the call:
+
+```go
+auth, err := v1.RefreshableToken(tokenSource,
+    v1.WithLeeway(30*time.Second),
+    v1.WithLogger(logger),
+)
+```
+
+Options are applied in the order they are passed, so later options override earlier ones when they set the same field. **Nil options are silently ignored at every entry point.** You can safely build option lists conditionally without filtering out nil entries:
+
+```go
+opts := []v1.RefreshOption{
+    v1.WithLeeway(30 * time.Second),
+    maybeLogger(), // may return nil
+}
+auth, err := v1.RefreshableToken(tokenSource, opts...)
 ```
 
 ## gRPC Layer

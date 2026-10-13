@@ -9,12 +9,12 @@ use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 use crate::app::App;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
-    let t = &app.theme;
-    if app.providers_v2_enabled {
-        draw_v2(frame, app, area, focused);
-        return;
-    }
+    draw_v2(frame, app, area, focused);
+}
 
+#[allow(dead_code)]
+fn draw_legacy(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    let t = &app.theme;
     let show_ws = app.all_workspaces;
 
     let mut header_cells = Vec::new();

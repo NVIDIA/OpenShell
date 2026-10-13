@@ -50,7 +50,7 @@ ensure_anthropic_provider() {
   echo "Registering anthropic provider..."
   openshell provider create \
     --name anthropic \
-    --type claude \
+    --type claude-code \
     --credential "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
 }
 

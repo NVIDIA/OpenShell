@@ -9,7 +9,7 @@
 #
 # Quick start:
 #
-#   1. Start the gateway:
+#   1. Start the gateway (init first generates JWT keys in /var/lib/openshell/tls):
 #        docker compose up -d
 #
 #   2. Register the gateway with the CLI (one-time):
@@ -49,18 +49,15 @@
 #   bind-mount source when sandbox containers are created.  Named volumes
 #   cannot be used here because Docker resolves bind-mount sources against the
 #   host filesystem, not the container filesystem.
-#
-# Linux note:
-#   host.docker.internal and host.openshell.internal are not automatically
-#   added on Linux Docker.  Add the following under the gateway service:
-#     extra_hosts:
-#       - "host.docker.internal:host-gateway"
-#       - "host.openshell.internal:host-gateway"
 
 services:
   gateway:
-    image: ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG:-latest}
+    image: &gateway-image ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG:-latest}
     restart: unless-stopped
+
+    depends_on:
+      init:
+        condition: service_completed_successfully
 
     # Clear the default CMD so gateway.toml owns all settings (see note above).
     command: []
@@ -79,13 +76,8 @@ services:
     user: "0"
 
     ports:
-      # gRPC / control-plane API  (used by the openshell CLI and sandbox callbacks)
-      # The Docker driver injects host.openshell.internal:<gateway-port> into sandbox
-      # containers as the callback endpoint.  The gateway's internal port is 8080, so
-      # host port 8080 must be published at the same number so that
-      # host.openshell.internal:8080 routes to the gateway container.
-      # gateway.toml binds to 127.0.0.1 — the Docker driver adds the bridge listener
-      # automatically so sandbox containers can reach the gateway without 0.0.0.0.
+      # gRPC / control-plane API. The Docker supervisor uses host networking
+      # and reaches this primary loopback endpoint through the published port.
       - "127.0.0.1:${OPENSHELL_PORT:-8080}:8080"
       # Health endpoint  (GET /healthz, GET /readyz)
       - "127.0.0.1:${OPENSHELL_HEALTH_PORT:-8081}:8081"
@@ -101,7 +93,8 @@ services:
       # (e.g. /var/lib/openshell/gateway): the path must match exactly on
       # both the host and inside the container, and a single gateway per host
       # is the expected topology.
-      - type: bind
+      - &openshell-data
+        type: bind
         source: /var/lib/openshell
         target: /var/lib/openshell
         bind:
@@ -131,3 +124,14 @@ services:
       # bind-mounted directory so its path is resolvable by the host Docker daemon.
       XDG_DATA_HOME: /var/lib/openshell
       HOME: /var/lib/openshell
+
+  # One-shot: generates the sandbox JWT keys (kept if present).
+  init:
+    image: *gateway-image
+    user: "0"
+    restart: "no"
+    command: ["generate-certs", "--output-dir", "/var/lib/openshell/tls"]
+    environment:
+      HOME: /var/lib/openshell
+    volumes:
+      - *openshell-data

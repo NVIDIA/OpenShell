@@ -24,9 +24,8 @@ func TestBrowserCommand_Platform(t *testing.T) {
 		assert.Equal(t, "xdg-open", name)
 		assert.Equal(t, []string{"https://example.com/auth"}, args)
 	case "windows":
-		assert.Equal(t, "cmd", name)
-		assert.Contains(t, args, "/c")
-		assert.Contains(t, args, "start")
+		assert.Equal(t, "rundll32", name)
+		assert.Equal(t, []string{"url.dll,FileProtocolHandler", "https://example.com/auth"}, args)
 	default:
 		// Unknown platform should still return something (even if it fails).
 		assert.NotEmpty(t, name)

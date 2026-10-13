@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::container::HostSupportContainer;
+use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
@@ -40,6 +41,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         generation += 1
         current_token = f"access-token-{generation}"
+        print(f"issued-token generation={generation}", flush=True)
         body = json.dumps({
             "access_token": current_token,
             "expires_in": 300,
@@ -52,9 +54,11 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        authorized = self.headers.get("Authorization") == f"Bearer {current_token}"
+        print(f"resource-request path={self.path} authorized={authorized}", flush=True)
         if self.path == "/":
             self.send_response(204)
-        elif self.path == "/probe" and self.headers.get("Authorization") == f"Bearer {current_token}":
+        elif self.path == "/probe" and authorized:
             self.send_response(204)
         else:
             self.send_response(401)
@@ -63,7 +67,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_args):
         pass
 
-ThreadingHTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+ThreadingHTTPServer(("0.0.0.0", __PORT__), Handler).serve_forever()
 "#;
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {
@@ -97,7 +101,7 @@ async fn run_cli_with_env(args: &[&str], env: &[(&str, &str)]) -> Result<String,
 
 async fn delete_provider_resources() {
     let _ = run_cli(&["provider", "delete", PROVIDER_NAME]).await;
-    let _ = run_cli(&["provider", "profile", "delete", PROFILE_ID]).await;
+    let _ = run_cli(&["profile", "delete", PROFILE_ID]).await;
 }
 
 fn write_profile(resource_port: u16, token_port: u16) -> Result<NamedTempFile, String> {
@@ -106,7 +110,7 @@ fn write_profile(resource_port: u16, token_port: u16) -> Result<NamedTempFile, S
         .tempfile()
         .map_err(|error| format!("create profile: {error}"))?;
     let profile = format!(
-        r#"id: {PROFILE_ID}
+        r"id: {PROFILE_ID}
 display_name: Stable refresh handle E2E
 category: other
 credentials:
@@ -139,8 +143,8 @@ endpoints:
       - 172.0.0.0/8
       - 192.168.0.0/16
 binaries:
-  - /usr/bin/curl
-"#
+  - /**
+"
     );
     file.write_all(profile.as_bytes())
         .map_err(|error| format!("write profile: {error}"))?;
@@ -155,7 +159,7 @@ fn write_policy(resource_port: u16) -> Result<NamedTempFile, String> {
         .tempfile()
         .map_err(|error| format!("create policy: {error}"))?;
     let policy = format!(
-        r#"version: 1
+        r"version: 1
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /proc, /etc, /dev/urandom]
@@ -181,8 +185,8 @@ network_policies:
           - 172.0.0.0/8
           - 192.168.0.0/16
     binaries:
-      - path: /usr/bin/curl
-"#
+      - path: /**
+"
     );
     file.write_all(policy.as_bytes())
         .map_err(|error| format!("write policy: {error}"))?;
@@ -193,7 +197,7 @@ network_policies:
 
 async fn configure_refresh(profile: &NamedTempFile) -> Result<(), String> {
     let profile_path = profile.path().to_string_lossy().into_owned();
-    run_cli(&["provider", "profile", "import", "--file", &profile_path]).await?;
+    run_cli(&["profile", "import", "--file", &profile_path]).await?;
     run_cli_with_env(
         &[
             "provider",
@@ -295,7 +299,10 @@ async fn wait_for_probe_failure(sandbox: &SandboxGuard) -> Result<(), String> {
 #[tokio::test]
 async fn long_running_process_survives_rotations_and_reconfigure_revokes() -> Result<(), String> {
     delete_provider_resources().await;
-    let fixture = HostSupportContainer::start_python(FIXTURE_SCRIPT, 8000).await?;
+    let fixture_port = find_free_port();
+    let fixture_script = FIXTURE_SCRIPT.replace("__PORT__", &fixture_port.to_string());
+    let fixture =
+        HostSupportContainer::start_python_on_host_network(&fixture_script, fixture_port).await?;
     let profile = write_profile(fixture.port, fixture.port)?;
     let policy = write_policy(fixture.port)?;
     configure_refresh(&profile).await?;
@@ -311,9 +318,7 @@ echo {READY_MARKER}
 while true; do
   if [ -f /sandbox/probe-trigger ]; then
     rm -f /sandbox/probe-trigger
-    if curl --fail --silent --output /dev/null \
-      --header "Authorization: Bearer $REFRESH_E2E_ACCESS_TOKEN" \
-      {resource_url}; then
+    if /usr/bin/python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'; then
       echo ok > /sandbox/probe-result
     else
       echo failed > /sandbox/probe-result
@@ -331,7 +336,10 @@ done"#
 
     let result = async {
         if trigger_probe(&sandbox).await? != "ok" {
-            return Err("initial long-running credential probe failed".to_string());
+            return Err(format!(
+                "initial long-running credential probe failed; fixture logs:\n{}",
+                fixture.logs().unwrap_or_else(|error| error)
+            ));
         }
 
         for _ in 0..12 {
@@ -343,7 +351,7 @@ done"#
         wait_for_probe_failure(&sandbox).await?;
 
         let fresh_probe = format!(
-            "curl --fail --silent --output /dev/null --header \"Authorization: Bearer $REFRESH_E2E_ACCESS_TOKEN\" {resource_url}"
+            r#"/usr/bin/python3 -c 'import os, urllib.request; request = urllib.request.Request("{resource_url}", headers=dict(Authorization="Bearer " + os.environ["REFRESH_E2E_ACCESS_TOKEN"])); urllib.request.urlopen(request, timeout=5).read()'"#
         );
         sandbox.exec(&["sh", "-c", &fresh_probe]).await?;
         Ok(())

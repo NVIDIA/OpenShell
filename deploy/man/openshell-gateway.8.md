@@ -14,11 +14,13 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway** **config preflight** [**--path** *PATH* | **--** *GATEWAY_ARGS*...]
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
 manages sandbox lifecycle, stores provider credentials, delivers
-network and filesystem policies to sandboxes, routes inference
+network and filesystem policies to sandboxes, manages provider access
 requests, and provides the SSH tunnel endpoint for CLI-to-sandbox
 connections.
 
@@ -58,12 +60,11 @@ TLS.
     stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
-**--drivers** *DRIVER*\[,*DRIVER*\]
-:   Compute driver. Accepts a comma-delimited list. The gateway
-    currently requires exactly one driver. Options: **podman**,
+**--compute-driver** *DRIVER*
+:   Compute driver. Selects exactly one driver. Options: **podman**,
     **docker**, **kubernetes**, **vm**. When unset, the gateway
     auto-detects Kubernetes, then Podman, then Docker. VM is opt-in.
-    Environment: **OPENSHELL_DRIVERS**.
+    Environment: **OPENSHELL_COMPUTE_DRIVER**.
 
 **--tls-cert** *PATH*
 :   Path to server TLS certificate file. Defaults to the local generated
@@ -92,6 +93,14 @@ TLS.
     the Kubernetes compute driver.
     Environment: **OPENSHELL_ENABLE_MTLS_AUTH**.
 
+**--enable-operator-auth** *BOOL*
+:   Enable direct mTLS operators with a trusted client certificate containing
+    **OU=operator**. Grants user/platform-admin capabilities across all
+    workspaces and access to runtime credential retrieval. Defaults off.
+    Requires TLS and a client CA, independently of ordinary mTLS user auth
+    and OIDC. Do not combine an operator certificate with bearer headers.
+    Environment: **OPENSHELL_ENABLE_OPERATOR_AUTH**.
+
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
     address is **0.0.0.0** (the RPM default), disabling TLS exposes the
@@ -111,6 +120,42 @@ Compute driver settings such as sandbox image, callback endpoint, image
 pull policy, network name, VM state directory, and guest TLS material are
 configured in the TOML file passed with **--config**.
 
+# CONFIGURATION PREFLIGHT
+
+Validate a gateway configuration before starting the daemon:
+
+    openshell-gateway config preflight [--path PATH | -- GATEWAY_ARGS...]
+
+With no path, preflight validates a nonempty OPENSHELL_GATEWAY_CONFIG. If that
+variable is unset, it optionally validates an auto-discovered XDG config. The
+absence of either config still validates the effective daemon arguments. An explicit missing path, legacy schema-v1
+file, invalid TOML, symlink, or nonregular file fails with a nonzero status.
+Preflight merges file and environment values and applies read-only startup checks
+for selector and socket normalization, registered compute-driver configuration,
+rate limits, TLS and mTLS, interceptors, and middleware. When a selected file
+omits the selector, it validates configured tables for auto-detectable drivers
+without running socket or process-based detection probes. It does not construct a
+compute driver or connect to a transport. Preflight never changes the file and
+reports that failed input was preserved.
+
+Arguments after **--** replace **--path** mode and are parsed as the exact gateway
+daemon invocation. Package wrappers use this form so command-line overrides are
+validated before the same arguments reach startup.
+
+An explicitly selected local **vm** driver also checks **mke2fs** or **mkfs.ext4**, **debugfs**, and **e2fsck**. Install e2fsprogs 1.43 or newer with the operating system's package manager, then run preflight with the gateway service's account, working directory, configuration, and environment. The command reports selected executable paths and versions. A restricted service **PATH** can select different tools from an interactive shell; include the installation's bin and sbin directories in that service's environment.
+
+Each executable receives only **-V**, with a five-second deadline and an 8 KiB output limit per stream. Missing, non-executable, unsupported, or failing tools return nonzero status with installation or repair guidance. Preflight creates no images or runtime state and does not start the VM driver. Other drivers do not require these tools. A remote driver endpoint reports that host tool checks were not performed; check a local VM configuration on that host in the driver service's environment.
+
+The Debian and Ubuntu systemd user unit runs preflight before certificate
+generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
+snap wrapper replays its effective daemon arguments through preflight. It first
+uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
+service-specific gateway.toml path whenever it exists or is a symlink. The legacy
+system service uses SNAP_COMMON/gateway.toml; the user service uses
+SNAP_USER_COMMON/.config/openshell/gateway.toml. A broken symlink
+fails preflight before the gateway is started. Correct or manually migrate an
+operator-owned v1 file, then run preflight again before restarting the service.
+
 # SYSTEMD INTEGRATION
 
 The package installs a systemd user unit at
@@ -127,8 +172,9 @@ View logs:
     journalctl --user -u openshell-gateway
     journalctl --user -u openshell-gateway -f
 
-The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
-step on first start. This generates a self-signed PKI bundle for mTLS
+The unit runs **openshell-gateway config preflight** and then
+**openshell-gateway generate-certs** as **ExecStartPre** steps. Certificate
+generation creates a self-signed PKI bundle for mTLS
 and sandbox JWT signing material, adding missing JWT files to older
 TLS-only installs when needed. The packaged unit sets
 **OPENSHELL_LOCAL_TLS_DIR** to *~/.local/state/openshell/tls* and uses that
@@ -138,6 +184,15 @@ need a custom bundle location.
 
 The gateway then starts from built-in defaults and reads
 *~/.config/openshell/gateway.toml* when that file exists.
+
+The user service also reads *~/.config/openshell/gateway.env* for both config
+preflight and startup. **OPENSHELL_SANDBOX_RUNTIME_IMAGE** and
+**OPENSHELL_SUPERVISOR_IMAGE** accept complete tagged or digest-pinned OCI
+references for the built-in Docker, Podman, and Kubernetes drivers. These
+variables take precedence over explicit image fields in the selected driver's
+TOML table, which take precedence over compiled release defaults.
+These are trusted gateway inputs and cannot be supplied by sandbox requests.
+Do not embed registry credentials in image references.
 
 To persist the service across logouts:
 

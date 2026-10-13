@@ -21,10 +21,6 @@ ignore = [
     { id = "RUSTSEC-2026-0204", reason = "crossbeam-epoch pointer deref — transitive via metrics/quanta" },
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin attack — transitive via spiffe, no direct exposure" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile unmaintained — transitive via older kube/hyper" },
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name constraints — transitive via older rustls" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name constraints — transitive via older rustls" },
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL parsing panic — transitive via older rustls" },
-    { id = "RUSTSEC-2025-0068", reason = "serde_yml unsound+unmaintained — direct dep, no maintained alternative yet" },
 ]
 
 # -- Licenses ------------------------------------------------------------------
@@ -41,6 +37,9 @@ allow = [
     "BSD-2-Clause",
     "BSD-3-Clause",
     "BSL-1.0",
+    # Permissive, non-copyleft license pulled in by the prebuilt Z3 archive
+    # path (z3-sys -> zip -> bzip2); compatible with this Apache-2.0 project.
+    "bzip2-1.0.6",
     "ISC",
     "Zlib",
     "0BSD",
@@ -56,6 +55,9 @@ registries = []
 
 # -- Bans ----------------------------------------------------------------------
 [bans]
+deny = [
+    { name = "ring", wrappers = ["rustls", "rustls-webpki", "x509-parser"], reason = "Use the AWS-LC crypto backend instead. These wrappers are required only by rcgen's CA certificate parser and z3-sys's prebuilt archive downloader." },
+]
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"

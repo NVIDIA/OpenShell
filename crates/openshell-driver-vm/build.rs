@@ -3,13 +3,17 @@
 
 //! Build script for openshell-driver-vm.
 //!
-//! This crate embeds the sandbox supervisor plus the minimal libkrun runtime
+//! This crate embeds the sandbox, host supervisor, and minimal libkrun runtime
 //! artifacts it needs to boot VMs without a separate VM runtime binary.
 
 use std::path::{Path, PathBuf};
 use std::{env, fs};
 
 fn main() {
+    if env::var_os("CARGO_FEATURE_COMPUTE_DRIVER").is_none() {
+        return;
+    }
+
     println!("cargo:rerun-if-env-changed=OPENSHELL_VM_RUNTIME_COMPRESSED_DIR");
 
     if let Ok(dir) = env::var("OPENSHELL_VM_RUNTIME_COMPRESSED_DIR") {
@@ -19,8 +23,9 @@ fn main() {
             "libkrunfw.so.5.zst",
             "libkrun.dylib.zst",
             "libkrunfw.5.dylib.zst",
-            "gvproxy.zst",
             "openshell-sandbox.zst",
+            "openshell-supervisor.zst",
+            "openshell-vm-init.zst",
             "umoci.zst",
         ] {
             println!("cargo:rerun-if-changed={dir}/{name}");
@@ -38,7 +43,14 @@ fn main() {
             println!("cargo:warning=VM runtime not available for {target_os}-{target_arch}");
             generate_stub_resources(
                 &out_dir,
-                &["libkrun", "libkrunfw", "openshell-sandbox.zst", "umoci.zst"],
+                &[
+                    "libkrun",
+                    "libkrunfw",
+                    "openshell-sandbox.zst",
+                    "openshell-supervisor.zst",
+                    "openshell-vm-init.zst",
+                    "umoci.zst",
+                ],
             );
             return;
         }
@@ -54,32 +66,20 @@ fn main() {
             &[
                 &format!("{libkrun_name}.zst"),
                 &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
                 "openshell-sandbox.zst",
+                "openshell-supervisor.zst",
+                "openshell-vm-init.zst",
                 "umoci.zst",
             ],
         );
         return;
     };
 
-    if !compressed_dir.is_dir() {
-        println!(
-            "cargo:warning=Compressed runtime dir not found: {}",
-            compressed_dir.display()
-        );
-        println!("cargo:warning=Run: mise run vm:setup && mise run vm:supervisor");
-        generate_stub_resources(
-            &out_dir,
-            &[
-                &format!("{libkrun_name}.zst"),
-                &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
-                "openshell-sandbox.zst",
-                "umoci.zst",
-            ],
-        );
-        return;
-    }
+    assert!(
+        compressed_dir.is_dir(),
+        "Compressed runtime dir not found: {}. Run: mise run vm:setup && mise run vm:supervisor",
+        compressed_dir.display()
+    );
 
     let files = [
         (format!("{libkrun_name}.zst"), format!("{libkrun_name}.zst")),
@@ -87,27 +87,44 @@ fn main() {
             format!("{libkrunfw_name}.zst"),
             format!("{libkrunfw_name}.zst"),
         ),
-        ("gvproxy.zst".to_string(), "gvproxy.zst".to_string()),
         (
             "openshell-sandbox.zst".to_string(),
             "openshell-sandbox.zst".to_string(),
         ),
+        (
+            "openshell-supervisor.zst".to_string(),
+            "openshell-supervisor.zst".to_string(),
+        ),
+        (
+            "openshell-vm-init.zst".to_string(),
+            "openshell-vm-init.zst".to_string(),
+        ),
         ("umoci.zst".to_string(), "umoci.zst".to_string()),
     ];
 
-    let mut all_found = true;
+    for (src_name, _) in &files {
+        let src_path = compressed_dir.join(src_name);
+        let metadata = fs::metadata(&src_path).unwrap_or_else(|e| {
+            panic!(
+                "Required compressed artifact unavailable: {}: {e}",
+                src_path.display()
+            )
+        });
+        assert!(
+            metadata.is_file(),
+            "Required compressed artifact is not a file: {}",
+            src_path.display()
+        );
+        assert!(
+            metadata.len() != 0,
+            "Required compressed artifact is empty: {}",
+            src_path.display()
+        );
+    }
+
     for (src_name, dst_name) in &files {
         let src_path = compressed_dir.join(src_name);
         let dst_path = out_dir.join(dst_name);
-
-        if !src_path.exists() {
-            println!(
-                "cargo:warning=Missing compressed artifact: {}",
-                src_path.display()
-            );
-            all_found = false;
-            continue;
-        }
 
         if dst_path.exists() {
             let _ = fs::remove_file(&dst_path);
@@ -122,22 +139,6 @@ fn main() {
         });
         let size = fs::metadata(&dst_path).map_or(0, |m| m.len());
         println!("cargo:warning=Embedded {src_name}: {size} bytes");
-    }
-
-    if !all_found {
-        println!(
-            "cargo:warning=Some artifacts missing. Run: mise run vm:setup && mise run vm:supervisor"
-        );
-        generate_stub_resources(
-            &out_dir,
-            &[
-                &format!("{libkrun_name}.zst"),
-                &format!("{libkrunfw_name}.zst"),
-                "gvproxy.zst",
-                "openshell-sandbox.zst",
-                "umoci.zst",
-            ],
-        );
     }
 }
 

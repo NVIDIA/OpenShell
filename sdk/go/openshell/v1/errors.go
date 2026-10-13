@@ -28,6 +28,12 @@ const (
 // StatusError is the typed error returned by all SDK operations.
 type StatusError = types.StatusError
 
+// FieldViolation identifies an invalid request field.
+type FieldViolation = types.FieldViolation
+
+// ErrorInfo describes a server failure using a stable reason within a domain.
+type ErrorInfo = types.ErrorInfo
+
 // IsNotFound returns true if the error indicates a resource was not found.
 func IsNotFound(err error) bool { return types.IsNotFound(err) }
 

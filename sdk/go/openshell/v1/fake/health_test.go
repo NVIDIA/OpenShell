@@ -84,13 +84,21 @@ func TestHealth_GetGatewayInfo_DeepCopy(t *testing.T) {
 		ComputeDrivers: []types.ComputeDriverInfo{
 			{Name: "k8s"},
 		},
+		Extensions: []types.ExtensionInfo{{
+			ConfiguredName:        "k8s",
+			SupportedCapabilities: []string{"openshell.compute.contract"},
+		}},
 	}))
 
 	info1, _ := fc.Health().GetGatewayInfo(context.Background())
 	info1.ComputeDrivers[0].Name = "mutated"
+	info1.Extensions[0].ConfiguredName = "mutated"
+	info1.Extensions[0].SupportedCapabilities[0] = "mutated"
 
 	info2, _ := fc.Health().GetGatewayInfo(context.Background())
 	assert.Equal(t, "k8s", info2.ComputeDrivers[0].Name)
+	assert.Equal(t, "k8s", info2.Extensions[0].ConfiguredName)
+	assert.Equal(t, "openshell.compute.contract", info2.Extensions[0].SupportedCapabilities[0])
 }
 
 func TestHealth_GetCurrentUser_Default(t *testing.T) {

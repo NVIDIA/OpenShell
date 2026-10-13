@@ -3,7 +3,7 @@
 
 //! Builder for API Activity [6003] events.
 
-use crate::builders::SandboxContext;
+use crate::builders::EventContext;
 use crate::enums::{SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{ApiActivityEvent, OcsfEvent};
@@ -26,7 +26,7 @@ fn sanitize_model_name(name: &str) -> String {
 
 /// Builder for API Activity [6003] events.
 pub struct ApiActivityBuilder<'a> {
-    ctx: &'a SandboxContext,
+    ctx: &'a EventContext,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -39,7 +39,7 @@ pub struct ApiActivityBuilder<'a> {
 
 impl<'a> ApiActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a SandboxContext, operation: impl Into<String>) -> Self {
+    pub fn new(ctx: &'a EventContext, operation: impl Into<String>) -> Self {
         Self {
             ctx,
             severity: SeverityId::Informational,
@@ -159,9 +159,9 @@ mod tests {
             .ai_model(AiModel::new("claude-3-haiku", "anthropic"))
             .http_request(HttpRequest::new(
                 "POST",
-                Url::new("https", "inference.local", "/v1/messages", 443),
+                Url::new("https", "api.anthropic.com", "/v1/messages", 443),
             ))
-            .dst_endpoint(Endpoint::from_domain("inference.local", 443))
+            .dst_endpoint(Endpoint::from_domain("api.anthropic.com", 443))
             .unmapped("latency_ms", 701_u64)
             .unmapped("input_tokens", 12_u64)
             .message("Model call: claude-3-haiku via anthropic")

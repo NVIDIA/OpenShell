@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/oauth2"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -291,6 +293,19 @@ func TestClientCredentialsAuthSingleFlightRenewalAndFields(t *testing.T) {
 	_, err = auth.GetRequestMetadata(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, int32(2), calls.Load())
+}
+
+func TestClientCredentialsAuthLateFlightReusesCachedToken(t *testing.T) {
+	auth := &clientCredentialsAuth{
+		token: &oauth2.Token{
+			AccessToken: "cached-token",
+			Expiry:      time.Now().Add(time.Hour),
+		},
+	}
+
+	accessToken, err := auth.accessTokenForExchange()
+	require.NoError(t, err)
+	assert.Equal(t, "cached-token", accessToken)
 }
 
 func TestClientCredentialsAuthCancellationDoesNotPoisonSharedExchange(t *testing.T) {

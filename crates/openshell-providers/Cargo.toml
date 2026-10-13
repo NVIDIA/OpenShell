@@ -10,7 +10,14 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Test-only access to the example profiles in `providers/`. Enable it from
+# `[dev-dependencies]` only; it reads the source checkout at run time.
+example-profiles = []
+
 [dependencies]
+prost-types = { workspace = true }
 glob = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }

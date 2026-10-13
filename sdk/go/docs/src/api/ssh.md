@@ -23,11 +23,11 @@ fmt.Printf("SSH via %s://%s:%d\n", session.GatewayScheme, session.GatewayHost, s
 Revoke an active SSH session, immediately terminating any connections using it.
 
 ```go
-revoked, err := client.SSH().RevokeSession(ctx, session.Token)
+deletion, err := client.SSH().RevokeSession(ctx, "default", session.Token)
 if err != nil {
     log.Fatal(err)
 }
-if revoked {
+if deletion.Outcome == v1.DeletionCompleted {
     fmt.Println("Session revoked")
 }
 ```

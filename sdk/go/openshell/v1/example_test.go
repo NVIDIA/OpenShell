@@ -35,7 +35,7 @@ func ExampleClient_Sandboxes() {
 	fmt.Println("Phase after wait:", sb.Status.Phase)
 
 	// Clean up
-	if err := client.Sandboxes().Delete(ctx, "default", "my-sandbox"); err != nil {
+	if _, err := client.Sandboxes().Delete(ctx, "default", "my-sandbox"); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("Deleted")
@@ -62,7 +62,7 @@ func ExampleClient_Providers() {
 	}
 
 	// List all providers
-	providers, err := client.Providers().List(ctx, "default")
+	providers, err := client.Providers().ListAll(ctx, "default")
 	if err != nil {
 		log.Fatal(err)
 	}

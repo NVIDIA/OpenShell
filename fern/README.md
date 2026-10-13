@@ -1,0 +1,74 @@
+# Fern documentation site
+
+OpenShell uses [Fern](https://buildwithfern.com/) to validate, preview, and publish the documentation at [docs.nvidia.com/openshell](https://docs.nvidia.com/openshell/). This directory contains the site configuration and presentation files. The documentation content lives in `docs/`.
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `docs/` | MDX pages, navigation in `docs/index.yml`, and page-specific components. |
+| `fern/docs.yml` | Site, theme, version, redirect, and navigation configuration. |
+| `fern/fern.config.json` | Fern organization and pinned CLI version. |
+| `fern/components/` | Shared site components. |
+| `fern/assets/` | Logos and other shared assets. |
+| `fern/main.css` | Site-wide styles. |
+
+In a normal source checkout, `fern/docs.yml` points the `dev` version at `docs/index.yml`. Release automation builds the multi-version configuration on the generated `docs-website` branch and maps the source documentation to the channel being published.
+
+## Local development
+
+Start a local Fern server from the repository root:
+
+```shell
+mise run docs:serve
+```
+
+Validate the configuration, navigation, and links without starting a server:
+
+```shell
+mise run docs
+```
+
+The tasks read the Fern CLI version from `fern/fern.config.json`, so local checks and GitHub Actions use the same version. See [docs/CONTRIBUTING.mdx](../docs/CONTRIBUTING.mdx) for the authoring and style guide.
+
+## Pull request previews
+
+`.github/workflows/branch-docs.yml` validates pull requests that change documentation or Fern configuration. When the workflow can access `FERN_TOKEN`, it publishes a Fern preview from the pull request checkout and adds the preview URL to the pull request. This path does not use or update the `docs-website` branch.
+
+## Versioned production site
+
+The generated `docs-website` branch contains the complete production input for Fern. Each version has an exact copy of its source commit's `docs/` tree under `fern/pages-<slug>/` and a navigation file under `fern/versions/`. `fern/.docs-snapshots.yml` records the original source ref, resolved source commit, and release version for each managed snapshot.
+
+The automated site uses these version types:
+
+| Version | Source | Update policy |
+|---|---|---|
+| `latest` | The newest stable release. | Mutable. A maintenance release older than the current stable release cannot move it backward unless a maintainer explicitly allows a rollback. |
+| `dev` | The most recent successful Release Dev run from `main`. | Mutable. Automation rejects an older version or the same version from a different commit unless a maintainer explicitly allows a rollback. |
+| `vX.Y.Z` | The tagged release commit. | Immutable. A later sync cannot replace its source commit. |
+
+Release Dev waits for the development artifacts and Helm chart, then calls `.github/workflows/sync-docs.yml` once. The reusable workflow updates `dev`, validates the generated site, commits and pushes the branch when needed, and publishes the production site once.
+
+Release Tag follows the same sequence for a non-prerelease tag after the release artifacts, SDK package, Helm chart, and wheel publication complete. One sync copies the tagged source into both the immutable `vX.Y.Z` snapshot and `latest` when the release is not older than the current version, then publishes the production site once. The version selector pins `latest` and `dev` first, followed by versioned snapshots in descending version order. Other historical entries follow in their existing order.
+
+The sync workflow still accepts an optional Fern availability badge, but the current Release Dev and Release Tag jobs do not request one. The next `dev` sync replaces the existing `dev` Beta badge with an unbadged entry. Other entries retain their badge setting until that entry is synced or removed.
+
+The sync and publish workflows share the `docs-website` concurrency group. This serializes writes and publication. Queued runs remain pending instead of replacing one another.
+
+The `dev` snapshot also owns the shared Fern configuration, components, assets, and CSS on `docs-website`. The `latest` snapshot copies its documentation, navigation, and redirects but does not replace shared components, assets, or CSS. This keeps the site configuration aligned with `main` while preserving the released content.
+
+A `dev` sync copies the top-level `announcement` from the source `fern/docs.yml`. This announcement is the global fallback, and removing it from the source removes it from `docs-website`. Each snapshot sync copies the source version announcement only to the channel being updated. A version announcement overrides the global announcement for that version, so Release Dev cannot change the `latest` announcement and Release Tag cannot change the `dev` announcement.
+
+Redirects are synchronized with their mutable snapshot. A redirect whose source starts with `/openshell/dev/` or `/openshell/latest/` belongs to that channel. An unversioned alias to a versioned destination belongs to the destination channel; other shared rules belong to `dev`. Each sync replaces that channel's rules, including removing rules absent from the source. A stable release updates `latest` redirects only when it promotes `latest`, so an older maintenance release cannot roll back live routing. Redirects owned by other versions remain unchanged.
+
+## Manual maintenance and publishing
+
+Maintainers can run `.github/workflows/sync-docs.yml` manually to add, refresh, or remove a historical version snapshot. To repair stale redirects for a mutable channel without changing its content, sync that channel from its recorded source commit and release version in `fern/.docs-snapshots.yml`, retaining its display name and availability from `fern/docs.yml`. Use the updated automation from `main`; select production publishing only when ready to publish the repair. The workflow preserves snapshots that were not selected. Production publishing is disabled by default for a manual sync.
+
+`.github/workflows/publish-docs-website.yml` validates and publishes the existing `docs-website` branch without syncing content. Its default mode creates a preview. Selecting production mode publishes the live site, so use it only for an intentional production republish.
+
+Run the automated sync tests after changing the version model or either publishing workflow:
+
+```shell
+mise run test:docs-website
+```

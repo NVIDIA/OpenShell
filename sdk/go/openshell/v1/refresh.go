@@ -32,5 +32,5 @@ type RefreshInterface interface {
 	GetStatus(ctx context.Context, workspace, provider, credentialKey string) ([]*RefreshStatus, error)
 	Configure(ctx context.Context, workspace string, config *RefreshConfig) (*RefreshStatus, error)
 	Rotate(ctx context.Context, workspace, provider, credentialKey string) (*RefreshStatus, error)
-	Delete(ctx context.Context, workspace, provider, credentialKey string) (bool, error)
+	Delete(ctx context.Context, workspace, provider, credentialKey string, opts ...DeleteOptions) (*DeletionResult, error)
 }

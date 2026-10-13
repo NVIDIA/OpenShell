@@ -8,6 +8,7 @@ use crate::l7::relay::L7EvalContext;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::activity::ActivitySender;
+use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::proto::ProviderProfileCredential;
 use openshell_core::secrets::SecretResolver;
 use std::collections::HashMap;
@@ -37,15 +38,23 @@ pub(super) struct RelayContext<'a> {
     middleware_engine: &'a OpaEngine,
 }
 
+/// Non-blocking observation channels attached to an authorized HTTP relay.
+pub(super) struct RelaySignals {
+    /// Receives general sandbox network activity.
+    pub(super) activity: Option<ActivitySender>,
+    /// Receives terminal tool server results for endpoint status reporting.
+    pub(super) endpoint_observation: Option<EndpointObservationSender>,
+}
+
 /// Build the request-processing context shared by CONNECT and forward HTTP.
 pub(super) fn http_context(
     decision: &EgressDecision,
     provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
-    activity_tx: Option<ActivitySender>,
     dynamic_credentials: Option<DynamicCredentials>,
     agent_proposals: openshell_core::proposals::AgentProposals,
     workspace: String,
+    signals: RelaySignals,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
     // each request after middleware/token-grant awaits. Keep only the legacy
@@ -82,13 +91,16 @@ pub(super) fn http_context(
         secret_resolver,
         provider_credentials,
         provider_credential_revision: None,
-        activity_tx,
+        provider_credential_installation_id: None,
+        body_classifier: None,
+        activity_tx: signals.activity,
         dynamic_credentials: dynamic_credentials.clone(),
         token_grant_resolver: dynamic_credentials
             .as_ref()
             .map(|_| crate::l7::token_grant_injection::default_resolver()),
         agent_proposals,
         workspace,
+        endpoint_observation_tx: signals.endpoint_observation,
     }
 }
 
@@ -283,6 +295,35 @@ where
     }
 }
 
+// Exercise the production single/multiple-route dispatch from L7 fixtures.
+#[cfg(test)]
+pub async fn relay_inspected_http_stream_for_test<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    configs: Vec<crate::l7::L7EndpointConfig>,
+    evaluator: TunnelPolicyEngine,
+    middleware_engine: &OpaEngine,
+    request: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    relay_http_stream(
+        client,
+        upstream,
+        RelayContext {
+            request,
+            policy: PreparedHttpPolicy::Inspect {
+                configs,
+                evaluator: Box::new(evaluator),
+            },
+            middleware_engine,
+        },
+    )
+    .await
+}
+
 /// Relay a policy-authorized raw TCP stream.
 pub(super) async fn relay_tcp<C, U>(
     client: &mut C,
@@ -353,12 +394,110 @@ mod tests {
             secret_resolver: None,
             provider_credentials: None,
             provider_credential_revision: None,
+            provider_credential_installation_id: None,
+            body_classifier: None,
             activity_tx: None,
             dynamic_credentials: None,
             token_grant_resolver: None,
             agent_proposals: openshell_core::proposals::AgentProposals::default(),
             workspace: String::new(),
+            endpoint_observation_tx: None,
         }
+    }
+
+    async fn assert_response_lifecycle<C, P>(mut caller: C, mut client: P)
+    where
+        C: AsyncRead + AsyncWrite + Unpin,
+        P: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut upstream, mut server) = tokio::io::duplex(1024);
+        let engine = OpaEngine::from_strings(POLICY_REGO, EMPTY_POLICY_DATA).unwrap();
+        let decision = decision(engine.current_generation());
+        let request = request_context();
+        let context = prepare_http_relay(None, &engine, &decision, &request).unwrap();
+        let persistent = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        // Larger than either transport buffer: closing must drain the body.
+        let body = vec![b'x'; 64 * 1024];
+        let mut closing = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        closing.extend_from_slice(&body);
+        let relay = Box::pin(relay_http_stream(&mut client, &mut upstream, context));
+        let serve = async {
+            for response in [persistent.as_slice(), closing.as_slice()] {
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(server.read_u8().await.unwrap());
+                    assert!(request.len() < 4096);
+                }
+                assert!(request.starts_with(b"GET / HTTP/1.1\r\n"));
+                server.write_all(response).await.unwrap();
+                server.flush().await.unwrap();
+            }
+            // Retain the upstream socket: response headers decide persistence.
+        };
+        let receive = async {
+            let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+            caller.write_all(request).await.unwrap();
+            caller.flush().await.unwrap();
+            let mut first = vec![0; persistent.len()];
+            caller.read_exact(&mut first).await.unwrap();
+            assert_eq!(first, persistent);
+            // A real second exchange verifies reuse, without a timing assertion.
+            caller.write_all(request).await.unwrap();
+            caller.flush().await.unwrap();
+            let mut second = Vec::new();
+            // TLS must return clean EOF, not UnexpectedEof from a dropped socket.
+            caller.read_to_end(&mut second).await.unwrap();
+            assert_eq!(second, closing);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (result, (), ()) = tokio::join!(relay, serve, receive);
+            result.unwrap();
+        })
+        .await
+        .expect("response delivery and EOF must not await another request");
+    }
+
+    #[tokio::test]
+    async fn http_relay_reuses_then_closes_after_complete_response() {
+        let (caller, client) = tokio::io::duplex(1024);
+        assert_response_lifecycle(caller, client).await;
+    }
+
+    #[tokio::test]
+    async fn tls_http_relay_reuses_then_sends_close_notify_after_complete_response() {
+        use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, tls_terminate_client};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let ca = SandboxCa::generate().unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
+            roots.add(cert.unwrap()).unwrap();
+        }
+        let config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let state = ProxyTlsState::new(CertCache::new(ca), config.clone());
+        let connector = tokio_rustls::TlsConnector::from(config);
+        let (caller, client) = tokio::io::duplex(1024);
+        let (caller, client) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                connector.connect(
+                    rustls::pki_types::ServerName::try_from("example.com").unwrap(),
+                    caller
+                ),
+                tls_terminate_client(client, &state, "example.com"),
+            )
+        })
+        .await
+        .expect("TLS handshake must complete");
+        assert_response_lifecycle(caller.unwrap(), client.unwrap()).await;
     }
 
     #[test]
@@ -403,12 +542,15 @@ mod tests {
             configs: vec![super::super::L7ConfigSnapshot {
                 config: crate::l7::L7EndpointConfig {
                     protocol: crate::l7::L7Protocol::Rest,
+                    endpoint_id: String::new(),
+                    policy_hash: String::new(),
                     path: "/**".to_string(),
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     mcp_strict_tool_names: true,
+                    mcp_versions: Vec::new(),
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

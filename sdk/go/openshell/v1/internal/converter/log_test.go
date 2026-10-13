@@ -15,12 +15,12 @@ import (
 
 func TestLogLineFromProto(t *testing.T) {
 	proto := &pb.SandboxLogLine{
-		SandboxId:   "sbx-1",
-		TimestampMs: 1700000000000,
-		Level:       "INFO",
-		Target:      "network",
-		Message:     "Connection established",
-		Source:      "sandbox-agent",
+		SandboxId: "sbx-1",
+		EventTime: TimestampFromMillis(1700000000000),
+		Level:     "INFO",
+		Target:    "network",
+		Message:   "Connection established",
+		Source:    "sandbox-agent",
 		Fields: map[string]string{
 			"host": "api.example.com",
 			"port": "443",
@@ -45,9 +45,9 @@ func TestLogLineFromProto_Nil(t *testing.T) {
 
 func TestLogLineDeepCopy(t *testing.T) {
 	proto := &pb.SandboxLogLine{
-		TimestampMs: 1700000000000,
-		Level:       "WARN",
-		Message:     "test",
+		EventTime: TimestampFromMillis(1700000000000),
+		Level:     "WARN",
+		Message:   "test",
 		Fields: map[string]string{
 			"key": "value",
 		},
@@ -64,8 +64,8 @@ func TestLogLineDeepCopy(t *testing.T) {
 func TestLogResultFromProto(t *testing.T) {
 	proto := &pb.GetSandboxLogsResponse{
 		Logs: []*pb.SandboxLogLine{
-			{TimestampMs: 1700000000000, Level: "INFO", Message: "first"},
-			{TimestampMs: 1700000001000, Level: "DEBUG", Message: "second"},
+			{EventTime: TimestampFromMillis(1700000000000), Level: "INFO", Message: "first"},
+			{EventTime: TimestampFromMillis(1700000001000), Level: "DEBUG", Message: "second"},
 		},
 		BufferTotal: 100,
 	}

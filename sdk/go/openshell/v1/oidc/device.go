@@ -16,6 +16,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/gateway"
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/options"
 )
 
 // deviceAuthResponse holds the parsed response from the device
@@ -46,9 +47,7 @@ type deviceAuthResponse struct {
 //   - any other error: return [ErrDeviceCode]
 func DeviceLogin(ctx context.Context, opts ...LoginOption) (*oauth2.Token, error) {
 	cfg := &loginConfig{}
-	for _, opt := range opts {
-		opt(cfg)
-	}
+	options.Apply(cfg, opts)
 	cfg.applyDefaults()
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline && cfg.timeout > 0 {
 		var cancel context.CancelFunc

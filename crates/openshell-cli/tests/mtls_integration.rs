@@ -3,9 +3,8 @@
 
 mod helpers;
 
-use helpers::{
-    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
-};
+use helpers::tempdir;
+use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::{get_gateway_metadata, load_active_gateway};
 use openshell_cli::{
     run,
@@ -20,7 +19,6 @@ use openshell_core::proto::{
     UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -34,10 +32,54 @@ struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn peer_get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn report_endpoint_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportEndpointStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportEndpointStatusResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ReportEndpointStatusResponse {},
+        ))
+    }
+
+    async fn begin_rootfs_tar_staging(
+        &self,
+        _request: tonic::Request<openshell_core::proto::BeginRootfsTarStagingRequest>,
+    ) -> Result<Response<openshell_core::proto::BeginRootfsTarStagingResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn report_main_process_exit(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportMainProcessExitRequest>,
     ) -> Result<Response<openshell_core::proto::ReportMainProcessExitResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
+    async fn finalize_main_process_exit(
+        &self,
+        _request: tonic::Request<openshell_core::proto::FinalizeMainProcessExitRequest>,
+    ) -> Result<Response<openshell_core::proto::FinalizeMainProcessExitResponse>, Status> {
         Err(Status::unimplemented("not used by this test server"))
     }
 
@@ -106,6 +148,8 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    unimplemented_sandbox_template_rpcs!();
+
     async fn list_sandbox_providers(
         &self,
         _request: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
@@ -138,7 +182,10 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,
     ) -> Result<Response<openshell_core::proto::DeleteSandboxResponse>, Status> {
         Ok(Response::new(
-            openshell_core::proto::DeleteSandboxResponse { deleted: true },
+            openshell_core::proto::DeleteSandboxResponse {
+                sandbox_id: String::new(),
+                outcome: openshell_core::proto::DeletionOutcome::Completed.into(),
+            },
         ))
     }
 
@@ -157,6 +204,24 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
         Ok(Response::new(
             openshell_core::proto::GetGatewayConfigResponse::default(),
+        ))
+    }
+
+    async fn get_sandbox_provider_status(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetSandboxProviderStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderStatusResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider readiness is not exercised by this mock",
+        ))
+    }
+
+    async fn report_provider_readiness(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportProviderReadinessResponse>, Status> {
+        Err(Status::unimplemented(
+            "provider installation reports are not exercised by this mock",
         ))
     }
 
@@ -228,6 +293,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented(
             "create_provider not implemented in test",
         ))
+    }
+
+    async fn get_provider_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        Err(Status::unimplemented("not used by this mock"))
     }
 
     async fn get_provider(
@@ -394,6 +466,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn report_sandbox_configuration(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ReportSandboxConfigurationRequest>,
+    ) -> Result<Response<openshell_core::proto::ReportSandboxConfigurationResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn report_policy_status(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
@@ -509,6 +588,17 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    type PeerRelayStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::PeerRelayFrame, Status>,
+    >;
+
+    async fn peer_relay(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PeerRelayFrame>>,
+    ) -> Result<Response<Self::PeerRelayStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
         Result<openshell_core::proto::TcpForwardFrame, Status>,
     >;
@@ -618,13 +708,13 @@ fn write_gateway_mtls_bundle(
 fn isolated_gateway_add_env(
     config_dir: &std::path::Path,
     state_dir: &std::path::Path,
-) -> EnvVarGuard {
+) -> Environment {
     let xdg_config = config_dir.to_string_lossy().into_owned();
     let xdg_state = state_dir.to_string_lossy().into_owned();
     let local_tls_dir = state_dir.join("no-package-managed-tls");
     let local_tls = local_tls_dir.to_string_lossy().into_owned();
 
-    EnvVarGuard::set(&[
+    Environment::from_pairs(&[
         ("XDG_CONFIG_HOME", xdg_config.as_str()),
         ("XDG_STATE_HOME", xdg_state.as_str()),
         ("HOME", xdg_state.as_str()),
@@ -635,8 +725,6 @@ fn isolated_gateway_add_env(
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -652,35 +740,36 @@ async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
         &client_cert,
         &client_key,
     );
-    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
 
-    let endpoint = format!("https://localhost:{}", addr.port());
-    run::gateway_add(
-        &endpoint,
-        Some("k8s"),
-        None,
-        true,
-        None,
-        "openshell-cli",
-        None,
-        None,
-        false,
-    )
-    .await
-    .unwrap();
+    isolated_gateway_add_env(config_dir.path(), state_dir.path())
+        .run_async(async {
+            let endpoint = format!("https://localhost:{}", addr.port());
+            run::gateway_add(
+                &endpoint,
+                Some("k8s"),
+                None,
+                true,
+                None,
+                "openshell-cli",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
 
-    let metadata = get_gateway_metadata("k8s").unwrap();
-    assert_eq!(metadata.name, "k8s");
-    assert_eq!(metadata.gateway_endpoint, endpoint);
-    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
-    assert_eq!(load_active_gateway().as_deref(), Some("k8s"));
-    assert!(get_gateway_metadata("openshell").is_none());
+            let metadata = get_gateway_metadata("k8s").unwrap();
+            assert_eq!(metadata.name, "k8s");
+            assert_eq!(metadata.gateway_endpoint, endpoint);
+            assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            assert_eq!(load_active_gateway().as_deref(), Some("k8s"));
+            assert!(get_gateway_metadata("openshell").is_none());
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
@@ -696,34 +785,35 @@ async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
         &client_cert,
         &client_key,
     );
-    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
 
-    let endpoint = format!("https://localhost:{}", addr.port());
-    run::gateway_add(
-        &endpoint,
-        None,
-        None,
-        true,
-        None,
-        "openshell-cli",
-        None,
-        None,
-        false,
-    )
-    .await
-    .unwrap();
+    isolated_gateway_add_env(config_dir.path(), state_dir.path())
+        .run_async(async {
+            let endpoint = format!("https://localhost:{}", addr.port());
+            run::gateway_add(
+                &endpoint,
+                None,
+                None,
+                true,
+                None,
+                "openshell-cli",
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
 
-    let metadata = get_gateway_metadata("openshell").unwrap();
-    assert_eq!(metadata.name, "openshell");
-    assert_eq!(metadata.gateway_endpoint, endpoint);
-    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
-    assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
+            let metadata = get_gateway_metadata("openshell").unwrap();
+            assert_eq!(metadata.name, "openshell");
+            assert_eq!(metadata.gateway_endpoint, endpoint);
+            assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+            assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_certs() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
     let ca_cert = ca.pem();
@@ -737,58 +827,60 @@ async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_
         &client_cert,
         &client_key,
     );
-    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
 
-    let err = run::gateway_add(
-        "https://localhost:1",
-        Some("k8s"),
-        None,
-        true,
-        None,
-        "openshell-cli",
-        None,
-        None,
-        false,
-    )
-    .await
-    .expect_err("explicit name should require matching named mTLS material");
+    isolated_gateway_add_env(config_dir.path(), state_dir.path())
+        .run_async(async {
+            let err = run::gateway_add(
+                "https://localhost:1",
+                Some("k8s"),
+                None,
+                true,
+                None,
+                "openshell-cli",
+                None,
+                None,
+                false,
+            )
+            .await
+            .expect_err("explicit name should require matching named mTLS material");
 
-    assert!(err.to_string().contains("gateway 'k8s'"));
-    assert!(get_gateway_metadata("k8s").is_none());
-    assert!(load_active_gateway().is_none());
+            assert!(err.to_string().contains("gateway 'k8s'"));
+            assert!(get_gateway_metadata("k8s").is_none());
+            assert!(load_active_gateway().is_none());
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn cli_connects_with_client_cert() {
-    let _env = EnvVarGuard::set(&[]);
-    install_rustls_provider();
+    Environment::from_pairs(&[])
+        .run_async(async {
+            let (ca, ca_key) = build_ca();
+            let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+            let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+            let ca_cert = ca.pem();
 
-    let (ca, ca_key) = build_ca();
-    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
-    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
-    let ca_cert = ca.pem();
+            let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
 
-    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+            let dir = tempdir().unwrap();
+            let ca_path = dir.path().join("ca.crt");
+            let cert_path = dir.path().join("tls.crt");
+            let key_path = dir.path().join("tls.key");
+            std::fs::write(&ca_path, ca_cert).unwrap();
+            std::fs::write(&cert_path, client_cert).unwrap();
+            std::fs::write(&key_path, client_key).unwrap();
 
-    let dir = tempdir().unwrap();
-    let ca_path = dir.path().join("ca.crt");
-    let cert_path = dir.path().join("tls.crt");
-    let key_path = dir.path().join("tls.key");
-    std::fs::write(&ca_path, ca_cert).unwrap();
-    std::fs::write(&cert_path, client_cert).unwrap();
-    std::fs::write(&key_path, client_key).unwrap();
-
-    let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
-    let endpoint = format!("https://localhost:{}", addr.port());
-    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
-    let response = client.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+            let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
+            let endpoint = format!("https://localhost:{}", addr.port());
+            let mut client = grpc_client(&endpoint, &tls).await.unwrap();
+            let response = client.health(HealthRequest {}).await.unwrap();
+            assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn cli_requires_client_cert_for_https() {
-    install_rustls_provider();
-
     let (ca, ca_key) = build_ca();
     let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
     let ca_cert = ca.pem();
@@ -799,14 +891,18 @@ async fn cli_requires_client_cert_for_https() {
     // Point XDG_CONFIG_HOME at the isolated temp dir so that default_tls_dir
     // cannot discover real client certs from the developer's machine.
     let xdg_path = dir.path().to_string_lossy();
-    let _xdg_env = EnvVarGuard::set(&[("XDG_CONFIG_HOME", &xdg_path)]);
-    let ca_path = dir.path().join("ca.crt");
-    std::fs::write(&ca_path, ca_cert).unwrap();
 
-    let tls = TlsOptions::new(Some(ca_path), None, None);
-    let endpoint = format!("https://localhost:{}", addr.port());
-    let result = grpc_client(&endpoint, &tls).await;
-    assert!(result.is_err());
+    Environment::from_pairs(&[("XDG_CONFIG_HOME", &xdg_path)])
+        .run_async(async {
+            let ca_path = dir.path().join("ca.crt");
+            std::fs::write(&ca_path, ca_cert).unwrap();
+
+            let tls = TlsOptions::new(Some(ca_path), None, None);
+            let endpoint = format!("https://localhost:{}", addr.port());
+            let result = grpc_client(&endpoint, &tls).await;
+            assert!(result.is_err());
+        })
+        .await;
 }
 
 async fn run_server_no_client_auth(
@@ -834,19 +930,20 @@ async fn run_server_no_client_auth(
 
 #[tokio::test]
 async fn cli_connects_with_gateway_insecure() {
-    let _env = EnvVarGuard::set(&[]);
-    install_rustls_provider();
+    Environment::from_pairs(&[])
+        .run_async(async {
+            let (ca, ca_key) = build_ca();
+            let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
 
-    let (ca, ca_key) = build_ca();
-    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+            let addr = run_server_no_client_auth(server_cert, server_key).await;
 
-    let addr = run_server_no_client_auth(server_cert, server_key).await;
+            let mut tls = TlsOptions::default();
+            tls.gateway_insecure = true;
 
-    let mut tls = TlsOptions::default();
-    tls.gateway_insecure = true;
-
-    let endpoint = format!("https://localhost:{}", addr.port());
-    let mut client = grpc_client(&endpoint, &tls).await.unwrap();
-    let response = client.health(HealthRequest {}).await.unwrap();
-    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+            let endpoint = format!("https://localhost:{}", addr.port());
+            let mut client = grpc_client(&endpoint, &tls).await.unwrap();
+            let response = client.health(HealthRequest {}).await.unwrap();
+            assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+        })
+        .await;
 }
