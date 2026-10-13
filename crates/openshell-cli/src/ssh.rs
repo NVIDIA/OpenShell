@@ -2924,11 +2924,13 @@ mod tests {
         let upload = ssh_upload_command("openshell ssh-proxy --sandbox demo");
         let effective = effective_ssh_config(&upload, &[]);
         assert_connection_sharing_disabled(&effective);
-        assert!(
-            effective
-                .lines()
-                .any(|line| line == "forkafterauthentication no")
-        );
+        for expected in [
+            "forkafterauthentication no",
+            "requesttty false",
+            "sessiontype subsystem",
+        ] {
+            assert!(effective.lines().any(|line| line == expected), "{expected}");
+        }
     }
 
     #[tokio::test]
