@@ -39,10 +39,27 @@ gh pr list --head "<branch>" --state open
 Retrieve the PR metadata:
 
 ```bash
-gh pr view <number> --json title,body,state,headRefName,baseRefName,labels,author
+gh pr view <number> --json title,body,state,headRefName,baseRefName,labels,author,closingIssuesReferences
 ```
 
 Record the **title**, **body**, **headRefName**, and **baseRefName** for use in later steps.
+
+### Check Issue Acceptance
+
+Inspect every closing issue reference (paginate as needed) and fetch its current
+repository and labels. Verify the PR author's permission in the target repository:
+
+```bash
+gh api repos/OWNER/REPO/collaborators/AUTHOR/permission --jq .permission
+```
+
+Call out each linked issue missing `state:accepted`, with an issue link. Verified
+`write`, `maintain`, or `admin` access permits the exception; report it as context,
+not a blocking concern. Other authors need at least one target-repository issue,
+and every linked issue must be accepted; report violations under **Potential
+Concerns**. PR body text such as `No issue required` does not bypass this gate.
+Report failed lookups as unverified and continue the code review. For a branch
+without a PR, note that issue acceptance was not verified.
 
 ## Step 3: Generate the Diff
 

@@ -28,9 +28,14 @@ the sandbox record and driver-supported persistent storage.
 Set `compute_driver` in the gateway TOML file. A gateway uses one driver at a time.
 
 ```toml
+[openshell]
+version = 2
+
 [openshell.gateway]
 compute_driver = "docker"
 ```
+
+Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
 When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
 
@@ -219,6 +224,8 @@ Common options in `[openshell.drivers.vm]` are `default_image`, `bootstrap_image
 
 The driver looks up sandbox images in local Docker or Podman before pulling from a registry. On Linux with Podman, start `podman.socket` so the driver can find local images.
 
+Registry downloads must match the resolved image digest, including the selected platform for multi-platform images. A mismatch fails image preparation. After upgrading, the driver rebuilds older bootstrap and prepared-image cache entries on first use, so the first sandbox start can take longer.
+
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
@@ -246,7 +253,7 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
 | `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |
 | `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
-| `allowed_pod_annotations` | `server.allowedPodAnnotations` | Pod annotation keys that sandbox templates may set, as exact keys or `<domain>/*` wildcards. Empty (default) rejects all template annotations. |
+| `allowed_pod_annotations` | `gatewayConfig.openshell.drivers.kubernetes.allowed_pod_annotations` | Pod annotation keys that sandbox templates may set, as exact keys or `<domain>/*` wildcards. Empty (default) rejects all template annotations. |
 | `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox pod UID and GID. Takes priority over OpenShift SCC namespace annotations. `sandbox_gid` defaults to the UID. |
 | `https_proxy` | `upstreamProxy.url` | Corporate proxy for sandbox egress. |
 | `no_proxy` | `upstreamProxy.noProxy` | Destinations that bypass the corporate proxy. |
@@ -316,4 +323,6 @@ On Docker and Podman, set `process.run_as_user` and `process.run_as_group` in th
 
 MicroVM persists the resolved UID:GID with the writable overlay and retains it across restarts, even if driver defaults change. Explicit policy selectors must match that identity. For example, `run_as_user: "10000"` fails when the overlay owner is `1000:1000`; OpenShell reports both values without changing file ownership. The symbolic selector `sandbox` refers to the guest account for that owner, and each omitted selector accepts its driver default. The `WorkloadIdentity` condition in `openshell sandbox get <name>` shows the resolved pair separately from workload readiness. Canonical and exec processes use this same pair; live policy updates cannot change it.
 
-On Docker, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Podman, Kubernetes, and MicroVM always use `/sandbox`.
+On Docker and Podman, the image's `WORKDIR` becomes the workspace. Images with no `WORKDIR`, `/`, or `/sandbox` use `/sandbox`. Any other `WORKDIR` must exist in the image and be writable by the sandbox user. Kubernetes and MicroVM always use `/sandbox`.
+
+Custom Docker and Podman workspaces use the workload container's writable layer, not a managed named volume. Files survive stop/start of the same container, but removing or replacing that container removes its workspace changes. Export files you need to retain before deleting the sandbox.

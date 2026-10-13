@@ -6,6 +6,10 @@
 #[path = "preparation.rs"]
 mod preparation;
 
+#[cfg(test)]
+#[path = "registry_cache_tests.rs"]
+mod registry_cache_tests;
+
 use crate::gpu::{GpuInventory, allocate_vsock_cid};
 
 use crate::isolation::VmBoundarySpec;
@@ -200,8 +204,9 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v5";
-const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
+// Older registry cache entries were not bound to the downloaded manifest.
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v6";
+const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v4";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
@@ -1010,19 +1015,12 @@ impl VmDriver {
             })?;
         }
         #[cfg(unix)]
-        let liveness_read_fd = liveness_read.as_raw_fd();
-        #[cfg(unix)]
         command
-            .arg("--parent-liveness-fd")
-            .arg(liveness_read_fd.to_string());
+            .stdin(Stdio::from(liveness_read))
+            .arg("--parent-liveness-stdin");
         #[cfg(unix)]
         unsafe {
             command.pre_exec(move || {
-                nix::fcntl::fcntl(
-                    liveness_read_fd,
-                    nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
-                )
-                .map_err(std::io::Error::other)?;
                 #[cfg(target_os = "linux")]
                 nix::sys::prctl::set_pdeathsig(Signal::SIGKILL).map_err(std::io::Error::other)?;
                 Ok(())
@@ -1036,7 +1034,6 @@ impl VmDriver {
         })?;
         #[cfg(unix)]
         {
-            drop(liveness_read);
             Ok((child, Some(fs::File::from(liveness_write))))
         }
         #[cfg(not(unix))]
@@ -3199,10 +3196,27 @@ impl VmDriver {
             return span_status.finish(result);
         }
 
+        span_status.finish(
+            self.ensure_cached_registry_rootfs_image(
+                sandbox_id,
+                image_ref,
+                &registry_client(),
+                &registry_auth(image_ref)?,
+            )
+            .await,
+        )
+    }
+
+    async fn ensure_cached_registry_rootfs_image(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        client: &OciClient,
+        auth: &RegistryAuth,
+    ) -> Result<String, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
         let reference = parse_registry_reference(image_ref)?;
-        let client = registry_client();
-        let auth = registry_auth(image_ref)?;
         info!(image_ref = %image_ref, "vm driver: authenticating with registry");
         self.publish_vm_progress(
             sandbox_id,
@@ -3214,7 +3228,7 @@ impl VmDriver {
             ]),
         );
         retry_registry_request("authenticate with registry", || {
-            client.auth(&reference, &auth, RegistryOperation::Pull)
+            client.auth(&reference, auth, RegistryOperation::Pull)
         })
         .await
         .map_err(|err| {
@@ -3232,15 +3246,13 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = retry_registry_request("fetch manifest digest", || {
-            client.fetch_manifest_digest(&reference, &auth)
-        })
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to resolve vm sandbox image '{image_ref}': {err}"
-            ))
-        })?;
+        let (reference, source_image_identity) = pin_registry_reference(client, &reference, auth)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to resolve vm sandbox image '{image_ref}': {err}"
+                ))
+            })?;
         info!(
             image_ref = %image_ref,
             image_identity = %source_image_identity,
@@ -3335,9 +3347,9 @@ impl VmDriver {
 
         self.build_cached_registry_image_rootfs_image(
             sandbox_id,
-            &client,
+            client,
             &reference,
-            &auth,
+            auth,
             image_ref,
             &image_identity,
         )
@@ -3522,8 +3534,14 @@ impl VmDriver {
                 .await;
         }
 
-        self.ensure_prepared_registry_image_disk(sandbox_id, image_ref, bootstrap_root_disk)
-            .await
+        self.ensure_prepared_registry_image_disk(
+            sandbox_id,
+            image_ref,
+            bootstrap_root_disk,
+            &registry_client(),
+            &registry_auth(image_ref)?,
+        )
+        .await
     }
 
     async fn ensure_prepared_local_image_disk(
@@ -3746,10 +3764,10 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
         bootstrap_root_disk: &Path,
+        client: &OciClient,
+        auth: &RegistryAuth,
     ) -> Result<PreparedImageDisk, Status> {
         let reference = parse_registry_reference(image_ref)?;
-        let client = registry_client();
-        let auth = registry_auth(image_ref)?;
 
         self.publish_vm_progress(
             sandbox_id,
@@ -3761,7 +3779,7 @@ impl VmDriver {
             ]),
         );
         retry_registry_request("authenticate with registry", || {
-            client.auth(&reference, &auth, RegistryOperation::Pull)
+            client.auth(&reference, auth, RegistryOperation::Pull)
         })
         .await
         .map_err(|err| {
@@ -3779,15 +3797,13 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = retry_registry_request("fetch manifest digest", || {
-            client.fetch_manifest_digest(&reference, &auth)
-        })
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to resolve vm sandbox image '{image_ref}': {err}"
-            ))
-        })?;
+        let (reference, source_image_identity) = pin_registry_reference(client, &reference, auth)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to resolve vm sandbox image '{image_ref}': {err}"
+                ))
+            })?;
         let cache_identity = prepared_image_cache_identity(&source_image_identity, &self.config);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
@@ -3814,7 +3830,7 @@ impl VmDriver {
         let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
 
         let (manifest, _) = retry_registry_request("pull image manifest", || {
-            client.pull_image_manifest(&reference, &auth)
+            client.pull_image_manifest(&reference, auth)
         })
         .await
         .map_err(|err| {
@@ -3827,7 +3843,7 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("create guest OCI layout failed: {err}")))?;
 
         download_registry_descriptor_blob_file(
-            &client,
+            client,
             &reference,
             image_ref,
             &layout_dir,
@@ -5202,6 +5218,28 @@ fn registry_client() -> OciClient {
     })
 }
 
+async fn pin_registry_reference(
+    client: &OciClient,
+    reference: &Reference,
+    auth: &RegistryAuth,
+) -> Result<(Reference, String), OciDistributionError> {
+    // Preserve caller pins, including their digest algorithm. A HEAD response
+    // is only a resolution hint for tags, never proof of the image's contents.
+    let digest = match reference.digest() {
+        Some(digest) => digest.to_string(),
+        None => {
+            retry_registry_request("fetch manifest digest", || {
+                client.fetch_manifest_digest(reference, auth)
+            })
+            .await?
+        }
+    };
+    // oci-client verifies GET bytes against this pin. For an index it verifies
+    // the index first, then the selected platform manifest against its entry.
+    // All retries must use this same reference before publishing to the cache.
+    Ok((reference.clone_with_digest(digest.clone()), digest))
+}
+
 async fn retry_registry_request<T, F, Fut>(
     operation: &str,
     request: F,
@@ -6465,6 +6503,9 @@ fn write_oci_layout_for_manifest(
 }
 
 fn bootstrap_image_cache_identity(image_identity: &str) -> String {
+    // Bound new cache/staging filenames even for long source digests such as
+    // SHA-512. Persisted identities still use the unchanged path lookup.
+    let image_identity = compute_bytes_sha256_hex(image_identity.as_bytes());
     format!(
         "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:guest-{}:{image_identity}",
         openshell_core::VERSION,
@@ -6480,6 +6521,7 @@ fn configured_sandbox_identity(config: &VmDriverConfig) -> Option<(u32, u32)> {
 }
 
 fn prepared_image_cache_identity(image_identity: &str, config: &VmDriverConfig) -> String {
+    let image_identity = compute_bytes_sha256_hex(image_identity.as_bytes());
     let identity = configured_sandbox_identity(config).map_or_else(
         || "image-account".to_string(),
         |(uid, gid)| format!("configured-{uid}-{gid}"),
@@ -11493,11 +11535,12 @@ mod tests {
     #[test]
     fn prepared_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
         let image = "sha256:local-image";
+        let image_hash = compute_bytes_sha256_hex(image.as_bytes());
         let image_account = prepared_image_cache_identity(image, &VmDriverConfig::default());
         assert_eq!(
             image_account,
             format!(
-                "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:image-account:{image}",
+                "sandbox-prepared-rootfs-ext4-umoci-v4:openshell-{}:image-account:{image_hash}",
                 openshell_core::VERSION
             )
         );
@@ -11539,10 +11582,10 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
-            "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-",
+            "sandbox-bootstrap-rootfs-ext4-v6:openshell-{}:guest-",
             openshell_core::VERSION
         )));
-        assert!(identity.ends_with(":sha256:bootstrap-image"));
+        assert!(identity.ends_with(&compute_bytes_sha256_hex(b"sha256:bootstrap-image")));
         assert!(identity.contains(&sandbox_guest_runtime_identity()));
     }
 

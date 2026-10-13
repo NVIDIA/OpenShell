@@ -469,7 +469,8 @@ impl OcsfEvent {
                 // Bracketed suffix carries the structured provenance fields a
                 // reviewer needs to scan a CONFIG audit line. Auto-approval
                 // emits `auto`/`source`/`prover_delta`; every config change
-                // also carries `policy_version` and `policy_hash`. Order is
+                // also carries `policy_version` and `policy_hash`. Rejections
+                // add `chunk_id`, `rejection_reason`, and `actor`. Order is
                 // stable so logs are greppable.
                 let suffix = e
                     .base
@@ -479,18 +480,21 @@ impl OcsfEvent {
                         let mut parts: Vec<String> = Vec::new();
                         let mut push = |key: &str| {
                             if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
-                                parts.push(format!("{key}:{value}"));
+                                parts.push(format!("{key}:{}", escape_context_field(value)));
                             }
                         };
                         push("auto");
                         push("source");
                         push("prover_delta");
                         push("resolved_from");
+                        push("chunk_id");
+                        push("rejection_reason");
+                        push("actor");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
-                            parts.push(format!("version:{ver}"));
+                            parts.push(format!("version:{}", escape_context_field(ver)));
                         }
                         if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
-                            parts.push(format!("hash:{hash}"));
+                            parts.push(format!("hash:{}", escape_context_field(hash)));
                         }
                         if parts.is_empty() {
                             String::new()
@@ -1241,6 +1245,32 @@ mod tests {
             "CONFIG:APPROVED [INFO] auto-approved: no new prover findings (source=agent_authored) \
              [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
              version:v4 hash:sha256:cafe]"
+        );
+    }
+
+    /// Rejection audit events carry the chunk, reason, and deciding actor.
+    /// Reviewer-typed text must not be able to close the bracketed suffix.
+    #[test]
+    fn test_config_state_change_shorthand_includes_rejection_fields() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("gateway rejected draft chunk chunk-1");
+        b.add_unmapped("chunk_id", serde_json::json!("chunk-1"));
+        b.add_unmapped("rejection_reason", serde_json::json!("too broad] [x"));
+        b.add_unmapped("actor", serde_json::json!("user:reviewer"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Other),
+            state_custom_label: Some("REJECTED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "CONFIG:REJECTED [INFO] gateway rejected draft chunk chunk-1 \
+             [chunk_id:chunk-1 rejection_reason:too\\u{20}broad\\]\\u{20}\\[x \
+             actor:user:reviewer]"
         );
     }
 

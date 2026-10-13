@@ -12,6 +12,7 @@ use openshell_isolation_interface::contract::{
 use russh::ChannelMsg;
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -96,6 +97,28 @@ impl BoundaryExec for TestExec {
     }
 }
 
+struct FailThenExec {
+    failed: AtomicBool,
+    session: Mutex<Option<ExecSession>>,
+}
+
+#[async_trait::async_trait]
+impl BoundaryExec for FailThenExec {
+    async fn exec(&self, _spec: ExecSpec) -> Result<ExecSession, BackendError> {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            return Err(BackendError::Unavailable(
+                "test boundary admission failure".to_string(),
+            ));
+        }
+        Ok(self
+            .session
+            .lock()
+            .unwrap()
+            .take()
+            .expect("test exec session"))
+    }
+}
+
 struct Control {
     stdin: DuplexStream,
     stdout: DuplexStream,
@@ -153,6 +176,43 @@ async fn start_exec(
     channel.exec(true, "cat").await.unwrap();
     assert!(matches!(channel.wait().await, Some(ChannelMsg::Success)));
     channel
+}
+
+#[tokio::test]
+async fn exec_start_failure_keeps_ssh_session_usable() {
+    tokio::time::timeout(DEADLINE, async {
+        let (session, mut control) = exec_session();
+        let client = test_client(
+            None,
+            Arc::new(FailThenExec {
+                failed: AtomicBool::new(false),
+                session: Mutex::new(Some(session)),
+            }),
+            russh::client::Config::default(),
+        )
+        .await;
+
+        let mut rejected = client.channel_open_session().await.unwrap();
+        rejected.exec(true, "first").await.unwrap();
+        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Failure)));
+
+        let mut channel = start_exec(&client).await;
+        control.stdout.shutdown().await.unwrap();
+        control.stderr.shutdown().await.unwrap();
+        control
+            .process
+            .status
+            .send_replace(Some(BoundaryExitStatus::Exited(0)));
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::ExitStatus { exit_status: 0 }) => break,
+                Some(_) => {}
+                None => panic!("successful exec closed without an exit status"),
+            }
+        }
+    })
+    .await
+    .expect("a rejected exec closed the SSH session");
 }
 
 #[tokio::test]

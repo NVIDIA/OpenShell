@@ -79,7 +79,7 @@ let
       '';
     };
 
-  conformanceCliArchive = mkTestArchive {
+  conformanceTestArchive = mkTestArchive {
     name = "openshell-conformance";
     workspacePath = "tests/suites/conformance";
     manifestPath = "tests/suites/conformance/Cargo.toml";
@@ -95,33 +95,38 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
+  ociImageArchive = mkTestArchive {
+    name = "oci-image";
+    workspacePath = "tests/suites/features";
+    manifestPath = "tests/suites/features/Cargo.toml";
+    package = "openshell-test-feature-oci-image";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
+  };
 
-  # Follow-up: migrate these wrapper-coupled tests once tmachine provides their
-  # managed-gateway controls, SPIFFE fixtures, caller driver-config setting,
-  # guest tools, and matching workload-image identity behavior. The corporate
-  # proxy and gateway-start binaries currently self-skip without wrapper-owned
-  # gateway metadata, so exclude them rather than report false passes.
+  # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
+  # entry says what it needs. Entries marked "wrapper lane" still run in the
+  # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
+  # there until tmachine provides what they need.
   podmanE2eFollowUpBinaries = [
-    "credential_gating"
+    # Needs the caller driver-config settings (`allow_driver_config`,
+    # `enable_bind_mounts`), which the tmachine gateway does not enable. Wrapper
+    # lane.
     "driver_config_volume"
-    "forward_proxy_graphql_l7"
-    "forward_proxy_jsonrpc_l7"
-    "forward_proxy_l7_bypass"
-    "host_gateway_alias"
-    "landlock"
+    # The next three self-skip without wrapper-owned gateway metadata (restart
+    # and configuration control), so exclude them rather than report false
+    # passes. Wrapper lane.
     "local_driver_token_restart"
-    # Standalone tmachine runs can time out while opening the localhost relay.
-    # Follow up on making the relay setup deterministic before restoring it.
-    "no_proxy"
     "podman_corporate_proxy"
     "podman_gateway_start"
-    "podman_oci_identity"
+    # Its move to conformance is deferred until the isolation work in #4120; see
+    # #4246.
     "provider_auto_create"
-    # The provider-refresh feature suite covers revoked Keycloak grants. This
-    # binary instead covers stable workload handles across repeated rotations
-    # and explicit refresh reconfiguration in a long-running sandbox.
-    "provider_refresh_handles"
+    # Needs the SPIFFE fixtures that the wrapper sets up. Wrapper lane.
     "provider_token_exchange"
+    # One test times out reaching support-container IPs from the sandbox in the
+    # rootless guest; the other tests in the binary pass. Nextest archive
+    # filters cannot select individual tests, so keep the complete binary here.
     "proxy_egress_pipeline"
     # Conformance covers stop/start workspace preservation and deletion while
     # stopped. The remaining canonical-main, TTY, attachment replay, and
@@ -130,7 +135,6 @@ let
     "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
-    "websocket_conformance"
     "workspace_lifecycle"
   ];
   podmanE2eArchiveFilter =
@@ -196,8 +200,9 @@ let
 in
 rec {
   inherit
-    conformanceCliArchive
+    conformanceTestArchive
     providerRefreshKeycloakArchive
+    ociImageArchive
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
@@ -244,14 +249,16 @@ rec {
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceCliArchive
+      conformanceTestArchive
       providerRefreshKeycloakArchive
+      ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
       build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
+      build-oci-image-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';

@@ -99,7 +99,6 @@ EXTERNAL_PG_FIXTURE_SECRET=""
 EXTERNAL_PG_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
 EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_USER="openshell"
-EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
 EXTERNAL_PG_FIXTURE_DATABASE="openshell"
 ENVOY_RELEASE_NAME="${OPENSHELL_E2E_ENVOY_RELEASE_NAME:-envoy-gateway}"
 ENVOY_NAMESPACE="${OPENSHELL_E2E_ENVOY_NAMESPACE:-envoy-gateway-system}"
@@ -157,8 +156,53 @@ kube_workload_ref() {
   return 1
 }
 
+# Verify the ConfigMap checksum causes a live gateway rollout. This belongs in
+# the harness, before port-forwards are established, because replacing a pod
+# necessarily interrupts any existing port-forward to it.
+verify_gateway_config_rollout() {
+  local workload_ref old_checksum new_checksum old_pod_uid new_pod_uid attempt
+  local pod_selector="app.kubernetes.io/instance=${RELEASE_NAME},app.kubernetes.io/name=openshell"
+
+  workload_ref="$(kube_workload_ref "${RELEASE_NAME}")"
+  old_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o jsonpath='{.spec.template.metadata.annotations.checksum/gateway-config}')"
+  old_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"
+  if [[ -z "${old_checksum}" || -z "${old_pod_uid}" ]]; then
+    echo "ERROR: gateway workload is missing its ConfigMap checksum or ready pod" >&2
+    return 1
+  fi
+
+  echo "Verifying ConfigMap-only gateway configuration rollout..."
+  helmctl upgrade "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+    --namespace "${NAMESPACE}" \
+    --reuse-values \
+    "${helm_values_args[@]}" \
+    --set "fullnameOverride=openshell" \
+    "${helm_extra_args[@]}" \
+    "${helm_post_renderer_args[@]}" \
+    --set-string 'gatewayConfig.openshell\.gateway.log_level=debug' \
+    --wait --timeout 5m
+
+  new_checksum="$(kctl -n "${NAMESPACE}" get "${workload_ref}" -o jsonpath='{.spec.template.metadata.annotations.checksum/gateway-config}')"
+  if [[ -z "${new_checksum}" || "${new_checksum}" == "${old_checksum}" ]]; then
+    echo "ERROR: ConfigMap-only gateway configuration change did not update workload checksum" >&2
+    return 1
+  fi
+  kctl -n "${NAMESPACE}" rollout status "${workload_ref}" --timeout=5m || return 1
+
+  for attempt in $(seq 1 60); do
+    new_pod_uid="$(kctl -n "${NAMESPACE}" get pods -l "${pod_selector}" -o jsonpath='{.items[0].metadata.uid}')"
+    if [[ -n "${new_pod_uid}" && "${new_pod_uid}" != "${old_pod_uid}" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "ERROR: gateway workload rolled out without replacing its pod" >&2
+  return 1
+}
+
 deploy_postgres_fixture() {
   local secret_name="$1"
+  local pg_password
   local pg_uri
 
   echo "Deploying external PostgreSQL fixture ${EXTERNAL_PG_FIXTURE_SERVICE}..."
@@ -180,9 +224,16 @@ deploy_postgres_fixture() {
   EXTERNAL_PG_FIXTURE_DEPLOYED=1
   EXTERNAL_PG_FIXTURE_SECRET="${secret_name}"
 
+  pg_password="$(kctl -n "${NAMESPACE}" get secret openshell-e2e-postgres-credentials \
+    -o jsonpath='{.data.password}' | base64 -d)"
+  if [[ -z "${pg_password}" ]]; then
+    echo "ERROR: external PostgreSQL fixture password is empty" >&2
+    return 1
+  fi
+
   kctl -n "${NAMESPACE}" rollout status "deployment/${EXTERNAL_PG_FIXTURE_SERVICE}" --timeout=120s
 
-  pg_uri="postgresql://${EXTERNAL_PG_FIXTURE_USER}:${EXTERNAL_PG_FIXTURE_PASSWORD}@${EXTERNAL_PG_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:5432/${EXTERNAL_PG_FIXTURE_DATABASE}"
+  pg_uri="postgresql://${EXTERNAL_PG_FIXTURE_USER}:${pg_password}@${EXTERNAL_PG_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:5432/${EXTERNAL_PG_FIXTURE_DATABASE}"
   kctl -n "${NAMESPACE}" delete secret "${secret_name}" \
     --ignore-not-found >/dev/null 2>&1 || true
   kctl -n "${NAMESPACE}" create secret generic "${secret_name}" \
@@ -214,18 +265,29 @@ install_envoy_gateway() {
 }
 
 wait_for_envoy_service() {
+  local gateway_name=""
   local svc_ref=""
   local svc_namespace=""
 
+  gateway_name="$(kctl -n "${NAMESPACE}" get grpcroute \
+    -l "app.kubernetes.io/instance=${RELEASE_NAME}" \
+    -o jsonpath='{.items[0].spec.parentRefs[0].name}' \
+    2>/dev/null || true)"
+  if [ -z "${gateway_name}" ]; then
+    echo "ERROR: could not determine the Gateway referenced by the OpenShell GRPCRoute." >&2
+    kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
+    return 1
+  fi
+
   for _ in $(seq 1 60); do
     svc_ref="$(kctl get svc -A \
-      -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+      -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
       -o jsonpath='{range .items[0]}{.metadata.namespace}{"/"}{.metadata.name}{end}' \
       2>/dev/null || true)"
     if [ -n "${svc_ref}" ]; then
       svc_namespace="${svc_ref%%/*}"
       if kctl -n "${svc_namespace}" wait --for=condition=Ready pod \
-        -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+        -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
         --timeout=5s >/dev/null 2>&1; then
         printf '%s\n' "${svc_ref}"
         return 0
@@ -234,13 +296,13 @@ wait_for_envoy_service() {
     sleep 2
   done
 
-  echo "ERROR: Envoy proxy Service for Gateway ${RELEASE_NAME} was not ready." >&2
+  echo "ERROR: Envoy proxy Service for Gateway ${gateway_name} was not ready." >&2
   kctl -n "${NAMESPACE}" get gateway,grpcroute -o wide >&2 || true
   kctl get svc -A \
-    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
     -o wide >&2 || true
   kctl get pods -A \
-    -l "gateway.envoyproxy.io/owning-gateway-name=${RELEASE_NAME},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
+    -l "gateway.envoyproxy.io/owning-gateway-name=${gateway_name},gateway.envoyproxy.io/owning-gateway-namespace=${NAMESPACE}" \
     -o wide >&2 || true
   return 1
 }
@@ -1171,6 +1233,7 @@ fi
 helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
+helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2
@@ -1182,10 +1245,14 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   )
 fi
 if [ -n "${HOST_GATEWAY_IP}" ]; then
-  helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
+  # server.hostGatewayIP owns both the gateway runtime field and sandbox-pod
+  # hostAliases. Exercise the public chart input rather than bypassing it with
+  # a direct gatewayConfig override.
+  helm_extra_args+=(--set-string "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+helm_values_args+=(--set-string "global.image.registry=$(e2e_image_reference_registry "${GATEWAY_IMAGE}")")
 if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   echo "OpenShift detected — applying SCC-compatible security context overrides."
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
@@ -1393,6 +1460,10 @@ else
     "${helm_post_renderer_args[@]}" \
     --wait --timeout 5m
   HELM_INSTALLED=1
+
+  if [ "${OPENSHELL_E2E_KUBE_CONFIG_ROLLOUT:-0}" = "1" ]; then
+    verify_gateway_config_rollout || exit 1
+  fi
 
   if [ -n "${OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET:-}" ]; then
     kctl -n "${NAMESPACE}" create secret docker-registry \

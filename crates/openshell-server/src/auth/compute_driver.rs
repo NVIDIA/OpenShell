@@ -3,7 +3,7 @@
 
 //! Compute-driver delegated sandbox bootstrap authentication.
 
-use super::authenticator::Authenticator;
+use super::authenticator::{Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use crate::compute::ComputeRuntime;
 use async_trait::async_trait;
@@ -34,11 +34,7 @@ impl Authenticator for ComputeDriverAuthenticator {
             return Ok(None);
         }
 
-        let Some(credential) = headers
-            .get(http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-        else {
+        let Some(credential) = bearer_credential(headers) else {
             return Ok(None);
         };
 
@@ -116,6 +112,23 @@ mod tests {
                 if driver_name == "external-kubernetes"
                     && runtime_identity == "test-runtime"
         ));
+    }
+
+    #[tokio::test]
+    async fn accepts_lowercase_bearer_scheme() {
+        let auth = authenticator(NoopTestDriver::authenticating_sandbox("sandbox-a")).await;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("bearer driver-credential"),
+        );
+
+        let principal = auth
+            .authenticate(&headers, ISSUE_SANDBOX_TOKEN_PATH)
+            .await
+            .unwrap();
+
+        assert!(principal.is_some());
     }
 
     #[tokio::test]

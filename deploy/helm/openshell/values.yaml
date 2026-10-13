@@ -248,11 +248,10 @@ autoscaling:
   # -- Additional autoscaling/v2 MetricSpec entries appended verbatim, such as
   # Pods metrics served by prometheus-adapter.
   metrics: []
-  # -- HPA scaling behavior. Scale-down disconnects the removed pod's
-  # supervisor sessions; they reconnect to the remaining replicas, so the
-  # default removes at most one replica every two minutes after a
-  # five-minute stabilization window. Helm merges maps: set
-  # autoscaling.behavior.scaleDown to null to drop the default.
+  # -- HPA scaling behavior. Scale-down hands the removed pod's supervisor
+  # sessions to the remaining replicas, so the default removes at most one
+  # replica every two minutes after a five-minute stabilization window. Helm
+  # merges maps: set autoscaling.behavior.scaleDown to null to drop the default.
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300
@@ -299,6 +298,14 @@ tolerations: []
 
 # -- Affinity rules for the gateway pod.
 affinity: {}
+
+# -- Non-secret gateway application configuration. Top-level keys name TOML
+# tables and are rendered into the mounted gateway.toml file. Kubernetes
+# resource inputs remain outside this map; template expressions derive the
+# corresponding runtime values from their resource owner.
+gatewayConfig:
+  openshell:
+    version: 2
 
 # Server configuration
 server:
@@ -372,11 +379,6 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
-  # -- Pod annotation keys that sandbox templates may set
-  # (`allowed_pod_annotations`). Each entry is an exact key
-  # (`example.com/team`) or a prefix wildcard (`example.com/*`).
-  # Empty (default) rejects every caller-supplied pod annotation.
-  allowedPodAnnotations: []
   # -- UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift
   # SCC namespace annotation if present, otherwise the driver default. Must be
   # an integer between 1 and 4294967294.
@@ -589,6 +591,14 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
+# Kubernetes resource references for external credential drivers. Runtime
+# driver settings remain in gatewayConfig.
+credentialDrivers:
+  vault:
+    # -- ConfigMap containing the private Vault/OpenBao CA certificate under
+    # the ca.crt key. Helm mounts it only when the Vault driver is selected.
+    caConfigMapName: ""
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Restrict SSH ingress on sandbox pods to the gateway. In managed mode,
@@ -679,9 +689,10 @@ certManager:
   serverIpAddresses:
     - 127.0.0.1
 
-# Kubernetes Gateway API - HTTPRoute and Gateway resources.
-# Requires a Gateway API controller in the cluster. Install Envoy Gateway via
-# the skaffold.yaml releases or independently:
+# Kubernetes Gateway API - GRPCRoute and Gateway resources.
+# Requires a Gateway API controller in the cluster. OpenShell tests the
+# examples with Envoy Gateway, which can be installed via skaffold.yaml or
+# independently:
 #   helm install eg oci://docker.io/envoyproxy/gateway-helm \
 #     --version v1.4.1 -n envoy-gateway-system --create-namespace
 grpcRoute:
@@ -691,23 +702,34 @@ grpcRoute:
   hostnames: []
   gateway:
     # -- When true, a Gateway resource is created in the release namespace.
-    # Set to false and provide name/namespace to attach to a pre-existing Gateway.
+    # Set to false and provide name/namespace to attach to a pre-existing
+    # Gateway. Use sectionName to select a specific listener when needed.
     create: false
-    # -- GatewayClass to reference. Envoy Gateway installs one named "eg".
+    # -- GatewayClass for a chart-created Gateway. Set this to the name exposed
+    # by your Gateway API implementation. Envoy Gateway uses "eg" in the
+    # OpenShell examples. Ignored when gateway.create is false.
     className: "eg"
-    # -- Name of the Gateway resource. Defaults to the chart fullname.
+    # -- Name of the Gateway resource. Defaults to `<fullname>`. Set a distinct
+    # name when the selected controller creates a proxy Service with the
+    # Gateway name. When gateway.create is false, set this to the name of the
+    # existing Gateway.
     name: ""
     # -- Namespace of the Gateway referenced by the GRPCRoute parentRef.
-    # Defaults to the release namespace.
+    # Defaults to the release namespace. A chart-created Gateway always resides
+    # in the release namespace.
     namespace: ""
+    # -- Listener name on an existing Gateway. Leave empty to let Gateway API
+    # listener matching select compatible listeners.
+    sectionName: ""
     # Listener settings (only used when gateway.create is true).
     listener:
       # -- Listener port for the generated Gateway resource. Use 443 with protocol HTTPS.
       port: 80
       # -- Listener protocol for the generated Gateway resource: HTTP or HTTPS.
-      # HTTPS terminates TLS at the Envoy Gateway listener; pair it with
-      # server.disableTls=true so Envoy forwards plaintext to the gateway pod,
-      # and use OIDC for client identity (the gateway never sees the client cert).
+      # HTTPS terminates TLS at the Gateway listener; pair it with
+      # server.disableTls=true so the proxy forwards plaintext to the gateway
+      # pod, and use OIDC for client identity (the gateway never sees the client
+      # certificate).
       protocol: HTTP
       # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.
       allowedRoutes: Same
@@ -720,6 +742,14 @@ grpcRoute:
         # or the existing openshell-server-tls Secret (its SANs must include the
         # external hostname).
         certificateRefs: []
+  replicaRouting:
+    # -- Route requests carrying an `x-openshell-replica` header straight to
+    # that gateway replica. The CLI sets the header on long-lived sandbox
+    # connections (SSH, port forwards, exec) using the owner the gateway
+    # reports, so they skip the relay through a peer replica. Renders one
+    # Service per replica. Requires workload.kind=statefulset,
+    # workload.allowMultiReplicaStatefulSet=true, and at most 15 replicas.
+    enabled: false
   # BackendTLSPolicy for end-to-end TLS between the Gateway proxy and the
   # OpenShell gateway pod. When enabled, the Gateway proxy terminates
   # client-facing TLS at the listener and re-encrypts when connecting to the

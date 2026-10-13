@@ -296,6 +296,13 @@ service OpenShell {
     };
   }
 
+  // Export selected usable runtime credentials. Only directly authenticated
+  // mTLS operators may call this method; refresh material is never returned.
+  rpc GetProviderCredentials(GetProviderCredentialsRequest)
+      returns (GetProviderCredentialsResponse) {
+    option (openshell.options.v1.authorization) = { auth_mode: "operator" };
+  }
+
   // List providers.
   rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse) {
     option (openshell.options.v1.authorization) = {
@@ -2136,6 +2143,31 @@ message GetProviderRequest {
   string name = 1;
 }
 
+// Retrieve selected runtime credentials from one provider in one workspace.
+// Refresh side effects can persist even when the complete request fails.
+message GetProviderCredentialsRequest {
+  // Required named workspace selection; all_workspaces is not accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Provider canonical name.
+  string name = 2;
+  // Nonempty selection of runtime environment keys (maximum 32).
+  repeated string credential_keys = 3;
+  // Omitted/zero uses a five-minute safety margin. Maximum is 24 hours.
+  google.protobuf.Duration minimum_remaining_lifetime = 4;
+}
+
+// Usable runtime value, never gateway-only minting material.
+message ProviderCredentialValue {
+  string value = 1 [(openshell.options.v1.secret) = true];
+  // Absent for credentials with no declared expiration.
+  google.protobuf.Timestamp expiration_time = 2;
+}
+
+message GetProviderCredentialsResponse {
+  // All requested values or an error; no partial response.
+  map<string, ProviderCredentialValue> credentials = 1;
+}
+
 // List providers request.
 message ListProvidersRequest {
   // Workspace scope. Named and all-workspaces selections are accepted.
@@ -2146,6 +2178,8 @@ message ListProvidersRequest {
   // Token from a previous ListProviders response. All other request parameters
   // except page_size must match the request that produced it.
   string page_token = 2;
+  // Optional label selector for filtering (format: "key1=value1,key2=value2").
+  string label_selector = 4;
 }
 
 // Update provider request.
@@ -2317,6 +2351,18 @@ message ProviderProfileCredential {
   ProviderCredentialRefresh refresh = 8;
   string path_template = 9;
   ProviderCredentialTokenGrant token_grant = 10;
+  // Output-only gateway-derived endpoint authorities for resolved token grants.
+  // For inspected L7 requests, empty means no endpoint may obtain this grant.
+  // L4 injection uses selectors without checking these authorities.
+  // Profile-authored values are ignored; normal policies name the originating
+  // provider endpoint, while a global policy uses its own endpoint authorities.
+  repeated string token_grant_owners = 11;
+  // Opt in to an opaque identity-bound environment placeholder for every env
+  // var declared by this credential. Use this only when an external credential
+  // updater requires one placeholder across value-only provider revisions.
+  // Gateway-managed refresh and token-grant credentials cannot opt in because
+  // they require identity-bearing handles for authorization-epoch revocation.
+  bool stable_placeholder = 12;
 }
 
 enum ProviderCredentialRefreshStrategy {
@@ -2568,6 +2614,9 @@ message LintProviderProfilesRequest {
 message LintProviderProfilesResponse {
   repeated ProviderProfileDiagnostic diagnostics = 1;
   bool valid = 2;
+  // Clients enabling stable_placeholder check this before import or update,
+  // since older gateways silently discard unknown credential fields.
+  bool supports_stable_placeholder = 3;
 }
 
 // Delete provider response.
@@ -2603,6 +2652,10 @@ message GetSandboxProviderEnvironmentRequest {
   // provider credentials. Gateways withhold static credential material when
   // this capability is absent.
   bool supports_static_credential_bindings = 2;
+  // Whether the requesting supervisor understands stable external-placeholder
+  // metadata. Gateways withhold credentials that require this behavior when
+  // the capability is absent.
+  bool supports_stable_placeholder_environment_keys = 3;
 }
 
 // One network endpoint at which a static provider credential may be resolved.
@@ -2619,11 +2672,11 @@ message StaticCredentialBinding {
   // Supervisors use it to retain old revision placeholders only across
   // rotations of the same provider credential.
   string credential_identity = 2;
-  // Opaque gateway-issued handle for a refresh-managed credential identity
-  // epoch. When non-empty, supervisors keep the workload placeholder stable
-  // across access-token rotations and replace only the resolver value. The
-  // handle changes when the sandbox, provider, credential key, refresh
-  // authorization epoch, or endpoint authorization boundary changes.
+  // Opaque gateway-issued handle for a stable credential lifecycle. When
+  // non-empty, supervisors keep the workload placeholder stable across value
+  // updates and replace only the resolver value. The handle changes when the
+  // sandbox, provider, credential key, endpoint authorization, or an applicable
+  // refresh authorization epoch changes.
   string workload_credential_handle = 3;
 }
 
@@ -2657,6 +2710,15 @@ message GetSandboxProviderEnvironmentResponse {
   ProviderReadinessReason readiness_reason = 9;
   // Complete desired set of non-secret managed files, keyed by absolute path.
   map<string, string> files = 10;
+  // Credential environment variables whose opaque resolver handle remains
+  // stable across value-only provider revisions. These keys are still secrets;
+  // this metadata only selects the stable external-placeholder behavior.
+  repeated string stable_placeholder_environment_keys = 11;
+  // Supporting gateways always acknowledge the stable-placeholder delivery
+  // contract, including responses without opted-in credentials. Supervisors
+  // require acknowledgment for declared or previously activated external
+  // stable credentials; ordinary legacy delivery does not require it.
+  bool supports_stable_placeholder_environment_keys = 12;
 }
 
 message ExchangeProviderSubjectTokenRequest {
@@ -2992,6 +3054,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    SessionRedirect session_redirect = 6;
   }
 }
 
@@ -3006,6 +3069,14 @@ message SupervisorHello {
   uint64 connection_epoch = 3;
   // The supervisor can report credential, policy, and launch-environment installation.
   bool supports_provider_readiness = 4;
+  // Set when this connection is the result of following a SessionRedirect. The
+  // receiving gateway serves a redirected hello locally instead of redirecting
+  // again, so a disagreement about membership cannot bounce the supervisor
+  // between replicas. A gateway that is shutting down may still redirect it.
+  bool redirected = 5;
+  // The supervisor understands SessionRedirect. Gateways never redirect a
+  // supervisor that does not set this.
+  bool supports_session_redirect = 6;
 }
 
 // Gateway accepts the supervisor session.
@@ -3022,6 +3093,20 @@ message SessionAccepted {
 message SessionRejected {
   // Human-readable rejection reason.
   string reason = 1;
+}
+
+// Gateway declines to own this session and names the replica that should.
+//
+// Sent instead of SessionAccepted when the placement ring puts the sandbox on
+// a different live replica, and to established sessions when their gateway
+// shuts down. The supervisor reconnects to peer_endpoint once with
+// SupervisorHello.redirected set, and falls back to its configured gateway
+// address if that fails.
+message SessionRedirect {
+  // Peer endpoint of the replica that should own this sandbox.
+  string peer_endpoint = 1;
+  // Replica ID that should own this sandbox, for logging.
+  string owner_replica_id = 2;
 }
 
 // Supervisor heartbeat.

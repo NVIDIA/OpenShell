@@ -91,7 +91,10 @@ where
         "yaml" => {
             let envelope =
                 paginated_collection_value(collection_name, items, next_page_token, to_json);
-            print!("{}", serde_yml::to_string(&envelope).into_diagnostic()?);
+            print!(
+                "{}",
+                openshell_core::yaml::to_string(&envelope).into_diagnostic()?
+            );
             Ok(true)
         }
         "table" => Ok(false),
@@ -138,7 +141,10 @@ where
         }
         "yaml" => {
             let values: Vec<_> = items.iter().map(to_json).collect();
-            print!("{}", serde_yml::to_string(&values).into_diagnostic()?);
+            print!(
+                "{}",
+                openshell_core::yaml::to_string(&values).into_diagnostic()?
+            );
             Ok(true)
         }
         "table" => Ok(false),
@@ -177,7 +183,10 @@ where
         }
         "yaml" => {
             let value = to_json(item);
-            print!("{}", serde_yml::to_string(&value).into_diagnostic()?);
+            print!(
+                "{}",
+                openshell_core::yaml::to_string(&value).into_diagnostic()?
+            );
             Ok(true)
         }
         "table" => Ok(false),
@@ -265,7 +274,7 @@ where
             write!(
                 writer,
                 "{}",
-                serde_yml::to_string(&values).into_diagnostic()?
+                openshell_core::yaml::to_string(&values).into_diagnostic()?
             )
             .into_diagnostic()?;
             Ok(true)
@@ -309,7 +318,7 @@ where
             write!(
                 writer,
                 "{}",
-                serde_yml::to_string(&envelope).into_diagnostic()?
+                openshell_core::yaml::to_string(&envelope).into_diagnostic()?
             )
             .into_diagnostic()?;
             Ok(true)
@@ -356,7 +365,7 @@ where
             write!(
                 writer,
                 "{}",
-                serde_yml::to_string(&value).into_diagnostic()?
+                openshell_core::yaml::to_string(&value).into_diagnostic()?
             )
             .into_diagnostic()?;
             Ok(true)

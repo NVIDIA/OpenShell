@@ -17,6 +17,26 @@ Create pull requests on GitHub using the `gh` CLI.
 
 ## Before Creating a PR
 
+### Verify Contributor Access and Issue Acceptance
+
+Before pushing or creating a PR (including a draft), verify the author's access
+to the target repository, not their fork. For the authenticated `gh` user:
+
+```bash
+gh repo view OWNER/REPO --json nameWithOwner,viewerPermission
+gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
+```
+
+Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
+`state:accepted`; keep the issue link and note the missing label. Everyone else
+must link at least one target-repository issue and have `state:accepted` on each.
+Otherwise, preserve local work and report which issue needs acceptance. A direct
+request, roadmap placement, other labels, or vouch status does not bypass this gate.
+
+When acting for another author, verify their permissions. Resolve failed lookups
+before proceeding; retry sandbox network failures outside the sandbox before
+reporting an authentication problem. Vouch requirements still apply separately.
+
 ### Check Config Documentation
 
 If the branch changes gateway TOML parsing, `[openshell.gateway]` fields,
@@ -219,6 +239,9 @@ EOF
 ## After Creating
 
 The command outputs the PR URL and number.
+
+Rerun `PR Issue Acceptance` after linked issue labels change; it does not refresh
+automatically on issue-label events.
 
 **Display the URL using markdown link syntax** so it's easily clickable:
 

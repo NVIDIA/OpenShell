@@ -549,6 +549,7 @@ fn to_proto(raw: PolicyFile) -> Result<SandboxPolicy> {
                             // Provider credential provenance is derived by the
                             // gateway and cannot be authored in policy YAML.
                             provider_credentialed: false,
+                            token_grant_owner: String::new(),
                             // Advisor provenance is internal runtime state, not
                             // a user-authored policy schema field.
                             advisor_proposed: false,

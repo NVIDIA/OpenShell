@@ -29,6 +29,7 @@ use crate::storage_proto::{
 
 const DEFAULT_REFRESH_BEFORE_SECONDS: i64 = 300;
 const EXPIRATION_PRESENT_ANNOTATION: &str = "openshell.nvidia.com/refresh-expiration-present";
+const COMPLETED_MINT_ANNOTATION: &str = "openshell.nvidia.com/refresh-completed-mint";
 const DEFAULT_MAX_LIFETIME_SECONDS: i64 = 3600;
 const REFRESH_ERROR_RETRY_SECONDS: i64 = 60;
 const REFRESH_CONFIGURATION_RETRY_SECONDS: i64 = 60 * 60;
@@ -845,7 +846,252 @@ fn validate_secret_material_references(
     )))
 }
 
+// Local waiters do not consume PostgreSQL sessions while another local mint owns
+// the credential. Weak entries avoid retaining every provider ever refreshed.
+static REFRESH_LOCKS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static REFRESH_EXECUTORS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+static REFRESH_ADMISSIONS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(32);
+
+fn refresh_lock(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>, Status> {
+    let key = refresh_state_name(&state.provider_id, &state.credential_key);
+    let mut locks = REFRESH_LOCKS
+        .lock()
+        .map_err(|_| Status::internal("refresh coordination unavailable"))?;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = locks
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap_or_else(|| std::sync::Arc::new(tokio::sync::Mutex::new(())));
+    locks.insert(key, std::sync::Arc::downgrade(&lock));
+    Ok(lock)
+}
+
+fn completed_mint(state: &StoredProviderCredentialRefreshState) -> Option<&str> {
+    state
+        .metadata
+        .as_ref()?
+        .annotations
+        .get(COMPLETED_MINT_ANNOTATION)
+        .map(String::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Cleanup also mutates the mint receipt's resource version. Use the same
+/// local/distributed locks as minting, then reload instead of writing a stale
+/// sweep snapshot over an active mint or deleting its replacement grant.
+async fn cleanup_pending_secret_deletions_coordinated(
+    store: &Store,
+    credentials: Option<&crate::credentials::CredentialRuntime>,
+    state: &mut StoredProviderCredentialRefreshState,
+) -> Result<(), Status> {
+    if state.pending_secret_deletions.is_empty() {
+        return Ok(());
+    }
+    let _local = tokio::time::timeout(Duration::from_secs(40), refresh_lock(state)?.lock_owned())
+        .await
+        .map_err(|_| Status::unavailable("credential refresh is busy"))?;
+    let _distributed = store
+        .acquire_refresh_guard(&state.provider_id, &state.credential_key)
+        .await
+        .map_err(|_| Status::unavailable("credential refresh coordination unavailable"))?;
+    let latest = get_refresh_state(
+        store,
+        state.object_workspace(),
+        &state.provider_id,
+        &state.credential_key,
+    )
+    .await?
+    .ok_or_else(|| Status::aborted("provider refresh was deleted"))?;
+    if latest.object_id() != state.object_id()
+        || effective_authorization_epoch(&latest)? != effective_authorization_epoch(state)?
+        || latest
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
+    {
+        return Err(Status::aborted(
+            "provider refresh was deleted or reconfigured",
+        ));
+    }
+    *state = latest;
+    let expected_version = state
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+    cleanup_pending_secret_deletions(store, credentials, state, expected_version).await?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefreshTrigger {
+    Automatic,
+    ExplicitRotation,
+}
+
+/// Automatic callers must honor the live failure schedule, not the eligibility
+/// observed before they queued. Configuration/investigation failures can still
+/// be retried by the worker once due; reauthorization stays parked.
+fn ensure_automatic_refresh_ready(
+    state: &StoredProviderCredentialRefreshState,
+    now_ms: i64,
+) -> Result<(), Status> {
+    if state.recovery_action == ProviderCredentialRefreshRecoveryAction::Reauthorize as i32 {
+        return Err(Status::failed_precondition(
+            "credential refresh requires recovery",
+        ));
+    }
+    if state.recovery_action != ProviderCredentialRefreshRecoveryAction::Unspecified as i32
+        && state.next_refresh_at_ms > now_ms
+    {
+        return Err(Status::unavailable(
+            "credential refresh is in retry backoff",
+        ));
+    }
+    Ok(())
+}
+
+/// Cancellation-safe entry point for a separately requested manual rotation.
 pub async fn refresh_provider_credential(
+    store: &Store,
+    workspace: &str,
+    credentials: &crate::credentials::CredentialRuntime,
+    compute: Option<&crate::compute::ComputeRuntime>,
+    provider_name: &str,
+    credential_key: &str,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    let provider = store
+        .get_message_by_name::<Provider>(workspace, provider_name)
+        .await
+        .map_err(|_| Status::internal("fetch provider failed"))?
+        .ok_or_else(|| Status::not_found("provider not found"))?;
+    let snapshot = get_refresh_state(store, workspace, provider.object_id(), credential_key)
+        .await?
+        .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
+    refresh_from_snapshot_with_trigger(
+        store,
+        credentials,
+        compute,
+        snapshot,
+        RefreshTrigger::ExplicitRotation,
+    )
+    .await
+}
+
+/// Coalesce an automatic refresh against the caller's observed generation, not
+/// a name-keyed replacement. Recheck recovery/backoff after acquiring the locks.
+pub async fn refresh_from_snapshot(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    compute: Option<&crate::compute::ComputeRuntime>,
+    snapshot: StoredProviderCredentialRefreshState,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    refresh_from_snapshot_with_trigger(
+        store,
+        credentials,
+        compute,
+        snapshot,
+        RefreshTrigger::Automatic,
+    )
+    .await
+}
+
+async fn refresh_from_snapshot_with_trigger(
+    store: &Store,
+    credentials: &crate::credentials::CredentialRuntime,
+    compute: Option<&crate::compute::ComputeRuntime>,
+    snapshot: StoredProviderCredentialRefreshState,
+    trigger: RefreshTrigger,
+) -> Result<StoredProviderCredentialRefreshState, Status> {
+    let admission = REFRESH_ADMISSIONS
+        .try_acquire()
+        .map_err(|_| Status::resource_exhausted("credential refresh queue is full"))?;
+    let lock = refresh_lock(&snapshot)?;
+    let store = store.clone();
+    let credentials = credentials.clone();
+    let compute = compute.cloned();
+    // A disconnected RPC must not cancel minting after an upstream rotates its
+    // refresh token. Spawn before any externally observable refresh side effect.
+    tokio::spawn(async move {
+        let _admission = admission;
+        let _local = tokio::time::timeout(Duration::from_secs(40), lock.lock_owned())
+            .await
+            .map_err(|_| Status::unavailable("credential refresh is busy"))?;
+        let _permit = tokio::time::timeout(Duration::from_secs(40), REFRESH_EXECUTORS.acquire())
+            .await
+            .map_err(|_| Status::resource_exhausted("credential refresh workers are busy"))?
+            .map_err(|_| Status::unavailable("credential refresh workers stopped"))?;
+        let _distributed = store
+            .acquire_refresh_guard(&snapshot.provider_id, &snapshot.credential_key)
+            .await
+            .map_err(|_| Status::unavailable("credential refresh coordination unavailable"))?;
+        let latest = get_refresh_state(
+            &store,
+            snapshot.object_workspace(),
+            &snapshot.provider_id,
+            &snapshot.credential_key,
+        )
+        .await?
+        .ok_or_else(|| Status::aborted("provider refresh was deleted"))?;
+        if latest.object_id() != snapshot.object_id()
+            || effective_authorization_epoch(&latest)? != effective_authorization_epoch(&snapshot)?
+        {
+            return Err(Status::aborted("provider refresh was reconfigured"));
+        }
+        if latest
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.deletion_time.is_some())
+        {
+            return Err(Status::failed_precondition(
+                "provider refresh is being deleted",
+            ));
+        }
+        // A row-version change can be cleanup or other bookkeeping, not a
+        // successful exchange. Only a new committed mint can satisfy a waiter.
+        if latest.status == "refreshed"
+            && completed_mint(&latest).is_some()
+            && completed_mint(&latest) != completed_mint(&snapshot)
+        {
+            return Ok(latest);
+        }
+        let provider = store
+            .get_message_by_name::<Provider>(snapshot.object_workspace(), &snapshot.provider_name)
+            .await
+            .map_err(|_| Status::internal("fetch provider failed"))?
+            .ok_or_else(|| Status::not_found("provider not found"))?;
+        if provider.object_id() != snapshot.provider_id {
+            return Err(Status::aborted("provider was replaced"));
+        }
+        if matches!(
+            latest.status.as_str(),
+            "refresh_in_progress" | "refresh_committing"
+        ) {
+            return Err(Status::failed_precondition(
+                "previous credential mint has an uncertain outcome; reconfigure the refresh grant",
+            ));
+        }
+        if trigger == RefreshTrigger::Automatic {
+            ensure_automatic_refresh_ready(&latest, current_time_ms())?;
+        }
+        refresh_provider_credential_locked(
+            &store,
+            snapshot.object_workspace(),
+            &credentials,
+            compute.as_ref(),
+            &snapshot.provider_name,
+            &snapshot.credential_key,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| Status::internal("credential refresh worker failed"))?
+}
+
+async fn refresh_provider_credential_locked(
     store: &Store,
     workspace: &str,
     credentials: &crate::credentials::CredentialRuntime,
@@ -911,6 +1157,14 @@ pub async fn refresh_provider_credential(
         "provider credential refresh started"
     );
 
+    // Persist uncertainty BEFORE contacting the issuer. A crashed process or a
+    // lost advisory-lock session cannot lead another replica to reuse the grant.
+    state.status = "refresh_in_progress".to_string();
+    state.next_refresh_at_ms = i64::MAX;
+    state.recovery_action = ProviderCredentialRefreshRecoveryAction::Investigate as i32;
+    let expected_version = persist_refresh_state_if_current(store, &state, expected_version)
+        .await?
+        .ok_or_else(|| Status::aborted("provider refresh changed before minting"))?;
     let mint_result = match resolve_refresh_material(Some(credentials), &state).await {
         Ok(transient_state) => mint_credential(&transient_state).await,
         Err(err) => Err(err.into()),
@@ -995,7 +1249,9 @@ pub async fn refresh_provider_credential(
             state.next_refresh_at_ms =
                 next_refresh_at_ms(minted.expires_at_ms, state.refresh_before.as_ref());
             state.last_refresh_at_ms = now_ms;
-            state.status = "refreshed".to_string();
+            let completed_next_refresh_at_ms = state.next_refresh_at_ms;
+            state.status = "refresh_committing".to_string();
+            state.next_refresh_at_ms = i64::MAX;
             state.last_error.clear();
             state.recovery_action = ProviderCredentialRefreshRecoveryAction::Unspecified as i32;
             state.failure_code.clear();
@@ -1083,6 +1339,22 @@ pub async fn refresh_provider_credential(
                 );
                 return Err(err);
             }
+            // A success snapshot must not become visible before its provider
+            // handles are committed. Park incomplete commits rather than minting
+            // again after a crash or lost database session.
+            state.status = "refreshed".to_string();
+            state.next_refresh_at_ms = completed_next_refresh_at_ms;
+            if let Some(metadata) = state.metadata.as_mut() {
+                metadata.annotations.insert(
+                    COMPLETED_MINT_ANNOTATION.to_string(),
+                    uuid::Uuid::new_v4().to_string(),
+                );
+            }
+            let new_version = persist_refresh_state_if_current(store, &state, new_version)
+                .await?
+                .ok_or_else(|| {
+                    Status::aborted("provider refresh changed during credential commit")
+                })?;
             info!(
                 provider = %state.provider_name,
                 credential_key = %state.credential_key,
@@ -1641,10 +1913,20 @@ async fn request_token(
                 error_kind,
                 "OAuth token endpoint request failed"
             );
-            RefreshFailure::retryable(
-                Status::unavailable("token endpoint request failed"),
-                "oauth_token_endpoint_unavailable",
-            )
+            if grant_kind == OAuthGrantKind::UserRefreshToken && error_kind != "connect" {
+                RefreshFailure::reauthorize(
+                    Status::failed_precondition(
+                        "refresh token exchange has an uncertain outcome; reauthorize the grant",
+                    ),
+                    "oauth_refresh_exchange_uncertain",
+                    None,
+                )
+            } else {
+                RefreshFailure::retryable(
+                    Status::unavailable("token endpoint request failed"),
+                    "oauth_token_endpoint_unavailable",
+                )
+            }
         })?;
     let status = response.status();
     if !status.is_success() {
@@ -1652,12 +1934,30 @@ async fn request_token(
         return Err(classify_oauth_token_error(status, &body, grant_kind));
     }
     let token = response.json::<TokenResponse>().await.map_err(|_| {
+        if grant_kind == OAuthGrantKind::UserRefreshToken {
+            return RefreshFailure::reauthorize(
+                Status::failed_precondition(
+                    "refresh token exchange returned an unusable response; reauthorize the grant",
+                ),
+                "oauth_refresh_exchange_uncertain",
+                None,
+            );
+        }
         RefreshFailure::investigate(
             Status::failed_precondition("token endpoint returned invalid JSON"),
             "oauth_invalid_success_response",
         )
     })?;
     if token.access_token.trim().is_empty() {
+        if grant_kind == OAuthGrantKind::UserRefreshToken {
+            return Err(RefreshFailure::reauthorize(
+                Status::failed_precondition(
+                    "refresh token exchange returned no access token; reauthorize the grant",
+                ),
+                "oauth_refresh_exchange_uncertain",
+                None,
+            ));
+        }
         return Err(RefreshFailure::investigate(
             Status::failed_precondition("token endpoint returned empty access_token"),
             "oauth_empty_access_token",
@@ -2018,12 +2318,8 @@ async fn refresh_states(
             continue;
         }
         let mut state = state;
-        let expected_version = state
-            .metadata
-            .as_ref()
-            .map_or(0, |metadata| metadata.resource_version);
         if let Err(err) =
-            cleanup_pending_secret_deletions(store, credentials, &mut state, expected_version).await
+            cleanup_pending_secret_deletions_coordinated(store, credentials, &mut state).await
         {
             warn!(
                 provider = %state.provider_name,
@@ -2078,15 +2374,14 @@ async fn refresh_states(
             status = %state.status,
             "refreshing provider credential"
         );
-        if let Err(err) = refresh_provider_credential(
-            store,
-            state.object_workspace(),
-            credentials,
-            compute,
-            &state.provider_name,
-            &state.credential_key,
-        )
-        .await
+        let trigger = if rotation_requested {
+            RefreshTrigger::ExplicitRotation
+        } else {
+            RefreshTrigger::Automatic
+        };
+        if let Err(err) =
+            refresh_from_snapshot_with_trigger(store, credentials, compute, state.clone(), trigger)
+                .await
         {
             warn!(
                 provider = %state.provider_name,
@@ -2107,9 +2402,9 @@ mod tests {
         MAX_OAUTH_ERROR_RESPONSE_BYTES, NewRefreshStateConfig, OAuthGrantKind, RefreshFailure,
         RefreshRetrySchedule, Status, classify_oauth_token_error,
         delete_refresh_state_with_credentials, effective_authorization_epoch,
-        enqueue_pending_secret_deletion, get_refresh_state, list_all_refresh_states,
-        list_refresh_states_for_provider, max_lifetime_seconds, new_refresh_state,
-        next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
+        enqueue_pending_secret_deletion, ensure_automatic_refresh_ready, get_refresh_state,
+        list_all_refresh_states, list_refresh_states_for_provider, max_lifetime_seconds,
+        new_refresh_state, next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
         refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
         refresh_state_name, refresh_status_from_state, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
@@ -3237,6 +3532,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_cleanup_waits_for_mint_and_preserves_rotated_grant() {
+        use std::time::Duration;
+
+        let issuer = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=old-grant"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "refresh_token": "replacement-grant",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&issuer)
+            .await;
+        let store = test_store().await;
+        let provider = provider("cleanup-during-mint", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let credentials = test_credentials();
+        let mut state = new_refresh_state(
+            &provider,
+            "default",
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".into(), "client".into()),
+                    ("refresh_token".into(), "old-grant".into()),
+                ]),
+                secret_material_keys: vec!["refresh_token".into()],
+                expires_at_ms: 1,
+                token_url: issuer.uri(),
+                scopes: vec![],
+                refresh_before: None,
+                max_lifetime: None,
+                additional_output_keys: HashMap::new(),
+            },
+        )
+        .unwrap();
+        let obsolete = credentials
+            .store_refresh_material_with_object_id(
+                refresh_material_scope(&state),
+                "obsolete-grant",
+                &HashMap::from([("refresh_token".into(), "obsolete".into())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap()
+            .remove("refresh_token")
+            .unwrap();
+        enqueue_pending_secret_deletion(&mut state, "refresh_token", obsolete);
+        put_refresh_state(&store, &state).await.unwrap();
+        let sweep_snapshot = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Fail pre-mint cleanup, then stop at replacement-grant storage after
+        // the issuer has rotated the grant but before the receipt CAS.
+        credentials.fail_next_delete();
+        let (storing, release) = credentials.gate_next_store();
+        let mint_store = store.clone();
+        let mint_credentials = credentials.clone();
+        let mint = tokio::spawn(async move {
+            refresh_provider_credential(
+                &mint_store,
+                "default",
+                &mint_credentials,
+                None,
+                "cleanup-during-mint",
+                "MS_GRAPH_ACCESS_TOKEN",
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), storing)
+            .await
+            .unwrap()
+            .unwrap();
+        let before_cleanup = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(before_cleanup.status, "refresh_in_progress");
+        let cleanup_store = store.clone();
+        let cleanup_credentials = credentials.clone();
+        let mut sweep = tokio::spawn(async move {
+            super::refresh_states(
+                &cleanup_store,
+                Some(&cleanup_credentials),
+                None,
+                vec![sweep_snapshot],
+                current_time_ms(),
+            )
+            .await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut sweep)
+                .await
+                .is_err(),
+            "cleanup must wait for the active mint"
+        );
+        let during_cleanup = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(during_cleanup, before_cleanup);
+        release.send(()).unwrap();
+        assert_eq!(mint.await.unwrap().unwrap().status, "refreshed");
+        tokio::time::timeout(Duration::from_secs(10), sweep)
+            .await
+            .unwrap()
+            .unwrap();
+        let committed = get_refresh_state(
+            &store,
+            "default",
+            provider.object_id(),
+            "MS_GRAPH_ACCESS_TOKEN",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(committed.status, "refreshed");
+        assert_ne!(committed.next_refresh_at_ms, i64::MAX);
+        assert!(committed.pending_secret_deletions.is_empty());
+        assert_eq!(
+            credentials
+                .resolve_refresh_material(
+                    refresh_material_scope(&committed),
+                    &committed.secret_material_handles,
+                )
+                .await
+                .unwrap()["refresh_token"],
+            "replacement-grant"
+        );
+        assert_eq!(credentials.stored_credential_count(), Some(2));
+        issuer.verify().await;
+    }
+
+    #[tokio::test]
     async fn rotated_refresh_token_store_failure_requires_reauthorization() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3464,6 +3911,48 @@ mod tests {
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
+    }
+
+    #[test]
+    fn automatic_refresh_honors_recovery_schedule_without_disabling_due_retries() {
+        let now_ms = 10_000;
+        for recovery in [
+            ProviderCredentialRefreshRecoveryAction::Retry,
+            ProviderCredentialRefreshRecoveryAction::FixConfiguration,
+            ProviderCredentialRefreshRecoveryAction::Investigate,
+        ] {
+            let mut state = StoredProviderCredentialRefreshState {
+                recovery_action: recovery as i32,
+                next_refresh_at_ms: now_ms + 1,
+                ..Default::default()
+            };
+            assert_eq!(
+                ensure_automatic_refresh_ready(&state, now_ms)
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unavailable,
+            );
+            state.next_refresh_at_ms = now_ms;
+            ensure_automatic_refresh_ready(&state, now_ms).unwrap();
+        }
+        let state = StoredProviderCredentialRefreshState {
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize as i32,
+            next_refresh_at_ms: now_ms,
+            ..Default::default()
+        };
+        assert_eq!(
+            ensure_automatic_refresh_ready(&state, now_ms)
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition,
+        );
+        // A healthy credential's proactive schedule must not block an on-read
+        // mint requested to meet a longer minimum remaining lifetime.
+        let state = StoredProviderCredentialRefreshState {
+            next_refresh_at_ms: now_ms + 1,
+            ..Default::default()
+        };
+        ensure_automatic_refresh_ready(&state, now_ms).unwrap();
     }
 
     #[tokio::test]

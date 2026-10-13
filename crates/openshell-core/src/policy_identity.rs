@@ -175,3 +175,165 @@ fn canonical_policy_bytes(policy: &ProtoSandboxPolicy) -> Vec<u8> {
 pub fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
     format!("{:x}", Sha256::digest(canonical_policy_bytes(policy)))
 }
+
+/// Derive token-grant authorities from a provider record and its complete profile rule.
+///
+/// The record identity separates providers whose names sanitize to the same policy
+/// key. Hashing the rule content and endpoint position prevents a refreshed profile
+/// from using grants through an older policy generation. Generated names and
+/// provenance are excluded so both gateway construction paths derive the same value.
+pub fn provider_token_grant_owners(provider_id: &str, rule: &NetworkPolicyRule) -> Vec<String> {
+    let mut authority = rule.clone();
+    authority.name.clear();
+    clear_rule_token_grant_provenance(&mut authority);
+    let rule_bytes = canonical_rule_bytes(&authority);
+    authority
+        .endpoints
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            token_grant_owner(
+                b"openshell:provider-token-grant-owner:v1",
+                provider_id.as_bytes(),
+                &rule_bytes,
+                index,
+            )
+        })
+        .collect()
+}
+
+/// Stamp endpoint authorities for a complete gateway-global policy replacement.
+///
+/// Global policy suppresses provider profile authorization rules. Its own endpoint
+/// authorities must therefore be used for grants, while the original credential
+/// host, port, and path selectors continue to limit where a token may be sent.
+/// The complete policy hash invalidates every stamp when the global policy changes.
+pub fn stamp_global_token_grant_owners(policy: &mut ProtoSandboxPolicy) {
+    let mut authority = policy.clone();
+    for rule in authority.network_policies.values_mut() {
+        for endpoint in &mut rule.endpoints {
+            endpoint.token_grant_owner.clear();
+            endpoint.provider_credentialed = false;
+        }
+    }
+    let policy_hash = deterministic_policy_hash(&authority);
+    for (name, rule) in &mut policy.network_policies {
+        for (index, endpoint) in rule.endpoints.iter_mut().enumerate() {
+            endpoint.token_grant_owner = token_grant_owner(
+                b"openshell:global-token-grant-owner:v1",
+                policy_hash.as_bytes(),
+                name.as_bytes(),
+                index,
+            );
+        }
+    }
+}
+
+fn clear_rule_token_grant_provenance(rule: &mut NetworkPolicyRule) {
+    for endpoint in &mut rule.endpoints {
+        endpoint.token_grant_owner.clear();
+        endpoint.provider_credentialed = false;
+        endpoint.advisor_proposed = false;
+    }
+}
+
+fn token_grant_owner(domain: &[u8], identity: &[u8], policy: &[u8], index: usize) -> String {
+    let mut input = Vec::new();
+    append_canonical_bytes(&mut input, domain);
+    append_canonical_bytes(&mut input, identity);
+    append_canonical_bytes(&mut input, policy);
+    input.extend_from_slice(&canonical_size(index));
+    format!("grant-owner:v1:{:x}", Sha256::digest(input))
+}
+
+#[cfg(test)]
+mod token_grant_owner_tests {
+    use super::*;
+    use crate::proto::{NetworkBinary, NetworkEndpoint};
+
+    fn profile_rule() -> NetworkPolicyRule {
+        NetworkPolicyRule {
+            endpoints: vec![
+                NetworkEndpoint {
+                    host: "api.example.test".into(),
+                    path: "/public/**".into(),
+                    ..Default::default()
+                },
+                NetworkEndpoint {
+                    host: "api.example.test".into(),
+                    path: "/private/**".into(),
+                    ..Default::default()
+                },
+            ],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/client".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn provider_owner_changes_with_identity_profile_or_endpoint_position() {
+        let rule = profile_rule();
+        let original = provider_token_grant_owners("provider-a", &rule);
+        assert_ne!(original[0], original[1]);
+        assert_ne!(original, provider_token_grant_owners("provider-b", &rule));
+
+        let mut changed = rule.clone();
+        changed.endpoints.swap(0, 1);
+        assert!(
+            !provider_token_grant_owners("provider-a", &changed)
+                .iter()
+                .any(|owner| original.contains(owner))
+        );
+        changed = rule.clone();
+        changed.binaries[0].path = "/usr/bin/other-client".into();
+        assert_ne!(
+            original,
+            provider_token_grant_owners("provider-a", &changed)
+        );
+        changed = rule;
+        changed.endpoints[0].access = 3;
+        assert_ne!(
+            original,
+            provider_token_grant_owners("provider-a", &changed)
+        );
+    }
+
+    #[test]
+    fn provider_owner_ignores_generated_names_and_untrusted_provenance() {
+        let mut rule = profile_rule();
+        let owners = provider_token_grant_owners("provider-a", &rule);
+        rule.name = "_provider_colliding_name_2".into();
+        for endpoint in &mut rule.endpoints {
+            endpoint.token_grant_owner = "forged".into();
+            endpoint.provider_credentialed = true;
+            endpoint.advisor_proposed = true;
+        }
+        assert_eq!(owners, provider_token_grant_owners("provider-a", &rule));
+    }
+
+    #[test]
+    fn global_owner_rebinds_on_policy_change_without_mutating_provenance() {
+        let mut policy = ProtoSandboxPolicy {
+            network_policies: HashMap::from([("global".into(), profile_rule())]),
+            ..Default::default()
+        };
+        let endpoint = &mut policy.network_policies.get_mut("global").unwrap().endpoints[0];
+        endpoint.advisor_proposed = true;
+        endpoint.provider_credentialed = true;
+        stamp_global_token_grant_owners(&mut policy);
+        let first = policy.network_policies["global"].endpoints[0].clone();
+        assert!(first.advisor_proposed && first.provider_credentialed);
+        stamp_global_token_grant_owners(&mut policy);
+        assert_eq!(first, policy.network_policies["global"].endpoints[0]);
+
+        policy.network_policies.get_mut("global").unwrap().binaries[0].path =
+            "/usr/bin/replacement".into();
+        stamp_global_token_grant_owners(&mut policy);
+        assert_ne!(
+            first.token_grant_owner,
+            policy.network_policies["global"].endpoints[0].token_grant_owner
+        );
+    }
+}

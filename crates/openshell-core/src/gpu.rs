@@ -302,6 +302,62 @@ fn cdi_nvidia_gpu_suffix(id: &str) -> Option<&str> {
     id.strip_prefix(CDI_NVIDIA_GPU_PREFIX)
 }
 
+// Local equivalent of the upstream CDI parser until its public API is released:
+// https://github.com/cncf-tags/container-device-interface-rs/pull/177
+fn is_qualified_name(device: &str) -> bool {
+    let Some((kind, name)) = device.split_once('=') else {
+        return false;
+    };
+    let Some((vendor, class)) = kind.split_once('/') else {
+        return false;
+    };
+    let valid_component = |value: &str, device_name: bool| {
+        let bytes = value.as_bytes();
+        bytes.first().is_some_and(|byte| {
+            if device_name {
+                byte.is_ascii_alphanumeric()
+            } else {
+                byte.is_ascii_alphabetic()
+            }
+        }) && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'_' | b'-' | b'.')
+                    || (device_name && *byte == b':')
+            })
+    };
+    valid_component(vendor, false) && valid_component(class, false) && valid_component(name, true)
+}
+
+/// Validate vendor-agnostic CDI qualified names without resolving or authorizing devices.
+///
+/// # Errors
+/// Returns an error for host paths or malformed `<vendor>/<class>=<name>` selectors.
+pub fn validate_cdi_device_names(devices: &[String], field: &str) -> Result<(), String> {
+    if devices.iter().any(|device| !is_qualified_name(device)) {
+        return Err(format!(
+            "{field} must contain CDI qualified names (<vendor>/<class>=<name>)"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate explicit CDI selectors and their GPU request requirements.
+///
+/// Docker and Podman use this helper; drivers with other identifier formats use
+/// [`validate_specific_gpu_device_request`] directly.
+///
+/// # Errors
+/// Returns an error for malformed CDI names or invalid GPU request requirements.
+pub fn validate_cdi_gpu_device_request(
+    gpu: Option<&DriverGpuResourceRequirements>,
+    devices: &[String],
+    field: &str,
+) -> Result<(), String> {
+    validate_cdi_device_names(devices, field)?;
+    validate_specific_gpu_device_request(gpu, devices, field)
+}
+
 /// Validate a compute-driver GPU request against driver-owned specific devices.
 ///
 /// Drivers call this when a sandbox request combines portable GPU requirements
@@ -346,6 +402,64 @@ pub fn validate_specific_gpu_device_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cdi_device_names_accept_vendor_agnostic_selectors() {
+        for device in [
+            "nvidia.com/gpu=0",
+            "nvidia.com/gpu=all",
+            "nvidia.com/gpu=GPU-5b2d",
+            "nvidia.com/gpu=MIG-5b2d",
+            "nvidia.com/gpu=0:1",
+            "example.com/accelerator=card_0.1",
+            "intel.com/gpu=0",
+            "amd.com/gpu=0",
+            "v/c=0",
+        ] {
+            let devices = vec![device.to_string()];
+            validate_cdi_device_names(&devices, "driver_config.cdi_devices")
+                .unwrap_or_else(|error| panic!("{device:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn cdi_device_names_reject_host_paths_and_malformed_selectors() {
+        for device in [
+            "",
+            "/dev/sda",
+            "/dev",
+            "/dev/sda:/dev/sda:rwm",
+            "dev/sda",
+            "../dev/sda",
+            "vendor/gpu",
+            "/gpu=0",
+            "vendor/=0",
+            "vendor/gpu=",
+            "vendor/gpu=/dev/sda",
+            "vendor/gpu=0/1",
+            "vendor/gpu=0=1",
+            "vendor/gpu=0,1",
+            "vendor/gpu=-0",
+            "vendor/gpu=0:",
+            "vendor/gpu=0 ",
+            " vendor/gpu=0",
+            "vendor/gpu=0\n",
+            "vendor/gpu=0\0",
+            "vendor/gpu=é",
+            "véndor/gpu=0",
+            "vendor/gpü=0",
+            "0vendor/gpu=0",
+            "vendor/0gpu=0",
+            "vendor./gpu=0",
+            "vendor/gpu-=0",
+            "vendor/gpu/other=0",
+        ] {
+            let error =
+                validate_cdi_device_names(&[device.to_string()], "driver_config.cdi_devices")
+                    .unwrap_err();
+            assert!(error.contains("CDI qualified names"), "{device:?}: {error}");
+        }
+    }
 
     #[test]
     fn effective_driver_gpu_count_normalizes_missing_count() {
@@ -545,6 +659,18 @@ mod tests {
             selector.next_device_ids(1),
             Ok(vec!["nvidia.com/gpu=1".to_string()])
         );
+    }
+
+    #[test]
+    fn specific_gpu_device_request_preserves_non_cdi_identifiers() {
+        let gpu = DriverGpuResourceRequirements { count: Some(1) };
+        let devices = vec!["0000:2d:00.0".to_string()];
+        validate_specific_gpu_device_request(Some(&gpu), &devices, "driver_config.gpu_device_ids")
+            .expect("generic GPU request validation must accept PCI device identifiers");
+        let error =
+            validate_cdi_gpu_device_request(Some(&gpu), &devices, "driver_config.cdi_devices")
+                .expect_err("CDI drivers must reject non-CDI identifiers");
+        assert!(error.contains("CDI qualified names"));
     }
 
     #[test]

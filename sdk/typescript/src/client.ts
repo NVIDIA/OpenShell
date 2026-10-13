@@ -15,10 +15,17 @@ import type { AddressInfo } from 'node:net';
 import * as net from 'node:net';
 import type { MessageInitShape } from '@bufbuild/protobuf';
 import { durationFromMs } from '@bufbuild/protobuf/wkt';
-import { type CallOptions, type Client, createClient, type Transport } from '@connectrpc/connect';
+import { type CallOptions, type Client, Code, createClient, type Transport } from '@connectrpc/connect';
 import { errorCode, fromConnect, SdkError } from './errors.js';
 import type { Provider, WorkspaceSelectorSchema } from './gen/datamodel_pb.js';
-import type { Sandbox, SandboxWorkloadTemplate, UpdateConfigResponse } from './gen/openshell_pb.js';
+import type {
+  Sandbox,
+  SandboxLogLine,
+  SandboxStreamEvent,
+  SandboxWorkloadTemplate,
+  UpdateConfigResponse,
+  PlatformEvent as WirePlatformEvent,
+} from './gen/openshell_pb.js';
 import {
   type ExecSandboxInputSchema,
   OpenShell,
@@ -32,6 +39,7 @@ import {
 } from './gen/openshell_pb.js';
 import type { EffectiveSetting, GetSandboxConfigResponse, SandboxPolicy, SettingValue } from './gen/sandbox_pb.js';
 import { PolicySource, type SandboxPolicySchema, SettingScope, type SettingValueSchema } from './gen/sandbox_pb.js';
+import { ProviderClient } from './providers.js';
 import { validateSshResponse } from './ssh-validate.js';
 import { buildTransport, type ConnectOptions } from './transport.js';
 
@@ -42,10 +50,23 @@ function durationFromSeconds(seconds: number) {
   return seconds === 0 ? undefined : durationFromMs(seconds * 1000);
 }
 
+// Distinct from timestampMillis(): LogLine/PlatformEvent timestamps are
+// always-present numbers that default to 0 when absent or unrepresentable,
+// not an optional string field like expiresAtMs.
+function eventTimeMillis(timestamp: { seconds: bigint; nanos: number } | undefined): number {
+  if (!timestamp) return 0;
+  return Number(timestamp.seconds * 1000n + BigInt(Math.trunc(timestamp.nanos / 1_000_000)));
+}
+
 function timestampMillis(timestamp: { seconds: bigint; nanos: number } | undefined): string | undefined {
   if (!timestamp) return undefined;
   const millis = timestamp.seconds * 1000n + BigInt(Math.trunc(timestamp.nanos / 1_000_000));
   return millis === 0n ? undefined : millis.toString();
+}
+
+function timestampEpochMs(timestamp: { seconds: bigint; nanos: number } | undefined): number | undefined {
+  const millis = timestampMillis(timestamp);
+  return millis ? Number(millis) : undefined;
 }
 
 // Generated protobuf message shapes that callers need to populate or round-trip
@@ -224,6 +245,8 @@ export interface SandboxRef {
   /** Service URLs returned by creation, keyed by service name. */
   serviceUrls: Record<string, string>;
   restartCount: number;
+  /** Creation time in epoch milliseconds; absent when the gateway omits it. */
+  createdAtMs?: number;
   nextRestartAtMs?: number;
   mainProcessStartedAtMs?: number;
 }
@@ -356,6 +379,80 @@ export interface ExecInteractiveSessionControl extends ExecInteractiveSession {
   cancel(): void;
   /** Observed process exit, retained even if final RPC completion fails. */
   readonly exitCode: number | undefined;
+}
+
+// ---- watchLogs --------------------------------------------------------
+
+/** A curated log line delivered by `watchLogs`. */
+export interface LogLine {
+  sandboxId: string;
+  /** Milliseconds since epoch. 0 if the wire timestamp was absent or unrepresentable. */
+  timestampMs: number;
+  level: string;
+  target: string;
+  message: string;
+  /** Log source (e.g. `'gateway'`, `'sandbox'`). An empty wire value is normalized to `'gateway'`. */
+  source: string;
+  fields: Record<string, string>;
+}
+
+/** A curated platform (compute-backend) event delivered by `watchLogs`. */
+export interface PlatformEvent {
+  /** Milliseconds since epoch. 0 if the wire timestamp was absent or unrepresentable. */
+  timestampMs: number;
+  source: string;
+  type: string;
+  reason: string;
+  message: string;
+  metadata: Record<string, string>;
+}
+
+// WatchLogEvent and WatchPlatformEvent both carry `cursor`, so — unlike
+// ExecStreamEvent's distinctly-named-field trick — discrimination needs an
+// explicit `kind` tag.
+export interface WatchLogEvent {
+  kind: 'log';
+  line: LogLine;
+  /** Opaque high-water-mark cursor. Feed back as `WatchOptions.resumeAfterCursor` to resume. */
+  cursor: string;
+}
+
+export interface WatchPlatformEvent {
+  kind: 'event';
+  event: PlatformEvent;
+  /** Opaque high-water-mark cursor. Feed back as `WatchOptions.resumeAfterCursor` to resume. */
+  cursor: string;
+}
+
+/** Recoverable server-side loss notice. The stream continues; never advances the cursor. */
+export interface WatchWarningEvent {
+  kind: 'warning';
+  message: string;
+}
+
+/** One item from `watchLogs`. Discriminate on `kind`. */
+export type WatchEvent = WatchLogEvent | WatchPlatformEvent | WatchWarningEvent;
+
+export interface WatchOptions extends SandboxWorkspaceOptions {
+  /** Stream server/supervisor log lines. Defaults to `true` when neither this nor `followEvents` is set. */
+  followLogs?: boolean;
+  /** Stream platform (compute-backend) events. */
+  followEvents?: boolean;
+  /** Restrict to these log sources (e.g. `'gateway'`, `'sandbox'`). Omit or empty for no filter. */
+  logSources?: string[];
+  /** Minimum log level to include (e.g. `'INFO'`, `'WARN'`, `'ERROR'`). Omit for no filter. */
+  logMinLevel?: string;
+  /**
+   * Opaque cursor to resume after, taken from a previous `WatchEvent`'s `cursor`.
+   * Omit or leave empty to start from the tail. Do not construct or parse one.
+   */
+  resumeAfterCursor?: string;
+  /** Replay the last N log lines (best-effort) before following. */
+  logTailLines?: number;
+  /** Replay the last N platform events (best-effort) before following. */
+  eventTail?: number;
+  /** Abort the watch (including any pending reconnect backoff) early. */
+  signal?: AbortSignal;
 }
 
 /** Cancellation for the poll-based wait helpers. */
@@ -528,8 +625,6 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
   if (!meta?.id || !meta.name) {
     throw new SdkError('invalid_config', 'sandbox metadata.id and metadata.name are required in gateway responses');
   }
-  const nextRestartAtMs = timestampMillis(sandbox.status?.nextRestartTime);
-  const mainProcessStartedAtMs = timestampMillis(sandbox.status?.mainProcessStartedTime);
   return {
     id: meta.id,
     name: meta.name,
@@ -548,8 +643,9 @@ function sandboxRef(sandbox: Sandbox | undefined, serviceUrls: Record<string, st
       : undefined,
     serviceUrls,
     restartCount: sandbox.status?.restartCount ?? 0,
-    nextRestartAtMs: nextRestartAtMs ? Number(nextRestartAtMs) : undefined,
-    mainProcessStartedAtMs: mainProcessStartedAtMs ? Number(mainProcessStartedAtMs) : undefined,
+    createdAtMs: timestampEpochMs(meta.createdTime),
+    nextRestartAtMs: timestampEpochMs(sandbox.status?.nextRestartTime),
+    mainProcessStartedAtMs: timestampEpochMs(sandbox.status?.mainProcessStartedTime),
   };
 }
 
@@ -690,6 +786,99 @@ function waitSleep(delayMs: number, deadline: number, signal?: AbortSignal): Pro
     };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
   });
+}
+
+// Reconnect backoff for watchLogs: uncapped deadline, just a capped delay
+// interruptible by the caller signal. Distinct from waitSleep, which is
+// deadline-bounded for poll loops.
+function defaultWatchLogsBackoffSleep(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, delayMs);
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(new SdkError('canceled', 'watchLogs aborted'));
+    };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+let watchLogsBackoffSleep: (delayMs: number, signal?: AbortSignal) => Promise<void> = defaultWatchLogsBackoffSleep;
+
+/**
+ * Test-only seam for the `watchLogs` reconnect backoff delay. Not part of the
+ * public API surface — not re-exported from index.ts. Call with no argument
+ * to restore the real timer-based sleep.
+ */
+export function __setWatchLogsBackoffSleepForTests(
+  fn?: (delayMs: number, signal?: AbortSignal) => Promise<void>,
+): void {
+  watchLogsBackoffSleep = fn ?? defaultWatchLogsBackoffSleep;
+}
+
+// Only Unavailable (connection drop, gateway restart) is retryable. Every
+// other status — including OUT_OF_RANGE — is terminal so the caller sees it
+// instead of the loop silently restarting from an empty cursor and hiding a gap.
+function isRetryableWatchLogsError(err: SdkError): boolean {
+  return err.connectCode === Code.Unavailable;
+}
+
+function toLogLine(value: SandboxLogLine): LogLine {
+  return {
+    sandboxId: value.sandboxId,
+    timestampMs: eventTimeMillis(value.eventTime),
+    level: value.level,
+    target: value.target,
+    message: value.message,
+    source: value.source || 'gateway',
+    fields: { ...value.fields },
+  };
+}
+
+function toPlatformEvent(value: WirePlatformEvent): PlatformEvent {
+  return {
+    timestampMs: eventTimeMillis(value.eventTime),
+    source: value.source,
+    type: value.type,
+    reason: value.reason,
+    message: value.message,
+    metadata: { ...value.metadata },
+  };
+}
+
+// Converts one wire watch event into a curated WatchEvent, returning the
+// (possibly advanced) cursor alongside it. `cursor` is a high-water mark, not
+// "last seen": the gateway reads the log and platform sources independently
+// during live delivery, so arrival order can differ from cursor order. Taking
+// the max keeps the resume point monotonic; assigning directly would let a
+// later lower-cursor event rewind it and replay already-delivered events after
+// a reconnect. The comparison is a plain byte-wise string compare on an opaque
+// token — well defined only because both cursors come from the same stream.
+function convertWatchEvent(wireEvent: SandboxStreamEvent, cursor: string): { event?: WatchEvent; cursor: string } {
+  switch (wireEvent.payload.case) {
+    case 'log': {
+      const next = wireEvent.cursor > cursor ? wireEvent.cursor : cursor;
+      return {
+        event: { kind: 'log', line: toLogLine(wireEvent.payload.value), cursor: wireEvent.cursor },
+        cursor: next,
+      };
+    }
+    case 'event': {
+      const next = wireEvent.cursor > cursor ? wireEvent.cursor : cursor;
+      return {
+        event: { kind: 'event', event: toPlatformEvent(wireEvent.payload.value), cursor: wireEvent.cursor },
+        cursor: next,
+      };
+    }
+    case 'warning':
+      return { event: { kind: 'warning', message: wireEvent.payload.value.message }, cursor };
+    default:
+      // Sandbox snapshots and draft-policy updates are not part of this
+      // curated log/event stream.
+      return { cursor };
+  }
 }
 
 // Wait for a socket to drain before writing more. Resolves on 'drain', and
@@ -1255,6 +1444,87 @@ export class SandboxClient {
     };
   }
 
+  /**
+   * Watch a sandbox's log lines and platform events with loss-aware resume.
+   *
+   * Reconnects transparently on a transient stream drop, resuming from the
+   * highest cursor already delivered. A recoverable server-side lag surfaces
+   * as a `{ kind: 'warning' }` item and the stream continues.
+   *
+   * An `SdkError` with `connectCode === Code.OutOfRange` is terminal and not
+   * retried: the resume point is gone (trimmed from the buffer, or issued by a
+   * cursor space the gateway no longer has), so events between it and now are
+   * unrecoverable. Auto-restarting from scratch would hide that loss, which is
+   * exactly what this method exists to surface. Callers who accept the gap can
+   * start a new watch with an empty `resumeAfterCursor`; retrying the same
+   * cursor fails identically.
+   */
+  async *watchLogs(name: string, options?: WatchOptions | null): AsyncGenerator<WatchEvent, void, void> {
+    let ref: SandboxRef;
+    try {
+      ref = await this.get(name, {
+        workspace: options?.workspace,
+        ...(options?.signal ? { signal: options.signal } : {}),
+      });
+    } catch (e) {
+      throw e instanceof SdkError ? e : fromConnect(e);
+    }
+
+    const signal = options?.signal;
+    let followLogs = options?.followLogs ?? false;
+    const followEvents = options?.followEvents ?? false;
+    // With both resolved false — whether from an explicit `false` or from
+    // omitting both options — the request would stream nothing and never
+    // complete or error. Mirror the Go SDK's guard and default to logs, since
+    // that footgun is worse than this one-line divergence from Rust's bare
+    // pass-through default.
+    if (!followLogs && !followEvents) followLogs = true;
+
+    let cursor = options?.resumeAfterCursor ?? '';
+    let backoffMs = 100;
+
+    for (;;) {
+      if (signal?.aborted) throw new SdkError('canceled', 'watchLogs aborted');
+
+      // connect-es returns this AsyncIterable synchronously and unconditionally;
+      // the stream only opens on first iteration, so "dial" and "drain" failures
+      // both land in the single catch below (unlike tonic's separate Result).
+      const stream = this.grpc.watchSandbox(
+        {
+          ...sandboxTarget(ref.name, options),
+          followStatus: false,
+          followLogs,
+          followEvents,
+          logTailLines: options?.logTailLines ?? 0,
+          eventTail: options?.eventTail ?? 0,
+          logSources: options?.logSources ?? [],
+          logMinLevel: options?.logMinLevel ?? '',
+          resumeAfterCursor: cursor,
+        },
+        { signal },
+      );
+
+      let cleanEof = true;
+      try {
+        for await (const wireEvent of stream) {
+          // A delivered event means the connection is healthy again; reset the
+          // backoff so a later drop retries promptly instead of at the cap.
+          backoffMs = 100;
+          const converted = convertWatchEvent(wireEvent, cursor);
+          cursor = converted.cursor;
+          if (converted.event) yield converted.event;
+        }
+      } catch (e) {
+        cleanEof = false;
+        const err = e instanceof SdkError ? e : fromConnect(e);
+        if (!isRetryableWatchLogsError(err)) throw err;
+        await watchLogsBackoffSleep(backoffMs, signal);
+        backoffMs = Math.min(backoffMs * 2, 2000);
+      }
+      if (cleanEof) break;
+    }
+  }
+
   // TTY + stdin transport half of an interactive exec. The first client frame
   // is the `start` variant carrying the exec request; subsequent frames are
   // `stdin`/`resize`. No terminal glue: raw mode, signal forwarding, and
@@ -1809,6 +2079,8 @@ export class OpenShellClient {
   readonly sandbox: SandboxClient;
   /** Reusable sandbox workload template lifecycle. */
   readonly sandboxTemplates: SandboxTemplateClient;
+  /** Privileged provider credential retrieval; requires direct operator mTLS. */
+  readonly providers: ProviderClient;
 
   /**
    * Advanced escape hatch: a generated client for every gateway RPC, including
@@ -1829,6 +2101,7 @@ export class OpenShellClient {
     this.raw = this.grpc;
     this.sandbox = new SandboxClient(transport, this.grpc);
     this.sandboxTemplates = new SandboxTemplateClient(transport, this.grpc);
+    this.providers = new ProviderClient(transport);
   }
 
   /**

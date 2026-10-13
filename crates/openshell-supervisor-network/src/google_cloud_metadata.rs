@@ -402,6 +402,29 @@ mod tests {
         };
         use tracing_subscriber::prelude::*;
 
+        const CHILD: &str = "OPENSHELL_TEST_GCP_METADATA_OCSF_CHILD";
+        // Tracing callsite interest is process-wide, so concurrent tests with
+        // other subscribers can disable this thread's capture. Run the capture
+        // in an isolated process while keeping the same test executable.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "google_cloud_metadata::tests::metadata_events_include_response_for_ocsf18",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let schema = load_class_schema("http_activity");
         for (method, path, headers, expected_code, expected_activity_id) in [
             ("GET", PATH_TOKEN, flavor_headers(), 200, 3),

@@ -710,7 +710,7 @@ mod tests {
         let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
-            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "mount should be blocked by the supervisor prelude filter"
         );
     }
@@ -741,7 +741,7 @@ mod tests {
         let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
-            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "clone3 should be blocked with ENOSYS, not EPERM"
         );
     }
@@ -787,7 +787,7 @@ mod tests {
         let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
-            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "additional seccomp filter installation should be blocked after startup"
         );
     }
@@ -821,7 +821,7 @@ mod tests {
         let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
-            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) should be allowed for getifaddrs(3)"
         );
     }
@@ -858,7 +858,7 @@ mod tests {
         let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
-            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG) should be blocked with EPERM"
         );
     }
@@ -969,7 +969,7 @@ mod tests {
         let mut status: libc::c_int = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         assert!(
-            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
             "block mode must deny IPv4, IPv6, and packet sockets while retaining Unix IPC"
         );
     }

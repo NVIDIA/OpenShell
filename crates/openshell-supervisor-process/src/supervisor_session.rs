@@ -29,7 +29,7 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use openshell_core::grpc_client;
 use openshell_core::transport_errors::is_expected_transport_close_status;
@@ -354,52 +354,149 @@ struct SessionConfig {
 }
 
 async fn run_session_loop(config: SessionConfig) {
-    let mut backoff = INITIAL_BACKOFF;
+    let mut backoff = ReconnectBackoff::new();
     let mut attempt: u64 = 0;
+
+    // The gateway may hand this sandbox to the replica that should own it. We
+    // dial `target` for the next attempt and mark it as redirected so that
+    // replica serves us rather than redirecting again. Any failure sends us
+    // back to the configured address, which load-balances across replicas.
+    let mut target = config.endpoint.clone();
+    let mut redirected = false;
 
     loop {
         attempt += 1;
 
-        let result = run_single_session(&config, attempt).await;
+        let result = run_single_session(&config, &target, redirected, attempt).await;
         if let Some(updates) = &config.session_id_updates {
             updates.send_replace(None);
         }
         match result {
-            Ok(()) => {
+            Ok(SessionOutcome::Closed) => {
                 config.ready_tx.send_replace(false);
-                let event = session_closed_event(
-                    openshell_ocsf::ctx::ctx(),
-                    &config.endpoint,
-                    &config.sandbox_id,
-                );
+                let event =
+                    session_closed_event(openshell_ocsf::ctx::ctx(), &target, &config.sandbox_id);
                 ocsf_emit!(event);
                 break;
             }
+            Ok(SessionOutcome::Redirect {
+                peer_endpoint,
+                owner_replica_id,
+            }) => {
+                backoff.on_redirect(config.ready_tx.send_replace(false));
+                info!(
+                    sandbox_id = %config.sandbox_id,
+                    owner_replica_id = %owner_replica_id,
+                    peer_endpoint = %peer_endpoint,
+                    "supervisor session: following gateway redirect"
+                );
+                target = peer_endpoint;
+                redirected = true;
+                // No backoff: this is an expected handoff, not a failure.
+            }
             Err(e) => {
-                config.ready_tx.send_replace(false);
+                let accepted = config.ready_tx.send_replace(false);
                 let event = session_failed_event(
                     openshell_ocsf::ctx::ctx(),
-                    &config.endpoint,
+                    &target,
                     attempt,
                     &e.to_string(),
                 );
                 ocsf_emit!(event);
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                // Fall back to the configured gateway address so a redirect
+                // to a replica that is going away cannot strand the sandbox.
+                let failed_redirect_target = target != config.endpoint && !accepted;
+                target.clone_from(&config.endpoint);
+                redirected = redirect_survives_failure(redirected, accepted);
+                if let Some(delay) = backoff.on_failure(accepted, failed_redirect_target) {
+                    tokio::time::sleep(delay).await;
+                }
             }
         }
     }
 }
 
+/// Reconnect delays for the supervisor session loop.
+///
+/// Delays double up to [`MAX_BACKOFF`] while reconnects keep failing. A session
+/// the gateway accepted proves the path works again, so its loss starts the
+/// delays over. Without that reset, every gateway restart over the sandbox's
+/// lifetime would compound until each reconnect waited the full maximum.
+#[derive(Debug)]
+struct ReconnectBackoff {
+    delay: Duration,
+    skipped_since_accept: bool,
+}
+
+impl ReconnectBackoff {
+    fn new() -> Self {
+        Self {
+            delay: INITIAL_BACKOFF,
+            skipped_since_accept: false,
+        }
+    }
+
+    /// Record a gateway redirect. Following it is an expected handoff, so the
+    /// supervisor reconnects without waiting.
+    fn on_redirect(&mut self, accepted: bool) {
+        if accepted {
+            *self = Self::new();
+        }
+    }
+
+    /// Record a failed or dropped session and return how long to wait before
+    /// the next attempt, or `None` to reconnect at once.
+    fn on_failure(&mut self, accepted: bool, failed_redirect_target: bool) -> Option<Duration> {
+        if accepted {
+            *self = Self::new();
+        }
+        if skip_backoff(failed_redirect_target, self.skipped_since_accept) {
+            self.skipped_since_accept = true;
+            return None;
+        }
+        let delay = self.delay;
+        self.delay = (self.delay * 2).min(MAX_BACKOFF);
+        Some(delay)
+    }
+}
+
+/// Keep asking not to be redirected when a redirected attempt never got a
+/// session, so a stale ring pointing at a dead replica cannot bounce us back
+/// to it. A session that was accepted and later dropped starts placement over.
+fn redirect_survives_failure(redirected: bool, accepted: bool) -> bool {
+    redirected && !accepted
+}
+
+/// A failed redirect target goes straight back to the configured endpoint, but
+/// only once until a session is accepted, so a draining gateway and a dead
+/// target cannot bounce the supervisor without backing off.
+fn skip_backoff(failed_redirect_target: bool, skipped_since_accept: bool) -> bool {
+    failed_redirect_target && !skipped_since_accept
+}
+
+/// How a session ended, when it ended without an error.
+enum SessionOutcome {
+    /// The gateway closed the session normally.
+    Closed,
+    /// The gateway declined to own this sandbox and named the replica that
+    /// should. The caller reconnects there once.
+    Redirect {
+        peer_endpoint: String,
+        owner_replica_id: String,
+    },
+}
+
 async fn run_single_session(
     config: &SessionConfig,
+    target: &str,
+    redirected: bool,
     connection_epoch: u64,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<SessionOutcome, Box<dyn std::error::Error + Send + Sync>> {
     // Connect to the gateway. The same `Channel` is used for both the
     // long-lived control stream and all data-plane `RelayStream` calls, so
     // every relay rides the same TCP+TLS+HTTP/2 connection — no new TLS
     // handshake per relay.
-    let channel = grpc_client::connect_channel_pub(&config.endpoint)
+    let channel = grpc_client::connect_channel_pub(target)
         .await
         .map_err(|e| format!("connect failed: {e}"))?;
     let mut client = OpenShellClient::new(channel.clone());
@@ -415,6 +512,8 @@ async fn run_single_session(
             instance_id: config.instance_id.clone(),
             connection_epoch,
             supports_provider_readiness: true,
+            redirected,
+            supports_session_redirect: true,
         })),
     })
     .await
@@ -438,6 +537,12 @@ async fn run_single_session(
         Some(gateway_message::Payload::SessionRejected(r)) => {
             return Err(format!("session rejected: {}", r.reason).into());
         }
+        Some(gateway_message::Payload::SessionRedirect(r)) => {
+            return Ok(SessionOutcome::Redirect {
+                peer_endpoint: r.peer_endpoint,
+                owner_replica_id: r.owner_replica_id,
+            });
+        }
         _ => return Err("expected SessionAccepted or SessionRejected".into()),
     };
 
@@ -451,7 +556,7 @@ async fn run_single_session(
     }
     let event = session_established_event(
         openshell_ocsf::ctx::ctx(),
-        &config.endpoint,
+        target,
         &accepted.session_id,
         u32::try_from(heartbeat_secs).unwrap_or(u32::MAX),
     );
@@ -471,8 +576,19 @@ async fn run_single_session(
                     &config.terminating,
                 )? {
                     SessionStreamMessage::Message(msg) => msg,
-                    SessionStreamMessage::ExpectedShutdownClose => return Ok(()),
+                    SessionStreamMessage::ExpectedShutdownClose => {
+                        return Ok(SessionOutcome::Closed);
+                    }
                 };
+                if let Some(gateway_message::Payload::SessionRedirect(r)) = &msg.payload {
+                    if supervisor_is_terminating(&config.terminating) {
+                        return Ok(SessionOutcome::Closed);
+                    }
+                    return Ok(SessionOutcome::Redirect {
+                        peer_endpoint: r.peer_endpoint.clone(),
+                        owner_replica_id: r.owner_replica_id.clone(),
+                    });
+                }
                 let context = GatewayMessageContext {
                     sandbox_id: &config.sandbox_id,
                     ssh_socket_path: &config.ssh_socket_path,
@@ -1224,6 +1340,58 @@ mod ocsf_event_tests {
         .expect_err("non-transport errors must stay fatal");
 
         assert!(err.to_string().contains("policy evaluation failed"));
+    }
+
+    #[test]
+    fn failed_redirect_is_served_on_the_next_attempt() {
+        assert!(redirect_survives_failure(true, false));
+        assert!(!redirect_survives_failure(true, true));
+        assert!(!redirect_survives_failure(false, false));
+        assert!(!redirect_survives_failure(false, true));
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_a_session_is_accepted() {
+        let mut backoff = ReconnectBackoff::new();
+        let delays: Vec<_> = (0..7)
+            .map(|_| backoff.on_failure(false, false).unwrap())
+            .collect();
+        assert_eq!(
+            delays,
+            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs).to_vec()
+        );
+
+        // Losing an accepted session starts over instead of waiting the maximum.
+        assert_eq!(backoff.on_failure(true, false), Some(INITIAL_BACKOFF));
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF * 2));
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_when_an_accepted_session_redirects() {
+        let mut backoff = ReconnectBackoff::new();
+        for _ in 0..5 {
+            backoff.on_failure(false, false);
+        }
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, false), Some(INITIAL_BACKOFF));
+    }
+
+    #[test]
+    fn reconnect_backoff_skips_one_failed_redirect_target_per_accepted_session() {
+        let mut backoff = ReconnectBackoff::new();
+        assert_eq!(backoff.on_failure(false, true), None);
+        assert_eq!(backoff.on_failure(false, true), Some(INITIAL_BACKOFF));
+
+        backoff.on_redirect(true);
+        assert_eq!(backoff.on_failure(false, true), None);
+    }
+
+    #[test]
+    fn backoff_is_skipped_once_per_accepted_session() {
+        assert!(skip_backoff(true, false));
+        assert!(!skip_backoff(true, true));
+        assert!(!skip_backoff(false, false));
     }
 
     #[cfg(target_os = "linux")]

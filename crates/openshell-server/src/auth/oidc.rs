@@ -10,7 +10,7 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
-use super::authenticator::Authenticator;
+use super::authenticator::{Authenticator, bearer_credential};
 use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
@@ -32,7 +32,8 @@ use tracing::{debug, error, info, warn};
 /// These are structural bypasses for gRPC infrastructure that doesn't map to a
 /// single RPC method. Per-method bypasses (e.g. `Health`) are declared at the
 /// handler with `auth_mode: "unauthenticated"` in the proto annotation.
-const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
+const UNAUTHENTICATED_PREFIXES: &[&str] =
+    &[crate::multiplex::REFLECTION_PATH_PREFIX, "/grpc.health."];
 
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
@@ -891,11 +892,7 @@ impl Authenticator for OidcAuthenticator {
         headers: &http::HeaderMap,
         _path: &str,
     ) -> Result<Option<Principal>, Status> {
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
+        let Some(token) = bearer_credential(headers) else {
             return Ok(None);
         };
 
@@ -1209,10 +1206,13 @@ mod tests {
     #[test]
     fn reflection_is_unauthenticated() {
         assert!(is_unauthenticated_method(
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        ));
+        assert!(!is_unauthenticated_method(
             "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
         ));
-        assert!(is_unauthenticated_method(
-            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        assert!(!is_unauthenticated_method(
+            "/grpc.reflection.v2.ServerReflection/ServerReflectionInfo"
         ));
     }
 

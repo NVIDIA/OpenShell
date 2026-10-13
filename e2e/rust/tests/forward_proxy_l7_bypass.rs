@@ -109,24 +109,15 @@ async fn forward_proxy_allows_l7_permitted_request() {
 
     let script = format!(
         r#"
-import urllib.request, urllib.error, json, sys, time
+import urllib.request, urllib.error, json, sys
 url = "http://{host}:{port}/allowed"
-# Retry expected-allowed requests across the startup symlink-resolution reload,
-# which can transiently surface as a stale-policy 403 in the forward proxy.
-last = {{"status": -1, "error": "not attempted"}}
-for attempt in range(6):
-    try:
-        resp = urllib.request.urlopen(url, timeout=15)
-        last = {{"status": resp.status, "error": None, "attempt": attempt + 1}}
-        break
-    except urllib.error.HTTPError as e:
-        last = {{"status": e.code, "error": str(e), "attempt": attempt + 1}}
-        if e.code != 403:
-            break
-        time.sleep(0.3)
-    except Exception as e:
-        last = {{"status": -1, "error": str(e), "attempt": attempt + 1}}
-        break
+try:
+    resp = urllib.request.urlopen(url, timeout=15)
+    last = {{"status": resp.status, "error": None}}
+except urllib.error.HTTPError as e:
+    last = {{"status": e.code, "error": str(e)}}
+except Exception as e:
+    last = {{"status": -1, "error": str(e)}}
 print(json.dumps(last))
 "#,
         host = server.host,

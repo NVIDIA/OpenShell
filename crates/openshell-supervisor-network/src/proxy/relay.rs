@@ -91,6 +91,7 @@ pub(super) fn http_context(
         secret_resolver,
         provider_credentials,
         provider_credential_revision: None,
+        provider_credential_installation_id: None,
         body_classifier: None,
         activity_tx: signals.activity,
         dynamic_credentials: dynamic_credentials.clone(),
@@ -294,6 +295,35 @@ where
     }
 }
 
+// Exercise the production single/multiple-route dispatch from L7 fixtures.
+#[cfg(test)]
+pub async fn relay_inspected_http_stream_for_test<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    configs: Vec<crate::l7::L7EndpointConfig>,
+    evaluator: TunnelPolicyEngine,
+    middleware_engine: &OpaEngine,
+    request: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    relay_http_stream(
+        client,
+        upstream,
+        RelayContext {
+            request,
+            policy: PreparedHttpPolicy::Inspect {
+                configs,
+                evaluator: Box::new(evaluator),
+            },
+            middleware_engine,
+        },
+    )
+    .await
+}
+
 /// Relay a policy-authorized raw TCP stream.
 pub(super) async fn relay_tcp<C, U>(
     client: &mut C,
@@ -364,6 +394,7 @@ mod tests {
             secret_resolver: None,
             provider_credentials: None,
             provider_credential_revision: None,
+            provider_credential_installation_id: None,
             body_classifier: None,
             activity_tx: None,
             dynamic_credentials: None,
