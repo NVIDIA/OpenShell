@@ -87,6 +87,13 @@ struct Args {
     )]
     sandbox_image_pull_secrets: Vec<String>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_ALLOWED_POD_ANNOTATIONS",
+        value_delimiter = ','
+    )]
+    allowed_pod_annotations: Vec<String>,
+
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
     managed_ssh_ingress_enabled: bool,
 
@@ -288,6 +295,7 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            allowed_pod_annotations: args.allowed_pod_annotations,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path

@@ -758,6 +758,9 @@ impl KubernetesComputeDriver {
         config
             .validate_upstream_proxy_config()
             .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_allowed_pod_annotations()
+            .map_err(KubernetesDriverError::Precondition)?;
         // Read the bundle once at startup so an unreadable path or a
         // certificate-free file fails the gateway here, rather than as a
         // repeated sandbox-create failure. The authoritative read still
@@ -1412,6 +1415,17 @@ impl KubernetesComputeDriver {
         kubernetes_driver_config_for_spec(sandbox.spec.as_ref())
     }
 
+    fn validate_pod_annotations_for_sandbox(&self, sandbox: &Sandbox) -> Result<(), String> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(());
+        };
+        validate_pod_annotations(template, &self.config)
+    }
+
     fn agent_sandbox_api(
         client: Client,
         sandbox_api_version: &str,
@@ -1603,6 +1617,8 @@ impl KubernetesComputeDriver {
             .validate()
             .map_err(tonic::Status::failed_precondition)?;
         let _ = Self::validate_driver_config_for_sandbox(sandbox)
+            .map_err(tonic::Status::invalid_argument)?;
+        self.validate_pod_annotations_for_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
         match self.config.workspace_mode {
             WorkspaceMode::Shared => {
@@ -1859,6 +1875,8 @@ impl KubernetesComputeDriver {
             sandbox,
         )
         .map_err(admission_error)?;
+        self.validate_pod_annotations_for_sandbox(sandbox)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
         let gpu_requirements = sandbox
             .spec
             .as_ref()
@@ -6738,6 +6756,31 @@ fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<Strin
     }
 }
 
+/// Reject template pod annotations whose keys are not in the operator's
+/// `allowed_pod_annotations` list.
+fn validate_pod_annotations(
+    template: &SandboxTemplate,
+    config: &KubernetesComputeConfig,
+) -> Result<(), String> {
+    let Some(serde_json::Value::Object(annotations)) =
+        platform_config_struct(template, "annotations")
+    else {
+        return Ok(());
+    };
+    let rejected: Vec<&str> = annotations
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !config.pod_annotation_allowed(key))
+        .collect();
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "pod annotations not permitted by the gateway's allowed_pod_annotations: {}",
+        rejected.join(", ")
+    ))
+}
+
 /// Extract a nested Struct value from the template's `platform_config`,
 /// converting it to `serde_json::Value`.
 fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
@@ -9533,6 +9576,72 @@ mod tests {
         let err = validate_gpu_request(gpu_requirements).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("gpu count must be greater than 0"));
+    }
+
+    fn template_with_pod_annotations(keys: &[&str]) -> SandboxTemplate {
+        let annotations = keys
+            .iter()
+            .map(|key| {
+                (
+                    (*key).to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("value".to_string())),
+                    },
+                )
+            })
+            .collect();
+        SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "annotations".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: annotations,
+                        })),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        }
+    }
+
+    #[test]
+    fn pod_annotations_rejected_by_default() {
+        let template = template_with_pod_annotations(&["example.com/owner"]);
+        let err =
+            validate_pod_annotations(&template, &KubernetesComputeConfig::default()).unwrap_err();
+        assert!(err.contains("example.com/owner"), "{err}");
+        assert!(err.contains("allowed_pod_annotations"), "{err}");
+    }
+
+    #[test]
+    fn pod_annotations_without_template_annotations_pass() {
+        validate_pod_annotations(
+            &SandboxTemplate::default(),
+            &KubernetesComputeConfig::default(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pod_annotations_allowlist_accepts_exact_and_wildcard_entries() {
+        let config = KubernetesComputeConfig {
+            allowed_pod_annotations: vec!["example.com/*".into(), "team".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        let template = template_with_pod_annotations(&["example.com/owner", "team"]);
+        validate_pod_annotations(&template, &config).unwrap();
+
+        let template = template_with_pod_annotations(&[
+            "example.com/owner",
+            "sub.example.com/owner",
+            "other.example.net/owner",
+        ]);
+        let err = validate_pod_annotations(&template, &config).unwrap_err();
+        assert!(err.contains("sub.example.com/owner"), "{err}");
+        assert!(err.contains("other.example.net/owner"), "{err}");
+        assert!(!err.contains("example.com/owner,"), "{err}");
     }
 
     #[test]

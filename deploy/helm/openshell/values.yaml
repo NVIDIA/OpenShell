@@ -372,6 +372,11 @@ server:
   # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
   # to all sandboxes that don't explicitly override it.
   defaultRuntimeClassName: ""
+  # -- Pod annotation keys that sandbox templates may set
+  # (`allowed_pod_annotations`). Each entry is an exact key
+  # (`example.com/team`) or a prefix wildcard (`example.com/*`).
+  # Empty (default) rejects every caller-supplied pod annotation.
+  allowedPodAnnotations: []
   # -- UID for sandbox pods (`sandbox_uid`). Empty (default) = use the OpenShift
   # SCC namespace annotation if present, otherwise the driver default. Must be
   # an integer between 1 and 4294967294.

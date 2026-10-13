@@ -247,6 +247,9 @@ data:
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}
+    {{- with .Values.server.allowedPodAnnotations }}
+    allowed_pod_annotations      = [{{- range $i, $key := . }}{{ if $i }}, {{ end }}{{ $key | quote }}{{- end }}]
+    {{- end }}
     {{- with include "openshell.sandboxId" (dict "name" "server.sandboxUid" "value" .Values.server.sandboxUid) }}
     sandbox_uid                  = {{ . }}
     {{- end }}
