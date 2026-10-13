@@ -162,7 +162,7 @@ USER app
                     "--name",
                     &name,
                     "--from",
-                    &image,
+                    &image.tag,
                     "--no-tty",
                     "--",
                     "sh",
@@ -285,7 +285,7 @@ fn workspace_checks(identity: &str, workspace: &str, image_file: bool) -> String
 async fn create_sandbox(
     runner: &mut OpenShellRunner,
     short: &str,
-    image: &str,
+    image: &TestImage,
     policy: Option<&str>,
     checks: &str,
 ) -> Result<String, String> {
@@ -294,7 +294,7 @@ async fn create_sandbox(
         "(set -eu; {checks} touch main-write) >/tmp/oci-main.log 2>&1; \
          echo $? >/tmp/oci-main.status; exec sleep infinity"
     );
-    let mut args = vec!["sandbox", "create", "--name", &name, "--from", image];
+    let mut args = vec!["sandbox", "create", "--name", &name, "--from", &image.tag];
     if let Some(policy) = policy {
         args.extend(["--policy", policy]);
     }
@@ -417,14 +417,14 @@ async fn file_transfer_uses_workspace(
 }
 
 /// Check the containers the driver created for `sandbox`. The workload runs
-/// the image ID inspected before creation, so retagging cannot swap it, and
+/// the image ID captured after the fixture build, before sandbox creation, and
 /// starts directly as the sandbox `identity` without a network or the
 /// supervisor's credentials. The supervisor runs in a separate non-root
 /// container.
 fn container_checks(
     engine: &Engine,
     sandbox: &str,
-    image: &str,
+    image: &TestImage,
     identity: &str,
 ) -> Result<(), String> {
     let workload = engine.container_for_role(sandbox, "sandbox")?;
@@ -432,12 +432,12 @@ fn container_checks(
     if workload == supervisor {
         return Err(format!("{sandbox} has no separate supervisor container"));
     }
-    let image_id = engine.output(&["image", "inspect", "--format", "{{.Id}}", image])?;
     let launched = engine.inspect_container(&workload, "{{.Image}}")?;
     let digest = |id: &str| id.trim_start_matches("sha256:").to_string();
-    if digest(&launched) != digest(&image_id) {
+    if digest(&launched) != digest(&image.id) {
         return Err(format!(
-            "workload launched image {launched}, expected the inspected {image_id}"
+            "workload launched image {launched}, expected the built image {}",
+            image.id
         ));
     }
     let user = engine.inspect_container(&workload, "{{.Config.User}}")?;
@@ -507,6 +507,12 @@ async fn exec(
     .await
 }
 
+/// A built fixture's mutable tag and image ID captured before sandbox creation.
+struct TestImage {
+    tag: String,
+    id: String,
+}
+
 /// The gateway's container engine. Images it builds for a scenario are
 /// removed by `run` after sandbox cleanup.
 struct Engine {
@@ -528,8 +534,8 @@ impl Engine {
         }
     }
 
-    /// Build `containerfile` and return the image tag.
-    fn build_image(&mut self, name: &str, containerfile: &str) -> Result<String, String> {
+    /// Build `containerfile` and capture its image ID before sandbox creation.
+    fn build_image(&mut self, name: &str, containerfile: &str) -> Result<TestImage, String> {
         let context = tempfile::tempdir().map_err(|error| format!("create context: {error}"))?;
         let file = context.path().join("Containerfile");
         std::fs::write(&file, containerfile)
@@ -545,7 +551,8 @@ impl Engine {
         ])?;
         // A failed build leaves no tag to remove.
         self.images.push(tag.clone());
-        Ok(tag)
+        let id = self.output(&["image", "inspect", "--format", "{{.Id}}", &tag])?;
+        Ok(TestImage { tag, id })
     }
 
     /// Remove every built image, returning one error per failed removal.
