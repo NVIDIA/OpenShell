@@ -5,8 +5,9 @@
 
 use crate::config::{
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, WorkspaceVolume,
+    is_dns_1123_label, managed_namespace, managed_namespace_prefix, parse_quantity_bytes,
+    validate_managed_namespace_name,
 };
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
@@ -370,6 +371,16 @@ struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
     volumes: Vec<KubernetesDriverVolumeConfig>,
+    /// Per-sandbox override of the gateway-wide `workspace_volume`. `None`
+    /// (unset) uses the gateway default. Only honoured on gateways that enable
+    /// `allow_driver_config`.
+    #[serde(default)]
+    workspace_volume: Option<WorkspaceVolume>,
+    /// Per-sandbox override of the workspace size — the `emptyDir` `sizeLimit`
+    /// or the PVC storage request. `None` uses `workspace_default_storage_size`.
+    /// Rejected when it exceeds the gateway `workspace_max_storage_size`.
+    #[serde(default)]
+    workspace_storage_size: Option<String>,
 }
 
 impl KubernetesSandboxDriverConfig {
@@ -762,6 +773,9 @@ impl KubernetesComputeDriver {
             .map_err(KubernetesDriverError::Precondition)?;
         config
             .validate_workspace_mode()
+            .map_err(KubernetesDriverError::Precondition)?;
+        config
+            .validate_workspace_sizes()
             .map_err(KubernetesDriverError::Precondition)?;
         config
             .validate_provider_spiffe_workload_api_socket_path()
@@ -1950,6 +1964,8 @@ impl KubernetesComputeDriver {
             sandbox_id: &sandbox.id,
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            workspace_volume: self.config.workspace_volume,
+            workspace_max_storage_size: self.config.effective_workspace_max_storage_size(),
             workspace_storage_class: &self.config.workspace_storage_class,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sandbox_uid: resolved_user_id,
@@ -6065,17 +6081,21 @@ fn apply_supervisor_sandbox_runtime_boundary(
 ///
 /// This injects:
 ///   1. A volume mount on the agent container at `/sandbox`.
-///   2. An init container (same image) that seeds the PVC with the image's
-///      original `/sandbox` contents on first use.
+///   2. An init container (same image) that seeds `/sandbox` with the image's
+///      original contents on first use.
 ///
-/// The PVC volume itself is **not** added here — the Sandbox CRD controller
-/// automatically creates a volume for each entry in `volumeClaimTemplates`
-/// (following the `StatefulSet` convention).  Adding one here would create a
-/// duplicate volume name and fail pod validation.
+/// In `persistent_volume_claim` mode the backing volume itself is **not** added
+/// here — the Sandbox CRD controller creates a volume for each entry in
+/// `volumeClaimTemplates` (following the `StatefulSet` convention). Adding one
+/// here would create a duplicate volume name and fail pod validation.
 ///
-/// The init container mounts the PVC at a temporary path so it can still see
-/// the image's `/sandbox` directory.  It checks for a sentinel file and skips
-/// the copy if the PVC was already initialised.
+/// In `empty_dir` mode there is no claim template, so this adds a size-capped
+/// pod-level `emptyDir` volume. The `emptyDir` is empty on every pod start, so
+/// the init container always re-seeds it from the image.
+///
+/// The init container mounts the volume at a temporary path so it can still see
+/// the image's `/sandbox` directory. It checks for a sentinel file and skips
+/// the copy if the volume was already initialised.
 #[allow(clippy::similar_names)]
 fn apply_workspace_persistence(
     pod_template: &mut serde_json::Value,
@@ -6083,6 +6103,7 @@ fn apply_workspace_persistence(
     image_pull_policy: Option<crate::KubernetesImagePullPolicy>,
     sandbox_gid: Option<u32>,
     workspace_owner: Option<(u32, u32)>,
+    workspace: &ResolvedWorkspace,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -6096,6 +6117,24 @@ fn apply_workspace_persistence(
             .or_insert_with(|| serde_json::json!({}));
         if let Some(pod_sc_obj) = pod_sc.as_object_mut() {
             pod_sc_obj.insert("fsGroup".to_string(), serde_json::json!(sandbox_gid));
+        }
+    }
+
+    // In empty_dir mode, declare the size-capped workspace volume directly on
+    // the pod spec (kubelet allocates a per-pod `emptyDir` at pod start). In
+    // persistent_volume_claim mode the volume is instead injected by the
+    // agent-sandbox controller from `volumeClaimTemplates`, so adding one here
+    // would duplicate the volume name.
+    if workspace.volume == WorkspaceVolume::EmptyDir {
+        let volumes = spec
+            .entry("volumes")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volumes) = volumes {
+            volumes.push(serde_json::json!({
+                "name": WORKSPACE_VOLUME_NAME,
+                "emptyDir": { "sizeLimit": workspace.size }
+            }));
         }
     }
 
@@ -6235,6 +6274,54 @@ fn default_workspace_volume_claim_templates(
     }])
 }
 
+/// The workspace backing and size resolved for a specific sandbox, after
+/// applying any per-sandbox `driver_config` override on top of the
+/// gateway-wide defaults.
+struct ResolvedWorkspace {
+    volume: WorkspaceVolume,
+    size: String,
+}
+
+/// Resolve the effective workspace backing and size for a sandbox.
+///
+/// A per-sandbox `driver_config` value wins over the gateway default. A
+/// per-sandbox `workspace_storage_size` is rejected when it exceeds the gateway
+/// `workspace_max_storage_size`, so a caller cannot claim an unbounded
+/// `emptyDir` (and starve the node) or an oversized PVC.
+fn resolve_workspace(
+    driver_config: &KubernetesSandboxDriverConfig,
+    params: &SandboxPodParams<'_>,
+) -> Result<ResolvedWorkspace, String> {
+    let volume = driver_config
+        .workspace_volume
+        .unwrap_or(params.workspace_volume);
+
+    let default_size = if params.workspace_default_storage_size.is_empty() {
+        DEFAULT_WORKSPACE_STORAGE_SIZE
+    } else {
+        params.workspace_default_storage_size
+    };
+
+    let size = match driver_config.workspace_storage_size.as_deref() {
+        Some(requested) => {
+            let requested_bytes = parse_quantity_bytes(requested)
+                .map_err(|err| format!("workspace_storage_size: {err}"))?;
+            let max_bytes = parse_quantity_bytes(params.workspace_max_storage_size)
+                .map_err(|err| format!("workspace_max_storage_size: {err}"))?;
+            if requested_bytes > max_bytes {
+                return Err(format!(
+                    "workspace_storage_size '{requested}' exceeds the gateway maximum '{}'",
+                    params.workspace_max_storage_size
+                ));
+            }
+            requested.to_string()
+        }
+        None => default_size.to_string(),
+    };
+
+    Ok(ResolvedWorkspace { volume, size })
+}
+
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
@@ -6247,6 +6334,11 @@ struct SandboxPodParams<'a> {
     sandbox_id: &'a str,
     enable_user_namespaces: bool,
     workspace_default_storage_size: &'a str,
+    /// Gateway-wide default workspace backing. Overridable per-sandbox via
+    /// `driver_config.kubernetes.workspace_volume`.
+    workspace_volume: WorkspaceVolume,
+    /// Ceiling for a per-sandbox `workspace_storage_size` override.
+    workspace_max_storage_size: &'a str,
     workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
     /// Resolved sandbox UID for supervisor `runAsUser` and env var.
@@ -6271,6 +6363,8 @@ impl Default for SandboxPodParams<'_> {
             sandbox_id: "",
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            workspace_volume: WorkspaceVolume::PersistentVolumeClaim,
+            workspace_max_storage_size: crate::config::DEFAULT_WORKSPACE_MAX_STORAGE_SIZE,
             workspace_storage_class: "",
             default_runtime_class_name: "",
             sandbox_uid: DEFAULT_SANDBOX_UID,
@@ -6312,10 +6406,11 @@ fn sandbox_to_k8s_spec(
     params: &SandboxPodParams<'_>,
 ) -> Result<serde_json::Value, String> {
     let driver_config = kubernetes_driver_config_for_spec(spec)?;
+    let workspace = resolve_workspace(&driver_config, params)?;
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
-    // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
+    // volume. Explicit Kubernetes driver-config mounts under /sandbox/ take
     // ownership of workspace persistence.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
@@ -6333,6 +6428,7 @@ fn sandbox_to_k8s_spec(
                     &pod_env,
                     &driver_config,
                     inject_workspace,
+                    &workspace,
                     params,
                 ),
             );
@@ -6345,13 +6441,14 @@ fn sandbox_to_k8s_spec(
         }
     }
 
-    if inject_workspace {
+    // The workspace PVC is declared via `volumeClaimTemplates` only in
+    // persistent_volume_claim mode. In empty_dir mode the `emptyDir` volume is
+    // instead added to the podTemplate by `apply_workspace_persistence`, so the
+    // Sandbox CR carries no claim template and needs no StorageClass.
+    if inject_workspace && workspace.volume == WorkspaceVolume::PersistentVolumeClaim {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(
-                params.workspace_default_storage_size,
-                params.workspace_storage_class,
-            ),
+            default_workspace_volume_claim_templates(&workspace.size, params.workspace_storage_class),
         );
     }
 
@@ -6366,6 +6463,7 @@ fn sandbox_to_k8s_spec(
                 &pod_env,
                 &driver_config,
                 inject_workspace,
+                &workspace,
                 params,
             ),
         );
@@ -6387,12 +6485,15 @@ fn sandbox_template_to_k8s(
     let gpu_requirements = gpu.then_some(GpuResourceRequirements { count: None });
     let driver_config = KubernetesSandboxDriverConfig::from_template(template)
         .expect("test Kubernetes driver_config should be valid");
+    let workspace = resolve_workspace(&driver_config, params)
+        .expect("test workspace resolution should succeed");
     sandbox_template_to_k8s_with_validated_config(
         template,
         gpu_requirements.as_ref(),
         spec_environment,
         &driver_config,
         inject_workspace,
+        &workspace,
         params,
     )
 }
@@ -6407,12 +6508,15 @@ fn sandbox_template_to_k8s_with_gpu_requirements(
 ) -> serde_json::Value {
     let driver_config = KubernetesSandboxDriverConfig::from_template(template)
         .expect("test Kubernetes driver_config should be valid");
+    let workspace = resolve_workspace(&driver_config, params)
+        .expect("test workspace resolution should succeed");
     sandbox_template_to_k8s_with_validated_config(
         template,
         gpu_requirements,
         spec_environment,
         &driver_config,
         inject_workspace,
+        &workspace,
         params,
     )
 }
@@ -6423,6 +6527,7 @@ fn sandbox_template_to_k8s_with_validated_config(
     spec_environment: &std::collections::HashMap<String, String>,
     driver_config: &KubernetesSandboxDriverConfig,
     inject_workspace: bool,
+    workspace: &ResolvedWorkspace,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
     let mut metadata = serde_json::Map::new();
@@ -6584,9 +6689,11 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     apply_supervisor_sandbox_runtime_boundary(&mut result, params);
 
-    // Inject workspace persistence (init container + PVC volume mount) so
-    // that /sandbox data survives pod rescheduling. Skipped when the user
-    // provides custom storage through driver_config.
+    // Inject workspace persistence (init container + volume mount) so that
+    // /sandbox is seeded from the image on pod start. Skipped when the user
+    // provides custom storage through driver_config. In empty_dir mode the
+    // pod-level `emptyDir` volume is added here; in persistent_volume_claim
+    // mode the controller injects it from `volumeClaimTemplates`.
     if inject_workspace {
         apply_workspace_persistence(
             &mut result,
@@ -6594,6 +6701,7 @@ fn sandbox_template_to_k8s_with_validated_config(
             params.image_pull_policy,
             None,
             Some((params.sandbox_uid, params.sandbox_gid)),
+            workspace,
         );
     }
 
@@ -8003,6 +8111,13 @@ mod tests {
         params: &SandboxPodParams<'_>,
     ) -> serde_json::Value {
         sandbox_to_k8s_spec(spec, params).expect("test Kubernetes driver_config should be valid")
+    }
+
+    fn pvc_test_workspace() -> ResolvedWorkspace {
+        ResolvedWorkspace {
+            volume: WorkspaceVolume::PersistentVolumeClaim,
+            size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
+        }
     }
 
     fn kube_api_error(code: u16, message: &str) -> KubeError {
@@ -10204,6 +10319,7 @@ mod tests {
             Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             Some(1000), // sandbox_gid
             None,
+            &pvc_test_workspace(),
         );
 
         // Init container
@@ -10264,6 +10380,7 @@ mod tests {
             Some(crate::KubernetesImagePullPolicy::IfNotPresent),
             Some(1000),
             None,
+            &pvc_test_workspace(),
         );
 
         let init_image = pod_template["spec"]["initContainers"][0]["image"]
@@ -10292,6 +10409,7 @@ mod tests {
             Some(crate::KubernetesImagePullPolicy::Always),
             Some(1000),
             None,
+            &pvc_test_workspace(),
         );
 
         let cmd = pod_template["spec"]["initContainers"][0]["command"]
@@ -10348,6 +10466,210 @@ mod tests {
             !has_workspace_mount,
             "workspace mount must NOT be present when inject_workspace is false"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // empty_dir workspace volume tests
+    // -----------------------------------------------------------------------
+
+    fn empty_dir_params<'a>() -> SandboxPodParams<'a> {
+        SandboxPodParams {
+            workspace_volume: WorkspaceVolume::EmptyDir,
+            ..SandboxPodParams::default()
+        }
+    }
+
+    #[test]
+    fn empty_dir_omits_volume_claim_templates_and_declares_sized_emptydir() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate::default()),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &empty_dir_params());
+
+        assert!(
+            cr["spec"].get("volumeClaimTemplates").is_none(),
+            "empty_dir must not emit volumeClaimTemplates on the Sandbox CR"
+        );
+
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("podTemplate must declare pod-level volumes");
+        let workspace = volumes
+            .iter()
+            .find(|v| v["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("empty_dir workspace volume must exist");
+        assert_eq!(
+            workspace["emptyDir"]["sizeLimit"], DEFAULT_WORKSPACE_STORAGE_SIZE,
+            "emptyDir must be capped at the default workspace size"
+        );
+        assert!(
+            workspace["emptyDir"].get("medium").is_none(),
+            "workspace emptyDir must be disk-backed, not tmpfs"
+        );
+    }
+
+    #[test]
+    fn empty_dir_still_seeds_via_init_container() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate::default()),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &empty_dir_params());
+
+        let init_containers = cr["spec"]["podTemplate"]["spec"]["initContainers"]
+            .as_array()
+            .expect("empty_dir must still run init containers");
+        assert!(
+            init_containers
+                .iter()
+                .any(|c| c["name"] == WORKSPACE_INIT_CONTAINER_NAME),
+            "empty_dir must still run the workspace-init container so /sandbox is seeded"
+        );
+    }
+
+    #[test]
+    fn default_pvc_mode_declares_no_pod_level_workspace_volume() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate::default()),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+
+        let vcts = cr["spec"]["volumeClaimTemplates"]
+            .as_array()
+            .expect("PVC mode must emit volumeClaimTemplates");
+        assert_eq!(vcts[0]["metadata"]["name"], WORKSPACE_VOLUME_NAME);
+
+        // The pod-level workspace volume is injected by the controller from the
+        // claim template, not by apply_workspace_persistence.
+        let has_pod_volume = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .is_some_and(|vols| vols.iter().any(|v| v["name"] == WORKSPACE_VOLUME_NAME));
+        assert!(
+            !has_pod_volume,
+            "PVC mode must not declare a pod-level workspace volume"
+        );
+    }
+
+    #[test]
+    fn per_sandbox_empty_dir_overrides_gateway_pvc_default() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({ "workspace_volume": "empty_dir" }))),
+            ..SandboxTemplate::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+        // Gateway default is PVC.
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+
+        assert!(
+            cr["spec"].get("volumeClaimTemplates").is_none(),
+            "per-sandbox empty_dir must override the gateway PVC default"
+        );
+        let has_pod_volume = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .is_some_and(|vols| {
+                vols.iter()
+                    .any(|v| v["name"] == WORKSPACE_VOLUME_NAME && v["emptyDir"].is_object())
+            });
+        assert!(
+            has_pod_volume,
+            "per-sandbox empty_dir must render an emptyDir workspace volume"
+        );
+    }
+
+    #[test]
+    fn per_sandbox_pvc_overrides_gateway_empty_dir_default() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({ "workspace_volume": "persistent_volume_claim" }))),
+            ..SandboxTemplate::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &empty_dir_params());
+
+        assert!(
+            cr["spec"]["volumeClaimTemplates"].is_array(),
+            "per-sandbox persistent_volume_claim must override the gateway empty_dir default"
+        );
+    }
+
+    #[test]
+    fn per_sandbox_storage_size_sets_emptydir_size_limit() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "workspace_volume": "empty_dir",
+                "workspace_storage_size": "5Gi"
+            }))),
+            ..SandboxTemplate::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &empty_dir_params());
+
+        let volumes = cr["spec"]["podTemplate"]["spec"]["volumes"]
+            .as_array()
+            .expect("podTemplate must declare pod-level volumes");
+        let workspace = volumes
+            .iter()
+            .find(|v| v["name"] == WORKSPACE_VOLUME_NAME)
+            .expect("workspace volume must exist");
+        assert_eq!(workspace["emptyDir"]["sizeLimit"], "5Gi");
+    }
+
+    #[test]
+    fn per_sandbox_storage_size_sets_pvc_request() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({ "workspace_storage_size": "7Gi" }))),
+            ..SandboxTemplate::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&spec), &SandboxPodParams::default());
+
+        let vcts = cr["spec"]["volumeClaimTemplates"]
+            .as_array()
+            .expect("PVC mode must emit volumeClaimTemplates");
+        assert_eq!(vcts[0]["spec"]["resources"]["requests"]["storage"], "7Gi");
+    }
+
+    #[test]
+    fn per_sandbox_storage_size_above_max_is_rejected() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({ "workspace_storage_size": "50Gi" }))),
+            ..SandboxTemplate::default()
+        };
+        let spec = SandboxSpec {
+            template: Some(template),
+            ..SandboxSpec::default()
+        };
+        // Default max is 10Gi.
+        let err = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default())
+            .expect_err("a size above the gateway maximum must be rejected");
+        assert!(
+            err.contains("exceeds the gateway maximum"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn driver_config_rejects_unknown_workspace_volume() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({ "workspace_volume": "tmpfs" }))),
+            ..SandboxTemplate::default()
+        };
+        let err = KubernetesSandboxDriverConfig::from_template(&template)
+            .expect_err("unknown workspace_volume must be rejected");
+        assert!(err.contains("unknown variant"), "unexpected error: {err}");
     }
 
     // -----------------------------------------------------------------------
