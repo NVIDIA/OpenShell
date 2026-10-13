@@ -122,6 +122,9 @@ infrastructure issue. Notify the responsible maintainers of new failures.
 Do not automatically retry failed tests; intermittent failures may expose races
 that affect larger installations.
 
+Tests may poll for documented asynchronous transitions within a defined timeout.
+They must not retry failed assertions merely to obtain a pass.
+
 Failures may be explicitly waived. Record each waiver's scope, rationale, and
 tracking issue, and retain the failed result.
 
@@ -134,8 +137,11 @@ Prepare the target separately from test execution so the same suite can run
 against locally provisioned or externally managed gateways.
 
 Target preparation supplies deployment configuration, credentials, images, and
-tools. Test runs accept the gateway endpoint and credentials. Host and runtime
-access supports provisioning, diagnostics, and disruption mechanisms.
+tools. Supply images and tools without requiring public internet access during
+test execution, for example through preloading or configured mirrors.
+
+Test runs accept the gateway endpoint and credentials. Host and runtime access
+supports provisioning, diagnostics, and disruption mechanisms.
 
 Tests must not depend on a particular provisioning tool. Conformance requirements
 remain the same across supported target configurations.
