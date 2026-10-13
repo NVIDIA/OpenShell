@@ -357,6 +357,18 @@ impl NetworkMediationSource for TestIo {
 
 #[tonic::async_trait]
 impl BoundaryProcess for TestIo {
+    async fn attach(
+        &self,
+    ) -> std::result::Result<openshell_isolation_interface::contract::ProcessAttachment, BackendError>
+    {
+        Ok(openshell_isolation_interface::contract::ProcessAttachment {
+            stdin: Box::new(tokio::io::sink()),
+            stdout: Box::new(tokio::io::empty()),
+            stderr: Some(Box::new(tokio::io::empty())),
+            terminal: None,
+        })
+    }
+
     async fn wait(&self) -> std::result::Result<BoundaryExitStatus, BackendError> {
         Ok(BoundaryExitStatus::Exited(0))
     }

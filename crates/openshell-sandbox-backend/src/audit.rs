@@ -49,7 +49,8 @@ mod tests {
                 },
                 "landlock_abi": 3, "landlock_allow_deny": true,
                 "udp_dns_round_trip": true, "tcp_dns_round_trip": true,
-                "tcp_allow_round_trip": true, "tcp_deny_round_trip": true
+                "tcp_allow_round_trip": true, "tcp_deny_round_trip": true,
+                "socket_loopback_confinement": true
         });
         let properties = LinuxBoundaryAuditValidator.validate(&evidence).unwrap();
         let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
