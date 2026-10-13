@@ -43,20 +43,6 @@ impl SeverityId {
         }
     }
 
-    /// Returns the single-character shorthand for log display.
-    #[must_use]
-    pub fn shorthand_char(self) -> char {
-        match self {
-            Self::Informational => 'I',
-            Self::Low => 'L',
-            Self::Medium => 'M',
-            Self::High => 'H',
-            Self::Critical => 'C',
-            Self::Fatal => 'F',
-            Self::Unknown | Self::Other => ' ',
-        }
-    }
-
     /// Returns the bracketed tag used in shorthand logs.
     ///
     /// `Unknown` and `Other` share `[UNKN]` so they never read as `[INFO]`.
@@ -94,18 +80,6 @@ mod tests {
         assert_eq!(SeverityId::Critical.label(), "Critical");
         assert_eq!(SeverityId::Fatal.label(), "Fatal");
         assert_eq!(SeverityId::Other.label(), "Other");
-    }
-
-    #[test]
-    fn test_severity_shorthand_chars() {
-        assert_eq!(SeverityId::Unknown.shorthand_char(), ' ');
-        assert_eq!(SeverityId::Informational.shorthand_char(), 'I');
-        assert_eq!(SeverityId::Low.shorthand_char(), 'L');
-        assert_eq!(SeverityId::Medium.shorthand_char(), 'M');
-        assert_eq!(SeverityId::High.shorthand_char(), 'H');
-        assert_eq!(SeverityId::Critical.shorthand_char(), 'C');
-        assert_eq!(SeverityId::Fatal.shorthand_char(), 'F');
-        assert_eq!(SeverityId::Other.shorthand_char(), ' ');
     }
 
     #[test]

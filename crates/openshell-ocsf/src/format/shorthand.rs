@@ -1224,16 +1224,21 @@ mod tests {
     fn test_shorthand_severity_tags() {
         use crate::enums::SeverityId;
 
-        for (severity, tag) in [
-            (SeverityId::Unknown, "[UNKN]"),
-            (SeverityId::Informational, "[INFO]"),
-            (SeverityId::Low, "[LOW]"),
-            (SeverityId::Medium, "[MED]"),
-            (SeverityId::High, "[HIGH]"),
-            (SeverityId::Critical, "[CRIT]"),
-            (SeverityId::Fatal, "[FATAL]"),
-            (SeverityId::Other, "[UNKN]"),
-        ] {
+        // Every wire value that deserializes, so a new variant is covered
+        // automatically and the exhaustive match below fails to compile.
+        for id in 0..=u8::MAX {
+            let Ok(severity) = serde_json::from_value::<SeverityId>(serde_json::json!(id)) else {
+                continue;
+            };
+            let tag = match severity {
+                SeverityId::Unknown | SeverityId::Other => "[UNKN]",
+                SeverityId::Informational => "[INFO]",
+                SeverityId::Low => "[LOW]",
+                SeverityId::Medium => "[MED]",
+                SeverityId::High => "[HIGH]",
+                SeverityId::Critical => "[CRIT]",
+                SeverityId::Fatal => "[FATAL]",
+            };
             let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
             b.severity = severity;
             b.set_message("msg");
