@@ -265,10 +265,8 @@ The supervisor writes logs to `/var/log/` in its own filesystem, separate from t
 
 Each format rotates daily with an independent three-file limit.
 
-Update supervisor OCSF collectors from `openshell-ocsf.*.log` to
-`openshell-ocsf.*.jsonl`. Existing OCSF `.log` files are not migrated or protected
-from shorthand retention cleanup. Collect any needed legacy history before
-upgrading. Shorthand filenames and Windows MXC gateway filenames are unchanged.
+Configure supervisor OCSF collectors to match `openshell-ocsf.*.jsonl`.
+Shorthand filenames and Windows MXC gateway filenames are unchanged.
 
 File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output.
 

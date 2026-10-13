@@ -1654,20 +1654,16 @@ mod tests {
 
     #[tokio::test]
     async fn recent_denials_skips_jsonl_log_files() {
-        // The shorthand reader must not surface current or legacy JSONL content
+        // The shorthand reader must not surface `openshell-ocsf.*.jsonl` content
         // even if a deny-looking line is present, so the response stays
         // independent of the JSONL appender's enabled state.
         let dir = tempfile::tempdir().unwrap();
-        for extension in ["jsonl", "log"] {
-            let jsonl = dir
-                .path()
-                .join(format!("openshell-ocsf.2026-05-06.{extension}"));
-            std::fs::write(
-                &jsonl,
-                r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,
-            )
-            .unwrap();
-        }
+        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.jsonl");
+        std::fs::write(
+            &jsonl,
+            r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,
+        )
+        .unwrap();
 
         let ctx = PolicyLocalContext::with_log_dir(
             None,
