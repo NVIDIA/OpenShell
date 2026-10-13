@@ -5,19 +5,35 @@
 
 //! E2E tests for edge tunnel auth flow against a running gateway.
 //!
-//! Prerequisites:
-//! - A running openshell gateway
-//! - For WS tunnel coverage, the gateway's HTTP endpoint is accessible (no TLS)
+//! `gateway_status_reports_healthy` runs wherever the common `e2e` suite runs.
+//! The tunnel test needs a gateway with special configuration, so it is a
+//! feature test behind `e2e-edge-tunnel`, which the Docker and Podman lanes
+//! enable.
+//!
+//! Prerequisites for the tunnel test:
+//! - A running openshell gateway started with the WebSocket tunnel enabled
+//!   (`--enable-websocket-tunnel true`) and reachable over `https://`. The CLI
+//!   only routes through the tunnel for `https://` gateways, so a plaintext
+//!   gateway cannot exercise it.
 //! - The `openshell` binary (built automatically from the workspace)
 //!
-//! These tests exercise the full CLI → WS tunnel → gRPC flow.
+//! The tunnel test reads the active gateway's endpoint from the user config
+//! the target registered (`$XDG_CONFIG_HOME/openshell/gateways/<name>`), not
+//! from the system gateway directory. When that gateway has a registered CA
+//! (`mtls/ca.crt`) the test trusts it by pointing the CLI at it with
+//! `SSL_CERT_FILE`, because the tunnel client uses the system trust store.
+//! Without one it relies on the system trust store, as a gateway with a
+//! publicly trusted certificate would.
+//!
+//! The tunnel client presents no client certificate. The gateway only requests
+//! client certificates, so the WebSocket upgrade does not need one.
 //!
 //! Environment variables:
 //! - `OPENSHELL_GATEWAY`: Name of the active gateway (standard e2e var)
-//! - `OPENSHELL_GATEWAY_ENDPOINT`: Optional direct plaintext endpoint.
-//!
-//! The edge-tunnel path requires a gateway endpoint that accepts plaintext HTTP.
+//! - `XDG_CONFIG_HOME`: Config home holding the registered gateways
 
+#[cfg(feature = "e2e-edge-tunnel")]
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
@@ -38,15 +54,28 @@ async fn run_cli(args: &[&str]) -> (String, i32) {
 
 /// Run `openshell <args>` with a custom config directory so the CLI reads
 /// our seeded gateway metadata and edge token instead of the real config.
-async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (String, i32) {
+///
+/// Debug logging is on so the CLI records the tunnel handshake. When
+/// `ssl_cert_file` is set, the CLI trusts that CA bundle instead of the system
+/// store.
+#[cfg(feature = "e2e-edge-tunnel")]
+async fn run_cli_with_config(
+    config_dir: &Path,
+    ssl_cert_file: Option<&Path>,
+    args: &[&str],
+) -> (String, i32) {
     let mut cmd = openshell_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("HOME", config_dir)
+        .env("RUST_LOG", "openshell_cli=debug,openshell_sdk=debug")
         .env_remove("OPENSHELL_GATEWAY")
         .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(ca) = ssl_cert_file {
+        cmd.env("SSL_CERT_FILE", ca);
+    }
 
     let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -59,8 +88,9 @@ async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (St
 /// Seed a temporary config directory with gateway metadata that has
 /// `auth_mode: "cloudflare_jwt"`, a stored edge token, and an active gateway
 /// pointing at the given endpoint.
+#[cfg(feature = "e2e-edge-tunnel")]
 fn seed_edge_gateway_config(
-    config_dir: &std::path::Path,
+    config_dir: &Path,
     gateway_name: &str,
     gateway_endpoint: &str,
     edge_token: &str,
@@ -123,6 +153,65 @@ async fn gateway_status_reports_healthy() {
     );
 }
 
+/// Where the active e2e gateway is and how to trust it.
+#[cfg(feature = "e2e-edge-tunnel")]
+struct GatewayTarget {
+    endpoint: String,
+    /// CA that signed the gateway's server certificate, when the target
+    /// registered one. Gateways with a publicly trusted certificate have none.
+    ca_cert: Option<PathBuf>,
+}
+
+/// Resolve the active gateway from the config the target registered, rather
+/// than scraping `gateway info` output.
+#[cfg(feature = "e2e-edge-tunnel")]
+fn active_gateway_target() -> GatewayTarget {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .expect("XDG_CONFIG_HOME or HOME must be set");
+    let openshell_dir = config_home.join("openshell");
+
+    let name = std::env::var("OPENSHELL_GATEWAY")
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::fs::read_to_string(openshell_dir.join("active_gateway"))
+                .ok()
+                .map(|name| name.trim().to_string())
+        })
+        .expect("no active gateway: set OPENSHELL_GATEWAY or register one");
+    let gateway_dir = openshell_dir.join("gateways").join(&name);
+
+    let metadata_path = gateway_dir.join("metadata.json");
+    let metadata = std::fs::read_to_string(&metadata_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", metadata_path.display()));
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata).expect("parse gateway metadata");
+    let endpoint = metadata["gateway_endpoint"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no gateway_endpoint in {}", metadata_path.display()))
+        .to_string();
+
+    let ca_cert = Some(gateway_dir.join("mtls").join("ca.crt")).filter(|ca| ca.is_file());
+    GatewayTarget { endpoint, ca_cert }
+}
+
+/// Whether `openshell status` output reports a healthy gateway: a `Status:`
+/// line whose value is exactly "Connected" or "Healthy". Substring matches
+/// would accept "Disconnected" and "unhealthy".
+#[cfg(feature = "e2e-edge-tunnel")]
+fn reports_healthy(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim().strip_prefix("Status:").is_some_and(|value| {
+            matches!(
+                value.trim().to_lowercase().as_str(),
+                "connected" | "healthy"
+            )
+        })
+    })
+}
+
 // -------------------------------------------------------------------
 // Test 13: gRPC through the WS tunnel proxy (edge token path)
 // -------------------------------------------------------------------
@@ -134,67 +223,51 @@ async fn gateway_status_reports_healthy() {
 /// CLI → local TCP proxy → WebSocket → /_ws_tunnel → loopback TCP → gRPC
 ///
 /// The test seeds a temporary config directory with edge auth metadata and a
-/// dummy token, then runs `openshell status` against the live plaintext
+/// dummy token, then runs `openshell status` against the live `https://`
 /// gateway.
 ///
-/// Note: The dummy token won't be validated (no edge auth middleware on
-/// the plaintext gateway), but it triggers the CLI's tunnel proxy codepath.
+/// Note: The dummy token won't be validated (no edge auth middleware on the
+/// gateway), but it triggers the CLI's tunnel proxy codepath. The CLI only
+/// tunnels over `https://`, so the test fails for a plaintext gateway instead
+/// of passing without using the tunnel. It also requires the CLI's debug log
+/// to show the completed WebSocket handshake, so a healthy status that did not
+/// use the tunnel cannot pass. That depends on a diagnostic line, which the
+/// testing strategy RFC (0016) discourages for conformance tests; it is kept
+/// here because nothing else observable separates the two paths.
+#[cfg(feature = "e2e-edge-tunnel")]
 #[tokio::test]
 async fn ws_tunnel_status_through_edge_proxy() {
-    let (original_status, _) = run_cli(&["status"]).await;
+    let (original_status, status_code) = run_cli(&["status"]).await;
     let clean_status = strip_ansi(&original_status);
 
-    // Only run this test if we have a healthy gateway to test against.
-    if !clean_status.to_lowercase().contains("healthy")
-        && !clean_status.to_lowercase().contains("running")
-        && !clean_status.to_lowercase().contains("connected")
-        && !clean_status.contains("✓")
-    {
-        eprintln!("Skipping ws_tunnel test: no healthy gateway available");
-        return;
-    }
+    // This test needs a healthy gateway to test against.
+    assert_eq!(
+        status_code, 0,
+        "ws_tunnel test needs a healthy gateway, but status failed:\n{clean_status}"
+    );
+    assert!(
+        reports_healthy(&clean_status),
+        "ws_tunnel test needs a healthy gateway:\n{clean_status}"
+    );
 
-    // Get the gateway endpoint from the gateway metadata.
-    let (info_output, info_code) = run_cli(&["gateway", "info"]).await;
-    assert_eq!(info_code, 0, "gateway info should succeed:\n{info_output}");
+    let GatewayTarget { endpoint, ca_cert } = active_gateway_target();
 
-    let info_clean = strip_ansi(&info_output);
+    // The CLI only routes through the tunnel for https:// gateways.
+    assert!(
+        endpoint.starts_with("https://"),
+        "ws_tunnel test needs an https:// gateway with the WebSocket tunnel enabled, got: {endpoint}\n\
+         A plaintext gateway, such as one reused through OPENSHELL_GATEWAY_ENDPOINT endpoint mode, \
+         cannot exercise the tunnel. Use a lane-started gateway."
+    );
 
-    // Extract the gateway endpoint from the info output.
-    // The format varies, but it should contain a URL-like string.
-    let endpoint = info_clean.lines().find_map(|line| {
-        if line.to_lowercase().contains("endpoint") || line.to_lowercase().contains("gateway") {
-            // Try to extract a URL from the line
-            line.split_whitespace()
-                .find(|word| word.starts_with("http://") || word.starts_with("https://"))
-                .map(String::from)
-        } else {
-            None
-        }
-    });
-
-    let Some(endpoint) = endpoint else {
-        eprintln!(
-            "Skipping ws_tunnel test: could not extract gateway endpoint from:\n{info_clean}"
-        );
-        return;
-    };
-
-    // For the WS tunnel test, we need the endpoint to be HTTP (plaintext).
-    // If it's HTTPS, the WS tunnel test requires TLS negotiation which
-    // complicates things. Skip if the gateway isn't plaintext.
-    if !endpoint.starts_with("http://") {
-        eprintln!(
-            "Skipping ws_tunnel test: gateway endpoint is not plaintext HTTP: {endpoint}\n\
-             Use a plaintext local gateway such as `mise run gateway:docker` for this test."
-        );
-        return;
-    }
+    // A gateway with a lane-local CA is not trusted by the system store, and
+    // the tunnel client uses the system store, so point it at that CA. With no
+    // registered CA, rely on the system store.
+    let tmpdir = tempfile::tempdir().expect("create temp config dir");
 
     // Seed a temporary config directory with edge auth metadata pointing at
     // the live gateway. The dummy token triggers the WS tunnel codepath
     // without requiring real edge auth middleware.
-    let tmpdir = tempfile::tempdir().expect("create temp config dir");
     seed_edge_gateway_config(
         tmpdir.path(),
         "edge-tunnel-test",
@@ -202,19 +275,30 @@ async fn ws_tunnel_status_through_edge_proxy() {
         "dummy-test-jwt",
     );
 
-    let (output, code) =
-        run_cli_with_config(tmpdir.path(), &["--gateway", "edge-tunnel-test", "status"]).await;
+    let (output, code) = run_cli_with_config(
+        tmpdir.path(),
+        ca_cert.as_deref(),
+        &["--gateway", "edge-tunnel-test", "status"],
+    )
+    .await;
 
     let clean = strip_ansi(&output);
     assert_eq!(
-        code, 0,
-        "openshell status through WS tunnel should exit 0:\n{clean}"
+        code,
+        0,
+        "openshell status through WS tunnel should exit 0 (trusted CA: {}):\n{clean}",
+        ca_cert
+            .as_deref()
+            .map_or_else(|| "system store".to_string(), |ca| ca.display().to_string())
+    );
+    // A healthy status alone does not show the tunnel carried it, so require
+    // the CLI's own record of the completed WebSocket handshake.
+    assert!(
+        clean.contains("WebSocket connected to edge"),
+        "status should have gone through the WS tunnel:\n{clean}"
     );
     assert!(
-        clean.to_lowercase().contains("healthy")
-            || clean.to_lowercase().contains("running")
-            || clean.to_lowercase().contains("connected")
-            || clean.contains("✓"),
+        reports_healthy(&clean),
         "status through WS tunnel should report healthy:\n{clean}"
     );
 }

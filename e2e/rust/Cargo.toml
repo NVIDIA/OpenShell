@@ -26,7 +26,11 @@ e2e = []
 # when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
 e2e-local-container-driver = ["e2e"]
-e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
+# Selects tests that need a gateway with the WebSocket tunnel enabled, reached
+# over `https://`. The lanes that start their own gateway (docker, podman)
+# configure it; the Kubernetes and VM lanes do not.
+e2e-edge-tunnel = ["e2e"]
+e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver", "e2e-edge-tunnel"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
@@ -34,7 +38,7 @@ e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-operator = ["e2e-kubernetes"]
-e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
+e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver", "e2e-edge-tunnel"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
