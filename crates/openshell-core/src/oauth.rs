@@ -770,7 +770,7 @@ mod tests {
         }
 
         let token = r#"{"access_token":"access-token"}"#;
-        let body = format!("{token:<MAX_TOKEN_RESPONSE_BYTES$}");
+        let body = format!("{token:<width$}", width = MAX_TOKEN_RESPONSE_BYTES);
         let (endpoint, server) = token_endpoint_once("200 OK", &body).await;
         post_oauth_token_grant(&test_client(), &endpoint, &empty_grant_params(), None)
             .await

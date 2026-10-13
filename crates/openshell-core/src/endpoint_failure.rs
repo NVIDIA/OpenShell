@@ -242,11 +242,12 @@ mod tests {
     #[test]
     fn rejects_each_invalid_field() {
         use EndpointFailureValidationError as E;
+        type Mutation = fn(&mut proto::EndpointFailure);
         assert_eq!(
             validate_endpoint_failure(&reported(), proto::EndpointResult::PolicyDenied),
             Err(E::Result)
         );
-        let cases: [(fn(&mut proto::EndpointFailure), E); 9] = [
+        let cases: [(Mutation, E); 9] = [
             (|f| f.domain = 99, E::Domain),
             (|f| f.code = "reauthorization_required".into(), E::Code),
             (|f| f.stage = "token service said no".into(), E::Stage),
