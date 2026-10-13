@@ -900,17 +900,14 @@ pub mod test_support {
         /// Installs this fixture's credentials as a pinned provider-credential
         /// snapshot. Admission-gated injection requests grants by revision-scoped
         /// key, so each scripted response is also registered under that key.
-        pub fn provider_credentials(
-            &self,
-        ) -> openshell_core::provider_credentials::ProviderCredentialState {
+        pub fn provider_credentials(&self) -> ProviderCredentialState {
             let credentials = self.dynamic_credentials.read().unwrap().clone();
-            let state =
-                openshell_core::provider_credentials::ProviderCredentialState::from_environment(
-                    1,
-                    HashMap::new(),
-                    HashMap::new(),
-                    credentials.clone(),
-                );
+            let state = ProviderCredentialState::from_environment(
+                1,
+                HashMap::new(),
+                HashMap::new(),
+                credentials.clone(),
+            );
             let snapshot = state.snapshot();
             let mut responses = self.responses.lock().unwrap();
             for key in credentials.keys() {
@@ -1092,8 +1089,8 @@ mod tests {
     use crate::l7::provider::{BodyLength, L7Request};
     use crate::l7::token_grant_injection::test_support::{TokenGrantTestFixture, inject_if_needed};
     use openshell_core::endpoint_status::{
-        EndpointConfigVersion, EndpointStatusReceiver, EndpointStatusTracker,
-        endpoint_status_channel,
+        EndpointConfigVersion, EndpointObservationSender, EndpointStatusReceiver,
+        EndpointStatusTracker, endpoint_status_channel,
     };
 
     const REQUEST_ID: &str = "6a1f0e2d-3c4b-4a59-8e7f-0123456789ab";
