@@ -14,8 +14,8 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use nix::sys::signal::Signal;
 use openshell_core::driver_mounts;
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
-    validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args,
+    shell_escape, validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
@@ -182,9 +182,13 @@ async fn ssh_session_config(
         // to 127.0.0.1 but the cluster is actually running on a remote host.
         #[allow(clippy::cast_possible_truncation)]
         let gateway_port_u16 = session.gateway_port as u16;
-        let (gateway_host, gateway_port) =
-            resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-        format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port)
+        let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+            &session.gateway_scheme,
+            &session.gateway_host,
+            gateway_port_u16,
+            server,
+        );
+        format_gateway_url(&gateway_scheme, &gateway_host, gateway_port)
     };
     let gateway_name = tls
         .gateway_name()
@@ -223,16 +227,7 @@ fn ssh_base_command(proxy_command: &str) -> Command {
     // Nested ProxyCommand processes inherit the effective verbosity too.
     command.env("OPENSHELL_SSH_LOG_LEVEL", &ssh_log_level);
     command
-        .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg(format!("LogLevel={ssh_log_level}"))
+        .args(sandbox_ssh_args(proxy_command, &ssh_log_level))
         // Detect a dead relay within ~45s. The relay rides on a TCP connection
         // that the client has no way to observe silently dropping (gateway
         // restart, supervisor restart, cluster failover), so fall back to
@@ -822,25 +817,13 @@ pub async fn sandbox_forward(
     Ok(())
 }
 
-/// Keep the SSH connection owned by the process we spawn. User SSH config may
-/// otherwise move it into a persistent mux.
-fn own_ssh_connection(command: &mut Command) -> &mut Command {
-    command
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg("-o")
-        .arg("ControlPersist=no")
-        .arg("-o")
-        .arg("ForkAfterAuthentication=no")
-}
-
 /// A forward must stay owned by the process we spawn so it can be reaped or
-/// tracked by PID.
+/// tracked by PID. User SSH config may otherwise fork it into the background.
 fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
     let mut command = ssh_base_command(proxy_command);
-    own_ssh_connection(&mut command)
+    command
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
         .arg("-N")
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
@@ -1327,11 +1310,14 @@ async fn ssh_tar_upload(
     Ok(final_path)
 }
 
-/// Upload EOF marks a complete archive. Under a user SSH mux, killing the client
-/// would still let the master send EOF, so the upload owns its connection.
+/// Upload EOF marks a complete archive and the SSH exit status reports
+/// extraction, so the session must stay in the process we spawn. User SSH
+/// config may otherwise fork it into the background.
 fn ssh_upload_command(proxy_command: &str) -> Command {
     let mut command = ssh_base_command(proxy_command);
-    own_ssh_connection(&mut command)
+    command
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
         .arg("-T")
         .arg("-o")
         .arg("RequestTTY=no")
@@ -2861,9 +2847,11 @@ mod tests {
         assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
     }
 
+    /// Resolve `ssh -G` for `command`'s arguments against a user config that
+    /// enables connection sharing and forking for the host `sandbox`. `extra_args`
+    /// supplies the host and, for the forking option, `-N`, when `command` lacks them.
     #[cfg(unix)]
-    #[test]
-    fn forward_and_upload_ssh_commands_override_user_multiplexing_and_forking() {
+    fn effective_ssh_config(command: &Command, extra_args: &[&str]) -> String {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2878,37 +2866,69 @@ mod tests {
         )
         .unwrap();
 
-        let proxy = "openshell ssh-proxy --sandbox demo";
-        for command in [
-            ssh_forward_command(proxy, "sandbox-id", &ForwardSpec::new(18080)),
-            ssh_upload_command(proxy),
-        ] {
-            let output = Command::new("ssh")
-                .arg("-F")
-                .arg(&config)
-                .arg("-G")
-                .args(command.get_args())
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "ssh -G failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let effective = String::from_utf8(output.stdout).unwrap();
-            assert!(effective.lines().any(|line| line == "controlmaster false"));
-            assert!(effective.lines().any(|line| line == "controlpersist no"));
-            assert!(
-                effective
-                    .lines()
-                    .any(|line| line == "forkafterauthentication no")
-            );
-            assert!(
-                !effective
-                    .lines()
-                    .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
-            );
-        }
+        let output = Command::new("ssh")
+            .arg("-F")
+            .arg(&config)
+            .arg("-G")
+            .args(command.get_args())
+            .args(extra_args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "ssh -G failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_connection_sharing_disabled(effective: &str) {
+        assert!(effective.lines().any(|line| line == "controlmaster false"));
+        assert!(effective.lines().any(|line| line == "controlpersist no"));
+        assert!(
+            !effective
+                .lines()
+                .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_base_command_overrides_user_connection_sharing() {
+        let effective =
+            effective_ssh_config(&ssh_base_command("openshell ssh-proxy"), &["-N", "sandbox"]);
+        assert_connection_sharing_disabled(&effective);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
+        let forward = ssh_forward_command(
+            "openshell ssh-proxy --sandbox demo",
+            "sandbox-id",
+            &ForwardSpec::new(18080),
+        );
+        let effective = effective_ssh_config(&forward, &[]);
+        assert_connection_sharing_disabled(&effective);
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "forkafterauthentication no")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_ssh_command_overrides_user_multiplexing_and_forking() {
+        let upload = ssh_upload_command("openshell ssh-proxy --sandbox demo");
+        let effective = effective_ssh_config(&upload, &[]);
+        assert_connection_sharing_disabled(&effective);
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "forkafterauthentication no")
+        );
     }
 
     #[tokio::test]

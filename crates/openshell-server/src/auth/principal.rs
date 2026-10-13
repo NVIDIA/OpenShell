@@ -109,3 +109,42 @@ pub enum SandboxIdentitySource {
         runtime_identity: String,
     },
 }
+
+impl Principal {
+    /// One-line caller label for audit records.
+    #[must_use]
+    pub fn audit_actor(&self) -> String {
+        match self {
+            Self::User(user) => format!("user:{}", user.identity.subject),
+            Self::Operator(operator) => format!("operator:{}", operator.identity.subject),
+            Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
+            Self::Peer(peer) => format!("peer:{}", peer.replica_id),
+            Self::Anonymous => "anonymous".to_string(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::identity::IdentityProvider;
+
+    #[test]
+    fn audit_actor_distinguishes_operator_from_user_with_same_subject() {
+        let identity = Identity {
+            subject: "reviewer".to_string(),
+            display_name: None,
+            roles: vec![],
+            scopes: vec![],
+            provider: IdentityProvider::Mtls,
+        };
+        let operator = Principal::Operator(OperatorPrincipal {
+            identity: identity.clone(),
+            certificate_sha256: "certificate-fingerprint".to_string(),
+        });
+        let user = Principal::User(UserPrincipal { identity });
+
+        assert_eq!(operator.audit_actor(), "operator:reviewer");
+        assert_eq!(user.audit_actor(), "user:reviewer");
+    }
+}

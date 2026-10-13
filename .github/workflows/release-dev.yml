@@ -127,6 +127,7 @@ jobs:
         [
           {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
           {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
           {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
         ]
@@ -242,7 +243,7 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   build-snap:
-    name: Build Snap
+    name: Build snap
     needs: [compute-versions, build-binaries]
     uses: ./.github/workflows/snap-package.yml
     with:
@@ -259,7 +260,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   publish-snap:
-    name: Publish Snap
+    name: Publish snap
     needs: build-snap
     uses: ./.github/workflows/snap-publish.yml
     with:

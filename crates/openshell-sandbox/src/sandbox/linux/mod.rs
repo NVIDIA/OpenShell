@@ -11,6 +11,8 @@ use openshell_core::policy::SandboxPolicy;
 use std::path::PathBuf;
 use std::sync::Once;
 
+pub use landlock::require_abi as require_landlock_abi;
+
 /// Opaque handle to a prepared-but-not-yet-enforced sandbox.
 /// Holds the Landlock ruleset with `PathFds` opened before child exec.
 pub struct PreparedSandbox {

@@ -148,7 +148,7 @@ Each executable receives only **-V**, with a five-second deadline and an 8 KiB o
 
 The Debian and Ubuntu systemd user unit runs preflight before certificate
 generation, while retaining its EnvironmentFile and bare ExecStart behavior. The
-Snap wrapper replays its effective daemon arguments through preflight. It first
+snap wrapper replays its effective daemon arguments through preflight. It first
 uses a nonempty OPENSHELL_GATEWAY_CONFIG. Otherwise it passes the canonical
 service-specific gateway.toml path whenever it exists or is a symlink. The legacy
 system service uses SNAP_COMMON/gateway.toml; the user service uses

@@ -111,6 +111,8 @@ message InterceptorManifest {
   // post-authentication consistency check.
   string expected_audience = 5;
   // Gateway-interceptor protocol metadata. Required for negotiation.
+  // Declare protocol 1.0 and list "openshell.gateway-interceptor.contract" in
+  // supported_capabilities.
   openshell.extension.v1.PeerMetadata extension = 6;
 }
 

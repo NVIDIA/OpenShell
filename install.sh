@@ -72,7 +72,7 @@ NOTES:
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
     x86_64/aarch64, depending on the host package manager. Set
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
-    that already have the OpenShell snap keep refreshing it. Snap installs use
+    that already have the OpenShell snap keep refreshing it. snap installs use
     latest/stable by default and latest/edge for dev, and do not support
     explicit release tags or prereleases. The OpenShell snap requires a running
     Docker Engine installed from a system package or Docker's package
@@ -1255,7 +1255,7 @@ openshell_snap_channel() {
   case "${OPENSHELL_VERSION:-}" in
     dev) printf '%s\n' "latest/edge" ;;
     '') printf '%s\n' "latest/stable" ;;
-    *) error "Snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
+    *) error "snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
   esac
 }
 
@@ -1327,7 +1327,7 @@ copy_snap_client_bundle() {
   done
 }
 
-# Snap revisions that require mTLS ship the post-refresh hook that migrates
+# snap revisions that require mTLS ship the post-refresh hook that migrates
 # older plaintext configs.
 snap_gateway_uses_mtls() {
   [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]

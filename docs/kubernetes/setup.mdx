@@ -228,6 +228,18 @@ openshell status
 
 </Steps>
 
+## Upgrade OpenShell
+
+To upgrade, rerun `helm upgrade --install` with the new `--version` and the values you installed with. Running sandboxes keep their supervisor and sandbox runtime images until they stop. When a stopped sandbox starts, it takes both images from the upgraded gateway and keeps its workload image and workspace.
+
+If you override images, set `supervisor.image` and `sandboxRuntime.image` to the same release, or set only `global.image.tag`. An incompatible pair fails when a sandbox starts, and the supervisor log shows the cause while the start is in progress:
+
+```shell
+kubectl -n openshell logs -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/component=supervisor
+```
+
+After you correct the images, recover a sandbox whose start timed out as described in [Sandbox Lifecycle](/how-it-works/sandboxes/overview#sandbox-lifecycle).
+
 ## Configure Chart Values
 
 The Helm chart renders `gatewayConfig` into the mounted `gateway.toml`

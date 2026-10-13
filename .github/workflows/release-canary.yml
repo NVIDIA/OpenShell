@@ -192,7 +192,7 @@ jobs:
           docker rm -f "${FEDORA_CANARY_CONTAINER}" >/dev/null 2>&1 || true
 
   ubuntu-snap-system-docker:
-    name: Ubuntu Snap with system Docker
+    name: Ubuntu snap with system Docker
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
@@ -245,7 +245,7 @@ jobs:
           openshell gateway list | grep -F "https://127.0.0.1:17670"
           openshell status
 
-      - name: Check a policy boundary with the Snap prover
+      - name: Check a policy boundary with the snap prover
         run: |
           set -euo pipefail
           prover_dir=$(mktemp -d "$HOME/openshell-prover-canary.XXXXXX")
@@ -275,7 +275,7 @@ jobs:
           openshell sandbox exec --name "$sandbox" --no-tty -- true
           openshell sandbox delete "$sandbox"
 
-      - name: Collect Snap diagnostics
+      - name: Collect snap diagnostics
         if: failure()
         run: |
           set +e
@@ -294,7 +294,7 @@ jobs:
           sudo ss -ltnp '( sport = :17670 )'
 
   ubuntu-snap-docker-preflight:
-    name: Ubuntu Snap Docker preflight
+    name: Ubuntu snap Docker preflight
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     env:
@@ -346,7 +346,7 @@ jobs:
           sudo snap list docker >/dev/null
           ! sudo snap list openshell >/dev/null 2>&1
 
-      - name: Collect Snap diagnostics
+      - name: Collect snap diagnostics
         if: failure()
         run: |
           set +e
