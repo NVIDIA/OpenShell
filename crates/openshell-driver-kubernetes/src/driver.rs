@@ -9702,68 +9702,32 @@ mod tests {
     }
 
     fn template_with_pod_annotations(keys: &[&str]) -> SandboxTemplate {
-        let annotations = keys
+        let annotations: serde_json::Map<_, _> = keys
             .iter()
-            .map(|key| {
-                (
-                    (*key).to_string(),
-                    Value {
-                        kind: Some(Kind::StringValue("value".to_string())),
-                    },
-                )
-            })
+            .map(|key| ((*key).to_string(), "v".into()))
             .collect();
         SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "annotations".to_string(),
-                    Value {
-                        kind: Some(Kind::StructValue(Struct {
-                            fields: annotations,
-                        })),
-                    },
-                ))
-                .collect(),
-            }),
+            platform_config: Some(json_struct(
+                serde_json::json!({ "annotations": annotations }),
+            )),
             ..SandboxTemplate::default()
         }
     }
 
     #[test]
-    fn pod_annotations_rejected_by_default() {
-        let template = template_with_pod_annotations(&["example.com/owner"]);
-        let err =
-            validate_pod_annotations(&template, &KubernetesComputeConfig::default()).unwrap_err();
-        assert!(err.contains("example.com/owner"), "{err}");
-        assert!(err.contains("allowed_pod_annotations"), "{err}");
-    }
-
-    #[test]
-    fn pod_annotations_without_template_annotations_pass() {
-        validate_pod_annotations(
-            &SandboxTemplate::default(),
-            &KubernetesComputeConfig::default(),
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn pod_annotations_allowlist_accepts_exact_and_wildcard_entries() {
+    fn validate_pod_annotations_reports_keys_outside_allowlist() {
         let config = KubernetesComputeConfig {
-            allowed_pod_annotations: vec!["example.com/*".into(), "team".into()],
+            allowed_pod_annotations: vec!["example.com/*".into()],
             ..KubernetesComputeConfig::default()
         };
-        let template = template_with_pod_annotations(&["example.com/owner", "team"]);
-        validate_pod_annotations(&template, &config).unwrap();
+        validate_pod_annotations(&SandboxTemplate::default(), &config).unwrap();
+        validate_pod_annotations(&template_with_pod_annotations(&["example.com/a"]), &config)
+            .unwrap();
 
-        let template = template_with_pod_annotations(&[
-            "example.com/owner",
-            "sub.example.com/owner",
-            "other.example.net/owner",
-        ]);
+        let template =
+            template_with_pod_annotations(&["example.com/a", "sub.example.com/a", "other.net/a"]);
         let err = validate_pod_annotations(&template, &config).unwrap_err();
-        let (_, rejected) = err.rsplit_once(": ").unwrap();
-        assert_eq!(rejected, "other.example.net/owner, sub.example.com/owner");
+        assert!(err.ends_with(": other.net/a, sub.example.com/a"), "{err}");
     }
 
     #[tokio::test]

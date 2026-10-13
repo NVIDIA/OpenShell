@@ -862,7 +862,10 @@ workspace_default_storage_size = "10Gi"
 # default_runtime_class_name   = "kata-containers"
 # Pod annotation keys that sandbox templates may set. Each entry is an exact
 # key or a `<domain>/*` wildcard. Empty (default) rejects every template
-# annotation. Keys under openshell.ai and agents.x-k8s.io are always rejected.
+# annotation. Keys under openshell.ai (OpenShell sandbox identity) and
+# agents.x-k8s.io (owned by the Agent Sandbox controller), including
+# subdomains, are reserved: templates cannot set them and the allowlist
+# cannot include them.
 # allowed_pod_annotations      = ["example.com/*", "team.example.org/owner"]
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
