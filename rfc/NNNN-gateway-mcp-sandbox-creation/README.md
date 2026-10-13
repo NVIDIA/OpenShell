@@ -520,7 +520,7 @@ driving them, and `exec` on an agent is refused to keep a parent from steering
 a child's work behind its harness. Tool sandboxes are the opposite: a disposable
 environment for running builds, tests or untrusted code on the parent's behalf.
 Every command run through `exec` is recorded with the parent, the child and the
-command line (R35 in the requirements).
+command line.
 
 ### Lifecycle
 
