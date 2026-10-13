@@ -1181,7 +1181,7 @@ impl SshHandler {
         if let Some(message) = message {
             session.extended_data(channel, 1, format!("openshell: {message}\n").into_bytes())?;
         }
-        self.reject_exec_input(channel, session, "invalid upload stream")
+        self.reject_exec_input(channel, session, message.unwrap_or("invalid upload stream"))
     }
 
     fn reject_exec_input(
@@ -1197,7 +1197,7 @@ impl SshHandler {
             if let Some(process) = state.process.take() {
                 tokio::spawn(async move {
                     if let Err(error) = process.terminate().await {
-                        warn!(%error, "failed to terminate exec after stdin overflow");
+                        warn!(%error, "failed to terminate rejected exec");
                     }
                 });
             }

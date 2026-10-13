@@ -8,16 +8,20 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
 use miette::Diagnostic;
-use openshell_core::upload::{DESTINATION_CHANGED_EXIT_CODE, UploadPlan, WINDOW_BYTES};
+use openshell_core::upload::{
+    ACK_INTERVAL_BYTES, DESTINATION_CHANGED_EXIT_CODE, UploadPlan, WINDOW_BYTES,
+};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::{mpsc, watch};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 const NEGOTIATION_TIMEOUT: Duration = Duration::from_secs(10);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK_BYTES: usize = 64 * 1024;
+// A larger chunk could wait forever for credit the supervisor never reports.
+const _: () = assert!(CHUNK_BYTES as u64 <= WINDOW_BYTES - ACK_INTERVAL_BYTES);
 const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 /// The producer can hold at most two chunks in addition to its current buffer
 /// and the chunk held by the sender. It cannot build an entire archive in RAM.
@@ -81,13 +85,11 @@ impl Drop for ChildGuard {
     }
 }
 
-struct AbortTasks(Vec<AbortHandle>);
+struct AbortOnDrop(AbortHandle);
 
-impl Drop for AbortTasks {
+impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        for task in &self.0 {
-            task.abort();
-        }
+        self.0.abort();
     }
 }
 
@@ -124,25 +126,33 @@ where
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let child = TokioCommand::from(command)
+    let mut child = TokioCommand::from(command)
         .kill_on_drop(true)
         .spawn()
         .map_err(|error| UploadError::Transport(error.to_string()))?;
+    // EOF marks the end of the archive, so a failed or cancelled transfer must
+    // stop SSH before its stdin closes. The transfer closes stdin only on
+    // success, and declaring stdin first drops the guard, killing SSH, first.
+    let mut stdin = Some(child.stdin.take().expect("piped SSH stdin"));
+    let stdout = child.stdout.take().expect("piped SSH stdout");
+    let stderr = child.stderr.take().expect("piped SSH stderr");
     let mut child = ChildGuard(Some(child));
-    // EOF marks the end of the archive, so a failed transfer must stop SSH
-    // before its stdin closes. The transfer closes stdin only on success.
-    let mut stdin = Some(child.child().stdin.take().expect("piped SSH stdin"));
-    let stdout = child.child().stdout.take().expect("piped SSH stdout");
-    let stderr = child.child().stderr.take().expect("piped SSH stderr");
     let diagnostics = tokio::spawn(read_diagnostic(stderr));
-    let diagnostic_guard = AbortTasks(vec![diagnostics.abort_handle()]);
+    let _diagnostics = AbortOnDrop(diagnostics.abort_handle());
 
     let transfer = match transfer(stdout, &mut stdin, plan, producer).await {
         Ok(sent) => Ok(sent),
         Err(Stopped::Stream(message)) => Err(message),
         Err(Stopped::Local(error)) => {
             let _ = child.finish(true).await;
-            return Err(error);
+            drop(stdin);
+            return Err(match error {
+                UploadError::Transport(message) => UploadError::Transport(format!(
+                    "{message}: {}",
+                    finish_diagnostic(diagnostics).await
+                )),
+                error => error,
+            });
         }
     };
     drop(stdin);
@@ -153,13 +163,7 @@ where
         ));
     };
     let status = status.map_err(|error| UploadError::Transport(error.to_string()))?;
-    let diagnostic = tokio::time::timeout(CHILD_EXIT_TIMEOUT, diagnostics)
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
-    drop(diagnostic_guard);
-    let diagnostic = diagnostic.trim();
+    let diagnostic = finish_diagnostic(diagnostics).await;
     match status.code() {
         Some(0) => match transfer {
             Ok(sent) if sent.acknowledged == sent.bytes => Ok(()),
@@ -189,6 +193,17 @@ where
             "extraction exited with status {code}: {diagnostic}"
         ))),
     }
+}
+
+/// The tail of SSH stderr, which includes extraction output.
+async fn finish_diagnostic(task: JoinHandle<String>) -> String {
+    tokio::time::timeout(CHILD_EXIT_TIMEOUT, task)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 async fn read_diagnostic<R: AsyncRead + Unpin>(mut reader: R) -> String {
@@ -316,7 +331,7 @@ where
         }
         Ok(())
     });
-    let _acks = AbortTasks(vec![acks.abort_handle()]);
+    let _acks = AbortOnDrop(acks.abort_handle());
     let mut chunks = spawn_producer(producer);
     let mut sent = 0_u64;
     loop {
@@ -350,8 +365,6 @@ where
                 });
             }
         }
-        // Count bytes before writing: the supervisor may acknowledge part of
-        // a chunk while the pipe write is still in progress.
         sent += length;
         writer.write_all(&chunk).await.map_err(stream)?;
     }
@@ -380,7 +393,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncBufReadExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 
-    const WINDOW: usize = 1024 * 1024;
+    #[allow(clippy::cast_possible_truncation)]
+    const WINDOW: usize = WINDOW_BYTES as usize;
     type Check = fn(&Result<(), UploadError>) -> bool;
 
     fn plan() -> UploadPlan {
@@ -393,7 +407,7 @@ mod tests {
     fn start(
         producer: impl FnOnce(&mut dyn Write) -> miette::Result<()> + Send + 'static,
         buffer: usize,
-    ) -> (tokio::task::JoinHandle<Result<Sent, Stopped>>, DuplexStream) {
+    ) -> (JoinHandle<Result<Sent, Stopped>>, DuplexStream) {
         let (client, server) = tokio::io::duplex(buffer);
         let (read, write) = tokio::io::split(client);
         let plan = plan().encode().unwrap();
@@ -592,7 +606,6 @@ mod tests {
         // archive before reporting. `\0\0\0\0\0\0\0\a` is a total of seven bytes.
         const ZERO: &str = r"printf '\0\0\0\0\0\0\0\0'";
         const SEVEN: &str = r"printf '\0\0\0\0\0\0\0\a'";
-        assert_eq!(WINDOW as u64, WINDOW_BYTES);
         let cases: [(String, Check); 4] = [
             (
                 format!("read -r plan; {ZERO}; cat >/dev/null; {SEVEN}"),

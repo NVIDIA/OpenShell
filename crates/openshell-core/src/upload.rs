@@ -18,6 +18,12 @@ pub const SUBSYSTEM: &str = "openshell-upload-v1";
 /// Archive bytes a client may send beyond the last acknowledged total. This
 /// must stay below the supervisor's pending-stdin budget.
 pub const WINDOW_BYTES: u64 = 1024 * 1024;
+/// Archive bytes between progress reports; success also reports the final total.
+///
+/// Clients must write archive chunks of at most
+/// `WINDOW_BYTES - ACK_INTERVAL_BYTES`, so a drained extractor always returns
+/// enough credit for the next chunk.
+pub const ACK_INTERVAL_BYTES: u64 = 256 * 1024;
 pub const MAX_PLAN_BYTES: usize = 16 * 1024;
 pub const DESTINATION_CHANGED_EXIT_CODE: i32 = 73;
 

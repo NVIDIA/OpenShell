@@ -9,7 +9,7 @@
 //! credit. The SSH exit status reports the result.
 
 use super::input::{InputProgress, InputState};
-use openshell_core::upload::{PlanError, PlanReader, UploadPlan, WINDOW_BYTES};
+use openshell_core::upload::{ACK_INTERVAL_BYTES, PlanError, PlanReader, UploadPlan, WINDOW_BYTES};
 use openshell_isolation_interface::contract::BoundaryProcess;
 use russh::ChannelId;
 use russh::server::Handle;
@@ -19,7 +19,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinHandle};
 
-const ACK_INTERVAL: u64 = 256 * 1024;
+// Honest clients cannot reach the general pending-input guard.
+const _: () = assert!(WINDOW_BYTES < super::input::MAX_PENDING_INPUT as u64);
 /// A successful `cat | tar` exit follows stdin EOF, so the writer publishes
 /// its drained state almost immediately.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -181,7 +182,7 @@ async fn send_acks(
             let _ = process.terminate().await;
             return;
         }
-        if latest.consumed - acknowledged >= ACK_INTERVAL {
+        if latest.consumed - acknowledged >= ACK_INTERVAL_BYTES {
             if handle.data(channel, ack(latest.consumed)).await.is_err() {
                 return;
             }

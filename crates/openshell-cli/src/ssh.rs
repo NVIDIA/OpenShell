@@ -69,9 +69,6 @@ const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
-#[cfg(test)]
-const UPLOAD_DESTINATION_CHANGED_EXIT_CODE: i32 =
-    openshell_core::upload::DESTINATION_CHANGED_EXIT_CODE;
 static DEFAULT_SSH_LOG_LEVEL: OnceLock<&'static str> = OnceLock::new();
 
 /// Set the SSH log level derived from CLI verbosity before starting commands.
@@ -825,10 +822,9 @@ pub async fn sandbox_forward(
     Ok(())
 }
 
-/// A forward must stay owned by the process we spawn so it can be reaped or
-/// tracked by PID. User SSH config may otherwise move it into a persistent mux.
-fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
-    let mut command = ssh_base_command(proxy_command);
+/// Keep the SSH connection owned by the process we spawn. User SSH config may
+/// otherwise move it into a persistent mux.
+fn own_ssh_connection(command: &mut Command) -> &mut Command {
     command
         .arg("-o")
         .arg("ControlMaster=no")
@@ -838,6 +834,13 @@ fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec
         .arg("ControlPersist=no")
         .arg("-o")
         .arg("ForkAfterAuthentication=no")
+}
+
+/// A forward must stay owned by the process we spawn so it can be reaped or
+/// tracked by PID.
+fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
+    let mut command = ssh_base_command(proxy_command);
+    own_ssh_connection(&mut command)
         .arg("-N")
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
@@ -1307,13 +1310,7 @@ async fn ssh_tar_upload(
         UploadSource::FileList { .. } => dest_dir.to_string(),
     };
 
-    let mut ssh = ssh_base_command(&session.proxy_command);
-    ssh.arg("-T")
-        .arg("-o")
-        .arg("RequestTTY=no")
-        .arg("-s")
-        .arg("sandbox")
-        .arg(openshell_core::upload::SUBSYSTEM);
+    let ssh = ssh_upload_command(&session.proxy_command);
     let plan = UploadPlan {
         destination_directory: dest_dir.to_string(),
         expected_destination: expected_destination.map(|(path, kind)| ExpectedDestination {
@@ -1328,6 +1325,20 @@ async fn ssh_tar_upload(
     .map_err(Report::new)?;
 
     Ok(final_path)
+}
+
+/// Upload EOF marks a complete archive. Under a user SSH mux, killing the client
+/// would still let the master send EOF, so the upload owns its connection.
+fn ssh_upload_command(proxy_command: &str) -> Command {
+    let mut command = ssh_base_command(proxy_command);
+    own_ssh_connection(&mut command)
+        .arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("-s")
+        .arg("sandbox")
+        .arg(openshell_core::upload::SUBSYSTEM);
+    command
 }
 
 /// Split a sandbox path into (`parent_directory`, basename).
@@ -2506,7 +2517,7 @@ mod tests {
     fn upload_errors_retry_only_explicit_transport_failures() {
         for error in [
             upload::UploadError::Unsupported,
-            upload::UploadError::Protocol("connection reset in malformed frame".into()),
+            upload::UploadError::Protocol("connection reset in invalid acknowledgment".into()),
             upload::UploadError::Remote("destination /connection/unavailable".into()),
             upload::UploadError::Archive("broken pipe while reading source".into()),
             upload::UploadError::Cancelled,
@@ -2852,7 +2863,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
+    fn forward_and_upload_ssh_commands_override_user_multiplexing_and_forking() {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2867,36 +2878,37 @@ mod tests {
         )
         .unwrap();
 
-        let forward = ssh_forward_command(
-            "openshell ssh-proxy --sandbox demo",
-            "sandbox-id",
-            &ForwardSpec::new(18080),
-        );
-        let output = Command::new("ssh")
-            .arg("-F")
-            .arg(&config)
-            .arg("-G")
-            .args(forward.get_args())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "ssh -G failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let effective = String::from_utf8(output.stdout).unwrap();
-        assert!(effective.lines().any(|line| line == "controlmaster false"));
-        assert!(effective.lines().any(|line| line == "controlpersist no"));
-        assert!(
-            effective
-                .lines()
-                .any(|line| line == "forkafterauthentication no")
-        );
-        assert!(
-            !effective
-                .lines()
-                .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
-        );
+        let proxy = "openshell ssh-proxy --sandbox demo";
+        for command in [
+            ssh_forward_command(proxy, "sandbox-id", &ForwardSpec::new(18080)),
+            ssh_upload_command(proxy),
+        ] {
+            let output = Command::new("ssh")
+                .arg("-F")
+                .arg(&config)
+                .arg("-G")
+                .args(command.get_args())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "ssh -G failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let effective = String::from_utf8(output.stdout).unwrap();
+            assert!(effective.lines().any(|line| line == "controlmaster false"));
+            assert!(effective.lines().any(|line| line == "controlpersist no"));
+            assert!(
+                effective
+                    .lines()
+                    .any(|line| line == "forkafterauthentication no")
+            );
+            assert!(
+                !effective
+                    .lines()
+                    .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
+            );
+        }
     }
 
     #[tokio::test]
@@ -3551,7 +3563,7 @@ mod tests {
             let output = run_upload_shell(&command, tmp.path(), Some(&archive));
             assert_eq!(
                 output.status.code(),
-                Some(UPLOAD_DESTINATION_CHANGED_EXIT_CODE)
+                Some(openshell_core::upload::DESTINATION_CHANGED_EXIT_CODE)
             );
             assert!(String::from_utf8_lossy(&output.stderr).contains("changed type"));
             if initial_kind == UploadDestinationKind::Directory {

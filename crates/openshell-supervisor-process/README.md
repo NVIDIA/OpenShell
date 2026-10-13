@@ -27,8 +27,8 @@ After the extractor exits successfully and stdin has drained, the supervisor
 sends the final total, then the exit status. The client succeeds only when the
 status is zero and the final total equals the bytes it sent. A malformed plan,
 credit violation, extended data or EOF before the plan fails the upload with
-exit status 74. Whichever happens first, the exit or the rejection, decides the
-reported result. Rejection, channel close or disconnect terminates the
+exit status 74. A rejection wins until the supervisor reports the exit result,
+even after the extractor exits. Rejection, channel close or disconnect terminates the
 extractor. Extraction writes directly to the destination, so failures can
 leave partially extracted files; there is no rollback or atomic replacement.
 

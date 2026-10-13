@@ -18,7 +18,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const CHUNK: usize = 64 * 1024;
-const WINDOW: usize = 1024 * 1024;
+#[allow(clippy::cast_possible_truncation)]
+const WINDOW: usize = WINDOW_BYTES as usize;
 
 struct Process {
     status: watch::Sender<Option<BoundaryExitStatus>>,
@@ -192,7 +193,6 @@ async fn start(client: &russh::client::Handle<AcceptAnyServerKey>) -> (Channel, 
 
 #[tokio::test]
 async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
-    assert_eq!(WINDOW as u64, WINDOW_BYTES);
     tokio::time::timeout(DEADLINE, async {
         let (upload, mut control) = exec_session();
         let (sibling, mut other) = exec_session();
@@ -264,6 +264,34 @@ async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
     })
     .await
     .expect("upload did not resume or blocked SSH control traffic");
+}
+
+#[tokio::test]
+async fn small_upload_in_one_packet_reports_final_total() {
+    tokio::time::timeout(DEADLINE, async {
+        let (session, mut control) = exec_session();
+        let client = client_for(vec![session]).await;
+        let mut channel = open(&client).await;
+        // The plan and archive share one packet; the tail stays below the
+        // progress interval, so only the final total covers it.
+        let mut packet = plan_line();
+        packet.push(b'x');
+        channel.data(packet.as_slice()).await.unwrap();
+        channel.eof().await.unwrap();
+        let mut bytes = Vec::new();
+        control.stdin.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"x");
+        control
+            .process
+            .status
+            .send_replace(Some(BoundaryExitStatus::Exited(0)));
+        drop((control.stdout, control.stderr));
+        let mut reader = Reader::default();
+        assert_eq!(reader.close(&mut channel).await, [0, 1]);
+        assert_eq!(reader.statuses, [0]);
+    })
+    .await
+    .expect("small upload did not report its final total");
 }
 
 #[tokio::test]
