@@ -31,7 +31,7 @@ pub fn clone_current_event() -> Option<OcsfEvent> {
 /// Emit an `OcsfEvent` through the tracing subscriber.
 ///
 /// The OCSF layers (`OcsfShorthandLayer`, `OcsfJsonlLayer`) format it
-/// as shorthand (`openshell.log`) and JSONL (`openshell-ocsf.log`).
+/// as human-readable shorthand and structured JSONL for their configured sinks.
 ///
 /// Both layers receive the event — `clone_current_event()` is non-consuming.
 pub fn emit_ocsf_event(event: OcsfEvent) {

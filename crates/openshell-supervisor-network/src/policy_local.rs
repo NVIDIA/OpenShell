@@ -472,7 +472,7 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
             let name = entry.file_name();
             let name = name.to_string_lossy();
             // `openshell.YYYY-MM-DD.log` only — the trailing dot in the prefix
-            // disambiguates from `openshell-ocsf.YYYY-MM-DD.log`.
+            // disambiguates from `openshell-ocsf.YYYY-MM-DD.jsonl`.
             if !name.starts_with(SHORTHAND_LOG_PREFIX) || !name.ends_with(".log") {
                 return None;
             }
