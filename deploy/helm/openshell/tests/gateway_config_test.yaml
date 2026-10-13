@@ -725,7 +725,7 @@ tests:
           path: data["gateway.toml"]
           pattern: 'image_pull_secrets\s*='
 
-  - it: renders allowed pod annotations for the Kubernetes driver
+  - it: renders allowed pod annotations and labels for the Kubernetes driver
     template: templates/gateway-config.yaml
     set:
       gatewayConfig:
@@ -733,17 +733,25 @@ tests:
           allowed_pod_annotations:
             - example.com/*
             - team.example.org/owner
+          allowed_pod_labels:
+            - app
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?allowed_pod_annotations\s*=\s*\[\s*"example\.com/\*",\s*"team\.example\.org/owner",?\s*\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?allowed_pod_labels\s*=\s*\[\s*"app",?\s*\]'
 
-  - it: omits allowed pod annotations by default
+  - it: omits allowed pod annotations and labels by default
     template: templates/gateway-config.yaml
     asserts:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: 'allowed_pod_annotations\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'allowed_pod_labels\s*='
 
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml

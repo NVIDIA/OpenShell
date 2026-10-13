@@ -272,6 +272,10 @@ pub struct KubernetesComputeConfig {
     /// identity under `openshell.ai`, and the Agent Sandbox controller owns
     /// `agents.x-k8s.io` and strips those keys from pod templates.
     pub allowed_pod_annotations: Vec<String>,
+    /// Pod label keys that sandbox templates may set, using the same entry
+    /// format and reserved domains as `allowed_pod_annotations`. Empty
+    /// (default) rejects every caller-supplied pod label.
+    pub allowed_pod_labels: Vec<String>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
     /// writes into each sandbox pod. Used only for the one-shot
     /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
@@ -374,6 +378,7 @@ impl Default for KubernetesComputeConfig {
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
+            allowed_pod_labels: Vec::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
@@ -390,58 +395,28 @@ impl KubernetesComputeConfig {
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
         self.validate_upstream_proxy_config()?;
-        self.validate_allowed_pod_annotations()
+        self.validate_allowed_pod_annotations()?;
+        self.validate_allowed_pod_labels()
     }
 
     pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {
-        for entry in &self.allowed_pod_annotations {
-            let key = entry.strip_suffix("/*").unwrap_or(entry);
-            let wildcard = key.len() != entry.len();
-            let (prefix, name) = match key.split_once('/') {
-                Some((prefix, name)) if !wildcard => (Some(prefix), Some(name)),
-                Some(_) => {
-                    return Err(format!(
-                        "allowed_pod_annotations entry {entry:?}: wildcard entries must be `<domain>/*`"
-                    ));
-                }
-                None if wildcard => (Some(key), None),
-                None => (None, Some(key)),
-            };
-            if let Some(prefix) = prefix
-                && !is_dns1123_subdomain(prefix)
-            {
-                return Err(format!(
-                    "allowed_pod_annotations entry {entry:?}: invalid key prefix {prefix:?}"
-                ));
-            }
-            if let Some(name) = name
-                && !is_annotation_name(name)
-            {
-                return Err(format!(
-                    "allowed_pod_annotations entry {entry:?}: invalid key name {name:?}"
-                ));
-            }
-            if prefix.is_some_and(is_reserved_annotation_domain) {
-                return Err(format!(
-                    "allowed_pod_annotations entry {entry:?}: domain is reserved for OpenShell and Agent Sandbox"
-                ));
-            }
-        }
-        Ok(())
+        validate_pod_metadata_allowlist("allowed_pod_annotations", &self.allowed_pod_annotations)
+    }
+
+    pub fn validate_allowed_pod_labels(&self) -> Result<(), String> {
+        validate_pod_metadata_allowlist("allowed_pod_labels", &self.allowed_pod_labels)
     }
 
     /// Whether a caller-supplied pod annotation key passes the operator allowlist.
     #[must_use]
     pub fn pod_annotation_allowed(&self, key: &str) -> bool {
-        let prefix = key.split_once('/').map(|(prefix, _)| prefix);
-        if prefix.is_some_and(is_reserved_annotation_domain) {
-            return false;
-        }
-        self.allowed_pod_annotations.iter().any(|entry| {
-            entry
-                .strip_suffix("/*")
-                .map_or_else(|| entry == key, |domain| prefix == Some(domain))
-        })
+        pod_metadata_key_allowed(&self.allowed_pod_annotations, key)
+    }
+
+    /// Whether a caller-supplied pod label key passes the operator allowlist.
+    #[must_use]
+    pub fn pod_label_allowed(&self, key: &str) -> bool {
+        pod_metadata_key_allowed(&self.allowed_pod_labels, key)
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
@@ -850,14 +825,67 @@ fn is_dns1123_subdomain(value: &str) -> bool {
         })
 }
 
-/// Annotation domains owned by `OpenShell` (sandbox identity such as
-/// `openshell.ai/sandbox-id`) and the Agent Sandbox controller (which strips
-/// them from pod templates). Sandbox templates can never set keys in these
-/// domains or their subdomains, regardless of `allowed_pod_annotations`.
-const RESERVED_POD_ANNOTATION_DOMAINS: &[&str] = &["openshell.ai", "agents.x-k8s.io"];
+/// Validate an `allowed_pod_annotations` or `allowed_pod_labels` list. Each
+/// entry is an exact qualified key or a `<domain>/*` wildcard outside the
+/// reserved domains.
+fn validate_pod_metadata_allowlist(field: &str, entries: &[String]) -> Result<(), String> {
+    for entry in entries {
+        let key = entry.strip_suffix("/*").unwrap_or(entry);
+        let wildcard = key.len() != entry.len();
+        let (prefix, name) = match key.split_once('/') {
+            Some((prefix, name)) if !wildcard => (Some(prefix), Some(name)),
+            Some(_) => {
+                return Err(format!(
+                    "{field} entry {entry:?}: wildcard entries must be `<domain>/*`"
+                ));
+            }
+            None if wildcard => (Some(key), None),
+            None => (None, Some(key)),
+        };
+        if let Some(prefix) = prefix
+            && !is_dns1123_subdomain(prefix)
+        {
+            return Err(format!(
+                "{field} entry {entry:?}: invalid key prefix {prefix:?}"
+            ));
+        }
+        if let Some(name) = name
+            && !is_qualified_name_segment(name)
+        {
+            return Err(format!(
+                "{field} entry {entry:?}: invalid key name {name:?}"
+            ));
+        }
+        if prefix.is_some_and(is_reserved_pod_metadata_domain) {
+            return Err(format!(
+                "{field} entry {entry:?}: domain is reserved for OpenShell and Agent Sandbox"
+            ));
+        }
+    }
+    Ok(())
+}
 
-fn is_reserved_annotation_domain(domain: &str) -> bool {
-    RESERVED_POD_ANNOTATION_DOMAINS.iter().any(|reserved| {
+fn pod_metadata_key_allowed(entries: &[String], key: &str) -> bool {
+    let prefix = key.split_once('/').map(|(prefix, _)| prefix);
+    if prefix.is_some_and(is_reserved_pod_metadata_domain) {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        entry
+            .strip_suffix("/*")
+            .map_or_else(|| entry == key, |domain| prefix == Some(domain))
+    })
+}
+
+/// Pod annotation and label domains owned by `OpenShell` (sandbox identity
+/// such as `openshell.ai/sandbox-id` and boundary labels) and the Agent
+/// Sandbox controller (which strips them from pod templates). Sandbox
+/// templates can never set keys in these domains or their subdomains,
+/// regardless of `allowed_pod_annotations` or `allowed_pod_labels`.
+const RESERVED_POD_METADATA_DOMAINS: &[&str] = &["openshell.ai", "agents.x-k8s.io"];
+
+fn is_reserved_pod_metadata_domain(domain: &str) -> bool {
+    RESERVED_POD_METADATA_DOMAINS.iter().any(|reserved| {
         domain == *reserved
             || domain
                 .strip_suffix(reserved)
@@ -867,7 +895,7 @@ fn is_reserved_annotation_domain(domain: &str) -> bool {
 
 /// Kubernetes qualified-name segment: at most 63 alphanumeric, `-`, `_`, or
 /// `.` characters, beginning and ending with an alphanumeric character.
-fn is_annotation_name(value: &str) -> bool {
+fn is_qualified_name_segment(value: &str) -> bool {
     let bytes = value.as_bytes();
     !bytes.is_empty()
         && bytes.len() <= 63
@@ -1102,6 +1130,28 @@ mod tests {
                 "{entry:?}"
             );
         }
+    }
+
+    #[test]
+    fn pod_label_allowlist_is_separate_from_annotation_allowlist() {
+        let cfg = KubernetesComputeConfig {
+            allowed_pod_annotations: vec!["annotations.example.com/*".into()],
+            allowed_pod_labels: vec!["app".into(), "labels.example.com/*".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.pod_label_allowed("app"));
+        assert!(cfg.pod_label_allowed("labels.example.com/team"));
+        assert!(!cfg.pod_label_allowed("annotations.example.com/team"));
+        assert!(!cfg.pod_annotation_allowed("labels.example.com/team"));
+        assert!(!KubernetesComputeConfig::default().pod_label_allowed("app"));
+
+        let cfg = KubernetesComputeConfig {
+            allowed_pod_labels: vec!["openshell.ai/managed-by".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(!cfg.pod_label_allowed("openshell.ai/managed-by"));
+        let err = cfg.validate_allowed_pod_labels().unwrap_err();
+        assert!(err.starts_with("allowed_pod_labels entry"), "{err}");
     }
 
     #[test]

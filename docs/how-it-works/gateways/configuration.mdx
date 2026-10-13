@@ -867,6 +867,11 @@ workspace_default_storage_size = "10Gi"
 # subdomains, are reserved: templates cannot set them and the allowlist
 # cannot include them.
 # allowed_pod_annotations      = ["example.com/*", "team.example.org/owner"]
+# Pod label keys that sandbox templates may set, in the same format and with
+# the same reserved domains. Empty (default) rejects every template label.
+# Labels select pods for NetworkPolicy rules and Services, so only allow keys
+# that no other rule in the sandbox namespace selects on.
+# allowed_pod_labels           = ["app", "team.example.org/*"]
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic
