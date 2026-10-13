@@ -154,6 +154,10 @@ for await (const item of client.sandbox.watchLogs(sandbox.name, { followLogs: tr
 }
 ```
 
+When a resume cursor has expired, `watchLogs` stops with an `SdkError` whose
+`code` is `rpc` and whose `connectCode` is `Code.OutOfRange`. To accept the missing
+events, start a new watch with an empty `resumeAfterCursor`.
+
 See [Accessing Logs](/observability/accessing-logs) for the cursor and resume
 contract this method implements.
 

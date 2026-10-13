@@ -819,7 +819,7 @@ export function __setWatchLogsBackoffSleepForTests(
 }
 
 // Only Unavailable (connection drop, gateway restart) is retryable. Every
-// other status — including out_of_range — is terminal so the caller sees it
+// other status — including OUT_OF_RANGE — is terminal so the caller sees it
 // instead of the loop silently restarting from an empty cursor and hiding a gap.
 function isRetryableWatchLogsError(err: SdkError): boolean {
   return err.connectCode === Code.Unavailable;
@@ -1451,8 +1451,8 @@ export class SandboxClient {
    * highest cursor already delivered. A recoverable server-side lag surfaces
    * as a `{ kind: 'warning' }` item and the stream continues.
    *
-   * An `out_of_range` `SdkError` is terminal and deliberately not retried: it
-   * means the resume point is gone (trimmed from the buffer, or issued by a
+   * An `SdkError` with `connectCode === Code.OutOfRange` is terminal and not
+   * retried: the resume point is gone (trimmed from the buffer, or issued by a
    * cursor space the gateway no longer has), so events between it and now are
    * unrecoverable. Auto-restarting from scratch would hide that loss, which is
    * exactly what this method exists to surface. Callers who accept the gap can

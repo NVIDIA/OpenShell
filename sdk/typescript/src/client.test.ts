@@ -652,7 +652,7 @@ describe('watchLogs', () => {
           // drain
         }
       })(),
-    ).rejects.toMatchObject({ code: 'out_of_range' });
+    ).rejects.toMatchObject({ code: 'rpc', connectCode: Code.OutOfRange });
     expect(calls).toBe(1);
   });
 
