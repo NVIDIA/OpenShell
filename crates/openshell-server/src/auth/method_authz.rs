@@ -24,6 +24,8 @@ pub enum AuthMode {
     Dual,
     /// Only callable by a gateway peer principal.
     Peer,
+    /// Only a verified mTLS operator may call this method.
+    Operator,
 }
 
 /// Coarse role mapping. Maps to the configured `admin_role` /
@@ -88,9 +90,20 @@ pub fn is_sandbox_callable(method: &str) -> bool {
 #[must_use]
 pub fn is_user_callable(method: &str) -> bool {
     match lookup(method).map(|m| m.auth_mode) {
-        Some(AuthMode::Sandbox | AuthMode::Unauthenticated | AuthMode::Peer) => false,
+        Some(
+            AuthMode::Sandbox | AuthMode::Unauthenticated | AuthMode::Peer | AuthMode::Operator,
+        ) => false,
         Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
     }
+}
+
+/// Operators have user/admin capabilities, but not supervisor or peer identities.
+#[must_use]
+pub fn is_operator_callable(method: &str) -> bool {
+    matches!(
+        lookup(method).map(|entry| entry.auth_mode),
+        Some(AuthMode::Operator | AuthMode::Bearer | AuthMode::Dual)
+    )
 }
 
 /// `true` if the method is callable by a gateway peer.

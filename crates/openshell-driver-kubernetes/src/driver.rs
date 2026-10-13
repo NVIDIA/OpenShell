@@ -683,6 +683,23 @@ const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
+/// Build a Kubernetes client whose requests time out after `request_timeout`.
+///
+/// kube's `read_timeout` counts the time a pooled connection spent idle, so a
+/// request that reuses a connection idle for nearly that long fails with
+/// `SendRequest` before the API server can answer. A per-request timeout
+/// starts when the request is sent instead.
+fn kubernetes_request_client(
+    mut config: kube::Config,
+    request_timeout: Duration,
+) -> Result<Client, KubernetesDriverError> {
+    config.read_timeout = None;
+    Ok(kube::client::ClientBuilder::try_from(config)
+        .map_err(KubernetesDriverError::from_kube)?
+        .with_layer(&tower::timeout::TimeoutLayer::new(request_timeout))
+        .build())
+}
+
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
     client: Client,
@@ -775,9 +792,8 @@ impl KubernetesComputeDriver {
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
-        kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
+        let client = kubernetes_request_client(kube_config, KUBE_API_TIMEOUT)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
@@ -2314,7 +2330,7 @@ impl KubernetesComputeDriver {
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .find(|container| container.name == "openshell-sandbox-bootstrap")
+            .find(|container| container.name == SANDBOX_BOOTSTRAP_CONTAINER_NAME)
             .ok_or_else(|| fail("trusted bootstrap init container missing"))?;
         check_container(bootstrap, "bootstrap init container")?;
         let mounts_volume = |container: &k8s_openapi::api::core::v1::Container,
@@ -3222,6 +3238,21 @@ impl KubernetesComputeDriver {
         })?;
         let (agent_uid, agent_gid, _) =
             self.resolve_sandbox_identity_in_namespace(&namespace).await;
+        let mut init_containers = object
+            .data
+            .pointer("/spec/podTemplate/spec/initContainers")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        replace_sandbox_bootstrap_init_container(
+            &mut init_containers,
+            sandbox_bootstrap_init_container(
+                &self.config.sandbox_runtime_image,
+                self.config.sandbox_runtime_image_pull_policy,
+                agent_uid,
+                agent_gid,
+            ),
+        )?;
         let supervisor = pods
             .create(
                 &PostParams::default(),
@@ -3312,8 +3343,11 @@ impl KubernetesComputeDriver {
                         ANNOTATION_SANDBOX_RUNTIME_GENERATION: generation.as_str(),
                         ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: supervisor_uid.clone(),
                     });
-                    running_patch["spec"]["podTemplate"]["spec"] =
-                        restart_pod_template_spec(&volumes, &image_pull_secrets);
+                    running_patch["spec"]["podTemplate"]["spec"] = restart_pod_template_spec(
+                        &volumes,
+                        &init_containers,
+                        &image_pull_secrets,
+                    );
                     running_patch
                 },
             )
@@ -4924,12 +4958,35 @@ fn runtime_pod_owner(name: &str, uid: &str) -> OwnerReference {
 /// generation.
 fn restart_pod_template_spec(
     volumes: &[serde_json::Value],
+    init_containers: &[serde_json::Value],
     image_pull_secrets: &[String],
 ) -> serde_json::Value {
     serde_json::json!({
         "volumes": volumes,
+        "initContainers": init_containers,
         "imagePullSecrets": image_pull_secret_refs(image_pull_secrets),
     })
+}
+
+/// Replace the stored trusted bootstrap init container in place. Entry order
+/// must not change because `workspace-init` runs the binary it stages.
+fn replace_sandbox_bootstrap_init_container(
+    init_containers: &mut [serde_json::Value],
+    bootstrap: serde_json::Value,
+) -> Result<(), KubernetesDriverError> {
+    let stored = init_containers
+        .iter_mut()
+        .find(|container| {
+            container.get("name").and_then(serde_json::Value::as_str)
+                == Some(SANDBOX_BOOTSTRAP_CONTAINER_NAME)
+        })
+        .ok_or_else(|| {
+            KubernetesDriverError::Precondition(
+                "Sandbox pod template is missing its trusted bootstrap init container".to_string(),
+            )
+        })?;
+    *stored = bootstrap;
+    Ok(())
 }
 
 fn sandbox_annotations(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -5745,6 +5802,7 @@ fn extract_image_size(message: &str) -> Option<u64> {
 const SANDBOX_RUNTIME_VOLUME_NAME: &str = "openshell-runtime";
 const SANDBOX_STATE_VOLUME_NAME: &str = "openshell-runtime-state";
 const SANDBOX_BOOTSTRAP_VOLUME_NAME: &str = "openshell-sandbox-bootstrap";
+const SANDBOX_BOOTSTRAP_CONTAINER_NAME: &str = "openshell-sandbox-bootstrap";
 const SANDBOX_POD_IDENTITY_VOLUME_NAME: &str = "openshell-pod-identity";
 const SANDBOX_RUNTIME_MOUNT_PATH: &str = "/.openshell/runtime";
 const SANDBOX_STATE_MOUNT_PATH: &str = "/.openshell/state";
@@ -5761,6 +5819,37 @@ fn sandbox_bootstrap_secret_name(spec: &serde_json::Value) -> Option<&str> {
         .find(|volume| volume["name"] == SANDBOX_BOOTSTRAP_VOLUME_NAME)?["secret"]["secretName"]
         .as_str()
         .filter(|name| !name.is_empty())
+}
+
+/// Render the trusted init container that stages the sandbox runtime binary.
+fn sandbox_bootstrap_init_container(
+    image: &str,
+    pull_policy: Option<crate::KubernetesImagePullPolicy>,
+    uid: u32,
+    gid: u32,
+) -> serde_json::Value {
+    let mut bootstrap = serde_json::json!({
+        "name": SANDBOX_BOOTSTRAP_CONTAINER_NAME,
+        "image": image,
+        "command": ["/openshell-sandbox", "bootstrap"],
+        "securityContext": {
+            "runAsUser": uid,
+            "runAsGroup": gid,
+            "runAsNonRoot": true,
+            "readOnlyRootFilesystem": true,
+            "allowPrivilegeEscalation": false,
+            "capabilities": {"drop": ["ALL"]}
+        },
+        "volumeMounts": [
+            {"name": SANDBOX_BOOTSTRAP_VOLUME_NAME, "mountPath": crate::sandbox_runtime::SANDBOX_BOOTSTRAP_INPUT_PATH, "readOnly": true},
+            {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH},
+            {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
+        ]
+    });
+    if let Some(policy) = pull_policy {
+        bootstrap["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
+    }
+    bootstrap
 }
 
 /// Render the workload Pod that runs the `OpenShell` sandbox runtime.
@@ -5882,28 +5971,12 @@ fn apply_supervisor_sandbox_runtime_boundary(
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .expect("pod init containers must be an array");
-    let mut bootstrap = serde_json::json!({
-        "name": "openshell-sandbox-bootstrap",
-        "image": params.sandbox_runtime_image,
-        "command": ["/openshell-sandbox", "bootstrap"],
-        "securityContext": {
-            "runAsUser": params.sandbox_uid,
-            "runAsGroup": params.sandbox_gid,
-            "runAsNonRoot": true,
-            "readOnlyRootFilesystem": true,
-            "allowPrivilegeEscalation": false,
-            "capabilities": {"drop": ["ALL"]}
-        },
-        "volumeMounts": [
-            {"name": SANDBOX_BOOTSTRAP_VOLUME_NAME, "mountPath": crate::sandbox_runtime::SANDBOX_BOOTSTRAP_INPUT_PATH, "readOnly": true},
-            {"name": SANDBOX_RUNTIME_VOLUME_NAME, "mountPath": SANDBOX_RUNTIME_MOUNT_PATH},
-            {"name": SANDBOX_STATE_VOLUME_NAME, "mountPath": SANDBOX_STATE_MOUNT_PATH}
-        ]
-    });
-    if let Some(policy) = params.sandbox_runtime_image_pull_policy {
-        bootstrap["imagePullPolicy"] = serde_json::json!(policy.as_kubernetes_str());
-    }
-    init_containers.push(bootstrap);
+    init_containers.push(sandbox_bootstrap_init_container(
+        params.sandbox_runtime_image,
+        params.sandbox_runtime_image_pull_policy,
+        params.sandbox_uid,
+        params.sandbox_gid,
+    ));
 
     let containers = spec
         .get_mut("containers")
@@ -7424,6 +7497,56 @@ fn spawn_namespace_file_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve Pod GETs over one reusable HTTP/1 connection per client,
+    /// delaying a request for Pod `slow-<millis>` by that many milliseconds.
+    async fn serve_delayed_pods() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(hyper::server::conn::http1::Builder::new().serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(|request: http::Request<_>| async move {
+                        let delay = request
+                            .uri()
+                            .path()
+                            .rsplit_once("/slow-")
+                            .and_then(|(_, millis)| millis.parse().ok())
+                            .map_or(Duration::ZERO, Duration::from_millis);
+                        tokio::time::sleep(delay).await;
+                        Ok::<_, std::convert::Infallible>(http::Response::new(
+                            http_body_util::Full::new(bytes::Bytes::from_static(
+                                br#"{"apiVersion":"v1","kind":"Pod","metadata":{"name":"pod"}}"#,
+                            )),
+                        ))
+                    }),
+                ));
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn request_timeout_ignores_pooled_connection_idle_time() {
+        let addr = serve_delayed_pods().await;
+        let config = kube::Config::new(format!("http://{addr}").parse().unwrap());
+        let client = kubernetes_request_client(config, Duration::from_secs(1)).unwrap();
+        let pods = Api::<Pod>::namespaced(client, "default");
+
+        pods.get("warm").await.unwrap();
+        // With a connection-level read timeout, 800ms of idle time would leave
+        // this 500ms request only 200ms on the reused connection.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        pods.get("slow-500").await.unwrap();
+
+        let error = pods.get("slow-1500").await.unwrap_err();
+        assert!(
+            matches!(&error, KubeError::Service(source) if source.is::<tower::timeout::error::Elapsed>()),
+            "expected request timeout, got {error:?}"
+        );
+    }
 
     #[tokio::test]
     async fn admission_defaults_reject_driver_config_before_kubernetes_io_in_every_mode() {
@@ -11541,12 +11664,32 @@ mod tests {
     #[test]
     fn restart_template_references_the_generation_image_pull_secrets() {
         let volumes = vec![serde_json::json!({"name": "bootstrap"})];
-        let spec = restart_pod_template_spec(&volumes, &["os-pull-sandbox-1-gen7-0".to_string()]);
+        let init_containers = vec![serde_json::json!({"name": SANDBOX_BOOTSTRAP_CONTAINER_NAME})];
+        let spec = restart_pod_template_spec(
+            &volumes,
+            &init_containers,
+            &["os-pull-sandbox-1-gen7-0".to_string()],
+        );
         assert_eq!(spec["volumes"], serde_json::json!(volumes));
+        assert_eq!(spec["initContainers"], serde_json::json!(init_containers));
         assert_eq!(
             spec["imagePullSecrets"],
             serde_json::json!([{"name": "os-pull-sandbox-1-gen7-0"}])
         );
+    }
+
+    #[test]
+    fn restart_rerenders_stored_bootstrap_init_container() {
+        let workspace_init = serde_json::json!({"name": WORKSPACE_INIT_CONTAINER_NAME});
+        let mut init_containers = vec![
+            serde_json::json!({"name": "openshell-sandbox-bootstrap", "image": "sandbox:0.1.2"}),
+            workspace_init.clone(),
+        ];
+        let bootstrap = sandbox_bootstrap_init_container("sandbox:0.1.3", None, 1500, 1500);
+
+        replace_sandbox_bootstrap_init_container(&mut init_containers, bootstrap.clone()).unwrap();
+
+        assert_eq!(init_containers, vec![bootstrap, workspace_init]);
     }
 
     #[tokio::test]

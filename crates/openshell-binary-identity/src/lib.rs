@@ -121,14 +121,23 @@ fn resolve_linux_process(
             paths
         });
 
-    let (executable_identity, pending_cache_entry) =
-        resolve_open_executable(&snapshot, &mut executable, cache)?;
-    let mut pending_cache_entries = pending_cache_entry.into_iter().collect::<Vec<_>>();
+    // Digests computed during this call. They reach the shared cache only after
+    // every snapshot validates, but later processes in the chain reuse them.
+    let mut pending_cache_entries = HashMap::new();
+    let executable_identity = resolve_open_executable(
+        &snapshot,
+        &mut executable,
+        cache,
+        &mut pending_cache_entries,
+    )?;
     let mut ancestors = Vec::with_capacity(ancestor_processes.len());
     for (ancestor, executable) in &mut ancestor_processes {
-        let (identity, pending_cache_entry) = resolve_open_executable(ancestor, executable, cache)?;
-        ancestors.push(identity);
-        pending_cache_entries.extend(pending_cache_entry);
+        ancestors.push(resolve_open_executable(
+            ancestor,
+            executable,
+            cache,
+            &mut pending_cache_entries,
+        )?);
     }
 
     validate_process_snapshot(pid, &snapshot)?;
@@ -151,23 +160,21 @@ fn resolve_open_executable(
     snapshot: &ProcessSnapshot,
     executable: &mut std::fs::File,
     cache: &Mutex<HashMap<ExecutableCacheKey, Sha256Digest>>,
-) -> Result<
-    (
-        ExecutableIdentity,
-        Option<(ExecutableCacheKey, Sha256Digest)>,
-    ),
-    ResolveError,
-> {
+    pending: &mut HashMap<ExecutableCacheKey, Sha256Digest>,
+) -> Result<ExecutableIdentity, ResolveError> {
     let key = snapshot.executable_cache_key();
-    let cached_digest = cached_executable_digest(cache, key);
-    let digest = cached_digest.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
-    Ok((
-        ExecutableIdentity {
-            path: snapshot.binary_path.clone(),
-            digest: Some(digest),
-        },
-        cached_digest.is_none().then_some((key, digest)),
-    ))
+    let known = pending
+        .get(&key)
+        .copied()
+        .or_else(|| cached_executable_digest(cache, key));
+    let digest = known.map_or_else(|| hash_executable(snapshot.pid, executable), Ok)?;
+    if known.is_none() {
+        pending.insert(key, digest);
+    }
+    Ok(ExecutableIdentity {
+        path: snapshot.binary_path.clone(),
+        digest: Some(digest),
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -543,6 +550,27 @@ mod tests {
         let parent = identity.ancestors.last().expect("process-tree root");
         assert_eq!(parent.path, std::env::current_exe().unwrap());
         assert!(parent.digest.is_some());
+    }
+
+    #[test]
+    fn executable_is_hashed_once_per_resolution() {
+        let pid = std::process::id();
+        let (snapshot, mut executable) = open_process_snapshot(pid).unwrap();
+        let cache = Mutex::new(HashMap::new());
+        let mut pending = HashMap::new();
+
+        let hashed =
+            resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // A sentinel proves a pending digest is reused instead of rehashed.
+        let sentinel: Sha256Digest = "ab".repeat(32).parse().unwrap();
+        assert_ne!(hashed.digest, Some(sentinel));
+        pending.insert(snapshot.executable_cache_key(), sentinel);
+        let reused =
+            resolve_open_executable(&snapshot, &mut executable, &cache, &mut pending).unwrap();
+        assert_eq!(reused.digest, Some(sentinel));
+        assert!(cache.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -161,6 +161,24 @@ Profile-backed providers always contribute policy unless a gateway-global
 policy is active. Static credential endpoint binding remains independently
 enforced.
 
+### Label and select providers
+
+Attach labels during provider creation with repeatable `--label KEY=VALUE`
+flags. Labels work with each credential source. List selectors require every
+comma-separated key-value pair to match and apply before pagination.
+
+```shell
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+openshell provider list --label-selector env=dev,team=ml
+openshell provider list --all-workspaces --label-selector team=ml --output json
+openshell provider get public-pypi
+```
+
+Use an imported profile, such as `pypi` in this example. `get` displays labels;
+structured list output includes them. `--all-workspaces` requires Platform
+Admin access. Preserve the selector and workspace scope when passing the next
+`--page-token`. Labels cannot be changed or removed after provider creation.
+
 ### Inspect and manage provider profiles
 
 ```shell
@@ -195,6 +213,8 @@ openshell provider delete my-github
 ```
 
 `provider update` does not take `--type`. It updates credentials, config, or credential expiry on the existing provider.
+
+For an external updater whose workload must retain its original environment reference, use a credential profile with `stable_placeholder: true` and a gateway and supervisor that support that mode. The CLI checks gateway support before importing or updating the opt-in. The default remains `false`, preserving existing revision-scoped behavior and ordinary legacy gateway operation. Preserve the supervisor-issued value; never manufacture a placeholder. After the supervisor installs a value-only update, the retained reference resolves the current credential only at its effective host, port, and path binding. Replacement, expiry, changed binding, or an activated detach prevents old authority from resolving. Remove the opt-in and activate that change before downgrading the gateway. See the provider profiles documentation for the lifecycle contract and its separation from gateway-managed refresh and `token_grant`.
 
 ### Configure credential refresh
 
@@ -242,12 +262,22 @@ When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
 `LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
 user must obtain a new OAuth grant and run `provider refresh configure`,
 `fix_configuration` means an operator must repair the OAuth client, scopes, or
-administrator policy, and `investigate` means the issuer returned an
-unrecognized response. The gateway parks `reauthorize` records until a manual
-rotate or reconfiguration. It retries
+administrator policy, and `investigate` can mean an unrecognized issuer
+response or an interrupted mint with an uncertain outcome. The gateway parks
+`reauthorize` records until a manual rotate or reconfiguration. It retries
 `fix_configuration` records hourly so externally repaired configuration can
 recover without rapid token-endpoint traffic. The existing access credential
 remains usable only until its recorded expiry.
+
+`refresh_in_progress` and `refresh_committing` can indicate active work. Check
+gateway health and refresh status again before treating them as failures;
+concurrent refresh requests wait for the active mint. If a gateway interruption
+leaves either marker behind and rotation reports an uncertain previous mint,
+the gateway will not reuse the grant automatically. Investigate the issuer state,
+then run `provider refresh configure` with a valid grant. Obtain a new OAuth
+grant first if the previous refresh token may have been consumed. Do not clear
+the marker directly or repeatedly rotate it; reconfiguration revokes old
+workload handles, so restart processes holding them.
 
 ---
 
@@ -397,6 +427,8 @@ openshell sandbox upload my-sandbox ./src
 # Download a path relative to the sandbox working directory
 openshell sandbox download my-sandbox output ./local-output
 ```
+
+Uploads use bounded streaming and wait for sandbox input consumption; the 4 MiB process-input budget is not a total upload-size limit. Upgrade both the CLI and the supervisor runtime used by the sandbox. An older supervisor rejects the upload protocol before file data is sent. Failed or canceled uploads may leave incomplete files in the destination; check it before retrying or remove the partial files.
 
 Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
 
@@ -673,6 +705,8 @@ openshell rule history dev
 
 Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
 
+`validation unavailable` blocks approval until the gateway can analyze both the current and proposed policies. It is not an accepted-risk finding.
+
 ---
 
 ## Workflow 5: BYOC (Bring Your Own Container)
@@ -869,6 +903,8 @@ openshell settings set --global --key ocsf_json_enabled --value true
 # OCSF schema version downgrade for SIEM compatibility (allowed: "1.1", "1.3")
 openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
+
+Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.
 
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 

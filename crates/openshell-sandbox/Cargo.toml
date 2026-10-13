@@ -50,7 +50,7 @@ clap = { workspace = true }
 miette = { workspace = true }
 
 # Unix identity and bootstrap ownership
-nix = { workspace = true }
+nix = { workspace = true, features = ["resource", "socket", "feature", "poll"] }
 
 # TLS crypto provider install (main.rs)
 rustls = { workspace = true }
@@ -68,14 +68,14 @@ tracing-subscriber = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-rustix = { workspace = true }
+rustix = { workspace = true, features = ["termios", "fs", "process", "net", "event"] }
 russh-sftp = "3.0"
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
-socket2 = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
 tempfile = "3"
 
 [dev-dependencies]

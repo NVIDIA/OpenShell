@@ -7,6 +7,7 @@ mod auth_rpc;
 pub mod mutation_replay;
 pub mod policy;
 pub mod provider;
+mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
 pub use sandbox::mint_persisted_authentication;
@@ -503,6 +504,13 @@ impl OpenShell for OpenShellService {
         request: Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         mutation_replay::run(&self.state, request).await
+    }
+
+    async fn get_provider_credentials(
+        &self,
+        request: Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        provider_credentials::handle(&self.state, request).await
     }
 
     async fn get_provider(

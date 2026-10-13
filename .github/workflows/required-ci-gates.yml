@@ -280,5 +280,8 @@ jobs:
           if [ "$CONTEXT_KIND" != "merge_group" ]; then
             evaluate_workflow "OpenShell / E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e" "Core E2E result"
             evaluate_workflow "OpenShell / GPU E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e-gpu" "GPU E2E result"
+          else
+            post_status "OpenShell / E2E" success "Not applicable: E2E runs only on PRs" "$STATUS_TARGET_URL"
+            post_status "OpenShell / GPU E2E" success "Not applicable: GPU E2E runs only on PRs" "$STATUS_TARGET_URL"
           fi
           evaluate_workflow "OpenShell / Helm Lint" "helm-lint.yml" "Helm Lint"

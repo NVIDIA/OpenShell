@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use openshell_isolation_interface::contract::BoundaryInput;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 
 /// Includes queued bytes and the chunk currently being written. Consumed bytes
@@ -28,6 +28,22 @@ struct Buffer {
 struct Shared {
     buffer: Mutex<Buffer>,
     ready: Notify,
+    progress: Option<watch::Sender<InputProgress>>,
+}
+
+/// A watch keeps only the newest consumed offset even when SSH output stalls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct InputProgress {
+    pub(super) consumed: u64,
+    pub(super) state: InputState,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum InputState {
+    #[default]
+    Writing,
+    Drained,
+    Failed,
 }
 
 pub(super) struct InputSender(Arc<Shared>);
@@ -73,8 +89,30 @@ pub(super) struct InputTask {
 
 impl InputTask {
     pub(super) fn spawn(stdin: BoundaryInput) -> (InputSender, Self) {
-        let shared = Arc::new(Shared::default());
-        let receiver = Receiver(shared.clone());
+        Self::spawn_inner(stdin, None)
+    }
+
+    pub(super) fn spawn_with_progress(
+        stdin: BoundaryInput,
+    ) -> (InputSender, Self, watch::Receiver<InputProgress>) {
+        let (progress, receiver) = watch::channel(InputProgress::default());
+        let (sender, task) = Self::spawn_inner(stdin, Some(progress));
+        (sender, task, receiver)
+    }
+
+    fn spawn_inner(
+        stdin: BoundaryInput,
+        progress: Option<watch::Sender<InputProgress>>,
+    ) -> (InputSender, Self) {
+        let shared = Arc::new(Shared {
+            progress,
+            ..Shared::default()
+        });
+        let receiver = Receiver {
+            shared: shared.clone(),
+            consumed: 0,
+            finished: false,
+        };
         let task = tokio::spawn(receiver.write_to(stdin));
         (InputSender(shared.clone()), Self { shared, task })
     }
@@ -96,15 +134,28 @@ impl Drop for InputTask {
     }
 }
 
-struct Receiver(Arc<Shared>);
+struct Receiver {
+    shared: Arc<Shared>,
+    consumed: u64,
+    finished: bool,
+}
 
 impl Receiver {
-    async fn write_to(self, mut stdin: BoundaryInput) {
+    fn publish(&self, state: InputState) {
+        if let Some(progress) = &self.shared.progress {
+            progress.send_replace(InputProgress {
+                consumed: self.consumed,
+                state,
+            });
+        }
+    }
+
+    async fn write_to(mut self, mut stdin: BoundaryInput) {
         loop {
-            let ready = self.0.ready.notified();
+            let ready = self.shared.ready.notified();
             let chunk = {
-                let Ok(mut buffer) = self.0.buffer.lock() else {
-                    break;
+                let Ok(mut buffer) = self.shared.buffer.lock() else {
+                    return;
                 };
                 if buffer.bytes.is_empty() && buffer.closed {
                     break;
@@ -118,12 +169,22 @@ impl Receiver {
                 continue;
             }
             if stdin.write_all(&chunk).await.is_err() {
-                break;
+                return;
             }
-            let Ok(mut buffer) = self.0.buffer.lock() else {
-                break;
-            };
-            buffer.in_flight = 0;
+            {
+                let Ok(mut buffer) = self.shared.buffer.lock() else {
+                    return;
+                };
+                buffer.in_flight = 0;
+            }
+            self.consumed += chunk.len() as u64;
+            self.publish(InputState::Writing);
+        }
+        // Ordinary exec retains its existing drop-to-close behavior. Upload
+        // needs an explicit shutdown result before claiming the drain complete.
+        if self.shared.progress.is_none() || stdin.shutdown().await.is_ok() {
+            self.finished = true;
+            self.publish(InputState::Drained);
         }
     }
 }
@@ -132,10 +193,13 @@ impl Drop for Receiver {
     fn drop(&mut self) {
         // A failed or cancelled writer must refuse later input and release the
         // queue even if the SSH channel has not yet received a close packet.
-        if let Ok(mut buffer) = self.0.buffer.lock() {
+        if let Ok(mut buffer) = self.shared.buffer.lock() {
             buffer.closed = true;
             buffer.in_flight = 0;
             buffer.bytes = VecDeque::new();
+        }
+        if !self.finished {
+            self.publish(InputState::Failed);
         }
     }
 }
@@ -181,5 +245,80 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(received, vec![42; 8192]);
+    }
+
+    #[tokio::test]
+    async fn progress_is_earned_after_complete_writes_and_reports_drain() {
+        let (stdin, mut reader) = tokio::io::duplex(1);
+        let (sender, _task, mut progress) = InputTask::spawn_with_progress(Box::new(stdin));
+        sender.send(&vec![42; WRITE_CHUNK]).unwrap();
+        reader.read_u8().await.unwrap();
+        assert_eq!(progress.borrow().consumed, 0);
+        drop(sender);
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, vec![42; WRITE_CHUNK - 1]);
+        progress
+            .wait_for(|progress| progress.state == InputState::Drained)
+            .await
+            .unwrap();
+        assert_eq!(progress.borrow().consumed, WRITE_CHUNK as u64);
+    }
+
+    #[tokio::test]
+    async fn failed_writer_publishes_terminal_state_and_refuses_input() {
+        let (stdin, reader) = tokio::io::duplex(1);
+        let (sender, _task, mut progress) = InputTask::spawn_with_progress(Box::new(stdin));
+        drop(reader);
+        sender.send(b"write fails").unwrap();
+        progress
+            .wait_for(|progress| progress.state == InputState::Failed)
+            .await
+            .unwrap();
+        assert_eq!(progress.borrow().consumed, 0);
+        assert_eq!(sender.send(b"later input"), Err(SendError::Closed));
+    }
+
+    #[tokio::test]
+    async fn shutdown_failure_preserves_consumption_without_claiming_drain() {
+        struct ShutdownFails(tokio::io::DuplexStream);
+
+        impl tokio::io::AsyncWrite for ShutdownFails {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                bytes: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::pin::Pin::new(&mut self.0).poll_write(cx, bytes)
+            }
+
+            fn poll_flush(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.0).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::other("shutdown failed")))
+            }
+        }
+
+        let (stdin, mut reader) = tokio::io::duplex(1024);
+        let (sender, _task, mut progress) =
+            InputTask::spawn_with_progress(Box::new(ShutdownFails(stdin)));
+        sender.send(b"consumed before shutdown").unwrap();
+        drop(sender);
+        let mut received = Vec::new();
+        reader.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"consumed before shutdown");
+        progress
+            .wait_for(|progress| progress.state == InputState::Failed)
+            .await
+            .unwrap();
+        assert_eq!(progress.borrow().consumed, received.len() as u64);
     }
 }

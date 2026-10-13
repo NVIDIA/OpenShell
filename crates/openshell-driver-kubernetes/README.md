@@ -104,8 +104,10 @@ the anchor stays in the gateway's trust domain rather than the sandbox
 namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
 supervisor Pod, and shared network-policy identities. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
-Pod before releasing a new workload Pod. The shared network fence remains for
-the lifetime of the namespace.
+Pod before releasing a new workload Pod. It also renders the trusted init
+container again from gateway config, so a sandbox created by an older gateway
+starts with the current sandbox runtime image. The shared network fence
+remains for the lifetime of the namespace.
 
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
@@ -124,7 +126,9 @@ state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
-indefinitely when the API server is slow or unavailable. Resource and Event
+indefinitely when the API server is slow or unavailable. The request client's
+timeout starts when each request is sent, so time a pooled connection spends
+idle does not shorten it. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
 

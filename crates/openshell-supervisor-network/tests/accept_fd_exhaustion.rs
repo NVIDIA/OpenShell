@@ -15,7 +15,6 @@
 //! limits are not affected.
 
 #![cfg(unix)]
-#![allow(unsafe_code, reason = "setrlimit requires unsafe")]
 
 use std::env;
 use std::io::Read;
@@ -49,14 +48,14 @@ fn accept_fd_exhaustion_child() {
         return;
     }
 
-    let limit = libc::rlimit {
-        rlim_cur: 32,
-        rlim_max: 32,
-    };
-    assert_eq!(
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, std::ptr::from_ref(&limit)) },
-        0,
-    );
+    rustix::process::setrlimit(
+        rustix::process::Resource::Nofile,
+        rustix::process::Rlimit {
+            current: Some(32),
+            maximum: Some(32),
+        },
+    )
+    .expect("setrlimit");
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();

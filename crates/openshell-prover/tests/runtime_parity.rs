@@ -36,6 +36,19 @@ fn runtime_engine_with_identity(policy: &str, require_binary_identity: bool) -> 
     );
 
     let mut engine = Engine::new();
+    // The runtime registers this native builtin for endpoint selectors only.
+    engine
+        .add_extension(
+            "openshell.endpoint_path_matches".into(),
+            2,
+            Box::new(|params: Vec<Value>| {
+                Ok(Value::from(openshell_core::endpoint_path::matches(
+                    params[0].as_string()?,
+                    params[1].as_string()?,
+                )))
+            }),
+        )
+        .expect("runtime endpoint path matcher should register");
     engine
         .add_policy("sandbox-policy.rego".into(), SANDBOX_POLICY_REGO.into())
         .expect("runtime Rego should compile");
@@ -46,6 +59,16 @@ fn runtime_engine_with_identity(policy: &str, require_binary_identity: bool) -> 
 }
 
 fn runtime_input(binary: &str, ancestors: &[&str], host: &str, method: &str) -> Value {
+    runtime_input_with_path(binary, ancestors, host, method, "/")
+}
+
+fn runtime_input_with_path(
+    binary: &str,
+    ancestors: &[&str],
+    host: &str,
+    method: &str,
+    path: &str,
+) -> Value {
     serde_json::from_value(json!({
         "exec": {
             "path": binary,
@@ -58,7 +81,7 @@ fn runtime_input(binary: &str, ancestors: &[&str], host: &str, method: &str) -> 
         },
         "request": {
             "method": method,
-            "path": "/",
+            "path": path,
             "query_params": {},
         },
     }))
@@ -82,6 +105,133 @@ fn eval_array_len(engine: &mut Engine, input: &Value, rule: &str) -> usize {
         Value::Array(values) => values.len(),
         Value::Undefined => 0,
         value => panic!("expected array from {rule}, got {value:?}"),
+    }
+}
+
+fn endpoint_path_policy(selector: &str, rule_path: &str) -> String {
+    json!({
+        "version": 1,
+        "network_policies": {"egress": {
+            "binaries": [{"path": "/usr/bin/curl"}],
+            "endpoints": [{
+                "host": "api.example.com", "ports": [443],
+                "protocol": "rest", "enforcement": "enforce", "path": selector,
+                "rules": [{"allow": {"method": "GET", "path": rule_path}}]
+            }]
+        }}
+    })
+    .to_string()
+}
+
+fn assert_runtime_path_expansion_replays(boundary: &str, candidate: &str, path: &str) {
+    let input = runtime_input_with_path("/usr/bin/curl", &[], "api.example.com", "GET", path);
+    assert!(eval_bool(
+        &mut runtime_engine(candidate),
+        &input,
+        "data.openshell.sandbox.allow_request"
+    ));
+    assert!(!eval_bool(
+        &mut runtime_engine(boundary),
+        &input,
+        "data.openshell.sandbox.allow_request"
+    ));
+
+    let result = check(boundary, candidate);
+    let CheckResult::Exceeds(evidence) = result else {
+        panic!("runtime expansion must exceed the boundary: {result:?}");
+    };
+    let Counterexample::Network {
+        binary,
+        ancestor_binary,
+        binary_identity_required,
+        host,
+        port,
+        method: Some(method),
+        path: Some(path),
+        ..
+    } = evidence.counterexample()
+    else {
+        panic!("expected a REST counterexample");
+    };
+    let input = serde_json::from_value(json!({
+        "exec": {
+            "path": binary.as_deref().unwrap_or(""),
+            "ancestors": ancestor_binary.iter().collect::<Vec<_>>(),
+            "cmdline_paths": [],
+        },
+        "network": {"host": host, "port": port},
+        "request": {"method": method, "path": path, "query_params": {}}
+    }))
+    .unwrap();
+    assert!(eval_bool(
+        &mut runtime_engine_with_identity(candidate, *binary_identity_required),
+        &input,
+        "data.openshell.sandbox.allow_request"
+    ));
+    assert!(!eval_bool(
+        &mut runtime_engine_with_identity(boundary, *binary_identity_required),
+        &input,
+        "data.openshell.sandbox.allow_request"
+    ));
+}
+
+#[test]
+fn endpoint_selector_single_star_crosses_path_separators() {
+    assert_runtime_path_expansion_replays(
+        &endpoint_path_policy("", "/v1/*"),
+        &endpoint_path_policy("/v1/*", "/**"),
+        "/v1/a/b",
+    );
+}
+
+#[test]
+fn endpoint_selector_subtree_includes_the_prefix_itself() {
+    assert_runtime_path_expansion_replays(
+        &endpoint_path_policy("", "/p/**"),
+        &endpoint_path_policy("/p/**", "/**"),
+        "/p",
+    );
+}
+
+#[test]
+fn endpoint_selector_scoped_denies_match_runtime() {
+    for (selector, path) in [("/v1/*", "/v1/a/b"), ("/p/**", "/p")] {
+        let mut boundary: serde_json::Value =
+            serde_json::from_str(&endpoint_path_policy("", "/**")).unwrap();
+        let endpoints = boundary["network_policies"]["egress"]["endpoints"]
+            .as_array_mut()
+            .unwrap();
+        let mut deny = endpoints[0].clone();
+        deny["path"] = json!(selector);
+        deny["deny_rules"] = json!([{"method": "GET", "path": "/**"}]);
+        endpoints.push(deny);
+        assert_runtime_path_expansion_replays(
+            &boundary.to_string(),
+            &endpoint_path_policy("", path),
+            path,
+        );
+    }
+}
+
+#[test]
+fn endpoint_selector_contained_policies_remain_within() {
+    for (boundary_selector, boundary_rule, candidate_selector, candidate_rule, path) in [
+        ("/v1/*", "/**", "", "/v1/**", "/v1/a/b"),
+        ("/p/**", "/**", "", "/p", "/p"),
+        ("/p/**", "/**", "/p/**", "/**", "/p/a"),
+    ] {
+        let boundary = endpoint_path_policy(boundary_selector, boundary_rule);
+        let candidate = endpoint_path_policy(candidate_selector, candidate_rule);
+        let input = runtime_input_with_path("/usr/bin/curl", &[], "api.example.com", "GET", path);
+        for policy in [&boundary, &candidate] {
+            assert!(eval_bool(
+                &mut runtime_engine(policy),
+                &input,
+                "data.openshell.sandbox.allow_request"
+            ));
+        }
+        let result = check(&boundary, &candidate);
+        assert!(matches!(result, CheckResult::Within(_)), "{result:?}");
     }
 }
 

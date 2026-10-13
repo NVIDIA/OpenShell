@@ -2721,6 +2721,91 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
 }
 
 #[test]
+fn container_spec_accepts_non_nvidia_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in ["example.com/gpu=0", "intel.com/gpu=0", "amd.com/gpu=0"] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit = build_container_create_body(&sandbox, &config).unwrap();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap();
+        for body in [explicit, resolved] {
+            let requests = body.host_config.unwrap().device_requests.unwrap();
+            assert_eq!(requests[0].driver.as_deref(), Some("cdi"));
+            assert_eq!(
+                requests[0].device_ids.as_ref().unwrap(),
+                &[device.to_string()]
+            );
+        }
+    }
+}
+
+#[test]
+fn container_spec_rejects_host_paths_in_explicit_and_resolved_cdi_devices() {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = true;
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    for device in [
+        "/dev/sda",
+        "/dev",
+        "/dev/sda:/dev/sda:rwm",
+        "vendor/gpu=0/1",
+    ] {
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = Some(cdi_devices_config(&[device]));
+        let explicit_error = build_container_create_body(&sandbox, &config).unwrap_err();
+        sandbox
+            .spec
+            .as_mut()
+            .unwrap()
+            .template
+            .as_mut()
+            .unwrap()
+            .driver_config = None;
+        let resolved_error = build_container_create_body_with_gpu_devices(
+            &sandbox,
+            &config,
+            &DockerSandboxDriverConfig::default(),
+            Some(&[device.to_string()]),
+        )
+        .unwrap_err();
+        for error in [explicit_error, resolved_error] {
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(error.message().contains("CDI qualified names"));
+        }
+    }
+}
+
+#[test]
 fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     let mut config = runtime_config();
     config.gpu.cdi_supported = true;
@@ -3651,6 +3736,71 @@ fn docker_oom_kill_stays_terminal_despite_137() {
     };
     apply_docker_exit_classification(&mut sandbox, &state);
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+#[test]
+fn supervisor_workspace_validation_exit_is_reported_explicitly() {
+    let status = workspace_validation_status();
+    assert_eq!(status.message(), WORKSPACE_VALIDATION_FAILED_MESSAGE);
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(
+        supervisor_start_failure_reason(
+            &Status::failed_precondition("provider SPIFFE socket has no parent directory"),
+            "ControlSupervisorStartFailed"
+        ),
+        "ControlSupervisorStartFailed"
+    );
+    assert_eq!(
+        supervisor_exit_reason(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(supervisor_exit_reason(1), "ControlSupervisorExited");
+
+    let (reason, message) =
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
+            error: "image workspace validation failed".into(),
+        })));
+    assert_eq!(reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+    assert!(message.contains("status 78"));
+    assert_eq!(
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: 1,
+            error: String::new(),
+        })))
+        .0,
+        "ControlSupervisorExited"
+    );
+}
+
+#[tokio::test]
+async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspection() {
+    let failures = Arc::new(Mutex::new(HashMap::from([(
+        "sandbox-1".to_string(),
+        DockerRuntimeFailure {
+            reason: CONDITION_WORKSPACE_VALIDATION_FAILED,
+            message: "Docker supervisor container exited with status 78".into(),
+        },
+    )])));
+    // There is no Docker daemon at this address: a monitor that has removed
+    // the supervisor must not need another inspection to retain the reason.
+    let docker = Docker::connect_with_http("127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION).unwrap();
+    let status = wait_for_docker_supervisor_ready(
+        &docker,
+        "removed-supervisor",
+        "workload-container-1",
+        "sandbox-1",
+        &failures,
+    )
+    .await
+    .expect_err("the recorded workspace failure takes precedence over inspection");
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
 }
 
 #[test]

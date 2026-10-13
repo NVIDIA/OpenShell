@@ -162,7 +162,7 @@ if ! (
   find_existing_native_openshell_bin() { return 1; }
   guard_native_to_snap_transition
 ) >"$out" 2>"$err"; then
-  echo "FAIL: Snap install without an existing native installation should continue" >&2
+  echo "FAIL: snap install without an existing native installation should continue" >&2
   cat "$err" >&2 || true
   exit 1
 fi
@@ -177,7 +177,7 @@ assert_native_to_snap_blocked() {
     UPGRADE_NOTICE_ACK=""
     guard_native_to_snap_transition
   ) >"$out" 2>"$err"; then
-    echo "FAIL: ${name}: expected native-to-Snap transition to be blocked" >&2
+    echo "FAIL: ${name}: expected native-to-snap transition to be blocked" >&2
     exit 1
   fi
   if ! grep -Fq "detected existing non-snap OpenShell ${version} at /usr/bin/openshell" "$err"; then
@@ -186,7 +186,7 @@ assert_native_to_snap_blocked() {
     exit 1
   fi
   if ! grep -Fq "does not import state from a non-snap installation" "$err"; then
-    echo "FAIL: ${name}: missing isolated Snap state explanation" >&2
+    echo "FAIL: ${name}: missing isolated snap state explanation" >&2
     cat "$err" >&2 || true
     exit 1
   fi
@@ -201,12 +201,12 @@ if ! (
   UPGRADE_NOTICE_ACK=1
   guard_native_to_snap_transition
 ) >"$out" 2>"$err"; then
-  echo "FAIL: acknowledged native-to-Snap transition should continue" >&2
+  echo "FAIL: acknowledged native-to-snap transition should continue" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if ! grep -Fq "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set" "$err"; then
-  echo "FAIL: acknowledged native-to-Snap transition was not reported" >&2
+  echo "FAIL: acknowledged native-to-snap transition was not reported" >&2
   cat "$err" >&2 || true
   exit 1
 fi
@@ -215,7 +215,7 @@ if (
   RELEASE_TAG=""
   target_uses_breaking_gateway_model
 ); then
-  echo "FAIL: Snap targets must not use the version-boundary upgrade guard" >&2
+  echo "FAIL: snap targets must not use the version-boundary upgrade guard" >&2
   exit 1
 fi
 
@@ -223,12 +223,12 @@ out="$(mktemp)"
 err="$(mktemp)"
 
 if ! OPENSHELL_VERSION=dev openshell_snap_channel >"$out" 2>"$err"; then
-  echo "FAIL: dev must select the latest/edge Snap channel" >&2
+  echo "FAIL: dev must select the latest/edge snap channel" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if [ "$(cat "$out")" != "latest/edge" ]; then
-  echo "FAIL: dev must select the latest/edge Snap channel" >&2
+  echo "FAIL: dev must select the latest/edge snap channel" >&2
   exit 1
 fi
 if [ -s "$err" ]; then
@@ -238,12 +238,12 @@ if [ -s "$err" ]; then
 fi
 
 if ! OPENSHELL_VERSION="" openshell_snap_channel >"$out" 2>"$err"; then
-  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable Snap channel" >&2
+  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable snap channel" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if [ "$(cat "$out")" != "latest/stable" ]; then
-  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable Snap channel" >&2
+  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable snap channel" >&2
   exit 1
 fi
 if [ -s "$err" ]; then
@@ -253,11 +253,11 @@ if [ -s "$err" ]; then
 fi
 
 if (OPENSHELL_VERSION=v1.2.3 openshell_snap_channel) >"$out" 2>"$err"; then
-  echo "FAIL: pinned release must not select a Snap channel" >&2
+  echo "FAIL: pinned release must not select a snap channel" >&2
   exit 1
 fi
-if ! grep -Fq "Snap installs do not support OPENSHELL_VERSION=v1.2.3" "$err"; then
-  echo "FAIL: pinned release Snap rejection was not explained" >&2
+if ! grep -Fq "snap installs do not support OPENSHELL_VERSION=v1.2.3" "$err"; then
+  echo "FAIL: pinned release snap rejection was not explained" >&2
   cat "$err" >&2
   exit 1
 fi
@@ -283,14 +283,33 @@ assert_snap_install_flow() {
       case "${1:-}:${2:-}" in
         list:docker) return 1 ;;
         list:openshell) [ "$openshell_present" = "1" ] ;;
+        get:openshell) printf '%s\n' system ;;
         *) command snap "$@" ;;
       esac
     }
-    as_root() { printf 'root:%s\n' "$*"; }
+    as_root() {
+      if [ "${1:-}:${2:-}" = snap:get ]; then
+        shift
+        snap "$@"
+      else
+        printf 'root:%s\n' "$*"
+      fi
+    }
+    as_target_user() { printf 'target:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
     wait_for_docker_daemon() { printf '%s\n' "wait:docker"; }
-    register_snap_gateway() { printf '%s\n' "register:gateway"; }
-    wait_for_snap_gateway_listener() { printf '%s\n' "wait:gateway-listener"; }
+    wait_for_user_docker_daemon() { printf '%s\n' "wait:user-docker"; }
+    snap_gateway_mode() {
+      if [ "$openshell_present" = 1 ]; then
+        printf '%s\n' system
+      else
+        printf '%s\n' user
+      fi
+    }
+    register_system_snap_gateway() { printf '%s\n' "register:system-gateway"; }
+    register_user_snap_gateway() { printf '%s\n' "register:user-gateway"; }
+    wait_for_system_snap_gateway_listener() { printf '%s\n' "wait:system-gateway-listener"; }
+    wait_for_user_snap_gateway_listener() { printf '%s\n' "wait:user-gateway-listener"; }
     wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
     info() { :; }
     export TARGET_USER=test-user
@@ -308,25 +327,117 @@ assert_snap_install_flow() {
   fi
 }
 
+assert_snap_user_refresh_flow() {
+  local calls
+  (
+    has_cmd() {
+      case "$1" in
+        snap | docker) return 0 ;;
+        *) command -v "$1" >/dev/null 2>&1 ;;
+      esac
+    }
+    snap() {
+      case "${1:-}:${2:-}" in
+        list:docker) return 1 ;;
+        list:openshell) return 0 ;;
+        get:openshell) printf '%s\n' user ;;
+        *) command snap "$@" ;;
+      esac
+    }
+    as_root() {
+      if [ "${1:-}:${2:-}" = snap:get ]; then
+        shift
+        snap "$@"
+      else
+        printf 'root:%s\n' "$*"
+      fi
+    }
+    as_target_user() { printf 'target:%s\n' "$*"; }
+    set_linux_target_runtime_dir() { :; }
+    wait_for_user_docker_daemon() { printf '%s\n' "wait:user-docker"; }
+    snap_gateway_mode() { printf '%s\n' user; }
+    wait_for_user_snap_gateway_listener() { printf '%s\n' "wait:user-gateway-listener"; }
+    register_user_snap_gateway() { printf '%s\n' "register:user-gateway"; }
+    wait_for_local_gateway_status() { printf '%s\n' "wait:gateway-status"; }
+    info() { :; }
+    export TARGET_USER=test-user
+    install_linux_snap
+  ) >"$out"
+  calls="$(cat "$out")"
+  expected="wait:user-docker
+root:snap refresh openshell --channel=latest/stable
+root:snap restart openshell.user-gateway
+wait:user-gateway-listener
+register:user-gateway
+wait:gateway-status"
+  if [ "$calls" != "$expected" ]; then
+    echo "FAIL: existing user-mode snap refresh used the wrong service" >&2
+    printf 'Expected:\n%s\nActual:\n%s\n' "$expected" "$calls" >&2
+    exit 1
+  fi
+}
+
 assert_snap_install_flow \
   "existing Docker is reused" \
   1 0 "" \
-  "wait:docker
+  "wait:user-docker
 root:snap install openshell --channel=latest/stable
-root:snap restart openshell.gateway
-wait:gateway-listener
-register:gateway
+wait:user-gateway-listener
+register:user-gateway
 wait:gateway-status"
+
+assert_snap_user_refresh_flow
 
 assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
   1 1 "" \
   "wait:docker
 root:snap refresh openshell --channel=latest/stable
-root:snap restart openshell.gateway
-wait:gateway-listener
-register:gateway
+root:snap restart openshell.system-gateway
+wait:system-gateway-listener
+register:system-gateway
 wait:gateway-status"
+
+if (
+  has_cmd() {
+    case "$1" in
+      snap) return 0 ;;
+      docker) return 1 ;;
+      *) command -v "$1" >/dev/null 2>&1 ;;
+    esac
+  }
+  snap() {
+    case "${1:-}:${2:-}" in
+      list:docker) return 1 ;;
+      list:openshell) return 0 ;;
+      get:openshell) printf '%s\n' disable ;;
+      *) echo "FAIL: disabled mode reached snap command: $*" >&2; return 99 ;;
+    esac
+  }
+  as_root() {
+    if [ "${1:-}:${2:-}" = snap:get ]; then
+      shift
+      snap "$@"
+    else
+      echo "FAIL: disabled mode reached root command: $*" >&2
+      return 99
+    fi
+  }
+  set_linux_target_runtime_dir() { :; }
+  install_linux_snap
+) >"$out" 2>"$err"; then
+  echo "FAIL: disabled snap gateway mode should block installation" >&2
+  exit 1
+fi
+if ! grep -Fq "OpenShell snap gateway mode is disabled" "$err"; then
+  echo "FAIL: disabled snap gateway mode missing recovery guidance" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if grep -Fq "disabled mode reached" "$err"; then
+  cat "$err" >&2 || true
+  exit 1
+fi
 
 assert_snap_install_rejected() {
   local name=$1
@@ -357,7 +468,7 @@ assert_snap_install_rejected() {
     set_linux_target_runtime_dir() { :; }
     install_linux_snap
   ) >"$out" 2>"$err"; then
-    echo "FAIL: ${name}: Snap installation should have been rejected" >&2
+    echo "FAIL: ${name}: snap installation should have been rejected" >&2
     exit 1
   fi
   if ! grep -Fq "$expected" "$err"; then
@@ -386,7 +497,11 @@ root_probes_file="${tmpdir}/docker-root-probes"
 printf '0\n' >"$attempts_file"
 printf '0\n' >"$root_probes_file"
 if ! (
-  docker() {
+  env() {
+    if [ "$*" != "-u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info" ]; then
+      echo "unexpected Docker readiness probe: $*" >&2
+      return 1
+    fi
     attempts="$(cat "$attempts_file")"
     attempts=$((attempts + 1))
     printf '%s\n' "$attempts" >"$attempts_file"
@@ -415,7 +530,7 @@ if [ "$(cat "$root_probes_file")" != "3" ]; then
 fi
 
 if (
-  docker() { return 1; }
+  env() { return 1; }
   as_root() { "$@"; }
   snap() { return 1; }
   sleep() { :; }
@@ -425,14 +540,71 @@ if (
   echo "FAIL: Docker readiness timeout should fail" >&2
   exit 1
 fi
-if ! grep -Fq "Docker daemon did not become reachable within 2s" "$err"; then
+if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable within 2s" "$err"; then
   echo "FAIL: missing Docker readiness timeout message" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 
+user_attempts_file="${tmpdir}/docker-user-attempts"
+user_probes_file="${tmpdir}/docker-user-probes"
+printf '0\n' >"$user_attempts_file"
+printf '0\n' >"$user_probes_file"
+if ! (
+  env() {
+    if [ "$*" != "-u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info" ]; then
+      echo "unexpected user Docker readiness probe: $*" >&2
+      return 1
+    fi
+    attempts="$(cat "$user_attempts_file")"
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" >"$user_attempts_file"
+    [ "$attempts" -ge 3 ]
+  }
+  as_target_user() {
+    user_probes="$(cat "$user_probes_file")"
+    printf '%s\n' "$((user_probes + 1))" >"$user_probes_file"
+    "$@"
+  }
+  sleep() { :; }
+  info() { :; }
+  TARGET_USER=test-user
+  export DOCKER_HOST=tcp://remote.example:2376
+  export DOCKER_CONTEXT=remote
+  OPENSHELL_INSTALL_DOCKER_TIMEOUT=3 wait_for_user_docker_daemon
+) >"$out" 2>"$err"; then
+  echo "FAIL: user Docker readiness should succeed after retries" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [ "$(cat "$user_attempts_file")" != "3" ]; then
+  echo "FAIL: user Docker readiness did not retry three times" >&2
+  exit 1
+fi
+if [ "$(cat "$user_probes_file")" != "3" ]; then
+  echo "FAIL: user Docker readiness probes did not run through as_target_user" >&2
+  exit 1
+fi
+
+if (
+  env() { return 1; }
+  as_target_user() { "$@"; }
+  sleep() { :; }
+  info() { :; }
+  TARGET_USER=test-user
+  OPENSHELL_INSTALL_DOCKER_TIMEOUT=2 wait_for_user_docker_daemon
+) >"$out" 2>"$err"; then
+  echo "FAIL: user Docker readiness timeout should fail" >&2
+  exit 1
+fi
+if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable as test-user within 2s" "$err"; then
+  echo "FAIL: missing user Docker readiness timeout message" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
 if ! grep -Fq '/snap/bin/openshell' "${ROOT}/install.sh"; then
-  echo "FAIL: Snap installs must use the Snap CLI explicitly" >&2
+  echo "FAIL: snap installs must use the snap CLI explicitly" >&2
   exit 1
 fi
 
@@ -445,16 +617,16 @@ if ! (
   info() { :; }
   TARGET_USER=test-user
   snap_gateway_uses_mtls() { return 0; }
-  register_snap_gateway
+  register_system_snap_gateway
 ) >"$out" 2>"$err"; then
-  echo "FAIL: Snap gateway registration should succeed" >&2
+  echo "FAIL: snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
 if [ "$registration_calls" != "copy:client-bundle
 target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]; then
-  echo "FAIL: mTLS Snap gateway registration must copy the client bundle and use HTTPS" >&2
+  echo "FAIL: mTLS snap gateway registration must copy the client bundle and use HTTPS" >&2
   printf '%s\n' "$registration_calls" >&2
   exit 1
 fi
@@ -465,20 +637,20 @@ if ! (
   copy_snap_client_bundle() { printf 'copy:client-bundle\n' >>"$registration_calls_file"; }
   print_gateway_add_output() { :; }
   snap_gateway_uses_mtls() { return 1; }
-  register_snap_gateway
+  register_system_snap_gateway
 ) >"$out" 2>"$err"; then
-  echo "FAIL: legacy plaintext Snap gateway registration should succeed" >&2
+  echo "FAIL: legacy plaintext snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
 if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
-  echo "FAIL: legacy Snap gateway registration must use HTTP without copying certificates" >&2
+  echo "FAIL: legacy snap gateway registration must use HTTP without copying certificates" >&2
   printf '%s\n' "$registration_calls" >&2
   exit 1
 fi
 if ! grep -Fq "without client authentication" "$err"; then
-  echo "FAIL: legacy Snap gateway registration must warn about unauthenticated access" >&2
+  echo "FAIL: legacy snap gateway registration must warn about unauthenticated access" >&2
   exit 1
 fi
 
@@ -494,7 +666,7 @@ assert_snap_listener_probe() {
     snap_gateway_uses_mtls() { [ "$uses_mtls" = "1" ]; }
     info() { :; }
     OPENSHELL_SNAP_TLS_DIR=/tls
-    wait_for_snap_gateway_listener >/dev/null
+    wait_for_system_snap_gateway_listener >/dev/null
     printf '%s\n' "$_last_output"
   )"
   if [ "$actual" != "$expected" ]; then
@@ -526,16 +698,16 @@ chmod 644 "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/cl
 snap_user_tls="${snap_user_home}/snap/openshell/common/.local/state/openshell/tls"
 for file in ca.crt client/tls.crt client/tls.key; do
   if ! cmp -s "${snap_tls_src}/${file}" "${snap_user_tls}/${file}"; then
-    echo "FAIL: Snap client bundle copy missing ${file}" >&2
+    echo "FAIL: snap client bundle copy missing ${file}" >&2
     exit 1
   fi
   if [[ -z $(find "${snap_user_tls}/${file}" -perm 600) ]]; then
-    echo "FAIL: Snap client bundle ${file} must be mode 0600" >&2
+    echo "FAIL: snap client bundle ${file} must be mode 0600" >&2
     exit 1
   fi
 done
 if [[ -z $(find "$snap_user_tls" -maxdepth 0 -perm 700) ]]; then
-  echo "FAIL: Snap client bundle directory must be mode 0700" >&2
+  echo "FAIL: snap client bundle directory must be mode 0700" >&2
   exit 1
 fi
 
@@ -627,6 +799,22 @@ fi
 
 if [ "$(run_listener_wait "$restarting_unit")" != "5" ]; then
   echo "FAIL: the listener wait must ignore the service state without a check" >&2
+  exit 1
+fi
+
+: >"$registration_calls_file"
+if ! (
+  as_target_user() { printf 'target:%s\n' "$*" >>"$registration_calls_file"; }
+  print_gateway_add_output() { :; }
+  register_user_snap_gateway
+) >"$out" 2>"$err"; then
+  echo "FAIL: user snap gateway registration should succeed" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+if [[ $(cat "$registration_calls_file") != "target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]]; then
+  echo "FAIL: user snap gateway registration must use its own local TLS bundle" >&2
+  cat "$registration_calls_file" >&2
   exit 1
 fi
 

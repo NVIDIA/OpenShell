@@ -5,6 +5,8 @@
 
 mod legacy_time_wire;
 mod postgres;
+#[cfg(test)]
+mod refresh_lock_tests;
 mod sqlite;
 
 pub use crate::storage_proto::{
@@ -307,6 +309,29 @@ impl Store {
         match self {
             Self::Postgres(store) => Ok(DistributedMutationGuard {
                 _postgres: Some(store.acquire_mutation_lock(0x4f53_5348_484f_5354).await?),
+            }),
+            Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
+        }
+    }
+
+    /// Independent per-credential lock, shared across `PostgreSQL` replicas.
+    /// Callers also hold a local keyed mutex on `SQLite`.
+    pub(crate) async fn acquire_refresh_guard(
+        &self,
+        provider_id: &str,
+        credential_key: &str,
+    ) -> PersistenceResult<DistributedMutationGuard> {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"openshell-provider-refresh-lock-v1\0");
+        digest.update(provider_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(credential_key.as_bytes());
+        let hash = digest.finalize();
+        let key = i64::from_be_bytes(hash[..8].try_into().expect("eight digest bytes"));
+        match self {
+            Self::Postgres(store) => Ok(DistributedMutationGuard {
+                _postgres: Some(store.acquire_mutation_lock(key).await?),
             }),
             Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
         }

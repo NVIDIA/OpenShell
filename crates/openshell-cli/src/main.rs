@@ -3,6 +3,8 @@
 
 //! `OpenShell` CLI - command-line interface for `OpenShell`.
 
+#![forbid(unsafe_code)]
+
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
@@ -858,6 +860,10 @@ enum ProviderCommands {
         #[arg(long = "type")]
         provider_type: String,
 
+        /// Labels to attach to the provider (KEY=VALUE, repeatable).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
         /// Load provider credentials/config from existing local state.
         #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
         from_existing: bool,
@@ -916,6 +922,10 @@ enum ProviderCommands {
         /// Opaque continuation token from a previous page.
         #[arg(long, default_value = "")]
         page_token: String,
+
+        /// Filter providers by labels (e.g. env=dev,team=ml).
+        #[arg(long)]
+        label_selector: Option<String>,
 
         /// Print only provider names, one per line.
         #[arg(long, conflicts_with = "output")]
@@ -1781,7 +1791,11 @@ enum SandboxCommands {
         #[arg(value_hint = ValueHint::AnyPath)]
         local_path: String,
 
-        /// Destination path in the sandbox (defaults to the container's working directory).
+        /// Destination path in the sandbox (defaults to its working directory).
+        ///
+        /// For an unfiltered single-file upload, an existing directory or a
+        /// trailing slash places the file inside that directory. A missing
+        /// nested path without a trailing slash renames the file.
         dest: Option<String>,
 
         /// Disable `.gitignore` filtering (uploads everything).
@@ -2613,22 +2627,12 @@ async fn run_async() -> Result<()> {
         )
         .init();
 
-    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
-    // Only set the env var when it hasn't been explicitly overridden by the
-    // user, so `OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell ...` still wins.
-    if std::env::var("OPENSHELL_SSH_LOG_LEVEL").is_err() {
-        let ssh_log_level = match cli.verbose {
-            0 => "ERROR",
-            1 => "INFO",
-            _ => "DEBUG",
-        };
-        // SAFETY: Called early in main() before spawning async tasks that
-        // read the environment, so no concurrent readers exist.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
-        }
-    }
+    // SSH commands read an explicit environment override themselves.
+    openshell_cli::ssh::set_default_ssh_log_level(match cli.verbose {
+        0 => "ERROR",
+        1 => "INFO",
+        _ => "DEBUG",
+    });
 
     match cli.command {
         // -----------------------------------------------------------
@@ -3880,6 +3884,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::Create {
                     name,
                     provider_type,
+                    labels,
                     from_existing,
                     credentials,
                     from_gcloud_adc,
@@ -3904,6 +3909,7 @@ async fn run_async() -> Result<()> {
                         server: endpoint,
                         name: &name,
                         provider_type: provider_type.as_str(),
+                        labels: &labels,
                         credentials: &credentials,
                         credential_source,
                         config: &config,
@@ -3999,6 +4005,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::List {
                     page_size,
                     page_token,
+                    label_selector,
                     names,
                     output,
                     all_workspaces,
@@ -4007,6 +4014,7 @@ async fn run_async() -> Result<()> {
                         endpoint,
                         page_size,
                         &page_token,
+                        label_selector.as_deref().unwrap_or_default(),
                         names,
                         output.as_str(),
                         &cli.workspace,
@@ -4331,29 +4339,10 @@ mod tests {
         ));
     }
 
-    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
-    // A static mutex serialises them so concurrent threads don't clobber
-    // each other's environment.
-    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
-    /// then restore the original value.
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = XDG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce()) {
+        test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .run(f);
     }
 
     fn edge_metadata(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -5673,6 +5662,75 @@ mod tests {
                 assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
             }
             other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_accepts_labels_with_each_credential_source() {
+        for source in [
+            vec![],
+            vec!["--from-existing"],
+            vec!["--credential", "GITHUB_TOKEN=token"],
+            vec!["--from-gcloud-adc"],
+            vec!["--from-oidc-token"],
+            vec!["--runtime-credentials"],
+        ] {
+            let mut args = vec![
+                "openshell",
+                "provider",
+                "create",
+                "--name",
+                "labeled",
+                "--type",
+                "github",
+                "--label",
+                "env=dev",
+                "--label",
+                "team=ml",
+            ];
+            args.extend(source);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Commands::Provider {
+                    command: Some(ProviderCommands::Create { labels, .. }),
+                }) => assert_eq!(labels, ["env=dev", "team=ml"]),
+                other => panic!("expected provider create, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn provider_list_accepts_label_selector_in_all_output_modes() {
+        for output in [
+            vec![],
+            vec!["--names"],
+            vec!["-o", "json"],
+            vec!["-o", "yaml"],
+        ] {
+            let mut args = vec![
+                "openshell",
+                "provider",
+                "list",
+                "--all-workspaces",
+                "--label-selector",
+                "env=dev,team=ml",
+            ];
+            args.extend(output);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Commands::Provider {
+                    command:
+                        Some(ProviderCommands::List {
+                            label_selector,
+                            all_workspaces,
+                            ..
+                        }),
+                }) => {
+                    assert_eq!(label_selector.as_deref(), Some("env=dev,team=ml"));
+                    assert!(all_workspaces);
+                }
+                other => panic!("expected provider list, got {other:?}"),
+            }
         }
     }
 
@@ -7049,3 +7107,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

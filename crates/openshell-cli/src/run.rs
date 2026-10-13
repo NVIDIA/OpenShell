@@ -37,7 +37,9 @@ pub use crate::commands::provider_readiness::{ProviderWaitOptions, sandbox_provi
 
 use crate::color::Colorize;
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{TlsOptions, grpc_client};
+use crate::tls::{
+    TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
+};
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -71,6 +73,7 @@ use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::{Code, Status};
 
 const PROVISIONAL_CONTAINER_EXIT_RECONCILIATION_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1057,7 +1060,9 @@ pub async fn sandbox_create(
                         "\u{2022}".dimmed(),
                     );
                 }
-                sandbox_upload_planned(
+                // Boxed so the upload state machine lives on the heap instead of
+                // inflating the `sandbox_create` future (clippy::large_futures).
+                Box::pin(sandbox_upload_planned(
                     upload_plan,
                     &effective_server,
                     &sandbox_name,
@@ -1065,7 +1070,7 @@ pub async fn sandbox_create(
                     dest,
                     &effective_tls,
                     workspace,
-                )
+                ))
                 .await
                 .wrap_err_with(|| {
                     format!(
@@ -1981,15 +1986,17 @@ pub async fn sandbox_exec_grpc(
     let mut client = grpc_client(server, tls).await?;
 
     // Resolve sandbox name to id.
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
+    let response = client
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-        })
+        }))
         .await
-        .into_diagnostic()?
+        .into_diagnostic()?;
+    let replica = owner_replica(&response);
+    let sandbox = response
         .into_inner()
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
@@ -2077,16 +2084,26 @@ pub async fn sandbox_exec_grpc(
             stdin_is_terminal,
             std::mem::take(&mut request.stdin),
             stdin_rest,
+            replica.as_ref(),
         )
         .await;
     }
 
     // Make the streaming gRPC call.
-    let mut stream = client
-        .exec_sandbox(request)
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    let retry = replica.is_some().then(|| request.clone());
+    let mut stream = match (
+        client
+            .exec_sandbox(routed_to(request, replica.as_ref()))
+            .await,
+        retry,
+    ) {
+        (Err(status), Some(request)) if retry_unrouted(replica.as_ref(), &status) => {
+            client.exec_sandbox(request).await
+        }
+        (response, _) => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Stream output to terminal in real-time.
     let mut exit_code = 0i32;
@@ -2139,7 +2156,7 @@ pub async fn service_forward_tcp(
     let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
     let mut client = grpc_client(server, tls).await?;
 
-    fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+    let mut replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
 
     let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
         .await
@@ -2173,7 +2190,7 @@ pub async fn service_forward_tcp(
             }
 
             _ = health_check.tick() => {
-                fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
+                replica = fetch_ready_sandbox_for_forward(&mut client, name, workspace).await?;
             }
 
             accepted = listener.accept() => {
@@ -2188,6 +2205,7 @@ pub async fn service_forward_tcp(
                 let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
                 let fatal_tx = fatal_tx.clone();
                 let legacy_session_tokens = legacy_session_tokens.clone();
+                let replica = replica.clone();
                 tokio::spawn(async move {
                     if let Err(err) = forward_one_tcp_connection(
                         &mut client,
@@ -2198,6 +2216,7 @@ pub async fn service_forward_tcp(
                         target_port,
                         service_id,
                         legacy_session_tokens,
+                        replica.as_ref(),
                     )
                     .await
                     {
@@ -2237,18 +2256,19 @@ fn forward_requires_session_token(status: &Status) -> bool {
         && status.message().contains("authorization_token is required")
 }
 
+/// Confirm the sandbox is still ready, returning the replica that owns it.
 async fn fetch_ready_sandbox_for_forward(
     client: &mut crate::tls::GrpcClient,
     name: &str,
     workspace: &str,
-) -> Result<Sandbox> {
+) -> Result<Option<AsciiMetadataValue>> {
     let response = match client
-        .get_sandbox(GetSandboxRequest {
+        .get_sandbox(with_owner_hint(GetSandboxRequest {
             name: name.to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 workspace.to_string(),
             )),
-        })
+        }))
         .await
     {
         Ok(response) => response,
@@ -2260,6 +2280,7 @@ async fn fetch_ready_sandbox_for_forward(
         Err(status) => return Err(status).into_diagnostic(),
     };
 
+    let replica = owner_replica(&response);
     let sandbox = response
         .into_inner()
         .sandbox
@@ -2273,7 +2294,7 @@ async fn fetch_ready_sandbox_for_forward(
         ));
     }
 
-    Ok(sandbox)
+    Ok(replica)
 }
 
 #[derive(Debug)]
@@ -2339,6 +2360,7 @@ async fn forward_one_tcp_connection(
     target_port: u16,
     service_id: String,
     legacy_session_tokens: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<(), ForwardTcpConnectionError> {
     let mut init = TcpForwardInit {
         sandbox: sandbox_name.clone(),
@@ -2369,7 +2391,7 @@ async fn forward_one_tcp_connection(
         }
     }
 
-    let opened = match open_forward_tcp_stream(client, init.clone()).await {
+    let opened = match open_forward_tcp_stream(client, init.clone(), replica).await {
         Ok(opened) => opened,
         Err(status) if session_token.is_none() && forward_requires_session_token(&status) => {
             tracing::info!(
@@ -2387,7 +2409,7 @@ async fn forward_one_tcp_connection(
             };
             init.authorization_token.clone_from(&token);
             session_token = Some(token);
-            match open_forward_tcp_stream(client, init).await {
+            match open_forward_tcp_stream(client, init, replica).await {
                 Ok(opened) => opened,
                 Err(status) => {
                     drain_and_shutdown_local_socket(socket).await;
@@ -2418,22 +2440,15 @@ type OpenForwardTcpStream = (
 async fn open_forward_tcp_stream(
     client: &mut crate::tls::GrpcClient,
     init: TcpForwardInit,
+    replica: Option<&AsciiMetadataValue>,
 ) -> std::result::Result<OpenForwardTcpStream, Status> {
-    use tokio_stream::wrappers::ReceiverStream;
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
-    tx.send(TcpForwardFrame {
+    let init = TcpForwardFrame {
         payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
             init,
         )),
-    })
-    .await
-    .map_err(|_| Status::internal("failed to initialize forward stream"))?;
-    let response = client
-        .forward_tcp(ReceiverStream::new(rx))
-        .await?
-        .into_inner();
-    Ok((tx, response))
+    };
+    let (tx, response) = crate::ssh::open_forward_tcp(client, init, replica).await;
+    Ok((tx, response?.into_inner()))
 }
 
 async fn revoke_forward_session_token(client: &mut crate::tls::GrpcClient, token: Option<String>) {
@@ -2561,6 +2576,7 @@ async fn sandbox_exec_streaming_grpc(
     stdin_is_terminal: bool,
     stdin_prefix: Vec<u8>,
     stdin_rest: Option<tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    replica: Option<&AsciiMetadataValue>,
 ) -> Result<i32> {
     #[cfg(unix)]
     use openshell_core::proto::ExecSandboxWindowResize;
@@ -2573,36 +2589,44 @@ async fn sandbox_exec_streaming_grpc(
         (0, 0)
     };
 
-    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    // The start message carries the exec metadata.
+    let start = ExecSandboxInput {
+        payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+            request_id: String::new(),
+            sandbox: sandbox.object_name().to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                (sandbox.object_workspace()).to_string(),
+            )),
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment: environment.clone(),
+            no_login_shell,
+            execution_timeout: proto_execution_timeout(timeout_seconds)?,
+            stdin: Vec::new(),
+            tty,
+            cols,
+            rows,
+        })),
+    };
 
-    // Send the start message with exec metadata.
-    input_tx
-        .send(ExecSandboxInput {
-            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
-                request_id: String::new(),
-                sandbox: sandbox.object_name().to_string(),
-                workspace_scope: Some(openshell_core::proto::workspace_selector(
-                    (sandbox.object_workspace()).to_string(),
-                )),
-                command: command.to_vec(),
-                workdir: workdir.unwrap_or_default().to_string(),
-                environment: environment.clone(),
-                no_login_shell,
-                execution_timeout: proto_execution_timeout(timeout_seconds)?,
-                stdin: Vec::new(),
-                tty,
-                cols,
-                rows,
-            })),
-        })
+    let (mut input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+    input_tx.send(start.clone()).await.into_diagnostic()?;
+    let mut stream = match client
+        .exec_sandbox_interactive(routed_to(ReceiverStream::new(input_rx), replica))
         .await
-        .into_diagnostic()?;
-
-    let mut stream = client
-        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
-        .await
-        .into_diagnostic()?
-        .into_inner();
+    {
+        Err(status) if retry_unrouted(replica, &status) => {
+            let (tx, rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(64);
+            tx.send(start).await.into_diagnostic()?;
+            input_tx = tx;
+            client
+                .exec_sandbox_interactive(ReceiverStream::new(rx))
+                .await
+        }
+        response => response,
+    }
+    .into_diagnostic()?
+    .into_inner();
 
     // Raw mode is only appropriate for an interactive terminal, not a pipe.
     let raw_guard = if tty && stdin_is_terminal {
@@ -4159,12 +4183,8 @@ async fn expose_service_endpoint(
             )),
         })
         .await
-        .map_err(service_expose_status_error)
+        .map_err(|status| service_status_error("expose service", "sandbox:write", sandbox, status))
         .map(tonic::Response::into_inner)
-}
-
-fn service_expose_status_error(status: Status) -> miette::Report {
-    service_status_error("expose service", "sandbox:write", status)
 }
 
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
@@ -4191,7 +4211,14 @@ pub async fn service_list(
             }),
         })
         .await
-        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .map_err(|status| {
+            service_status_error(
+                "list services",
+                "sandbox:read",
+                sandbox.unwrap_or_default(),
+                status,
+            )
+        })?
         .into_inner();
 
     let next_page_token = response.next_page_token.clone();
@@ -4241,7 +4268,7 @@ pub async fn service_get(
             name: service.to_string(),
         })
         .await
-        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .map_err(|status| service_status_error("get service", "sandbox:read", sandbox, status))?
         .into_inner();
 
     print_service_endpoint_table(&[response], server, false);
@@ -4267,7 +4294,7 @@ pub async fn service_delete(
             )),
         })
         .await
-        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .map_err(|status| service_status_error("delete service", "sandbox:write", sandbox, status))?
         .into_inner();
 
     if !deletion_completed(response.outcome)? {
@@ -4291,13 +4318,23 @@ pub async fn service_delete(
     Ok(())
 }
 
-fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
+fn service_status_error(
+    action: &str,
+    required_scope: &str,
+    sandbox: &str,
+    status: Status,
+) -> miette::Report {
     let message = status.message();
     match status.code() {
         Code::PermissionDenied => {
             miette!("{action} failed: permission denied (requires {required_scope})")
         }
         Code::Unauthenticated => miette!("{action} failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" && !sandbox.is_empty() => {
+            miette!(
+                "{action} failed: sandbox \"{sandbox}\" not found (the first argument is the sandbox name, not the service name)"
+            )
+        }
         Code::NotFound if message == "sandbox not found" => {
             miette!("{action} failed: sandbox not found")
         }
@@ -5088,7 +5125,7 @@ async fn sandbox_upload_planned(
     sandbox_path: Option<&str>,
     tls: &TlsOptions,
     workspace: &str,
-) -> Result<()> {
+) -> Result<Option<String>> {
     match plan {
         SandboxUploadPlan::GitAware { base_dir, files } => {
             sandbox_sync_up_files(
@@ -5101,10 +5138,13 @@ async fn sandbox_upload_planned(
                 tls,
                 workspace,
             )
-            .await
+            .await?;
+            Ok(None)
         }
         SandboxUploadPlan::Regular => {
-            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace).await
+            sandbox_sync_up(server, name, local_path, sandbox_path, tls, workspace)
+                .await
+                .map(Some)
         }
     }
 }
@@ -5130,7 +5170,7 @@ pub async fn sandbox_upload(
         dest_display
     );
 
-    sandbox_upload_planned(
+    let uploaded_path = sandbox_upload_planned(
         upload_plan,
         server,
         name,
@@ -5141,7 +5181,11 @@ pub async fn sandbox_upload(
     )
     .await?;
 
-    eprintln!("{} Upload complete", "✓".green().bold());
+    if let Some(path) = uploaded_path {
+        eprintln!("{} Upload complete: {path}", "✓".green().bold());
+    } else {
+        eprintln!("{} Upload complete", "✓".green().bold());
+    }
     Ok(())
 }
 
@@ -6871,7 +6915,7 @@ mod tests {
         policy_revision_to_json, proto_execution_timeout, provisioning_timeout_message,
         ready_false_condition_message, relay_local_socket, resolve_from,
         rootfs_tar_sources_supported_for_gateway, sandbox_should_persist, sandbox_upload_plan,
-        service_endpoint_to_json, service_expose_status_error, service_url_for_gateway,
+        service_endpoint_to_json, service_status_error, service_url_for_gateway,
         workspace_member_to_json,
     };
     use openshell_core::proto::TcpForwardFrame;
@@ -6911,7 +6955,7 @@ mod tests {
     use crate::commands::common::{
         parse_credential_expiry_pairs, parse_credential_pairs, progress_step_from_metadata,
     };
-    use crate::test_utils::EnvVarGuard;
+    use crate::test_utils::Environment;
     use openshell_bootstrap::GatewayMetadata;
     use std::fs;
     use std::path::Path;
@@ -7099,81 +7143,97 @@ mod tests {
 
     #[test]
     fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
-
-        let parsed =
-            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
-            Some(&"from-env".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env")
+            .run(|| {
+                let parsed = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()])
+                    .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
+                    Some(&"from-env".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
-            .expect_err("missing env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .remove("NAV_PARSE_CREDENTIAL_MISSING")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
+                    .expect_err("missing env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
-            .expect_err("empty env should error");
-        assert!(err.to_string().contains(
+        Environment::new()
+            .set("NAV_PARSE_CREDENTIAL_EMPTY", "")
+            .run(|| {
+                let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
+                    .expect_err("empty env should error");
+                assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_reads_value_from_named_environment_variable() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_NAMED", "pem-material");
-
-        let parsed =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_NAMED".to_string()])
+        Environment::new()
+            .set("NAV_PARSE_SME_NAMED", "pem-material")
+            .run(|| {
+                let parsed = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_NAMED".to_string()
+                ])
                 .expect("parse");
-        assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+                assert_eq!(parsed.get("private_key"), Some(&"pem-material".to_string()));
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_defaults_env_name_to_key() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_KEY_ONLY", "key-only-material");
-
-        let parsed = parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
-            .expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_SME_KEY_ONLY"),
-            Some(&"key-only-material".to_string())
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_KEY_ONLY", "key-only-material")
+            .run(|| {
+                let parsed =
+                    parse_secret_material_env_pairs(&["NAV_PARSE_SME_KEY_ONLY".to_string()])
+                        .expect("parse");
+                assert_eq!(
+                    parsed.get("NAV_PARSE_SME_KEY_ONLY"),
+                    Some(&"key-only-material".to_string())
+                );
+            });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_missing_environment() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_SME_MISSING");
-
-        let err =
-            parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
-                .expect_err("missing env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
-        ));
+        Environment::new().remove("NAV_PARSE_SME_MISSING").run(|| {
+            let err =
+                parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_MISSING".to_string()])
+                    .expect_err("missing env should error");
+            assert!(err.to_string().contains(
+                "requires local env var 'NAV_PARSE_SME_MISSING' to be set to a non-empty value"
+            ));
+        });
     }
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_empty_environment_value() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_EMPTY", "   ");
-
-        let err = parse_secret_material_env_pairs(&["private_key=NAV_PARSE_SME_EMPTY".to_string()])
-            .expect_err("blank env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
-        ));
+        Environment::new()
+            .set("NAV_PARSE_SME_EMPTY", "   ")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_EMPTY".to_string()
+                ])
+                .expect_err("blank env should error");
+                assert!(err.to_string().contains(
+                    "requires local env var 'NAV_PARSE_SME_EMPTY' to be set to a non-empty value"
+                ));
+            });
     }
 
     #[test]
@@ -7185,17 +7245,19 @@ mod tests {
 
     #[test]
     fn parse_secret_material_env_pairs_rejects_duplicate_keys() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_SME_DUP", "value");
-
-        let err = parse_secret_material_env_pairs(&[
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-            "private_key=NAV_PARSE_SME_DUP".to_string(),
-        ])
-        .expect_err("duplicate key should error");
-        assert!(
-            err.to_string()
-                .contains("key 'private_key' supplied more than once")
-        );
+        Environment::new()
+            .set("NAV_PARSE_SME_DUP", "value")
+            .run(|| {
+                let err = parse_secret_material_env_pairs(&[
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                    "private_key=NAV_PARSE_SME_DUP".to_string(),
+                ])
+                .expect_err("duplicate key should error");
+                assert!(
+                    err.to_string()
+                        .contains("key 'private_key' supplied more than once")
+                );
+            });
     }
 
     #[test]
@@ -7798,14 +7860,63 @@ mod tests {
     }
 
     #[test]
-    fn service_expose_status_error_mentions_required_scope() {
-        let report = service_expose_status_error(Status::permission_denied(
-            "scope 'sandbox:write' required",
-        ));
+    fn service_status_error_mentions_required_scope() {
+        let report = service_status_error(
+            "expose service",
+            "sandbox:write",
+            "demo",
+            Status::permission_denied("scope 'sandbox:write' required"),
+        );
 
         assert_eq!(
             report.to_string(),
             "expose service failed: permission denied (requires sandbox:write)"
+        );
+    }
+
+    #[test]
+    fn service_status_error_names_missing_sandbox() {
+        let report = service_status_error(
+            "delete service",
+            "sandbox:write",
+            "web-http",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "delete service failed: sandbox \"web-http\" not found \
+             (the first argument is the sandbox name, not the service name)"
+        );
+    }
+
+    #[test]
+    fn service_status_error_omits_empty_sandbox_name() {
+        let report = service_status_error(
+            "list services",
+            "sandbox:read",
+            "",
+            Status::not_found("sandbox not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "list services failed: sandbox not found"
+        );
+    }
+
+    #[test]
+    fn service_status_error_keeps_missing_service_message() {
+        let report = service_status_error(
+            "get service",
+            "sandbox:read",
+            "demo",
+            Status::not_found("service endpoint not found"),
+        );
+
+        assert_eq!(
+            report.to_string(),
+            "get service failed: service endpoint not found"
         );
     }
 
@@ -8131,17 +8242,19 @@ mod tests {
         fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
         fs::write(repo.join("top.txt"), "top").expect("write top.txt");
 
-        let _git_dir = EnvVarGuard::set("GIT_DIR", "/tmp/not-the-test-repo/.git");
-        let _git_work_tree = EnvVarGuard::set("GIT_WORK_TREE", "/tmp/not-the-test-repo");
+        Environment::new()
+            .set("GIT_DIR", "/tmp/not-the-test-repo/.git")
+            .set("GIT_WORK_TREE", "/tmp/not-the-test-repo")
+            .run(|| {
+                let result = git_sync_files(&repo.join("nested"));
+                let (base_dir, files) = result.expect("git_sync_files should succeed");
 
-        let result = git_sync_files(&repo.join("nested"));
-        let (base_dir, files) = result.expect("git_sync_files should succeed");
-
-        assert_eq!(
-            base_dir,
-            fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
-        );
-        assert_eq!(files, vec!["file.txt"]);
+                assert_eq!(
+                    base_dir,
+                    fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
+                );
+                assert_eq!(files, vec!["file.txt"]);
+            });
     }
 
     #[test]

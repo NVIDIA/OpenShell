@@ -213,11 +213,12 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - named scenarios for lifecycle,
-  mechanistic drafts, and the sandbox-local API, including agent-authored
-  permission requests. Driver E2E wrappers run every scenario. The
-  installed-artifact conformance suite runs all scenarios and offers a focused
-  `policy-advisor` testsuite for manual integration runs.
+- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
+  lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
+  including agent-authored permission requests. Driver E2E runs the complete
+  Cargo test package. The installed-artifact conformance suite runs the same
+  tests from a nextest archive and offers a focused `policy-advisor` testsuite
+  for manual integration runs.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
@@ -242,17 +243,25 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:docker
 ```
 
-Run the minimal portable CLI conformance profile against the gateway selected
-in your OpenShell CLI configuration:
+Run the portable CLI conformance suite against the gateway selected in your
+OpenShell CLI configuration:
 
 ```shell
-mise run e2e:cli-conformance
+cargo build --package openshell-cli
+OPENSHELL_BIN="$PWD/target/debug/openshell" \
+  cargo test \
+    --locked \
+    --manifest-path tests/suites/conformance/Cargo.toml \
+    --package openshell-test-conformance-cli \
+    --no-fail-fast \
+    -- \
+    --test-threads=1 \
+    --nocapture
 ```
 
-The gateway must already be installed, reachable, and selected before the task
-starts. The task does not provision a gateway or select a compute driver. Set
-`OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
-the current checkout.
+The gateway must already be installed, reachable, and selected before the tests
+start. The test suite does not provision a gateway or select a compute driver.
+Set `OPENSHELL_BIN` to another executable to test a different prebuilt CLI.
 
 The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
 depending on how the gateway was installed or which driver is configured. It
@@ -278,9 +287,9 @@ openshell sandbox list --output json
 openshell sandbox delete <sandbox-name>
 ```
 
-Gateway-backed Rust E2E tasks build the standalone conformance CLI, run its
-registered scenarios against the configured gateway, then run any lane-specific
-Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
+Gateway-backed Rust E2E tasks run the CLI conformance Cargo tests against the
+configured gateway, then run any lane-specific Rust tests that still apply.
+Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
 mise run e2e:podman
@@ -305,11 +314,37 @@ Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
-gateway controls, host fixtures, missing guest tools, or nondeterministic relay
-setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
+gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
+guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
 binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
+
+The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
+OCI image identity and working-directory behavior shared by the Docker and
+Podman drivers against installed deb packages on Ubuntu and rpm packages on
+Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+```
+
+The shared suite also runs in the existing ARM64 Docker E2E workflow for
+branch checks and both release workflows. That interim lane compiles the same
+test crate natively and uses the architecture-matched prebuilt candidate CLI
+and gateway plus the candidate multi-architecture sandbox and supervisor
+images through `e2e/with-docker-gateway.sh`. The tmachine lanes still use
+x86_64 artifacts; they do not replace ARM64 image coverage.
+
+Run it against a local Docker or Podman gateway:
+
+```shell
+mise run e2e:oci-image
+mise run e2e:oci-image:podman
+```
+
+Both tasks set `OPENSHELL_TEST_CONTAINER_ENGINE`, the command that builds test
+images into the gateway's image store.
 
 Run the VM-backed Rust CLI e2e suite:
 
@@ -490,7 +525,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test custom_image
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:
