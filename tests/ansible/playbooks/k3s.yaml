@@ -8,7 +8,7 @@
   gather_facts: false
   vars:
     helm_version: 4.2.0
-    k3s_version: 1.36.3+k3s1
+    k3s_version: 1.29.15+k3s1
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
