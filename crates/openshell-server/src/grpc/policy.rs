@@ -24596,6 +24596,7 @@ mod tests {
             non_member_request(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sandbox-other".into(),
                 supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
             }),
         )
         .await
