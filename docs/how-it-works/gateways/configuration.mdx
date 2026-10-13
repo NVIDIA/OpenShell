@@ -968,6 +968,9 @@ sandbox_label      = "docker-dev"
 # host (default) or bridge networking for the supervisor.
 # Operator-owned; sandbox driver config cannot override this choice.
 supervisor_network_mode = "host"
+# Optional host-address override. Bridge mode otherwise uses Docker's default
+# bridge gateway; Desktop and custom Docker setups may need a different IP.
+# host_gateway_ip = "172.29.0.254"
 # Optional override. Omit for automatic host or bridge callback selection.
 # grpc_endpoint = "https://gateway.example.com:17670"
 # Workload-side runtime. Defaults to the gateway version.
@@ -1017,8 +1020,16 @@ explicit endpoint for remapped ports. HTTPS certificates must cover the endpoint
 The local `gateway:docker` task uses automatic endpoint selection unless you set
 `OPENSHELL_GRPC_ENDPOINT`.
 
-Bridge resolves both host aliases through Docker's `host-gateway`; native Linux
-services bound only to loopback remain unreachable. Desktop host mode requires
+In bridge mode, the driver uses the default Docker bridge network's gateway IP
+for `host.openshell.internal` and `host.docker.internal`, preferring IPv4.
+This heuristic works with standard native Linux Docker networking. Docker
+Desktop and custom daemon host-gateway settings may use a different host IP:
+set `host_gateway_ip` to the address reachable from the supervisor. This
+operator-owned setting also overrides the host aliases in host mode. The
+driver uses the same IP for the aliases and the sandbox's trusted host address.
+If the bridge has no unique gateway, configure `host_gateway_ip` explicitly.
+
+Native Linux services bound only to loopback remain unreachable from bridge mode. Desktop host mode requires
 host networking enabled. The sandbox must pass Landlock and seccomp
 qualification in either mode. Configure the OTLP collector endpoint to be
 reachable from the selected supervisor network; a loopback collector URL in

@@ -196,6 +196,9 @@ pub struct DockerComputeConfig {
     /// Networking mode for the supervisor only. Workloads always use network=none.
     pub supervisor_network_mode: DockerSupervisorNetworkMode,
 
+    /// Override the trusted host address. Bridge mode otherwise uses the default bridge gateway.
+    pub host_gateway_ip: Option<IpAddr>,
+
     /// Image containing the trusted `openshell-sandbox` binary.
     pub sandbox_runtime_image: Option<String>,
 
@@ -296,6 +299,7 @@ impl Default for DockerComputeConfig {
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
             supervisor_network_mode: DockerSupervisorNetworkMode::Host,
+            host_gateway_ip: None,
             sandbox_runtime_image: None,
             supervisor_bin: None,
             supervisor_image: None,
@@ -334,6 +338,7 @@ struct DockerDriverRuntimeConfig {
     supervisor_network_mode: DockerSupervisorNetworkMode,
     supervisor_endpoint_explicit: bool,
     bridge_default_endpoint: Option<String>,
+    host_gateway_ip: Option<IpAddr>,
     ssh_socket_path: String,
     guest_tls: Option<DockerGuestTlsPaths>,
     gpu: DockerGpuRuntimeCapabilities,
@@ -928,6 +933,26 @@ impl DockerComputeDriver {
             ))
         })?;
         let supervisor_grpc_endpoint = docker_config.grpc_endpoint.clone();
+        let host_gateway_ip = if let Some(ip) = docker_config.host_gateway_ip {
+            Some(validate_docker_host_gateway_ip(
+                ip,
+                docker_config.supervisor_network_mode,
+            )?)
+        } else if docker_config.supervisor_network_mode == DockerSupervisorNetworkMode::Bridge {
+            let network = docker
+                .inspect_network("bridge", None)
+                .await
+                .map_err(|error| {
+                    Error::config(format!(
+                        "inspect Docker bridge gateway: {error}; set host_gateway_ip explicitly"
+                    ))
+                })?;
+            let ip = docker_bridge_host_gateway_ip(&network)?;
+            info!(host_gateway_ip = %ip, "Using Docker bridge gateway for host aliases; configure host_gateway_ip if the Docker host uses a different address");
+            Some(ip)
+        } else {
+            docker_supervisor_host_address(&supervisor_grpc_endpoint)
+        };
         let supervisor_image = docker_config
             .supervisor_image
             .clone()
@@ -975,6 +1000,7 @@ impl DockerComputeDriver {
                 supervisor_network_mode: docker_config.supervisor_network_mode,
                 supervisor_endpoint_explicit,
                 bridge_default_endpoint,
+                host_gateway_ip,
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
                 gpu,
@@ -4599,10 +4625,7 @@ async fn prepare_docker_boundary_files(
             server_name: tls.server_name.clone(),
             trust_anchor_pem: tls.trust_anchor_pem.clone(),
         },
-        // Host mode pins the alias to the gateway address, normally loopback.
-        // In bridge mode the companion replaces this value from its own
-        // Docker-injected hosts file before attaching the descriptor.
-        host_gateway_ip: docker_supervisor_host_address(&config.supervisor_grpc_endpoint),
+        host_gateway_ip: config.host_gateway_ip,
         workload_identity: workload_identity.clone(),
         child_env: docker_child_environment(sandbox),
     }
@@ -5012,6 +5035,7 @@ fn docker_supervisor_host_config(
     mounts: Vec<Mount>,
     grpc_endpoint: &str,
     network_mode: DockerSupervisorNetworkMode,
+    host_gateway_ip: Option<IpAddr>,
 ) -> HostConfig {
     HostConfig {
         // The supervisor is trusted infrastructure and originates every
@@ -5026,16 +5050,18 @@ fn docker_supervisor_host_config(
             }
             .to_string(),
         ),
-        extra_hosts: if network_mode == DockerSupervisorNetworkMode::Bridge {
-            // Docker resolves host-gateway on the daemon, including Desktop's VM.
-            // The gateway endpoint may be remote and must not define host aliases.
-            Some(vec![
-                format!("{HOST_OPEN_SHELL_INTERNAL}:host-gateway"),
-                format!("{HOST_DOCKER_INTERNAL}:host-gateway"),
-            ])
-        } else {
-            docker_supervisor_host_aliases(grpc_endpoint)
-        },
+        extra_hosts: host_gateway_ip
+            .map(|ip| {
+                let address = match ip {
+                    IpAddr::V4(ip) => ip.to_string(),
+                    IpAddr::V6(ip) => format!("[{ip}]"),
+                };
+                vec![
+                    format!("{HOST_OPEN_SHELL_INTERNAL}:{address}"),
+                    format!("{HOST_DOCKER_INTERNAL}:{address}"),
+                ]
+            })
+            .or_else(|| docker_supervisor_host_aliases(grpc_endpoint)),
         mounts: Some(mounts),
         cap_drop: Some(vec!["ALL".to_string()]),
         cap_add: None,
@@ -5190,9 +5216,6 @@ async fn spawn_docker_control_process(
         workspace_root,
         format!("--health-socket-path={SUPERVISOR_HEALTH_SOCKET_PATH}"),
     ];
-    if network_mode == DockerSupervisorNetworkMode::Bridge {
-        command.push("--host-gateway-from-hosts".to_string());
-    }
     command.extend(docker_upstream_proxy_cli_args(
         &config.upstream_proxy,
         config.proxy_ca_bundle.is_some(),
@@ -5258,6 +5281,7 @@ async fn spawn_docker_control_process(
             supervisor_mounts,
             &supervisor_endpoint,
             network_mode,
+            config.host_gateway_ip,
         )),
         ..Default::default()
     };
@@ -6626,6 +6650,60 @@ fn default_docker_bridge_endpoint(
     } else {
         None
     }
+}
+
+fn validate_docker_host_gateway_ip(
+    ip: IpAddr,
+    mode: DockerSupervisorNetworkMode,
+) -> CoreResult<IpAddr> {
+    let normalized = match ip {
+        IpAddr::V6(ip) => ip.to_ipv4_mapped().map_or(IpAddr::V6(ip), IpAddr::V4),
+        ip @ IpAddr::V4(_) => ip,
+    };
+    if normalized.is_unspecified()
+        || normalized.is_multicast()
+        || (mode == DockerSupervisorNetworkMode::Bridge && normalized.is_loopback())
+        || matches!(normalized, IpAddr::V4(ip) if ip.is_link_local() || ip.is_broadcast())
+        || matches!(normalized, IpAddr::V6(ip) if ip.is_unicast_link_local())
+    {
+        return Err(Error::config(format!(
+            "invalid Docker host_gateway_ip '{ip}' for {mode:?} networking"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn docker_bridge_host_gateway_ip(network: &bollard::models::NetworkInspect) -> CoreResult<IpAddr> {
+    let addresses = network
+        .ipam
+        .as_ref()
+        .and_then(|ipam| ipam.config.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|config| config.gateway.as_deref())
+        .map(str::parse::<IpAddr>)
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .map_err(|error| {
+            Error::config(format!(
+                "invalid Docker bridge gateway: {error}; set host_gateway_ip explicitly"
+            ))
+        })?;
+    let ipv4 = addresses
+        .iter()
+        .copied()
+        .filter(IpAddr::is_ipv4)
+        .collect::<Vec<_>>();
+    let candidates = if ipv4.is_empty() {
+        addresses.into_iter().collect::<Vec<_>>()
+    } else {
+        ipv4
+    };
+    let [ip] = candidates.as_slice() else {
+        return Err(Error::config(
+            "Docker bridge does not report a unique gateway; set host_gateway_ip explicitly",
+        ));
+    };
+    validate_docker_host_gateway_ip(*ip, DockerSupervisorNetworkMode::Bridge)
 }
 
 fn docker_supervisor_networking(

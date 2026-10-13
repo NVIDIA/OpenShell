@@ -112,11 +112,13 @@ compute_driver = "docker"
 socket_path = "/var/run/docker.sock"
 ```
 
-Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `supervisor_network_mode`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
+Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `supervisor_network_mode`, `host_gateway_ip`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
 `supervisor_network_mode` defaults to `host`. Set `bridge` to use Docker bridge networking; `auto` also selects host. The workload always retains `network=none`.
 
 Host mode on Docker Desktop requires host networking enabled. Bridge mode automatically uses `host.docker.internal` for a gateway on the Desktop host. On native Linux, the gateway and host services must listen on bridge-reachable addresses. Set `grpc_endpoint` for remote gateways, remapped published ports, or other custom layouts. Endpoint selection preserves TLS verification and does not change the gateway's listener. See [Docker configuration](/how-it-works/gateways/configuration#docker).
+
+Bridge mode maps the host aliases to Docker's default bridge gateway IP. Set `host_gateway_ip` when Docker Desktop or a custom daemon uses a different host address.
 
 The sandbox must pass its Landlock and seccomp qualification in either network mode. For GPU sandboxes, configure Docker CDI before starting the gateway.
 

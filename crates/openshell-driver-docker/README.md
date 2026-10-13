@@ -182,12 +182,17 @@ uses its sandbox-scoped bearer token to authenticate RPCs. User client
 certificates and private keys are not delivered to either container.
 
 Host mode on Docker Desktop requires host networking enabled in Settings.
-Bridge mode uses Docker-resolved `host-gateway` entries for both
-host aliases. The supervisor's `--host-gateway-from-hosts` option pins the
-numeric address from its own driver-owned `/etc/hosts` into the runtime
-descriptor before attaching the workload; workload DNS and hosts files cannot
-select this address. Gateway endpoints and host aliases are independent in
-bridge mode.
+In bridge mode, the driver inspects the default `bridge` network's IPAM gateway
+at gateway startup, preferring a unique IPv4 address and otherwise a unique
+IPv6 address. Set the operator-owned `host_gateway_ip` to override this
+heuristic. Docker Desktop and custom daemon host-gateway settings can use a
+different host address and require the override. Missing or ambiguous gateway
+metadata produces an actionable configuration error.
+
+The driver uses the selected address for both host aliases and the runtime
+descriptor's trust pin; workload DNS and hosts files cannot select it. Host
+mode retains its gateway-address pin unless `host_gateway_ip` is configured.
+No helper container or supervisor-specific resolution flag is required.
 
 When `grpc_endpoint` is omitted, bridge mode uses `host.docker.internal` on
 Desktop or for a wildcard gateway listener, and the concrete bind address for

@@ -215,6 +215,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_network_mode: DockerSupervisorNetworkMode::Host,
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
+        host_gateway_ip: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -3037,6 +3038,7 @@ fn docker_supervisor_uses_host_network() {
         Vec::new(),
         "https://127.0.0.1:17670",
         DockerSupervisorNetworkMode::Host,
+        None,
     );
 
     assert_eq!(host.network_mode.as_deref(), Some("host"));
@@ -3057,6 +3059,7 @@ fn docker_supervisor_maps_host_aliases_to_the_gateway_address() {
         Vec::new(),
         "https://172.20.0.4:17670",
         DockerSupervisorNetworkMode::Host,
+        None,
     );
 
     assert_eq!(
@@ -3078,6 +3081,7 @@ fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
         Vec::new(),
         "https://gateway.example.com:17670",
         DockerSupervisorNetworkMode::Host,
+        None,
     );
 
     assert_eq!(host.extra_hosts, None);
@@ -3194,13 +3198,14 @@ fn docker_bridge_host_aliases_are_independent_of_gateway_endpoint() {
         Vec::new(),
         "https://gateway.example.com:9443",
         DockerSupervisorNetworkMode::Bridge,
+        Some("172.17.0.1".parse().unwrap()),
     );
     assert_eq!(host.network_mode.as_deref(), Some("bridge"));
     assert_eq!(
         host.extra_hosts,
         Some(vec![
-            "host.openshell.internal:host-gateway".into(),
-            "host.docker.internal:host-gateway".into()
+            "host.openshell.internal:172.17.0.1".into(),
+            "host.docker.internal:172.17.0.1".into()
         ])
     );
     assert_eq!(host.cap_drop, Some(vec!["ALL".into()]));
@@ -3217,6 +3222,81 @@ fn docker_bridge_host_aliases_are_independent_of_gateway_endpoint() {
             .network_mode
             .as_deref(),
         Some("none")
+    );
+}
+
+#[test]
+fn docker_bridge_gateway_heuristic_prefers_ipv4_and_requires_one_safe_address() {
+    let network = |gateways: &[&str]| {
+        serde_json::from_value::<bollard::models::NetworkInspect>(
+        serde_json::json!({"IPAM": {"Config": gateways.iter().map(|ip| serde_json::json!({"Gateway": ip})).collect::<Vec<_>>()}})
+    ).unwrap()
+    };
+    assert_eq!(
+        docker_bridge_host_gateway_ip(&network(&["172.17.0.1", "fd00::1"])).unwrap(),
+        "172.17.0.1".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(
+        docker_bridge_host_gateway_ip(&network(&["fd00::1"])).unwrap(),
+        "fd00::1".parse::<IpAddr>().unwrap()
+    );
+    for gateways in [
+        &[][..],
+        &["172.17.0.1", "172.18.0.1"][..],
+        &["bad-ip"][..],
+        &["169.254.169.254"][..],
+        &["127.0.0.1"][..],
+        &["::ffff:127.0.0.1"][..],
+    ] {
+        assert!(
+            docker_bridge_host_gateway_ip(&network(gateways)).is_err(),
+            "{gateways:?}"
+        );
+    }
+}
+
+#[test]
+fn docker_host_gateway_override_is_operator_owned_and_matches_the_alias_pin() {
+    let config: DockerComputeConfig =
+        toml::from_str("supervisor_network_mode = 'bridge'\nhost_gateway_ip = '172.29.0.254'")
+            .unwrap();
+    let ip = validate_docker_host_gateway_ip(
+        config.host_gateway_ip.unwrap(),
+        config.supervisor_network_mode,
+    )
+    .unwrap();
+    let host = docker_supervisor_host_config(
+        Vec::new(),
+        "https://gateway.example.com:8443",
+        config.supervisor_network_mode,
+        Some(ip),
+    );
+    assert_eq!(
+        host.extra_hosts.unwrap(),
+        [
+            "host.openshell.internal:172.29.0.254",
+            "host.docker.internal:172.29.0.254"
+        ]
+    );
+    assert!(
+        serde_json::from_value::<DockerSandboxDriverConfig>(
+            serde_json::json!({"host_gateway_ip": "172.29.0.254"})
+        )
+        .is_err()
+    );
+    assert!(
+        validate_docker_host_gateway_ip(
+            "127.0.0.1".parse().unwrap(),
+            DockerSupervisorNetworkMode::Host
+        )
+        .is_ok()
+    );
+    assert!(
+        validate_docker_host_gateway_ip(
+            "0.0.0.0".parse().unwrap(),
+            DockerSupervisorNetworkMode::Host
+        )
+        .is_err()
     );
 }
 

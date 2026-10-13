@@ -320,7 +320,11 @@ Common findings:
   `gateway:docker` task discovers its endpoint unless `OPENSHELL_GRPC_ENDPOINT`
   supplies an override. The OTLP collector endpoint must also be reachable
   from the supervisor's selected network. Mode selection does not bypass
-  Landlock/seccomp qualification. See the
+  Landlock/seccomp qualification. Bridge host aliases use the default Docker
+  bridge gateway as a heuristic; set the operator-owned `host_gateway_ip` if
+  Desktop or custom daemon networking uses a different host address. The driver
+  uses that same address for alias mapping and the sandbox's host trust pin.
+  Missing or ambiguous bridge gateway metadata requires an explicit override. See the
   published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
   for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
