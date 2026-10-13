@@ -141,6 +141,32 @@ impl FromStr for WorkspaceMode {
     }
 }
 
+/// Volume that backs each sandbox's `/sandbox` workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceVolume {
+    /// A per-sandbox PVC that survives Pod replacement.
+    #[default]
+    PersistentVolumeClaim,
+    /// An `emptyDir` capped at `workspace_default_storage_size` that lasts as
+    /// long as the workload Pod.
+    EmptyDir,
+}
+
+impl FromStr for WorkspaceVolume {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "persistent_volume_claim" => Ok(Self::PersistentVolumeClaim),
+            "empty_dir" => Ok(Self::EmptyDir),
+            other => Err(format!(
+                "invalid workspace volume '{other}'; expected persistent_volume_claim or empty_dir"
+            )),
+        }
+    }
+}
+
 fn deserialize_provider_spiffe_workload_api_socket_path<'de, D>(
     deserializer: D,
 ) -> Result<String, D::Error>
@@ -252,6 +278,9 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
+    /// Volume that backs `/sandbox`. Default `persistent_volume_claim`;
+    /// `empty_dir` needs no `StorageClass`.
+    pub workspace_volume: WorkspaceVolume,
     pub workspace_default_storage_size: String,
     /// Kubernetes `StorageClass` name for the default workspace PVC.
     /// Empty string (default) = omit `storageClassName`, using the cluster's
@@ -374,6 +403,7 @@ impl Default for KubernetesComputeConfig {
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
+            workspace_volume: WorkspaceVolume::default(),
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
@@ -1059,6 +1089,20 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.workspace_storage_class, "fast-ssd");
+    }
+
+    #[test]
+    fn serde_override_workspace_volume() {
+        let json = serde_json::json!({ "workspace_volume": "empty_dir" });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_volume, WorkspaceVolume::EmptyDir);
+    }
+
+    #[test]
+    fn serde_rejects_invalid_workspace_volume() {
+        let json = serde_json::json!({ "workspace_volume": "ephemeral" });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]

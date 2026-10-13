@@ -230,7 +230,7 @@ openshell status
 
 ## Upgrade OpenShell
 
-To upgrade, rerun `helm upgrade --install` with the new `--version` and the values you installed with. Running sandboxes keep their supervisor and sandbox runtime images until they stop. When a stopped sandbox starts, it takes both images from the upgraded gateway and keeps its workload image and workspace.
+To upgrade, rerun `helm upgrade --install` with the new `--version` and the values you installed with. Running sandboxes keep their supervisor and sandbox runtime images until they stop. When a stopped sandbox starts, it takes both images from the upgraded gateway and keeps its workload image and workspace PVC.
 
 If you override images, set `supervisor.image` and `sandboxRuntime.image` to the same release, or set only `global.image.tag`. An incompatible pair fails when a sandbox starts, and the supervisor log shows the cause while the start is in progress:
 
