@@ -80,7 +80,7 @@ OpenShell keeps skills for using the product separate from skills for developing
 
 ### Skills for Using OpenShell
 
-Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`.
+Public skills live in `skills/` and work without an OpenShell source checkout. Install them with `npx skills add NVIDIA/OpenShell`. To install the skills from a specific release, add its tag: `npx skills add NVIDIA/OpenShell#<release-tag>`.
 
 | Skill | Purpose |
 | --- | --- |
@@ -89,7 +89,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
 | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
 
-Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
+Public skills use `openshell agent context` and `openshell <command> --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
 ### Agent Skills for Contributors
 

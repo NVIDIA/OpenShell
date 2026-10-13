@@ -22,6 +22,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | Security assessment or remediation | `review-security-issue`, `fix-security-issue` |
 | Published docs workflow | `update-docs-from-commits` |
 | CLI commands, flags, defaults, or workflows | `openshell-cli` |
+| `openshell agent context` output or usage | `openshell-cli`, `generate-sandbox-policy`, `debug-inference`, `debug-openshell-cluster` |
 | Sandbox policy schema or enforcement | `generate-sandbox-policy`, `openshell-cli` |
 | Gateway deployment, Helm, drivers, or health checks | `debug-openshell-cluster`, `helm-dev-environment` |
 | Inference providers or native model endpoints | `debug-inference`, `openshell-cli` |

@@ -5193,6 +5193,32 @@ pub async fn sandbox_upload(
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
 
+/// Parse and validate a policy file locally, without contacting a gateway.
+///
+/// Runs the schema and safety validation the gateway also applies to a
+/// submitted policy and reports every violation, so a policy can be checked
+/// before `policy set`.
+pub fn policy_validate(policy_path: &str) -> Result<()> {
+    let policy = openshell_policy::parse_sandbox_policy_file(Path::new(policy_path))
+        .wrap_err_with(|| format!("{policy_path} is not a valid policy"))?;
+    match openshell_policy::validate_and_canonicalize_sandbox_policy(policy) {
+        Ok(_) => {
+            println!("{policy_path}: valid");
+            Ok(())
+        }
+        Err(error) => {
+            let violations = error.violations();
+            for violation in violations {
+                eprintln!("  {violation}");
+            }
+            Err(miette::miette!(
+                "{policy_path} has {} policy violation(s)",
+                violations.len()
+            ))
+        }
+    }
+}
+
 pub async fn sandbox_policy_set_global(
     server: &str,
     policy_path: &str,

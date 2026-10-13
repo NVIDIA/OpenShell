@@ -12,6 +12,7 @@ pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(()
 #[cfg(test)]
 pub(crate) mod test_utils;
 
+pub mod agent;
 pub mod auth;
 pub mod color;
 pub(crate) mod commands;

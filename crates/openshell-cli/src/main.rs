@@ -278,6 +278,7 @@ const HELP_TEMPLATE: &str = "\
   doctor:      Diagnose gateway issues
 
 \x1b[1mADDITIONAL COMMANDS\x1b[0m
+  agent:       Print CLI context for coding agents
   term:        Launch the OpenShell interactive TUI
   completions: Generate shell completions
   ssh-proxy:   SSH proxy (used by ProxyCommand)
@@ -424,6 +425,10 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell doctor check
+";
+
+const AGENT_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell agent context
 ";
 
 /// `OpenShell` CLI - agent execution and management.
@@ -642,6 +647,13 @@ enum Commands {
     // ===================================================================
     // ADDITIONAL COMMANDS
     // ===================================================================
+    /// Print CLI context for coding agents.
+    #[command(after_help = AGENT_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Agent {
+        #[command(subcommand)]
+        command: Option<AgentCommands>,
+    },
+
     /// Launch the `OpenShell` interactive TUI.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Term {
@@ -758,6 +770,16 @@ If no profile exists yet, create one first:
 
    New-Item -Path $PROFILE -Type File -Force
 ";
+
+/// Write command output to stdout, treating a closed pipe as success so
+/// commands such as `openshell agent context | head` exit cleanly.
+fn write_stdout(bytes: &[u8]) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
 
 fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) -> Result<String> {
     let script = String::from_utf8(output)
@@ -1418,6 +1440,24 @@ enum GatewayCommands {
         #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
     },
+}
+
+// -----------------------------------------------------------------------
+// Agent commands
+// -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum AgentCommands {
+    /// Print a map of every command and flag for coding agents.
+    ///
+    /// Lists each command with its usage line and summary, and each flag with
+    /// its allowed values, default, environment variable, and the flags it
+    /// cannot be combined with. The map is generated from this binary's
+    /// command definitions, so it always matches the installed version, and
+    /// it is sized to fit in a single agent tool call. Use `--help` on a
+    /// command for flag descriptions.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Context,
 }
 
 // -----------------------------------------------------------------------
@@ -2145,6 +2185,19 @@ enum PolicyCommands {
         /// Timeout for --wait in seconds.
         #[arg(long, default_value_t = 60)]
         timeout: u64,
+    },
+
+    /// Check a policy file without contacting a gateway.
+    ///
+    /// Parses the file and runs the schema and safety validation the gateway
+    /// also applies to a submitted policy, then prints every violation. The
+    /// gateway runs more checks when the policy is applied, including
+    /// endpoint ambiguity, provider composition, and registered middleware.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Validate {
+        /// Path to the policy YAML or JSON file.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        policy: String,
     },
 
     /// Incrementally update policy on a live sandbox.
@@ -3026,6 +3079,12 @@ async fn run_async() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
+        // Local validation needs no gateway, so it runs before gateway resolution.
+        Some(Commands::Policy {
+            command: Some(PolicyCommands::Validate { policy }),
+        }) => {
+            run::policy_validate(&policy)?;
+        }
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
@@ -3171,6 +3230,9 @@ async fn run_async() -> Result<()> {
                         )
                         .await?;
                     }
+                }
+                PolicyCommands::Validate { .. } => {
+                    unreachable!("policy validate runs before gateway resolution")
                 }
                 PolicyCommands::Delete { global, yes } => {
                     if !global {
@@ -4079,6 +4141,20 @@ async fn run_async() -> Result<()> {
             )
             .await?;
         }
+        Some(Commands::Agent {
+            command: Some(AgentCommands::Context),
+        }) => {
+            let reference = openshell_cli::agent::render_context(&Cli::command());
+            write_stdout(reference.as_bytes())
+                .map_err(|e| miette::miette!("failed to write agent context: {e}"))?;
+        }
+        Some(Commands::Agent { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("agent")
+                .expect("agent subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()
                 .map_err(|e| miette::miette!("failed to find current executable: {e}"))?;
@@ -4358,6 +4434,40 @@ mod tests {
     #[test]
     fn cli_debug_assert() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn agent_context_lists_every_visible_command() {
+        fn leaf_paths(cmd: &clap::Command, prefix: &str, paths: &mut Vec<String>) {
+            let path = format!("{prefix} {}", cmd.get_name());
+            let mut children = cmd
+                .get_subcommands()
+                .filter(|c| !c.is_hide_set())
+                .peekable();
+            if children.peek().is_none() {
+                paths.push(path);
+            } else {
+                for child in children {
+                    leaf_paths(child, &path, paths);
+                }
+            }
+        }
+
+        let root = Cli::command();
+        let mut paths = Vec::new();
+        for command in root.get_subcommands().filter(|c| !c.is_hide_set()) {
+            leaf_paths(command, root.get_name(), &mut paths);
+        }
+        let reference = openshell_cli::agent::render_context(&root);
+
+        assert!(paths.len() > 50, "expected many commands, got {paths:?}");
+        for path in paths {
+            assert!(
+                reference.contains(&format!("\n{path}\n"))
+                    || reference.contains(&format!("\n{path} ")),
+                "agent context is missing `{path}`"
+            );
+        }
     }
 
     #[test]

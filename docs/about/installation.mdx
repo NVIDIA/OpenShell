@@ -26,6 +26,12 @@ openshell status
 
 To install a specific release, set `OPENSHELL_VERSION` to a release tag. Release artifacts are also on the [GitHub Releases](https://github.com/NVIDIA/OpenShell/releases) page.
 
+If a coding agent drives the CLI for you, have it run the following command first. It prints a map of every command and flag in the installed CLI, sized to fit in one tool call.
+
+```shell
+openshell agent context
+```
+
 ## Prerelease and Development Builds
 
 Use a prerelease candidate to evaluate an upcoming release, or the rolling development build to test the latest commit on `main`. These builds may change before the next stable release. The matching documentation is published in the [development channel](https://docs.nvidia.com/openshell/dev/index.html).

@@ -153,11 +153,16 @@ YAML as `policy.yaml`, then edit the sections you want to change. Keep
 everything else, including filesystem paths that OpenShell added when the
 sandbox started.
 
-Submit the edited file and wait for the result:
+Check the edited file locally, then submit it and wait for the result:
 
 ```shell
+openshell policy validate --policy policy.yaml
 openshell policy set my-sandbox --policy policy.yaml --wait
 ```
+
+`policy validate` runs the gateway's schema and safety checks without contacting
+it. The gateway runs more checks when you apply the policy, including endpoint
+ambiguity, provider composition, and registered middleware.
 
 </Tab>
 <Tab title="Script with jq">
