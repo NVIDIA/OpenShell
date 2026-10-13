@@ -243,6 +243,7 @@ jobs:
     needs: compute-versions
     permissions:
       contents: read
+      pull-requests: read
     uses: ./.github/workflows/codex-compatibility.yml
     with:
       candidate_ref: ${{ inputs.tag || github.ref_name }}
