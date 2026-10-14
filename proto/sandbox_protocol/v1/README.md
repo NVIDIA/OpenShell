@@ -8,7 +8,7 @@ SPDX-License-Identifier: Apache-2.0
 This is the wire contract for an isolation backend implemented outside the
 OpenShell tree. An implementation may use any language and owns its native
 isolation mechanisms. Generate gRPC bindings from
-[`isolation_backend.proto`](../../isolation_backend.proto),
+[`sandbox_backend.proto`](../../sandbox_backend.proto),
 [`sandbox_protocol.proto`](../../sandbox_protocol.proto), and their imports.
 No OpenShell guest executable or linked backend implementation is required.
 
@@ -30,7 +30,7 @@ The gateway reads `isolation_backend` from the selected compute driver's
 `openshell.supervisor.isolation_backends` in operator-owned `gateway.toml`.
 Selecting `openshell.gateway.compute_driver` selects both the driver and its
 backend; their names can differ.
-It sends the resolved `IsolationBackendRegistration` through the compute
+It sends the resolved `SandboxBackendRegistration` through the compute
 protocol in validation/create specs and every start request, including recovery.
 This requires the driver's `openshell.compute.sandbox-backend`
 capability; unsupported drivers fail gateway startup. Missing selection or
@@ -107,7 +107,7 @@ The public sandbox API has no endpoint or isolation-backend selector.
 ## Authentication and ordering
 
 TLS 1.3 verifies the generation-pinned serving certificate and negotiates HTTP/2
-with ALPN `h2`. Every control RPC except `GetCapabilities`, and every stream,
+with ALPN `h2`. Every control RPC except `Describe`, and every stream,
 uses `authorization: Bearer <sandbox-token>`. The backend validates the token's
 signature with the trusted gateway verification keys and its expiry, audience,
 gateway ID, sandbox ID, runtime generation, and authorization epoch.
@@ -370,6 +370,6 @@ interoperability and launch ordering, and simulates enforcement evidence with a
 fixed test bearer. It does not exercise JWT validation or provide isolation.
 
 Suspend/resume is a separate optional capability described in
-`isolation_backend.proto`. Protocol 1.0 implementations may return
+`sandbox_backend.proto`. Protocol 1.0 implementations may return
 `UNIMPLEMENTED` without advertising it. This registration path supports fresh
 launches; it does not yet orchestrate state-preserving restoration.
