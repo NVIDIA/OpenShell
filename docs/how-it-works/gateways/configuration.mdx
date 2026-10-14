@@ -1020,20 +1020,11 @@ explicit endpoint for remapped ports. HTTPS certificates must cover the endpoint
 The local `gateway:docker` task uses automatic endpoint selection unless you set
 `OPENSHELL_GRPC_ENDPOINT`.
 
-In bridge mode, the driver uses the default Docker bridge network's gateway IP
-for `host.openshell.internal` and `host.docker.internal`, preferring IPv4.
-This heuristic works with standard native Linux Docker networking. Docker
-Desktop and custom daemon host-gateway settings may use a different host IP:
-set `host_gateway_ip` to the address reachable from the supervisor. This
-operator-owned setting also overrides the host aliases in host mode. The
-driver uses the same IP for the aliases and the sandbox's trusted host address.
-If the bridge has no unique gateway, configure `host_gateway_ip` explicitly.
-
-Native Linux services bound only to loopback remain unreachable from bridge mode. Desktop host mode requires
-host networking enabled. The sandbox must pass Landlock and seccomp
-qualification in either mode. Configure the OTLP collector endpoint to be
-reachable from the selected supervisor network; a loopback collector URL in
-bridge mode refers to the supervisor container.
+If host services are unreachable or automatic host-address discovery fails,
+set `host_gateway_ip` to a host address reachable from containers.
+In bridge mode, host services and the configured OTLP collector endpoint must
+be reachable from containers; native Linux loopback-only listeners are unreachable.
+Host mode on Docker Desktop requires host networking enabled.
 
 Docker accepts `http://` and `https://` proxy URLs in explicit
 `scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;
