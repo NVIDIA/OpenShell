@@ -20,14 +20,17 @@ multiple pre-provisioned workspace namespaces.
 ## Cluster-scoped vs namespaced objects
 
 Most objects in this chart are namespaced and land in the release namespace.
-Only two are cluster-scoped:
+These are cluster-scoped:
 
 | Object | Default name |
 | --- | --- |
 | `ClusterRole` | `<fullname>-node-reader-<release namespace>` |
 | `ClusterRoleBinding` | `<fullname>-node-reader-<release namespace>` |
+| `ValidatingAdmissionPolicy` | `<fullname>-workspace-scope-<release namespace>` |
+| `ValidatingAdmissionPolicyBinding` | `<fullname>-workspace-scope-<release namespace>` |
 
-By default the release creates both, so an install by a cluster-admin is
+The admission policy and its binding render only in `managed` and `operator`
+workspace modes. By default the release creates all of them, so an install by a cluster-admin is
 unchanged. On clusters where cluster-scoped RBAC is owned by a different team,
 split the install in two.
 
@@ -43,6 +46,10 @@ helm template openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <ver
   --show-only templates/clusterrole.yaml \
   --show-only templates/clusterrolebinding.yaml | kubectl apply -f -
 ```
+
+In `managed` and `operator` workspace modes, also add
+`--show-only templates/workspace-admission-policy.yaml`, and pass
+`--set admissionPolicy.enabled=false` to the namespace-admin install below.
 
 A namespace-admin then installs and upgrades the release with cluster-scoped
 objects omitted, using [`ci/values-namespace-admin.yaml`](ci/values-namespace-admin.yaml)
@@ -73,7 +80,7 @@ currently held`.
 | --- | --- | --- |
 | `shared` | built-in `admin` only | `rbac.create=false`, cluster-admin pre-creates all gateway RBAC |
 | `shared` | `admin` plus the sandbox permissions in the namespace | `rbac.clusterScoped.create=false` |
-| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false` |
+| `managed`, `operator` | built-in `admin` only | `rbac.clusterScoped.create=false`, `admissionPolicy.enabled=false` |
 
 `managed` and `operator` render no namespaced sandbox `Role`, so no extra grant
 is needed there.
@@ -116,7 +123,18 @@ kubectl annotate clusterrolebinding "openshell-node-reader-<namespace>" \
   helm.sh/resource-policy=keep --overwrite
 ```
 
-The objects then survive the upgrade that sets the flag, and the cluster-admin
+In `managed` and `operator` workspace modes, the namespace-admin release also
+sets `admissionPolicy.enabled=false`, which deletes the admission policy and its
+binding while the gateway keeps its cluster-wide permissions. Annotate them too:
+
+```shell
+kubectl annotate validatingadmissionpolicy "openshell-workspace-scope-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+kubectl annotate validatingadmissionpolicybinding "openshell-workspace-scope-<namespace>" \
+  helm.sh/resource-policy=keep --overwrite
+```
+
+The objects then survive the upgrade that sets the flags, and the cluster-admin
 owns them from that point on. Fresh installs need no such step.
 
 `rbac.clusterScoped.create` is independent of

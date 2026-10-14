@@ -31,6 +31,16 @@ workspace namespace modes via `workspace_mode`:
   gateway state; it never deletes or otherwise accesses the operator-managed
   Kubernetes namespace.
 
+In managed and operator mode, a chart-installed `ValidatingAdmissionPolicy`
+matching only the gateway ServiceAccount limits the ClusterRole's workspace
+grants: Secret, Pod, Sandbox, Service, ServiceAccount, and NetworkPolicy writes
+are admitted only in namespaces labeled as owned by this gateway and namespaces
+matching the operator label selector, with Secret writes also admitted in the
+credential namespace, and Namespace writes only for namespaces this gateway
+owns. The
+gateway cannot patch namespaces, so it cannot add ownership labels to an
+existing namespace. The policy is on by default and can be disabled.
+
 When the gateway configures `[openshell.gateway.otlp]`, Kubernetes
 compute-driver spans export to the same OTLP/gRPC collector with the service
 name `openshell-driver-kubernetes`. The driver preserves the gateway trace
