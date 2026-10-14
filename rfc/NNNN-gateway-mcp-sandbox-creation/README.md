@@ -579,6 +579,14 @@ It reuses the mechanism that serves the `policy.local` API today
   call, so a sandbox without a grant, or with no depth left, reaches the door
   and is refused.
 
+- **Children use their own door.** A child's harness calls the same URL,
+  `http://openshell.local/mcp`, and the child's own supervisor answers it and
+  forwards the call with the child's token. The gateway therefore sees the
+  child, not its parent, and applies the shared grant to it: agents only with
+  depth left, tool sandboxes within breadth and total, and actions only on the
+  child's own descendants. A child runs its parent's image, so its harness
+  already carries the same MCP setting and needs no configuration.
+
 - **Calling program.** The door identifies the calling program from the binary
   identity the isolation backend supplies for the connection (RFC 0012), and
   sends its kernel-resolved path to the gateway in the
