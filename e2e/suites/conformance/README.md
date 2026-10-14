@@ -1,43 +1,127 @@
 # OpenShell conformance suite
 
-Conformance tests exercise required public behavior against a prepared gateway.
-Cargo discovers and runs the tests directly. Each area retains its existing
-scenario implementation and helpers in one integration-test file:
-`file_transfer.rs`, `lifecycle.rs`, `policy_advisor.rs`, and `smoke.rs`.
+Conformance is an end-to-end test type for required public behavior against an
+already configured gateway. This workspace contains Cargo tests organized by
+conformance area and user story. The CLI is the current client interface; lifecycle, file transfer, and policy behavior define the test groups.
 
-The runner, process executor, polling, diagnostics, and cleanup remain in
-`crates/openshell-conformance`. That crate no longer defines scenarios or a
-registry. Existing Rust e2e, driver, and feature consumers retain their harnesses
-and locations. Story-module organization and shared-runner consolidation are
-separate follow-ups.
+## Layout
 
-## Run
+- `cli/tests/<area>/main.rs`: declares story modules for one Cargo test target.
+- `cli/tests/<area>/<story>.rs`: test functions, steps, and assertions for a story.
+- `cli/tests/<area>/helpers.rs`: setup and assertions shared by that area's stories.
 
-Supply the matching candidate CLI and a configured gateway:
+The current areas are `file_transfer`, `lifecycle`, `policy_advisor`, and `smoke`.
+Each area compiles into one test binary; individual stories remain selectable by
+their module prefix. `main.rs` contains only module declarations.
+
+CLI execution, polling, diagnostics, and cleanup remain in
+`crates/openshell-conformance`. Story modules implement their tests directly;
+Cargo and nextest provide discovery and selection. The runner crate contains no
+scenario registry. Existing Rust e2e tests retain their separate harness.
+
+For example, run only file-transfer round trips against a prepared gateway:
 
 ```shell
 OPENSHELL_BIN=/absolute/path/to/openshell \
   cargo test --locked --manifest-path e2e/suites/conformance/Cargo.toml \
-    --package openshell-test-conformance-cli -- --test-threads=1 --nocapture
+    --test file_transfer round_trip::
 ```
 
-Use `--test file_transfer`, `--test lifecycle`, `--test policy_advisor`, or
-`--test smoke` to select an area. Existing test names remain available for
-focused selection. The lifecycle test retains combined stop/start persistence
-and stopped-sandbox deletion checks.
+## Run without a gateway
 
-## Source checks
+Run shared tooling and scenario unit tests:
 
 ```shell
 cargo test --locked --package openshell-conformance
 cargo test --locked --manifest-path e2e/suites/conformance/Cargo.toml \
-  --package openshell-test-conformance-cli --test policy_advisor draft_assertion
+  --package openshell-test-conformance-cli --test policy_advisor draft_assertion::tests::
 ```
 
-The runner unit tests and three policy assertions run without a gateway. Other
-integration tests require target preparation and run in the existing driver E2E
-and installed nextest archive lanes. Tests register resources before creation,
-use unique names, and always call `OpenShellRunner::finish` so cleanup failures
-remain visible. Bounded polling observes asynchronous state; failed assertions
-are not retried. Live tests and public internet dependencies remain outside
-source unit checks.
+Compile the gateway-backed entry points without executing them:
+
+```shell
+cargo test --locked --manifest-path e2e/suites/conformance/Cargo.toml \
+  --package openshell-test-conformance-cli --no-run
+```
+
+Repository formatting, Clippy, and unit-test checks include this workspace.
+The unit-test commands select only the pure policy assertion tests. Running every
+workspace test also executes the gateway-backed cases.
+
+## Run against a prepared gateway
+
+Install, register, and select the gateway before starting the suite. Supply the
+matching candidate CLI explicitly:
+
+```shell
+OPENSHELL_BIN=/absolute/path/to/openshell \
+  cargo test --locked --manifest-path e2e/suites/conformance/Cargo.toml \
+    --package openshell-test-conformance-cli --no-fail-fast -- \
+    --test-threads=1 --nocapture
+```
+
+For development, use a suite, CLI, and gateway from the same candidate build.
+Cross-version qualification is not defined. The suite does not install OpenShell, start a gateway, or select a compute driver. The target
+must supply the workload image and tools used by the selected scenarios. Missing
+CLI or gateway prerequisites fail the run rather than silently passing.
+
+Run one group with `--test file_transfer`, `--test lifecycle`,
+`--test policy_advisor`, or `--test smoke`, before the `--` separator. A group or
+individual-test filter exercises only part of the suite.
+
+The tmachine conformance testsuite runs these same entry points from the
+nextest archive built by `build-openshell-conformance-test-archive`. See
+[CI.md](../../../CI.md) for the implemented integration lanes and
+[the test-guest guide](../../../nix/test-guest/README.md) for preparation
+and artifact execution. Archive construction selects the CLI test package;
+harness unit tests run separately in source checks.
+
+## Add or change a test
+
+Document the expected public behavior, preconditions, required permissions, and
+significant side effects beside each scenario implementation. Use descriptive,
+stable test names so results can be tracked across runs. Add the Cargo entry point
+in the behavior group it exercises. Preserve existing test names when moving code so
+Cargo and nextest filters keep working.
+
+Use structured CLI output and sandbox operations for behavioral assertions.
+Separate end-user and administrative interactions into different tests. Tests
+may modify resources and settings through public APIs within their declared
+permissions; deployment configuration belongs to target preparation. Keep
+runtime inspection and host-specific assertions in driver suites. Behavioral
+assertions must not depend on public internet services.
+
+Tests must clean up their changes. Use unique resource names, register resources
+before creation, and call `OpenShellRunner::finish` even when the scenario fails so it
+attempts cleanup. Cleanup failures must remain visible. Current policy-advisor
+cases set the proposal setting on their own sandbox; the suite runs serially.
+
+## Failures and evidence
+
+Every conformance test checks required behavior. A failing test on a supported
+target records a conformance gap; missing support must not turn the result into
+a passing test. Cargo currently reports ordinary test success or failure.
+
+Investigate failures and track their product, test, or infrastructure causes.
+Retain the result and failure logs with the revision, target configuration, and
+run duration. Notify the responsible maintainers of new failures. Do not
+configure automatic retries for failed tests.
+
+An explicit waiver records its scope, rationale, and tracking issue while
+retaining the failed result. Waivers are review decisions, not changes to test
+assertions or successful results. Automated evidence retention, notifications,
+and waiver handling remain implementation work.
+
+## Migration scope
+
+The conformance workspace lives under `e2e/suites/conformance/`; feature and
+driver suites remain under `tests/suites/`, alongside target provisioning. Existing
+assertions and test identities are preserved. The legacy mixed suites under
+`e2e/rust/` still need classification and migration by behavioral intent.
+
+[RFC 0016](https://github.com/NVIDIA/OpenShell/pull/3460) also proposes independent
+conformance, feature, and driver PR selection, release qualification, and later
+restart/upgrade disruption tests. Those execution changes and packaging for runs
+without a source checkout are separate follow-ups in
+[#3954](https://github.com/NVIDIA/OpenShell/issues/3954). See [CI.md](../../../CI.md) for the
+implemented gates; this layout change does not establish those proposed gates.

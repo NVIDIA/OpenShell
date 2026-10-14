@@ -1,144 +1,32 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable sandbox lifecycle conformance scenarios.
-
-use std::collections::HashSet;
-use std::time::{Duration, Instant};
-
+use openshell_conformance::OpenShellRunner;
+use openshell_conformance::Poll;
 use serde::Deserialize;
+use std::collections::HashSet;
+use std::time::Duration;
+use std::time::Instant;
 
-use openshell_conformance::{OpenShellRunner, Poll};
-
-const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
-const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
-const TRANSITION_TIMEOUT: Duration = Duration::from_mins(4);
-const TRANSITION_INTERVAL: Duration = Duration::from_secs(2);
-
-#[derive(Debug, Deserialize)]
-struct SandboxState {
-    id: String,
-    name: String,
-    phase: String,
-}
+pub const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
+pub const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
+pub const TRANSITION_TIMEOUT: Duration = Duration::from_mins(4);
+pub const TRANSITION_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize)]
-struct SandboxListPage {
-    sandboxes: Vec<SandboxState>,
-    next_page_token: String,
+pub struct SandboxState {
+    pub id: String,
+    pub name: String,
+    pub phase: String,
 }
 
-/// Certify sandbox stop, start, and deletion lifecycle behavior.
-
-#[tokio::test]
-async fn sandbox_lifecycle() {
-    let mut runner = OpenShellRunner::from_env("sandbox-lifecycle")
-        .expect("candidate openshell CLI is available");
-    let result = async {
-        runner.check_gateway_status().await?;
-        let runner = &mut runner;
-        stop_start_preserves_workspace(runner).await?;
-        stopped_can_be_deleted(runner).await
-    }
-    .await;
-    if let Err(error) = runner.finish(result).await {
-        panic!("sandbox-lifecycle conformance scenario failed:\n{error}");
-    }
+#[derive(Debug, Deserialize)]
+pub struct SandboxListPage {
+    pub sandboxes: Vec<SandboxState>,
+    pub next_page_token: String,
 }
 
-async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<(), String> {
-    let sandbox_name = format!("ct-{}-ss", runner.id());
-    let sentinel = format!("openshell-stop-start-{}", runner.id());
-    let sentinel_path = "/sandbox/.openshell-stop-start-sentinel";
-    let run_count_path = "/sandbox/.openshell-main-run-count";
-    let main = format!(
-        "count=0; test ! -f '{run_count_path}' || count=$(cat '{run_count_path}'); \
-         count=$((count + 1)); printf '%s\\n' \"$count\" > '{run_count_path}'; \
-         exec sleep infinity"
-    );
-
-    create_running_sandbox(runner, &sandbox_name, &main, "stop-start").await?;
-    exec_expect_exact(
-        runner,
-        &sandbox_name,
-        "write-sentinel",
-        &[
-            "sh",
-            "-lc",
-            &format!("printf '%s\\n' '{sentinel}' > '{sentinel_path}' && sync"),
-        ],
-        "",
-    )
-    .await?;
-
-    run_lifecycle_command(runner, "stop", &sandbox_name, "stop-start/stop").await?;
-    wait_for_phase(runner, &sandbox_name, "Stopped", "stop-start/stopped").await?;
-
-    let stopped_exec = runner
-        .step("stop-start/exec-while-stopped")
-        .description(format!(
-            "sandbox '{sandbox_name}' rejects exec while stopped"
-        ))
-        .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            &sandbox_name,
-            "--no-tty",
-            "--",
-            "cat",
-            sentinel_path,
-        ])
-        .await
-        .map_err(|error| error.to_string())?;
-    if stopped_exec.success() {
-        return Err(
-            stopped_exec.failure_diagnostic("sandbox exec fails while the sandbox is stopped")
-        );
-    }
-
-    run_lifecycle_command(runner, "start", &sandbox_name, "stop-start/start").await?;
-    wait_for_phase(runner, &sandbox_name, "Ready", "stop-start/restarted").await?;
-
-    exec_expect_exact(
-        runner,
-        &sandbox_name,
-        "read-sentinel",
-        &["cat", sentinel_path],
-        &format!("{sentinel}\n"),
-    )
-    .await?;
-    exec_expect_exact(
-        runner,
-        &sandbox_name,
-        "read-main-run-count",
-        &["cat", run_count_path],
-        "2\n",
-    )
-    .await
-}
-
-async fn stopped_can_be_deleted(runner: &mut OpenShellRunner) -> Result<(), String> {
-    let sandbox_name = format!("ct-{}-sd", runner.id());
-    create_running_sandbox(
-        runner,
-        &sandbox_name,
-        "exec sleep infinity",
-        "stopped-delete",
-    )
-    .await?;
-
-    run_lifecycle_command(runner, "stop", &sandbox_name, "stopped-delete/stop").await?;
-    let sandbox =
-        wait_for_phase(runner, &sandbox_name, "Stopped", "stopped-delete/stopped").await?;
-    run_lifecycle_command(runner, "delete", &sandbox_name, "stopped-delete/delete").await?;
-    wait_for_absence(runner, &sandbox.id, &sandbox_name, "stopped-delete/deleted").await?;
-    runner.forget_sandbox(&sandbox_name);
-    Ok(())
-}
-
-async fn create_running_sandbox(
+pub async fn create_running_sandbox(
     runner: &mut OpenShellRunner,
     sandbox_name: &str,
     main: &str,
@@ -169,7 +57,7 @@ async fn create_running_sandbox(
         .map(|_| ())
 }
 
-async fn run_lifecycle_command(
+pub async fn run_lifecycle_command(
     runner: &OpenShellRunner,
     operation: &str,
     sandbox_name: &str,
@@ -185,7 +73,7 @@ async fn run_lifecycle_command(
     result.require_success()
 }
 
-async fn exec_expect_exact(
+pub async fn exec_expect_exact(
     runner: &OpenShellRunner,
     sandbox_name: &str,
     step: &str,
@@ -209,7 +97,7 @@ async fn exec_expect_exact(
     }
 }
 
-async fn wait_for_phase(
+pub async fn wait_for_phase(
     runner: &mut OpenShellRunner,
     sandbox_name: &str,
     expected_phase: &str,
@@ -259,7 +147,7 @@ async fn wait_for_phase(
         .map_err(|error| error.to_string())
 }
 
-async fn wait_for_absence(
+pub async fn wait_for_absence(
     runner: &mut OpenShellRunner,
     sandbox_id: &str,
     sandbox_name: &str,
@@ -288,7 +176,7 @@ async fn wait_for_absence(
         .map_err(|error| error.to_string())
 }
 
-async fn sandbox_is_listed(
+pub async fn sandbox_is_listed(
     runner: &OpenShellRunner,
     sandbox_id: &str,
     sandbox_name: &str,

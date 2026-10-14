@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable phase-1 CLI conformance scenario.
-
-use std::time::{Duration, Instant};
-
-use openshell_conformance::{OpenShellRunner, STATUS_TIMEOUT};
+use openshell_conformance::OpenShellRunner;
+use openshell_conformance::STATUS_TIMEOUT;
 use serde::Deserialize;
+use std::time::Duration;
+use std::time::Instant;
 use tokio::time::sleep;
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -28,106 +27,101 @@ struct SandboxListPage {
     next_page_token: String,
 }
 
-/// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-
+/// Verify status, creation, listing, execution, and deletion through the CLI.
 #[tokio::test]
-async fn smoke() {
+async fn creates_executes_and_deletes_a_sandbox() {
     let mut runner =
         OpenShellRunner::from_env("smoke").expect("candidate openshell CLI is available");
     let result = async {
         runner.check_gateway_status().await?;
         let runner = &mut runner;
-        run_smoke_inner(runner).await
+        let status = runner
+            .step("status")
+            .description("openshell status succeeds")
+            .with_timeout(STATUS_TIMEOUT)
+            .run(&["status"])
+            .await
+            .map_err(|error| error.to_string())?;
+        status.require_success()?;
+
+        let sandbox_name = format!("ct-{}-01", runner.id());
+        runner.track_sandbox(&sandbox_name);
+        let create = runner
+            .step("create")
+            .description("sandbox creation succeeds")
+            .with_timeout(CREATE_TIMEOUT)
+            .run(&["sandbox", "create", "--name", &sandbox_name, "--detach"])
+            .await
+            .map_err(|error| error.to_string())?;
+        create.require_success()?;
+
+        let get = runner
+            .step("get-ready")
+            .description(format!("sandbox '{sandbox_name}' can be retrieved"))
+            .with_timeout(LIST_ATTEMPT_TIMEOUT)
+            .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
+            .await
+            .map_err(|error| error.to_string())?;
+        get.require_success()?;
+
+        let sandbox = get
+            .json::<SandboxListEntry>()
+            .map_err(|error| error.to_string())?;
+        if sandbox.name != sandbox_name {
+            return Err(format!(
+                "sandbox get returned {:?}; expected sandbox '{sandbox_name}'",
+                sandbox.name
+            ));
+        }
+        if sandbox.phase != "Ready" {
+            return Err(format!(
+                "sandbox '{sandbox_name}' is in phase {:?}; expected Ready",
+                sandbox.phase
+            ));
+        }
+
+        check_sandbox_listed(runner, &sandbox_name).await?;
+
+        let marker = format!("openshell-conformance-{}", runner.id());
+        let exec = runner
+            .step("exec")
+            .description("sandbox exec exits successfully")
+            .with_timeout(EXEC_TIMEOUT)
+            .run(&[
+                "sandbox",
+                "exec",
+                "--name",
+                &sandbox_name,
+                "--no-tty",
+                "--",
+                "echo",
+                &marker,
+            ])
+            .await
+            .map_err(|error| error.to_string())?;
+        exec.require_success()?;
+        let expected_stdout = format!("{marker}\n");
+        if exec.stdout() != expected_stdout {
+            return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
+        }
+
+        let delete = runner
+            .step("delete")
+            .description("sandbox deletion succeeds")
+            .with_timeout(DELETE_TIMEOUT)
+            .run(&["sandbox", "delete", &sandbox_name])
+            .await
+            .map_err(|error| error.to_string())?;
+        delete.require_success()?;
+
+        check_empty_list(runner, &sandbox_name).await?;
+        runner.forget_sandbox(&sandbox_name);
+        Ok(())
     }
     .await;
     if let Err(error) = runner.finish(result).await {
-        panic!("smoke conformance scenario failed:\n{error}");
+        panic!("smoke conformance story failed:\n{error}");
     }
-}
-
-async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {
-    let status = runner
-        .step("status")
-        .description("openshell status succeeds")
-        .with_timeout(STATUS_TIMEOUT)
-        .run(&["status"])
-        .await
-        .map_err(|error| error.to_string())?;
-    status.require_success()?;
-
-    let sandbox_name = format!("ct-{}-01", runner.id());
-    runner.track_sandbox(&sandbox_name);
-    let create = runner
-        .step("create")
-        .description("sandbox creation succeeds")
-        .with_timeout(CREATE_TIMEOUT)
-        .run(&["sandbox", "create", "--name", &sandbox_name, "--detach"])
-        .await
-        .map_err(|error| error.to_string())?;
-    create.require_success()?;
-
-    let get = runner
-        .step("get-ready")
-        .description(format!("sandbox '{sandbox_name}' can be retrieved"))
-        .with_timeout(LIST_ATTEMPT_TIMEOUT)
-        .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
-        .await
-        .map_err(|error| error.to_string())?;
-    get.require_success()?;
-
-    let sandbox = get
-        .json::<SandboxListEntry>()
-        .map_err(|error| error.to_string())?;
-    if sandbox.name != sandbox_name {
-        return Err(format!(
-            "sandbox get returned {:?}; expected sandbox '{sandbox_name}'",
-            sandbox.name
-        ));
-    }
-    if sandbox.phase != "Ready" {
-        return Err(format!(
-            "sandbox '{sandbox_name}' is in phase {:?}; expected Ready",
-            sandbox.phase
-        ));
-    }
-
-    check_sandbox_listed(runner, &sandbox_name).await?;
-
-    let marker = format!("openshell-conformance-{}", runner.id());
-    let exec = runner
-        .step("exec")
-        .description("sandbox exec exits successfully")
-        .with_timeout(EXEC_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            &sandbox_name,
-            "--no-tty",
-            "--",
-            "echo",
-            &marker,
-        ])
-        .await
-        .map_err(|error| error.to_string())?;
-    exec.require_success()?;
-    let expected_stdout = format!("{marker}\n");
-    if exec.stdout() != expected_stdout {
-        return Err(exec.failure_diagnostic(&format!("stdout is exactly {expected_stdout:?}")));
-    }
-
-    let delete = runner
-        .step("delete")
-        .description("sandbox deletion succeeds")
-        .with_timeout(DELETE_TIMEOUT)
-        .run(&["sandbox", "delete", &sandbox_name])
-        .await
-        .map_err(|error| error.to_string())?;
-    delete.require_success()?;
-
-    check_empty_list(runner, &sandbox_name).await?;
-    runner.forget_sandbox(&sandbox_name);
-    Ok(())
 }
 
 async fn check_sandbox_listed(runner: &OpenShellRunner, sandbox_name: &str) -> Result<(), String> {

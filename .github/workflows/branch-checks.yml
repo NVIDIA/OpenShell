@@ -237,7 +237,7 @@ jobs:
           OPENSHELL_TELEMETRY_ENABLED: "false"
         run: |
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
-          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path e2e/suites/conformance/Cargo.toml --package openshell-test-conformance-cli -E 'binary(policy_advisor) & test(draft_assertion)'
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path e2e/suites/conformance/Cargo.toml --package openshell-test-conformance-cli -E 'binary(policy_advisor) & test(draft_assertion::tests::)'
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
 
   rust-build-modes:
