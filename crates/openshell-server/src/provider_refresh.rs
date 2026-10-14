@@ -1909,8 +1909,10 @@ async fn request_token(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
+    // GitHub returns form-encoded bodies unless JSON is requested.
     let response = client
         .post(parsed)
+        .header(reqwest::header::ACCEPT, "application/json")
         .form(form)
         .send()
         .await
@@ -2422,7 +2424,7 @@ mod tests {
         list_all_refresh_states, list_refresh_states_for_provider, max_lifetime_seconds,
         new_refresh_state, next_refresh_at_ms, put_refresh_state, read_bounded_oauth_error_body,
         refresh_has_expiration, refresh_material_scope, refresh_provider_credential,
-        refresh_state_name, refresh_status_from_state, refresh_strategy_name,
+        refresh_state_name, refresh_status_from_state, refresh_strategy_name, request_token,
         run_refresh_worker_tick, seconds_until_ms, set_refresh_expiration_presence,
         validate_secret_material_references,
     };
@@ -2461,7 +2463,7 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName, ObjectWorkspace};
     use std::collections::HashMap;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn ts(milliseconds: i64) -> prost_types::Timestamp {
@@ -3016,6 +3018,30 @@ mod tests {
         assert_eq!(stored.provider_error_subtype, "invalid_rapt");
         assert!(stored.last_error_at_ms > 0);
         assert!(!stored.last_error.contains("provider-controlled detail"));
+    }
+
+    #[tokio::test]
+    async fn request_token_sends_accept_json() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-token",
+                "expires_in": 3600
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let minted = request_token(
+            &format!("{}/token", mock_server.uri()),
+            &[("grant_type".to_string(), "refresh_token".to_string())],
+            60,
+            OAuthGrantKind::UserRefreshToken,
+        )
+        .await
+        .unwrap();
+        assert_eq!(minted.access_token, "minted-token");
     }
 
     #[tokio::test]
