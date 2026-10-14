@@ -303,7 +303,7 @@ struct SandboxDeleteTarget {
 /// Optional caller-owned preconditions for an identity-safe sandbox delete.
 ///
 /// These values are validated again while holding the sandbox lifecycle and
-/// gateway-global locks, immediately before the durable `Deleting` mutation.
+/// scoped mutation locks, immediately before the durable `Deleting` mutation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SandboxDeletePreconditions {
     pub expected_sandbox_id: Option<String>,

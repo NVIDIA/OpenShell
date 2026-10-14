@@ -670,6 +670,8 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
+    // Provider and policy reads must stay under the create mutation guard so
+    // their revisions cannot change before the sandbox's launch is committed.
     let mut runtime_inputs =
         super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
 
