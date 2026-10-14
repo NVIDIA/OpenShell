@@ -3,7 +3,7 @@ authors:
   - "@patkraw"
 state: draft
 links:
-  - (originating GitHub issue, to be opened; maintainers assign the RFC number)
+  - https://github.com/NVIDIA/OpenShell/issues/4574
 ---
 
 # RFC NNNN - Gateway MCP for Creating Sandboxes
