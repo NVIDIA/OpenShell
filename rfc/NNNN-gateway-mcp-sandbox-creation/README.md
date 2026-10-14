@@ -401,13 +401,53 @@ tasks differ.
 | Prover result | Error returned to the agent |
 |---------------|-----------------------------|
 | `Within` | none; creation continues |
-| `Exceeds` | `EXCEEDS_CEILING`, with the prover's counterexample, so the agent can narrow its request and retry |
+| `Exceeds` | `EXCEEDS_CEILING`, with the prover's counterexample and a hint on how to ask for more, so the agent can narrow its request or widen its own policy and retry |
 | `Unsupported` | `UNSUPPORTED_RULES`, naming the rule the prover cannot model |
 | `Inconclusive` | `PROVER_INCONCLUSIVE` |
 
 Returning the counterexample matters: it tells the agent which request
 (`POST api.github.com/repos/...`) is outside the ceiling, which is usually
 enough for it to correct its policy without involving the user.
+
+**Asking for more than the parent has.** When the task really needs access the
+parent lacks, the parent widens its own policy first, through the proposal flow
+every sandbox has today, and then retries. No new mechanism is involved; the
+gateway's refusal points the agent to it, in the same way the supervisor's
+guidance for a blocked request does (`AGENT_GUIDANCE` in
+`crates/openshell-supervisor-network/src/policy_local.rs`):
+
+1. The lead calls `create_sandbox` for a worker with `POST
+   api.github.com/repos/**`. The gateway refuses with `EXCEEDS_CEILING`, the
+   counterexample, and the hint: "A child cannot get more than you have. Either
+   narrow the child's policy and retry, or, if the task needs this access and
+   policy proposals are enabled in this sandbox, first ask for it for
+   yourself: read
+   /etc/openshell/skills/policy_advisor.md, submit the narrowest rule to
+   http://policy.local/v1/proposals, wait for approval and
+   `policy_reloaded: true`, then retry create_sandbox."
+2. The lead submits the rule for itself to `POST
+   http://policy.local/v1/proposals` and keeps the returned chunk id.
+3. The user approves it as any proposal today: `openshell rule approve lead
+   --chunk-id <id>`, the TUI, or auto-approval when the prover finds nothing
+   new. For a child, the proposal must also fit the child's own ceiling (see
+   Later policy writes) or it is rejected without asking.
+4. The lead waits on `GET /v1/proposals/<id>/wait` until it reports
+   `policy_reloaded: true`.
+5. The lead retries `create_sandbox`. The ceiling is the parent's current
+   policy, so the worker now fits.
+
+Agent proposals are off by default (`agent_policy_proposals_enabled`). Where
+they are off, `policy.local` refuses step 2 with `feature_disabled`, and only the
+user can widen the parent, by editing its policy directly. A user who expects
+this flow turns the setting on for the lead, or gateway-wide, when starting the
+tree. The proof of concept runs the whole flow end to end with the setting on.
+
+An approval in the harness's own interface does not count: the harness never
+tells OpenShell about it, so the gateway still refuses until the parent's
+policy or the grant changes. The user approves the parent's proposal without
+seeing that it is meant for a child; showing that context, or approving a
+child's policy in one step, is the interactive approval described in Future
+work.
 
 **Later policy writes.** The same check runs on every later write to the policy
 of a sandbox that has a lineage, whatever the source: `UpdateConfig`, policy
@@ -650,8 +690,8 @@ lifetime still applies, so no tree runs forever.
 rules through `policy.local`, as any sandbox can. The gateway first checks that
 the proposal fits the child's ceiling and rejects it without asking if it does
 not. Otherwise the user approves as today, with `openshell rule approve`, the
-TUI or auto-approval. This is the only point at which the user may be prompted
-during a run.
+TUI or auto-approval. Proposals, from a child or from a parent asking for access
+to pass on, are the only point at which the user may be prompted during a run.
 
 ### Images and resources
 
@@ -877,7 +917,10 @@ the user would approve where they are: in the TUI, in a harness's approval
 interface (OpenWorker shows one for teams), or through a harness extension's
 confirmation dialog, which Pi forwards over its RPC mode. Open points are where
 pending requests are shown, timeouts, and whether to use a pending identifier
-with `wait` or MCP's long-running task support.
+with `wait` or MCP's long-running task support. The same prompt could replace
+the two-step flow for a child that needs more than its parent has (see Asking
+for more than the parent has): the user would see the child's request, and
+approving it would widen the parent and create the child together.
 
 ### Per-tool rules for other MCP servers
 
@@ -1077,7 +1120,11 @@ node (worker) → openshell.local/mcp   create_sandbox
 
 ```text
 create_sandbox { policy: {POST api.github.com/repos/**} }
-→ prover: Exceeds, counterexample POST /repos/... → EXCEEDS_CEILING
+→ prover: Exceeds, counterexample POST /repos/... → EXCEEDS_CEILING + hint
+→ lead: POST policy.local/v1/proposals {addRule github_write} → chunk id
+→ user: openshell rule approve lead --chunk-id <id>
+→ lead: GET policy.local/v1/proposals/<id>/wait → policy_reloaded: true
+→ lead: create_sandbox again → prover: Within → created
 ```
 
 **7. The user widens the grant.**
