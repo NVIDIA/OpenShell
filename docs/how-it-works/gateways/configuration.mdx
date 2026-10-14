@@ -417,15 +417,9 @@ Use an `https://` endpoint for TLS. The gateway verifies the collector certifica
 
 The OpenTelemetry SDK logs export failures after startup. Spans in a failed batch are dropped rather than retried.
 
-`service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`. The gateway also reports `service.version`, `openshell.gateway.name` from the gateway's configured `name`, and `openshell.gateway.compute_driver`.
+`service_name` sets the gateway's `service.name` resource attribute and defaults to `openshell-gateway`.
 
-Inbound gRPC and HTTP requests produce server spans named for the RPC or HTTP method. Compute-driver operations appear as child spans. Internal reconciliation and driver-watch loops create operation roots because no inbound request supplies a parent, and credential refresh creates one only when a credential is due or needs cleanup. The gateway continues valid W3C `traceparent` context and starts a new trace when none is supplied. Request spans carry `method`, `path`, and the `request_id` that also appears in gateway logs. Store operation spans, health endpoint spans, and spans for RPCs that sandbox supervisors call on a timer (`GetSandboxConfig` and `ReportProviderReadiness`, including its peer-forwarded form) use DEBUG level. The default INFO filter does not export them. Set the gateway log level to `debug` to include them.
-
-The gateway forwards the trace endpoint, configured gateway name, configured compute driver, and W3C trace context to managed external drivers. Built-in drivers also export their spans to the trace collector through dedicated in-process providers. Driver spans retain the gateway trace context, use a distinct service name such as `openshell-driver-docker` or `openshell-driver-podman`, and carry the same `openshell.gateway.name` and `openshell.gateway.compute_driver` resource attributes as gateway spans. Compute-driver client and server spans use the same fully qualified protobuf operation name, such as `openshell.compute.v1.ComputeDriver/CreateSandbox`, in both the span name and `rpc.method`. The service name and span kind distinguish each side. Backend-prefixed child spans identify implementation work. A streaming watch records a terminal status when observed; consumer teardown without a terminal status leaves the span status unset. Operator-run external drivers own their own telemetry configuration.
-
-Sandbox supervisors export spans to the trace collector, so its endpoint must also be reachable from sandboxes.
-
-Spans for routine or high-volume operations use DEBUG level, and the default INFO level does not export them. Set the gateway or sandbox log level to `debug` to include them.
+The gateway passes the trace endpoint to compute drivers and sandbox supervisors, which export their own spans to it, so the trace collector must also be reachable from sandboxes. Spans for routine or high-volume operations use DEBUG level and are exported only when the gateway or sandbox log level is `debug`. For what is traced, span names, and resource attributes, refer to [Traces](/observability/traces).
 
 For Helm deployments, set `server.otlp.endpoint` to render this table. The
 optional `server.otlp.serviceName` value overrides the gateway service name;
@@ -490,27 +484,43 @@ Metrics include `openshell_ocsf_otlp_queued_total`, `openshell_ocsf_otlp_exporte
 
 ### Tuning
 
-This table decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys:
+`[openshell.gateway.otlp]` decides whether and where to export. How the SDK exports is controlled by the standard OpenTelemetry environment variables, which the gateway reads through the SDK rather than mirroring as TOML keys. They apply to the gateway and its in-process compute drivers. The gateway does not pass them to sandbox supervisors, which receive only the endpoints, the OCSF schema version, and the [OCSF collector headers](#ocsf-log-export).
+
+The gateway honors these variables:
 
 | Variable | Effect |
 |---|---|
+| `OTEL_SERVICE_NAME` | The gateway's `service.name` when `service_name` is not set in `[openshell.gateway.otlp]`. Compute-driver and supervisor service names are fixed. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
 | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Sampling strategy and ratio. Defaults to `parentbased_always_on`. |
 | `OTEL_BSP_SCHEDULE_DELAY`, `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_EXPORT_TIMEOUT` | Batch span processor tuning. |
-| `OTEL_RESOURCE_ATTRIBUTES` | Additional resource attributes, such as `deployment.environment=prod`. |
 | `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`, `OTEL_SPAN_LINK_COUNT_LIMIT` | Per-span limits. |
 | `OTEL_EXPORTER_OTLP_HEADERS`, `OTEL_EXPORTER_OTLP_TIMEOUT` | Exporter transport tuning for every signal. |
 | `OTEL_EXPORTER_OTLP_COMPRESSION` | Set to `gzip` to compress exports of every signal. `zstd` is not supported. |
+| `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_TRACES_COMPRESSION`, `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | Exporter transport tuning for spans only. These override the general variables. |
 | `OTEL_EXPORTER_OTLP_LOGS_HEADERS`, `OTEL_EXPORTER_OTLP_LOGS_COMPRESSION`, `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Exporter transport tuning for OCSF log records only. These override the general variables. |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | No effect. The gateway is built with the gRPC exporter only. |
-| `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | No effect. OCSF log export uses its own queue and batching, described in [OCSF Log Export](#ocsf-log-export). |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | Additional trust roots for `https://` endpoints, such as a private CA. |
+
+These variables have no effect. Only `[openshell.gateway.otlp]` decides which signals are exported and where they go, for two reasons:
+
+- OCSF events are security records, so where they go must be a deliberate choice. Platform tooling can add `OTEL_*` variables to a process, as the OpenTelemetry Operator does for annotated pods on Kubernetes. Such a variable must not start sending security records to a collector, redirect them, or turn them off.
+- The gateway passes its export settings to compute drivers and sandbox supervisors. Supervisors run in each sandbox and do not inherit the gateway's environment, so they could not follow a setting that exists only there.
+
+| Variable | Reason |
+|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Enablement has one source, `[openshell.gateway.otlp]`, so an environment variable cannot silently turn export on or redirect it. |
+| `OTEL_SDK_DISABLED`, `OTEL_TRACES_EXPORTER`, `OTEL_LOGS_EXPORTER`, `OTEL_METRICS_EXPORTER` | `[openshell.gateway.otlp]` decides which signals are exported. To disable export, omit it. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL`, `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | The gateway is built with the gRPC exporter only. |
+| `OTEL_EXPORTER_OTLP_INSECURE`, `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_KEY`, and their per-signal forms | The endpoint scheme selects TLS, and collector certificates are verified against the system trust roots. Client certificates are not supported. |
+| `OTEL_PROPAGATORS` | The gateway always propagates W3C Trace Context. |
+| `OTEL_BLRP_SCHEDULE_DELAY`, `OTEL_BLRP_MAX_QUEUE_SIZE`, `OTEL_BLRP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BLRP_EXPORT_TIMEOUT` | OCSF log export uses its own queue and batching, described in [OCSF Log Export](#ocsf-log-export). |
+| `OTEL_EXPORTER_OTLP_METRICS_*`, `OTEL_METRIC_EXPORT_INTERVAL` | The gateway serves metrics for Prometheus scraping and does not export them over OTLP. |
 
 To sample 10% of traces:
 
 ```shell
 OTEL_TRACES_SAMPLER=parentbased_traceidratio OTEL_TRACES_SAMPLER_ARG=0.1
 ```
-
-`OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, and `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` are deliberately ignored. Enablement has one source, so an environment variable cannot silently turn export on or redirect it. `OTEL_RESOURCE_ATTRIBUTES` does apply and adds attributes, but a `service_name` set here wins over `OTEL_SERVICE_NAME`.
 
 The gateway flushes buffered spans during shutdown, so spans from in-flight requests survive a `SIGTERM`.
 

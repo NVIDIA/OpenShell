@@ -5,6 +5,7 @@ title: "Gateway Metrics"
 sidebar-title: "Gateway Metrics"
 description: "Scrape Prometheus metrics from the OpenShell gateway, including supervisor session, relay capacity, peer routing, and mutation lock signals for multi-replica deployments."
 keywords: "Generative AI, Cybersecurity, Observability, Metrics, Prometheus, Gateway, Kubernetes, High Availability"
+position: 3
 ---
 
 The gateway exports Prometheus metrics for API requests, database readiness,
@@ -135,6 +136,22 @@ Then read the metrics from another terminal:
 ```shell
 curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessions'
 ```
+
+## Metric Names
+
+Every metric name starts with `openshell_`, followed by the subsystem that
+records it:
+
+| Prefix | Covers |
+|---|---|
+| `openshell_server_` | API requests, readiness, supervisor sessions, relays, and requests forwarded between replicas |
+| `openshell_gateway_interceptor_` | Gateway interceptor evaluations, failures, and latency |
+| `openshell_ocsf_log_` | The gateway's OCSF JSONL file |
+| `openshell_ocsf_otlp_` | OCSF log export over OTLP |
+
+Names follow Prometheus conventions. Counters end in `_total`, and names with a
+unit end in that unit, such as `_seconds` or `_bytes`. Metrics carry no gateway
+name label, so use your scrape configuration to tell installations apart.
 
 ## Histograms and Summaries
 
@@ -291,6 +308,7 @@ enabled record its queue and exporter:
 
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) for traces and OCSF events.
 - To monitor capacity and choose autoscaling signals for multiple gateway
   replicas, refer to
   [High Availability](/kubernetes/high-availability#monitor-capacity).
