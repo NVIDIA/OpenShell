@@ -234,9 +234,11 @@ existing `ExecSandbox` RPC with the same guard.
 | CLI | Users and scripts | The user's login |
 | MCP `/mcp` | Any MCP-capable agent or harness | From a sandbox: through the door. From the host: the user's login. |
 
-The door forwards both the MCP endpoint and the `SandboxChildren` service, so
-SDK code inside a sandbox connects to `openshell.local` with no credential in
-the same way an MCP client does.
+The door is the only way code inside a sandbox reaches the gateway, so what it
+forwards decides which surfaces work from inside. MCP is plain HTTP/1.1 and is
+forwarded. The gRPC service runs on HTTP/2, and how the door carries it is an
+open decision (see [Open questions](#open-questions)); until then, code inside a
+sandbox uses MCP and the gRPC service is used from the host.
 
 ### Grants
 
@@ -983,6 +985,22 @@ is instead offered as a maximum that every sandbox must fit inside.
   operators who run shared gateways use the global policy today?
 - Is the MCP endpoint's cost when idle small enough to keep it on by default on
   every gateway?
+- **Decision to make: how the door carries gRPC.** The door forwards MCP, which
+  is plain HTTP/1.1: one request, one response, read and forwarded with the
+  sandbox's token. gRPC uses HTTP/2, with many calls multiplexed on one
+  connection and streaming responses. Options:
+  - **A. MCP only inside sandboxes.** No change; agents use MCP, and the SDKs
+    are used from the host. Cost: SDK code inside a sandbox cannot call the
+    child-sandbox API.
+  - **B. Forward gRPC over HTTP/2.** The door becomes an HTTP/2 proxy that adds
+    the sandbox's token to every call and relays streams. Cost: the largest
+    change to the supervisor.
+  - **C. gRPC over HTTP/1.1 (gRPC-Web or Connect).** The gateway also accepts
+    the HTTP/1.1 encoding, and the door forwards it the way it forwards MCP.
+    Cost: a second encoding on the gateway and SDK clients configured for it.
+
+  Leaning: A for v1, then C. Agents mostly use MCP, and C reuses the existing
+  door.
 
 ## Appendix: End-to-End Walkthrough
 
