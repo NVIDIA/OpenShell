@@ -313,8 +313,9 @@ message SandboxGrantSpec {
   // Absolute path of the executable allowed to use the door,
   // for example /usr/local/bin/node for a Node-based harness.
   string program = 5;
-  // NARROW (default): agents write their children's network rules within their
-  // own policy. INHERIT: every child receives its parent's policy unchanged.
+  // NARROW (default): agents write their children's policies, any section the
+  // prover checks, within their own policy. INHERIT: every child receives its
+  // parent's policy unchanged.
   ChildPolicyMode child_policy = 6;
 }
 
@@ -336,8 +337,8 @@ per level, would put a prompt in front of the user every time a worker
 delegated.
 
 **No grant, no children.** A sandbox started without a grant cannot create
-sandboxes. `create_sandbox` is absent from its tool list, and a call is refused
-with `NOT_ALLOWED`. The safe default is that a sandbox never gains the ability
+sandboxes. `create_sandbox` is listed for it like for any sandbox (see
+[Refusals](#refusals)), and a call is refused with `NOT_ALLOWED`. The safe default is that a sandbox never gains the ability
 to create sandboxes unless the user said so.
 
 **Set up front.** In v1 the grant is the only approval. A request inside it
@@ -504,8 +505,9 @@ the global one instead, so `create_sandbox` with a policy is refused with
 rather than receiving a child with unexpected access.
 
 **Whether a parent may set its child's policy.** A grant states whether agents
-in the tree may write their children's network rules (`child_policy: narrow`,
-the default) or whether every child receives its parent's policy unchanged
+in the tree may write their children's policies (`child_policy: narrow`, the
+default; any section the prover checks, see "What the agent writes" in
+[Ceiling and policy proof](#ceiling-and-policy-proof)) or whether every child receives its parent's policy unchanged
 (`child_policy: inherit`). In `inherit` mode a `create_sandbox` request that
 includes a policy is refused. Either way a child never receives more than the
 ceiling and the global maximum allow.
@@ -681,7 +683,8 @@ existing extension-credential path, which today mints only for supervisor
 middleware services and is rate limited per sandbox. The token is bound to the
 sandbox id and lives at most one hour (`MAX_EXTENSION_TOKEN_TTL`). The gateway
 accepts it only on `/mcp`. Using a dedicated audience instead of the
-supervisor's main session token limits what a leaked token can do.
+supervisor's main session token limits what a leaked token can do. The proof of
+concept forwards the session token; v1 requires the dedicated audience.
 
 ### Refusals
 
@@ -712,6 +715,9 @@ made.
 | `stop_sandbox` | sandboxes | `handle` | `stopped` | `NOT_YOUR_CHILD` |
 | `list_children` | sandboxes | none | children with kind, lifetime, depth | none |
 | `get_limits` | sandboxes | none | depth, children and total used and allowed | none |
+| `grant_list` | users | none | grants in the caller's workspace | none |
+| `grant_create` | users | `handle` of a running top-level sandbox, grant fields | the grant | `NOT_ALLOWED`, `ALREADY_EXISTS` |
+| `grant_update` | users | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits, or `revoked` | `NOT_FOUND`, `NOT_ALLOWED` |
 
 A sandbox acts only on its own descendants; `handle` is the child's sandbox name
 within the caller's workspace. A user caller creates top-level sandboxes with
@@ -906,9 +912,10 @@ The work is phased so that each phase is usable and testable on its own:
 - **Phase 2: Gateway MCP endpoint and supervisor door.** Add `/mcp` over the
   same API, with authentication, the program check and a per-sandbox rate
   limit, and the `openshell gateway mcp` commands. Add the door at
-  `openshell.local` for both MCP and the gRPC service, open in every sandbox,
-  and the `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
-  callers.
+  `openshell.local` for MCP, open in every sandbox, and the
+  `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
+  callers. Carrying gRPC through the door follows later, as decided in
+  [Open questions](#open-questions).
 - **Phase 3: Tool sandboxes.** `kind: tool`, `exec` with command audit, and the
   idle timeout.
 - **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
@@ -1114,8 +1121,6 @@ is instead offered as a maximum that every sandbox must fit inside.
 
 ## Open questions
 
-- Is a dedicated gateway-MCP token audience required for v1, or is the
-  supervisor's session token acceptable initially?
 - Is the separate `sandbox_lineage` record acceptable alongside RFC 0011's
   model, or should lineage live elsewhere?
 - Will `openshell-prover` model MCP and GraphQL rules, and on what timeline?
