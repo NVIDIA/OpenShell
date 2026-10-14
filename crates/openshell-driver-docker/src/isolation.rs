@@ -115,6 +115,7 @@ impl DockerBoundarySpec {
                 },
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
+                cdi_context: None,
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,

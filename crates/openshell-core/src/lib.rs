@@ -12,6 +12,7 @@
 pub mod activity;
 pub mod app_listener;
 pub mod auth;
+pub mod cdi;
 pub mod compute;
 #[cfg(target_os = "linux")]
 pub mod cdi_name {

@@ -563,6 +563,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                     "kubernetes.workload_pod_uid".to_string(),
                     self.workload_pod_uid_path,
                 )]),
+                cdi_context: None,
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
