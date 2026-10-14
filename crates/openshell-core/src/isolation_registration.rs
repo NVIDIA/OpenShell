@@ -90,13 +90,13 @@ pub fn validate_registrations(registrations: &[BackendRegistration]) -> Result<(
     Ok(())
 }
 
-impl TryFrom<&BackendRegistration> for crate::proto::compute::v1::IsolationBackendRegistration {
+impl TryFrom<&BackendRegistration> for crate::proto::compute::v1::SandboxBackendRegistration {
     type Error = &'static str;
 
     fn try_from(registration: &BackendRegistration) -> Result<Self, Self::Error> {
         use crate::proto::compute::v1::{
-            IsolationBackendTcpEndpoint, IsolationBackendVsockEndpoint,
-            isolation_backend_registration::Endpoint,
+            SandboxBackendTcpEndpoint, SandboxBackendVsockEndpoint,
+            sandbox_backend_registration::Endpoint,
         };
         validate_backend_name(&registration.name)?;
         registration.endpoint.validate()?;
@@ -110,12 +110,12 @@ impl TryFrom<&BackendRegistration> for crate::proto::compute::v1::IsolationBacke
             SandboxTransport::Tcp {
                 authority,
                 addresses,
-            } => Endpoint::Tcp(IsolationBackendTcpEndpoint {
+            } => Endpoint::Tcp(SandboxBackendTcpEndpoint {
                 authority: authority.clone(),
                 addresses: addresses.iter().map(ToString::to_string).collect(),
             }),
             SandboxTransport::Vsock { guest_cid, port } => {
-                Endpoint::Vsock(IsolationBackendVsockEndpoint {
+                Endpoint::Vsock(SandboxBackendVsockEndpoint {
                     guest_cid: *guest_cid,
                     port: *port,
                 })
@@ -128,13 +128,13 @@ impl TryFrom<&BackendRegistration> for crate::proto::compute::v1::IsolationBacke
     }
 }
 
-impl TryFrom<&crate::proto::compute::v1::IsolationBackendRegistration> for BackendRegistration {
+impl TryFrom<&crate::proto::compute::v1::SandboxBackendRegistration> for BackendRegistration {
     type Error = &'static str;
 
     fn try_from(
-        registration: &crate::proto::compute::v1::IsolationBackendRegistration,
+        registration: &crate::proto::compute::v1::SandboxBackendRegistration,
     ) -> Result<Self, Self::Error> {
-        use crate::proto::compute::v1::isolation_backend_registration::Endpoint;
+        use crate::proto::compute::v1::sandbox_backend_registration::Endpoint;
         let endpoint = match registration
             .endpoint
             .as_ref()
@@ -172,7 +172,7 @@ impl TryFrom<&crate::proto::compute::v1::IsolationBackendRegistration> for Backe
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::compute::v1::IsolationBackendRegistration;
+    use crate::proto::compute::v1::SandboxBackendRegistration;
 
     #[test]
     fn operator_routes_survive_compute_protocol_and_supervisor_json() {
@@ -196,7 +196,7 @@ mod tests {
                 name: "agent-substrate".into(),
                 endpoint,
             };
-            let wire = IsolationBackendRegistration::try_from(&original).unwrap();
+            let wire = SandboxBackendRegistration::try_from(&original).unwrap();
             let decoded = BackendRegistration::try_from(&wire).unwrap();
             assert_eq!(decoded, original);
             let json = serde_json::to_string(&decoded).unwrap();

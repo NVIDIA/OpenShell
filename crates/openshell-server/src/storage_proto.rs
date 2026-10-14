@@ -520,8 +520,8 @@ mod tests {
             for service in &file.service {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
-                if package == "openshell.isolation.backend.v1" {
-                    assert_eq!(service_name, "IsolationBackend");
+                if package == "openshell.sandbox.backend.v1" {
+                    assert_eq!(service_name, "SandboxBackend");
                     isolation_methods.extend(
                         service
                             .method
@@ -530,7 +530,7 @@ mod tests {
                     );
                 }
                 if package == "openshell.sandbox.protocol.v1" {
-                    assert_eq!(service_name, "DelegatedIsolationBoundary");
+                    assert_eq!(service_name, "SandboxBoundary");
                     sandbox_protocol_methods.extend(service.method.iter().map(|method| {
                         method
                             .name
@@ -564,7 +564,7 @@ mod tests {
         assert_eq!(
             isolation_methods,
             BTreeSet::from([
-                "GetCapabilities",
+                "Describe",
                 "OpenBoundary",
                 "ResumeBoundary",
                 "SuspendBoundary"

@@ -8,17 +8,17 @@ use tokio_stream::StreamExt as _;
 /// workload stops reading a relayed download. Other streams echo one chunk.
 #[derive(Clone)]
 struct StallingPeer {
-    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<DelegatedBoundaryChunk>>>>,
+    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<BoundaryChunk>>>>,
 }
 
 #[tonic::async_trait]
-impl DelegatedIsolationBoundary for StallingPeer {
+impl SandboxBoundary for StallingPeer {
     type ExchangeStream = TestGrpcStream;
     type MediateStream = TestGrpcStream;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         let stall = request.metadata().get("x-stall").is_some();
         let mut inbound = request.into_inner();
@@ -40,7 +40,7 @@ impl DelegatedIsolationBoundary for StallingPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+        _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("flow-control fixture"))
     }
@@ -66,8 +66,8 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
             .initial_connection_window_size(
                 crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
             )
-            .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-            .add_service(DelegatedIsolationBoundaryServer::new(peer))
+            .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+            .add_service(SandboxBoundaryServer::new(peer))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -84,9 +84,7 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
 }
 
 /// Push into one stalled stream until the peer stops granting credit.
-async fn saturate(
-    channel: tonic::transport::Channel,
-) -> tokio::sync::mpsc::Sender<DelegatedBoundaryChunk> {
+async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<BoundaryChunk> {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     sender
         .send(boundary_chunk(TEST_BOUNDARY_HANDLE))
@@ -96,7 +94,7 @@ async fn saturate(
     request
         .metadata_mut()
         .insert("x-stall", "1".parse().unwrap());
-    let mut client = DelegatedIsolationBoundaryClient::new(channel);
+    let mut client = SandboxBoundaryClient::new(channel);
     tokio::spawn(async move {
         let _response = client.exchange(request).await;
         std::future::pending::<()>().await;

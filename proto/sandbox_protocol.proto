@@ -10,12 +10,12 @@ package openshell.sandbox.protocol.v1;
 // handle against the authenticated sandbox and generation before accepting any
 // data. Subsequent data fragments carry the existing Sandbox Protocol bytes.
 // OpenBoundary returns the handle before policy discovery and lifecycle traffic.
-service DelegatedIsolationBoundary {
-  rpc Exchange(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
-  rpc Mediate(stream DelegatedBoundaryChunk) returns (stream DelegatedBoundaryChunk);
+service SandboxBoundary {
+  rpc Exchange(stream BoundaryChunk) returns (stream BoundaryChunk);
+  rpc Mediate(stream BoundaryChunk) returns (stream BoundaryChunk);
 }
 
-message DelegatedBoundaryChunk {
+message BoundaryChunk {
   oneof payload {
     // Nonempty handle required as the first client frame; forbidden on later frames.
     string boundary_id = 1;

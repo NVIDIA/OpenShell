@@ -16,14 +16,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::isolation_proto::{
-    GetIsolationCapabilitiesRequest, OpenBoundaryRequest,
-    isolation_backend_client::IsolationBackendClient, open_boundary_response::LaunchOutcome,
+use crate::backend_proto::{
+    DescribeSandboxBackendRequest, OpenBoundaryRequest, open_boundary_response::LaunchOutcome,
+    sandbox_backend_client::SandboxBackendClient,
 };
 use crate::isolation_protocol::{boundary_chunk, chunk_data, data_chunk};
-use crate::proto::{
-    DelegatedBoundaryChunk, delegated_isolation_boundary_client::DelegatedIsolationBoundaryClient,
-};
+use crate::proto::{BoundaryChunk, sandbox_boundary_client::SandboxBoundaryClient};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use openshell_isolation_interface::AgentSpec;
@@ -2037,12 +2035,12 @@ impl BoundaryClient {
         channel: tonic::transport::Channel,
         credential: &BoundaryCredential,
     ) -> Result<(), BackendError> {
-        let mut client = IsolationBackendClient::new(channel)
+        let mut client = SandboxBackendClient::new(channel)
             .max_decoding_message_size(64 * 1024)
             .max_encoding_message_size(64 * 1024);
         let supervisor = crate::isolation_protocol::metadata("openshell/supervisor");
         let response = client
-            .get_capabilities(GetIsolationCapabilitiesRequest {
+            .describe(DescribeSandboxBackendRequest {
                 supervisor: Some(supervisor.clone()),
             })
             .await
@@ -2198,13 +2196,13 @@ async fn open_grpc_client_stream_with_authorization(
 ) -> Result<BoundaryDuplexStream, BackendError> {
     let (application, bridge) = tokio::io::duplex(256 * 1024);
     let (reader, writer) = tokio::io::split(bridge);
-    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<DelegatedBoundaryChunk>(64);
+    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<BoundaryChunk>(64);
     outbound
         .send(boundary_chunk(boundary_id))
         .await
         .map_err(|_| BackendError::Unavailable("queue boundary binding frame".to_string()))?;
     tokio::spawn(pump_to_grpc(reader, outbound));
-    let mut client = DelegatedIsolationBoundaryClient::new(channel)
+    let mut client = SandboxBoundaryClient::new(channel)
         .max_decoding_message_size(64 * 1024)
         .max_encoding_message_size(64 * 1024);
     let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
@@ -2225,7 +2223,7 @@ async fn open_grpc_client_stream_with_authorization(
     Ok(Box::new(application))
 }
 
-async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<DelegatedBoundaryChunk>)
+async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<BoundaryChunk>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -2251,7 +2249,7 @@ where
     }
 }
 
-async fn pump_from_grpc<W>(mut stream: tonic::Streaming<DelegatedBoundaryChunk>, mut writer: W)
+async fn pump_from_grpc<W>(mut stream: tonic::Streaming<BoundaryChunk>, mut writer: W)
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -2400,17 +2398,15 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
-    use crate::boundary_protocol::{ExitStatusWire, generate_sandbox_tls_material};
-    use crate::isolation_proto::{
-        GetIsolationCapabilitiesResponse, OpenBoundaryResponse, ResumeBoundaryRequest,
+    use crate::backend_proto::{
+        DescribeSandboxBackendResponse, OpenBoundaryResponse, ResumeBoundaryRequest,
         SuspendBoundaryRequest, SuspendBoundaryResponse,
-        isolation_backend_server::{IsolationBackend as ControlBackend, IsolationBackendServer},
+        sandbox_backend_server::{SandboxBackend as ControlBackend, SandboxBackendServer},
     };
+    use crate::boundary_protocol::{ExitStatusWire, generate_sandbox_tls_material};
     use crate::proto::{
-        DelegatedBoundaryChunk,
-        delegated_isolation_boundary_server::{
-            DelegatedIsolationBoundary, DelegatedIsolationBoundaryServer,
-        },
+        BoundaryChunk,
+        sandbox_boundary_server::{SandboxBoundary, SandboxBoundaryServer},
     };
     use openshell_core::jwt::{SecretJwt, SessionBearerTokenSlot};
     use openshell_core::policy::{
@@ -2442,16 +2438,16 @@ mod tests {
 
     #[tonic::async_trait]
     impl ControlBackend for TestIsolationBackend {
-        async fn get_capabilities(
+        async fn describe(
             &self,
-            request: tonic::Request<GetIsolationCapabilitiesRequest>,
-        ) -> Result<tonic::Response<GetIsolationCapabilitiesResponse>, tonic::Status> {
+            request: tonic::Request<DescribeSandboxBackendRequest>,
+        ) -> Result<tonic::Response<DescribeSandboxBackendResponse>, tonic::Status> {
             assert!(
                 request.metadata().get("authorization").is_none(),
                 "capability request must not convey sandbox credentials"
             );
             assert!(request.into_inner().supervisor.is_some());
-            Ok(tonic::Response::new(GetIsolationCapabilitiesResponse {
+            Ok(tonic::Response::new(DescribeSandboxBackendResponse {
                 backend: self.metadata.clone(),
             }))
         }
@@ -2493,7 +2489,7 @@ mod tests {
         }
     }
 
-    async fn test_bind(inbound: &mut tonic::Streaming<DelegatedBoundaryChunk>) {
+    async fn test_bind(inbound: &mut tonic::Streaming<BoundaryChunk>) {
         assert_eq!(
             inbound.message().await.unwrap().unwrap(),
             boundary_chunk(TEST_BOUNDARY_HANDLE)
@@ -2536,7 +2532,7 @@ mod tests {
                     .await
                     .unwrap();
                 tonic::transport::Server::builder()
-                    .add_service(IsolationBackendServer::new(service))
+                    .add_service(SandboxBackendServer::new(service))
                     .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                         Box::new(stream),
                     ))]))
@@ -2575,7 +2571,7 @@ mod tests {
                     .await
                     .unwrap();
                 tonic::transport::Server::builder()
-                    .add_service(IsolationBackendServer::new(TestIsolationBackend {
+                    .add_service(SandboxBackendServer::new(TestIsolationBackend {
                         outcome: outcome as i32,
                         ..TestIsolationBackend::default()
                     }))
@@ -2639,21 +2635,17 @@ mod tests {
     }
 
     type TestGrpcStream = Pin<
-        Box<
-            dyn tokio_stream::Stream<Item = Result<DelegatedBoundaryChunk, tonic::Status>>
-                + Send
-                + 'static,
-        >,
+        Box<dyn tokio_stream::Stream<Item = Result<BoundaryChunk, tonic::Status>> + Send + 'static>,
     >;
 
     #[tonic::async_trait]
-    impl DelegatedIsolationBoundary for TestGrpcBoundary {
+    impl SandboxBoundary for TestGrpcBoundary {
         type ExchangeStream = TestGrpcStream;
         type MediateStream = TestGrpcStream;
 
         async fn exchange(
             &self,
-            request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
             let authorization = request
                 .metadata()
@@ -2782,7 +2774,7 @@ mod tests {
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
             if self
                 .mediation_failures
@@ -2825,8 +2817,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             tonic::transport::Server::builder()
-                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                .add_service(DelegatedIsolationBoundaryServer::new(service))
+                .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxBoundaryServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
                 .await
                 .unwrap();
@@ -2898,8 +2890,8 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(DelegatedIsolationBoundaryServer::new(service))
+                        .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxBoundaryServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3010,8 +3002,8 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(DelegatedIsolationBoundaryServer::new(service))
+                        .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxBoundaryServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3067,8 +3059,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             tonic::transport::Server::builder()
-                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                .add_service(DelegatedIsolationBoundaryServer::new(service))
+                .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxBoundaryServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
                 .await
                 .unwrap();
@@ -3256,8 +3248,8 @@ mod tests {
             confirmation,
         };
         tonic::transport::Server::builder()
-            .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-            .add_service(DelegatedIsolationBoundaryServer::new(service))
+            .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+            .add_service(SandboxBoundaryServer::new(service))
             .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                 stream,
             ))]))
@@ -3731,8 +3723,8 @@ mod tests {
                 let service = service.clone();
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(DelegatedIsolationBoundaryServer::new(service))
+                        .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxBoundaryServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3800,8 +3792,8 @@ mod tests {
                 .await
                 .unwrap();
             tonic::transport::Server::builder()
-                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                .add_service(DelegatedIsolationBoundaryServer::new(service))
+                .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxBoundaryServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                     Box::new(stream),
                 ))]))

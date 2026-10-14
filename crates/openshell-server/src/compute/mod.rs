@@ -688,7 +688,7 @@ impl ComputeDriver for RemoteComputeDriver {
 
 #[derive(Clone)]
 pub struct ComputeRuntime {
-    isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
+    isolation_backend: Option<openshell_core::proto::compute::v1::SandboxBackendRegistration>,
     admission: openshell_core::resource_admission::DriverAdmissionConfig,
     admission_acknowledgement: String,
     driver: TracedDriver,
@@ -15942,7 +15942,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket_path = directory.path().join("compute.sock");
         let driver = FakeComputeDriver::new()
-            .with_isolation_backend_registration()
+            .with_sandbox_backend_registration()
             .with_gateway_manages_lifecycle();
         let _server = driver.serve_uds(&socket_path).unwrap();
         let endpoint = connect_remote_compute_driver("external", &socket_path)
@@ -15964,10 +15964,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         )
         .unwrap();
         let registration = file.isolation_backend("external").unwrap().unwrap();
-        let expected = openshell_core::proto::compute::v1::IsolationBackendRegistration::try_from(
-            registration,
-        )
-        .unwrap();
+        let expected =
+            openshell_core::proto::compute::v1::SandboxBackendRegistration::try_from(registration)
+                .unwrap();
         let runtime = ComputeRuntime::new_remote_driver(
             endpoint,
             store,

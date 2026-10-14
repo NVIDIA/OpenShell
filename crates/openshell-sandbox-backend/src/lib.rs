@@ -15,7 +15,7 @@ pub mod mediation;
 mod runtime;
 pub mod sandbox_auth;
 
-pub use openshell_core::proto::isolation::backend::v1 as isolation_proto;
+pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
 pub use runtime::{DelegatedRuntimeBackend, OpenShellRuntimeBackend};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.

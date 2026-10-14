@@ -38,12 +38,12 @@ async fn external_backend(
                     confirmation,
                 };
                 tonic::transport::Server::builder()
-                    .add_service(IsolationBackendServer::new(TestIsolationBackend {
+                    .add_service(SandboxBackendServer::new(TestIsolationBackend {
                         backend_name: EXTERNAL_NAME.into(),
                         driver_descriptor: Some(OPAQUE_PAYLOAD.to_vec()),
                         ..TestIsolationBackend::default()
                     }))
-                    .add_service(DelegatedIsolationBoundaryServer::new(service))
+                    .add_service(SandboxBoundaryServer::new(service))
                     .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                         Box::new(stream),
                     ))]))
