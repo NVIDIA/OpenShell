@@ -2991,9 +2991,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         .run_async(async {
             let tls = test_tls(&server);
             install_fake_forwarding_ssh(&fake_ssh_dir);
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let forward_port = listener.local_addr().unwrap().port();
-            drop(listener);
+            let forward_port = reserve_local_port();
 
             run::sandbox_create(
                 &server.endpoint,
@@ -3104,9 +3102,7 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
             let tls = test_tls(&server);
             install_fake_forwarding_ssh(&fake_ssh_dir);
             install_fake_pgrep_no_match(&fake_ssh_dir);
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let forward_port = listener.local_addr().unwrap().port();
-            drop(listener);
+            let forward_port = reserve_local_port();
 
             let spec = openshell_core::forward::ForwardSpec::new(forward_port);
             run::sandbox_forward(
@@ -3147,9 +3143,7 @@ async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens()
         .run_async(async {
             let tls = test_tls(&server);
             install_fake_ssh(&fake_ssh_dir);
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let forward_port = listener.local_addr().unwrap().port();
-            drop(listener);
+            let forward_port = reserve_local_port();
 
             let spec = openshell_core::forward::ForwardSpec::new(forward_port);
             let err = run::sandbox_forward(
@@ -3181,9 +3175,7 @@ async fn sandbox_forward_background_terminates_owned_child_when_listener_never_o
     test_env(&fake_ssh_dir, &xdg_dir).run_async(async {
     let tls = test_tls(&server);
     let fake_forward = install_fake_unreachable_forwarding_ssh(&fake_ssh_dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forward_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let forward_port = reserve_local_port();
 
     let spec = openshell_core::forward::ForwardSpec::new(forward_port);
     let err = run::sandbox_forward(
@@ -3847,9 +3839,28 @@ async fn sandbox_template_create_suppresses_credential_env_warnings() {
 // ---------------------------------------------------------------------------
 
 /// Pick a free loopback port for the forward to bind.
+///
+/// The port is released before the CLI binds it. An OS-assigned port could be
+/// handed to a concurrent test's `bind("127.0.0.1:0")` in that gap, so pick
+/// from below the ephemeral ranges (32768+ on Linux, 49152+ on macOS), starting
+/// at a random offset so concurrent tests don't probe the same ports.
 fn reserve_local_port() -> u16 {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap().port()
+    use std::hash::{BuildHasher, Hasher};
+
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 12_000;
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    let start = u16::try_from(hasher.finish() % u64::from(COUNT)).expect("offset fits in u16");
+    (0..COUNT)
+        .map(|offset| FIRST + (start + offset) % COUNT)
+        .find(|&port| {
+            openshell_core::forward::check_port_available(
+                &openshell_core::forward::ForwardSpec::new(port),
+            )
+            .is_ok()
+        })
+        .expect("no free loopback port below the ephemeral range")
 }
 
 fn spawn_service_forward(
