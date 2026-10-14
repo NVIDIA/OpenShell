@@ -6,7 +6,7 @@ use super::helpers::{
     COMMAND_TIMEOUT, EMPTY_NETWORK_POLICY, await_mechanistic_draft, create_sandbox,
     sandbox_bash_path,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use std::io::Write as _;
 use tempfile::NamedTempFile;
 

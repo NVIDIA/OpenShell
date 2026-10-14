@@ -4,7 +4,7 @@
 use super::helpers::{
     create_running_sandbox, run_lifecycle_command, wait_for_absence, wait_for_phase,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 
 /// Verify a stopped sandbox can be deleted.
 #[tokio::test]

@@ -5,7 +5,7 @@ use super::helpers::{
     delete_sandbox, download, exec, fs_error, git, git_init, prepare_sandbox, require_absent,
     require_exists, require_text, upload, upload_result,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use std::fs;
 use std::path::Path;
 

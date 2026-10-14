@@ -16,11 +16,14 @@ mise run ci            # Everything: lint, compile checks, and tests
 - End-to-end tests exercise a configured OpenShell target through a client.
 - Benchmarks measure performance or scale separately from behavioral correctness.
 
-Conformance stories under `e2e/suites/conformance/` verify required public behavior.
-The [conformance guide](e2e/suites/conformance/README.md) owns their authoring and
-execution guidance. Driver and feature suites remain under `tests/suites/`;
-existing mixed suites remain under `e2e/rust/`. `tests/` also supplies provisioning
-and artifact construction.
+End-to-end suites are grouped by intent: conformance verifies
+required public behavior, feature suites need a named external service or special
+gateway configuration, and driver suites verify driver or host integration.
+The [conformance guide](e2e/suites/conformance/README.md) owns conformance
+requirements, authoring, and execution guidance. Existing mixed suites remain
+under `e2e/rust/` while their behavior is migrated. `tests/` supplies provisioning
+and artifact construction independently of the suite layout. Driver and feature
+suites remain under `tests/suites/` pending their relocation.
 
 ## Test Layout
 
@@ -29,7 +32,7 @@ crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
-e2e/rust/              # Rust CLI E2E tests
+e2e/rust/              # Legacy Rust CLI E2E tests awaiting migration
 e2e/suites/conformance/ # Conformance stories
 tests/suites/          # Existing feature and driver suites
 tests/                 # Target provisioning and artifact construction
@@ -227,11 +230,10 @@ When more than one test needs this behavior, put the transport in the shared
 Rust e2e harness and require callers to use it instead of duplicating DNS,
 HTTP `Host`, TLS SNI, and mTLS handling.
 
-Conformance command execution, polling, diagnostics, and cleanup remain in
-`crates/openshell-conformance`. Story implementations live directly under
-`e2e/suites/conformance/cli/tests`. `mise run test:rust` includes runner and pure
-policy assertion tests without requiring a gateway. Existing Rust e2e tests
-retain their own harness.
+Shared Rust test tooling lives under `e2e/support/rust`, including the CLI runner,
+binary resolution, output parsing, and port utilities. Conformance scenarios live
+under `e2e/suites/conformance/cli/tests`. `mise run test:rust` includes the tooling
+and scenario unit tests without requiring a gateway.
 
 Suites:
 

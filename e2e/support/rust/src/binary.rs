@@ -12,10 +12,10 @@ use std::path::{Path, PathBuf};
 /// Locate the workspace root by walking up from the crate's manifest directory.
 fn workspace_root() -> PathBuf {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // e2e/rust/ is two levels below the workspace root.
+    // e2e/support/rust/ is three levels below the workspace root.
     manifest_dir
         .ancestors()
-        .nth(2)
+        .nth(3)
         .expect("failed to resolve workspace root from CARGO_MANIFEST_DIR")
         .to_path_buf()
 }

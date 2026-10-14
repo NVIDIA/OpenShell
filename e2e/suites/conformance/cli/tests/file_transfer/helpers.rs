@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_conformance::CommandResult;
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::CommandResult;
+use openshell_e2e_support::OpenShellRunner;
 use std::fs;
 use std::path::Path;
 use std::process::Stdio;

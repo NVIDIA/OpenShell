@@ -5,7 +5,7 @@ use super::helpers::{
     delete_sandbox, download, download_result, exec, fs_error, prepare_sandbox, require_absent,
     require_text,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use std::fs;
 use std::path::Path;
 

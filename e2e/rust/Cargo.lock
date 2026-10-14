@@ -899,6 +899,7 @@ dependencies = [
  "jsonwebtoken",
  "nix",
  "noyalib",
+ "openshell-e2e-support",
  "prost",
  "rand",
  "rustls",
@@ -916,6 +917,17 @@ dependencies = [
  "tonic-prost",
  "tower",
  "url",
+]
+
+[[package]]
+name = "openshell-e2e-support"
+version = "0.0.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

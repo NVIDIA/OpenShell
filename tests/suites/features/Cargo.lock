@@ -875,17 +875,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openshell-conformance"
-version = "0.0.0"
-dependencies = [
- "rand",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
-]
-
-[[package]]
 name = "openshell-e2e"
 version = "0.1.0"
 dependencies = [
@@ -900,6 +889,7 @@ dependencies = [
  "jsonwebtoken",
  "nix",
  "noyalib",
+ "openshell-e2e-support",
  "prost",
  "rand",
  "rustls",
@@ -919,10 +909,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-e2e-support"
+version = "0.0.0"
+dependencies = [
+ "rand",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "openshell-test-feature-provider-refresh-keycloak"
 version = "0.0.0"
 dependencies = [
- "openshell-conformance",
  "openshell-e2e",
  "serde_json",
  "tempfile",

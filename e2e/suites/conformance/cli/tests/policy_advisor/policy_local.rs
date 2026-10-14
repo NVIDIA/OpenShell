@@ -5,7 +5,7 @@ use super::helpers::{
     COMMAND_TIMEOUT, POLL_INTERVAL, READY_TIMEOUT, create_sandbox, enable_proposals,
     sandbox_bash_path,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use serde_json::Value;
 use std::time::Instant;
 use tokio::time::sleep;

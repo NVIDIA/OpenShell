@@ -1,9 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Command execution, polling, diagnostics, and cleanup for `OpenShell` conformance tests.
+//! Shared CLI runner and utilities for `OpenShell` end-to-end tests.
 
+pub mod binary;
 pub mod executor;
+pub mod output;
+pub mod port;
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -209,7 +212,7 @@ struct AuthenticationOutput {
     status: String,
 }
 
-/// Runs `OpenShell` commands for one conformance scenario and owns its cleanup.
+/// Runs `OpenShell` commands for one test scenario and owns its cleanup.
 pub struct OpenShellRunner {
     cli: Arc<dyn CliExecutor>,
     run_id: String,

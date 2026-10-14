@@ -3,11 +3,11 @@
 
 //! Shared test harness modules for CLI e2e tests.
 
-pub mod binary;
+pub use openshell_e2e_support::binary;
 pub mod cli;
 pub mod container;
 pub mod gateway;
 pub mod host_process;
-pub mod output;
-pub mod port;
+pub use openshell_e2e_support::output;
+pub use openshell_e2e_support::port;
 pub mod sandbox;

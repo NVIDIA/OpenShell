@@ -5,7 +5,7 @@ use super::helpers::{
     LARGE_FILE_SIZE, delete_sandbox, download, exec, fs_error, prepare_sandbox, require_text,
     upload, upload_result,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use std::fs;
 use std::path::Path;
 

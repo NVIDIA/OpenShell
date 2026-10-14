@@ -14,10 +14,10 @@ The current areas are `file_transfer`, `lifecycle`, `policy_advisor`, and `smoke
 Each area compiles into one test binary; individual stories remain selectable by
 their module prefix. `main.rs` contains only module declarations.
 
-CLI execution, polling, diagnostics, and cleanup remain in
-`crates/openshell-conformance`. Story modules implement their tests directly;
-Cargo and nextest provide discovery and selection. The runner crate contains no
-scenario registry. Existing Rust e2e tests retain their separate harness.
+Shared CLI execution, polling, diagnostics, and cleanup live in
+[`e2e/support/rust`](../../support/rust/README.md), alongside the utilities used by
+the existing Rust e2e tests. Story modules implement their tests directly; Cargo and nextest provide discovery and selection. Product crates must
+not depend on the test tooling.
 
 For example, run only file-transfer round trips against a prepared gateway:
 
@@ -32,7 +32,7 @@ OPENSHELL_BIN=/absolute/path/to/openshell \
 Run shared tooling and scenario unit tests:
 
 ```shell
-cargo test --locked --package openshell-conformance
+cargo test --locked --manifest-path e2e/support/rust/Cargo.toml
 cargo test --locked --manifest-path e2e/suites/conformance/Cargo.toml \
   --package openshell-test-conformance-cli --test policy_advisor draft_assertion::tests::
 ```
@@ -115,7 +115,7 @@ and waiver handling remain implementation work.
 ## Migration scope
 
 The conformance workspace lives under `e2e/suites/conformance/`; feature and
-driver suites remain under `tests/suites/`, alongside target provisioning. Existing
+driver workspaces remain under `tests/suites/` until a separate relocation. Existing
 assertions and test identities are preserved. The legacy mixed suites under
 `e2e/rust/` still need classification and migration by behavioral intent.
 

@@ -6,7 +6,7 @@ use super::helpers::{
     COMMAND_TIMEOUT, EMPTY_NETWORK_POLICY, await_mechanistic_draft, create_sandbox,
     enable_proposals,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use serde_json::Value;
 use std::io::Write as _;
 use tempfile::NamedTempFile;

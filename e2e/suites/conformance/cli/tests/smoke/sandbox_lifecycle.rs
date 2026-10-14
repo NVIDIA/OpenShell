@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_conformance::OpenShellRunner;
-use openshell_conformance::STATUS_TIMEOUT;
+use openshell_e2e_support::OpenShellRunner;
+use openshell_e2e_support::STATUS_TIMEOUT;
 use serde::Deserialize;
 use std::time::Duration;
 use std::time::Instant;

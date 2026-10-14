@@ -5,7 +5,7 @@ use super::helpers::{
     COMMAND_TIMEOUT, create_running_sandbox, exec_expect_exact, run_lifecycle_command,
     wait_for_phase,
 };
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 
 /// Verify stop/start preserves the workspace and restarts the main process.
 #[tokio::test]

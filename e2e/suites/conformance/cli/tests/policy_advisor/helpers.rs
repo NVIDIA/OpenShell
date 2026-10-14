@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::draft_assertion::{ExpectedDraft, assert_mechanistic_draft};
-use openshell_conformance::OpenShellRunner;
+use openshell_e2e_support::OpenShellRunner;
 use serde::Deserialize;
 use serde_json::Value;
 use std::time::Duration;
