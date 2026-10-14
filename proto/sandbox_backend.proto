@@ -12,13 +12,16 @@ import "options.proto";
 // trusted, authenticated endpoint selected by operator configuration or compute
 // driver provisioning. Workload control, network mediation, and byte streams
 // remain on the Sandbox Protocol.
-// PeerMetadata negotiates the base contract and optional suspend/resume support.
+// Describe exchanges PeerMetadata to negotiate the base contract and optional
+// suspend/resume support.
 // Version 1.0 requires openshell.sandbox.protocol on both peers and includes
 // boundary routing. Optional state retention support advertises
 // openshell.sandbox.suspend-resume. Add optional capabilities
-// with compatible minor versions; incompatible semantics require a major bump.
+// or fields with compatible minor versions; incompatible semantics require a
+// major bump. Peers ignore unknown protobuf fields and must satisfy both peers'
+// required capabilities before use.
 service SandboxBackend {
-  // Negotiate the isolation contract before opening a boundary. This call
+  // Describe the backend and negotiate before opening a boundary. This call
   // conveys no sandbox credentials or driver descriptor.
   rpc Describe(DescribeSandboxBackendRequest) returns (DescribeSandboxBackendResponse);
 

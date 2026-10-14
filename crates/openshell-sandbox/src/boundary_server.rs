@@ -5315,11 +5315,29 @@ mod linux {
                     .code(),
                 tonic::Code::FailedPrecondition
             );
+            let mut compatible =
+                openshell_sandbox_backend::isolation_protocol::metadata("test/supervisor");
+            compatible.protocol_version.as_mut().unwrap().minor += 1;
+            compatible
+                .supported_capabilities
+                .push("openshell.isolation.future".to_string());
+            let mut unmet_requirement = compatible.clone();
+            unmet_requirement
+                .required_capabilities
+                .push("openshell.isolation.future".to_string());
+            assert_eq!(
+                control
+                    .describe(DescribeSandboxBackendRequest {
+                        supervisor: Some(unmet_requirement),
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
             control
                 .describe(DescribeSandboxBackendRequest {
-                    supervisor: Some(openshell_sandbox_backend::isolation_protocol::metadata(
-                        "test/supervisor",
-                    )),
+                    supervisor: Some(compatible),
                 })
                 .await
                 .unwrap();

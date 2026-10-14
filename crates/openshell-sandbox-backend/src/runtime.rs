@@ -122,12 +122,7 @@ impl OpenShellRuntimeBackend {
     ) -> Result<(Option<String>, bool), BackendError> {
         let mut client = BoundaryClient::new(descriptor, bearer);
         client.connector = connector;
-        match client.call_idempotent(Request::DiscoverPolicy).await? {
-            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
-            _ => Err(BackendError::Descriptor(
-                "expected image policy discovery response".to_string(),
-            )),
-        }
+        client.discover_policy().await
     }
 
     pub fn new(
@@ -201,12 +196,7 @@ impl DelegatedRuntimeBackend {
         validate_runtime_coordinates(&descriptor)?;
         let client =
             BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
-        match client.call_idempotent(Request::DiscoverPolicy).await? {
-            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
-            _ => Err(BackendError::Descriptor(
-                "expected image policy discovery response".to_string(),
-            )),
-        }
+        client.discover_policy().await
     }
 }
 
@@ -285,7 +275,10 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             ));
         }
         Ok(Box::new(RemoteBound {
-            audit_validator: self.audit_validator.clone(),
+            audit_validator: self
+                .delegated
+                .is_none()
+                .then(|| self.audit_validator.clone()),
             client: client.clone(),
             agent: sandbox.agent,
             policy: sandbox.policy,
@@ -299,7 +292,6 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             session_id,
             resource_claims,
             outer_fence,
-            native_audit: self.delegated.is_none(),
         }))
     }
 }
@@ -313,11 +305,6 @@ fn validate_runtime_descriptor(
             "boundary {:?} does not match sandbox {:?}",
             runtime_descriptor.boundary_id, sandbox.sandbox_id
         )));
-    }
-    if runtime_descriptor.generation.is_empty() {
-        return Err(BackendError::Descriptor(
-            "boundary generation must not be empty".to_string(),
-        ));
     }
     if runtime_descriptor.session_id != sandbox.session_id {
         return Err(BackendError::Descriptor(
@@ -403,7 +390,7 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
 }
 
 struct RemoteBound {
-    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
+    audit_validator: Option<Arc<dyn crate::audit::BoundaryAuditValidator>>,
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
     policy: openshell_core::policy::SandboxPolicy,
@@ -417,7 +404,6 @@ struct RemoteBound {
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
     outer_fence: openshell_isolation_interface::contract::OuterFenceGuarantees,
-    native_audit: bool,
 }
 
 #[async_trait]
@@ -445,8 +431,8 @@ impl BoundBoundary for RemoteBound {
                     .to_string(),
             ));
         }
-        if self.native_audit {
-            let properties = self.audit_validator.validate(&confirmation.backend_audit)?;
+        if let Some(validator) = &self.audit_validator {
+            let properties = validator.validate(&confirmation.backend_audit)?;
             if confirmation.properties != properties {
                 return Err(BackendError::Confirm(
                     "sandbox confirmation properties do not match validated audit evidence"
@@ -1360,6 +1346,15 @@ impl BoundaryCredential {
 }
 
 impl BoundaryClient {
+    async fn discover_policy(&self) -> Result<(Option<String>, bool), BackendError> {
+        match self.call_idempotent(Request::DiscoverPolicy).await? {
+            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
+            _ => Err(BackendError::Descriptor(
+                "expected image policy discovery response".to_string(),
+            )),
+        }
+    }
+
     fn new(
         runtime_descriptor: SandboxRuntimeDescriptor,
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
@@ -3384,8 +3379,7 @@ mod tests {
             test_bearer(&expected_token),
         ));
         let bound = RemoteBound {
-            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
-            native_audit: true,
+            audit_validator: Some(Arc::new(crate::audit::LinuxBoundaryAuditValidator)),
             client: client.clone(),
             agent: context.agent,
             policy: context.policy,

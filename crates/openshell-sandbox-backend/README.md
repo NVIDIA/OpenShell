@@ -5,7 +5,7 @@ control protocol shared with `openshell-sandbox`.
 
 ## Boundary startup and routing
 
-The supervisor uses the generated `IsolationBackend` control service to
+The supervisor uses the generated `SandboxBackend` control service to
 negotiate capabilities and open a boundary before reading image policy. Each
 physical connection repeats that handshake, including credential-epoch changes
 and transport recovery. The launch session and generation identify retries;

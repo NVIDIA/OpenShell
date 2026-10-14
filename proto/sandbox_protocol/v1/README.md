@@ -13,15 +13,24 @@ isolation mechanisms. Generate gRPC bindings from
 No OpenShell guest executable or linked backend implementation is required.
 
 The negotiated isolation version covers **both** the control RPCs and the
-framing and JSON messages below. Version 1.0 requires
-`openshell.sandbox.protocol` on both peers. An incompatible change to a
-message, framing, authentication, or lifecycle guarantee requires a major bump.
-A minor revision may add optional capabilities; it must preserve all 1.0
-messages and behavior. A new operation requires an advertised capability
-before a sender uses it. Adding fields to an existing 1.0 request requires a
-major bump: additional request fields are not part of 1.0 and must not be sent.
-Unknown required capabilities fail startup. This
-contract is independently versioned from OpenShell releases.
+framing and JSON messages below. `Describe` exchanges the shared
+[`PeerMetadata` and `ProtocolVersion`](../../extension.proto). Version 1.0
+requires `openshell.sandbox.protocol` on both peers.
+
+Follow the shared extension version rules: major versions change when peers
+cannot safely interoperate; minor versions add optional fields or capabilities
+and remain compatible when both peers' required capabilities are satisfied.
+Unknown required capabilities fail negotiation. The protocol version is
+independent of OpenShell releases and the diagnostic implementation version.
+
+Protobuf additions preserve existing field numbers and behavior; receivers
+ignore unknown protobuf fields. A new operation or a field whose behavior the
+sender relies on requires an advertised capability before use. JSON additions
+must also preserve existing behavior: send new fields only after negotiating
+receiver support, since existing JSON types may reject unknown fields or bind
+their contents to a request digest. Without that support, use the existing
+message shape and digest rules. Incompatible changes to messages, framing,
+authentication, or lifecycle guarantees require a major bump.
 
 ## Trusted registration and launch
 
