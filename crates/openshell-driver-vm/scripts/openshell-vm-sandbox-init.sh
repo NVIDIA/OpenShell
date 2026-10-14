@@ -211,10 +211,6 @@ exec_supervisor_in_newroot() {
         if [ -x "/newroot${supervisor}" ]; then
             exec "$chroot_bin" /newroot "$supervisor" "$@"
         fi
-
-        if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox "$@"
-        fi
     done
 
     ts "FATAL: unable to exec openshell-sandbox in guest rootfs"
