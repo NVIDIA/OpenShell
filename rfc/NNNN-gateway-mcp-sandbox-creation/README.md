@@ -21,10 +21,9 @@ first.
 The contract is a gRPC API for child sandboxes, exposed through the SDKs, the
 CLI and an MCP endpoint, so a harness can integrate at whichever level suits it.
 Agents inside a sandbox reach the gateway through a door in their own
-supervisor at `http://openshell.local`. The supervisor checks the calling
-program against a network rule that the gateway writes from the grant, attaches
-a token bound to the sandbox, and forwards the call; the agent never holds a
-credential. Agents and tools running on the host call the same endpoint with the
+supervisor at `http://openshell.local`, which is open in every sandbox. The
+supervisor identifies the calling program, attaches it and a token bound to the
+sandbox, and forwards the call; the agent never holds a credential. Agents and tools running on the host call the same endpoint with the
 user's login and create sandboxes as the user would with the CLI. In every case
 the gateway makes every decision, and a sandbox without a grant cannot create
 sandboxes at all.
@@ -113,17 +112,17 @@ Two kinds of caller reach the gateway.
 
 **Harness inside a sandbox.** This is the main case. The user starts a lead
 sandbox with a grant. The lead's harness connects to `http://openshell.local/mcp`,
-which the lead's supervisor serves. The supervisor checks the calling program,
-attaches the sandbox's token and forwards the call. The gateway authenticates
-the sandbox, checks the grant, proves the child's policy, records lineage and
-launches the child through the compute driver.
+which the lead's supervisor serves. The supervisor identifies the calling
+program, attaches it and the sandbox's token, and forwards the call. The gateway
+authenticates the sandbox, checks the program and the grant, proves the child's
+policy, records lineage and launches the child through the compute driver.
 
 ```mermaid
 flowchart LR
   U["User: start the lead with --grant"]:::user
   subgraph LEAD["Lead sandbox"]
     A["Agent harness, e.g. Pi (no credential)"]:::untrusted
-    S["Supervisor door at openshell.local/mcp: program allowed? add sandbox token"]:::new
+    S["Supervisor door at openshell.local/mcp: add calling program and sandbox token"]:::new
   end
   subgraph GW["OpenShell gateway"]
     M["MCP endpoint /mcp"]:::new
@@ -307,8 +306,9 @@ from the CLI, and needs no new approval interface. Interactive approval for
 requests outside the grant is future work.
 
 **Only the user changes a grant.** The user can widen, shrink or revoke a grant
-while the tree runs. Changes apply to new creates only: an existing child keeps
-its policy and its door rule. No sandbox can change a grant, including through
+while the tree runs. Changes apply to the next call: a sandbox that had no depth
+left can create children as soon as the user raises `max_depth`, with no policy
+change, and an existing child keeps its policy. No sandbox can change a grant, including through
 the gateway MCP, and every change is audited. If an agent could widen its own
 grant, the grant would mean nothing.
 
@@ -374,7 +374,7 @@ not change that model. It is used only for decisions about trees (cascade stop,
 
 **A child's ceiling is its parent's policy.** When a sandbox creates a child,
 the gateway proves the child's policy against the parent's current policy,
-without the door rule and provider layers. The lead's children are bounded by
+without provider layers. The lead's children are bounded by
 the lead's policy, its grandchildren by its children's policies, and so on, so
 each level can only narrow: `child ≤ parent ≤ global maximum`, the model in
 #2025. A single tree-wide ceiling, the lead's policy, would let a child that was
@@ -445,9 +445,9 @@ the default) or whether every child receives its parent's policy unchanged
 includes a policy is refused. Either way a child never receives more than the
 ceiling and the global maximum allow.
 
-**Layers the gateway adds.** The door rule and provider layers are added after
-the proof. Both come from trusted sources, the grant and admin-imported provider
-profiles, not from the agent. Provider attachments are checked separately: a
+**Layers the gateway adds.** Provider layers are added after the proof. They
+come from a trusted source, admin-imported provider profiles, not from the
+agent. Provider attachments are checked separately: a
 child may only receive providers attached to its parent.
 
 #### Other MCP servers
@@ -499,45 +499,42 @@ It reuses the mechanism that serves the `policy.local` API today
   Clients that honor the proxy environment reach the explicit forward-proxy
   path. Both paths dispatch on the `Host` header.
 
-- **Program check.** The door checks the calling program against the sandbox's
-  network policy for `openshell.local:80`, using the binary identity the
-  isolation backend supplies for the connection (RFC 0012), through the same
-  OPA evaluation the proxy uses for egress (`authorize_supplied_identity`). The
-  workload cannot forge this identity. `policy.local` today skips this check;
-  the door must not.
+- **Open in every sandbox.** Every sandbox can reach the door while the gateway
+  MCP is enabled, as every sandbox can reach `policy.local` today. Nothing in a
+  sandbox's policy controls it; there is no door rule. The gateway decides every
+  call, so a sandbox without a grant, or with no depth left, reaches the door
+  and is refused.
+
+- **Calling program.** The door identifies the calling program from the binary
+  identity the isolation backend supplies for the connection (RFC 0012), and
+  sends its kernel-resolved path to the gateway in the
+  `x-openshell-caller-program` header. The door builds the forwarded request
+  itself, so the workload cannot set or forge this header. A connection whose
+  program cannot be identified is refused with `door_denied`.
 
 - **Forwarding.** The door reads the request body (the same 64 KiB limit as
   `policy.local`), forwards it to the gateway's `/mcp` with a token bound to
   this sandbox, and returns the gateway's response unchanged.
 
-**The door rule.** The network rule that makes the program check pass is
-written by the gateway, never by the agent:
+- **Rate limit.** The gateway limits calls per sandbox, so a sandbox that may
+  not create children cannot flood the gateway through its door.
 
-```yaml
-network_policies:
-  openshell_gateway_mcp:
-    name: openshell_gateway_mcp
-    endpoints:
-      - host: openshell.local
-        port: 80
-    binaries:
-      - path: /usr/local/bin/node   # the grant's program
-```
+**Why no door rule.** An earlier design opened the door only in sandboxes with a
+grant and depth left, through a network rule the gateway wrote into each
+sandbox's policy. That rule went stale when the user changed a grant, was lost
+when a user replaced a policy or a global policy replaced every policy, and had
+to be stripped before every proof and guarded against agents writing it. An
+open door with every decision in the gateway has none of these problems, and a
+grant change takes effect on the next call.
 
-The gateway adds it to a sandbox's base policy at creation when the sandbox is
-an agent with depth left: the holder when `max_depth > 0`, and an agent child
-when its depth is below `max_depth`. A child policy that already contains the
-key is refused. Because the rule is part of the base policy at creation, it is
-present from the supervisor's first configuration fetch; the 10 second policy
-poll (`OPENSHELL_POLICY_POLL_INTERVAL_SECS`) does not delay it. The door rule is
-a plain network rule, so the prover can check it.
-
-**Program, not script.** The door rule names an executable. Pi is a Node
-program, so its rule names `/usr/local/bin/node`, and any Node process in the
-sandbox can use the door, including one the agent starts from its shell. `curl`,
-`bash` and other programs cannot. Provider credentials scoped to `node` have the
-same property today. The gateway's checks still apply to every call, so a
-script using the door gets exactly what the harness would get.
+**Program check.** A grant names one program, for example
+`/usr/local/bin/node` for Pi. The gateway refuses a call from a sandbox in that
+tree when the forwarded program differs, with `PROGRAM_NOT_ALLOWED`. Any Node
+process in the sandbox can use the door, including one the agent starts from
+its shell; `curl`, `bash` and other programs cannot. The gateway's checks still
+apply to every call, so a script using the door gets exactly what the harness
+would get. A sandbox without a grant has no program restriction, since it may
+not create children at all.
 
 **Token.** The supervisor obtains a short-lived token for the audience
 `urn:openshell:gateway-mcp` through `RefreshSandboxToken`, extending the
@@ -547,35 +544,27 @@ sandbox id and lives at most one hour (`MAX_EXTENSION_TOKEN_TTL`). The gateway
 accepts it only on `/mcp`. Using a dedicated audience instead of the
 supervisor's main session token limits what a leaked token can do.
 
-### Three walls
+### Refusals
 
-A sandbox with no depth left meets three independent checks if it tries to
-create a child:
-
-| Wall | Where | What happens |
-|------|-------|--------------|
-| The tool is hidden | Gateway | `tools/list` is answered per caller; without a grant or with no depth left there is no `create_sandbox`. Models do not see, and so do not waste turns on, tools they cannot use. |
-| No route | Supervisor | No door rule, so the door refuses every program before anything reaches the gateway. |
-| Refused | Gateway | Any create from such a caller fails with `LIMIT_REACHED(depth)` and is audited. |
-
-The door enforces who can reach the gateway MCP; the gateway enforces what they
-may do. The gateway remains the final authority: the first two walls are early
-refusals that also protect against a bug in the third.
+A sandbox with no depth left, or no grant, reaches the door and sees the same
+tools as any other sandbox. The gateway refuses its `create_sandbox` with
+`LIMIT_REACHED(depth)` or `NOT_ALLOWED` and audits the refusal. Tools are always
+listed because a grant can be widened at any time and many MCP clients load the
+tool list only once; `get_limits` reports what the caller may do right now
+(`can_create_children`, depth, breadth and total). A model that calls a tool it
+cannot use gets a clear error in one turn.
 
 ### MCP tools
 
-`tools/list` is answered by the gateway, because the list depends on state only
-the gateway has: whether the caller has a grant, how much depth and breadth it
-has left, and whether the user changed the grant a moment ago. The supervisor
-only learns policy changes on its 10 second poll and never sees the counters.
-MCP clients call `tools/list` once per connection, so this costs one request per
-session. A client's cached list can go out of date during a session, for example
-still showing `create_sandbox` after the budget is used; the gateway refuses
-such calls, and pushing list-changed notifications is future work.
+`tools/list` is answered by the gateway and depends only on the kind of caller:
+a sandbox sees the child tools, a user sees `create_sandbox` and the grant
+tools. It does not depend on the grant or the counters, so a client's cached
+list never goes out of date; whether a call is allowed is decided when it is
+made.
 
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
-| `create_sandbox` | users; sandboxes with a grant and depth left | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `GLOBAL_POLICY_ACTIVE` |
+| `create_sandbox` | users and sandboxes | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `GLOBAL_POLICY_ACTIVE` |
 | `wait` | sandboxes | `handle`, `timeout_s` | `phase`, `exit_code` | `NOT_YOUR_CHILD` |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
 | `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
@@ -605,7 +594,7 @@ and whether it can delegate further.
 | Runs | A harness doing its own task | No agent; only commands its parent sends |
 | Parent uses it with | `wait`, `get_file` | `exec`, `get_file` |
 | `exec` | Refused with `WRONG_KIND` | Allowed; every command is logged |
-| Can create children | If depth is left; it gets the door rule | Never; it never gets the door rule |
+| Can create children | If depth is left | Never |
 | Command | Required | Optional; it stays up until stopped |
 | Lifetime | Until stopped; never outlives its parent | Until stopped, or stopped after an idle timeout (default 10 minutes without `exec` or `get_file`) |
 
@@ -685,8 +674,8 @@ while lineage records which sandbox asked.
 | Start a sandbox with `--grant` | yes | no | no | no |
 | List grants | own workspace | no | no | no |
 | Update or revoke a grant | own grants; Workspace Admin for the workspace | no | no | no |
-| Reach the door | not applicable | named program only | no route | no route |
-| `create_sandbox` | top-level sandboxes, as with the CLI | within limits | hidden and refused | hidden and refused |
+| Use the door | not applicable | grant's program only | grant's program only | grant's program only |
+| `create_sandbox` | top-level sandboxes, as with the CLI | within limits | refused | refused |
 | `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | own descendants |
 
 ### Gateway configuration
@@ -773,10 +762,10 @@ The work is phased so that each phase is usable and testable on its own:
   sandbox with a lineage. Validate with the existing Pi and OpenWorker
   prototypes by replacing their host creation services with these RPCs.
 - **Phase 2: Gateway MCP endpoint and supervisor door.** Add `/mcp` over the
-  same API, with authentication and per-caller `tools/list`, and the
-  `openshell gateway mcp` commands. Add the door at `openshell.local` for both
-  MCP and the gRPC service, the door rule written from the grant, and the
-  `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
+  same API, with authentication, the program check and a per-sandbox rate
+  limit, and the `openshell gateway mcp` commands. Add the door at
+  `openshell.local` for both MCP and the gRPC service, open in every sandbox,
+  and the `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
   callers.
 - **Phase 3: Tool sandboxes.** `kind: tool`, `exec` with command audit, and the
   idle timeout.
@@ -812,16 +801,19 @@ dedicated token.
   would let an unauthenticated caller create sandboxes, so this code needs
   focused review and tests for every principal type.
 
-- **Trusted, unproved layers.** The door rule and provider layers are added
-  after the proof. A bug in the code that writes them could widen a child
-  without the prover noticing. The code is small and table-driven, and tests
-  cover each kind and depth combination, but it is trusted rather than proved.
+- **Trusted, unproved layers.** Provider layers are added after the proof. A
+  bug in the code that writes them could widen a child without the prover
+  noticing. It is trusted rather than proved.
 
-- **Program-level door.** The door rule matches an executable, not a script. In
-  a harness built on Node or Python, any script run by the same interpreter can
+- **Program-level check.** The grant names an executable, not a script. In a
+  harness built on Node or Python, any script run by the same interpreter can
   use the door. Such a script still receives only what the gateway would give
-  the harness, but operators should not read the door rule as "only the
-  harness".
+  the harness, but operators should not read `program` as "only the harness".
+
+- **Every sandbox reaches the gateway MCP.** The door is open in every sandbox,
+  so the gateway's authentication and refusals are the only barrier, and every
+  sandbox can learn that the endpoint exists. The rate limit bounds the load a
+  sandbox can cause; `openshell gateway mcp disable` closes the door everywhere.
 
 - **Results channel.** A child's standard output does not reach the sandbox
   logs, and `get_file` needs the child to be running. A child that exits before
@@ -924,8 +916,7 @@ example "only the lead may call `create_*`".
 
 This was rejected because the prover cannot check MCP rules, a policy rule
 cannot count ("at most three children"), and the decision would be split
-between policy and grant. The grant decides; the door rule controls only
-reachability.
+between policy and grant. The grant decides.
 
 ### SDK or CLI only, without MCP
 
@@ -1020,7 +1011,6 @@ CreateSandbox { name: "lead", policy: lead.yaml, providers: [pi-nvidia],
                          expires_after: 4h, program: "/usr/local/bin/node" } }
 → principal = User → may set a grant → pass
 → lead.yaml is the ceiling for the lead's children
-→ max_depth > 0 → add door rule (openshell.local:80, /usr/local/bin/node)
 → persist SandboxGrant { total: 1 }, SandboxLineage { lead, depth: 0 }
 ```
 
@@ -1028,9 +1018,10 @@ CreateSandbox { name: "lead", policy: lead.yaml, providers: [pi-nvidia],
 
 ```text
 node → openshell.local/mcp   tools/list
-→ supervisor: binary /usr/local/bin/node allowed by door rule → pass
-→ forward with gateway-mcp token → Principal::Sandbox(lead)
-→ grant present, depth 0 < 1, budget left → include create_sandbox
+→ supervisor: calling program /usr/local/bin/node → forward with it and the
+  gateway-mcp token → Principal::Sandbox(lead)
+→ program matches the grant → pass
+→ list every tool
 ```
 
 **3. The lead creates a worker.**
@@ -1044,7 +1035,6 @@ create_sandbox { kind: agent, policy: {board rule}, providers: [pi-nvidia],
 → providers ⊆ lead's providers → pass
 → prover: check_within_boundary(lead's policy, child) → Within
 → reserve counters (total 2, lead's children 1)
-→ child depth 1 = max_depth → no door rule
 → create from lead's template, no GPU, acting for the root user
 → persist SandboxLineage { worker, parent: lead, depth: 1 }
 ```
@@ -1059,10 +1049,10 @@ create_sandbox { ..., request_id: r1 }
 **5. The worker tries to create a child.**
 
 ```text
-node (worker) → openshell.local/mcp
-→ supervisor: no door rule → 403 door_denied, HttpActivity denial emitted
-(were the call to reach the gateway)
+node (worker) → openshell.local/mcp   create_sandbox
+→ supervisor: forward with program and token → program matches the grant
 → depth 1 = max_depth → LIMIT_REACHED(depth), ApiActivity emitted
+(after the user raises max_depth to 2, the same call succeeds)
 ```
 
 **6. The lead asks for more than it has.**
