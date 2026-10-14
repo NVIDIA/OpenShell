@@ -75,7 +75,8 @@ const MAX_DENIALS_LIMIT: usize = 100;
 /// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
 const LOG_DIR: &str = "/var/log";
-/// `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files.
+/// `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files,
+/// which are opt-in via `ocsf_json_enabled`.
 const SHORTHAND_LOG_PREFIX: &str = "openshell.";
 /// Defensive cap on per-line length returned to the agent so a pathological
 /// log entry (very long URL path, etc.) cannot blow up the response.
