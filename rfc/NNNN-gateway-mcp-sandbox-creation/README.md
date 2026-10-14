@@ -10,23 +10,23 @@ links:
 
 ## Summary
 
-This RFC proposes letting agents create sandboxes through an MCP endpoint
-hosted in the OpenShell gateway. An agent running in a sandbox can create
-sub-agents (`kind: agent`) and tool sandboxes (`kind: tool`). Every request is
-identified by OpenShell, proved against a ceiling with the policy prover,
-limited by a grant that the user sets once when starting the tree's first
-sandbox, and recorded in a lineage so that stopping a parent stops its children
+This RFC proposes letting agents create sandboxes through an MCP endpoint hosted
+in the OpenShell gateway. An agent running in a sandbox can create sub-agents
+(`kind: agent`) and tool sandboxes (`kind: tool`). Every request is identified
+by OpenShell, proved against a ceiling with the policy prover, limited by a
+grant that the user sets when starting the tree's first sandbox or attaches to
+it later, and recorded in a lineage so that stopping a parent stops its children
 first.
 
 The contract is a gRPC API for child sandboxes, exposed through the SDKs, the
 CLI and an MCP endpoint, so a harness can integrate at whichever level suits it.
-Agents inside a sandbox reach the gateway through a door in their own
-supervisor at `http://openshell.local`, which is open in every sandbox. The
-supervisor identifies the calling program, attaches it and a token bound to the
-sandbox, and forwards the call; the agent never holds a credential. Agents and tools running on the host call the same endpoint with the
-user's login and create sandboxes as the user would with the CLI. In every case
-the gateway makes every decision, and a sandbox without a grant cannot create
-sandboxes at all.
+Agents inside a sandbox reach the gateway through a door in their own supervisor
+at `http://openshell.local`, which is open in every sandbox. The supervisor
+identifies the calling program, attaches it and a token bound to the sandbox,
+and forwards the call; the agent never holds a credential. Agents and tools
+running on the host call the same endpoint with the user's login and create
+sandboxes as the user would with the CLI. In every case the gateway makes every
+decision, and a sandbox without a grant cannot create sandboxes at all.
 
 ## Motivation
 
@@ -249,15 +249,16 @@ given access to it.
 
 | Surface | Used by | How it reaches the gateway |
 |---------|---------|----------------------------|
-| gRPC / SDK (Rust, Python, TypeScript, Go) | Harnesses integrating in code; services such as RL environment runners | From the host: the user's login. From a sandbox: through the door, once it carries gRPC (open decision). |
+| gRPC / SDK (Rust, Python, TypeScript, Go) | Harnesses integrating in code; services such as RL environment runners | From the host: the user's login. From a sandbox: not in v1; the door carries MCP only, and gRPC through the door comes later (see [Open questions](#open-questions)). |
 | CLI | Users and scripts | The user's login |
 | MCP `/mcp` | Any MCP-capable agent or harness | From a sandbox: through the door. From the host: the user's login. |
 
 The door is the only way code inside a sandbox reaches the gateway, so what it
 forwards decides which surfaces work from inside. MCP is plain HTTP/1.1 and is
-forwarded. The gRPC service runs on HTTP/2, and how the door carries it is an
-open decision (see [Open questions](#open-questions)); until then, code inside a
-sandbox uses MCP and the gRPC service is used from the host.
+forwarded. The gRPC service runs on HTTP/2; in v1 the door carries MCP only, so
+code inside a sandbox uses MCP and the gRPC service is used from the host.
+Carrying gRPC through the door comes later (leaning towards gRPC-Web or Connect;
+see [Open questions](#open-questions)).
 
 ### Grants
 
@@ -330,23 +331,25 @@ When a child creates its own child, the gateway charges the shared counters and
 checks an agent child's depth against the same `max_depth`. Tool sandboxes
 ignore the depth limit, so an agent at the bottom of the tree can still run
 commands in tool sandboxes of its own; they count toward breadth and total like
-any child. A child's slice is never
-more than its parent has left, so the user confirms the tree's limits once and
-sees no further prompts however deep the tree goes. The alternative, a new grant
+any child. A child never uses more than the grant has left, so the user
+confirms the tree's limits once and sees no further prompts however deep the
+tree goes. The alternative, a new grant
 per level, would put a prompt in front of the user every time a worker
 delegated.
 
 **No grant, no children.** A sandbox started without a grant cannot create
 sandboxes. `create_sandbox` is listed for it like for any sandbox (see
-[Refusals](#refusals)), and a call is refused with `NOT_ALLOWED`. The safe default is that a sandbox never gains the ability
-to create sandboxes unless the user said so.
+[Refusals](#refusals)), and a call is refused with `NOT_ALLOWED`. The safe
+default is that a sandbox never gains the ability to create sandboxes unless the
+user said so.
 
 **Set up front.** In v1 the grant is the only approval. A request inside it
 proceeds without prompting anyone; a request outside it is refused with
 `LIMIT_REACHED` and the agent adapts. This matches how OpenShell is used today,
 from the CLI, and needs no new approval interface. Access the parent lacks goes
-through the existing proposal flow (see [Asking for more than the parent has](#asking-for-more-than-the-parent-has)); a
-single prompt for requests outside the grant is future work.
+through the existing proposal flow (see [Asking for more than the parent
+has](#asking-for-more-than-the-parent-has)); a single prompt for requests
+outside the grant is future work.
 
 **Only the user changes a grant.** The user can widen, shrink or revoke a grant
 while the tree runs:
@@ -430,12 +433,13 @@ not change that model. It is used only for decisions about trees (cascade stop,
 
 **A child's ceiling is its parent's policy.** When a sandbox creates a child,
 the gateway proves the child's policy against the parent's current policy,
-without provider layers. The lead's children are bounded by
-the lead's policy, its grandchildren by its children's policies, and so on, so
-each level can only narrow: `child ≤ parent ≤ global maximum`, the model in
-the spike on agents setting maximum policies for spawned agents
-([#2025](https://github.com/NVIDIA/OpenShell/issues/2025)). A single tree-wide ceiling, the lead's policy, would let a child that was
-given only GitHub read access create a grandchild with everything the lead has.
+without provider layers. The lead's children are bounded by the lead's policy,
+its grandchildren by its children's policies, and so on, so each level can only
+narrow: `child ≤ parent ≤ global maximum`, the model in the spike on agents
+setting maximum policies for spawned agents
+([#2025](https://github.com/NVIDIA/OpenShell/issues/2025)). A single tree-wide
+ceiling, the lead's policy, would let a child that was given only GitHub read
+access create a grandchild with everything the lead has.
 
 Because the ceiling is the parent's policy at the moment of the create, a
 parent whose policy has grown through an approved proposal can pass that access
@@ -494,8 +498,8 @@ global_policy_mode = "maximum"
 
 In `maximum` mode each sandbox keeps its own policy, provider layers stay
 active, and the gateway proves that every policy fits inside the global one: a
-grant holder's policy when it is created, every child policy, and every later
-policy write. A policy that does not fit is refused with
+grant holder's policy when it is created or given a grant, every child policy,
+and every later policy write. A policy that does not fit is refused with
 `EXCEEDS_GLOBAL_POLICY` and the prover's counterexample. Children are then
 proved against both their ceiling and the global policy.
 
@@ -506,11 +510,11 @@ rather than receiving a child with unexpected access.
 
 **Whether a parent may set its child's policy.** A grant states whether agents
 in the tree may write their children's policies (`child_policy: narrow`, the
-default; any section the prover checks, see "What the agent writes" in
-[Ceiling and policy proof](#ceiling-and-policy-proof)) or whether every child receives its parent's policy unchanged
-(`child_policy: inherit`). In `inherit` mode a `create_sandbox` request that
-includes a policy is refused. Either way a child never receives more than the
-ceiling and the global maximum allow.
+default; any section the prover checks, see "What the agent writes" in [Ceiling
+and policy proof](#ceiling-and-policy-proof)) or whether every child receives
+its parent's policy unchanged (`child_policy: inherit`). In `inherit` mode a
+`create_sandbox` request that includes a policy is refused. Either way a child
+never receives more than the ceiling and the global maximum allow.
 
 **Layers the gateway adds.** Provider layers are added after the proof. They
 come from a trusted source, admin-imported provider profiles, not from the
@@ -519,11 +523,11 @@ child may only receive providers attached to its parent.
 
 #### Asking for more than the parent has
 
-When the task really needs access the parent lacks, the parent widens its own policy first, through the proposal flow
-every sandbox has today, and then retries. No new mechanism is involved; the
-gateway's refusal points the agent to it, in the same way the supervisor's
-guidance for a blocked request does (`AGENT_GUIDANCE` in
-`crates/openshell-supervisor-network/src/policy_local.rs`):
+When the task really needs access the parent lacks, the parent widens its own
+policy first, through the proposal flow every sandbox has today, and then
+retries. No new mechanism is involved; the gateway's refusal points the agent to
+it, in the same way the supervisor's guidance for a blocked request does
+(`AGENT_GUIDANCE` in `crates/openshell-supervisor-network/src/policy_local.rs`):
 
 1. The lead calls `create_sandbox` for a worker with `POST
    api.github.com/repos/**`. The gateway refuses with `EXCEEDS_CEILING`, the
@@ -691,12 +695,12 @@ concept forwards the session token; v1 requires the dedicated audience.
 A sandbox with no depth left, or no grant, reaches the door and sees the same
 tools as any other sandbox. The gateway refuses its `create_sandbox` with
 `LIMIT_REACHED(depth)` or `NOT_ALLOWED` and audits the refusal; a sandbox with
-no depth left can still create tool sandboxes within breadth and total. Tools are always
-listed because a grant can be widened at any time and many MCP clients load the
-tool list only once; `get_limits` reports what the caller may do right now
-(`can_create_children` for agents, `can_create_tools`, depth, breadth and
-total). A model that calls a tool it
-cannot use gets a clear error in one turn.
+no depth left can still create tool sandboxes within breadth and total. Tools
+are always listed because a grant can be widened at any time and many MCP
+clients load the tool list only once; `get_limits` reports what the caller may
+do right now (`can_create_children` for agents, `can_create_tools`, depth,
+breadth and total). A model that calls a tool it cannot use gets a clear error
+in one turn.
 
 ### MCP tools
 
@@ -708,13 +712,13 @@ made.
 
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
-| `create_sandbox` | users and sandboxes | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `GLOBAL_POLICY_ACTIVE` |
+| `create_sandbox` | users and sandboxes | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `PROVER_INCONCLUSIVE`, `PROGRAM_NOT_ALLOWED`, `GLOBAL_POLICY_ACTIVE`, `EXCEEDS_GLOBAL_POLICY` |
 | `wait` | sandboxes | `handle`, `timeout_s` | `phase`, `exit_code` | `NOT_YOUR_CHILD` |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
 | `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
 | `stop_sandbox` | sandboxes | `handle` | `stopped` | `NOT_YOUR_CHILD` |
 | `list_children` | sandboxes | none | children with kind, lifetime, depth | none |
-| `get_limits` | sandboxes | none | depth, children and total used and allowed | none |
+| `get_limits` | sandboxes | none | depth, children and total used and allowed; `can_create_children` (agents) and `can_create_tools` | none |
 | `grant_list` | users | none | grants in the caller's workspace | none |
 | `grant_create` | users | `handle` of a running top-level sandbox, grant fields | the grant | `NOT_ALLOWED`, `ALREADY_EXISTS` |
 | `grant_update` | users | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits, or `revoked` | `NOT_FOUND`, `NOT_ALLOWED` |
@@ -722,9 +726,9 @@ made.
 A sandbox acts only on its own descendants; `handle` is the child's sandbox name
 within the caller's workspace. A user caller creates top-level sandboxes with
 the same rules as `openshell sandbox create`, may attach a grant to them, and
-acts on any sandbox its workspace role allows. `inputs` lists paths in the parent that are
-copied read-only into the child at start. `exec` and `get_file` run through the
-existing `ExecSandbox` path, acting for the tree's root user.
+acts on any sandbox its workspace role allows. `inputs` lists paths in the
+parent that are copied read-only into the child at start. `exec` and `get_file`
+run through the existing `ExecSandbox` path, acting for the tree's root user.
 
 These are the only tools a harness reaches through the gateway. A harness's
 built-in tools (shell, file editing) run inside the sandbox, constrained by its
@@ -741,9 +745,9 @@ and whether it can delegate further.
 | Runs | A harness doing its own task | No agent; only commands its parent sends |
 | Parent uses it with | `wait`, `get_file` | `exec`, `get_file` |
 | `exec` | Refused with `WRONG_KIND` | Allowed; every command is logged |
-| Can create children | If depth is left | Never |
+| Can create children | Agents if depth is left; tool sandboxes within breadth and total | Never |
 | Command | Required | Optional; it stays up until stopped |
-| Lifetime | Until stopped; never outlives its parent | Until stopped, or stopped after an idle timeout (default 10 minutes without `exec` or `get_file`) |
+| Lifetime | Until stopped (default) or until exit (`until_exit`); never outlives its parent | Until stopped, or stopped after an idle timeout (default 10 minutes without `exec` or `get_file`) |
 
 Agent sandboxes run their own task, so their parent observes them rather than
 driving them, and `exec` on an agent is refused to keep a parent from steering
@@ -819,11 +823,12 @@ while lineage records which sandbox asked.
 | Action | User | Holder or agent child with depth left | Agent child with no depth left | Tool child |
 |--------|------|------|------|------|
 | Start a sandbox with `--grant` | yes | no | no | no |
+| Attach a grant later (`grant create`) | top-level sandboxes without a grant | no | no | no |
 | List grants | own workspace | no | no | no |
 | Update or revoke a grant | own grants; Workspace Admin for the workspace | no | no | no |
-| Use the door | not applicable | grant's program only | grant's program only | grant's program only |
+| Call the gateway MCP | not applicable | grant's program only (gateway checks) | grant's program only (gateway checks) | grant's program only (gateway checks) |
 | `create_sandbox` | top-level sandboxes, as with the CLI | within limits | tool sandboxes only, within breadth and total | refused |
-| `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | own descendants |
+| `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | none (no children) |
 
 ### Gateway configuration
 
@@ -893,10 +898,11 @@ did it run" from the same log stream they already ship to their SIEM.
 ### Compatibility
 
 The change is additive. Sandboxes created without `--grant` behave exactly as
-today, and the default `global_policy_mode` remains `replace`. Existing gRPC clients are unaffected; the new `grant` field is optional.
-Supervisors without the door ignore `openshell.local`, so a newer gateway with
-an older supervisor image simply cannot serve in-sandbox callers until the image
-is updated. Host agents can use the endpoint as soon as the gateway supports it.
+today, and the default `global_policy_mode` remains `replace`. Existing gRPC
+clients are unaffected; the new `grant` field is optional. Supervisors without
+the door ignore `openshell.local`, so a newer gateway with an older supervisor
+image simply cannot serve in-sandbox callers until the image is updated. Host
+agents can use the endpoint as soon as the gateway supports it.
 
 ## Implementation plan
 
@@ -914,13 +920,14 @@ The work is phased so that each phase is usable and testable on its own:
   limit, and the `openshell gateway mcp` commands. Add the door at
   `openshell.local` for MCP, open in every sandbox, and the
   `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
-  callers. Carrying gRPC through the door follows later, as decided in
-  [Open questions](#open-questions).
+  callers. Carrying gRPC through the door comes in a later phase (see
+  [Open questions](#open-questions)).
 - **Phase 3: Tool sandboxes.** `kind: tool`, `exec` with command audit, and the
   idle timeout.
 - **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
-  proof of every grant holder's policy, child policy and policy write against
-  the global policy in `maximum` mode.
+  proof of every grant holder's policy (at create and when a grant is
+  attached), child policy and policy write against the global policy in
+  `maximum` mode.
 - **Phase 5: Lifecycle.** Cascade stop on every way a parent ends, the orphan
   reaper, and idle and maximum lifetime for agent children with the "a parent
   with running children is not idle" rule.
@@ -928,9 +935,9 @@ The work is phased so that each phase is usable and testable on its own:
   reference pages for grants and the MCP tools, and a configuration entry for
   `[openshell.gateway.sandbox_mcp]`.
 
-Validation runs at each phase: unit tests for grant parsing, limits and the
-door-rule decision; gateway tests for refusals; and an end-to-end scenario with
-the Docker driver that exercises every refusal listed in this RFC.
+Validation runs at each phase: unit tests for grant parsing, limits, the program
+check and the ceiling proof; gateway tests for refusals; and an end-to-end
+scenario with the Docker driver that exercises every refusal listed in this RFC.
 
 A proof of concept of phases 1 to 3 exists on the branch `gateway-mcp-poc`
 (`crates/openshell-server/src/mcp.rs`,
@@ -967,8 +974,8 @@ dedicated token.
 - **Results channel.** A child's standard output does not reach the sandbox
   logs, and `get_file` needs the child to be running. A child that exits before
   its parent reads its result loses that result. Harnesses must keep agent
-  children running until their result is read, or results need a channel that
-  survives exit.
+  children running until their result is read; a results channel is future
+  work (see [Returning results to the parent](#returning-results-to-the-parent)).
 
 - **Spawn storms.** A misbehaving lead can create children up to its grant
   quickly. Atomic counters, `max_total`, operator caps, retry deduplication and
@@ -1004,9 +1011,10 @@ interface (OpenWorker shows one for teams), or through a harness extension's
 confirmation dialog, which Pi forwards over its RPC mode. Open points are where
 pending requests are shown, timeouts, and whether to use a pending identifier
 with `wait` or MCP's long-running task support. The same prompt could replace
-the two-step flow for a child that needs more than its parent has (see
-[Asking for more than the parent has](#asking-for-more-than-the-parent-has)): the user would see the child's request, and
-approving it would widen the parent and create the child together.
+the two-step flow for a child that needs more than its parent has (see [Asking
+for more than the parent has](#asking-for-more-than-the-parent-has)): the user
+would see the child's request, and approving it would widen the parent and
+create the child together.
 
 ### Per-tool rules for other MCP servers
 
@@ -1126,16 +1134,14 @@ is instead offered as a maximum that every sandbox must fit inside.
 - Will `openshell-prover` model MCP and GraphQL rules, and on what timeline?
   The answer decides whether per-tool rules for other MCP servers become
   possible.
-- Should a parent be able to read the result of a child that has exited, for
-  example through a result file the gateway keeps until the parent reads it?
 - When interactive approval is added, where should pending requests appear?
 - Should `global_policy_mode = "maximum"` become the default, and how do
   operators who run shared gateways use the global policy today?
 - Is the MCP endpoint's cost when idle small enough to keep it on by default on
   every gateway?
-- **Decision to make: how the door carries gRPC.** The door forwards MCP, which
-  is plain HTTP/1.1: one request, one response, read and forwarded with the
-  sandbox's token. gRPC uses HTTP/2, with many calls multiplexed on one
+- **How the door carries gRPC after v1.** v1 carries MCP only. The door forwards
+  MCP, which is plain HTTP/1.1: one request, one response, read and forwarded
+  with the sandbox's token. gRPC uses HTTP/2, with many calls multiplexed on one
   connection and streaming responses. Options:
   - **A. MCP only inside sandboxes.** No change; agents use MCP, and the SDKs
     are used from the host. Cost: SDK code inside a sandbox cannot call the
@@ -1207,7 +1213,8 @@ node (worker) → openshell.local/mcp   create_sandbox
 (after the user raises max_depth to 2, the same call succeeds)
 ```
 
-**6. The lead asks for more than it has.**
+**6. The lead asks for more than it has** (agent proposals enabled for the
+lead with `agent_policy_proposals_enabled`).
 
 ```text
 create_sandbox { policy: {POST api.github.com/repos/**} }
@@ -1223,7 +1230,7 @@ create_sandbox { policy: {POST api.github.com/repos/**} }
 ```text
 UpdateSandboxGrant { grant_id, max_breadth: 3, max_total: 4 }
 → principal = User, grant owner → pass
-→ applies to new creates only; worker unchanged; audited
+→ applies from the next call; existing children keep their policy; audited
 ```
 
 **8. The lead collects the result and stops the worker.**
