@@ -443,12 +443,19 @@ parent's policy shrinks keep their policy; revalidating them is the subject of
 [#3808](https://github.com/NVIDIA/OpenShell/issues/3808), "revalidate running
 subagents when ancestor authority changes".
 
-**What the agent writes.** The agent supplies only the child's
-`network_policies`. The gateway builds the child's full policy from the
-ceiling's filesystem, process and Landlock sections plus those network rules.
-This keeps the agent from requesting filesystem or process changes it has no
-reason to make, and keeps the proof focused on network access, where delegated
-tasks differ.
+**What the agent writes.** The agent may narrow every section of the child's
+policy that the prover checks: `network_policies`, `filesystem_policy`,
+`process` and `landlock`. A filesystem, process or Landlock section it omits is
+copied from the parent; network rules it omits are none, so a child has no
+network access unless the agent asks for it. The whole policy is then proved
+against the parent's. A read-only reviewer, for example, is the parent's
+filesystem section with `/sandbox` moved from `read_write` to `read_only`.
+Network middlewares are not proved and cannot be set for a child.
+
+The prover is conservative with filesystem paths: a child that lists a path the
+parent does not list, or depends on an unresolved image working directory, is
+refused as `UNSUPPORTED_RULES` rather than proved. Narrowing that keeps the
+parent's paths and moves them to read-only, or drops them, is proved.
 
 **The proof.** The gateway serializes the ceiling and the candidate with
 `openshell_policy::serialize_sandbox_policy`, parses both with
