@@ -10,6 +10,9 @@ use openshell_core::policy::SandboxPolicy;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(all(unix, any(target_os = "linux", test)))]
+mod cdi_paths;
+
 /// Apply sandboxing rules for the current platform.
 ///
 /// # Errors

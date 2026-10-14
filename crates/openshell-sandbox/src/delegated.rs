@@ -36,6 +36,7 @@ pub async fn spawn_workload(
     timeout_secs: u64,
     interactive: bool,
     policy: &SandboxPolicy,
+    launch_context: &crate::launch::WorkloadLaunchContext,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
@@ -79,6 +80,7 @@ pub async fn spawn_workload(
     let boundary_exec: Arc<dyn BoundaryExec> =
         Arc::new(crate::boundary_exec::LocalBoundaryExec::new(
             policy.clone(),
+            launch_context.clone(),
             workspace.owned_root(),
             ca_file_paths.clone().map(Arc::new),
             provider_credentials,
@@ -99,6 +101,7 @@ pub async fn spawn_workload(
         &workspace,
         interactive,
         policy,
+        launch_context,
         ca_file_paths.as_ref(),
         tls_environment_mode,
         &provider_env,
