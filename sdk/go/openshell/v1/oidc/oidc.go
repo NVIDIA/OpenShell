@@ -203,7 +203,7 @@ func loginBrowser(ctx context.Context, cfg *loginConfig, provider *providerConfi
 		_ = srv.Close()
 	}()
 
-	redirectURI := fmt.Sprintf("http://localhost:%d/callback", port)
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
 	authURL := buildAuthURL(provider.AuthorizationEndpoint, cfg.clientID, redirectURI, state, challenge, cfg.scopes)
 
 	// Try to open the browser.

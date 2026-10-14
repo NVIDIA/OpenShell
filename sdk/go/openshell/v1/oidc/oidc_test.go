@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -494,3 +496,99 @@ func TestLogin_ContextTimeout(t *testing.T) {
 	)
 	require.Error(t, err)
 }
+
+// TestLoginBrowser_RedirectURIMatchesCallbackListener verifies that
+// loginBrowser constructs redirect_uri using 127.0.0.1 to match the
+// 127.0.0.1 listener bound by startCallbackServer (#4518).
+func TestLoginBrowser_RedirectURIMatchesCallbackListener(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell stub used for browser launcher")
+	}
+	resetDiscoveryCache()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := ln.Addr().(*net.TCPAddr).Port
+	require.NoError(t, ln.Close())
+
+	var tokenRedirectURI string
+	mux := http.NewServeMux()
+	var srv *httptest.Server
+	mux.HandleFunc("/.well-known/openid-configuration", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                           srv.URL,
+			"authorization_endpoint":           srv.URL + "/authorize",
+			"token_endpoint":                   srv.URL + "/token",
+			"scopes_supported":                 []string{"openid", "profile", "email"},
+			"code_challenge_methods_supported": []string{"S256"},
+		})
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		tokenRedirectURI = r.FormValue("redirect_uri")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(tokenResponseJSON("browser-access-token", "browser-refresh-token", 3600)))
+	})
+	srv = httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	binDir := t.TempDir()
+	urlFile := filepath.Join(binDir, "auth_url.txt")
+	cmdName, _ := browserCommand("https://example.com")
+	scriptPath := filepath.Join(binDir, cmdName)
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s' \"$1\" > %q\n", urlFile)
+	require.NoError(t, os.WriteFile(scriptPath, []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	authURLCh := make(chan string, 1)
+	go func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			data, readErr := os.ReadFile(urlFile)
+			if readErr == nil && len(data) > 0 {
+				rawAuthURL := string(data)
+				authURLCh <- rawAuthURL
+				parsedAuth, parseErr := url.Parse(rawAuthURL)
+				if parseErr == nil {
+					state := parsedAuth.Query().Get("state")
+					cbURL := fmt.Sprintf("http://127.0.0.1:%d/callback?code=browser-code&state=%s", port, url.QueryEscape(state))
+					resp, getErr := http.Get(cbURL)
+					if getErr == nil {
+						_ = resp.Body.Close()
+					}
+				}
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	tok, err := Login(ctx, "",
+		WithIssuer(srv.URL),
+		WithClientID("test-client"),
+		WithCallbackPort(port),
+		WithInMemory(),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "browser-access-token", tok.AccessToken)
+
+	var capturedAuthURL string
+	select {
+	case capturedAuthURL = <-authURLCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for browser command to capture authorization URL")
+	}
+
+	parsedAuthURL, err := url.Parse(capturedAuthURL)
+	require.NoError(t, err)
+	expectedRedirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	assert.Equal(t, expectedRedirectURI, parsedAuthURL.Query().Get("redirect_uri"),
+		"authorization URL redirect_uri must use 127.0.0.1 to match startCallbackServer listener")
+	assert.Equal(t, expectedRedirectURI, tokenRedirectURI,
+		"token exchange redirect_uri must use 127.0.0.1 to match authorization request and callback listener")
+}
+
