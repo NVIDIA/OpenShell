@@ -681,6 +681,11 @@ labels. Read-only mounts still require approval. Namespaces do not grant
 approval. Newly provisioned private storage and bootstrap material use driver
 ownership checks instead.
 
+Kubernetes PVC mount destinations must not overlap the driver-managed
+`/.openshell` tree or `/run`, including mounts using `sub_path`. Approval labels
+do not override these restrictions. Mount application data at paths such as
+`/data` or a directory below `/sandbox`.
+
 RuntimeClasses and PriorityClasses are shared operator infrastructure. They must
 match every fixed required label, but `${workspace}` entries do not apply to
 them. Kubernetes API-server and admission-webhook mutations of the live Pod are
