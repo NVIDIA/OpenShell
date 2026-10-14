@@ -8,10 +8,10 @@ on:
     outputs:
       docker-result:
         description: Docker runtime result for existing release summaries
-        value: ${{ jobs.runtime.outputs.docker-result }}
+        value: ${{ jobs.result.outputs.docker-result }}
       vm-result:
         description: VM runtime result for existing release summaries
-        value: ${{ jobs.runtime.outputs.vm-result }}
+        value: ${{ jobs.result.outputs.vm-result }}
     inputs:
       profile:
         description: core, release, gpu, kubernetes-ha, or kubernetes-credentials
@@ -53,10 +53,174 @@ jobs:
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
 
-  runtime:
-    uses: ./.github/workflows/e2e-runtime-tests.yml
+  docker:
+    name: Docker (${{ matrix.variant }})
+    if: inputs.profile == 'core' || inputs.profile == 'release'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: regular
+            gateway_artifact: ''
+            external_driver_binary: ''
+            suites:
+              - suite: python
+                cmd: mise run --no-deps --skip-deps e2e:python
+                apt_packages: ''
+                python_proto: true
+                mcp: false
+              - suite: oidc-python
+                cmd: mise run --no-deps --skip-deps e2e:oidc-python:docker
+                apt_packages: ''
+                python_proto: true
+                mcp: false
+              - suite: oidc-pkce-docker
+                cmd: mise run --no-deps --skip-deps e2e:oidc-pkce:docker
+                apt_packages: openssh-client
+                python_proto: false
+                mcp: false
+              - suite: rust-docker
+                cmd: mise run --no-deps --skip-deps e2e:rust
+                apt_packages: openssh-client
+                python_proto: false
+                mcp: false
+              - suite: oci-image
+                cmd: mise run --no-deps --skip-deps e2e:oci-image
+                apt_packages: openssh-client
+                python_proto: false
+                mcp: false
+              - suite: mcp
+                cmd: mise run --no-deps --skip-deps e2e:mcp
+                apt_packages: ''
+                python_proto: false
+                mcp: true
+    uses: ./.github/workflows/e2e-docker-test.yml
     with:
+      checkout-ref: ${{ inputs.source-sha }}
       test-family: drivers
-      profile: ${{ inputs.profile }}
-      source-sha: ${{ inputs.source-sha }}
       image-tag: ${{ inputs.image-tag }}
+      runner: linux-arm64-cpu8
+      gateway-artifact: ${{ matrix.gateway_artifact }}
+      external-driver-binary: ${{ matrix.external_driver_binary }}
+      suite-matrix: ${{ toJSON(matrix.suites) }}
+
+  podman:
+    name: Podman (${{ matrix.variant }})
+    if: inputs.profile == 'core'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: regular
+            gateway_artifact: ''
+            external_driver_binary: ''
+            suites:
+              - suite: ci
+                runner: ubuntu-26.04
+                podman_major: '5'
+                podman_package_version: 5.7.0+ds2-3build1
+                conmon_package_version: 2.1.13+ds1-2
+                cmd: mise run --no-deps --skip-deps e2e:podman:ci
+    uses: ./.github/workflows/e2e-podman-test.yml
+    with:
+      checkout-ref: ${{ inputs.source-sha }}
+      test-family: drivers
+      image-tag: ${{ inputs.image-tag }}
+      gateway-artifact: ${{ matrix.gateway_artifact }}
+      external-driver-binary: ${{ matrix.external_driver_binary }}
+      suite-matrix: ${{ toJSON(matrix.suites) }}
+
+  vm:
+    name: VM (${{ matrix.variant }})
+    if: inputs.profile == 'core' || inputs.profile == 'release'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: >-
+          ${{ fromJSON(inputs.profile == 'core' && '[
+            {"variant":"regular","gateway_artifact":"","suite_name":"managed","e2e_task":"e2e:vm"},
+            {"variant":"external","gateway_artifact":"openshell-gateway-plain-x86_64-unknown-linux-gnu","suite_name":"external-driver","e2e_task":"e2e:vm:external-driver"}
+          ]' ||
+          '[
+            {"variant":"regular","gateway_artifact":"","suite_name":"managed","e2e_task":"e2e:vm"}
+          ]') }}
+    uses: ./.github/workflows/e2e-vm-test.yml
+    with:
+      checkout-ref: ${{ inputs.source-sha }}
+      test-family: drivers
+      gateway-artifact: ${{ matrix.gateway_artifact }}
+      suite-name: ${{ matrix.suite_name }}
+      e2e-task: ${{ matrix.e2e_task }}
+
+  kubernetes:
+    name: ${{ matrix.job-name }}
+    if: inputs.profile == 'core' || inputs.profile == 'kubernetes-ha' || inputs.profile == 'kubernetes-credentials'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: >-
+          ${{ fromJSON(inputs.profile == 'core' && '[
+            {"job-name":"Kubernetes E2E (Rust smoke, Agent Sandbox v1beta1)","agent-sandbox-version":"v1.0.3","e2e-task":"e2e:kubernetes","gateway-artifact":"","external-driver-binary":"","cluster-images":"gateway sandbox supervisor","extra-helm-values":"","external-postgres-secret":"","test-name":"","kubernetes-features":"","use-envoy-gateway":false},
+            {"job-name":"Kubernetes E2E (Rust smoke, Agent Sandbox v1alpha1)","agent-sandbox-version":"v0.4.6","e2e-task":"e2e:kubernetes","gateway-artifact":"","external-driver-binary":"","cluster-images":"gateway sandbox supervisor","extra-helm-values":"","external-postgres-secret":"","test-name":"","kubernetes-features":"","use-envoy-gateway":false},
+            {"job-name":"Kubernetes E2E (workspace managed mode)","e2e-task":"e2e:kubernetes:workspace-managed","agent-sandbox-version":"v1.0.3","gateway-artifact":"","external-driver-binary":"","cluster-images":"gateway sandbox supervisor","extra-helm-values":"","external-postgres-secret":"","test-name":"","kubernetes-features":"","use-envoy-gateway":false},
+            {"job-name":"Kubernetes E2E (workspace operator mode)","e2e-task":"e2e:kubernetes:workspace-operator","agent-sandbox-version":"v1.0.3","gateway-artifact":"","external-driver-binary":"","cluster-images":"gateway sandbox supervisor","extra-helm-values":"","external-postgres-secret":"","test-name":"","kubernetes-features":"","use-envoy-gateway":false}
+          ]' ||
+          inputs.profile == 'kubernetes-ha' && '[
+            {"job-name":"Kubernetes HA E2E (Rust smoke)","extra-helm-values":"deploy/helm/openshell/ci/values-high-availability.yaml","external-postgres-secret":"openshell-ha-pg","test-name":"kubernetes_ha_rebalancing","kubernetes-features":"e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha","use-envoy-gateway":true,"agent-sandbox-version":"v1.0.3","e2e-task":"e2e:kubernetes","gateway-artifact":"","external-driver-binary":"","cluster-images":"gateway sandbox supervisor"}
+          ]' ||
+          '[
+            {"job-name":"Kubernetes Credential Drivers E2E","e2e-task":"e2e:kubernetes:credential-drivers","agent-sandbox-version":"v1.0.3","gateway-artifact":"","external-driver-binary":"","cluster-images":"gateway sandbox supervisor","extra-helm-values":"","external-postgres-secret":"","test-name":"","kubernetes-features":"","use-envoy-gateway":false}
+          ]') }}
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    with:
+      checkout-ref: ${{ inputs.source-sha }}
+      test-family: drivers
+      image-tag: ${{ inputs.image-tag }}
+      job-name: ${{ matrix.job-name }}
+      agent-sandbox-version: ${{ matrix.agent-sandbox-version }}
+      e2e-task: ${{ matrix.e2e-task }}
+      gateway-artifact: ${{ matrix.gateway-artifact }}
+      external-driver-binary: ${{ matrix.external-driver-binary }}
+      cluster-images: ${{ matrix.cluster-images }}
+      extra-helm-values: ${{ matrix.extra-helm-values }}
+      external-postgres-secret: ${{ matrix.external-postgres-secret }}
+      test-name: ${{ matrix.test-name }}
+      kubernetes-features: ${{ matrix.kubernetes-features }}
+      use-envoy-gateway: ${{ matrix.use-envoy-gateway }}
+
+  gpu:
+    name: GPU
+    if: inputs.profile == 'gpu'
+    uses: ./.github/workflows/e2e-gpu-test.yaml
+    with:
+      checkout-ref: ${{ inputs.source-sha }}
+      test-family: drivers
+      image-tag: ${{ inputs.image-tag }}
+
+  result:
+    name: Family result
+    if: always()
+    outputs:
+      docker-result: ${{ needs.docker.result }}
+      vm-result: ${{ needs.vm.result }}
+    needs: [driver-specific-integration, docker, podman, vm, kubernetes, gpu]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every selected driver and integration job to succeed
+        env:
+          JOB_RESULTS: ${{ toJSON(needs) }}
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          set -euo pipefail
+          case "$PROFILE" in
+            core) expected='["driver-specific-integration","docker","podman","vm","kubernetes"]' ;;
+            release) expected='["docker","vm"]' ;;
+            gpu) expected='["gpu"]' ;;
+            kubernetes-ha) expected='["kubernetes"]' ;;
+            kubernetes-credentials) expected='["kubernetes"]' ;;
+            *) echo "::error::Unknown E2E profile: $PROFILE"; exit 2 ;;
+          esac
+          jq -e --argjson expected "$expected" '
+            . as $results
+            | all($expected[]; $results[.].result == "success")
+          ' <<< "$JOB_RESULTS"

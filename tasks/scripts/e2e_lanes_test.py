@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -20,15 +21,50 @@ def workflow(name):
     return yaml.load((WORKFLOWS / name).read_text(), Loader=yaml.BaseLoader)
 
 
-def selected(family, profile):
-    result = subprocess.run(
-        ["bash", "tasks/scripts/select-e2e-runtime-jobs.sh", family, profile],
-        cwd=ROOT,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    return json.loads(result.stdout)
+def matrix_rows(job, profile="core"):
+    expression = job["strategy"]["matrix"]["include"]
+    if isinstance(expression, list):
+        return expression
+    if "inputs.profile" in expression:
+        for candidate, rows in re.findall(
+            r"inputs.profile == '([^']+)' && '([^']+)'", expression
+        ):
+            if profile == candidate:
+                return json.loads(rows)
+        return json.loads(re.search(r"\|\|\s+'([^']+)'\) }}$", expression)[1])
+    return json.loads(re.search(r"fromJSON\('([^']+)'\)", expression)[1])
+
+
+def family_targets(family, profile):
+    """Expand the actual family matrices into identifiable coverage targets."""
+    targets = set()
+    for driver, job in workflow(f"e2e-{family}.yml")["jobs"].items():
+        if not job.get("uses", "").startswith("./.github/workflows/e2e-"):
+            continue
+        profiles = re.findall(r"inputs.profile == '([^']+)'", job["if"])
+        if profile not in profiles:
+            continue
+        if driver == "gpu":
+            targets.add("gpu-e2e")
+            continue
+        for row in matrix_rows(job, profile):
+            if driver == "kubernetes":
+                task = row["e2e-task"]
+                if task == "e2e:kubernetes":
+                    key = (
+                        "kubernetes-ha-e2e"
+                        if profile == "kubernetes-ha"
+                        else f"kubernetes-{row['agent-sandbox-version']}-e2e"
+                    )
+                else:
+                    key = task.removeprefix("e2e:").replace(":", "-") + "-e2e"
+                    key = key.replace("credential-drivers", "credentials")
+            else:
+                key = driver + (
+                    "-external-driver-e2e" if row["variant"] == "external" else "-e2e"
+                )
+            targets.add(key)
+    return targets
 
 
 @pytest.fixture
@@ -160,32 +196,41 @@ def test_runtime_profiles_preserve_existing_targets():
         "docker-e2e",
         "podman-e2e",
         "vm-e2e",
-        "kubernetes-e2e",
+        "kubernetes-v1.0.3-e2e",
+        "kubernetes-v0.4.6-e2e",
         "kubernetes-workspace-managed-e2e",
         "vm-external-driver-e2e",
     }
-    assert set(selected("conformance", "core")) == core | {
+    assert set(family_targets("conformance", "core")) == core | {
         "docker-external-driver-e2e",
         "podman-external-driver-e2e",
         "kubernetes-external-driver-e2e",
     }
-    assert set(selected("drivers", "core")) == core | {
+    assert set(family_targets("drivers", "core")) == core | {
         "kubernetes-workspace-operator-e2e"
     }
     for family in ("conformance", "drivers"):
-        assert set(selected(family, "release")) == {"docker-e2e", "vm-e2e"}
-        assert selected(family, "gpu") == ["gpu-e2e"]
-        assert selected(family, "kubernetes-ha") == ["kubernetes-ha-e2e"]
-        assert selected(family, "kubernetes-credentials") == [
-            "kubernetes-credential-drivers-e2e"
-        ]
+        assert set(family_targets(family, "release")) == {"docker-e2e", "vm-e2e"}
+        assert family_targets(family, "gpu") == {"gpu-e2e"}
+        assert family_targets(family, "kubernetes-ha") == {"kubernetes-ha-e2e"}
+        assert family_targets(family, "kubernetes-credentials") == {
+            "kubernetes-credentials-e2e"
+        }
 
 
 def test_docker_split_retains_all_six_legacy_suites():
-    runtime = workflow("e2e-runtime-tests.yml")["jobs"]["docker-e2e"]["with"]
-    # Inspect the two literal branches of the Actions family expression.
-    conformance, drivers = runtime["suite-matrix"].split(" && '")[1].split("' || '")
-    rows = json.loads(drivers.removesuffix("' }}\n").removesuffix("' }}"))
+    conformance = matrix_rows(workflow("e2e-conformance.yml")["jobs"]["docker"])[0]
+    drivers = matrix_rows(workflow("e2e-drivers.yml")["jobs"]["docker"])[0]
+    rows = drivers["suites"]
+    # BaseLoader keeps YAML scalar values as strings; JSON suite defaults
+    # contain native booleans. Compare the equivalent execution inputs.
+    rows = [
+        {
+            key: value == "true" if key in ("python_proto", "mcp") else value
+            for key, value in row.items()
+        }
+        for row in rows
+    ]
     legacy = workflow("e2e-docker-test.yml")["on"]["workflow_call"]["inputs"][
         "suite-matrix"
     ]["default"]
@@ -198,34 +243,54 @@ def test_docker_split_retains_all_six_legacy_suites():
         "oci-image",
         "mcp",
     ]
-    assert [row["cmd"] for row in json.loads(conformance)] == [
+    assert [row["cmd"] for row in conformance["suites"]] == [
         "mise run --no-deps --skip-deps e2e:rust"
     ]
 
 
-@pytest.mark.parametrize("family,profile", [("features", "core"), ("drivers", "typo")])
-def test_unknown_runtime_requests_are_rejected(family, profile):
-    result = subprocess.run(
-        ["bash", "tasks/scripts/select-e2e-runtime-jobs.sh", family, profile],
-        cwd=ROOT,
-        capture_output=True,
-    )
-    assert result.returncode != 0 and not result.stdout
-
-
+@pytest.mark.parametrize("family", ["conformance", "drivers"])
+@pytest.mark.parametrize(
+    "profile",
+    ["core", "release", "gpu", "kubernetes-ha", "kubernetes-credentials", "typo"],
+)
 @pytest.mark.parametrize("status", ["success", "failure", "skipped", "cancelled", None])
-def test_runtime_completion_requires_every_selected_job(status):
-    step = workflow("e2e-runtime-tests.yml")["jobs"]["result"]["steps"][0]
-    results = {"selection": {"result": "success"}, "unselected": {"result": "skipped"}}
-    if status is not None:
-        results["selected"] = {"result": status}
-    result = subprocess.run(
-        ["bash", "-c", step["run"]],
-        env=os.environ
-        | {"JOB_RESULTS": json.dumps(results), "SELECTED_JOBS": '["selected"]'},
-        capture_output=True,
-    )
-    assert (result.returncode == 0) == (status == "success")
+def test_family_completion_requires_every_selected_job(family, profile, status):
+    jobs = workflow(f"e2e-{family}.yml")["jobs"]
+    result_job = jobs["result"]
+    expected = [
+        key
+        for key in result_job["needs"]
+        if profile in re.findall(r"inputs.profile == '([^']+)'", jobs[key]["if"])
+    ]
+    assert expected or profile == "typo"
+    for selected in expected or ["unknown"]:
+        results = {
+            key: {"result": "success" if key in expected else "skipped"}
+            for key in result_job["needs"]
+        }
+        if status is None:
+            results.pop(selected, None)
+        else:
+            results[selected] = {"result": status}
+        result = subprocess.run(
+            ["bash", "-c", result_job["steps"][0]["run"]],
+            env=os.environ | {"JOB_RESULTS": json.dumps(results), "PROFILE": profile},
+            capture_output=True,
+        )
+        assert (result.returncode == 0) == (status == "success" and profile != "typo")
+
+
+def test_families_call_driver_workflows_directly():
+    assert not (WORKFLOWS / "e2e-runtime-tests.yml").exists()
+    for family in ("conformance", "drivers"):
+        jobs = workflow(f"e2e-{family}.yml")["jobs"]
+        for driver in ("docker", "podman", "vm", "kubernetes", "gpu"):
+            job = jobs[driver]
+            suffix = "yaml" if driver == "gpu" else "yml"
+            assert job["uses"] == f"./.github/workflows/e2e-{driver}-test.{suffix}"
+            assert job["with"]["test-family"] == family
+            if driver != "gpu":
+                assert job["strategy"]["fail-fast"] == "false"
 
 
 def test_existing_matrices_and_artifact_variants():
@@ -238,13 +303,18 @@ def test_existing_matrices_and_artifact_variants():
         ("fedora-podman-rootful", "rpm"),
         ("fedora-podman-rootless", "rpm"),
     }
-    features = workflow("e2e-features.yml")["jobs"]["feature-specific-integration"]
-    rows = json.loads(features["with"]["test-matrix"])
+    features = workflow("e2e-features.yml")["jobs"]
+    rows = [
+        row
+        for job in features.values()
+        for row in json.loads(job["with"]["test-matrix"])
+    ]
     assert len(rows) == 5
     assert (
         sorted(r["testsuite"] for r in rows)
         == ["oci-image"] * 3 + ["provider-refresh"] * 2
     )
+    assert len({job["with"]["category"] for job in features.values()}) == 2
     drivers = workflow("e2e-drivers.yml")["jobs"]["driver-specific-integration"]
     rows = json.loads(drivers["with"]["test-matrix"])
     assert {(r["environment"], r["installer"], r["testsuite"]) for r in rows} == {
@@ -252,10 +322,11 @@ def test_existing_matrices_and_artifact_variants():
         ("fedora-podman-rootless", "binaries", "e2e-podman"),
         ("fedora-podman-rootless", "binaries", "driver-podman"),
     }
-    runtime = workflow("e2e-runtime-tests.yml")["jobs"]
-    assert runtime["kubernetes-e2e"]["strategy"]["matrix"]["include"] == [
-        {"agent_sandbox_api": "v1beta1", "agent_sandbox_version": "v1.0.3"},
-        {"agent_sandbox_api": "v1alpha1", "agent_sandbox_version": "v0.4.6"},
+    runtime = workflow("e2e-conformance.yml")["jobs"]
+    kube_rows = matrix_rows(runtime["kubernetes"])
+    assert [(r["job-name"], r["agent-sandbox-version"]) for r in kube_rows[:2]] == [
+        ("Kubernetes E2E (Rust smoke, Agent Sandbox v1beta1)", "v1.0.3"),
+        ("Kubernetes E2E (Rust smoke, Agent Sandbox v1alpha1)", "v0.4.6"),
     ]
     for driver, arch in [
         ("docker", "aarch64"),
@@ -263,11 +334,13 @@ def test_existing_matrices_and_artifact_variants():
         ("kubernetes", "x86_64"),
         ("vm", "x86_64"),
     ]:
-        lane = runtime[f"{driver}-external-driver-e2e"]["with"]
-        assert (
-            lane["gateway-artifact"]
-            == f"openshell-gateway-plain-{arch}-unknown-linux-gnu"
-        )
+        for row in matrix_rows(runtime[driver]):
+            artifact = row.get("gateway_artifact", row.get("gateway-artifact", ""))
+            if artifact:
+                assert artifact == f"openshell-gateway-plain-{arch}-unknown-linux-gnu"
+                break
+        else:
+            pytest.fail(f"Missing external {driver} coverage")
     gpu = workflow("e2e-gpu-test.yaml")["jobs"]["e2e-gpu"]
     assert [
         (r["name"], r["experimental"]) for r in gpu["strategy"]["matrix"]["include"]

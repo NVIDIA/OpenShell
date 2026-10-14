@@ -151,10 +151,13 @@ local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
 to the package installers and downloads the packages selected by its matrix.
 
 Branch and release workflows call the conformance, features, and drivers family
-workflows. Conformance and drivers select runtime jobs through
-`e2e-runtime-tests.yml`; the same recorded job list drives execution and the
-completion check. A selected job that fails, is cancelled, or is skipped fails
-its family. The existing core/GPU required result names and optional Kubernetes
+workflows within the same Actions run. Each family calls the reusable driver
+workflows directly. Driver matrices expand regular/external variants and
+Kubernetes configurations; driver workflows can expand their own scenario
+matrices. Features exposes provider-refresh and OCI-image separately. Each
+family checks that every job required by its profile succeeds, so a failed,
+cancelled, missing, or skipped required job fails its family. The existing
+core/GPU required result names and optional Kubernetes
 policy remain unchanged, including advisory WSL GPU execution.
 
 The `core` profile retains the branch target matrix. The `release` profile
@@ -567,8 +570,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
-| `.github/workflows/e2e-conformance.yml`, `e2e-features.yml`, `e2e-drivers.yml` | Test-family entrypoints shared by branch and release workflows. Retain the current integration matrices and runtime profiles. |
-| `.github/workflows/e2e-runtime-tests.yml` | Selects runtime jobs by family and execution profile and requires every selected job to succeed. |
+| `.github/workflows/e2e-conformance.yml`, `e2e-features.yml`, `e2e-drivers.yml` | Test-family entrypoints shared by branch and release workflows. Call driver adapters directly with variant/configuration matrices and require every selected job to succeed. Retain the current integration matrices and runtime profiles. |
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml`, `e2e-gpu-test.yaml` | Reusable target preparation and execution adapters. Accept an explicit test family while keeping combined execution as their default. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |

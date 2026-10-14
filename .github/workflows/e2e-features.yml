@@ -28,21 +28,22 @@ permissions:
   packages: read
 
 jobs:
-  feature-specific-integration:
-    permissions:
-      actions: read
-      contents: read
-      packages: read
+  provider-refresh:
+    name: provider-refresh
     uses: ./.github/workflows/integration-runner.yml
     with:
-      category: feature-specific
+      category: feature-specific-provider-refresh
       source-sha: ${{ inputs.source-sha }}
       integration-inputs-artifact-id: ${{ inputs.integration-inputs-artifact-id }}
       test-matrix: >-
-        [
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
-        ]
+        [{"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},{"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}]
+
+  oci-image:
+    name: oci-image
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: feature-specific-oci-image
+      source-sha: ${{ inputs.source-sha }}
+      integration-inputs-artifact-id: ${{ inputs.integration-inputs-artifact-id }}
+      test-matrix: >-
+        [{"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},{"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},{"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}]

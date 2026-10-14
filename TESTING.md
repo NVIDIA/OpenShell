@@ -130,6 +130,11 @@ uses the shared package in `tests/suites/conformance/`; features retains the
 provider-refresh and OCI-image suites. Drivers collects the existing runtime
 and host-specific suites, including mixed legacy tests pending extraction.
 Bundled versus external compute drivers are target variants across families.
+Each family calls driver workflows directly, with matrices for applicable
+variants and configurations. Regular and external VM targets run in both
+conformance and drivers. Features exposes provider-refresh and OCI-image as
+separate calls with their existing target matrices. All families share the
+artifacts built by the parent workflow and remain in the same Actions run.
 
 The Docker, Podman, Kubernetes, and VM Rust harnesses accept
 `OPENSHELL_E2E_TEST_FAMILY=conformance` or `drivers` to execute each part

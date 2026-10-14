@@ -153,10 +153,12 @@ once after preparation succeeds. Skipped dependent E2E suites indicate blocked
 coverage.
 
 For E2E, inspect the Conformance, Features, and Drivers family calls in
-`Branch E2E Checks`, `Release Dev`, or `Release Tag`. Runtime family selection
-is logged by `e2e-runtime-tests.yml`; its completion check fails when a selected
-job fails, is cancelled, or is skipped. External VM has separate conformance
-and runtime jobs. Existing `Core E2E result` and `GPU E2E result` names remain
+`Branch E2E Checks`, `Release Dev`, or `Release Tag`. Each family calls driver
+workflows directly; inspect their variant/configuration matrices and nested
+scenario matrices. Features has separate provider-refresh and OCI-image calls.
+Each family result fails when a required job fails, is cancelled, is missing,
+or is skipped. Regular and external VM have separate conformance and runtime
+execution. Existing `Core E2E result` and `GPU E2E result` names remain
 the PR gate adapters; optional Kubernetes and advisory WSL policy is unchanged.
 The manual `Integration Tests` workflow still accepts a custom tmachine matrix.
 
