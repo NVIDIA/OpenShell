@@ -139,6 +139,16 @@ struct Args {
     /// Stdin is a driver-owned liveness pipe. EOF means the driver exited.
     #[arg(long, hide = true)]
     parent_liveness_stdin: bool,
+
+    /// Attach and policy-discover request timeout, in milliseconds. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default for
+    /// the remote boundary to boot before the supervisor gives up.
+    #[arg(
+        long,
+        env = "OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS",
+        default_value = "300000"
+    )]
+    attach_request_timeout_ms: u64,
 }
 
 #[cfg(unix)]
@@ -439,6 +449,7 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend,
                     args.main_exit_marker,
+                    args.attach_request_timeout_ms,
                 ))
                 .await;
                 supervisor_exit(result)

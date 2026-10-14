@@ -41,6 +41,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Initial attachment may include runtime image pulls and trusted bootstrap
 /// work before the boundary begins listening. Keep this aligned with the
 /// driver bootstrap grace period rather than the normal operation timeout.
+/// The supervisor overrides this default for slow-provisioning runtimes:
+/// `peer-pods` `CoCo` pod VMs take ~5 minutes to provision (CVM boot +
+/// workspace seed + agent start), which consumes the whole default 5-minute
+/// window — the supervisor exits with "boundary idempotent control request
+/// timed out" right as the boundary comes up.
 const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// How long one control call keeps retrying boundary connect attempts. Boot-time
 /// callers retry whole calls above this; past boot, exhausting this window
@@ -82,6 +87,7 @@ pub struct OpenShellRuntimeBackend {
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    attach_request_timeout: Duration,
 }
 
 impl OpenShellRuntimeBackend {
@@ -89,16 +95,19 @@ impl OpenShellRuntimeBackend {
     pub async fn discover_policy(
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
-        Self::discover_policy_with_connector(descriptor, bearer, None).await
+        Self::discover_policy_with_connector(descriptor, bearer, None, attach_request_timeout).await
     }
 
     pub async fn discover_policy_with_connector(
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
         connector: Option<Arc<dyn BoundaryTransportConnector>>,
+        attach_request_timeout: Duration,
     ) -> Result<(Option<String>, bool), BackendError> {
         let mut client = BoundaryClient::new(descriptor, bearer);
+        client.attach_request_timeout = attach_request_timeout;
         client.connector = connector;
         match client.call_idempotent(Request::DiscoverPolicy).await? {
             Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
@@ -119,7 +128,17 @@ impl OpenShellRuntimeBackend {
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
+            attach_request_timeout: ATTACH_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Override the attach/discover request timeout. The supervisor configures
+    /// this for slow-provisioning runtimes where the remote boundary boots
+    /// after the default window expires.
+    #[must_use]
+    pub fn with_attach_request_timeout(mut self, timeout: Duration) -> Self {
+        self.attach_request_timeout = timeout;
+        self
     }
 
     #[must_use]
@@ -164,6 +183,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
         let session_id = runtime_descriptor.session_id;
         let outer_fence = runtime_descriptor.outer_fence.clone();
         let mut client = BoundaryClient::new(runtime_descriptor, self.sandbox_bearer.clone());
+        client.attach_request_timeout = self.attach_request_timeout;
         client.connector = self.connector.clone();
         let client = Arc::new(client);
         let response = client
@@ -1123,6 +1143,7 @@ struct BoundaryClient {
     runtime_descriptor: SandboxRuntimeDescriptor,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    attach_request_timeout: Duration,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
     mediation: tokio::sync::Mutex<Option<Arc<ClientMediationSession>>>,
     mediation_open: tokio::sync::Mutex<()>,
@@ -1287,6 +1308,7 @@ impl BoundaryClient {
             runtime_descriptor,
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
+            attach_request_timeout: ATTACH_REQUEST_TIMEOUT,
             grpc_channel: tokio::sync::Mutex::new(None),
             mediation: tokio::sync::Mutex::new(None),
             mediation_open: tokio::sync::Mutex::new(()),
@@ -1326,7 +1348,7 @@ impl BoundaryClient {
         let remember_attach = matches!(request, Request::Attach { .. });
         let remember_confirm = matches!(request, Request::Confirm);
         let timeout = if remember_attach || matches!(request, Request::DiscoverPolicy) {
-            ATTACH_REQUEST_TIMEOUT
+            self.attach_request_timeout
         } else {
             REQUEST_TIMEOUT
         };
@@ -2228,6 +2250,21 @@ mod tests {
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
+
+    #[test]
+    fn attach_request_timeout_defaults_and_overrides() {
+        let backend = OpenShellRuntimeBackend::new(
+            Arc::new(std::sync::Mutex::new(None)),
+            openshell_core::provider_credentials::ProviderCredentialState::from_child_env_snapshot(
+                1,
+                HashMap::new(),
+            ),
+            test_bearer(&"a".repeat(32)),
+        );
+        assert_eq!(backend.attach_request_timeout, ATTACH_REQUEST_TIMEOUT);
+        let overridden = backend.with_attach_request_timeout(Duration::from_mins(15));
+        assert_eq!(overridden.attach_request_timeout, Duration::from_mins(15));
+    }
 
     fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
         use openshell_isolation_interface::contract::OuterFenceGuarantee;

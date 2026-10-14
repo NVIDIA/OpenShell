@@ -151,7 +151,7 @@ async fn pending_driver_operation_blocks_error_recovery_without_mutation() {
     let driver = ControlledDriver::new();
     let runtime = test_runtime(driver.clone()).await;
     let mut sandbox = error_sandbox_record("pending-id", "pending", "StartFailed");
-    let mut operation = provisioning_deadline::new_record(openshell_core::time::now_ms());
+    let mut operation = provisioning_deadline::new_record(openshell_core::time::now_ms(), 300_000);
     operation.driver_operation_pending = true;
     operation.driver_operation_id = "owned-operation".into();
     sandbox.status.as_mut().unwrap().provisioning = Some(operation);
@@ -177,7 +177,7 @@ async fn timeout_stop_preserves_cleanup_and_direct_start_recovery() {
         driver.track_compute.store(true, Ordering::SeqCst);
         let runtime = test_runtime(driver.clone()).await;
         let mut sandbox = error_sandbox_record("timeout-id", "timeout", "ProvisioningTimedOut");
-        let mut operation = provisioning_deadline::new_record(0);
+        let mut operation = provisioning_deadline::new_record(0, 300_000);
         operation.timeout_time = openshell_core::time::timestamp_from_millis(300_000).ok();
         operation.cleanup_retry_time = openshell_core::time::timestamp_from_millis(310_000).ok();
         if cleanup_complete {

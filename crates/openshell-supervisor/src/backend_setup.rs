@@ -34,6 +34,7 @@ pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
+    pub attach_request_timeout: std::time::Duration,
 }
 
 /// Private startup result; native payload decoding never reaches shared runtime
@@ -67,6 +68,7 @@ pub trait PreparedBackend: Send + Sync {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError>;
 
     /// Consume prepared launch data and retain the supervisor's live handles.
@@ -151,9 +153,10 @@ impl SelectedBackend {
     pub async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> Result<(Option<String>, bool)> {
         self.prepared
-            .discover_policy(bearer)
+            .discover_policy(bearer, attach_request_timeout)
             .await
             .map_err(|error| miette::miette!("discover workload image policy: {error}"))
     }
@@ -240,9 +243,14 @@ impl PreparedBackend for OpenShellLaunch {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
-        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(self.0.clone(), bearer)
-            .await
+        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
+            self.0.clone(),
+            bearer,
+            attach_request_timeout,
+        )
+        .await
     }
 
     fn build(
@@ -253,11 +261,14 @@ impl PreparedBackend for OpenShellLaunch {
         Ok(BuiltBackend {
             payload,
             proxy_listener: None,
-            backend: Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                services.ca_file_paths,
-                services.provider_credentials,
-                services.sandbox_bearer,
-            )),
+            backend: Arc::new(
+                openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+                    services.ca_file_paths,
+                    services.provider_credentials,
+                    services.sandbox_bearer,
+                )
+                .with_attach_request_timeout(services.attach_request_timeout),
+            ),
         })
     }
 }

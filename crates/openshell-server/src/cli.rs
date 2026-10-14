@@ -619,6 +619,22 @@ fn prepare_server_config_with_drivers(
         config.image_preparation_timeout_seconds = seconds;
     }
 
+    if let Ok(raw) = std::env::var("OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS") {
+        let window = raw.parse::<i64>().map_err(|_| {
+            miette::miette!(
+                "OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS must be an integer number of milliseconds"
+            )
+        })?;
+        validate_provisioning_repair_window_ms(window)?;
+        config.provisioning_repair_window_ms = window;
+    } else if let Some(window) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.provisioning_repair_window_ms)
+    {
+        validate_provisioning_repair_window_ms(window)?;
+        config.provisioning_repair_window_ms = window;
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
@@ -1312,6 +1328,15 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.db_lock_max_connections = Some(max_connections);
     }
+}
+
+fn validate_provisioning_repair_window_ms(window: i64) -> Result<()> {
+    if !(1_000..=86_400_000).contains(&window) {
+        return Err(miette::miette!(
+            "provisioning_repair_window_ms must be between 1000 and 86400000"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u64>) -> Result<()> {
@@ -3650,6 +3675,112 @@ mem_mib = "not-a-number"
                     .contains("image_preparation_timeout_seconds must be between 1 and 86400")
             );
         }
+            });
+    }
+
+    #[test]
+    fn server_config_prepares_provisioning_repair_window_from_toml() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_ms = 900000\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(prepared.config.provisioning_repair_window_ms, 900_000);
+            });
+    }
+
+    #[test]
+    fn server_config_rejects_unbounded_provisioning_repair_window() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                for window in [999, 86_400_001] {
+                    std::fs::write(
+                        &config_path,
+                        format!(
+                            "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_ms = {window}\n"
+                        ),
+                    )
+                    .unwrap();
+                    let (mut args, matches) = parse_with_args(&[
+                        "openshell-gateway",
+                        "--config",
+                        config_path.to_str().unwrap(),
+                        "--db-url",
+                        "sqlite::memory:",
+                        "--compute-driver",
+                        "podman",
+                        "--disable-tls",
+                    ]);
+                    let Err(error) = super::prepare_server_config(&mut args, &matches) else {
+                        panic!("unbounded repair window must be rejected");
+                    };
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("provisioning_repair_window_ms must be between 1000 and 86400000")
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn server_config_env_overrides_provisioning_repair_window() {
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        Environment::new()
+            .set("XDG_STATE_HOME", state.path().to_str().unwrap())
+            .set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap())
+            .set("OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS", "600000")
+            .run(|| {
+                let state =
+                    std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap());
+                let config_path = state.join("gateway.toml");
+                std::fs::write(
+                    &config_path,
+                    "[openshell]\nversion = 2\n[openshell.gateway]\nprovisioning_repair_window_ms = 900000\n",
+                )
+                .unwrap();
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--config",
+                    config_path.to_str().unwrap(),
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--compute-driver",
+                    "podman",
+                    "--disable-tls",
+                ]);
+                let prepared = super::prepare_server_config(&mut args, &matches)
+                    .expect("server config is prepared");
+                assert_eq!(prepared.config.provisioning_repair_window_ms, 600_000);
             });
     }
 

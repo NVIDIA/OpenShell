@@ -286,6 +286,11 @@ pub struct Config {
     /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
     pub image_preparation_timeout_seconds: u32,
 
+    /// Provisioning repair window, in milliseconds. The first authenticated
+    /// supervisor configuration report starts admission repair, which stays
+    /// armed until Ready. Must be between 1000 and 86400000, inclusive.
+    pub provisioning_repair_window_ms: i64,
+
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
     /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
@@ -918,6 +923,7 @@ impl Config {
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             image_preparation_timeout_seconds: 1800,
+            provisioning_repair_window_ms: 300_000,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),

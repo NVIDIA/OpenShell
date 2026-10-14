@@ -100,6 +100,7 @@ impl TestSetup {
                 HashMap::from([("TEST_CONFIG".into(), "initial".into())]),
             ),
             sandbox_bearer: self.auth.sandbox_bearer_slot().unwrap(),
+            attach_request_timeout: std::time::Duration::from_mins(5),
         }
     }
 }
@@ -174,6 +175,7 @@ impl PreparedBackend for TestLaunch {
     async fn discover_policy(
         &self,
         bearer: SessionBearerTokenSlot,
+        _attach_request_timeout: std::time::Duration,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
         self.observed.record("discover");
         bearer.authorization_metadata().unwrap();
@@ -716,6 +718,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 auth_bundle: setup.auth.clone(),
                 admitted_isolation_backend: Some(TEST_BACKEND.into()),
                 main_exit_marker: Some(marker.clone()),
+                attach_request_timeout_ms: 300_000,
             },
         ))
     };

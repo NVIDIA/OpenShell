@@ -12,8 +12,6 @@ use openshell_core::proto::SandboxProvisioning;
 use openshell_core::time::{timestamp_from_millis, timestamp_to_millis};
 use serde::{Deserialize, Serialize};
 
-const REPAIR_WINDOW_MS: i64 = 300_000;
-
 /// Opaque identity of a committed effective configuration change. A -> B -> A
 /// must use three different IDs even if the first and last content hashes match.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,7 +124,12 @@ impl ProvisioningDeadline {
         };
     }
 
-    pub fn new(attempt_id: String, change: ConfigurationChange, now_ms: i64) -> Self {
+    pub fn new(
+        attempt_id: String,
+        change: ConfigurationChange,
+        now_ms: i64,
+        repair_window_ms: i64,
+    ) -> Self {
         Self {
             attempt_id,
             change,
@@ -134,7 +137,7 @@ impl ProvisioningDeadline {
             preparation_deadline_at_ms: None,
             admission_start_at_ms: None,
             state: DeadlineState::Armed {
-                deadline_at_ms: now_ms.saturating_add(REPAIR_WINDOW_MS),
+                deadline_at_ms: now_ms.saturating_add(repair_window_ms),
             },
         }
     }
@@ -146,7 +149,7 @@ impl ProvisioningDeadline {
     /// Only an authenticated report for the current supervisor may call this.
     /// Persist it with the report: duplicate delivery or restart must not grant
     /// another admission window, and a late registration cannot revive compute.
-    fn start_admission(&mut self, attempt_id: &str, now_ms: i64) -> bool {
+    fn start_admission(&mut self, attempt_id: &str, now_ms: i64, repair_window_ms: i64) -> bool {
         if attempt_id != self.attempt_id
             || !self.is_preparing()
             || now_ms < self.change.committed_at_ms
@@ -158,7 +161,7 @@ impl ProvisioningDeadline {
         }
         self.admission_start_at_ms = Some(now_ms);
         self.state = DeadlineState::Armed {
-            deadline_at_ms: now_ms.saturating_add(REPAIR_WINDOW_MS),
+            deadline_at_ms: now_ms.saturating_add(repair_window_ms),
         };
         true
     }
@@ -172,7 +175,12 @@ impl ProvisioningDeadline {
 
     /// Apply a newer, committed change to an active attempt. Delayed observation
     /// uses commit time, not poll time. A change after expiry cannot revive it.
-    pub fn configuration_changed(&mut self, attempt_id: &str, change: ConfigurationChange) -> bool {
+    pub fn configuration_changed(
+        &mut self,
+        attempt_id: &str,
+        change: ConfigurationChange,
+        repair_window_ms: i64,
+    ) -> bool {
         let Some(deadline_at_ms) = self.deadline_at_ms() else {
             return false;
         };
@@ -186,7 +194,7 @@ impl ProvisioningDeadline {
         if !self.is_preparing() {
             self.state = DeadlineState::Armed {
                 deadline_at_ms: deadline_at_ms
-                    .max(change.committed_at_ms.saturating_add(REPAIR_WINDOW_MS)),
+                    .max(change.committed_at_ms.saturating_add(repair_window_ms)),
             };
         }
         self.change = change;
@@ -196,7 +204,13 @@ impl ProvisioningDeadline {
 
     /// Only the first accepted rejection for the current change grants a repair
     /// window. Retrying, reconnecting, or changing diagnostic text does not.
-    pub fn rejected(&mut self, attempt_id: &str, change_id: &str, now_ms: i64) -> bool {
+    pub fn rejected(
+        &mut self,
+        attempt_id: &str,
+        change_id: &str,
+        now_ms: i64,
+        repair_window_ms: i64,
+    ) -> bool {
         let Some(deadline_at_ms) = self.deadline_at_ms() else {
             return false;
         };
@@ -210,7 +224,7 @@ impl ProvisioningDeadline {
         }
         self.first_rejection_at_ms = Some(now_ms);
         self.state = DeadlineState::Armed {
-            deadline_at_ms: deadline_at_ms.max(now_ms.saturating_add(REPAIR_WINDOW_MS)),
+            deadline_at_ms: deadline_at_ms.max(now_ms.saturating_add(repair_window_ms)),
         };
         true
     }
@@ -271,7 +285,7 @@ pub(super) fn driver_operation_pending(sandbox: &openshell_core::proto::Sandbox)
 
 /// Adopt an existing untimed attempt without granting it a new preparation phase.
 /// New create/start operations use `new_preparation_record` instead.
-pub fn new_record(now_ms: i64) -> SandboxProvisioning {
+pub fn new_record(now_ms: i64, repair_window_ms: i64) -> SandboxProvisioning {
     let mut record = SandboxProvisioning::default();
     ProvisioningDeadline::new(
         uuid::Uuid::new_v4().to_string(),
@@ -280,6 +294,7 @@ pub fn new_record(now_ms: i64) -> SandboxProvisioning {
             committed_at_ms: now_ms,
         },
         now_ms,
+        repair_window_ms,
     )
     .write_record(&mut record);
     record
@@ -288,8 +303,12 @@ pub fn new_record(now_ms: i64) -> SandboxProvisioning {
 /// Create an independent attempt with a fixed preparation budget. The gateway
 /// validates the configured seconds before constructing the runtime. Reconnects
 /// and driver progress must never call this function.
-pub fn new_preparation_record(now_ms: i64, timeout_seconds: u32) -> SandboxProvisioning {
-    let mut record = new_record(now_ms);
+pub fn new_preparation_record(
+    now_ms: i64,
+    timeout_seconds: u32,
+    repair_window_ms: i64,
+) -> SandboxProvisioning {
+    let mut record = new_record(now_ms, repair_window_ms);
     let ceiling = now_ms.saturating_add(i64::from(timeout_seconds) * 1_000);
     record.preparation_deadline = timestamp_from_millis(ceiling).ok();
     record.deadline.clone_from(&record.preparation_deadline);
@@ -299,18 +318,31 @@ pub fn new_preparation_record(now_ms: i64, timeout_seconds: u32) -> SandboxProvi
 /// The caller has authenticated the supervisor and checked its instance fence.
 /// A Pending registration may start timing before configuration validation.
 /// Persist this transition in the same CAS as the supervisor report.
-pub fn record_admission_start(record: &mut SandboxProvisioning, now_ms: i64) -> Result<(), String> {
+pub fn record_admission_start(
+    record: &mut SandboxProvisioning,
+    now_ms: i64,
+    repair_window_ms: i64,
+) -> Result<(), String> {
     let mut deadline = ProvisioningDeadline::from_record(record)?;
-    deadline.start_admission(&record.attempt_id, now_ms);
+    deadline.start_admission(&record.attempt_id, now_ms, repair_window_ms);
     deadline.write_record(record);
     Ok(())
 }
 
 /// Apply the first accepted rejection under the same CAS as admission evidence.
 /// The report's generation and supervisor instance must already be validated.
-pub fn record_rejection(record: &mut SandboxProvisioning, now_ms: i64) -> Result<(), String> {
+pub fn record_rejection(
+    record: &mut SandboxProvisioning,
+    now_ms: i64,
+    repair_window_ms: i64,
+) -> Result<(), String> {
     let mut deadline = ProvisioningDeadline::from_record(record)?;
-    deadline.rejected(&record.attempt_id, &record.configuration_change_id, now_ms);
+    deadline.rejected(
+        &record.attempt_id,
+        &record.configuration_change_id,
+        now_ms,
+        repair_window_ms,
+    );
     deadline.write_record(record);
     Ok(())
 }
@@ -391,6 +423,7 @@ pub async fn refresh_configuration(
     store: &crate::persistence::Store,
     sandbox: &mut openshell_core::proto::Sandbox,
     now_ms: i64,
+    repair_window_ms: i64,
 ) -> Result<(), String> {
     use openshell_core::proto::SandboxPhase;
     if !matches!(
@@ -402,7 +435,7 @@ pub async fn refresh_configuration(
     let status = sandbox.status.get_or_insert_with(Default::default);
     let record = status
         .provisioning
-        .get_or_insert_with(|| new_record(now_ms));
+        .get_or_insert_with(|| new_record(now_ms, repair_window_ms));
     if record.deadline.is_none() {
         return Ok(());
     }
@@ -417,7 +450,7 @@ pub async fn refresh_configuration(
         // Taking the first source snapshot does not grant a second initial window.
         deadline.change.id = change.id;
     } else {
-        deadline.configuration_changed(&record.attempt_id, change);
+        deadline.configuration_changed(&record.attempt_id, change, repair_window_ms);
     }
     deadline.write_record(record);
     Ok(())
@@ -481,7 +514,13 @@ impl super::ComputeRuntime {
                 continue;
             };
             let previous = current.clone();
-            refresh_configuration(&self.store, &mut current, now_ms).await?;
+            refresh_configuration(
+                &self.store,
+                &mut current,
+                now_ms,
+                self.provisioning_repair_window_ms,
+            )
+            .await?;
             if current != previous {
                 current = self
                     .store
@@ -787,7 +826,7 @@ mod tests {
         assert!(!record.driver_operation_pending);
         assert!(record.driver_operation_id.is_empty());
         let before = record.clone();
-        record_admission_start(&mut record, 299_999).unwrap();
+        record_admission_start(&mut record, 299_999, 300_000).unwrap();
         assert_eq!(record, before);
         assert!(record.preparation_deadline.is_none());
         assert!(!allows_admission(&record, 300_000));
@@ -795,18 +834,18 @@ mod tests {
 
     #[test]
     fn preparation_over_five_minutes_gets_a_full_admission_repair_window() {
-        let record = new_preparation_record(0, 1800);
+        let record = new_preparation_record(0, 1800, 300_000);
         let mut timer = ProvisioningDeadline::from_record(&record).unwrap();
         let attempt = record.attempt_id;
         let change_id = record.configuration_change_id;
         assert!(!timer.expire(&attempt, &change_id, 600_000));
         assert!(!timer.ready(&attempt, &change_id, 600_000));
-        assert!(timer.start_admission(&attempt, 600_000));
+        assert!(timer.start_admission(&attempt, 600_000, 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(900_000));
-        assert!(timer.rejected(&attempt, &change_id, 601_000));
+        assert!(timer.rejected(&attempt, &change_id, 601_000, 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(901_000));
-        assert!(!timer.start_admission(&attempt, 800_000));
-        assert!(timer.configuration_changed(&attempt, change("updated", 800_000)));
+        assert!(!timer.start_admission(&attempt, 800_000, 300_000));
+        assert!(timer.configuration_changed(&attempt, change("updated", 800_000), 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(1_100_000));
         assert_eq!(timer.admission_start_at_ms, Some(600_000));
         assert_eq!(timer.preparation_deadline_at_ms, Some(1_800_000));
@@ -815,15 +854,15 @@ mod tests {
     #[test]
     fn preparation_config_changes_and_restart_preserve_the_absolute_ceiling() {
         use prost::Message;
-        let mut record = new_preparation_record(0, 1800);
+        let mut record = new_preparation_record(0, 1800, 300_000);
         record.driver_operation_pending = true;
         record.driver_operation_id = "operation-1".into();
         let mut timer = ProvisioningDeadline::from_record(&record).unwrap();
         let attempt = record.attempt_id.clone();
-        assert!(timer.configuration_changed(&attempt, change("first", 600_000)));
-        assert!(timer.configuration_changed(&attempt, change("last", 1_799_000)));
-        assert!(!timer.configuration_changed(&attempt, change("last", 1_799_500)));
-        assert!(!timer.rejected(&attempt, "last", 1_799_500));
+        assert!(timer.configuration_changed(&attempt, change("first", 600_000), 300_000));
+        assert!(timer.configuration_changed(&attempt, change("last", 1_799_000), 300_000));
+        assert!(!timer.configuration_changed(&attempt, change("last", 1_799_500), 300_000));
+        assert!(!timer.rejected(&attempt, "last", 1_799_500, 300_000));
         timer.write_record(&mut record);
         let bytes = record.encode_to_vec();
         let restored = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
@@ -831,30 +870,30 @@ mod tests {
         assert_eq!(restored.driver_operation_id, "operation-1");
         let mut timer = ProvisioningDeadline::from_record(&restored).unwrap();
         assert_eq!(timer.deadline_at_ms(), Some(1_800_000));
-        assert!(!timer.start_admission("previous-attempt", 1_799_999));
-        assert!(!timer.start_admission(&attempt, 1_800_000));
+        assert!(!timer.start_admission("previous-attempt", 1_799_999, 300_000));
+        assert!(!timer.start_admission(&attempt, 1_800_000, 300_000));
         assert!(timer.expire(&attempt, "last", 1_800_000));
-        assert!(!timer.start_admission(&attempt, 1_799_999));
+        assert!(!timer.start_admission(&attempt, 1_799_999, 300_000));
         assert!(!timer.ready(&attempt, "last", 1_799_999));
-        assert!(!timer.configuration_changed(&attempt, change("late", 1_799_999)));
+        assert!(!timer.configuration_changed(&attempt, change("late", 1_799_999), 300_000));
     }
 
     #[test]
     fn admission_registration_roundtrip_does_not_restart_repair() {
         use prost::Message;
-        let mut record = new_preparation_record(0, 1800);
-        record_admission_start(&mut record, 600_000).unwrap();
+        let mut record = new_preparation_record(0, 1800, 300_000);
+        record_admission_start(&mut record, 600_000, 300_000).unwrap();
         let before = record.clone();
         let bytes = record.encode_to_vec();
         let mut restored = SandboxProvisioning::decode(bytes.as_slice()).unwrap();
-        record_admission_start(&mut restored, 899_999).unwrap();
+        record_admission_start(&mut restored, 899_999, 300_000).unwrap();
         assert_eq!(restored, before);
         assert!(!allows_admission(&restored, 900_000));
     }
 
     #[test]
     fn malformed_preparation_timing_cannot_grant_admission() {
-        let mut record = new_preparation_record(0, 1800);
+        let mut record = new_preparation_record(0, 1800, 300_000);
         record.deadline = timestamp_from_millis(1_800_001).ok();
         assert!(ProvisioningDeadline::from_record(&record).is_err());
         record.deadline = None;
@@ -867,8 +906,9 @@ mod tests {
     #[test]
     fn protobuf_roundtrip_retains_deadline_and_cleanup_progress() {
         use prost::Message;
-        let mut deadline = ProvisioningDeadline::new("attempt".into(), change("change", 0), 0);
-        assert!(deadline.rejected("attempt", "change", 1_000));
+        let mut deadline =
+            ProvisioningDeadline::new("attempt".into(), change("change", 0), 0, 300_000);
+        assert!(deadline.rejected("attempt", "change", 1_000, 300_000));
         let mut record = SandboxProvisioning::default();
         deadline.write_record(&mut record);
         let bytes = record.encode_to_vec();
@@ -892,7 +932,7 @@ mod tests {
     #[test]
     fn malformed_persisted_timing_cannot_grant_another_window() {
         assert!(ProvisioningDeadline::from_record(&SandboxProvisioning::default()).is_err());
-        let mut record = new_record(0);
+        let mut record = new_record(0, 300_000);
         record.timeout_time = timestamp_from_millis(300_000).ok();
         assert!(ProvisioningDeadline::from_record(&record).is_err());
         record.timeout_time = None;
@@ -908,7 +948,7 @@ mod tests {
     }
 
     fn initial() -> ProvisioningDeadline {
-        ProvisioningDeadline::new("attempt-1".into(), change("change-1", 0), 0)
+        ProvisioningDeadline::new("attempt-1".into(), change("change-1", 0), 0, 300_000)
     }
 
     #[test]
@@ -922,9 +962,9 @@ mod tests {
     #[test]
     fn repeated_failures_do_not_extend_the_repair_window() {
         let mut timer = initial();
-        assert!(timer.rejected("attempt-1", "change-1", 5_000));
+        assert!(timer.rejected("attempt-1", "change-1", 5_000, 300_000));
         for now in (7_000..305_000).step_by(2_000) {
-            assert!(!timer.rejected("attempt-1", "change-1", now));
+            assert!(!timer.rejected("attempt-1", "change-1", now, 300_000));
         }
         assert_eq!(timer.deadline_at_ms(), Some(305_000));
         assert!(timer.expire("attempt-1", "change-1", 305_000));
@@ -933,12 +973,12 @@ mod tests {
     #[test]
     fn change_and_first_failed_load_each_reset_once() {
         let mut timer = initial();
-        assert!(timer.configuration_changed("attempt-1", change("change-2", 100_000)));
+        assert!(timer.configuration_changed("attempt-1", change("change-2", 100_000), 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(400_000));
-        assert!(timer.rejected("attempt-1", "change-2", 105_000));
+        assert!(timer.rejected("attempt-1", "change-2", 105_000, 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(405_000));
-        assert!(!timer.configuration_changed("attempt-1", change("change-2", 110_000)));
-        assert!(!timer.rejected("attempt-1", "change-2", 110_000));
+        assert!(!timer.configuration_changed("attempt-1", change("change-2", 110_000), 300_000));
+        assert!(!timer.rejected("attempt-1", "change-2", 110_000, 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(405_000));
     }
 
@@ -946,17 +986,17 @@ mod tests {
     fn delayed_observation_uses_commit_time() {
         let mut timer = initial();
         // Caller can observe this later, but it committed before the deadline.
-        assert!(timer.configuration_changed("attempt-1", change("change-2", 100_000)));
+        assert!(timer.configuration_changed("attempt-1", change("change-2", 100_000), 300_000));
         assert_eq!(timer.deadline_at_ms(), Some(400_000));
-        assert!(!timer.configuration_changed("attempt-1", change("older", 50_000)));
+        assert!(!timer.configuration_changed("attempt-1", change("older", 50_000), 300_000));
     }
 
     #[test]
     fn stale_attempts_and_changes_cannot_extend_or_expire() {
         let mut timer = initial();
-        assert!(!timer.rejected("old-attempt", "change-1", 1_000));
-        assert!(!timer.rejected("attempt-1", "old-change", 1_000));
-        assert!(!timer.configuration_changed("old-attempt", change("change-2", 1_000)));
+        assert!(!timer.rejected("old-attempt", "change-1", 1_000, 300_000));
+        assert!(!timer.rejected("attempt-1", "old-change", 1_000, 300_000));
+        assert!(!timer.configuration_changed("old-attempt", change("change-2", 1_000), 300_000));
         assert!(!timer.expire("old-attempt", "change-1", 400_000));
         assert!(!timer.expire("attempt-1", "old-change", 400_000));
         assert_eq!(timer.deadline_at_ms(), Some(300_000));
@@ -965,45 +1005,50 @@ mod tests {
     #[test]
     fn late_change_failure_or_ready_cannot_escape_expiry() {
         let mut timer = initial();
-        assert!(!timer.configuration_changed("attempt-1", change("change-2", 300_000)));
-        assert!(!timer.rejected("attempt-1", "change-1", 300_000));
+        assert!(!timer.configuration_changed("attempt-1", change("change-2", 300_000), 300_000));
+        assert!(!timer.rejected("attempt-1", "change-1", 300_000, 300_000));
         assert!(!timer.ready("attempt-1", "change-1", 300_000));
         assert!(timer.expire("attempt-1", "change-1", 300_000));
         assert!(!timer.ready("attempt-1", "change-1", 300_001));
-        assert!(!timer.configuration_changed("attempt-1", change("change-2", 100_000)));
+        assert!(!timer.configuration_changed("attempt-1", change("change-2", 100_000), 300_000));
     }
 
     #[test]
     fn ready_disarms_and_cannot_rearm_for_a_failed_live_update() {
         let mut timer = initial();
         assert!(timer.ready("attempt-1", "change-1", 50_000));
-        assert!(!timer.rejected("attempt-1", "change-1", 60_000));
-        assert!(!timer.configuration_changed("attempt-1", change("change-2", 60_000)));
+        assert!(!timer.rejected("attempt-1", "change-1", 60_000, 300_000));
+        assert!(!timer.configuration_changed("attempt-1", change("change-2", 60_000), 300_000));
         assert!(!timer.expire("attempt-1", "change-1", 400_000));
     }
 
     #[test]
     fn restart_roundtrip_preserves_first_failure_and_deadline() {
         let mut timer = initial();
-        assert!(timer.rejected("attempt-1", "change-1", 5_000));
+        assert!(timer.rejected("attempt-1", "change-1", 5_000, 300_000));
         let encoded = serde_json::to_vec(&timer).unwrap();
         let mut restored: ProvisioningDeadline = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(restored, timer);
-        assert!(!restored.rejected("attempt-1", "change-1", 100_000));
+        assert!(!restored.rejected("attempt-1", "change-1", 100_000, 300_000));
         assert_eq!(restored.deadline_at_ms(), Some(305_000));
     }
 
     #[test]
     fn explicit_retry_is_a_new_attempt_and_old_cleanup_cannot_expire_it() {
-        let mut timer =
-            ProvisioningDeadline::new("attempt-2".into(), change("change-2", 350_000), 400_000);
+        let mut timer = ProvisioningDeadline::new(
+            "attempt-2".into(),
+            change("change-2", 350_000),
+            400_000,
+            300_000,
+        );
         assert_eq!(timer.deadline_at_ms(), Some(700_000));
         assert!(!timer.expire("attempt-1", "change-2", 800_000));
     }
 
     #[test]
     fn legacy_initialization_grants_one_window_from_adoption() {
-        let timer = ProvisioningDeadline::new("adopted".into(), change("legacy", 0), 1_000_000);
+        let timer =
+            ProvisioningDeadline::new("adopted".into(), change("legacy", 0), 1_000_000, 300_000);
         assert_eq!(timer.deadline_at_ms(), Some(1_300_000));
     }
 }

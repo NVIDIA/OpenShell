@@ -4798,6 +4798,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         &state.store,
         &mut sandbox,
         current_time_ms(),
+        state.config.provisioning_repair_window_ms,
     )
     .await
     .map_err(Status::internal)?;
@@ -4891,11 +4892,19 @@ pub(super) async fn handle_report_sandbox_configuration(
                 .map_err(Status::internal)?;
             return Err(Status::failed_precondition("provisioning deadline expired"));
         }
-        crate::compute::provisioning_deadline::record_admission_start(record, now_ms)
-            .map_err(Status::internal)?;
+        crate::compute::provisioning_deadline::record_admission_start(
+            record,
+            now_ms,
+            state.config.provisioning_repair_window_ms,
+        )
+        .map_err(Status::internal)?;
         if reported == ConfigurationAdmissionState::Rejected {
-            crate::compute::provisioning_deadline::record_rejection(record, now_ms)
-                .map_err(Status::internal)?;
+            crate::compute::provisioning_deadline::record_rejection(
+                record,
+                now_ms,
+                state.config.provisioning_repair_window_ms,
+            )
+            .map_err(Status::internal)?;
         }
     }
     let updated = state
@@ -8168,7 +8177,7 @@ mod tests {
             Vec::new(),
         );
         sandbox.set_phase(SandboxPhase::Provisioning.into());
-        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800);
+        let preparation = new_preparation_record(current_time_ms() - 600_000, 1800, 300_000);
         sandbox.status.as_mut().unwrap().provisioning = Some(preparation.clone());
         state.store.put_message(&sandbox).await.unwrap();
         let instance_id = uuid::Uuid::new_v4().to_string();
@@ -8257,7 +8266,8 @@ mod tests {
             Vec::new(),
         );
         sandbox.set_phase(SandboxPhase::Provisioning.into());
-        sandbox.status.as_mut().unwrap().provisioning = Some(new_preparation_record(0, 1800));
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(new_preparation_record(0, 1800, 300_000));
         state.store.put_message(&sandbox).await.unwrap();
         let error = handle_report_sandbox_configuration(
             &state,

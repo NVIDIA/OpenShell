@@ -205,6 +205,18 @@ pub struct KubernetesComputeConfig {
     pub supervisor_image_pull_policy: Option<KubernetesImagePullPolicy>,
     /// Cross-pod sandbox/supervisor settings.
     pub sandbox_runtime: KubernetesSandboxRuntimeConfig,
+    /// Bound on how long a crash-interrupted, fail-closed sandbox runtime
+    /// bootstrap may remain stranded before the driver reclaims it. Slow
+    /// VM-backed runtimes (CoCo/peer-pods) need longer than the default.
+    #[serde(default)]
+    pub runtime_bootstrap_grace_ms: u64,
+    /// Supervisor attach/policy-discover request timeout, in milliseconds.
+    /// When set, the driver copies the value into the supervisor pod
+    /// environment (`OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS`) so slow VM-backed
+    /// runtimes have time to boot the remote boundary before the supervisor
+    /// gives up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_attach_request_timeout_ms: Option<u64>,
     /// Corporate HTTP forward proxy used by the network supervisor for
     /// policy-approved TLS CONNECT egress.
     pub https_proxy: Option<String>,
@@ -361,6 +373,8 @@ impl Default for KubernetesComputeConfig {
             supervisor_image: config::default_supervisor_image(),
             supervisor_image_pull_policy: None,
             sandbox_runtime: KubernetesSandboxRuntimeConfig::default(),
+            runtime_bootstrap_grace_ms: 300_000,
+            sandbox_attach_request_timeout_ms: None,
             https_proxy: None,
             no_proxy: None,
             proxy_auth_secret_name: None,
@@ -969,6 +983,25 @@ mod tests {
             let input = format!("{field} = \"sometimes\"");
             assert!(toml::from_str::<KubernetesComputeConfig>(&input).is_err());
         }
+    }
+
+    #[test]
+    fn bootstrap_grace_defaults_and_parses_from_toml() {
+        assert_eq!(
+            KubernetesComputeConfig::default().runtime_bootstrap_grace_ms,
+            300_000
+        );
+        assert!(
+            KubernetesComputeConfig::default()
+                .sandbox_attach_request_timeout_ms
+                .is_none()
+        );
+        let config: KubernetesComputeConfig = toml::from_str(
+            "runtime_bootstrap_grace_ms = 900000\nsandbox_attach_request_timeout_ms = 900000\n",
+        )
+        .unwrap();
+        assert_eq!(config.runtime_bootstrap_grace_ms, 900_000);
+        assert_eq!(config.sandbox_attach_request_timeout_ms, Some(900_000));
     }
 
     #[test]

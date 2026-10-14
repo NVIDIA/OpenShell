@@ -54,6 +54,33 @@ Debian and RPM user services, place them in
 `~/.config/openshell/gateway.env`; the service supplies that file to both
 preflight and gateway startup.
 
+### Slow-provisioning runtime windows
+
+Remote VM-backed isolation runtimes (CoCo/peer-pods, Kata) can take longer to
+provision a sandbox than the defaults allow. Three windows are configurable:
+
+| Window | Default | Set with |
+|---|---|---|
+| Provisioning repair window (gateway) | 5 min | `provisioning_repair_window_ms` or `OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS` |
+| Sandbox runtime bootstrap grace (Kubernetes driver) | 5 min | `runtime_bootstrap_grace_ms` or `OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS` |
+| Supervisor attach timeout (supervisor) | 5 min | `--attach-request-timeout-ms` or `OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS` |
+
+All values are milliseconds. The provisioning repair window is a gateway
+process setting: the first authenticated supervisor configuration report
+starts admission repair, which stays armed until Ready. Set it under
+`[openshell.gateway]`; allowed values are 1000 through 86400000.
+
+The sandbox runtime bootstrap grace bounds how long a crash-interrupted,
+fail-closed sandbox runtime bootstrap may remain stranded before the driver
+reclaims it. Set it under `[openshell.drivers.kubernetes]`.
+
+The supervisor attach timeout bounds how long the supervisor retries
+attachment and policy discovery while the remote boundary boots. On the
+Kubernetes driver, setting `sandbox_attach_request_timeout_ms` under
+`[openshell.drivers.kubernetes]` copies the value into the supervisor pod
+environment (`OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS`), so one gateway setting
+reaches every supervisor pod without a custom supervisor image.
+
 `name` assigns an operator-facing identity to the gateway installation. Set it with `[openshell.gateway].name`, `--name`, or `OPENSHELL_GATEWAY_NAME`. It defaults to `openshell`; the Helm chart defaults it to the chart fullname so all replicas in one installation share a name. Chart fullnames are only unique within their Kubernetes namespace, so set `server.name` explicitly when one collector receives telemetry from multiple namespaces or clusters. This identity is independent of client-side gateway aliases, TLS names, and `gateway_jwt.gateway_id`.
 
 ## Package-Managed Locations
@@ -183,6 +210,11 @@ ssh_session_ttl_secs  = 3600
 # Absolute image preparation and initial supervisor startup budget.
 # Applies to new attempts only; allowed values are 1 through 86400 seconds.
 image_preparation_timeout_seconds = 1800
+
+# Provisioning repair window for authenticated supervisor configuration
+# reports. Applies to active attempts; allowed values are 1000 through
+# 86400000 milliseconds. OPENSHELL_PROVISIONING_REPAIR_WINDOW_MS overrides.
+provisioning_repair_window_ms = 300000
 
 # Reject invalid policy generations securely by default. Set
 # "retain_last_valid" only when availability takes priority.
@@ -829,6 +861,14 @@ service_account_name           = "openshell-sandbox"
 default_image                  = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy              = "if_not_present"
 image_pull_secrets             = ["regcred"]
+# Bound on how long a crash-interrupted, fail-closed sandbox runtime bootstrap
+# may remain stranded before the driver reclaims it. Default is 300000.
+# runtime_bootstrap_grace_ms  = 300000
+# Supervisor attach/policy-discover request timeout, in milliseconds. When
+# set, the driver copies the value into the supervisor pod environment
+# (OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS) so slow VM-backed runtimes have time
+# to boot the remote boundary before the supervisor gives up.
+# sandbox_attach_request_timeout_ms = 900000
 # Defaults to the gateway version; override to pin a specific build.
 # sandbox_runtime_image        = "ghcr.io/nvidia/openshell/sandbox:<version>"
 sandbox_runtime_image_pull_policy = "if_not_present"

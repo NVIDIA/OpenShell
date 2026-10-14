@@ -141,6 +141,10 @@ pub struct GatewayFileSection {
     /// Absolute preparation budget for new attempts; existing deadlines persist.
     #[serde(default)]
     pub image_preparation_timeout_seconds: Option<u32>,
+    /// Provisioning repair window for authenticated supervisor configuration
+    /// reports; must be between 1000 and 86400000 milliseconds, inclusive.
+    #[serde(default)]
+    pub provisioning_repair_window_ms: Option<i64>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]

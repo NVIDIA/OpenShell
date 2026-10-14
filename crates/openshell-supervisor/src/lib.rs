@@ -685,6 +685,7 @@ pub async fn run_sandbox(
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    attach_request_timeout_ms: u64,
 ) -> Result<i32> {
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
@@ -710,6 +711,7 @@ pub async fn run_sandbox(
             auth_bundle,
             admitted_isolation_backend,
             main_exit_marker,
+            attach_request_timeout_ms,
         },
     ))
     .await
@@ -736,6 +738,7 @@ struct SandboxRunConfig {
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    attach_request_timeout_ms: u64,
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
@@ -766,6 +769,7 @@ async fn run_sandbox_with_backend(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
+        attach_request_timeout_ms,
     } = config;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
@@ -846,7 +850,10 @@ async fn run_sandbox_with_backend(
     openshell_otel::set_parent_from_environment(&startup);
     let startup_status = startup.in_scope(openshell_otel::ErrorStatusGuard::current);
     let (image_yaml, invalid_image) = selected_backend
-        .discover_policy(sandbox_bearer.clone())
+        .discover_policy(
+            sandbox_bearer.clone(),
+            Duration::from_millis(attach_request_timeout_ms),
+        )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.discover_policy"))
         .await?;
     let image_discovery = if invalid_image {
@@ -991,6 +998,7 @@ async fn run_sandbox_with_backend(
                 ca_file_paths: ca_file_paths.clone(),
                 provider_credentials: provider_credentials.clone(),
                 sandbox_bearer,
+                attach_request_timeout: Duration::from_millis(attach_request_timeout_ms),
             },
             policy.clone(),
             openshell_isolation_interface::AgentSpec {
@@ -5215,6 +5223,7 @@ mod tests {
             auth_bundle,
             None,
             None,
+            300_000,
         )
         .await
         .expect_err("missing admission cannot authorize startup");

@@ -275,6 +275,15 @@ async fn main() -> Result<()> {
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
                 boundary_port: args.sandbox_runtime_boundary_port,
             },
+            runtime_bootstrap_grace_ms: std::env::var("OPENSHELL_RUNTIME_BOOTSTRAP_GRACE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(300_000),
+            sandbox_attach_request_timeout_ms: std::env::var("OPENSHELL_ATTACH_REQUEST_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0),
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,
             proxy_auth_secret_name: args.proxy_auth_secret_name,
