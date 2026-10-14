@@ -388,7 +388,7 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 
 ## Stale Issues and Pull Requests
 
-Issues and pull requests receive `state:stale` after 14 days without activity. Only the `lifecycle:frozen` label exempts an issue from stale handling. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
+Issues and pull requests receive `state:stale` after 14 days without activity. Only `lifecycle:frozen` or `state:frozen` exempts an issue from stale handling. Both labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
 
 ## Pull Requests
 

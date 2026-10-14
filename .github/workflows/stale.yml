@@ -26,7 +26,7 @@ jobs:
           operations-per-run: 300
           sort-by: updated
 
-          exempt-issue-labels: lifecycle:frozen
+          exempt-issue-labels: lifecycle:frozen,state:frozen
           close-issue-reason: not_planned
 
           stale-issue-message: >
