@@ -95,8 +95,11 @@ sandbox, for whom, and was it allowed".
 - **Shared or highly available supervisors** (RFC 0018). This design keeps
   identity per sandbox so that it remains valid when one supervisor process
   serves several sandboxes.
-- **Interactive approval for requests outside a grant.** v1 refuses them;
-  interactive approval is future work.
+- **A single prompt for requests outside a grant.** v1 refuses requests beyond
+  the grant's limits; the user raises them with `openshell grant update`.
+  Access the parent lacks goes through the existing proposal flow (see Asking
+  for more than the parent has). A single prompt that shows the child's request
+  and approves it in one step is future work.
 
 ## Proposal
 
@@ -302,8 +305,9 @@ to create sandboxes unless the user said so.
 **Set up front.** In v1 the grant is the only approval. A request inside it
 proceeds without prompting anyone; a request outside it is refused with
 `LIMIT_REACHED` and the agent adapts. This matches how OpenShell is used today,
-from the CLI, and needs no new approval interface. Interactive approval for
-requests outside the grant is future work.
+from the CLI, and needs no new approval interface. Access the parent lacks goes
+through the existing proposal flow (see Asking for more than the parent has); a
+single prompt for requests outside the grant is future work.
 
 **Only the user changes a grant.** The user can widen, shrink or revoke a grant
 while the tree runs. Changes apply to the next call: a sandbox that had no depth
