@@ -216,10 +216,7 @@ carriage return and tab as `\"`, `\\`, `\b`, `\f`, `\n`, `\r`, `\t`;
 escape other control characters below U+0020 as lowercase `\u00xx`. Do not
 escape non-ASCII characters or `/`. Integers use base-10 digits without leading
 zeros; floating point values are not used. Hash these bytes with SHA-256.
-Object order in the transmitted message is immaterial. See
-[`vectors.json`](vectors.json) for independently generated request byte/digest examples
-checked by Rust and the independent Python fixture. Frame hex provides one
-valid serialization; its object key order is not normative.
+Object order in the transmitted message is immaterial.
 
 The backend validates the digest and records replayable mutations by generation
 and request ID. The same ID and digest returns the original result without
@@ -372,11 +369,7 @@ TCP/DNS decisions, connection recovery, credential rotation, and enforcement
 loss in its actual driver placement. OpenShell's delegated adapter tests verify
 opaque payload forwarding and generic evidence without a native Linux audit.
 Its existing transport suites cover recovery, credential renewal, and flow
-control; Docker lifecycle E2E verifies the built-in placement. Run
-`mise run e2e:isolation-protocol` for the stock supervisor against an independent
-Python implementation generated from the public protos. That fixture tests
-interoperability and launch ordering, and simulates enforcement evidence with a
-fixed test bearer. It does not exercise JWT validation or provide isolation.
+control; Docker lifecycle E2E verifies the built-in placement.
 
 Suspend/resume is a separate optional capability described in
 `sandbox_backend.proto`. Protocol 1.0 implementations may return

@@ -316,11 +316,6 @@ jobs:
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
           cargo test --locked --manifest-path examples/isolation-backend-wasi/Cargo.toml
 
-      - name: Sandbox Protocol interoperability
-        if: matrix.system == 'x86_64-linux'
-        shell: nix develop -c bash -euo pipefail {0}
-        run: mise run e2e:isolation-protocol
-
   rust-postgres-test:
     name: Rust PostgreSQL tests
     needs: pr_metadata

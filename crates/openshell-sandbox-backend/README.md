@@ -43,8 +43,7 @@ generation, resource claims, and outer-fence evidence. Native evidence is
 validated by the registered backend; Linux evidence validation remains in the
 built-in adapter.
 
-The language-neutral contract, generation instructions, and interoperability
-vectors are in [Sandbox Protocol 1.0](../../proto/sandbox_protocol/v1/README.md).
+The language-neutral contract and generation instructions are in [Sandbox Protocol 1.0](../../proto/sandbox_protocol/v1/README.md).
 
 ## Exec recovery
 
