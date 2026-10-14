@@ -98,8 +98,14 @@ sandbox, for whom, and was it allowed".
 - **A single prompt for requests outside a grant.** v1 refuses requests beyond
   the grant's limits; the user raises them with `openshell grant update`.
   Access the parent lacks goes through the existing proposal flow (see
-  [Asking for more than the parent has](#asking-for-more-than-the-parent-has)). A single prompt that shows the child's request
-  and approves it in one step is future work.
+  [Asking for more than the parent has](#asking-for-more-than-the-parent-has)).
+  A single prompt that shows the child's request and approves it in one step is
+  future work.
+- **A results channel.** A parent gets results from `exec` output on tool
+  children, or from files it reads with `get_file` while an agent child runs; a
+  child that has exited leaves only its exit code. A result the gateway keeps
+  for the parent is future work (see
+  [Returning results to the parent](#returning-results-to-the-parent)).
 
 ## Proposal
 
