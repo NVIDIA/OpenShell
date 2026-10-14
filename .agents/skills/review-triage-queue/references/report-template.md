@@ -1,48 +1,31 @@
 # Triage queue report
 
-- Repository: `<owner>/<repo>`
-- Generated at: `<UTC timestamp>`
-- Previous report: `<path or none>`
-- Coverage: `<sources, time windows, counts, and cursors>`
-- Limitations: `<partial/unavailable sources or none>`
-- Next triage issue: `<stable ID or none>`
+Include repository, generation time, source/checkpoint coverage, scan limitations, and `next_triage_issue`. Retain empty sections with `None`.
 
 ## Needs your decision — new
 
-For each recommendation, use this record; use `None` when empty.
-
-### `<stable ID>` — `<concise action>`
-
-- Source: `<canonical object URL>`
-- Priority / classification / confidence: `<values; uncertainty if needed>`
-- First seen: `<UTC timestamp>`
-- Proposed action: `<one write or private routing>`
-- Rationale and evidence: `<short paraphrase and public links>`
-- Documentation: `<public links or none found>`
-- Disposition at generation: `<pending/applied/rejected/deferred>`
+Each entry has an object ID, canonical source link, priority, classification, concise proposed action, confidence, linked evidence, applicable public-doc links or `none found`, and disposition at generation.
 
 ## Needs your decision — carried
 
-Use the same recommendation record, retaining original priority and first-seen time. Add the shareable deferral reason or `private reason withheld`, action-record link, and existing public waiting-context link when available.
+Use the same fields; include the shareable deferral reason or `private reason withheld`, action-record link, and existing public waiting-context link when available.
 
 ## Triage queue
 
-Total: `<count>`. Listed: `<count>`. Unlisted: `<count>`.
-
-List up to five items in continuation order with ID, number, title, updated time, source link, and material changes. Link the rest in overflow.
+State total and unlisted queue counts. Show up to five recently updated items with ID, title, updated time, and a concise summary of context and material changes. Put the rest in overflow. Do not assess these issues; direct the engineer to `triage-issue`.
 
 ## Dependabot pull requests
 
-Include stable ID, package update, checks, current test-authorization requirement, and source link.
+List open non-draft Dependabot PRs needing maintainer action, with ID, package/update, checks, current test-authorization requirement, and link. Use the current repository workflow.
 
 ## Community pull requests
 
-Include stable ID, title, author, checks, and source link; overflow after five.
+List up to five new non-draft community PRs with ID, title, author, checks, and link. Exclude Dependabot entries; put the rest in overflow.
 
 ## Deferred and overflow findings
 
-Preserve capacity-limited recommendations using the same record; link remaining queue issues and PRs. Include informational CI findings with canonical run URL, stable ID, attempt, workflow, commit, and conclusion.
+Preserve lower-priority and capacity-limited findings with the recommendation fields above. Include informational CI findings with ID, canonical run link, attempt, workflow, commit, and conclusion.
 
 ## Local inbox follow-up
 
-Include only incorporated prompts, their outcome, and any resulting stable ID.
+List each incorporated inbox entry, its outcome, and any resulting recommendation ID or finding. Do not copy the whole inbox.
