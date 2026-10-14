@@ -348,11 +348,21 @@ through the existing proposal flow (see [Asking for more than the parent has](#a
 single prompt for requests outside the grant is future work.
 
 **Only the user changes a grant.** The user can widen, shrink or revoke a grant
-while the tree runs. Changes apply to the next call: a sandbox that had no depth
-left can create children as soon as the user raises `max_depth`, with no policy
-change, and an existing child keeps its policy. No sandbox can change a grant, including through
-the gateway MCP, and every change is audited. If an agent could widen its own
-grant, the grant would mean nothing.
+while the tree runs:
+
+```shell
+openshell grant list                        # find the grant id, e.g. gr-1a2b3c4d
+openshell grant update gr-1a2b3c4d --max-depth 2 --max-breadth 3 --max-total 6
+openshell grant revoke gr-1a2b3c4d
+```
+
+`grant update` changes only the limits it is given; `expires`, `program` and
+`child_policy` are changed by revoking the grant and creating a new one. Changes
+apply to the next call: a sandbox that had no depth left can create children as
+soon as the user raises `max_depth`, with no policy change, and an existing
+child keeps its policy. No sandbox can change a grant, including through the
+gateway MCP, and every change is audited. If an agent could widen its own grant,
+the grant would mean nothing.
 
 ```proto
 rpc CreateSandboxGrant(CreateSandboxGrantRequest) returns (SandboxGrantResponse) {
