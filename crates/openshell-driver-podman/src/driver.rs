@@ -1108,7 +1108,9 @@ impl PodmanComputeDriver {
                     match create_sandbox_resolver_secret(&self.client, &sandbox.id).await {
                         Ok(name) => name,
                         Err(e) => {
-                            let _ = self.client.remove_volume(&vol_name).await;
+                            if managed_workspace {
+                                let _ = self.client.remove_volume(&vol_name).await;
+                            }
                             return Err(e);
                         }
                     };
@@ -1117,7 +1119,9 @@ impl PodmanComputeDriver {
                 {
                     Ok(name) => name,
                     Err(e) => {
-                        let _ = self.client.remove_volume(&vol_name).await;
+                        if managed_workspace {
+                            let _ = self.client.remove_volume(&vol_name).await;
+                        }
                         cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
                         return Err(e);
                     }
@@ -1128,7 +1132,9 @@ impl PodmanComputeDriver {
                     {
                         Ok(name) => name,
                         Err(e) => {
-                            let _ = self.client.remove_volume(&vol_name).await;
+                            if managed_workspace {
+                                let _ = self.client.remove_volume(&vol_name).await;
+                            }
                             if let Some(secret) = token_secret_name.as_deref() {
                                 cleanup_sandbox_token_secret(&self.client, secret).await;
                             }
@@ -1157,12 +1163,17 @@ impl PodmanComputeDriver {
         // Clean up the volume and per-sandbox secrets on any failure past this
         // point.
         let channel_owned = std::sync::atomic::AtomicBool::new(false);
+        let control_owned = std::sync::atomic::AtomicBool::new(false);
         let cleanup_created = || async {
             if channel_owned.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = self.client.remove_volume(&channel_volume).await;
+            }
+            if control_owned.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = self.client.remove_volume(&control_volume).await;
             }
-            let _ = self.client.remove_volume(&vol_name).await;
+            if managed_workspace {
+                let _ = self.client.remove_volume(&vol_name).await;
+            }
             cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
             if let Some(secret) = token_secret_name.as_deref() {
                 cleanup_sandbox_token_secret(&self.client, secret).await;
@@ -1247,6 +1258,7 @@ impl PodmanComputeDriver {
                     self.client
                         .create_owned_volume(&control_volume, &sandbox.id, &sandbox.workspace, None)
                         .await?;
+                    control_owned.store(true, std::sync::atomic::Ordering::Relaxed);
                     let workload_id = self.client.create_typed_container(&specs.workload).await?;
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
@@ -1700,7 +1712,10 @@ impl PodmanComputeDriver {
         }
         match self
             .client
-            .remove_volume(&crate::isolation::channel_volume_name(sandbox_id))
+            .remove_owned_volume(
+                &crate::isolation::channel_volume_name(sandbox_id),
+                sandbox_id,
+            )
             .await
         {
             Ok(()) | Err(PodmanApiError::NotFound(_)) => {}
@@ -1712,10 +1727,13 @@ impl PodmanComputeDriver {
             debug!(sandbox_id = %sandbox_id, "Sandbox container not found (already deleted)");
             let _ = self
                 .client
-                .remove_volume(&crate::isolation::control_volume_name(sandbox_id))
+                .remove_owned_volume(
+                    &crate::isolation::control_volume_name(sandbox_id),
+                    sandbox_id,
+                )
                 .await;
             let vol = container::volume_name(sandbox_id);
-            if let Err(e) = self.client.remove_volume(&vol).await {
+            if let Err(e) = self.client.remove_owned_volume(&vol, sandbox_id).await {
                 warn!(sandbox_id = %sandbox_id, volume = %vol, error = %e, "Failed to remove workspace volume");
             }
             cleanup_sandbox_token_secret(&self.client, &container::token_secret_name(sandbox_id))
@@ -1751,22 +1769,27 @@ impl PodmanComputeDriver {
 
         if let Err(error) = self
             .client
-            .remove_volume(&crate::isolation::control_volume_name(sandbox_id))
+            .remove_owned_volume(
+                &crate::isolation::control_volume_name(sandbox_id),
+                sandbox_id,
+            )
             .await
             && !matches!(error, PodmanApiError::NotFound(_))
         {
             warn!(%sandbox_id, %error, "Failed to remove private control volume");
         }
-        // Remove workspace volume.
         if let Err(error) = self
             .client
-            .remove_volume(&crate::isolation::channel_volume_name(sandbox_id))
+            .remove_owned_volume(
+                &crate::isolation::channel_volume_name(sandbox_id),
+                sandbox_id,
+            )
             .await
         {
             warn!(%sandbox_id, %error, "Failed to remove private channel volume");
         }
         let vol = container::volume_name(sandbox_id);
-        if let Err(e) = self.client.remove_volume(&vol).await {
+        if let Err(e) = self.client.remove_owned_volume(&vol, sandbox_id).await {
             warn!(
                 sandbox_id = %sandbox_id,
                 volume = %vol,
@@ -2671,10 +2694,11 @@ mod tests {
         let (delete_socket, _requests, delete_handle) = spawn_podman_stub(
             "trace-delete",
             vec![
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no channel volume
                 StubResponse::new(StatusCode::OK, "[]"),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no control volume
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no workspace volume
             ],
         );
         let subscriber =
@@ -3386,6 +3410,15 @@ mod tests {
         format!("/v5.0.0{path}")
     }
 
+    fn requests_without_queries(request_log: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+        request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .iter()
+            .map(|request| request.split('?').next().unwrap_or_default().to_string())
+            .collect()
+    }
+
     #[test]
     fn podman_local_volume_with_bind_option_is_bind_backed() {
         let volume = VolumeInspect {
@@ -3558,11 +3591,12 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // channel volume already gone
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // control volume already gone
+                owned_volume_response(&volume_name, sandbox_id, Some((1234, 1235))),
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
@@ -3582,11 +3616,64 @@ mod tests {
             .clone();
         assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[4],
+            requests[5],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
             )
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_keeps_unowned_volumes_when_container_is_already_gone() {
+        let sandbox_id = "sandbox-123";
+        let unlabeled_channel = serde_json::json!({
+            "Name": crate::isolation::channel_volume_name(sandbox_id),
+            "Driver": "local", "Options": {}, "Labels": {}
+        });
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "delete-unowned-not-found",
+            vec![
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
+                StubResponse::new(StatusCode::OK, unlabeled_channel.to_string()),
+                StubResponse::new(StatusCode::OK, "[]"), // no workload
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no control volume
+                owned_volume_response(
+                    &container::volume_name(sandbox_id),
+                    "sandbox-other",
+                    Some((1234, 1235)),
+                ),
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // token secret
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // resolver secret
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // proxy-auth secret
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // TLS CA secret
+            ],
+        );
+
+        let deleted = test_driver(socket_path.clone())
+            .delete_sandbox(sandbox_id)
+            .await
+            .expect("delete should succeed");
+
+        assert!(!deleted, "missing container should report deleted=false");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("stub should receive every scripted request")
+            .expect("stub task should finish");
+        assert_eq!(
+            requests_without_queries(&request_log),
+            [
+                "DELETE /v5.0.0/libpod/containers/openshell-supervisor-sandbox-123",
+                "GET /v5.0.0/libpod/volumes/openshell-channel-sandbox-123/json",
+                "GET /v5.0.0/libpod/containers/json",
+                "GET /v5.0.0/libpod/volumes/openshell-control-sandbox-123/json",
+                "GET /v5.0.0/libpod/volumes/openshell-sandbox-sandbox-123-workspace/json",
+                "DELETE /v5.0.0/libpod/secrets/openshell-token-sandbox-123",
+                "DELETE /v5.0.0/libpod/secrets/openshell-resolver-sandbox-123",
+                "DELETE /v5.0.0/libpod/secrets/openshell-proxy-auth-sandbox-123",
+                "DELETE /v5.0.0/libpod/secrets/openshell-tls-ca-sandbox-123",
+            ]
         );
         let _ = fs::remove_file(socket_path);
     }
@@ -3988,6 +4075,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_rollback_skips_unmanaged_workspace_volume() {
+        let sandbox_id = "sandbox-workdir";
+        // Give the workload image a custom WORKDIR and drop the workspace volume
+        // inspect, create, and verify responses that it no longer reaches.
+        let mut responses = create_setup_responses(false, sandbox_id);
+        responses[3] = StubResponse::new(
+            StatusCode::OK,
+            r#"{"Id":"sha256:sandbox","Config":{"User":"1234:1235","WorkingDir":"/workspace/project"}}"#,
+        );
+        responses.drain(11..14);
+        responses.extend([
+            StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "create failed"),
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // control
+            StubResponse::new(StatusCode::NO_CONTENT, ""), // resolver secret
+        ]);
+        let (socket_path, request_log, handle) =
+            spawn_podman_stub("create-custom-workdir-fail", responses);
+
+        test_driver(socket_path.clone())
+            .create_sandbox(&plain_sandbox(sandbox_id, "demo"))
+            .await
+            .expect_err("container create should fail");
+
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("stub should receive every scripted request")
+            .expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned");
+        let workspace = container::volume_name(sandbox_id);
+        assert!(
+            !requests.iter().any(|request| request.contains(&workspace)),
+            "custom WORKDIR create must not touch {workspace}: {requests:?}"
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
     async fn create_sandbox_removes_proxy_auth_secret_on_start_failure() {
         // The container is created but fails to start; the staged credential
         // secret must still be removed.
@@ -4047,11 +4174,11 @@ mod tests {
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-proxy-auth",
             vec![
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
-                StubResponse::new(StatusCode::OK, "[]"),
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no companion
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no channel volume
+                StubResponse::new(StatusCode::OK, "[]"),      // list_containers (not found)
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no control volume
+                StubResponse::new(StatusCode::NOT_FOUND, ""), // no workspace volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove resolver secret
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove proxy-auth secret
@@ -4086,6 +4213,8 @@ mod tests {
         let container_id = "abc123def456";
         let container_name = "openshell-default--demo-sandbox-request-id";
         let volume_name = container::volume_name(sandbox_id);
+        let channel_volume = crate::isolation::channel_volume_name(sandbox_id);
+        let control_volume = crate::isolation::control_volume_name(sandbox_id);
         let list_body = serde_json::json!([{
             "Id": container_id,
             "Names": [container_name],
@@ -4099,15 +4228,19 @@ mod tests {
             "delete-label-lookup",
             vec![
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
-                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
+                owned_volume_response(&channel_volume, sandbox_id, None),
+                StubResponse::new(StatusCode::CONFLICT, ""), // channel still attached
                 // list_containers by label
                 StubResponse::new(StatusCode::OK, list_body),
                 // single timed remove_container operation
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                owned_volume_response(&control_volume, sandbox_id, None),
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
                 // channel volume, now detached
+                owned_volume_response(&channel_volume, sandbox_id, None),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 // remove_volume
+                owned_volume_response(&volume_name, sandbox_id, None),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -4124,9 +4257,9 @@ mod tests {
             .lock()
             .expect("request log lock should not be poisoned")
             .clone();
-        assert!(requests[2].contains("/libpod/containers/json"));
+        assert!(requests[3].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[3],
+            requests[4],
             format!(
                 "DELETE {}",
                 api_path(&format!(
@@ -4135,11 +4268,76 @@ mod tests {
             )
         );
         assert_eq!(
-            requests[6],
+            requests[10],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
             )
+        );
+        let _ = fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn delete_sandbox_keeps_unowned_workspace_volume_after_container_removal() {
+        let sandbox_id = "sandbox-123";
+        let channel_volume = crate::isolation::channel_volume_name(sandbox_id);
+        let control_volume = crate::isolation::control_volume_name(sandbox_id);
+        let list_body = serde_json::json!([{
+            "Id": "workload", "State": "running", "Labels": {LABEL_SANDBOX_ID: sandbox_id}
+        }]);
+        // A custom-WORKDIR sandbox never creates its workspace volume.
+        let unlabeled_workspace = serde_json::json!({
+            "Name": container::volume_name(sandbox_id),
+            "Driver": "local", "Options": {}, "Labels": {}
+        });
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "delete-unowned-workspace",
+            vec![
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
+                owned_volume_response(&channel_volume, sandbox_id, None),
+                StubResponse::new(StatusCode::CONFLICT, ""), // channel still attached
+                StubResponse::new(StatusCode::OK, list_body.to_string()),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove workload
+                owned_volume_response(&control_volume, sandbox_id, None),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove control
+                owned_volume_response(&channel_volume, sandbox_id, None),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel
+                StubResponse::new(StatusCode::OK, unlabeled_workspace.to_string()),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // token secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // resolver secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy-auth secret
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // TLS CA secret
+            ],
+        );
+
+        let deleted = test_driver(socket_path.clone())
+            .delete_sandbox(sandbox_id)
+            .await
+            .expect("delete should succeed");
+
+        assert!(deleted, "existing container should report deleted=true");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("stub should receive every scripted request")
+            .expect("stub task should finish");
+        assert_eq!(
+            requests_without_queries(&request_log),
+            [
+                "DELETE /v5.0.0/libpod/containers/openshell-supervisor-sandbox-123",
+                "GET /v5.0.0/libpod/volumes/openshell-channel-sandbox-123/json",
+                "DELETE /v5.0.0/libpod/volumes/openshell-channel-sandbox-123",
+                "GET /v5.0.0/libpod/containers/json",
+                "DELETE /v5.0.0/libpod/containers/workload",
+                "GET /v5.0.0/libpod/volumes/openshell-control-sandbox-123/json",
+                "DELETE /v5.0.0/libpod/volumes/openshell-control-sandbox-123",
+                "GET /v5.0.0/libpod/volumes/openshell-channel-sandbox-123/json",
+                "DELETE /v5.0.0/libpod/volumes/openshell-channel-sandbox-123",
+                "GET /v5.0.0/libpod/volumes/openshell-sandbox-sandbox-123-workspace/json",
+                "DELETE /v5.0.0/libpod/secrets/openshell-token-sandbox-123",
+                "DELETE /v5.0.0/libpod/secrets/openshell-resolver-sandbox-123",
+                "DELETE /v5.0.0/libpod/secrets/openshell-proxy-auth-sandbox-123",
+                "DELETE /v5.0.0/libpod/secrets/openshell-tls-ca-sandbox-123",
+            ]
         );
         let _ = fs::remove_file(socket_path);
     }

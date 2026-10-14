@@ -15,7 +15,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Podman libpod API version prefix.
 const API_VERSION: &str = "v5.0.0";
@@ -802,6 +802,28 @@ impl PodmanClient {
                 "private volume ownership verification failed".into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Remove a managed volume only when its sandbox ID label names
+    /// `sandbox_id`. A missing volume is a no-op; any other volume is kept
+    /// with a warning.
+    pub(crate) async fn remove_owned_volume(
+        &self,
+        name: &str,
+        sandbox_id: &str,
+    ) -> Result<(), PodmanApiError> {
+        let labels = match self.inspect_volume(name).await {
+            Ok(volume) => volume.labels.unwrap_or_default(),
+            Err(PodmanApiError::NotFound(_)) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let reason = match labels.get(openshell_core::driver_utils::LABEL_SANDBOX_ID) {
+            Some(owner) if owner == sandbox_id => return self.remove_volume(name).await,
+            Some(_) => "sandbox ID label names another sandbox",
+            None => "sandbox ID label is missing",
+        };
+        warn!(%sandbox_id, volume = %name, %reason, "Kept volume not owned by sandbox");
         Ok(())
     }
 
