@@ -1,0 +1,102 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Maintainer Approval Status
+
+# workflow_run always runs the default branch's copy of this file with a
+# write-capable token, fork pull requests included. The pull request cannot
+# alter the decision logic, and a commit status failure sends no email.
+
+on:
+  workflow_run:
+    workflows: [Maintainer Approval]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish maintainer approval status
+    if: >-
+      github.repository_owner == 'NVIDIA' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Check out the default branch, never the pull request head. Both the
+      # maintainer list and the decision helper must come from main.
+      - name: Check out the maintainer list and helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          sparse-checkout: |
+            MAINTAINERS.md
+            tasks/scripts/check_maintainer_approval.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Require an approving review from a maintainer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TRIGGER_EVENT: ${{ github.event.workflow_run.event }}
+          TRIGGER_TITLE: ${{ github.event.workflow_run.display_title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # This context is the required status check. Changing it silently
+          # breaks the ruleset entry that gates merges on it.
+          post_status() {
+            gh api --method POST "repos/$GH_REPO/statuses/$HEAD_SHA" \
+              -f state="$1" \
+              -f context="OpenShell / Maintainer Approval" \
+              -f description="$2" \
+              -f target_url="$RUN_URL" >/dev/null
+          }
+
+          # Only GitHub can raise merge_group events, and a pull request
+          # enters the queue only after this status passed on its head.
+          if [ "$TRIGGER_EVENT" = "merge_group" ]; then
+            post_status success "Checked before entering the merge queue"
+            exit 0
+          fi
+
+          # The run name comes from the pull request's copy of the trigger
+          # workflow, so it is untrusted. Bind it to the run's commit below.
+          if [[ ! "$TRIGGER_TITLE" =~ ^Maintainer\ Approval\ for\ PR\ \#([0-9]+)$ ]]; then
+            echo "::warning::Unrecognized trigger run name; leaving the status unchanged"
+            exit 0
+          fi
+          PR_NUMBER="${BASH_REMATCH[1]}"
+
+          gh api "repos/$GH_REPO/pulls/$PR_NUMBER" > pr.json
+          if [ "$(jq -r '.state' pr.json)" != "open" ] \
+             || [ "$(jq -r '.head.sha' pr.json)" != "$HEAD_SHA" ]; then
+            # Closed, or the head moved on. A new head has no status yet, so
+            # the required context stays pending until it is evaluated.
+            echo "PR #$PR_NUMBER is closed or no longer at $HEAD_SHA; nothing to do"
+            exit 0
+          fi
+
+          gh api --paginate "repos/$GH_REPO/pulls/$PR_NUMBER/reviews" --jq '.[]' \
+            | jq -s '.' > reviews.json
+
+          # Exits non-zero when no maintainer's latest decisive review is an
+          # approval, and when MAINTAINERS.md yields no handles.
+          if python3 tasks/scripts/check_maintainer_approval.py \
+              --maintainers MAINTAINERS.md \
+              --reviews reviews.json; then
+            post_status success "Approved by a maintainer"
+          else
+            post_status failure "Needs approval from a maintainer in MAINTAINERS.md"
+          fi
