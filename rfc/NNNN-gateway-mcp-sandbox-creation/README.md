@@ -230,7 +230,7 @@ existing `ExecSandbox` RPC with the same guard.
 
 | Surface | Used by | How it reaches the gateway |
 |---------|---------|----------------------------|
-| gRPC / SDK (Rust, Python, TypeScript, Go) | Harnesses integrating in code; services such as RL environment runners | From a sandbox: through the door at `openshell.local`. From the host: the user's login. |
+| gRPC / SDK (Rust, Python, TypeScript, Go) | Harnesses integrating in code; services such as RL environment runners | From the host: the user's login. From a sandbox: through the door, once it carries gRPC (open decision). |
 | CLI | Users and scripts | The user's login |
 | MCP `/mcp` | Any MCP-capable agent or harness | From a sandbox: through the door. From the host: the user's login. |
 
