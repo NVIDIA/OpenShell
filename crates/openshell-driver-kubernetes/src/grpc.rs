@@ -285,6 +285,7 @@ impl ComputeDriver for ComputeDriverService {
                         )?;
                     }
                     WorkspaceMode::Operator => {
+                        self.driver.wait_for_operator_allowlist().await?;
                         if let Some(allowlist) = self.driver.operator_allowlist()
                             && !allowlist.contains(&workspace)
                         {

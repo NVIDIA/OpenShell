@@ -27,7 +27,10 @@ workspace namespace modes via `workspace_mode`:
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
   (`operator_namespace_file`). Sandbox creation fails closed if the workspace
-  namespace is not in the current allowlist. Workspace deletion only removes
+  namespace is not in the current allowlist. With a label selector, workspace
+  checks that run before the watcher's first namespace listing wait up to 10
+  seconds for it and then return `Unavailable`, so a gateway restart does not
+  reject labeled workspaces as unknown. Workspace deletion only removes
   gateway state; it never deletes or otherwise accesses the operator-managed
   Kubernetes namespace.
 
