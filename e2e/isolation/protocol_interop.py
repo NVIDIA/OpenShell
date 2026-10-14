@@ -192,7 +192,7 @@ async def main(binary):
             async def GetCapabilities(self, request, context):
                 assert request.supervisor.protocol_version.major == 1
                 assert (
-                    "openshell.isolation.contract"
+                    "openshell.isolation.sandbox"
                     in request.supervisor.supported_capabilities
                 )
                 assert "authorization" not in dict(context.invocation_metadata())
@@ -202,8 +202,8 @@ async def main(binary):
                         protocol_version=extension.ProtocolVersion(major=1, minor=0),
                         implementation_name="python-interop",
                         implementation_version="1.0",
-                        supported_capabilities=["openshell.isolation.contract"],
-                        required_capabilities=["openshell.isolation.contract"],
+                        supported_capabilities=["openshell.isolation.sandbox"],
+                        required_capabilities=["openshell.isolation.sandbox"],
                     )
                 )
 

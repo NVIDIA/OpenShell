@@ -13,7 +13,7 @@ import "options.proto";
 // driver provisioning. Workload control, network mediation, and byte streams
 // remain on the Sandbox Protocol.
 // PeerMetadata negotiates the base contract and optional suspend/resume support.
-// Version 1.0 requires openshell.isolation.contract on both peers and includes
+// Version 1.0 requires openshell.isolation.sandbox on both peers and includes
 // boundary routing. Optional state retention support advertises
 // openshell.isolation.suspend-resume. Add optional capabilities
 // with compatible minor versions; incompatible semantics require a major bump.

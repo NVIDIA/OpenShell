@@ -2507,7 +2507,7 @@ mod tests {
         let mut missing_contract = crate::isolation_protocol::metadata("test/backend");
         missing_contract
             .supported_capabilities
-            .retain(|capability| capability != crate::isolation_protocol::CONTRACT_CAPABILITY);
+            .retain(|capability| capability != crate::isolation_protocol::SANDBOX_CAPABILITY);
         let mut unsupported_requirement = crate::isolation_protocol::metadata("test/backend");
         unsupported_requirement
             .required_capabilities

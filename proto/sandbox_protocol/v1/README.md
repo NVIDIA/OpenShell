@@ -14,7 +14,7 @@ No OpenShell guest executable or linked backend implementation is required.
 
 The negotiated isolation version covers **both** the control RPCs and the
 framing and JSON messages below. Version 1.0 requires
-`openshell.isolation.contract` on both peers. An incompatible change to a
+`openshell.isolation.sandbox` on both peers. An incompatible change to a
 message, framing, authentication, or lifecycle guarantee requires a major bump.
 A minor revision may add optional capabilities; it must preserve all 1.0
 messages and behavior. A new operation requires an advertised capability

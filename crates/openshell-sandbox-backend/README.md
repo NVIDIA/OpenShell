@@ -14,7 +14,7 @@ the same handle for the runtime's lifetime. Driver deletion terminates the
 runtime and invalidates that handle.
 
 Isolation protocol 1.0 includes boundary routing and requires
-`openshell.isolation.contract` on both peers. The shared extension
+`openshell.isolation.sandbox` on both peers. The shared extension
 negotiator checks major versions and each peer's required capabilities. The
 built-in runtime does not advertise `openshell.isolation.suspend-resume` and
 returns `UNIMPLEMENTED` for those optional RPCs.

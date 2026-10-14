@@ -10,13 +10,13 @@ use crate::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
 use crate::isolation_proto::OpenBoundaryRequest;
 use crate::proto::{DelegatedBoundaryChunk, delegated_boundary_chunk::Payload};
 
-pub const CONTRACT_CAPABILITY: &str = "openshell.isolation.contract";
+pub const SANDBOX_CAPABILITY: &str = "openshell.isolation.sandbox";
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
 
 /// The built-in runtime supports fresh launches; suspend/resume is optional.
 #[must_use]
 pub fn metadata(implementation: &str) -> PeerMetadata {
-    let capabilities = vec![CONTRACT_CAPABILITY.to_string()];
+    let capabilities = vec![SANDBOX_CAPABILITY.to_string()];
     PeerMetadata {
         protocol_version: Some(PROTOCOL_VERSION),
         implementation_name: implementation.to_string(),
