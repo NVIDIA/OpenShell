@@ -432,13 +432,16 @@ the gateway proves the child's policy against the parent's current policy,
 without provider layers. The lead's children are bounded by
 the lead's policy, its grandchildren by its children's policies, and so on, so
 each level can only narrow: `child ≤ parent ≤ global maximum`, the model in
-#2025. A single tree-wide ceiling, the lead's policy, would let a child that was
+the spike on agents setting maximum policies for spawned agents
+([#2025](https://github.com/NVIDIA/OpenShell/issues/2025)). A single tree-wide ceiling, the lead's policy, would let a child that was
 given only GitHub read access create a grandchild with everything the lead has.
 
 Because the ceiling is the parent's policy at the moment of the create, a
 parent whose policy has grown through an approved proposal can pass that access
 on, and one whose policy has shrunk cannot. Children already running when a
-parent's policy shrinks keep their policy; revalidating them is #3808.
+parent's policy shrinks keep their policy; revalidating them is the subject of
+[#3808](https://github.com/NVIDIA/OpenShell/issues/3808), "revalidate running
+subagents when ancestor authority changes".
 
 **What the agent writes.** The agent supplies only the child's
 `network_policies`. The gateway builds the child's full policy from the
