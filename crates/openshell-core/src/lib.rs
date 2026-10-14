@@ -13,6 +13,12 @@ pub mod activity;
 pub mod app_listener;
 pub mod auth;
 pub mod compute;
+#[cfg(target_os = "linux")]
+pub mod cdi_name {
+    pub use container_device_interface::parser::is_qualified_name;
+}
+#[cfg(not(target_os = "linux"))]
+pub mod cdi_name;
 pub mod config;
 pub mod container_paths;
 pub mod denial;
