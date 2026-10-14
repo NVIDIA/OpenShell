@@ -261,13 +261,16 @@ sandbox uses MCP and the gRPC service is used from the host.
 
 ### Grants
 
-A grant is a budget for one tree of sandboxes, set by the user. It answers
-three questions: may this tree create sandboxes at all, how large may it grow,
-and what is the most any sandbox in it may be given.
+A grant is a budget for one tree of sandboxes, set by the user. It answers four
+questions: may this tree create sandboxes at all, how large may it grow, which
+program may ask, and whether agents may write their children's policies
+(`child_policy`). What a child may be given is not part of the grant: every
+child is bounded by its parent's policy (see
+[Ceiling and policy proof](#ceiling-and-policy-proof)).
 
-**Creation.** A grant is created when the user starts the tree's first sandbox,
-called the holder. There is no grant file; the grant is part of the create
-request:
+**Creation.** A grant is usually created when the user starts the tree's first
+sandbox, called the holder. There is no grant file; the grant is part of the
+create request:
 
 ```shell
 openshell sandbox create \
@@ -281,6 +284,20 @@ openshell sandbox create \
 The CLI parses `--grant` into a `SandboxGrantSpec` on `CreateSandboxRequest`.
 Only a user principal may set it; the gateway rejects the field from any other
 principal. The holder's policy is the ceiling for its children.
+
+**Adding a grant to a running sandbox.** A user often finds that a sandbox
+needs sub-agents only after starting it. `CreateSandboxGrant` attaches a grant
+to an existing top-level sandbox, which becomes the holder from then on:
+
+```shell
+openshell grant create lead \
+  --max-depth 1 --max-breadth 2 --max-total 3 --expires 4h --program /usr/local/bin/node
+```
+
+The same rules apply as at creation: only a user may call it, the sandbox must
+not already hold a grant or belong to a tree, and the holder's current policy
+becomes the ceiling for its children. A sandbox that is itself a child cannot be
+given a grant of its own; its tree's grant already covers it.
 
 ```proto
 message SandboxGrantSpec {
@@ -338,6 +355,9 @@ the gateway MCP, and every change is audited. If an agent could widen its own
 grant, the grant would mean nothing.
 
 ```proto
+rpc CreateSandboxGrant(CreateSandboxGrantRequest) returns (SandboxGrantResponse) {
+  option (authorization) = { auth_mode: "bearer" workspace_role: "user" scope: "sandbox:write" };
+}
 rpc ListSandboxGrants(ListSandboxGrantsRequest) returns (ListSandboxGrantsResponse) {
   option (authorization) = { auth_mode: "bearer" workspace_role: "user" scope: "sandbox:read" };
 }
@@ -817,6 +837,7 @@ openshell sandbox create --policy lead.yaml \
   -- pi
 
 # Inspect and change grants
+openshell grant create <sandbox> --max-depth 1 --max-breadth 2 --max-total 3 --expires 4h --program /usr/local/bin/node
 openshell grant list
 openshell grant update <grant-id> --max-breadth 3 --max-total 4
 openshell grant revoke <grant-id>
@@ -971,6 +992,13 @@ they are attached by name and not proved.
 
 A grant could list workload templates a child may use, so that a Pi lead can
 create a Claude Code child in a different image.
+
+### Grant profiles
+
+Named grant profiles defined by an administrator, for example `rl-env` with
+`max_depth=1,max_total=50`, so that users and runners start trees with
+`--grant-profile rl-env` instead of repeating limits. Profiles would also let an
+enterprise cap what users may grant, alongside the global policy maximum.
 
 ### Resource budgets
 
