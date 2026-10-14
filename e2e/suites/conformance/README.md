@@ -114,8 +114,8 @@ and waiver handling remain implementation work.
 
 ## Migration scope
 
-The conformance workspace lives under `e2e/suites/conformance/`; feature and
-driver workspaces remain under `tests/suites/` until a separate relocation. Existing
+The conformance, feature, and driver suite workspaces live under `e2e/suites/`;
+target provisioning stays under `tests/`. Existing
 assertions and test identities are preserved. The legacy mixed suites under
 `e2e/rust/` still need classification and migration by behavioral intent.
 

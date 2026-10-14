@@ -16,14 +16,13 @@ mise run ci            # Everything: lint, compile checks, and tests
 - End-to-end tests exercise a configured OpenShell target through a client.
 - Benchmarks measure performance or scale separately from behavioral correctness.
 
-End-to-end suites are grouped by intent: conformance verifies
+End-to-end suites under `e2e/suites/` are grouped by intent: conformance verifies
 required public behavior, feature suites need a named external service or special
 gateway configuration, and driver suites verify driver or host integration.
 The [conformance guide](e2e/suites/conformance/README.md) owns conformance
 requirements, authoring, and execution guidance. Existing mixed suites remain
 under `e2e/rust/` while their behavior is migrated. `tests/` supplies provisioning
-and artifact construction independently of the suite layout. Driver and feature
-suites remain under `tests/suites/` pending their relocation.
+and artifact construction independently of the suite layout.
 
 ## Test Layout
 
@@ -33,8 +32,7 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Legacy Rust CLI E2E tests awaiting migration
-e2e/suites/conformance/ # Conformance stories
-tests/suites/          # Existing feature and driver suites
+e2e/suites/            # Conformance, feature, and driver E2E suites
 tests/                 # Target provisioning and artifact construction
 ```
 

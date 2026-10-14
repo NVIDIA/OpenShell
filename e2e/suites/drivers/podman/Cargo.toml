@@ -10,6 +10,6 @@ license = "Apache-2.0"
 repository = "https://github.com/NVIDIA/OpenShell"
 
 [dependencies]
-openshell-e2e-support = { path = "../../../../e2e/support/rust" }
+openshell-e2e-support = { path = "../../../support/rust" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1.43", features = ["macros", "rt"] }

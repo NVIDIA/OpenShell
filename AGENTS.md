@@ -60,7 +60,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `python/openshell/` | Python SDK | Python bindings and CLI packaging |
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
-| `e2e/suites/` | Behavioral E2E suites | Conformance stories; other suites remain in tests/suites |
+| `e2e/suites/` | Behavioral E2E suites | Conformance scenarios, feature tests, and driver tests |
 | `e2e/support/rust/` | Shared Rust test tooling | CLI runner, binary resolution, output parsing, and port utilities |
 | `tests/` | Test provisioning | Target configuration, artifact construction, and Ansible setup |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |

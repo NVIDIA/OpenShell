@@ -89,8 +89,8 @@ let
   };
   providerRefreshKeycloakArchive = mkTestArchive {
     name = "provider-refresh-keycloak";
-    workspacePath = "tests/suites/features";
-    manifestPath = "tests/suites/features/Cargo.toml";
+    workspacePath = "e2e/suites/features";
+    manifestPath = "e2e/suites/features/Cargo.toml";
     package = "openshell-test-feature-provider-refresh-keycloak";
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
@@ -177,8 +177,8 @@ let
 
   podmanDriverArchive = mkTestArchive {
     name = "podman-driver";
-    workspacePath = "tests/suites/drivers";
-    manifestPath = "tests/suites/drivers/Cargo.toml";
+    workspacePath = "e2e/suites/drivers";
+    manifestPath = "e2e/suites/drivers/Cargo.toml";
     package = "openshell-test-suite-podman";
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-podman-tests.tar";
