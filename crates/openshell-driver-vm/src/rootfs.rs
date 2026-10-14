@@ -1291,6 +1291,10 @@ mod tests {
             )
         );
         assert!(init_script.contains("OPENSHELL_VM_SANDBOX_BOOTSTRAP"));
+        assert!(init_script.contains("exec \"$chroot_bin\" /newroot \"$supervisor\" \"$@\""));
+        assert!(!init_script.contains("--library-path"));
+        assert!(!init_script.contains("\"$loader\""));
+        assert!(!init_script.contains("ld-linux"));
         assert!(init_script.contains("    reconcile_sandbox_account\n    setup_sandbox_workdir"));
         assert!(
             init_script
