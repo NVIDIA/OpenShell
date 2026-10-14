@@ -14,7 +14,7 @@ No OpenShell guest executable or linked backend implementation is required.
 
 The negotiated isolation version covers **both** the control RPCs and the
 framing and JSON messages below. Version 1.0 requires
-`openshell.isolation.sandbox` on both peers. An incompatible change to a
+`openshell.sandbox.protocol` on both peers. An incompatible change to a
 message, framing, authentication, or lifecycle guarantee requires a major bump.
 A minor revision may add optional capabilities; it must preserve all 1.0
 messages and behavior. A new operation requires an advertised capability
@@ -32,7 +32,7 @@ Selecting `openshell.gateway.compute_driver` selects both the driver and its
 backend; their names can differ.
 It sends the resolved `IsolationBackendRegistration` through the compute
 protocol in validation/create specs and every start request, including recovery.
-This requires the driver's `openshell.compute.isolation-backend-registration`
+This requires the driver's `openshell.compute.sandbox-backend`
 capability; unsupported drivers fail gateway startup. Missing selection or
 `openshell-sandbox` retains the built-in runtime. The public sandbox spec has
 no selector or endpoint.
