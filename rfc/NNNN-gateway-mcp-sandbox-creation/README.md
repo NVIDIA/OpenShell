@@ -212,6 +212,12 @@ service SandboxChildren {
   rpc WaitChildSandbox(WaitChildSandboxRequest) returns (WaitChildSandboxResponse) {
     option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:read" };
   }
+  rpc ExecChildSandbox(ExecChildSandboxRequest) returns (ExecChildSandboxResponse) {
+    option (authorization) = { auth_mode: "sandbox" };
+  }
+  rpc GetChildSandboxFile(GetChildSandboxFileRequest) returns (GetChildSandboxFileResponse) {
+    option (authorization) = { auth_mode: "sandbox" };
+  }
   rpc StopChildSandbox(StopChildSandboxRequest) returns (StopChildSandboxResponse) {
     option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:write" };
   }
@@ -227,8 +233,13 @@ service SandboxChildren {
 `auth_mode: "dual"` admits both user and sandbox principals. For sandbox
 principals each handler applies a child-scope guard, in the style of
 `ensure_sandbox_principal_scope`: a sandbox may create children only under its
-grant and act only on its own descendants. `exec` and `get_file` use the
-existing `ExecSandbox` RPC with the same guard.
+grant and act only on its own descendants, and is refused with
+`NOT_YOUR_CHILD` otherwise. `ExecChildSandbox` and `GetChildSandboxFile` are
+sandbox-only: users already have `ExecSandbox`. They apply the same guard, refuse
+`exec` on an agent child with `WRONG_KIND`, log every command, and then run the
+existing `ExecSandbox` handler inside the gateway (`get_file` runs `cat` on the
+path). `ExecSandbox` itself keeps its current authorization; sandboxes are not
+given access to it.
 
 | Surface | Used by | How it reaches the gateway |
 |---------|---------|----------------------------|
