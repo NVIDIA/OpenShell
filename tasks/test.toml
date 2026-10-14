@@ -15,6 +15,7 @@ depends = [
   "test:postgres-runner",
   "test:gateway-pull-policy",
   "test:e2e-image-overrides",
+  "test:e2e-lanes",
   "test:gateway-config",
   "test:packaging-assets",
   "test:qualification-summary",
@@ -311,4 +312,10 @@ run = "e2e/rust/e2e-docker.sh"
 description = "Test generated local gateway TOML without starting a runtime"
 run = "bash tasks/scripts/test-gateway-config.sh"
 run_windows = "echo Skipping test:gateway-config: Unix gateway scripts do not apply on Windows."
+hide = true
+
+["test:e2e-lanes"]
+description = "Verify e2e family selection, preserved target matrices, and failure gates without provisioning runtimes"
+run = "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/e2e_lanes_test.py"
+run_windows = "echo Skipping test:e2e-lanes: E2E harnesses execute on Unix hosts."
 hide = true

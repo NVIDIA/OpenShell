@@ -16,6 +16,9 @@ DEFAULT_WORKLOAD_MANIFEST="${ROOT}/e2e/gpu/images/.build/workloads.yaml"
 RUN_WITH_GATEWAY_COMMAND="__openshell_run_podman_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
+# shellcheck source=e2e/support/test-family.sh
+source "${ROOT}/e2e/support/test-family.sh"
+e2e_select_test_family "${E2E_FEATURES}"
 
 # Keep required branch CI on the Podman targets that are known to pass. The
 # unfiltered e2e:podman task remains available while the omitted targets are
@@ -71,8 +74,10 @@ if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_WORKLOAD_MANIFEST:-}" ] &&
 fi
 
 if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
-  e2e_run_openshell_conformance "Podman"
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_RUN_CONFORMANCE}" = "1" ]; then
+    e2e_run_openshell_conformance "Podman"
+  fi
+  if [ "${E2E_RUN_DRIVER_TESTS}" = "0" ]; then
     exit 0
   fi
 
@@ -80,7 +85,7 @@ if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
     cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml"
     --features "${E2E_FEATURES}"
   )
-  for test_target in "${SELECTED_TESTS[@]}"; do
+  for test_target in ${SELECTED_TESTS[@]+"${SELECTED_TESTS[@]}"}; do
     TEST_ARGS+=(--test "${test_target}")
   done
   TEST_ARGS+=(-- --nocapture)

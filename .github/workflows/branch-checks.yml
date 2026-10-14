@@ -522,6 +522,9 @@ jobs:
           bash tasks/scripts/test-gateway-pull-policy.sh
           bash tasks/scripts/test-gateway-config.sh
 
+      - name: Test E2E family selection and coverage
+        run: mise run test:e2e-lanes
+
       - name: Test release qualification summary
         run: mise run test:qualification-summary
   go:

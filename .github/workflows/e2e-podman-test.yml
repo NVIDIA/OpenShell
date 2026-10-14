@@ -6,6 +6,11 @@ name: Podman E2E Test
 on:
   workflow_call:
     inputs:
+      test-family:
+        description: Suite family (all, conformance, or drivers)
+        required: false
+        type: string
+        default: all
       image-tag:
         required: true
         type: string
@@ -40,6 +45,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.suite-matrix) }}
     env:
+      OPENSHELL_E2E_TEST_FAMILY: ${{ inputs.test-family }}
       IMAGE_TAG: ${{ inputs.image-tag }}
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell

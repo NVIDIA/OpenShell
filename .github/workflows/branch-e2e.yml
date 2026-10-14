@@ -240,268 +240,126 @@ jobs:
       deb-artifact-name: deb-linux-amd64
       rpm-artifact-name: rpm-linux-x86_64
 
-  # Run driver-independent conformance tests.
-  conformance-integration:
-    needs: prepare-integration
+  conformance:
+    needs: [pr_metadata, prepare-integration, build-gateway-plain, build-external-drivers, build-vm-driver]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-conformance.yml
     with:
-      category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      image-tag: ${{ github.sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
-          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
-        ]
 
-  # Run feature-specific integration tests:
-  feature-specific-integration:
-    needs: prepare-integration
+  features:
+    needs: [pr_metadata, prepare-integration]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-features.yml
     with:
-      category: feature-specific
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      image-tag: ${{ github.sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
-          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
-        ]
 
-  # Run driver-specific integration tests:
-  # These suites require the binary installer's CLI path, local HTTP gateway,
-  # and system service configuration for their Podman user-namespace fixtures.
-  driver-specific-integration:
-    needs: prepare-integration
+  drivers:
+    needs: [pr_metadata, prepare-integration, build-gateway-plain, build-external-drivers, build-vm-driver]
+    if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: ./.github/workflows/e2e-drivers.yml
     with:
-      category: driver-specific
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      image-tag: ${{ github.sha }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
-      test-matrix: >-
-        [
-          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"driver-podman"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
-          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
-        ]
 
-  docker-e2e:
+  gpu-conformance:
     needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-docker-test.yml
+    uses: ./.github/workflows/e2e-conformance.yml
     with:
+      profile: gpu
+      source-sha: ${{ github.sha }}
       image-tag: ${{ github.sha }}
-      runner: linux-arm64-cpu8
 
-  podman-e2e:
+  gpu-drivers:
     needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
+    uses: ./.github/workflows/e2e-drivers.yml
     with:
+      profile: gpu
+      source-sha: ${{ github.sha }}
       image-tag: ${{ github.sha }}
-      suite-matrix: >-
-        [{"suite":"ci","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:ci"}]
 
-  vm-e2e:
-    needs: [pr_metadata, build-binaries, build-vm-driver]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-vm-test.yml
-
-  docker-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-docker-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      runner: linux-arm64-cpu8
-      gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-docker
-      suite-matrix: >-
-        [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
-
-  podman-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-podman
-      suite-matrix: >-
-        [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
-
-  vm-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-vm-driver]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-vm-test.yml
-    with:
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      suite-name: external-driver
-      e2e-task: e2e:vm:external-driver
-
-  gpu-e2e:
+  kubernetes-ha-conformance:
     needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-gpu-test.yaml
+    uses: ./.github/workflows/e2e-conformance.yml
     with:
+      profile: kubernetes-ha
+      source-sha: ${{ github.sha }}
       image-tag: ${{ github.sha }}
 
-  kubernetes-e2e:
+  kubernetes-ha-drivers:
     needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - agent_sandbox_api: v1beta1
-            agent_sandbox_version: v1.0.3
-          - agent_sandbox_api: v1alpha1
-            agent_sandbox_version: v0.4.6
+    if: needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: ./.github/workflows/e2e-drivers.yml
     with:
+      profile: kubernetes-ha
+      source-sha: ${{ github.sha }}
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
-      agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
 
-  kubernetes-workspace-managed-e2e:
+  kubernetes-credentials-conformance:
     needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: ./.github/workflows/e2e-conformance.yml
     with:
+      profile: kubernetes-credentials
+      source-sha: ${{ github.sha }}
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (workspace managed mode)
-      e2e-task: e2e:kubernetes:workspace-managed
 
-  kubernetes-external-driver-e2e:
-    needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (external compute driver)
-      e2e-task: e2e:kubernetes:external-driver
-      gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
-      external-driver-binary: openshell-driver-kubernetes
-      cluster-images: sandbox supervisor
-
-  kubernetes-workspace-operator-e2e:
+  kubernetes-credentials-drivers:
     needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    if: needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: ./.github/workflows/e2e-drivers.yml
     with:
+      profile: kubernetes-credentials
+      source-sha: ${{ github.sha }}
       image-tag: ${{ github.sha }}
-      job-name: Kubernetes E2E (workspace operator mode)
-      e2e-task: e2e:kubernetes:workspace-operator
-
-  kubernetes-ha-e2e:
-    needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      job-name: Kubernetes HA E2E (Rust smoke)
-      extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
-      external-postgres-secret: openshell-ha-pg
-      test-name: kubernetes_ha_rebalancing
-      kubernetes-features: e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha
-      use-envoy-gateway: true
-
-  kubernetes-credential-drivers-e2e:
-    needs: [pr_metadata, build-binaries, build-images]
-    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
-    permissions:
-      actions: read
-      contents: read
-      packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-      job-name: Kubernetes Credential Drivers E2E
-      e2e-task: e2e:kubernetes:credential-drivers
 
   core-e2e-result:
     name: Core E2E result
-    needs:
-      - pr_metadata
-      - conformance-integration
-      - feature-specific-integration
-      - driver-specific-integration
-      - docker-e2e
-      - podman-e2e
-      - vm-e2e
-      - docker-external-driver-e2e
-      - podman-external-driver-e2e
-      - vm-external-driver-e2e
-      - kubernetes-e2e
-      - kubernetes-external-driver-e2e
-      - kubernetes-workspace-managed-e2e
-      - kubernetes-workspace-operator-e2e
+    needs: [pr_metadata, conformance, features, drivers]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -514,7 +372,7 @@ jobs:
 
   gpu-e2e-result:
     name: GPU E2E result
-    needs: [pr_metadata, gpu-e2e]
+    needs: [pr_metadata, gpu-conformance, gpu-drivers]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -527,7 +385,7 @@ jobs:
 
   kubernetes-ha-e2e-result:
     name: Kubernetes HA E2E result
-    needs: [pr_metadata, kubernetes-ha-e2e]
+    needs: [pr_metadata, kubernetes-ha-conformance, kubernetes-ha-drivers]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -540,7 +398,7 @@ jobs:
 
   kubernetes-credential-drivers-e2e-result:
     name: Kubernetes Credential Drivers E2E result
-    needs: [pr_metadata, kubernetes-credential-drivers-e2e]
+    needs: [pr_metadata, kubernetes-credentials-conformance, kubernetes-credentials-drivers]
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     runs-on: ubuntu-latest
     steps:

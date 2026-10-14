@@ -1,0 +1,62 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: E2E Drivers Tests
+
+on:
+  workflow_call:
+    outputs:
+      docker-result:
+        description: Docker runtime result for existing release summaries
+        value: ${{ jobs.runtime.outputs.docker-result }}
+      vm-result:
+        description: VM runtime result for existing release summaries
+        value: ${{ jobs.runtime.outputs.vm-result }}
+    inputs:
+      profile:
+        description: core, release, gpu, kubernetes-ha, or kubernetes-credentials
+        required: false
+        type: string
+        default: core
+      source-sha:
+        required: true
+        type: string
+      image-tag:
+        required: true
+        type: string
+      integration-inputs-artifact-id:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  driver-specific-integration:
+    if: inputs.profile == 'core'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: driver-specific
+      source-sha: ${{ inputs.source-sha }}
+      integration-inputs-artifact-id: ${{ inputs.integration-inputs-artifact-id }}
+      test-matrix: >-
+        [
+          {"environment":"fedora-podman-rootful","installer":"binaries","testsuite":"driver-podman"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"e2e-podman"},
+          {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
+        ]
+
+  runtime:
+    uses: ./.github/workflows/e2e-runtime-tests.yml
+    with:
+      test-family: drivers
+      profile: ${{ inputs.profile }}
+      source-sha: ${{ inputs.source-sha }}
+      image-tag: ${{ inputs.image-tag }}

@@ -44,6 +44,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
+# shellcheck source=e2e/support/test-family.sh
+source "${ROOT}/e2e/support/test-family.sh"
 
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
@@ -51,6 +53,7 @@ DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
+e2e_select_test_family "${E2E_FEATURES}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -382,7 +385,12 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-e2e_run_openshell_conformance "VM"
+if [ "${E2E_RUN_CONFORMANCE}" = "1" ]; then
+  e2e_run_openshell_conformance "VM"
+fi
+if [ "${E2E_RUN_DRIVER_TESTS}" = "0" ]; then
+  exit 0
+fi
 
 # Seed the catalog once for the whole lane. The profiles live in the gateway
 # for as long as it runs, and the import is create-only: a second import of

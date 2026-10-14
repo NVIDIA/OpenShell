@@ -25,8 +25,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_WITH_GATEWAY_COMMAND="__openshell_run_kubernetes_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
+# shellcheck source=e2e/support/test-family.sh
+source "${ROOT}/e2e/support/test-family.sh"
 
 E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES-e2e,e2e-host-gateway,e2e-kubernetes}"
+e2e_select_test_family "${E2E_FEATURES}"
 
 # Fixed output path of the `e2e-kubernetes` nextest profile (`.config/nextest.toml`).
 JUNIT_XML="${ROOT}/results/e2e-kubernetes.xml"
@@ -89,8 +92,10 @@ run_suite() {
 }
 
 run_e2e() {
-  run_conformance
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_RUN_CONFORMANCE}" = "1" ]; then
+    run_conformance
+  fi
+  if [ "${E2E_RUN_DRIVER_TESTS}" = "0" ]; then
     return 0
   fi
 

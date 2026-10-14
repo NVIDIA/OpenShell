@@ -152,6 +152,14 @@ Direct Nix builds and app dependency preparation also retry once; apps run
 once after preparation succeeds. Skipped dependent E2E suites indicate blocked
 coverage.
 
+For E2E, inspect the Conformance, Features, and Drivers family calls in
+`Branch E2E Checks`, `Release Dev`, or `Release Tag`. Runtime family selection
+is logged by `e2e-runtime-tests.yml`; its completion check fails when a selected
+job fails, is cancelled, or is skipped. External VM has separate conformance
+and runtime jobs. Existing `Core E2E result` and `GPU E2E result` names remain
+the PR gate adapters; optional Kubernetes and advisory WSL policy is unchanged.
+The manual `Integration Tests` workflow still accepts a custom tmachine matrix.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do

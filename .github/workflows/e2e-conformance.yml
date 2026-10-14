@@ -1,0 +1,57 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: E2E Conformance Tests
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: core, release, gpu, kubernetes-ha, or kubernetes-credentials
+        required: false
+        type: string
+        default: core
+      source-sha:
+        required: true
+        type: string
+      image-tag:
+        required: true
+        type: string
+      integration-inputs-artifact-id:
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+
+jobs:
+  conformance-integration:
+    if: inputs.profile == 'core' || inputs.profile == 'release'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: conformance
+      source-sha: ${{ inputs.source-sha }}
+      integration-inputs-artifact-id: ${{ inputs.integration-inputs-artifact-id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+        ]
+
+  runtime:
+    uses: ./.github/workflows/e2e-runtime-tests.yml
+    with:
+      test-family: conformance
+      profile: ${{ inputs.profile }}
+      source-sha: ${{ inputs.source-sha }}
+      image-tag: ${{ inputs.image-tag }}

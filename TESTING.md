@@ -125,6 +125,34 @@ OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18080 mise run e2e
 Raw endpoint mode is HTTP-only. Use a named gateway config when a gateway
 requires mTLS.
 
+CI groups e2e execution into conformance, features, and drivers. Conformance
+uses the shared package in `tests/suites/conformance/`; features retains the
+provider-refresh and OCI-image suites. Drivers collects the existing runtime
+and host-specific suites, including mixed legacy tests pending extraction.
+Bundled versus external compute drivers are target variants across families.
+
+The Docker, Podman, Kubernetes, and VM Rust harnesses accept
+`OPENSHELL_E2E_TEST_FAMILY=conformance` or `drivers` to execute each part
+independently. The default, `all`, retains combined local execution. For example:
+
+```shell
+OPENSHELL_E2E_TEST_FAMILY=conformance mise run e2e:docker
+OPENSHELL_E2E_TEST_FAMILY=drivers mise run e2e:docker
+OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER=1 OPENSHELL_E2E_TEST_FAMILY=drivers mise run e2e:docker
+```
+
+This selector controls the driver harnesses; it does not filter standalone
+Python, OIDC, OCI-image, or MCP entrypoints. Existing external-driver tasks for
+Docker, Podman, and Kubernetes retain their conformance-only feature selection.
+Use the normal driver task with the external-driver flag, as above, to run its
+runtime suite against an external driver. CI preserves its previous target
+coverage: external VM runs in both families, while the other external variants
+currently run only in conformance.
+
+`mise run test:e2e-lanes` checks suite dispatch, target matrices, and completion
+failure handling without provisioning runtimes. Live CI execution is still
+required to validate the prepared targets.
+
 `mise run test:gateway-config` validates generated gateway TOML without a live
 runtime. It covers the current schema and the Podman in-tree versus external
 driver configuration boundary.

@@ -150,6 +150,28 @@ retain the binary installer because their fixtures configure its system service,
 local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
 to the package installers and downloads the packages selected by its matrix.
 
+Branch and release workflows call the conformance, features, and drivers family
+workflows. Conformance and drivers select runtime jobs through
+`e2e-runtime-tests.yml`; the same recorded job list drives execution and the
+completion check. A selected job that fails, is cancelled, or is skipped fails
+its family. The existing core/GPU required result names and optional Kubernetes
+policy remain unchanged, including advisory WSL GPU execution.
+
+The `core` profile retains the branch target matrix. The `release` profile
+retains Docker and VM runtime coverage plus the existing conformance and feature
+integration matrices; it does not add the rest of the branch driver matrix to
+release qualification. GPU, Kubernetes HA, and credential-driver profiles retain
+their existing label selections. Bundled/external is a target dimension:
+external VM runs both conformance and runtime suites; the other external lanes
+currently run conformance only. The operator workspace lane retains its
+conformance exclusion. Mixed Python/OIDC/MCP and other legacy suites remain
+under Drivers until their assertions are extracted into the appropriate family.
+
+Each selected family provisions its own targets using the shared runtime setup.
+Splitting the previously combined runtime jobs therefore adds provisioning work;
+it also lets conformance and driver failures be reported independently. The
+manual `Integration Tests` entrypoint retains its custom tmachine matrix interface.
+
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
@@ -545,7 +567,9 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
-| `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
+| `.github/workflows/e2e-conformance.yml`, `e2e-features.yml`, `e2e-drivers.yml` | Test-family entrypoints shared by branch and release workflows. Retain the current integration matrices and runtime profiles. |
+| `.github/workflows/e2e-runtime-tests.yml` | Selects runtime jobs by family and execution profile and requires every selected job to succeed. |
+| `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml`, `e2e-gpu-test.yaml` | Reusable target preparation and execution adapters. Accept an explicit test family while keeping combined execution as their default. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
 | `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |

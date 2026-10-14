@@ -23,6 +23,7 @@ export FEATURE_INTEGRATION_RESULT=success
 export DOCKER_E2E_RESULT=success
 export VM_E2E_RESULT=success
 export PROTO_COMPATIBILITY_RESULT=success
+export DRIVER_FAMILY_RESULT=success
 
 current_profile_passed=$("${GENERATOR}" "${TEST_DIR}/qualification-summary.json")
 [[ "${current_profile_passed}" == "false" ]]
@@ -51,5 +52,19 @@ jq -e '
   (.suites | has("compatibility") | not)
   and (.profile.missing_suites | index("SDK/configuration compatibility and migration review") != null)
 ' "${TEST_DIR}/qualified-summary.json" >/dev/null
+
+# A family failure must block publication even if individual runtime outputs
+# are present and successful (for example, completion validation failed).
+for status in failure cancelled skipped; do
+  export DRIVER_FAMILY_RESULT="${status}"
+  current_profile_passed=$("${GENERATOR}" "${TEST_DIR}/driver-${status}.json")
+  [[ "${current_profile_passed}" == "false" ]]
+  jq -e --arg status "${status}" '
+    .suites.driver_family == $status
+    and .suites.docker_e2e == "success"
+    and .suites.vm_e2e == "success"
+    and .current_profile_passed == false
+  ' "${TEST_DIR}/driver-${status}.json" >/dev/null
+done
 
 echo "qualification summary tests passed"
