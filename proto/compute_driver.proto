@@ -210,7 +210,7 @@ message DriverSandboxSpec {
   bytes launch_authentication = 16 [(openshell.options.v1.secret) = true];
   // Operator-selected external isolation backend. Never derived from the
   // public sandbox spec or workload environment. Omitted for the built-in
-  // runtime. Requires openshell.compute.isolation-backend-registration.
+  // runtime. Requires openshell.compute.sandbox-backend.
   IsolationBackendRegistration isolation_backend = 17;
 }
 

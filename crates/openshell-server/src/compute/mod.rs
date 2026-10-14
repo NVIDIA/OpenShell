@@ -76,9 +76,9 @@ pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 fn supports_isolation_registration(capabilities: &[String]) -> bool {
-    capabilities.iter().any(|capability| {
-        capability == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND_REGISTRATION
-    })
+    capabilities
+        .iter()
+        .any(|capability| capability == openshell_core::extension_protocol::COMPUTE_SANDBOX_BACKEND)
 }
 
 use provisioning_operation::ProvisioningOperationError;
@@ -16209,8 +16209,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap()
             .supported_capabilities
             .retain(|capability| {
-                capability
-                    != openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND_REGISTRATION
+                capability != openshell_core::extension_protocol::COMPUTE_SANDBOX_BACKEND
             });
         let _ = driver.clone().with_capabilities(capabilities);
         driver.clear_calls();

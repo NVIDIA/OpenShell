@@ -213,10 +213,7 @@ impl FakeComputeDriver {
                 .as_mut()
                 .unwrap()
                 .supported_capabilities
-                .push(
-                    openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND_REGISTRATION
-                        .into(),
-                );
+                .push(openshell_core::extension_protocol::COMPUTE_SANDBOX_BACKEND.into());
         });
         self
     }
