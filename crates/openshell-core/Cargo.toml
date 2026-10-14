@@ -48,6 +48,9 @@ nix = { workspace = true }
 rustix = { workspace = true }
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+container-device-interface = { workspace = true }
+
 [features]
 default = ["telemetry"]
 ## Compile in anonymous telemetry emission support. On by default; disable with
