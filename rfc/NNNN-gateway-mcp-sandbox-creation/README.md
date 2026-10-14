@@ -128,7 +128,7 @@ flowchart LR
   subgraph GW["OpenShell gateway"]
     M["MCP endpoint /mcp"]:::new
     C["Create logic shared with gRPC"]:::changed
-    P["Prover: child inside the ceiling?"]:::changed
+    P["Prover: child inside the parent's policy?"]:::changed
     L[("Grants and lineage")]:::new
     X["Cascade stop"]:::new
   end
@@ -261,7 +261,7 @@ openshell sandbox create \
 
 The CLI parses `--grant` into a `SandboxGrantSpec` on `CreateSandboxRequest`.
 Only a user principal may set it; the gateway rejects the field from any other
-principal. The holder's policy at creation becomes the grant's ceiling.
+principal. The holder's policy is the ceiling for its children.
 
 ```proto
 message SandboxGrantSpec {
@@ -276,8 +276,8 @@ message SandboxGrantSpec {
   // Absolute path of the executable allowed to use the door,
   // for example /usr/local/bin/node for a Node-based harness.
   string program = 5;
-  // NARROW (default): agents write their children's network rules within the
-  // ceiling. INHERIT: every child receives its parent's ceiling unchanged.
+  // NARROW (default): agents write their children's network rules within their
+  // own policy. INHERIT: every child receives its parent's policy unchanged.
   ChildPolicyMode child_policy = 6;
 }
 
@@ -372,13 +372,18 @@ not change that model. It is used only for decisions about trees (cascade stop,
 
 ### Ceiling and policy proof
 
-**The ceiling caps a child, not the parent's current policy.** A parent's
-current policy can change from task to task through approved proposals. If a
-child had to fit inside the parent's current policy, child creation would fail
-or succeed depending on what the parent happened to have at that moment. The
-parent could obtain anything inside its ceiling anyway, so capping by the
-ceiling adds no risk and makes behavior predictable. A child's own ceiling is
-its parent's ceiling.
+**A child's ceiling is its parent's policy.** When a sandbox creates a child,
+the gateway proves the child's policy against the parent's current policy,
+without the door rule and provider layers. The lead's children are bounded by
+the lead's policy, its grandchildren by its children's policies, and so on, so
+each level can only narrow: `child ≤ parent ≤ global maximum`, the model in
+#2025. A single tree-wide ceiling, the lead's policy, would let a child that was
+given only GitHub read access create a grandchild with everything the lead has.
+
+Because the ceiling is the parent's policy at the moment of the create, a
+parent whose policy has grown through an approved proposal can pass that access
+on, and one whose policy has shrunk cannot. Children already running when a
+parent's policy shrinks keep their policy; revalidating them is #3808.
 
 **What the agent writes.** The agent supplies only the child's
 `network_policies`. The gateway builds the child's full policy from the
@@ -423,7 +428,7 @@ global_policy_mode = "maximum"
 
 In `maximum` mode each sandbox keeps its own policy, provider layers stay
 active, and the gateway proves that every policy fits inside the global one: a
-grant's ceiling when the holder is created, every child policy, and every later
+grant holder's policy when it is created, every child policy, and every later
 policy write. A policy that does not fit is refused with
 `EXCEEDS_GLOBAL_POLICY` and the prover's counterexample. Children are then
 proved against both their ceiling and the global policy.
@@ -435,7 +440,7 @@ rather than receiving a child with unexpected access.
 
 **Whether a parent may set its child's policy.** A grant states whether agents
 in the tree may write their children's network rules (`child_policy: narrow`,
-the default) or whether every child receives its parent's ceiling unchanged
+the default) or whether every child receives its parent's policy unchanged
 (`child_policy: inherit`). In `inherit` mode a `create_sandbox` request that
 includes a policy is refused. Either way a child never receives more than the
 ceiling and the global maximum allow.
@@ -776,8 +781,8 @@ The work is phased so that each phase is usable and testable on its own:
 - **Phase 3: Tool sandboxes.** `kind: tool`, `exec` with command audit, and the
   idle timeout.
 - **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
-  proof of every ceiling, child policy and policy write against the global
-  policy in `maximum` mode.
+  proof of every grant holder's policy, child policy and policy write against
+  the global policy in `maximum` mode.
 - **Phase 5: Lifecycle.** Cascade stop on every way a parent ends, the orphan
   reaper, and idle and maximum lifetime for agent children with the "a parent
   with running children is not idle" rule.
@@ -1014,7 +1019,7 @@ CreateSandbox { name: "lead", policy: lead.yaml, providers: [pi-nvidia],
                 grant: { max_depth: 1, max_breadth: 2, max_total: 3,
                          expires_after: 4h, program: "/usr/local/bin/node" } }
 → principal = User → may set a grant → pass
-→ ceiling = lead.yaml
+→ lead.yaml is the ceiling for the lead's children
 → max_depth > 0 → add door rule (openshell.local:80, /usr/local/bin/node)
 → persist SandboxGrant { total: 1 }, SandboxLineage { lead, depth: 0 }
 ```
@@ -1037,7 +1042,7 @@ create_sandbox { kind: agent, policy: {board rule}, providers: [pi-nvidia],
 → no global policy → pass
 → depth 0 < 1, breadth 0 < 2, total 1 < 3 → pass
 → providers ⊆ lead's providers → pass
-→ prover: check_within_boundary(ceiling, child) → Within
+→ prover: check_within_boundary(lead's policy, child) → Within
 → reserve counters (total 2, lead's children 1)
 → child depth 1 = max_depth → no door rule
 → create from lead's template, no GPU, acting for the root user
@@ -1060,7 +1065,7 @@ node (worker) → openshell.local/mcp
 → depth 1 = max_depth → LIMIT_REACHED(depth), ApiActivity emitted
 ```
 
-**6. The lead asks for more than its ceiling.**
+**6. The lead asks for more than it has.**
 
 ```text
 create_sandbox { policy: {POST api.github.com/repos/**} }
