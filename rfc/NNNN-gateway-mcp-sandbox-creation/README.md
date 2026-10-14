@@ -489,6 +489,14 @@ protocol version and tool-name syntax.
 
 ### The supervisor door
 
+**Why a door.** An agent could call the gateway directly, but it would need a
+token and a network rule to the gateway. A prompt-injected agent could take the
+token and use it from anywhere, and the gateway would not know which program
+called. The supervisor already holds the sandbox's token and sees each
+connection's program, and its local name `openshell.local` works wherever the
+gateway runs. The door reuses the `policy.local` mechanism, so it adds no new
+kind of component.
+
 The door is served by the supervisor at `openshell.local`, port 80, path `/mcp`.
 It reuses the mechanism that serves the `policy.local` API today
 (`crates/openshell-supervisor-network/src/policy_local.rs`):
@@ -872,11 +880,6 @@ create a Claude Code child in a different image.
 
 A per-tree CPU, memory and GPU budget in the grant (`max_cpu`, `max_gpu`) for
 trees that need GPUs.
-
-### Tool-list change notifications
-
-The gateway could notify connected clients when a caller's tool list changes,
-for example after its budget is used, so that cached lists stay accurate.
 
 ## Alternatives
 
