@@ -386,6 +386,10 @@ Release Dev publishes the `dev` docs version from `main`. Release Tag publishes 
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 
+## Stale Issues and Pull Requests
+
+Issues and pull requests receive `state:stale` after 14 days without activity. Only the `lifecycle:frozen` label exempts an issue from stale handling. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
+
 ## Pull Requests
 
 1. Create a branch from `main`, or from the parent PR branch for dependent work, following [Branch Names](#branch-names).
