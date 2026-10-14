@@ -1,37 +1,64 @@
 # Partial Wasmtime isolation backend
 
 This example explores WebAssembly as a different isolation mechanism for the
-OpenShell backend contract. It contains a Python protobuf service and a local
+OpenShell backend contract. It contains a Rust protobuf service and a local
 WASIp1 guest runner. It does **not** implement a complete supervisor backend.
 
-The service uses the repository's actual `SandboxBackend` and
-`SandboxBoundary` protobuf definitions. Generated Python bindings live
-in a temporary directory, using `proto/sandbox_backend.proto` and
-`proto/sandbox_protocol.proto`. Negotiation uses `SandboxBackend.Describe`; streams
-carry `BoundaryChunk` messages. No Rust crate, workspace dependency, or runtime
-selection code is changed.
+The service generates Rust bindings from the repository's public
+`SandboxBackend` and `SandboxBoundary` protobuf definitions at build time. It
+links no OpenShell implementation crates and lives in its own Cargo workspace.
+
+## Code layout
+
+```text
+build.rs           Generate bindings from the public protos
+src/main.rs        CLI: serve the backend or run a local guest
+src/protocol.rs    Generated bindings, backend name, experimental capability
+src/backend.rs     Provisioning, authentication, boundary binding, RPC handlers
+src/guest.rs       Wasmtime configuration, WASI capabilities, execution limits
+tests/protocol.rs  Subprocess gRPC contract checks
+tests/guest.rs     Real guest confinement, resource limits, and interruption
+guest.wat          Small WASIp1 filesystem probe
+```
 
 ## Run the experiment
 
-From the repository root:
+From the repository root, with Rust 1.94 or newer:
 
 ```shell
-uv run examples/isolation-backend-wasi/example.py smoke
+cargo test --locked --manifest-path examples/isolation-backend-wasi/Cargo.toml
 ```
 
-`uv` installs the script's pinned dependencies. The smoke command launches the
-backend in a separate Python process and calls it over loopback gRPC. It then runs
-real WebAssembly guests through the separate local runner. It checks:
+The protocol test starts the compiled backend in a separate process and calls it
+over loopback gRPC. Guest tests separately check read-only filesystem access,
+parent traversal and symlink rejection, fuel and memory limits, bounded output,
+unsupported socket imports, and engine interruption. The symlink check requires
+Unix. `Cargo.lock` pins dependencies; Wasmtime 46 supports the repository's Rust
+version. The first build compiles Wasmtime and Cranelift.
 
-- Experimental capability negotiation and rejection of the full supervisor contract.
-- Credential checks and binding to the provisioned sandbox, session, generation,
-  backend name, and SHA-256 digest of the compiled guest bytes.
-- Identical boundary handles on an exact retry; rejection of changed inputs.
-- Stream routing and explicit `UNIMPLEMENTED` for unsupported operations.
-- Reading an allowed file through a read-only `/work` preopen.
-- Denial of parent traversal, a symlink pointing at an existing outside file, and writes.
-- Fuel exhaustion, a 16 MiB guest memory limit, and rejection of an unprovided socket import.
-- Interrupting a running guest using its backend-owned Wasmtime engine.
+Run a local guest against a directory containing `allowed.txt`:
+
+```shell
+cargo run --locked --manifest-path examples/isolation-backend-wasi/Cargo.toml -- \
+  run examples/isolation-backend-wasi/guest.wat --workspace /path/to/workspace
+```
+
+The bundled filesystem probe also expects `/work/escape` to be a symlink to an
+existing file outside the workspace. It asserts that reading that link fails.
+
+Start the partial service with trusted launch coordinates and a credential file
+containing at least 32 non-whitespace characters:
+
+```shell
+cargo run --locked --manifest-path examples/isolation-backend-wasi/Cargo.toml -- \
+  serve examples/isolation-backend-wasi/guest.wat \
+  --sandbox-id sandbox-a --session-id session-a --generation-id generation-a \
+  --token-file /path/to/protected/credential
+```
+
+The service prints JSON containing its ephemeral loopback endpoint, backend name,
+and module descriptor. The credential stays in the protected file. Send it as
+`authorization: Bearer <credential>` on authenticated RPCs.
 
 The guest is handwritten WebAssembly text in `guest.wat`; no WASI compiler SDK is
 needed. File-denial checks trap if an operation unexpectedly succeeds.
@@ -39,7 +66,7 @@ needed. File-denial checks trap if an operation unexpectedly succeeds.
 The two execution paths are deliberately distinct:
 
 ```text
-smoke client -> external protobuf service -> reserve a module binding; no execution
+protocol test -> external protobuf service -> reserve a module binding; no execution
 local runner -> Wasmtime/WASIp1           -> execute a guest with limited capabilities
 ```
 
@@ -66,7 +93,7 @@ operation, not resource binding or confirmation.
 The existing base capability is a bundle of mandatory guarantees. A partial
 implementation cannot safely advertise that capability just because it implements
 the control RPCs. Consequently, a production supervisor's negotiation fails for
-this example. The smoke peer explicitly negotiates the experimental capability.
+this example. The test peer explicitly negotiates the experimental capability.
 
 This is a contract probe, not a route for bypassing supervisor confirmation.
 The local `run` command is unreachable through the service and does not install
@@ -118,4 +145,4 @@ The following milestone would add a mediated guest socket host function with
 authoritative module identity. Neither is implemented here.
 
 Sources: [Wasmtime security model](https://docs.wasmtime.dev/security.html) and
-[Wasmtime Python API](https://bytecodealliance.github.io/wasmtime-py/).
+[Wasmtime Rust WASIp1 API](https://docs.rs/wasmtime-wasi/46.0.3/wasmtime_wasi/p1/index.html).
