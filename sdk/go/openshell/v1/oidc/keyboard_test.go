@@ -170,3 +170,75 @@ func (r *countingBlockingReader) Read(_ []byte) (int, error) {
 	r.active.Add(-1)
 	return 0, io.EOF
 }
+
+// TestKeyboardFlow_TimeoutDoesNotConsumeNextCode verifies that when a
+// keyboardFlow call times out waiting for input, the background reader
+// does not swallow the authorization code entered for the subsequent
+// login attempt (#4519).
+func TestKeyboardFlow_TimeoutDoesNotConsumeNextCode(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pw.Close()
+		_ = pr.Close()
+	})
+
+	// First attempt times out before the user enters a code.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel1()
+	_, err := keyboardFlow(ctx1, "https://example.com/auth?attempt=1", pr, &bytes.Buffer{})
+	require.ErrorIs(t, err, ErrTimeout)
+
+	// User now enters a single code for the second attempt.
+	go func() {
+		_, _ = io.WriteString(pw, "second-attempt-code\n")
+	}()
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	code, err := keyboardFlow(ctx2, "https://example.com/auth?attempt=2", pr, &bytes.Buffer{})
+	require.NoError(t, err)
+	assert.Equal(t, "second-attempt-code", code)
+}
+
+// TestLogin_KeyboardFlow_RetryAfterTimeoutUsesNextCode verifies end-to-end
+// that a timed-out keyboard Login does not consume the authorization code
+// entered during the next Login call (#4519).
+func TestLogin_KeyboardFlow_RetryAfterTimeoutUsesNextCode(t *testing.T) {
+	resetDiscoveryCache()
+	provider := setupMockProvider(t)
+
+	pr, pw := io.Pipe()
+	t.Cleanup(func() {
+		_ = pw.Close()
+		_ = pr.Close()
+	})
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel1()
+	_, err := Login(ctx1, "",
+		WithIssuer(provider.URL),
+		WithClientID("test-client"),
+		WithKeyboardFlow(),
+		WithInMemory(),
+		withInput(pr),
+	)
+	require.ErrorIs(t, err, ErrTimeout)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel2()
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_, _ = io.WriteString(pw, "retry-auth-code\n")
+	}()
+
+	tok, err := Login(ctx2, "",
+		WithIssuer(provider.URL),
+		WithClientID("test-client"),
+		WithKeyboardFlow(),
+		WithInMemory(),
+		withInput(pr),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, "login-access-token", tok.AccessToken)
+}
+

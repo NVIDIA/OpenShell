@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 )
 
@@ -47,8 +48,9 @@ func keyboardFlow(ctx context.Context, authURL string, input io.Reader, output i
 }
 
 type inputRequest struct {
-	input  io.Reader
-	result chan readResult
+	input   io.Reader
+	result  chan readResult
+	abandon chan struct{}
 }
 
 type inputDispatcher struct {
@@ -67,7 +69,13 @@ func (d *inputDispatcher) read(ctx context.Context, input io.Reader) (readResult
 	if err := ctx.Err(); err != nil {
 		return readResult{}, fmt.Errorf("%w: %v", ErrTimeout, err)
 	}
-	request := inputRequest{input: input, result: make(chan readResult, 1)}
+	request := inputRequest{
+		input:   input,
+		result:  make(chan readResult),
+		abandon: make(chan struct{}),
+	}
+	defer close(request.abandon)
+
 	select {
 	case d.requests <- request:
 	case <-ctx.Done():
@@ -82,16 +90,67 @@ func (d *inputDispatcher) read(ctx context.Context, input io.Reader) (readResult
 }
 
 func (d *inputDispatcher) run() {
+	var (
+		scanner       *bufio.Scanner
+		scannerInput  io.Reader
+		pendingResult *readResult
+		pendingInput  io.Reader
+	)
 	for request := range d.requests {
-		scanner := bufio.NewScanner(request.input)
-		if scanner.Scan() {
-			request.result <- readResult{code: strings.TrimSpace(scanner.Text())}
+		if pendingResult != nil && sameReader(pendingInput, request.input) {
+			res := *pendingResult
+			pendingResult = nil
+			pendingInput = nil
+			select {
+			case request.result <- res:
+			case <-request.abandon:
+				pendingResult = &res
+				pendingInput = request.input
+			}
 			continue
 		}
-		if err := scanner.Err(); err != nil {
-			request.result <- readResult{err: fmt.Errorf("%w: failed to read authorization code: %v", ErrAuthCode, err)}
+		pendingResult = nil
+		pendingInput = nil
+
+		if scanner == nil || !sameReader(scannerInput, request.input) {
+			scanner = bufio.NewScanner(request.input)
+			scannerInput = request.input
+		}
+
+		var res readResult
+		scanned := scanner.Scan()
+		if scanned {
+			res = readResult{code: strings.TrimSpace(scanner.Text())}
 		} else {
-			request.result <- readResult{err: fmt.Errorf("%w: no authorization code received (EOF)", ErrAuthCode)}
+			if err := scanner.Err(); err != nil {
+				res = readResult{err: fmt.Errorf("%w: failed to read authorization code: %v", ErrAuthCode, err)}
+			} else {
+				res = readResult{err: fmt.Errorf("%w: no authorization code received (EOF)", ErrAuthCode)}
+			}
+			scanner = nil
+			scannerInput = nil
+		}
+
+		select {
+		case request.result <- res:
+		case <-request.abandon:
+			if scanned {
+				pendingResult = &res
+				pendingInput = request.input
+			}
 		}
 	}
 }
+
+func sameReader(a, b io.Reader) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ta := reflect.TypeOf(a)
+	tb := reflect.TypeOf(b)
+	if ta != tb || !ta.Comparable() {
+		return false
+	}
+	return a == b
+}
+
