@@ -78,7 +78,17 @@ pub fn socket_inode_if_socket(tid: u32, fd: RawFd) -> io::Result<Option<u64>> {
             "TID must be nonzero and FD must be nonnegative",
         ));
     }
-    let target = fs::read_link(format!("/proc/{tid}/fd/{fd}"))?;
+    let target = match fs::read_link(format!("/proc/{tid}/fd/{fd}")) {
+        Ok(target) => target,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            // A missing descriptor should keep the syscall's EBADF result.
+            // Check the parent so a vanished task or inaccessible procfs does
+            // not get mistaken for a closed descriptor.
+            fs::metadata(format!("/proc/{tid}/fd"))?;
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Err(error) => return Err(error),
+    };
     let target = target.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -147,6 +157,12 @@ mod tests {
         assert_eq!(
             socket_inode_if_socket(std::process::id(), i32::MAX)
                 .expect_err("closed descriptor cannot be inspected")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            socket_inode_if_socket(u32::MAX, 3)
+                .expect_err("missing task must remain an inspection error")
                 .raw_os_error(),
             Some(libc::ENOENT)
         );

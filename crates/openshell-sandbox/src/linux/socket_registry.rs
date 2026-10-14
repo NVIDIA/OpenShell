@@ -499,7 +499,14 @@ mod tests {
                 .resolve_for_native_fallback(std::process::id(), i32::MAX)
                 .expect_err("vanished descriptor must fail closed")
                 .raw_os_error(),
-            Some(libc::ENOENT)
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            registry
+                .resolve_mut_for_native_fallback(std::process::id(), i32::MAX)
+                .expect_err("vanished descriptor must fail closed")
+                .raw_os_error(),
+            Some(libc::EBADF)
         );
     }
 

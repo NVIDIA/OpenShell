@@ -2172,6 +2172,26 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
+    fn closed_workload_socket_reports_bad_descriptor() {
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let error = launcher
+            .execute(|| {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                let fd = socket.as_raw_fd();
+                drop(socket);
+                // SAFETY: listen on a closed descriptor is a valid error probe.
+                assert_eq!(unsafe { libc::listen(fd, 1) }, -1);
+                io::Error::last_os_error().raw_os_error()
+            })
+            .unwrap();
+        assert_eq!(error, Some(libc::EBADF));
+    }
+
+    #[test]
     fn relay_rejects_descriptor_replaced_after_policy_decision() {
         let metadata = SocketMetadata {
             family: InetFamily::V4,
