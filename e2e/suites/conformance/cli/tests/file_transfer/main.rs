@@ -3,6 +3,7 @@
 
 //! File transfer conformance stories.
 
+mod create_upload;
 mod git_filtering;
 mod helpers;
 mod path_safety;
