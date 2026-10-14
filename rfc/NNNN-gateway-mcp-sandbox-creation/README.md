@@ -267,7 +267,8 @@ principal. The holder's policy is the ceiling for its children.
 
 ```proto
 message SandboxGrantSpec {
-  // Levels below the holder. 1 means the holder's children cannot create.
+  // Levels of agents below the holder. 1 means the holder's agent children
+  // cannot create agents. Tool sandboxes do not count against depth.
   uint32 max_depth = 1;
   // Children per parent.
   uint32 max_breadth = 2;
@@ -291,7 +292,10 @@ message CreateSandboxRequest {
 
 **One grant per tree.** Children and grandchildren draw from the same grant.
 When a child creates its own child, the gateway charges the shared counters and
-checks the child's depth against the same `max_depth`. A child's slice is never
+checks an agent child's depth against the same `max_depth`. Tool sandboxes
+ignore the depth limit, so an agent at the bottom of the tree can still run
+commands in tool sandboxes of its own; they count toward breadth and total like
+any child. A child's slice is never
 more than its parent has left, so the user confirms the tree's limits once and
 sees no further prompts however deep the tree goes. The alternative, a new grant
 per level, would put a prompt in front of the user every time a worker
@@ -618,10 +622,12 @@ supervisor's main session token limits what a leaked token can do.
 
 A sandbox with no depth left, or no grant, reaches the door and sees the same
 tools as any other sandbox. The gateway refuses its `create_sandbox` with
-`LIMIT_REACHED(depth)` or `NOT_ALLOWED` and audits the refusal. Tools are always
+`LIMIT_REACHED(depth)` or `NOT_ALLOWED` and audits the refusal; a sandbox with
+no depth left can still create tool sandboxes within breadth and total. Tools are always
 listed because a grant can be widened at any time and many MCP clients load the
 tool list only once; `get_limits` reports what the caller may do right now
-(`can_create_children`, depth, breadth and total). A model that calls a tool it
+(`can_create_children` for agents, `can_create_tools`, depth, breadth and
+total). A model that calls a tool it
 cannot use gets a clear error in one turn.
 
 ### MCP tools
@@ -745,7 +751,7 @@ while lineage records which sandbox asked.
 | List grants | own workspace | no | no | no |
 | Update or revoke a grant | own grants; Workspace Admin for the workspace | no | no | no |
 | Use the door | not applicable | grant's program only | grant's program only | grant's program only |
-| `create_sandbox` | top-level sandboxes, as with the CLI | within limits | refused | refused |
+| `create_sandbox` | top-level sandboxes, as with the CLI | within limits | tool sandboxes only, within breadth and total | refused |
 | `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | own descendants |
 
 ### Gateway configuration
