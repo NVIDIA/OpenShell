@@ -1062,6 +1062,7 @@ impl ComputeRuntime {
         self.validate_sandbox_create_with_runtime_inputs(
             sandbox,
             &SandboxCreateRuntimeInputs::default(),
+            false,
         )
         .await
     }
@@ -1070,6 +1071,7 @@ impl ComputeRuntime {
         &self,
         sandbox: &Sandbox,
         runtime_inputs: &SandboxCreateRuntimeInputs,
+        await_main_process_attachment: bool,
     ) -> Result<(), Status> {
         self.validate_caller_driver_config(
             sandbox
@@ -1079,6 +1081,9 @@ impl ComputeRuntime {
         )?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(spec) = driver_sandbox.spec.as_mut() {
+            spec.await_main_process_attachment = await_main_process_attachment;
+        }
         if let Some(effective_policy) = runtime_inputs.effective_policy.as_ref()
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -7968,6 +7973,7 @@ mod tests {
         omit_protocol_metadata: bool,
         requires_launch_authentication: bool,
         validate_create_calls: AtomicUsize,
+        validated_sandboxes: TestMutex<Vec<DriverSandbox>>,
         create_calls: AtomicUsize,
         created_sandboxes: TestMutex<Vec<DriverSandbox>>,
     }
@@ -8025,9 +8031,13 @@ mod tests {
 
         async fn validate_sandbox_create(
             &self,
-            _request: Request<ValidateSandboxCreateRequest>,
+            request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
             self.validate_create_calls.fetch_add(1, Ordering::Relaxed);
+            self.validated_sandboxes
+                .lock()
+                .expect("validated sandbox observation lock poisoned")
+                .push(request.into_inner().sandbox.expect("validation sandbox"));
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
         }
 
@@ -8777,6 +8787,49 @@ mod tests {
             Some(1),
             "the public sandbox must retain its base policy"
         );
+    }
+
+    #[tokio::test]
+    async fn preflight_and_create_receive_the_same_main_attachment_intent() {
+        for attachment_expected in [false, true] {
+            let driver = Arc::new(TestDriver::default());
+            let runtime = test_runtime(driver.clone()).await;
+            let mut sandbox =
+                sandbox_record("sb-attachment", "attachment", SandboxPhase::Provisioning);
+            sandbox.spec = Some(SandboxSpec {
+                command: vec!["echo".into(), "ok".into()],
+                ..Default::default()
+            });
+            let inputs = SandboxCreateRuntimeInputs::default();
+            runtime
+                .validate_sandbox_create_with_runtime_inputs(&sandbox, &inputs, attachment_expected)
+                .await
+                .expect("preflight");
+            runtime
+                .create_sandbox_with_runtime_inputs(sandbox, None, attachment_expected, inputs)
+                .await
+                .expect("create");
+            let validated = driver.validated_sandboxes.lock().unwrap();
+            let created = driver.created_sandboxes.lock().unwrap();
+            assert_eq!(validated.len(), 1);
+            assert_eq!(created.len(), 1);
+            assert_eq!(
+                validated[0]
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .await_main_process_attachment,
+                attachment_expected
+            );
+            assert_eq!(
+                created[0]
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .await_main_process_attachment,
+                attachment_expected
+            );
+        }
     }
 
     async fn test_runtime_with_gateway_managed_lifecycle(

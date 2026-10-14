@@ -692,7 +692,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .observed
         .require_networking
         .store(true, Ordering::SeqCst);
-    let startup = || {
+    let startup = |await_main_process_attachment| {
         Box::pin(crate::run_sandbox_with_backend(
             &setup,
             crate::SandboxRunConfig {
@@ -700,7 +700,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 workdir: Some("/test-workspace".into()),
                 timeout_secs: 15,
                 interactive: false,
-                await_main_process_attachment: false,
+                await_main_process_attachment,
                 sandbox_id: Some(setup.sandbox_id.clone()),
                 sandbox: None,
                 openshell_endpoint: None,
@@ -720,11 +720,18 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         ))
     };
 
+    let error = startup(true)
+        .await
+        .expect_err("foreground attachment requires an adapter");
+    assert!(error.to_string().contains("foreground attachment"));
+    assert!(setup.observed.events().is_empty());
+    assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+
     setup
         .observed
         .discovery_unavailable
         .store(true, Ordering::SeqCst);
-    let error = tokio::time::timeout(Duration::from_secs(5), startup())
+    let error = tokio::time::timeout(Duration::from_secs(5), startup(false))
         .await
         .expect("discovery failure must end startup")
         .expect_err("discovery failure must reject startup");
@@ -746,7 +753,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         .observed
         .deny_confirmation
         .store(true, Ordering::SeqCst);
-    assert!(startup().await.is_err());
+    assert!(startup(false).await.is_err());
     assert_eq!(
         setup.observed.events(),
         [
@@ -793,7 +800,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
             .unwrap();
     };
-    let (result, ()) = tokio::join!(startup(), observe_and_shutdown);
+    let (result, ()) = tokio::join!(startup(false), observe_and_shutdown);
     assert_eq!(result.unwrap(), 0);
     assert_eq!(
         setup.observed.events(),

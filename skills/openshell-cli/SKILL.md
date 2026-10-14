@@ -317,6 +317,8 @@ Key flags:
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
 
+If the driver rejects foreground attachment during create validation, use `--detach`.
+
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
 expected main-process SSH attachment; cleanup finalizes after that connection

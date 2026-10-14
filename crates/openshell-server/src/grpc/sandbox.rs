@@ -680,7 +680,11 @@ async fn handle_create_sandbox_inner(
         .validate_launch_signer_configured(state.sandbox_session_jwt_authority.is_some())?;
     state
         .compute
-        .validate_sandbox_create_with_runtime_inputs(&sandbox, &runtime_inputs)
+        .validate_sandbox_create_with_runtime_inputs(
+            &sandbox,
+            &runtime_inputs,
+            await_main_process_attachment,
+        )
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");

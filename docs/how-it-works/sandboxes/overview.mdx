@@ -33,6 +33,9 @@ attaching:
 openshell sandbox create --name worker --detach -- ./worker
 ```
 
+Drivers that do not support foreground attachment reject the request before
+provisioning. Use `--detach` with those drivers.
+
 Use `--restart-policy on-failure` to replace the runtime after a nonzero main
 process exit, or `--restart-policy always` to replace it after every exit:
 

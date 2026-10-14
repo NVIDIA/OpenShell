@@ -767,6 +767,13 @@ async fn run_sandbox_with_backend(
         admitted_isolation_backend,
         main_exit_marker,
     } = config;
+    // The current client attachment adapter is SSH; retaining a process's I/O
+    // internally does not make it reachable by a foreground client.
+    if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
+        return Err(miette::miette!(
+            "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
+        ));
+    }
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
