@@ -124,7 +124,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let mut supported_capabilities = vec![contract.clone()];
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
-        supported_capabilities.push(COMPUTE_ISOLATION_BACKEND_REGISTRATION.to_string());
+        supported_capabilities.push(COMPUTE_SANDBOX_BACKEND.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {

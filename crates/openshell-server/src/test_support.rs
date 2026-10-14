@@ -112,7 +112,7 @@ pub enum FakeComputeDriverCall {
     StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
-        isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
+        isolation_backend: Option<openshell_core::proto::compute::v1::SandboxBackendRegistration>,
         launch_authentication: Vec<u8>,
     },
     DeleteSandbox {
@@ -205,7 +205,7 @@ impl FakeComputeDriver {
     }
 
     #[must_use]
-    pub fn with_isolation_backend_registration(self) -> Self {
+    pub fn with_sandbox_backend_registration(self) -> Self {
         self.with_state(|state| {
             state
                 .capabilities
@@ -213,10 +213,7 @@ impl FakeComputeDriver {
                 .as_mut()
                 .unwrap()
                 .supported_capabilities
-                .push(
-                    openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND_REGISTRATION
-                        .into(),
-                );
+                .push(openshell_core::extension_protocol::COMPUTE_SANDBOX_BACKEND.into());
         });
         self
     }

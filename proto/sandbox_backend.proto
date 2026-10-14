@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package openshell.isolation.backend.v1;
+package openshell.sandbox.backend.v1;
 
 import "extension.proto";
 import "options.proto";
@@ -17,10 +17,10 @@ import "options.proto";
 // boundary routing. Optional state retention support advertises
 // openshell.sandbox.suspend-resume. Add optional capabilities
 // with compatible minor versions; incompatible semantics require a major bump.
-service IsolationBackend {
+service SandboxBackend {
   // Negotiate the isolation contract before opening a boundary. This call
   // conveys no sandbox credentials or driver descriptor.
-  rpc GetCapabilities(GetIsolationCapabilitiesRequest) returns (GetIsolationCapabilitiesResponse);
+  rpc Describe(DescribeSandboxBackendRequest) returns (DescribeSandboxBackendResponse);
 
   // Bind a driver-provisioned resource to one fresh sandbox launch. The
   // caller credential must match sandbox_id and generation_id. This call must
@@ -49,11 +49,11 @@ service IsolationBackend {
   rpc ResumeBoundary(ResumeBoundaryRequest) returns (OpenBoundaryResponse);
 }
 
-message GetIsolationCapabilitiesRequest {
+message DescribeSandboxBackendRequest {
   openshell.extension.v1.PeerMetadata supervisor = 1;
 }
 
-message GetIsolationCapabilitiesResponse {
+message DescribeSandboxBackendResponse {
   openshell.extension.v1.PeerMetadata backend = 1;
 }
 

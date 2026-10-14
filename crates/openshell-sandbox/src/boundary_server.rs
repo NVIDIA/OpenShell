@@ -38,25 +38,23 @@ mod linux {
         BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
         BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
     };
-    use openshell_sandbox_backend::isolation_proto::{
-        GetIsolationCapabilitiesRequest, GetIsolationCapabilitiesResponse, OpenBoundaryRequest,
+    use openshell_sandbox_backend::backend_proto::{
+        DescribeSandboxBackendRequest, DescribeSandboxBackendResponse, OpenBoundaryRequest,
         OpenBoundaryResponse, ResumeBoundaryRequest, SuspendBoundaryRequest,
         SuspendBoundaryResponse,
-        isolation_backend_server::{IsolationBackend, IsolationBackendServer},
         open_boundary_response::LaunchOutcome,
+        sandbox_backend_server::{SandboxBackend, SandboxBackendServer},
     };
     use openshell_sandbox_backend::isolation_protocol::{chunk_data, data_chunk};
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
     #[cfg(test)]
-    use openshell_sandbox_backend::proto::delegated_isolation_boundary_client::DelegatedIsolationBoundaryClient;
+    use openshell_sandbox_backend::proto::sandbox_boundary_client::SandboxBoundaryClient;
     use openshell_sandbox_backend::proto::{
-        DelegatedBoundaryChunk,
-        delegated_boundary_chunk::Payload,
-        delegated_isolation_boundary_server::{
-            DelegatedIsolationBoundary, DelegatedIsolationBoundaryServer,
-        },
+        BoundaryChunk,
+        boundary_chunk::Payload,
+        sandbox_boundary_server::{SandboxBoundary, SandboxBoundaryServer},
     };
     use openshell_sandbox_backend::sandbox_auth::{
         SandboxAuthError, SandboxConnectionId, SandboxConnectionRegistry,
@@ -615,12 +613,12 @@ mod linux {
             .initial_stream_window_size(BOUNDARY_STREAM_WINDOW_BYTES)
             .initial_connection_window_size(BOUNDARY_CONNECTION_WINDOW_BYTES)
             .add_service(
-                IsolationBackendServer::new(service.clone())
+                SandboxBackendServer::new(service.clone())
                     .max_decoding_message_size(64 * 1024)
                     .max_encoding_message_size(64 * 1024),
             )
             .add_service(
-                DelegatedIsolationBoundaryServer::new(service)
+                SandboxBoundaryServer::new(service)
                     .max_decoding_message_size(64 * 1024)
                     .max_encoding_message_size(64 * 1024),
             )
@@ -776,11 +774,11 @@ mod linux {
     }
 
     #[tonic::async_trait]
-    impl IsolationBackend for GrpcBoundaryService {
-        async fn get_capabilities(
+    impl SandboxBackend for GrpcBoundaryService {
+        async fn describe(
             &self,
-            request: tonic::Request<GetIsolationCapabilitiesRequest>,
-        ) -> Result<tonic::Response<GetIsolationCapabilitiesResponse>, tonic::Status> {
+            request: tonic::Request<DescribeSandboxBackendRequest>,
+        ) -> Result<tonic::Response<DescribeSandboxBackendResponse>, tonic::Status> {
             let backend =
                 openshell_sandbox_backend::isolation_protocol::metadata("openshell/sandbox");
             openshell_sandbox_backend::isolation_protocol::negotiate(
@@ -788,7 +786,7 @@ mod linux {
                 request.into_inner().supervisor,
             )?;
             self.negotiated.store(true, Ordering::Release);
-            Ok(tonic::Response::new(GetIsolationCapabilitiesResponse {
+            Ok(tonic::Response::new(DescribeSandboxBackendResponse {
                 backend: Some(backend),
             }))
         }
@@ -845,14 +843,9 @@ mod linux {
     impl GrpcBoundaryService {
         async fn bind_stream(
             &self,
-            request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
-        ) -> Result<
-            (
-                tonic::Streaming<DelegatedBoundaryChunk>,
-                SandboxProtocolPrincipal,
-            ),
-            tonic::Status,
-        > {
+            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        ) -> Result<(tonic::Streaming<BoundaryChunk>, SandboxProtocolPrincipal), tonic::Status>
+        {
             let principal = self
                 .runtime
                 .authenticate_request(self.connection_id, request.metadata())?;
@@ -886,16 +879,16 @@ mod linux {
         }
     }
 
-    type GrpcResponseStream = ReceiverStream<Result<DelegatedBoundaryChunk, tonic::Status>>;
+    type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
 
     #[tonic::async_trait]
-    impl DelegatedIsolationBoundary for GrpcBoundaryService {
+    impl SandboxBoundary for GrpcBoundaryService {
         type ExchangeStream = GrpcResponseStream;
         type MediateStream = GrpcResponseStream;
 
         async fn exchange(
             &self,
-            request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
             let (inbound, principal) = self.bind_stream(request).await?;
             let (stream, response) =
@@ -915,7 +908,7 @@ mod linux {
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
             let (inbound, principal) = self.bind_stream(request).await?;
             let (stream, response) =
@@ -931,13 +924,13 @@ mod linux {
     }
 
     fn bridge_grpc_server_stream(
-        mut inbound: tonic::Streaming<DelegatedBoundaryChunk>,
+        mut inbound: tonic::Streaming<BoundaryChunk>,
         connection_closed: tokio::sync::watch::Receiver<()>,
     ) -> (tokio::io::DuplexStream, GrpcResponseStream) {
         let (application, bridge) = tokio::io::duplex(256 * 1024);
         let (mut reader, mut writer) = tokio::io::split(bridge);
         let (outbound, outbound_rx) =
-            tokio::sync::mpsc::channel::<Result<DelegatedBoundaryChunk, tonic::Status>>(64);
+            tokio::sync::mpsc::channel::<Result<BoundaryChunk, tonic::Status>>(64);
         // Do not retain the response sender while the client request direction
         // stays open: finite exchanges must still observe the server's EOF.
         let invalid_frames = outbound.downgrade();
@@ -4103,9 +4096,9 @@ mod linux {
             request: OpenBoundaryRequest,
             token: &str,
         ) -> String {
-            let mut control = openshell_sandbox_backend::isolation_proto::isolation_backend_client::IsolationBackendClient::new(channel);
+            let mut control = openshell_sandbox_backend::backend_proto::sandbox_backend_client::SandboxBackendClient::new(channel);
             control
-                .get_capabilities(GetIsolationCapabilitiesRequest {
+                .describe(DescribeSandboxBackendRequest {
                     supervisor: Some(openshell_sandbox_backend::isolation_protocol::metadata(
                         "test/supervisor",
                     )),
@@ -4666,7 +4659,7 @@ mod linux {
                 .send(data_chunk(encode_frame(&request).unwrap()))
                 .await
                 .unwrap();
-            let mut response = DelegatedIsolationBoundaryClient::new(channel)
+            let mut response = SandboxBoundaryClient::new(channel)
                 .mediate(bearer_request(ReceiverStream::new(receiver), &token))
                 .await
                 .unwrap()
@@ -5281,8 +5274,8 @@ mod linux {
                 .connect()
                 .await
                 .unwrap();
-            let mut control = openshell_sandbox_backend::isolation_proto::isolation_backend_client::IsolationBackendClient::new(channel.clone());
-            let mut streams = DelegatedIsolationBoundaryClient::new(channel.clone());
+            let mut control = openshell_sandbox_backend::backend_proto::sandbox_backend_client::SandboxBackendClient::new(channel.clone());
+            let mut streams = SandboxBoundaryClient::new(channel.clone());
             let before_open = streams
                 .exchange(bearer_request(
                     tokio_stream::iter([data_chunk(Vec::new())]),
@@ -5303,7 +5296,7 @@ mod linux {
             );
             assert_eq!(
                 control
-                    .get_capabilities(GetIsolationCapabilitiesRequest { supervisor: None })
+                    .describe(DescribeSandboxBackendRequest { supervisor: None })
                     .await
                     .unwrap_err()
                     .code(),
@@ -5314,7 +5307,7 @@ mod linux {
             incompatible.protocol_version.as_mut().unwrap().major += 1;
             assert_eq!(
                 control
-                    .get_capabilities(GetIsolationCapabilitiesRequest {
+                    .describe(DescribeSandboxBackendRequest {
                         supervisor: Some(incompatible)
                     })
                     .await
@@ -5323,7 +5316,7 @@ mod linux {
                 tonic::Code::FailedPrecondition
             );
             control
-                .get_capabilities(GetIsolationCapabilitiesRequest {
+                .describe(DescribeSandboxBackendRequest {
                     supervisor: Some(openshell_sandbox_backend::isolation_protocol::metadata(
                         "test/supervisor",
                     )),
@@ -5385,8 +5378,7 @@ mod linux {
                 .await
                 .unwrap();
             let binding = openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle);
-            let mut replacement_streams =
-                DelegatedIsolationBoundaryClient::new(replacement.clone());
+            let mut replacement_streams = SandboxBoundaryClient::new(replacement.clone());
             assert_eq!(
                 replacement_streams
                     .exchange(bearer_request(
@@ -5431,7 +5423,7 @@ mod linux {
             for frames in [
                 vec![],
                 vec![data_chunk(Vec::new())],
-                vec![DelegatedBoundaryChunk { payload: None }],
+                vec![BoundaryChunk { payload: None }],
                 vec![openshell_sandbox_backend::isolation_protocol::boundary_chunk("")],
                 vec![
                     openshell_sandbox_backend::isolation_protocol::boundary_chunk("other-boundary"),
@@ -5553,7 +5545,7 @@ mod linux {
                 openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle),
                 data_chunk(encode_frame(&request).expect("encode logical request")),
             ]);
-            let mut body = DelegatedIsolationBoundaryClient::new(channel)
+            let mut body = SandboxBoundaryClient::new(channel)
                 .exchange(bearer_request(request_stream, &token))
                 .await
                 .expect("exchange logical request")

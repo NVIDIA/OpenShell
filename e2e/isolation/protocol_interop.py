@@ -88,7 +88,7 @@ async def main(binary):
                         for name in [
                             "options.proto",
                             "extension.proto",
-                            "isolation_backend.proto",
+                            "sandbox_backend.proto",
                             "sandbox_protocol.proto",
                         ]
                     ],
@@ -98,8 +98,8 @@ async def main(binary):
         )
         sys.path.insert(0, str(directory))
         import extension_pb2 as extension
-        import isolation_backend_pb2 as control
-        import isolation_backend_pb2_grpc as control_rpc
+        import sandbox_backend_pb2 as control
+        import sandbox_backend_pb2_grpc as control_rpc
         import sandbox_protocol_pb2 as stream
         import sandbox_protocol_pb2_grpc as stream_rpc
 
@@ -180,8 +180,8 @@ async def main(binary):
         handle = "external-route"
 
         class Backend(
-            control_rpc.IsolationBackendServicer,
-            stream_rpc.DelegatedIsolationBoundaryServicer,
+            control_rpc.SandboxBackendServicer,
+            stream_rpc.SandboxBoundaryServicer,
         ):
             async def authenticated(self, context):
                 assert (
@@ -189,21 +189,21 @@ async def main(binary):
                     == f"Bearer {TOKEN}"
                 )
 
-            async def GetCapabilities(self, request, context):
+            async def Describe(self, request, context):
                 assert request.supervisor.protocol_version.major == 1
                 assert (
-                    "openshell.isolation.contract"
+                    "openshell.sandbox.protocol"
                     in request.supervisor.supported_capabilities
                 )
                 assert "authorization" not in dict(context.invocation_metadata())
                 events.append("negotiate")
-                return control.GetIsolationCapabilitiesResponse(
+                return control.DescribeSandboxBackendResponse(
                     backend=extension.PeerMetadata(
                         protocol_version=extension.ProtocolVersion(major=1, minor=0),
                         implementation_name="python-interop",
                         implementation_version="1.0",
-                        supported_capabilities=["openshell.isolation.contract"],
-                        required_capabilities=["openshell.isolation.contract"],
+                        supported_capabilities=["openshell.sandbox.protocol"],
+                        required_capabilities=["openshell.sandbox.protocol"],
                     )
                 )
 
@@ -346,7 +346,7 @@ async def main(binary):
                 else:
                     raise AssertionError(f"unexpected operation {operation}")
                 replay[envelope["request_id"]] = envelope["payload_digest"], response
-                yield stream.DelegatedBoundaryChunk(
+                yield stream.BoundaryChunk(
                     data=frame(
                         {"request_id": envelope["request_id"], "response": response}
                     )
@@ -362,7 +362,7 @@ async def main(binary):
                         },
                         separators=(",", ":"),
                     ).encode()
-                    yield stream.DelegatedBoundaryChunk(
+                    yield stream.BoundaryChunk(
                         data=bytes([3]) + struct.pack(">I", len(payload)) + payload
                     )
 
@@ -372,8 +372,8 @@ async def main(binary):
 
         server = grpc.aio.server()
         backend = Backend()
-        control_rpc.add_IsolationBackendServicer_to_server(backend, server)
-        stream_rpc.add_DelegatedIsolationBoundaryServicer_to_server(backend, server)
+        control_rpc.add_SandboxBackendServicer_to_server(backend, server)
+        stream_rpc.add_SandboxBoundaryServicer_to_server(backend, server)
         port = server.add_secure_port(
             "127.0.0.1:0", grpc.ssl_server_credentials([(key_pem, cert_pem)])
         )

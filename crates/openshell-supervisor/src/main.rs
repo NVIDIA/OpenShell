@@ -400,7 +400,7 @@ fn main() -> Result<()> {
     });
     let ocsf_headers = isolation_inputs
         .as_ref()
-        .and_then(|(_, auth)| auth.ocsf_otlp_headers.as_ref())
+        .and_then(|(_, _, auth, _)| auth.ocsf_otlp_headers.as_ref())
         .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret);
     let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
         start_ocsf_export(

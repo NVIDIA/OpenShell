@@ -51,13 +51,13 @@ struct NetworkPeer {
 }
 
 #[tonic::async_trait]
-impl DelegatedIsolationBoundary for NetworkPeer {
+impl SandboxBoundary for NetworkPeer {
     type ExchangeStream = TestGrpcStream;
     type MediateStream = TestGrpcStream;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if request.metadata().get("authorization").unwrap()
             != format!("Bearer {}", "a".repeat(32)).as_str()
@@ -80,7 +80,7 @@ impl DelegatedIsolationBoundary for NetworkPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<DelegatedBoundaryChunk>>,
+        _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("TCP fixture"))
     }
@@ -89,8 +89,8 @@ impl DelegatedIsolationBoundary for NetworkPeer {
 impl NetworkPeer {
     async fn respond(
         &self,
-        mut inbound: tonic::Streaming<DelegatedBoundaryChunk>,
-        outbound: tokio::sync::mpsc::Sender<Result<DelegatedBoundaryChunk, tonic::Status>>,
+        mut inbound: tonic::Streaming<BoundaryChunk>,
+        outbound: tokio::sync::mpsc::Sender<Result<BoundaryChunk, tonic::Status>>,
     ) -> Result<(), tonic::Status> {
         test_bind(&mut inbound).await;
         let mut frame = Vec::new();
@@ -300,8 +300,8 @@ impl Fixture {
                     ))])
                     .chain(tokio_stream::pending());
                     let serving = tonic::transport::Server::builder()
-                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(DelegatedIsolationBoundaryServer::new(peer))
+                        .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxBoundaryServer::new(peer))
                         .serve_with_incoming(incoming);
                     tokio::select! {
                         result = serving => result.unwrap(),

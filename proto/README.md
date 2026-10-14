@@ -88,7 +88,7 @@ identifies the service being exposed.
 
 ## Isolation backend protocol
 
-[`isolation_backend.proto`](isolation_backend.proto) and
+[`sandbox_backend.proto`](sandbox_backend.proto) and
 [`sandbox_protocol.proto`](sandbox_protocol.proto) are supervisor-to-backend
 contracts, not gateway RPCs. Backend authors can generate bindings independently
 and implement [Sandbox Protocol 1.0](sandbox_protocol/v1/README.md). Its negotiated

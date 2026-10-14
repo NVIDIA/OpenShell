@@ -9,10 +9,10 @@ use openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor;
 use openshell_sandbox_backend::delegated::DelegatedLaunch;
 use serde::Deserialize;
 
-use super::{BackendServices, BackendSetup, LaunchIdentity, PreparedBackend};
+use super::{BackendServices, BackendSetup, BuiltBackend, LaunchIdentity, PreparedBackend};
 use miette::Result;
 use openshell_core::jwt::SessionBearerTokenSlot;
-use openshell_isolation_interface::contract::{BackendError, IsolationBackend};
+use openshell_isolation_interface::contract::BackendError;
 use std::sync::Arc;
 
 #[derive(Default, Deserialize)]
@@ -112,14 +112,20 @@ impl PreparedBackend for RegisteredLaunch {
     fn build(
         self: Box<Self>,
         services: BackendServices,
-    ) -> std::result::Result<Arc<dyn IsolationBackend>, BackendError> {
-        Ok(Arc::new(DelegatedRuntimeBackend::new(
+    ) -> std::result::Result<BuiltBackend, BackendError> {
+        let payload = self.payload.clone();
+        let backend = Arc::new(DelegatedRuntimeBackend::new(
             self.name,
             self.descriptor,
             self.payload,
             services.ca_file_paths,
             services.provider_credentials,
             services.sandbox_bearer,
-        )?))
+        )?);
+        Ok(BuiltBackend {
+            backend,
+            payload,
+            proxy_listener: None,
+        })
     }
 }
