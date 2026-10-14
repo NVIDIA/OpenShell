@@ -1005,8 +1005,7 @@ proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
 provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 ```
 
-Use `sandbox_label` for Docker configurations. The legacy
-`sandbox_namespace` key is rejected.
+Use `sandbox_label` for Docker configurations.
 
 `supervisor_network_mode` accepts `host` (the default), `bridge`, or `auto`.
 `auto` also selects host; the driver does not infer a mode from the workload runtime.
@@ -1014,11 +1013,7 @@ The workload always uses `network=none`.
 
 Omit `grpc_endpoint` for automatic selection: host mode uses loopback; bridge
 uses `host.docker.internal` on Desktop or with a wildcard listener, otherwise
-the Linux listener's non-loopback address. Both use the gateway's bind port.
-Bridge requires a reachable listener; OpenShell does not widen it. Set an
-explicit endpoint for remapped ports. HTTPS certificates must cover the endpoint.
-The local `gateway:docker` task uses automatic endpoint selection unless you set
-`OPENSHELL_GRPC_ENDPOINT`.
+the Linux listener's non-loopback address.
 
 If host services are unreachable or automatic host-address discovery fails,
 set `host_gateway_ip` to a host address reachable from containers.
