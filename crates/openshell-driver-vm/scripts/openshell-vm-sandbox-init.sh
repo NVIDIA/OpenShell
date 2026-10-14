@@ -203,8 +203,7 @@ prepare_guest_image_rootfs() {
 
 exec_supervisor_in_newroot() {
     local chroot_bin
-    local bootstrap="/.openshell-bootstrap"
-    local supervisor="${bootstrap}/opt/openshell/bin/openshell-sandbox"
+    local supervisor="/.openshell-bootstrap/opt/openshell/bin/openshell-sandbox"
 
     for chroot_bin in /usr/sbin/chroot /usr/bin/chroot /sbin/chroot /bin/chroot; do
         [ -x "$chroot_bin" ] || continue
