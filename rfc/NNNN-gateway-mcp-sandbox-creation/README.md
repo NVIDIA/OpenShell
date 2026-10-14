@@ -456,9 +456,22 @@ The prover models a request as program, host, port, HTTP method and path. That
 is enough for network and REST rules. MCP rules match fields inside the JSON-RPC
 body, the `method` and the tool name in `params.name`, and the model has no
 body fields. The prover therefore returns `Unsupported` for any endpoint with
-`protocol: mcp`, including one that allows every tool ("only L4 TCP and REST are
-modeled", `crates/openshell-prover/src/containment.rs`). This is unbuilt work
+`protocol: mcp`: per-tool rules because "only L4 TCP and REST are modeled", and
+`allow_all_known_mcp_methods` because it "uses authority outside the initial
+model" (`crates/openshell-prover/src/containment.rs`). This is unbuilt work
 rather than a fundamental limit; tool names are strings like paths.
+
+**A parent with MCP rules.** The prover checks both policies before comparing
+them, so one `protocol: mcp` endpoint in the parent's policy would make every
+proof `Unsupported`, and that parent could create no children at all, even ones
+that need nothing from the MCP server. The gateway therefore proves against the
+part of the parent's policy the prover can model: it drops endpoints whose
+protocol is not L4 or REST before the proof. Dropping allow rules only shrinks
+the boundary, so a child that fits the result also fits the parent's full
+policy. Such a parent can create children for everything else; it cannot pass
+its MCP rules on. With `child_policy: inherit` the child receives the parent's
+policy unchanged, which fits by construction, so the proof is skipped and the
+MCP rules are inherited.
 
 Until the prover models MCP rules, a child gets another MCP server whole or not
 at all, written as a REST rule on the server's `/mcp` path:
@@ -479,13 +492,15 @@ network_policies:
 ```
 
 We checked the three ways of writing this with `openshell-prover` against a
-ceiling that allows `POST` and `GET` on `/mcp`. The REST rule above is
+parent that allows `POST` and `GET` on `/mcp`. The REST rule above is
 `within`. A rule naming only the host and port `exceeds` the ceiling, because it
 allows requests to any path. An endpoint with `protocol: mcp` and
 `allow_all_known_mcp_methods: true` is `unsupported`. The cost of the REST form
 is that there are no per-tool limits, so a child with GitHub's MCP server can
 call every tool on it, and the supervisor applies no MCP-specific checks such as
-protocol version and tool-name syntax.
+protocol version and tool-name syntax. The parent must allow at least the
+methods the child gets: a child with `POST`, `GET` and `DELETE` on `/mcp`
+exceeds a parent with only `POST` and `GET`.
 
 ### The supervisor door
 
