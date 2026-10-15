@@ -13,7 +13,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode, WorkspaceVolume,
 };
 
 #[derive(Parser, Debug)]
@@ -191,6 +191,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_WORKSPACE_VOLUME",
+        default_value = "persistent_volume_claim"
+    )]
+    workspace_volume: WorkspaceVolume,
+
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
     /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
@@ -307,6 +314,7 @@ async fn main() -> Result<()> {
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
             enable_user_namespaces: args.enable_user_namespaces,
+            workspace_volume: args.workspace_volume,
             workspace_default_storage_size: std::env::var(
                 "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
             )

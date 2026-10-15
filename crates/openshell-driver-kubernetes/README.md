@@ -142,9 +142,9 @@ errors, avoiding a gateway-side watch restart and its associated watch gap.
 
 ## Workspace Persistence
 
-Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the
-PVC from the image's original `/sandbox` contents on first start and writes a
-sentinel so subsequent starts skip the copy.
+By default, sandbox pods use a PVC-backed `/sandbox` workspace. An init
+container seeds the PVC from the image's original `/sandbox` contents on first
+start and writes a sentinel so subsequent starts skip the copy.
 
 This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply
@@ -168,6 +168,12 @@ runtime via `OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE` and
 `OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS`. Both apply only to the workspace PVC
 that OpenShell provisions automatically; they have no effect when a `driver_config`
 mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
+
+Set `workspace_volume = "empty_dir"` (standalone driver:
+`OPENSHELL_K8S_WORKSPACE_VOLUME`) to back `/sandbox` with an `emptyDir` capped
+at `workspace_default_storage_size` instead of a PVC, for clusters without
+dynamic provisioning. The init container then seeds `/sandbox` on every pod
+start, so stop and start or any other pod replacement resets it.
 
 ## Credentials, TLS, and Relay
 

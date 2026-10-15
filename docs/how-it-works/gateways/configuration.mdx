@@ -941,6 +941,10 @@ ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
 host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
+# Volume backing /sandbox: "persistent_volume_claim" (default) or "empty_dir".
+# An emptyDir needs no StorageClass, is capped at workspace_default_storage_size,
+# and lasts only as long as the sandbox pod.
+# workspace_volume             = "empty_dir"
 workspace_default_storage_size = "10Gi"
 # Kubernetes StorageClass for the workspace PVC. Empty (default) omits the
 # field, using the cluster's default StorageClass. Set this on clusters with no

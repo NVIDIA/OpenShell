@@ -5,8 +5,9 @@
 
 use crate::config::{
     DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_SANDBOX_UID, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, is_dns_1123_label,
-    managed_namespace, managed_namespace_prefix, validate_managed_namespace_name,
+    KubernetesComputeConfig, OperatorNamespaceAllowlist, WorkspaceMode, WorkspaceVolume,
+    is_dns_1123_label, managed_namespace, managed_namespace_prefix,
+    validate_managed_namespace_name,
 };
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeBoundarySpec,
@@ -701,11 +702,13 @@ fn kubernetes_driver_volume_mount_to_k8s(
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
 // ---------------------------------------------------------------------------
-// Every sandbox pod gets a PVC-backed `/sandbox` directory so that user data
-// (installed packages, files, dotfiles) survives pod rescheduling across
-// gateway stop/start cycles.  An init container seeds the PVC with the
+// By default, every sandbox pod gets a PVC-backed `/sandbox` directory so that
+// user data (installed packages, files, dotfiles) survives pod rescheduling
+// across gateway stop/start cycles.  An init container seeds the PVC with the
 // image's original `/sandbox` contents on first use so that the Python venv,
-// skills, and shell config are not lost when the empty PVC is mounted.
+// skills, and shell config are not lost when the empty PVC is mounted.  With
+// `workspace_volume = "empty_dir"`, a size-capped `emptyDir` replaces the PVC
+// and the init container seeds it on every pod start.
 //
 // NOTE: This PVC + init-container approach is a stopgap.  It has known
 // limitations: image upgrades don't propagate into existing PVCs, the init
@@ -2053,6 +2056,7 @@ impl KubernetesComputeDriver {
             service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            workspace_volume: self.config.workspace_volume,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             workspace_storage_class: &self.config.workspace_storage_class,
             default_runtime_class_name: &self.config.default_runtime_class_name,
@@ -6317,16 +6321,11 @@ fn default_workspace_volume_claim_templates(
     storage_size: &str,
     storage_class: &str,
 ) -> serde_json::Value {
-    let size = if storage_size.is_empty() {
-        DEFAULT_WORKSPACE_STORAGE_SIZE
-    } else {
-        storage_size
-    };
     let mut spec = serde_json::json!({
         "accessModes": ["ReadWriteOnce"],
         "resources": {
             "requests": {
-                "storage": size
+                "storage": workspace_storage_size(storage_size)
             }
         }
     });
@@ -6341,6 +6340,15 @@ fn default_workspace_volume_claim_templates(
     }])
 }
 
+/// Size of the workspace volume: the PVC request, or the `emptyDir` limit.
+fn workspace_storage_size(storage_size: &str) -> &str {
+    if storage_size.is_empty() {
+        DEFAULT_WORKSPACE_STORAGE_SIZE
+    } else {
+        storage_size
+    }
+}
+
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
 #[allow(clippy::struct_excessive_bools)]
 struct SandboxPodParams<'a> {
@@ -6352,6 +6360,7 @@ struct SandboxPodParams<'a> {
     service_account_name: &'a str,
     sandbox_id: &'a str,
     enable_user_namespaces: bool,
+    workspace_volume: WorkspaceVolume,
     workspace_default_storage_size: &'a str,
     workspace_storage_class: &'a str,
     default_runtime_class_name: &'a str,
@@ -6376,6 +6385,7 @@ impl Default for SandboxPodParams<'_> {
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             enable_user_namespaces: false,
+            workspace_volume: WorkspaceVolume::default(),
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             workspace_storage_class: "",
             default_runtime_class_name: "",
@@ -6421,7 +6431,7 @@ fn sandbox_to_k8s_spec(
     let mut root = serde_json::Map::new();
 
     // Determine early whether OpenShell should inject its default workspace
-    // PVC. Explicit Kubernetes driver-config mounts under /sandbox/ take
+    // volume. Explicit Kubernetes driver-config mounts under /sandbox/ take
     // ownership of workspace persistence.
     // We need this flag before building the podTemplate because the workspace
     // persistence transforms are applied inside sandbox_template_to_k8s.
@@ -6451,7 +6461,7 @@ fn sandbox_to_k8s_spec(
         }
     }
 
-    if inject_workspace {
+    if inject_workspace && params.workspace_volume == WorkspaceVolume::PersistentVolumeClaim {
         root.insert(
             "volumeClaimTemplates".to_string(),
             default_workspace_volume_claim_templates(
@@ -6690,9 +6700,9 @@ fn sandbox_template_to_k8s_with_validated_config(
 
     apply_supervisor_sandbox_runtime_boundary(&mut result, params);
 
-    // Inject workspace persistence (init container + PVC volume mount) so
-    // that /sandbox data survives pod rescheduling. Skipped when the user
-    // provides custom storage through driver_config.
+    // Inject the workspace (init container + `/sandbox` mount, plus the
+    // `emptyDir` when it replaces the PVC). Skipped when the user provides
+    // custom storage through driver_config.
     if inject_workspace {
         apply_workspace_persistence(
             &mut result,
@@ -6701,6 +6711,17 @@ fn sandbox_template_to_k8s_with_validated_config(
             None,
             Some((params.sandbox_uid, params.sandbox_gid)),
         );
+        if params.workspace_volume == WorkspaceVolume::EmptyDir {
+            result["spec"]["volumes"]
+                .as_array_mut()
+                .expect("pod volumes must be an array")
+                .push(serde_json::json!({
+                    "name": WORKSPACE_VOLUME_NAME,
+                    "emptyDir": {
+                        "sizeLimit": workspace_storage_size(params.workspace_default_storage_size)
+                    }
+                }));
+        }
     }
 
     result
@@ -11594,6 +11615,45 @@ mod tests {
             cr["spec"]["volumeClaimTemplates"][0]["spec"]
                 .get("storageClassName")
                 .is_none()
+        );
+        assert!(
+            !cr["spec"]["podTemplate"]["spec"]["volumes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|volume| volume["name"] == WORKSPACE_VOLUME_NAME)
+        );
+    }
+
+    #[test]
+    fn empty_dir_workspace_volume_replaces_claim_template() {
+        let params = SandboxPodParams {
+            workspace_volume: WorkspaceVolume::EmptyDir,
+            workspace_default_storage_size: "5Gi",
+            ..SandboxPodParams::default()
+        };
+        let cr = sandbox_to_k8s_spec_for_test(Some(&SandboxSpec::default()), &params);
+
+        assert!(cr["spec"].get("volumeClaimTemplates").is_none());
+        let pod_spec = &cr["spec"]["podTemplate"]["spec"];
+        let workspace = pod_spec["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|volume| volume["name"] == WORKSPACE_VOLUME_NAME)
+            .unwrap();
+        assert_eq!(
+            workspace["emptyDir"],
+            serde_json::json!({"sizeLimit": "5Gi"})
+        );
+        assert!(
+            pod_spec["containers"][0]["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!({
+                    "name": WORKSPACE_VOLUME_NAME,
+                    "mountPath": WORKSPACE_MOUNT_PATH
+                }))
         );
     }
 
