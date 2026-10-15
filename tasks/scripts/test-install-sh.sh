@@ -366,7 +366,9 @@ assert_snap_user_refresh_flow() {
   calls="$(cat "$out")"
   expected="wait:user-docker
 root:snap refresh openshell --channel=latest/stable
-root:snap restart openshell.user-gateway
+target:systemctl --user daemon-reload
+target:systemctl --user enable --now snap.openshell.user-gateway.service
+target:systemctl --user restart snap.openshell.user-gateway.service
 wait:user-gateway-listener
 register:user-gateway
 wait:gateway-status"
@@ -382,6 +384,8 @@ assert_snap_install_flow \
   1 0 "" \
   "wait:user-docker
 root:snap install openshell --channel=latest/stable
+target:systemctl --user daemon-reload
+target:systemctl --user enable --now snap.openshell.user-gateway.service
 wait:user-gateway-listener
 register:user-gateway
 wait:gateway-status"

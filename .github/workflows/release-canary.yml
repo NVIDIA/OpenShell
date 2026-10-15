@@ -221,6 +221,11 @@ jobs:
       - name: Install and check status
         run: |
           set -euo pipefail
+          other_user=openshell-canary-other
+          sudo useradd --create-home "$other_user"
+          other_uid=$(id -u "$other_user")
+          sudo loginctl enable-linger "$other_user"
+          sudo systemctl start "user@${other_uid}.service"
           systemctl --user set-environment \
             "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh |
@@ -238,6 +243,21 @@ jobs:
           snap services openshell
           systemctl --user is-enabled --quiet snap.openshell.user-gateway.service
           systemctl --user is-active snap.openshell.user-gateway.service
+          sudo -u "$other_user" env \
+            HOME="/home/${other_user}" \
+            XDG_RUNTIME_DIR="/run/user/${other_uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${other_uid}/bus" \
+            systemctl --user daemon-reload
+          ! sudo -u "$other_user" env \
+            HOME="/home/${other_user}" \
+            XDG_RUNTIME_DIR="/run/user/${other_uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${other_uid}/bus" \
+            systemctl --user is-enabled --quiet snap.openshell.user-gateway.service
+          ! sudo -u "$other_user" env \
+            HOME="/home/${other_user}" \
+            XDG_RUNTIME_DIR="/run/user/${other_uid}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/${other_uid}/bus" \
+            systemctl --user is-active --quiet snap.openshell.user-gateway.service
           ! systemctl is-enabled --quiet snap.openshell.system-gateway.service
           ! systemctl is-active --quiet snap.openshell.system-gateway.service
           journalctl --user -u snap.openshell.user-gateway.service --no-pager |

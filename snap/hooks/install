@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Fresh installations use the per-user gateway. The configure hook applies the
-# service selection after this transaction commits.
+# Fresh installations select the per-user gateway model. Each user enables the
+# gateway through their own systemd user manager.
 
 set -eu
 
