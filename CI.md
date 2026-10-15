@@ -274,6 +274,8 @@ Failed pre-release builds send notifications via Slack using a webhook and
 at-mentioning the triage engineer with a link to the failure. The webhook is
 stored in the repository secret `SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` and the
 mention is stored in the repository secret `SLACK_OPENSHELL_TRIAGE_MENTION`.
+Successful pre-release builds post a top-level message to the same webhook
+without a mention, so a recovery after failures is visible in the channel.
 Notifications are non-blocking and do not affect release results; an unset
 webhook skips sending; an unset mention sends without a mention.
 
