@@ -255,6 +255,9 @@ struct Scenario {
     device: String,
     /// Facts the workload must observe once the sandbox is created.
     checks: Vec<Check>,
+    /// When set, sandbox creation must fail with a report containing this
+    /// text, and `checks` are not asserted.
+    rejected: Option<String>,
 }
 
 /// Read a scenario's expectations, and the checks every scenario carries, from
@@ -280,17 +283,23 @@ fn scenario_expectations(document: &Value, name: &str) -> Result<Scenario> {
         .as_str()
         .filter(|kind| !kind.is_empty())
         .ok_or_else(|| Error::msg("the published expectations name no device kind"))?;
-    // Every scenario creates a sandbox that starts. Ignoring a key that asked
-    // for something else would silently drop the expectation.
-    testkit::ensure!(
-        expect.get("rejected").is_none(),
-        "scenario {name:?}: `rejected` is not supported; scenarios must create a sandbox"
-    );
+    // An absent key means the sandbox must start. A key of any other type is a
+    // mistake that would silently drop the expectation.
+    let rejected = match &expect["rejected"] {
+        Value::Null => None,
+        Value::String(text) => Some(text.clone()),
+        other => {
+            return Err(Error::msg(format!(
+                "scenario {name:?}: `rejected` must be a string, found {other}"
+            )));
+        }
+    };
     let mut checks = checks_from(&document["common_checks"])?;
     checks.extend(checks_from(&expect["checks"])?);
     Ok(Scenario {
         device: format!("{kind}={name}"),
         checks,
+        rejected,
     })
 }
 
@@ -363,15 +372,21 @@ async fn compute_driver(cx: &Context) -> Result<&'static str> {
 /// Create a sandbox that selects the named scenario device on the gateway's
 /// compute driver and check it against the scenario's published expectations.
 ///
-/// The sandbox must create, and the workload must observe each of the
-/// scenario's checks, including the checks every scenario carries.
+/// Unless the scenario expects a rejection, the sandbox must create and the
+/// workload must observe each of the scenario's checks, including the checks
+/// every scenario carries. A rejected scenario must instead fail to create,
+/// with a report containing the expected text.
 ///
 /// # Errors
 ///
 /// Fails when the expectations cannot be read, the gateway does not run the
 /// Docker or Podman driver, or the sandbox does not behave as the scenario expects.
 pub async fn scenario(cx: &Context, name: &str) -> Result {
-    let Scenario { device, checks } = load(name)?;
+    let Scenario {
+        device,
+        checks,
+        rejected,
+    } = load(name)?;
     let driver = compute_driver(cx).await?;
 
     let sandbox = cx.name("cdi");
@@ -396,6 +411,18 @@ pub async fn scenario(cx: &Context, name: &str) -> Result {
         ])
         .await?;
 
+    if let Some(expected) = rejected {
+        let output = output.failure().context(format!(
+            "sandbox with scenario device {name} is rejected"
+        ))?;
+        testkit::ensure!(
+            output.report_text().contains(&expected),
+            "scenario {name}: creation failed without a report containing {expected:?}:\n{}",
+            output.report_text()
+        );
+        return Ok(());
+    }
+
     let output = output
         .success()
         .context(format!("sandbox with scenario device {name} starts"))?;
@@ -406,6 +433,21 @@ pub async fn scenario(cx: &Context, name: &str) -> Result {
         failures.join("\n  FAIL "),
         output.stdout
     );
+    Ok(())
+}
+
+/// Like [`scenario`], but only on the named compute drivers. On any other
+/// driver the scenario is not run and the reason is printed.
+///
+/// # Errors
+///
+/// As [`scenario`], and when the gateway's compute driver cannot be determined.
+pub async fn scenario_on(cx: &Context, name: &str, drivers: &[&str], reason: &str) -> Result {
+    let driver = compute_driver(cx).await?;
+    if drivers.contains(&driver) {
+        return scenario(cx, name).await;
+    }
+    eprintln!("skipping scenario {name} on the {driver} driver: {reason}");
     Ok(())
 }
 
@@ -445,8 +487,18 @@ mod tests {
     }
 
     #[test]
-    fn rejected_scenarios_are_not_supported() {
-        assert!(scenario_expectations(&document(), "refused").is_err());
+    fn a_rejected_scenario_carries_the_expected_report() {
+        let scenario = scenario_expectations(&document(), "refused").unwrap();
+        assert_eq!(scenario.rejected.as_deref(), Some("no such device"));
+        let plain = scenario_expectations(&document(), "plain").unwrap();
+        assert_eq!(plain.rejected, None);
+    }
+
+    #[test]
+    fn rejected_must_be_a_string() {
+        let mut doc = document();
+        doc["scenarios"]["refused"]["rejected"] = json!(true);
+        assert!(scenario_expectations(&doc, "refused").is_err());
     }
 
     #[test]
