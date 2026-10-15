@@ -232,7 +232,7 @@ The `error` field is a short machine-readable code (`policy_denied`, `middleware
 
 For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When the policy advisor is enabled, the body also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
 
-A failed [dynamic token grant](/how-it-works/providers/profiles#token-grant-failures) returns `502 Bad Gateway` with an `x-openshell-request-id` header. The forward proxy returns `{"error":"token_grant_failed","detail":"dynamic token grant failed"}`; L7 relays return an empty body. The response does not say why the grant failed. Give the request ID to someone who can read the sandbox.
+A failed [dynamic token grant](/how-it-works/providers/profiles#token-grant-failures) returns `502 Bad Gateway` with an `x-openshell-request-id` header. The forward proxy body is `{"error":"token_grant_failed","detail":"dynamic token grant failed"}`; L7 relays send an empty body. Neither states the cause, so give the request ID to someone who can read the sandbox.
 
 ## Filesystem Sandbox Logs
 
