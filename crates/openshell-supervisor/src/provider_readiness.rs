@@ -387,12 +387,11 @@ fn report_acknowledged(response: &ReportProviderReadinessResponse, sequence: u64
             .is_some_and(|ttl| !ttl.is_zero())
 }
 
-#[tonic::async_trait]
 trait ReportClient: Send + Sync {
-    async fn report(
+    fn report(
         &self,
         observation: ProviderReadinessObservation,
-    ) -> miette::Result<ReportProviderReadinessResponse>;
+    ) -> impl Future<Output = miette::Result<ReportProviderReadinessResponse>> + Send;
 }
 
 struct GatewayReporter {
@@ -400,7 +399,6 @@ struct GatewayReporter {
     sandbox_id: String,
 }
 
-#[tonic::async_trait]
 impl ReportClient for GatewayReporter {
     async fn report(
         &self,
@@ -462,7 +460,6 @@ mod tests {
 
     struct CapturingReporter(tokio::sync::mpsc::UnboundedSender<ProviderReadinessObservation>);
 
-    #[tonic::async_trait]
     impl ReportClient for CapturingReporter {
         async fn report(
             &self,
@@ -489,7 +486,6 @@ mod tests {
         )>,
     );
 
-    #[tonic::async_trait]
     impl ReportClient for DelayedReporter {
         async fn report(
             &self,
