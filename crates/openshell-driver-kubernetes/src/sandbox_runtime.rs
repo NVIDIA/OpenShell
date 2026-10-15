@@ -1103,6 +1103,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             owner(),
             &[
                 (
@@ -1399,6 +1400,7 @@ mod tests {
             None,
             Some(("openshell-network-additional-ca-gateway-generation", digest)),
             owner(),
+            &[],
         )
         .expect("render supervisor Pod with destination trust");
         let spec = pod.spec.expect("Pod spec");

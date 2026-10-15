@@ -19489,7 +19489,9 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let recovered_runtime = runtime.clone();
         let mut recovery = tokio::spawn(async move {
             recovered_runtime
-                .recover_persisted_lifecycle_transitions()
+                .recover_persisted_lifecycle_transitions(&|_sandbox: &Sandbox| async {
+                    Ok::<Vec<u8>, String>(Vec::new())
+                })
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())

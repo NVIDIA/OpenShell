@@ -13568,6 +13568,7 @@ mod tests {
                 sandbox_api_version: Arc::new(OnceCell::new()),
                 lifecycle_gates: Arc::default(),
                 config: managed_config(&[]),
+                network_trust_bundle: None,
                 operator_allowlist: None,
                 shared_supervisor: None,
             };

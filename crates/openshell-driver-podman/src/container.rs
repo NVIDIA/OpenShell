@@ -1254,7 +1254,6 @@ pub fn build_container_spec_for_image(
     image: &ResolvedPodmanImage,
     supervisor_bin_path: Option<&Path>,
     tls_secret_names: Option<&[String; 1]>,
-    network_trust_artifact: Option<&Path>,
 ) -> Result<Value, ComputeDriverError> {
     serde_json::to_value(build_base_spec(
         sandbox,
@@ -1985,21 +1984,18 @@ mod tests {
             "sha256:image".into(),
         )
         .unwrap();
+        let image = resolved_image("image", "sha256:image", "1000:1001", "/workspace/project");
         let specs = build_isolation_specs(IsolationSpecInput {
             sandbox: &sandbox,
             config: &PodmanComputeConfig::default(),
             token_secret: None,
             resolver_secret: "resolver",
             gpu_devices: None,
-            requested_image: "image",
-            image_id: "sha256:image",
-            image_user: "1000:1001",
-            image_env: &[],
+            image: &image,
             supervisor_bin: None,
             tls_secrets: None,
             network_trust: Some(&bundle),
             identity: &identity,
-            rootless: false,
         })
         .unwrap();
 

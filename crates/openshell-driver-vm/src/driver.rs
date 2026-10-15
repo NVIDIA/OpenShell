@@ -8547,6 +8547,7 @@ mod tests {
 
         let result = VmDriver::new(VmDriverConfig {
             grpc_endpoint: "http://127.0.0.1:8080".to_string(),
+            bootstrap_image: "bootstrap:latest".to_string(),
             network_additional_ca_snapshot: Some(supplied_snapshot),
             ..Default::default()
         });
