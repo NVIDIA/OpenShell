@@ -10,7 +10,8 @@ conformance area and user story. The CLI is the current client interface; lifecy
 - `cli/tests/<area>/<story>.rs`: test functions, steps, and assertions for a story.
 - `cli/tests/<area>/helpers.rs`: setup and assertions shared by that area's stories.
 
-The current areas are `file_transfer`, `lifecycle`, `policy_advisor`, and `smoke`.
+The current areas are `file_transfer`, `lifecycle`, `policy_advisor`, `sandbox_templates`,
+and `smoke`.
 Each area compiles into one test binary; individual stories remain selectable by
 their module prefix. `main.rs` contains only module declarations.
 
@@ -66,7 +67,8 @@ must supply the workload image and tools used by the selected scenarios. Missing
 CLI or gateway prerequisites fail the run rather than silently passing.
 
 Run one group with `--test file_transfer`, `--test lifecycle`,
-`--test policy_advisor`, or `--test smoke`, before the `--` separator. A group or
+`--test policy_advisor`, `--test sandbox_templates`, or `--test smoke`, before the
+`--` separator. A group or
 individual-test filter exercises only part of the suite.
 
 The tmachine conformance testsuite runs these same entry points from the
