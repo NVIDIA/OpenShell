@@ -337,6 +337,15 @@ impl std::ops::Deref for DriverService {
 }
 #[tonic::async_trait]
 impl compute_driver_server::ComputeDriver for DriverService {
+    async fn update_sandbox_image(
+        &self,
+        _: Request<UpdateSandboxImageRequest>,
+    ) -> Result<Response<UpdateSandboxImageResponse>, Status> {
+        Err(Status::unimplemented(
+            "storage-preserving image updates are not supported by this driver",
+        ))
+    }
+
     async fn get_capabilities(
         &self,
         _: Request<GetCapabilitiesRequest>,

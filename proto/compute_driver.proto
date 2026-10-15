@@ -45,6 +45,13 @@ service ComputeDriver {
   // Provision platform resources for a sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
+  // Idempotently replace only the workload image of a stopped sandbox, retaining
+  // its stable resource and storage. Requires the optional capability
+  // openshell.compute.update-sandbox-image. Unsupported drivers return
+  // UNIMPLEMENTED without changing any resource.
+  rpc UpdateSandboxImage(UpdateSandboxImageRequest)
+      returns (UpdateSandboxImageResponse);
+
   // Idempotently stop platform resources without deleting persistent state.
   rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
 
@@ -440,6 +447,27 @@ message CreateSandboxResponse {
   // Required when the driver advertises sandbox authentication support.
   string runtime_identity = 1;
 }
+
+message UpdateSandboxImageRequest {
+  string sandbox_id = 1;
+  string name = 2;
+  string image = 3;
+  // Pre-update image. A different current image conflicts unless durable driver
+  // evidence identifies this exact operation as already applied.
+  string expected_image = 4;
+  // Never adopt a same-name replacement resource.
+  string expected_runtime_identity = 5;
+  // Stable UUID across retries, recorded atomically with the image change.
+  string operation_id = 6;
+  // Perform all admission and state checks without writing any resource. The
+  // gateway uses this before recording durable intent; apply rechecks them.
+  bool validate_only = 7;
+  // Monotonic sandbox image revision. The driver atomically records it with
+  // the image and rejects earlier revisions even if expected_image matches.
+  uint64 revision = 8;
+}
+
+message UpdateSandboxImageResponse {}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

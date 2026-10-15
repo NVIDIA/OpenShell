@@ -322,6 +322,13 @@ impl OpenShell for OpenShellService {
         mutation_replay::run(&self.state, request).await
     }
 
+    async fn update_sandbox(
+        &self,
+        request: Request<openshell_core::proto::UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        mutation_replay::run(&self.state, request).await
+    }
+
     async fn begin_rootfs_tar_staging(
         &self,
         request: Request<BeginRootfsTarStagingRequest>,

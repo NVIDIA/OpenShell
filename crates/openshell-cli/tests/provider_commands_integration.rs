@@ -242,6 +242,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not used by this test server"))
     }
 
+    async fn update_sandbox(
+        &self,
+        _request: tonic::Request<openshell_core::proto::UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        Err(Status::unimplemented("not implemented by test service"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,

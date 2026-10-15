@@ -16,6 +16,7 @@ const SERVICE_OPEN_SHELL: &str = "openshell.v1.OpenShell";
 /// here.
 pub const INTERCEPTABLE_METHODS: &[&str] = &[
     "CreateSandbox",
+    "UpdateSandbox",
     "AttachSandboxProvider",
     "DetachSandboxProvider",
     "DeleteSandbox",

@@ -163,6 +163,13 @@ macro_rules! mock_gateway {
     ) => {
         #[tonic::async_trait]
         impl OpenShell for MockGateway {
+            async fn update_sandbox(
+                &self,
+                _request: Request<openshell_core::proto::UpdateSandboxRequest>,
+            ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+                Err(Status::unimplemented("not implemented by test service"))
+            }
+
             $(async fn $method(&self, _: Request<$request>) -> Result<Response<$response>, Status> {
                 Err(Status::unimplemented("unused test RPC"))
             })*

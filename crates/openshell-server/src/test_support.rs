@@ -105,6 +105,9 @@ pub enum FakeComputeDriverCall {
     CreateSandbox {
         sandbox: Option<DriverSandbox>,
     },
+    UpdateSandboxImage {
+        request: openshell_core::proto::compute::v1::UpdateSandboxImageRequest,
+    },
     StopSandbox {
         sandbox_id: String,
         sandbox_name: String,
@@ -140,6 +143,8 @@ struct FakeComputeDriverState {
     sandboxes: HashMap<String, DriverSandbox>,
     calls: Vec<FakeComputeDriverCall>,
     traceparents: Vec<String>,
+    image_update_error: Option<tonic::Code>,
+    image_validation_error: Option<tonic::Code>,
 }
 
 impl Default for FakeComputeDriver {
@@ -183,6 +188,8 @@ impl FakeComputeDriver {
                 sandboxes: HashMap::new(),
                 calls: Vec::new(),
                 traceparents: Vec::new(),
+                image_update_error: None,
+                image_validation_error: None,
             })),
         }
     }
@@ -260,6 +267,14 @@ impl FakeComputeDriver {
         Ok(FakeComputeDriverServerHandle { socket_path, task })
     }
 
+    pub fn set_image_update_error(&self, code: Option<tonic::Code>) {
+        self.with_state(|state| state.image_update_error = code);
+    }
+
+    pub fn set_image_validation_error(&self, code: Option<tonic::Code>) {
+        self.with_state(|state| state.image_validation_error = code);
+    }
+
     fn with_state<R>(&self, f: impl FnOnce(&mut FakeComputeDriverState) -> R) -> R {
         let mut state = self
             .state
@@ -312,6 +327,30 @@ impl Stream for UnixIncoming {
 
 #[tonic::async_trait]
 impl ComputeDriver for FakeComputeDriver {
+    async fn update_sandbox_image(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status>
+    {
+        self.record_traceparent(request.metadata());
+        self.with_state(|state| {
+            let request = request.into_inner();
+            let validate_only = request.validate_only;
+            state
+                .calls
+                .push(FakeComputeDriverCall::UpdateSandboxImage { request });
+            if let Some(code) = state.image_validation_error.filter(|_| validate_only) {
+                return Err(Status::new(code, "injected image validation error"));
+            }
+            if let Some(code) = state.image_update_error.filter(|_| !validate_only) {
+                return Err(Status::new(code, "injected image update error"));
+            }
+            Ok(Response::new(
+                openshell_core::proto::compute::v1::UpdateSandboxImageResponse {},
+            ))
+        })
+    }
+
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,

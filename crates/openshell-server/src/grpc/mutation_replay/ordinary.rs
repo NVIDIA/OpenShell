@@ -472,6 +472,11 @@ scoped_mutation!(
     }
 );
 sandbox_mutation!(
+    openshell_core::proto::UpdateSandboxRequest,
+    "UpdateSandbox",
+    sandbox::handle_update_sandbox
+);
+sandbox_mutation!(
     StartSandboxRequest,
     "StartSandbox",
     sandbox::handle_start_sandbox

@@ -302,6 +302,23 @@ storage. The driver confirms the stop from both the published `Suspended`
 condition and deletion of the backing pod. Legacy `v1alpha1` controllers omit
 a usable stopped condition, so pod deletion alone confirms their stop.
 
+The optional `openshell.compute.update-sandbox-image` capability supports
+image-only updates while the sandbox is stopped. `UpdateSandboxImage` requires
+the persisted Kubernetes runtime identity, current image, sandbox name, and a
+stable operation ID with a monotonic image revision. The driver verifies that
+the same Sandbox resource is suspended, runtime bootstrap has completed, and
+no workload or supervisor Pods
+remain, then revalidates stored external-resource admission. It patches only
+the agent image, the workspace seed image, and dedicated operation evidence,
+using the resource UID and `resourceVersion` as concurrency guards. A repeat of
+the same completed operation succeeds without a second patch; a different
+current image, stale revision, or reused operation ID with different parameters
+fails closed. A stale operation cannot reapply an image after a later update
+returns to an earlier tag. Image updates do not delete or recreate the Sandbox resource, PVCs, mounts,
+trusted runtime images, or bootstrap annotations. They leave the sandbox
+stopped. Existing workspace contents and the seed sentinel remain unchanged,
+so an image update does not replace files already stored under `/sandbox`.
+
 The workspace PVC size defaults to `workspace_default_storage_size`. Set
 `workspace_storage_class` to pin the PVC to a specific `StorageClass`; an empty
 value omits `storageClassName` so the cluster's default `StorageClass` applies.

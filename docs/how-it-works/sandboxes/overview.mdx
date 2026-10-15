@@ -1010,6 +1010,54 @@ If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause
 
 For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
+### Update the Image of a Stopped Sandbox
+
+Use the raw `UpdateSandbox` RPC to change only a stopped sandbox's workload
+image. This operation initially supports the Kubernetes compute driver only;
+other drivers return `UNIMPLEMENTED`. There is no `sandbox update` CLI command
+or curated SDK update method.
+
+The update preserves the sandbox ID, Kubernetes custom resource, and persistent
+volume claim. It does not delete and recreate the sandbox, reseed its existing
+workspace from the new image, or change the trusted supervisor and sandbox
+runtime images. Other create-time configuration remains unchanged. Submitting the
+same image reference is a no-op; use a different tag or an immutable digest to
+select new image content.
+
+Follow this sequence through the CLI and a generated/raw RPC client.
+
+1. Run `openshell sandbox stop my-sandbox` and wait for `Stopped`.
+2. Call `GetSandbox` with the named `workspace_scope` and sandbox `name`. Read
+   `sandbox.metadata.resource_version` after stop completes.
+3. Call `UpdateSandbox` with the same scope and name, the nonempty OCI workload
+   `image`, and `expected_resource_version` set to that current, nonzero
+   version. The response is a `SandboxResponse`; the sandbox remains stopped.
+4. After the update succeeds, run `openshell sandbox start my-sandbox` to launch
+   the new image.
+
+If the new image fails to start and provisioning times out, wait until
+`provisioning.cleanup_completed_time` is present and
+`provisioning.driver_operation_pending` is false. Run `sandbox stop` to move the
+reclaimed sandbox from `Error` to `Stopped`, then repeat the update sequence with
+a working image. Stop retains the timeout record and storage; it does not stop
+compute again. Cleanup that is still pending cannot be bypassed.
+
+An `ABORTED` version conflict requires another read before you construct a new
+conditional request. An update failure or disconnected response can leave a
+persistent `sandbox.status.image_update` intent, even when
+`sandbox.spec.template.image` already names the target image. While that intent
+exists, start is blocked. Read the current version and retry `UpdateSandbox`
+with the intent's same `image`; do not select a different image or delete the
+sandbox to bypass reconciliation. Only a successful retry clears the intent.
+
+The optional `request_id` uses [durable request admission](/sdk/api-errors#durable-request-admission).
+A retry with the same ID must keep the original payload, including its expected
+version. An unresolved admission returns `REQUEST_OUTCOME_UNCERTAIN` rather than
+executing again. Reconcile the sandbox and pending target first, then submit a
+new conditional same-image request with a fresh version and a new ID, or no ID.
+Do not change the expected version under the original ID or blindly switch IDs
+after a timeout.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.

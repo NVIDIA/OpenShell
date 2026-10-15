@@ -27,6 +27,7 @@ const (
 	OpenShell_GetCurrentUser_FullMethodName                = "/openshell.v1.OpenShell/GetCurrentUser"
 	OpenShell_GetGatewayInfo_FullMethodName                = "/openshell.v1.OpenShell/GetGatewayInfo"
 	OpenShell_CreateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/CreateSandbox"
+	OpenShell_UpdateSandbox_FullMethodName                 = "/openshell.v1.OpenShell/UpdateSandbox"
 	OpenShell_BeginRootfsTarStaging_FullMethodName         = "/openshell.v1.OpenShell/BeginRootfsTarStaging"
 	OpenShell_GetSandbox_FullMethodName                    = "/openshell.v1.OpenShell/GetSandbox"
 	OpenShell_ListSandboxes_FullMethodName                 = "/openshell.v1.OpenShell/ListSandboxes"
@@ -132,6 +133,9 @@ type OpenShellClient interface {
 	GetGatewayInfo(ctx context.Context, in *GetGatewayInfoRequest, opts ...grpc.CallOption) (*GetGatewayInfoResponse, error)
 	// Create a new sandbox.
 	CreateSandbox(ctx context.Context, in *CreateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
+	// Update only the workload image of a stopped sandbox without deleting its
+	// identity or retained storage. Requires compute-driver image-update support.
+	UpdateSandbox(ctx context.Context, in *UpdateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error)
 	// Allocate a gateway-owned staging slot for a local rootfs tar archive.
 	//
 	// The gateway creates a request-scoped directory inside the compute driver's
@@ -401,6 +405,16 @@ func (c *openShellClient) CreateSandbox(ctx context.Context, in *CreateSandboxRe
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(SandboxResponse)
 	err := c.cc.Invoke(ctx, OpenShell_CreateSandbox_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *openShellClient) UpdateSandbox(ctx context.Context, in *UpdateSandboxRequest, opts ...grpc.CallOption) (*SandboxResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SandboxResponse)
+	err := c.cc.Invoke(ctx, OpenShell_UpdateSandbox_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1284,6 +1298,9 @@ type OpenShellServer interface {
 	GetGatewayInfo(context.Context, *GetGatewayInfoRequest) (*GetGatewayInfoResponse, error)
 	// Create a new sandbox.
 	CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error)
+	// Update only the workload image of a stopped sandbox without deleting its
+	// identity or retained storage. Requires compute-driver image-update support.
+	UpdateSandbox(context.Context, *UpdateSandboxRequest) (*SandboxResponse, error)
 	// Allocate a gateway-owned staging slot for a local rootfs tar archive.
 	//
 	// The gateway creates a request-scoped directory inside the compute driver's
@@ -1530,6 +1547,9 @@ func (UnimplementedOpenShellServer) GetGatewayInfo(context.Context, *GetGatewayI
 }
 func (UnimplementedOpenShellServer) CreateSandbox(context.Context, *CreateSandboxRequest) (*SandboxResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CreateSandbox not implemented")
+}
+func (UnimplementedOpenShellServer) UpdateSandbox(context.Context, *UpdateSandboxRequest) (*SandboxResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateSandbox not implemented")
 }
 func (UnimplementedOpenShellServer) BeginRootfsTarStaging(context.Context, *BeginRootfsTarStagingRequest) (*BeginRootfsTarStagingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginRootfsTarStaging not implemented")
@@ -1866,6 +1886,24 @@ func _OpenShell_CreateSandbox_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(OpenShellServer).CreateSandbox(ctx, req.(*CreateSandboxRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _OpenShell_UpdateSandbox_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateSandboxRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).UpdateSandbox(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_UpdateSandbox_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).UpdateSandbox(ctx, req.(*UpdateSandboxRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -3288,6 +3326,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateSandbox",
 			Handler:    _OpenShell_CreateSandbox_Handler,
+		},
+		{
+			MethodName: "UpdateSandbox",
+			Handler:    _OpenShell_UpdateSandbox_Handler,
 		},
 		{
 			MethodName: "BeginRootfsTarStaging",

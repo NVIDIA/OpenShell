@@ -421,6 +421,10 @@ above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
 ### Kubernetes E2E Notes
 
 Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
+Set `OPENSHELL_E2E_KUBE_TEST=kubernetes_image_update` to scope the Rust suite to
+image replacement with retained sandbox, SSH, and PVC identities. This target is
+included in both existing Agent Sandbox API-version lanes; unlike the Python
+Docker suite, it exercises the driver that supports image updates.
 The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.

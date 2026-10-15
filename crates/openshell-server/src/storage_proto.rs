@@ -163,12 +163,18 @@ mod tests {
     // and SUSPENDED values to the shared
     // SandboxPhase enum. Stored rows never carried those values, so prior
     // payloads decode unchanged.
+
+    // Image updates add UpdateSandboxRequest to the public inventory and
+    // SandboxImageUpdate to both the public and durable inventories through
+    // SandboxStatus. The pending intent and monotonic image revision follow the
+    // existing token-grant observation without reusing its wire tag. Legacy
+    // sandboxes decode absent/zero; revisions fence delayed driver retries.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f24c9b77a85f59ae9ab60f783d45654d78bf566fcf260f9131f1aba39fa4b59b";
+        "ad55008e162f4c0c759a047b12d4a8b30ffc04d02899edb2a5d7be44fa79fba5";
     const DURABLE_SCHEMA_SHA256: &str =
-        "ffb20595e36032a9476d1c6956e2dcdc814f85286fc4735751e5ec6f499ea9ed";
+        "36eace7a0236872f5167913e53c5be19805b837f18d85b7f6a7dee05c25a896a";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "9997e51420f29542cefd99d394e211a8e5a21967f4f0fb9ac94aaf598a821b11";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -631,7 +637,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            106 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            108 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
@@ -641,7 +647,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
@@ -651,7 +657,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            80 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            81 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
@@ -702,15 +708,26 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (330, 31),
-                (95, 22),
-                (83, 22),
+                (332, 31),
+                (96, 22),
+                (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
             ),
             "the public/durable schema inventory changed; review API and storage ownership, preserve prior-payload decoding, and update the reviewed fingerprints"
         );
+    }
+
+    #[test]
+    fn pre_image_update_sandbox_has_no_pending_image_intent() {
+        let sandbox = openshell_core::proto::Sandbox::decode(
+            legacy_bytes(SANDBOX_WITHOUT_ENDPOINT_STATUS).as_slice(),
+        )
+        .expect("legacy sandbox must remain decodable");
+        let status = sandbox.status.unwrap();
+        assert!(status.image_update.is_none());
+        assert_eq!(status.image_revision, 0);
     }
 
     #[test]

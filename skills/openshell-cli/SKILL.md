@@ -554,6 +554,32 @@ state cannot be restored; use `sandbox start` for an explicit clean boot. `sandb
 `sandbox stop`, and `sandbox delete` on a suspended sandbox discard the
 retained memory state.
 
+### Change a stopped sandbox's workload image
+
+Do not invent a `sandbox update` command or use delete/create to change an
+existing sandbox's image. The raw `UpdateSandbox` RPC initially supports only
+stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED`. Stop and
+wait for `Stopped`, read the sandbox's current resource version through
+`GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
+OCI image, and required nonzero `expected_resource_version`, then start after
+success. There is no curated SDK update method. The sandbox identity, Kubernetes
+custom resource, and persistent volume claim remain; the existing workspace is
+not reseeded and trusted runtime images do not change.
+
+For an image that fails to start and reaches a provisioning timeout, wait for
+cleanup completion and settlement of the original driver operation, then run
+`sandbox stop` to obtain `Stopped` before correcting the image. This retains the
+timeout diagnostic and storage and does not bypass pending cleanup.
+
+If raw `sandbox.status.image_update` is present after a failure, start is
+blocked. Read a fresh version and retry that same pending image. An optional
+`request_id` with an unresolved admission does not execute again; inspect and
+reconcile state before submitting a new conditional request with a fresh
+version and new ID, or no ID. Never change the payload under the original ID or
+blindly switch IDs after a timeout. See the published
+[image update workflow](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+and [API errors](https://docs.nvidia.com/openshell/latest/sdk/api-errors).
+
 ---
 
 ## Workflow 4: Policy Iteration Loop

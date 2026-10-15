@@ -152,6 +152,10 @@ async fn pending_driver_operation_blocks_error_recovery_without_mutation() {
     let runtime = test_runtime(driver.clone()).await;
     let mut sandbox = error_sandbox_record("pending-id", "pending", "StartFailed");
     let mut operation = provisioning_deadline::new_record(openshell_core::time::now_ms());
+    // Even a completion timestamp cannot override an unsettled original driver
+    // operation. This also fences malformed/stale timeout cleanup evidence.
+    operation.timeout_time = openshell_core::time::timestamp_from_millis(300_000).ok();
+    operation.cleanup_completed_time = openshell_core::time::timestamp_from_millis(320_000).ok();
     operation.driver_operation_pending = true;
     operation.driver_operation_id = "owned-operation".into();
     sandbox.status.as_mut().unwrap().provisioning = Some(operation);
@@ -188,14 +192,33 @@ async fn timeout_stop_preserves_cleanup_and_direct_start_recovery() {
         runtime.store.put_message(&sandbox).await.unwrap();
         let before = stored(&runtime, sandbox.object_id()).await;
 
-        let error = runtime
-            .stop_sandbox("default", "timeout")
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), Code::FailedPrecondition);
-        assert!(error.message().contains("start"));
-        assert_eq!(stored(&runtime, sandbox.object_id()).await, before);
-        assert_eq!(driver.stop_calls(), 0, "timeout cleanup owns reclamation");
+        let stop = runtime.stop_sandbox("default", "timeout").await;
+        if cleanup_complete {
+            let stopped = stop.expect(
+                "completed timeout cleanup permits an explicit stopped state for image repair",
+            );
+            assert_eq!(stopped.phase(), SandboxPhase::Stopped as i32);
+            assert_eq!(stopped.object_id(), before.object_id());
+            assert_eq!(stopped.spec, before.spec);
+            assert_eq!(
+                stopped.status.as_ref().unwrap().provisioning,
+                before.status.as_ref().unwrap().provisioning
+            );
+            let repeated = runtime.stop_sandbox("default", "timeout").await.unwrap();
+            assert_eq!(
+                repeated, stopped,
+                "the retained stopped transition is idempotent"
+            );
+        } else {
+            let error = stop.unwrap_err();
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert_eq!(stored(&runtime, sandbox.object_id()).await, before);
+        }
+        assert_eq!(
+            driver.stop_calls(),
+            0,
+            "timeout cleanup already owns reclamation"
+        );
 
         let result = runtime.start_sandbox("default", "timeout").await;
         if cleanup_complete {
@@ -212,6 +235,35 @@ async fn timeout_stop_preserves_cleanup_and_direct_start_recovery() {
         }
         assert_eq!(driver.delete_calls(), 0);
     }
+}
+
+#[tokio::test]
+async fn reclaimed_timeout_can_still_start_directly_without_stop() {
+    let driver = ControlledDriver::new();
+    driver.set_start_outcome(ControlledLifecycleOutcome::NotFound);
+    driver.track_compute.store(true, Ordering::SeqCst);
+    let runtime = test_runtime(driver.clone()).await;
+    let mut sandbox = error_sandbox_record(
+        "direct-timeout-id",
+        "direct-timeout",
+        "ImagePreparationTimedOut",
+    );
+    let mut operation = provisioning_deadline::new_record(0);
+    operation.timeout_time = openshell_core::time::timestamp_from_millis(300_000).ok();
+    operation.cleanup_completed_time = openshell_core::time::timestamp_from_millis(320_000).ok();
+    sandbox.status.as_mut().unwrap().provisioning = Some(operation);
+    runtime.store.put_message(&sandbox).await.unwrap();
+
+    let starting = runtime
+        .start_sandbox("default", "direct-timeout")
+        .await
+        .unwrap();
+    assert_eq!(starting.phase(), SandboxPhase::Starting as i32);
+    assert_eq!(starting.object_id(), sandbox.object_id());
+    assert!(driver.compute_exists.load(Ordering::SeqCst));
+    assert_eq!(driver.start_calls(), 1);
+    assert_eq!(driver.stop_calls(), 0);
+    assert_eq!(driver.delete_calls(), 0);
 }
 
 #[tokio::test]

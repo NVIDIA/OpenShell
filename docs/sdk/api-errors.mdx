@@ -56,7 +56,7 @@ guarantee.
 | `ABORTED` | Read fresh state before retrying a conditional operation. |
 | `UNAVAILABLE`, `RESOURCE_EXHAUSTED` | A transient condition may recover. Apply backoff and any minimum retry delay only to a retry-safe operation. |
 | `DEADLINE_EXCEEDED`, `CANCELLED` | A mutation's outcome can be unknown. Cancellation does not imply rollback. |
-| `UNIMPLEMENTED` | Check gateway and SDK version compatibility. |
+| `UNIMPLEMENTED` | Check gateway and SDK version compatibility and whether the compute driver supports the operation. |
 | `INTERNAL`, `UNKNOWN`, `DATA_LOSS` | Preserve the status and correlation metadata for diagnosis. Do not blindly retry mutations. |
 
 ## SDK access
@@ -92,14 +92,14 @@ No SDK automatically retries a mutation as a result of decoding these details.
 
 ## Durable request admission
 
-Thirty user-callable unary RPCs accept an optional `request_id` in their protobuf requests.
+Thirty-one user-callable unary RPCs accept an optional `request_id` in their protobuf requests.
 
 | Resource | RPCs |
 |---|---|
 | Workspace | `CreateWorkspace`, `DeleteWorkspace` |
 | Workspace member | `AddWorkspaceMember`, `RemoveWorkspaceMember` |
 | Sandbox template | `CreateSandboxTemplate`, `DeleteSandboxTemplate` |
-| Sandbox | `CreateSandbox`, `DeleteSandbox`, `StartSandbox`, `StopSandbox`, `AttachSandboxProvider`, `DetachSandboxProvider` |
+| Sandbox | `CreateSandbox`, `UpdateSandbox`, `DeleteSandbox`, `StartSandbox`, `StopSandbox`, `AttachSandboxProvider`, `DetachSandboxProvider` |
 | Service | `ExposeService`, `DeleteService` |
 | Provider | `CreateProvider`, `UpdateProvider`, `DeleteProvider`, `ConfigureProviderRefresh`, `DeleteProviderRefresh`, `RotateProviderCredential` |
 | Provider profile | `ImportProviderProfiles`, `UpdateProviderProfiles`, `DeleteProviderProfile` |
@@ -191,6 +191,33 @@ rootfs staging, and supervisor-authenticated mutations do not gain deduplication
 from this feature. Sandbox principals cannot opt into `UpdateConfig` admission.
 Check gateway compatibility
 before relying on IDs; older protobuf servers can silently ignore unknown fields.
+
+### Sandbox image update recovery
+
+`UpdateSandbox` is an image-only conditional mutation for stopped Kubernetes
+sandboxes. Other compute drivers return `UNIMPLEMENTED`. Supply a named
+`workspace_scope`, sandbox `name`, nonempty OCI `image`, and a required nonzero
+`expected_resource_version` read from `sandbox.metadata.resource_version`.
+A stale version returns `ABORTED`; read fresh state before constructing another
+conditional request. The operation does not start compute.
+
+A failed or interrupted update can leave durable `sandbox.status.image_update`
+state. The desired spec image alone does not prove driver reconciliation
+completed. Start returns `FAILED_PRECONDITION` until you successfully retry the
+same pending image using the current resource version. A different target image
+cannot replace a pending update.
+
+If the original request supplied `request_id`, an error leaves its admission
+unresolved. Reusing that ID with the original payload returns
+`REQUEST_OUTCOME_UNCERTAIN`; changing its expected version returns
+`REQUEST_ID_PAYLOAD_MISMATCH`. Inspect and reconcile the pending image first,
+then make a new conditional same-image request with the fresh version and a new
+ID, or without an ID. This is explicit recovery, not permission to blindly
+repeat uncertain mutations. A replay of a confirmed success returns the
+sandbox's current state without applying the image again.
+
+See [Update the Image of a Stopped Sandbox](/how-it-works/sandboxes/overview#update-the-image-of-a-stopped-sandbox)
+for the stop, update, and start workflow and storage guarantees.
 
 ## Exec launch admission
 

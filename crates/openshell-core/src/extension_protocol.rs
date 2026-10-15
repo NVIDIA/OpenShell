@@ -25,6 +25,9 @@ pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend
 /// Driver implements `SuspendSandbox` and resuming through `StartSandbox`.
 pub const COMPUTE_SUSPEND_RESUME: &str = "openshell.compute.suspend-resume";
 
+/// Optional stopped-state image updates retaining the resource and its storage.
+pub const COMPUTE_UPDATE_SANDBOX_IMAGE: &str = "openshell.compute.update-sandbox-image";
+
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
 const MAX_CAPABILITY_BYTES: usize = 128;

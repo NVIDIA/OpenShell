@@ -53,6 +53,16 @@ service OpenShell {
     };
   }
 
+  // Update only the workload image of a stopped sandbox without deleting its
+  // identity or retained storage. Requires compute-driver image-update support.
+  rpc UpdateSandbox(UpdateSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+
   // Allocate a gateway-owned staging slot for a local rootfs tar archive.
   //
   // The gateway creates a request-scoped directory inside the compute driver's
@@ -1242,6 +1252,20 @@ message SandboxStatus {
   // failures before a configured endpoint or credential could be selected.
   // Matching grant success or a policy, provider, or supervisor reset clears it.
   TokenGrantFailureObservation last_token_grant_failure = 17;
+  // Durable pending image change. Start is blocked until the same image update
+  // is retried successfully. Absence means no image update is pending.
+  SandboxImageUpdate image_update = 18;
+  // Monotonic gateway-owned image intent revision. Never reset by restart.
+  uint64 image_revision = 19;
+}
+
+// Gateway-owned intent retained across interrupted driver operations.
+message SandboxImageUpdate {
+  string operation_id = 1;
+  string previous_image = 2;
+  string image = 3;
+  // Fences delayed operations, including image changes that return to an old tag.
+  uint64 revision = 4;
 }
 
 // User-facing sandbox condition derived from platform or gateway observations.
@@ -1328,6 +1352,22 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
+}
+
+// Image-only update. Other create-time configuration is not mutable through
+// this RPC. Stop before updating; start explicitly after a successful update.
+message UpdateSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Canonical name of the existing sandbox; this is not a rename or upsert.
+  string name = 2;
+  // Nonempty OCI workload image reference. This does not change trusted runtime
+  // images or reseed an existing workspace.
+  string image = 3;
+  // Required nonzero resource version read by the caller.
+  uint64 expected_resource_version = 4;
+  // Optional nonzero UUID for durable at-most-once admission.
+  string request_id = 5;
 }
 
 message CreateSandboxTemplateRequest {
