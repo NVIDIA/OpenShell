@@ -4212,6 +4212,8 @@ mod tests {
             auth_bundle,
             None,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("missing admission cannot authorize startup");

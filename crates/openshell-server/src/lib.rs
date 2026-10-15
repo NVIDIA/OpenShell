@@ -1343,7 +1343,6 @@ pub trait ComputeDriverFactory: Send + Sync {
     fn supports_network_supervisor_trust(&self) -> bool {
         false
     }
-    }
 
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
@@ -2265,6 +2264,8 @@ mod tests {
             driver_startup: crate::compute::driver_config::DriverStartupContext {
                 file: None,
                 guest_tls: None,
+                network_trust: None,
+                network_trust_configured: false,
                 gateway_port: 8080,
                 gateway_tls_enabled: false,
                 endpoint_overrides: &endpoint_overrides,

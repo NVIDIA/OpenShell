@@ -12440,6 +12440,7 @@ mod tests {
                 sandbox_api_version: Arc::new(OnceCell::new()),
                 lifecycle_gates: Arc::default(),
                 config: managed_config(&[]),
+                network_trust_bundle: None,
                 operator_allowlist: None,
             };
             let service = crate::ComputeDriverService::new(driver);
