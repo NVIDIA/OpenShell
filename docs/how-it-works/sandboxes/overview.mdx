@@ -745,30 +745,11 @@ Read `last_result` to choose the next check:
 - `NoObservedExchange`: nothing has been reported for the current configuration and supervisor session. Try the operation, then check the logs if no result appears.
 - `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Check the client's response for protocol or tool errors, because an HTTP 200 can still carry one.
 - `PolicyDenied`: OpenShell denied the request, including MCP protocol-version, request-header, request-body, and HTTP-method checks. Check the sandbox policy and denial logs.
-- `CredentialUnavailable`: a required credential was unavailable. Check the endpoint's attached provider and `last_failure`.
+- `CredentialUnavailable`: a required credential was unavailable. Check the attached provider and [diagnose the token grant failure](#read-token-grant-failures).
 - `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
 - `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
 - `UpstreamRejected`: the server returned HTTP 400 or higher. Check the server's response and logs.
 - `Unspecified`: the result is unrecognized or absent. Do not infer success.
-
-For a provider-credentialed MCP-over-HTTP endpoint, a failed [dynamic token grant](/how-it-works/providers/profiles#token-grant-failures) sets `last_failure`, which explains `CredentialUnavailable`. The tool server can still be healthy. `openshell sandbox get` prints it under the result:
-
-```text
-Last result: Required OpenShell-managed credential was unavailable.
-Cause: provider_authorization_required (token grant, stage gateway_rpc)
-Credential: github/access_token
-Recovery: Reauthorize the provider credential.
-Request ID: 7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908
-```
-
-`last_failure` has `domain`, `code`, `recovery_action`, `provider`, `credential_key`, `stage`, `upstream_http_status`, and `request_id` in JSON and YAML, and is `null` when no cause was reported. `recovery_action` is one of:
-
-- `reauthorize`: the user authorizes the provider again.
-- `fix_configuration`: an operator repairs the provider, grant, or workload identity configuration.
-- `retry`: the failure can be temporary.
-- `investigate`: an operator checks the supervisor and gateway logs for the request ID.
-
-`request_id` matches the `x-openshell-request-id` header of the refused response. `provider` and `credential_key` are names, never values, and are empty if the grant failed before credential selection. Like `last_result`, `last_failure` is the last observation only: a later exchange replaces it, and changing the attached provider clears it.
 
 For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After it recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
 
@@ -780,13 +761,26 @@ Addresses use lowercase hosts, canonical paths, and sorted distinct effective po
 
 ### Read Token Grant Failures
 
-`openshell sandbox get` shows `last_token_grant_failure` for the latest classified grant refusal, including REST requests and failures before an HTTP path is known. The protobuf field is `Sandbox.status.last_token_grant_failure`. It has `destination_host`, `destination_port`, and a `failure` with the fields above. It describes the attempted call, not server health.
+When OpenShell cannot obtain a required token, the workload receives HTTP 502 with an `x-openshell-request-id` header. The response hides the cause. If you can read the sandbox, inspect its latest failure:
 
 ```shell
 openshell sandbox get my-sandbox --output json | jq '.last_token_grant_failure'
 ```
 
-Match `failure.request_id` with the refused response's `x-openshell-request-id` before recovering, because a newer failure replaces this record. A successful grant for the same destination, provider, and credential clears it, or for the same destination if the failure came before credential selection. A policy, provider, or supervisor-session reset also clears it. The value is `null` when nothing is retained.
+Match `failure.request_id` to the response header; a newer failure may have replaced the record. It identifies the destination host and port, failure code, stage, and recovery action. Provider and credential names appear when known; credential values never appear.
+
+| Recovery action | Next step |
+|---|---|
+| `reauthorize` | Authorize the provider again. |
+| `fix_configuration` | Repair the provider, grant, or workload identity configuration. |
+| `retry` | Retry later. |
+| `investigate` | Check supervisor and gateway logs using the request ID. |
+
+For MCP-over-HTTP endpoints, `Tool server connections` also shows the cause as `last_failure` under `CredentialUnavailable`. A credential failure does not establish that the remote server is unhealthy.
+
+The sandbox retains one latest failure, not a request history. A successful grant for the same destination, provider, and credential clears it; failures before credential selection clear on the next successful grant to that destination. Policy, provider, and supervisor-session resets also clear it. JSON/YAML shows `null` when no failure remains.
+
+See [Token Grant Failures](/how-it-works/providers/profiles#token-grant-failures) for failure-code definitions and token-service behavior.
 
 ### Inspect Logs and Activity
 
