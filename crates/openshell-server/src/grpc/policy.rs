@@ -2790,15 +2790,8 @@ pub(super) async fn handle_get_sandbox_config(
     let result = handle_get_sandbox_config_inner(state, request).await;
     match result {
         Err(error)
-            if matches!(principal, Principal::Sandbox(_))
-                && matches!(
-                    error.code(),
-                    Code::FailedPrecondition | Code::InvalidArgument
-                ) =>
+            if matches!(principal, Principal::Sandbox(_)) && is_configuration_rejection(&error) =>
         {
-            // A malformed stored candidate must not prevent a supervisor
-            // from registering its startup fence and waiting for repair.
-            // Do not expose parser payloads or copy malformed policy history.
             let sandbox = super::sandbox::resolve_and_authorize_sandbox_name(
                 state,
                 &principal,
@@ -2807,19 +2800,39 @@ pub(super) async fn handle_get_sandbox_config(
                 MinWorkspaceRole::User,
             )
             .await?;
-            Ok(Response::new(GetSandboxConfigResponse {
-                configuration_admitted: false,
-                configuration_error: configuration_failure_diagnostic(&error).to_string(),
-                configuration_instance_id: sandbox
-                    .status
-                    .as_ref()
-                    .and_then(|status| status.configuration_admission.as_ref())
-                    .map_or_else(String::new, |admission| admission.instance_id.clone()),
-                workspace: sandbox.object_workspace().to_string(),
-                ..Default::default()
-            }))
+            Ok(Response::new(sandbox_config_response(
+                unadmitted_sandbox_config(&sandbox, &error),
+            )))
         }
         result => result,
+    }
+}
+
+/// Whether a configuration build failed on the stored configuration itself,
+/// rather than on a transient store or credential error.
+pub fn is_configuration_rejection(error: &Status) -> bool {
+    matches!(
+        error.code(),
+        Code::FailedPrecondition | Code::InvalidArgument
+    )
+}
+
+/// The configuration a supervisor receives while its stored configuration is
+/// rejected: not admitted, so the supervisor fails closed until a repair.
+/// A malformed stored candidate must not prevent a supervisor from waiting
+/// for that repair. Do not expose parser payloads or copy malformed policy
+/// history.
+pub fn unadmitted_sandbox_config(sandbox: &Sandbox, error: &Status) -> SandboxConfigSnapshot {
+    SandboxConfigSnapshot {
+        configuration_admitted: false,
+        configuration_error: configuration_failure_diagnostic(error).to_string(),
+        configuration_instance_id: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.as_ref())
+            .map_or_else(String::new, |admission| admission.instance_id.clone()),
+        workspace: sandbox.object_workspace().to_string(),
+        ..Default::default()
     }
 }
 

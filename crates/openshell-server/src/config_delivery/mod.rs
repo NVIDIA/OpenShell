@@ -27,7 +27,8 @@ use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
-    build_sandbox_config_snapshot_from_inputs, load_sandbox_config_inputs,
+    build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
+    load_sandbox_config_inputs, unadmitted_sandbox_config,
 };
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 
@@ -329,7 +330,26 @@ impl Deliver for Builder<'_> {
         )
         .await;
         let (inputs, sandbox_config) = match built {
-            Ok(Ok(Some(built))) => built,
+            Ok(Ok(Some(BuiltSandboxConfig::Built(inputs, sandbox_config)))) => {
+                (*inputs, sandbox_config)
+            }
+            Ok(Ok(Some(BuiltSandboxConfig::Rejected {
+                sandbox_config,
+                providers,
+                error_code,
+            }))) => {
+                record_build_failure(sandbox_id, "rejected", error_code, started.elapsed());
+                let provider_environment = unresolved_provider_environment(&sandbox_config);
+                let config = SupervisorConfig {
+                    sandbox_config,
+                    provider_environment,
+                };
+                let owner = deliver_if_owner(state, sandbox_id, &record.session_id, config).await;
+                if matches!(owner, OwnerCheck::Remote) {
+                    notify_peer(state, PeerNotifyTarget::Sandbox(record.sandbox_id.clone()));
+                }
+                return (matches!(owner, OwnerCheck::Unknown), Some(providers));
+            }
             Ok(Ok(None)) => {
                 record_build("ok", started.elapsed());
                 return (false, None);
@@ -377,12 +397,23 @@ impl Deliver for Builder<'_> {
     }
 }
 
+enum BuiltSandboxConfig {
+    Built(Box<SandboxConfigInputs>, SandboxConfigSnapshot),
+    /// The stored configuration is invalid, so the supervisor receives the
+    /// not-admitted configuration polling serves and fails closed.
+    Rejected {
+        sandbox_config: SandboxConfigSnapshot,
+        providers: HashSet<String>,
+        error_code: Code,
+    },
+}
+
 /// Read the sandbox and the inputs its configuration shares, and build its
 /// sandbox configuration, or `None` once the sandbox is gone.
 async fn build_sandbox_config(
     state: &Arc<ServerState>,
     sandbox_id: &str,
-) -> Result<Option<(SandboxConfigInputs, SandboxConfigSnapshot)>, Status> {
+) -> Result<Option<BuiltSandboxConfig>, Status> {
     let Some(sandbox) = state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -391,9 +422,27 @@ async fn build_sandbox_config(
     else {
         return Ok(None);
     };
-    let inputs = load_sandbox_config_inputs(state, sandbox).await?;
-    let snapshot = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
-    Ok(Some((inputs, snapshot)))
+    let built = async {
+        let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
+        let snapshot = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
+        Ok::<_, Status>((inputs, snapshot))
+    }
+    .await;
+    match built {
+        Ok((inputs, snapshot)) => Ok(Some(BuiltSandboxConfig::Built(Box::new(inputs), snapshot))),
+        Err(error) if is_configuration_rejection(&error) => {
+            Ok(Some(BuiltSandboxConfig::Rejected {
+                sandbox_config: unadmitted_sandbox_config(&sandbox, &error),
+                providers: sandbox
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.providers.iter().cloned().collect())
+                    .unwrap_or_default(),
+                error_code: error.code(),
+            }))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// The provider environment `sandbox` names. The session's last resolved
@@ -1067,6 +1116,70 @@ mod tests {
             .await
             .expect("configuration update");
         assert!(is_config_update(&update));
+    }
+
+    /// Store a policy revision that decodes but fails stored-policy
+    /// validation: MCP options on a non-MCP endpoint.
+    async fn store_invalid_policy(state: &ServerState, sandbox_id: &str, version: i64) {
+        use crate::policy_store::PolicyStoreExt as _;
+        use openshell_core::proto::{McpOptions, NetworkEndpoint, NetworkPolicyRule};
+        use prost::Message as _;
+
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "mcp".to_string(),
+            NetworkPolicyRule {
+                name: "mcp".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.example.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    mcp: Some(McpOptions {
+                        strict_tool_names: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        state
+            .store
+            .put_policy_revision(
+                &uuid::Uuid::new_v4().to_string(),
+                sandbox_id,
+                "default",
+                version,
+                &policy.encode_to_vec(),
+                "uncanonicalized-hash",
+            )
+            .await
+            .unwrap();
+    }
+
+    fn delivered_sandbox_config(message: GatewayMessage) -> SandboxConfigSnapshot {
+        let Some(gateway_message::Payload::ConfigUpdate(update)) = message.payload else {
+            panic!("expected a configuration update");
+        };
+        update.sandbox_config.expect("sandbox configuration")
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_policy_is_delivered_not_admitted() {
+        let state = push_state().await;
+        put_sandbox(&state, "sandbox", &[]).await;
+        let (mut harness, session_id) = accepted_session(&state, "sandbox").await;
+
+        store_invalid_policy(&state, "sandbox", 1).await;
+        handle_peer_notify_config_update(&state, peer_notify("sandbox", &session_id)).unwrap();
+        let rejected = delivered_sandbox_config(
+            next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("configuration update"),
+        );
+        assert!(!rejected.configuration_admitted);
+        assert!(rejected.policy.is_none());
+        assert!(!rejected.configuration_error.is_empty());
     }
 
     #[tokio::test]
