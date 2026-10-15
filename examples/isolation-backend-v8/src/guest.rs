@@ -219,6 +219,7 @@ impl Guest {
                     })
                     .unwrap_or_else(|| "JavaScript execution failed".into());
                 stderr.append(&message);
+                stderr.append("\n");
                 Ok(GuestStatus::Failed)
             }
         })();

@@ -12,6 +12,8 @@ From this example directory:
 ./start.sh
 ```
 
+Pass a JavaScript file to run another script: `./start.sh path/to/script.js`.
+
 The script builds the binaries, generates local configuration and credentials,
 and starts the backend, driver, and gateway. The first build downloads the V8
 library. The script prints the temporary directory containing `gateway.toml` and
@@ -45,17 +47,17 @@ backend name to `backend.sock`.
 In another terminal, from this example directory:
 
 ```shell
-export PATH="$PWD/../../target/debug:$PATH"
 export OPENSHELL_GATEWAY_ENDPOINT=http://127.0.0.1:18770
-openshell sandbox create --name v8-demo --policy policy.yaml \
-  --detach --no-tty --no-auto-providers -- /work/guest.js
+openshell sandbox create --name v8-demo \
+  --keep --no-tty --no-auto-providers -- /work/guest.js
 ```
 
 The driver starts the supervisor. The backend loads `guest.js` into a fresh V8
 isolate with `console.log` and `httpGet`. No filesystem, process, or direct
 network API is exposed. `httpGet` sends the request through the Sandbox Protocol;
-the supervisor enforces `policy.yaml`, whose empty `network_policies` denies it.
-The guest succeeds only on that policy denial; transport failures are errors.
+the supervisor's default policy has no network grants and denies it. No policy
+file is needed. The guest succeeds only on that policy denial; transport failures
+are errors.
 
 ```javascript
 const url = "http://1.1.1.1/";
@@ -67,8 +69,13 @@ if (result !== -1) {
 console.log("Request denied by supervisor network policy (expected)");
 ```
 
-The script prints a `tail -f` command for the backend log, which includes guest
-output. `openshell logs v8-demo` shows the supervisor's policy-denial audit.
+The create command prints the script's output and returns its exit code. The
+sandbox becomes `Completed` on exit code 0 or `Error` on a nonzero exit code.
+`--keep` retains the sandbox so you can inspect that result after the command.
+`openshell logs v8-demo` shows the supervisor's policy-denial audit.
+
+Add `--detach` to run without attaching; detached creation does not stream guest
+output. Use `openshell sandbox connect v8-demo` to attach afterward.
 
 ## Inspect and stop
 

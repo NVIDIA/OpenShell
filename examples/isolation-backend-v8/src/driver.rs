@@ -263,6 +263,11 @@ impl Driver {
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &self.state_dir)
             .env(
+                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(Some(spec))
+                    .map_err(internal)?,
+            )
+            .env(
                 openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
                 BACKEND,
             )
@@ -297,8 +302,6 @@ impl Driver {
             .arg("--isolation-backends-file")
             .arg(self.state_dir.join("registrations.json"))
             .arg("--parent-liveness-stdin")
-            .arg("--")
-            .arg("/work/guest.js")
             .stdin(std::process::Stdio::piped())
             .stdout(output)
             .stderr(errors);

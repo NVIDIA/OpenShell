@@ -60,7 +60,7 @@ trap 'exit 143' TERM
 
 v8-backend backend --state-dir "$v8_state_dir" > "$v8_state_dir/backend.log" 2>&1 &
 v8_children+=("$!")
-v8-backend driver --state-dir "$v8_state_dir" > "$v8_state_dir/driver.log" 2>&1 &
+v8-backend driver --state-dir "$v8_state_dir" --script "${1:-guest.js}" > "$v8_state_dir/driver.log" 2>&1 &
 v8_children+=("$!")
 for ((i=0; i<100; i++)); do
   if [[ -S "$v8_state_dir/compute.sock" ]]; then break; fi
