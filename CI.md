@@ -43,7 +43,7 @@ missing baselines, merge conflicts, and tool failures always fail the check.
 Release qualification compares the tagged candidate cumulatively against the previous
 stable release, using the same minor-versus-patch policy. Its result is part
 of the qualification profile: failure blocks stable publication and fails the
-Pre-release workflow after its artifacts are published. Qualification evidence
+Pre-release workflow without blocking pre-release publication. Qualification evidence
 remains in Actions. This checks
 protobuf compatibility; SDK/configuration compatibility and migration review
 remain separate qualification work.
@@ -271,7 +271,7 @@ CI container.
 
 Tagged releases treat Cargo Deny findings as failures of the
 currently implemented qualification profile. A profile failure prevents stable
-publication. Pre-releases publish first; failed qualification fails the parent
+publication. Pre-release publication runs alongside qualification; failed qualification fails the parent
 workflow and sends the failure notification while published artifacts remain
 available. CodeQL, Trivy, and Zizmor findings are
 temporarily informational for tagged releases: the existing findings were
@@ -295,7 +295,7 @@ gh workflow run security-scan.yml --ref main \
 
 To integrate it into a larger workflow, run it after the job that creates the
 candidate tag and stages source-addressed artifacts for scanning. Stable
-publication follows successful qualification; pre-release publication precedes it.
+publication follows successful qualification; pre-release publication runs alongside it.
 This example assumes an existing
 `build` job with outputs named `candidate_tag`, `gateway_image`, `sandbox_image`,
 and `chart_ref`; adapt those names to your workflow:
@@ -324,7 +324,7 @@ jobs:
 Set `needs: security` on a downstream promotion job to require successful scans.
 `Release` and `Pre-release` share `release-build.yml`, `release-publish.yml`, and
 `release-qualification.yml`. Release builds, qualifies, then publishes. Pre-release
-builds, publishes, then qualifies within the same run, using native job dependencies.
+builds, then publishes and qualifies in parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
@@ -332,7 +332,7 @@ qualification. Failed checks fail the parent workflow and retain evidence in Act
 
 Each qualification attempt writes its result to the Actions run summary and
 uploads `qualification-summary.json` as a 90-day workflow artifact. The qualification
-workflow publishes passing and failing summaries to
+workflow attempts to publish passing and failing summaries to
 `ghcr.io/nvidia/openshell/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
 The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
@@ -581,7 +581,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release-tag.yml` | Release orchestrator for stable tags: build, qualify, publish. Automatic tag triggers exclude `-pre.*`. |
-| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, dispatched by Release Auto-Tag or manually: build, publish, qualify. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
+| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually: build, then publish and qualify in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |

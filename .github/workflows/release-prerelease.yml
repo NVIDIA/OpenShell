@@ -4,6 +4,9 @@
 name: Pre-release
 
 on:
+  push:
+    tags:
+      - "v*.*.*-pre.*"
   workflow_dispatch:
     inputs:
       tag:
@@ -23,7 +26,7 @@ jobs:
       packages: write
     uses: ./.github/workflows/release-build.yml
     with:
-      release-tag: ${{ inputs.tag }}
+      release-tag: ${{ inputs.tag || github.ref_name }}
       is-prerelease: true
     secrets:
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -40,7 +43,7 @@ jobs:
       artifact-metadata: write
     uses: ./.github/workflows/release-publish.yml
     with:
-      release-tag: ${{ inputs.tag }}
+      release-tag: ${{ inputs.tag || github.ref_name }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       semver: ${{ needs.build.outputs.semver }}
       python-version: ${{ needs.build.outputs.python_version }}
@@ -49,7 +52,7 @@ jobs:
 
   qualify:
     name: Qualify
-    needs: [build, publish]
+    needs: build
     permissions:
       actions: read
       contents: read
@@ -58,7 +61,7 @@ jobs:
       pull-requests: read
     uses: ./.github/workflows/release-qualification.yml
     with:
-      release-tag: ${{ inputs.tag }}
+      release-tag: ${{ inputs.tag || github.ref_name }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       is-prerelease: true
     secrets:
@@ -107,7 +110,7 @@ jobs:
       - name: Send Slack notification
         continue-on-error: true
         env:
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
           PUBLICATION_RESULT: ${{ needs.publish.result }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
           SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}

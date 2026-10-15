@@ -169,12 +169,12 @@ train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
 the `release-tag-v1` qualification profile. Release and Pre-release call the reusable
 `release-qualification.yml` workflow to run the checks and collect their results.
-Release builds, qualifies, then publishes. Pre-release builds, publishes, then
-qualifies in the same run. Failed, cancelled, or skipped required suites fail
+Release builds, qualifies, then publishes. Pre-release builds, then publishes
+and qualifies in parallel in the same run. Failed, cancelled, or skipped required suites fail
 qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the
 run link. Both callers share `release-build.yml` and `release-publish.yml`.
-Qualification evidence remains in Actions and OCI storage for diagnosis.
+Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
 Snap Store uploads happen only for stable releases after qualification passes.
 
 For `Codex Compatibility Review`, inspect its job summary and the

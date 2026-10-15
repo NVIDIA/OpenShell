@@ -225,12 +225,23 @@ jobs:
           if-no-files-found: error
 
       - name: Install ORAS
+        id: oras
+        continue-on-error: true
+        timeout-minutes: 1
         uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.0
 
       - name: Log in to GHCR
+        id: ghcr
+        if: steps.oras.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
         run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Publish qualification summary
+        id: oci
+        if: steps.ghcr.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
         env:
           SOURCE_SHA: ${{ inputs.source-sha }}
         run: |
@@ -244,6 +255,11 @@ jobs:
             qualification-summary.json:application/vnd.nvidia.openshell.qualification.summary.v1+json
 
           echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Warn if OCI summary publication failed
+        if: ${{ !cancelled() && (steps.oras.outcome == 'failure' || steps.ghcr.outcome == 'failure' || steps.oci.outcome == 'failure') }}
+        run: |
+          echo "::warning::Could not publish the qualification summary to OCI. The summary remains available in this run's Actions artifacts."
 
       - name: Require current qualification profile
         if: steps.summary.outputs.current-profile-passed != 'true'
