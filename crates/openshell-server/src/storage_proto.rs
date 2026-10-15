@@ -121,11 +121,11 @@ mod tests {
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
-    // ProviderProfileFile is reachable from stored provider profiles. Its
-    // additive declaration changes the durable and public/durable overlap
-    // inventories; the provider-environment file map is public-only. The
-    // request has no provider-file capability field: older supervisors ignore
-    // the additive file map while retaining the rest of the response.
+    // ProviderProfileFile and ProviderProfileEnvironment are reachable from
+    // stored provider profiles. Their additive declarations change the public,
+    // durable, and overlap inventories while preserving existing field tags and
+    // legacy payload decoding. The provider-environment file map is public-only;
+    // older supervisors ignore it while retaining the rest of the response.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
     // Existing rows decode with both absent and retain their active deadline;
     // no stored attempt gains another phase or time budget on upgrade.
@@ -149,11 +149,11 @@ mod tests {
     // ListProvidersRequest field 4 adds a public-only label selector. Older
     // requests decode an empty selector; durable schemas remain unchanged.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "b6734ba353b4ffe81240309f7971ef48f6473e14ce2196412beabe1984b0548d";
+        "38522dccd5a89d3816ff27b83323f0b49c2da81209fd85fe8b85361353197db0";
     const DURABLE_SCHEMA_SHA256: &str =
-        "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
+        "ed4360fa578dbe0f3c7794354930c159012ff4e92ae53f6168d380378636092e";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "e6823be4512eb3731a1a04aa89215b6c2c2acaef1c99735c1a4c9e3b50ff8ee4";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -621,9 +621,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (314, 27),
+                (96, 21),
+                (84, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -764,6 +764,8 @@ mod tests {
         let profile = profile.profile.expect("profile");
         assert_eq!(profile.id, "profile");
         assert_eq!(profile.display_name, "Legacy");
+        assert!(profile.environment.is_none());
+        assert!(profile.required_platform_adapter.is_empty());
 
         let policy_payload =
             PolicyRevisionPayload::decode(legacy_bytes(V0_0_116_POLICY_PAYLOAD).as_slice())

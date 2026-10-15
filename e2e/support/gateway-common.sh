@@ -237,12 +237,22 @@ EOF
 e2e_import_example_provider_profiles() {
   local cli_bin=$1
   local root=$2
+  local profile adapter
 
   echo "Importing example provider profiles from ${root}/providers..."
-  if ! "${cli_bin}" provider profile import --from "${root}/providers" --global; then
-    echo "ERROR: failed to import example provider profiles" >&2
-    return 1
-  fi
+  for profile in "${root}"/providers/*.yaml; do
+    adapter="$(yq -r '.required_platform_adapter // ""' "${profile}")" || return 1
+    # The standard Linux test runtimes provide the supervisor GCP metadata
+    # adapter. Other platform adapters need a specialized suite.
+    if [ -n "${adapter}" ] && [ "${adapter}" != "gcp-metadata" ]; then
+      echo "Skipping ${profile}: requires platform adapter ${adapter}"
+      continue
+    fi
+    if ! "${cli_bin}" provider profile import --file "${profile}" --global; then
+      echo "ERROR: failed to import example provider profile ${profile}" >&2
+      return 1
+    fi
+  done
 }
 
 # Register an administrator OIDC session for a gateway, non-interactively.
