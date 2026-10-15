@@ -25,12 +25,13 @@ use tracing::warn;
 
 use crate::ServerState;
 use crate::auth::principal::Principal;
+use crate::gateway_members::{GatewayMember, GatewayMemberIndex, MEMBER_TTL};
 use crate::grpc::policy::{
     SandboxConfigInputs, build_provider_environment_snapshot_from_inputs,
     build_sandbox_config_snapshot_from_inputs, is_configuration_rejection,
     load_sandbox_config_inputs, unadmitted_sandbox_config,
 };
-use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
+use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex, dialable_peer_endpoint};
 
 pub use task::Registration;
 use task::{Deliver, FanoutScope, SessionRecord};
@@ -651,12 +652,23 @@ async fn notify_sandbox_owner(state: &Arc<ServerState>, sandbox_id: &str) -> Pee
     PeerNotifyResult::Done
 }
 
+/// The endpoints of the other live replicas, the only ones that can own a
+/// session this replica does not. A replica without a peer endpoint does not
+/// join the membership.
+fn peer_endpoints(members: Vec<GatewayMember>, local_replica_id: &str) -> Vec<String> {
+    members
+        .into_iter()
+        .filter(|member| member.replica_id != local_replica_id)
+        .filter_map(|member| dialable_peer_endpoint(&member.peer_endpoint).map(str::to_string))
+        .collect()
+}
+
 async fn notify_peers(state: &Arc<ServerState>, scope: &FanoutScope) {
-    let owners = SupervisorOwnerIndex::new(Arc::clone(&state.store), OWNER_TTL);
-    let endpoints = match owners.list_fresh_peer_endpoints(&state.replica_id).await {
-        Ok(endpoints) => endpoints,
+    let members = GatewayMemberIndex::new(Arc::clone(&state.store), MEMBER_TTL);
+    let endpoints = match members.live_members().await {
+        Ok(members) => peer_endpoints(members, &state.replica_id),
         Err(error) => {
-            warn!(error = %error, "configuration peer fanout owner listing failed");
+            warn!(error = %error, "configuration peer fanout membership listing failed");
             return;
         }
     };
@@ -1064,6 +1076,21 @@ mod tests {
             message.payload,
             Some(gateway_message::Payload::ConfigUpdate(_))
         )
+    }
+
+    #[test]
+    fn peer_fanout_dials_other_live_replicas() {
+        let member = |replica_id: &str, peer_endpoint: &str| GatewayMember {
+            replica_id: replica_id.into(),
+            peer_endpoint: peer_endpoint.into(),
+        };
+        let members = vec![
+            member("gw-1", "http://gw-1"),
+            member("gw-2", "http://gw-2"),
+            member("gw-3", "local://unreachable"),
+            member("gw-4", ""),
+        ];
+        assert_eq!(peer_endpoints(members, "gw-1"), vec!["http://gw-2"]);
     }
 
     #[tokio::test]
