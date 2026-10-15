@@ -13,6 +13,8 @@ The [shorthand log format](/observability/logging) is optimized for humans and a
 
 Configure `[openshell.gateway.ocsf_log]` in `gateway.toml` to collect gateway-origin OCSF events into one JSONL file. This includes gateway-wide events such as TLS certificate reloads, even when no sandbox log stream applies. Collection preserves native OCSF fields and event IDs and does not depend on `RUST_LOG`.
 
+To send gateway OCSF events directly to an OpenTelemetry collector instead, enable [OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export).
+
 The gateway writes OCSF events to a local JSONL file. Give each replica its own path and configure the shipper to follow renamed rotation segments. See [OCSF JSONL configuration](/how-it-works/gateways/configuration#ocsf-jsonl-output) for queue bounds, retention, loss metrics, and best-effort delivery limits.
 
 This output is separate from the supervisor stderr and file output described below. Enabling one does not enable the other. The gateway JSONL sink does not archive supervisor log lines pushed to the gateway; those lines carry OCSF shorthand text, not the full structured record.
@@ -63,9 +65,13 @@ $env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
 openshell-gateway --drivers mxc --config gateway.toml
 ```
 
-The sink is available only when Windows selects the MXC driver. It rotates
+This environment-configured sink is available on all platforms independently of
+the selected compute driver. On Unix hosts its default directory is
+`$XDG_STATE_HOME/openshell/logs` (or `$HOME/.local/state/openshell/logs`). It rotates
 daily and retains the three most recent files. Diagnostic `--log-level` values
 do not suppress records in this explicitly enabled audit sink.
+Prefer the `gateway.toml` output above for configured retention and loss metrics;
+enabling both sinks writes to both independently.
 
 ## Output Location
 
@@ -88,11 +94,11 @@ kubectl -n <sandbox-namespace> logs <supervisor-pod> -c supervisor --follow
 
 JSON stderr output works independently of writable log storage and the diagnostic log filter. Disabling the setting stops new JSON records. The console writer uses a bounded queue of 1,024 complete lines shared by diagnostics, shorthand, and JSON; when the queue is full, new lines are dropped rather than blocking enforcement. Delivery is best-effort, and retention depends on your runtime and external collector. The gateway log API and `openshell logs` continue to return shorthand.
 
-When file logging is available, supervisors also write plain JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.log` in their own filesystem, separate from the workload. `openshell sandbox exec` cannot read those files. File output requires a writable `/var/log`; a missing file sink does not disable JSON stderr output.
+When file logging is available, supervisors also write plain JSONL to `/var/log/openshell-ocsf.YYYY-MM-DD.jsonl` in their own filesystem, separate from the workload. `openshell sandbox exec` cannot read those files. File output requires a writable `/var/log`; a missing file sink does not disable JSON stderr output.
 
 This file contains supervisor-originated events, not the [sandbox-runtime events](/observability/accessing-logs#main-process-output) emitted into workload container logs.
 
-Supervisor files rotate daily with a configured three-file limit, but cleanup can remove JSONL history earlier. See [supervisor file retention](/observability/logging#log-file-location) for the limits. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
+Supervisor files rotate daily with an independent three-file limit per format. Docker and Podman store them on tmpfs; Kubernetes stores them in the supervisor pod's `emptyDir`. For durable retention, arrange external collection before rotation or teardown. See [supervisor file access](/observability/accessing-logs#direct-filesystem-access) for collection paths and best-effort limits.
 
 Windows MXC gateway records use `%PROGRAMDATA%\OpenShell\logs` or `OPENSHELL_OCSF_LOG_DIR`. That sink also rotates daily and retains the three most recent files. The separate `[openshell.gateway.ocsf_log]` sink uses its configured path and retention.
 
@@ -123,8 +129,8 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
   "metadata": {
     "product": {
       "name": "OpenShell Sandbox Supervisor",
-      "vendor_name": "NVIDIA",
-      "version": "0.3.0"
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
     },
     "version": "1.8.0"
   },
@@ -153,38 +159,73 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
 }
 ```
 
-And a denied connection:
+And a denied connection, produced when `curl https://github.com` runs in a sandbox without a network policy that allows `github.com`:
 
 ```json
 {
   "class_uid": 4001,
   "class_name": "Network Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
   "activity_id": 1,
   "activity_name": "Open",
+  "type_uid": 400101,
+  "type_name": "Network Activity: Open",
+  "time": 1791996125789,
   "severity_id": 3,
   "severity": "Medium",
   "status_id": 2,
   "status": "Failure",
-  "action_id": 2,
-  "action": "Denied",
-  "disposition_id": 2,
-  "disposition": "Blocked",
-  "status_detail": "no matching policy",
-  "message": "CONNECT denied httpbin.org:443",
+  "message": "Transparent TCP denied before relay: network connections not allowed by policy",
+  "status_detail": "transparent_tcp_policy_denied",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "OpenShell Sandbox Supervisor",
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
+    },
+    "profiles": [
+      "security_control",
+      "network_proxy",
+      "container",
+      "host"
+    ],
+    "uid": "b885957d-124a-4af7-9eef-75cc410ff070"
+  },
+  "device": {
+    "hostname": "docker-desktop",
+    "type_id": 99,
+    "type": "Sandbox",
+    "os": {
+      "name": "Linux"
+    }
+  },
+  "container": {
+    "name": "docs-deny",
+    "uid": "3949f6fc-2b84-45b2-a631-46debe41d84f"
+  },
   "dst_endpoint": {
-    "domain": "httpbin.org",
+    "domain": "github.com",
+    "ip": "198.18.0.2",
     "port": 443
+  },
+  "proxy_endpoint": {
+    "ip": "127.0.0.1",
+    "port": 3128
   },
   "actor": {
     "process": {
       "name": "/usr/bin/curl",
-      "pid": 63
+      "pid": 2187,
+      "cmd_line": "curl https://github.com"
     }
   },
-  "firewall_rule": {
-    "name": "-",
-    "type": "opa"
-  }
+  "action_id": 2,
+  "action": "Denied",
+  "disposition_id": 2,
+  "disposition": "Blocked",
+  "is_src_dst_assignment_known": true
 }
 ```
 
@@ -296,18 +337,19 @@ The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 After [copying supervisor files](/observability/accessing-logs#direct-filesystem-access) into `./supervisor-logs`, use `jq` to extract all denied connections:
 
 ```shell
-jq -c 'select(.action == "Denied")' ./supervisor-logs/openshell-ocsf.*.log
+jq -c 'select(.action == "Denied")' ./supervisor-logs/openshell-ocsf.*.jsonl
 ```
 
 ## Relationship to Shorthand Logs
 
 Sandbox events identify the sandbox environment with `device.type_id: 99` (Other) and `device.type: "Sandbox"`. The operating system is reported separately in `device.os.name`; the device type does not classify the underlying host or compute backend.
 
-The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
+The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.jsonl` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the full structured record when no schema downgrade is configured. When `ocsf_schema_version` is set, the JSON export is a lossy projection of the internal event model. Both formats are generated at the same time from the same event data.
 
 Shorthand stderr output follows the diagnostic log filter; its local file is available when file logging starts successfully. JSON stderr and file export are opt-in through `ocsf_json_enabled`. File export requires the supervisor's JSONL sink to start successfully; stderr export is independent of that sink.
 
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) to compare JSONL files with OTLP log export.
 - Learn how to [read the shorthand format](/observability/logging) for real-time monitoring.
 - Refer to the [OCSF specification](https://schema.ocsf.io/) for the full schema reference.

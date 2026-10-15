@@ -4692,9 +4692,12 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "http 1.4.0",
+ "metrics",
+ "openshell-ocsf",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tonic",
@@ -4932,6 +4935,7 @@ dependencies = [
  "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
@@ -5137,7 +5141,6 @@ dependencies = [
  "hex",
  "libc",
  "miette",
- "nix 0.29.0",
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
@@ -6753,9 +6756,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",

@@ -82,6 +82,11 @@ stable release to the exact candidate commit, using the same tag-derived
 patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
 and TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
 and persisted state.
+Both Codex workflows share the `codex-release-review` concurrency group with
+`queue: max`, so only one review runs at a time and up to 100 pending reviews
+are retained across branch, release, and manual runs. The release compatibility
+review is scheduled independently of Security Scan; other security scanners run
+in parallel.
 It does not replace Buf or change the release train's version.
 
 The agent inspects code first, then uses `gh` with a read-only GitHub token to
@@ -113,9 +118,9 @@ agent shell commands; the inference credential is excluded.
 It does not run candidate builds or tests. The review has a 30-minute execution
 limit inside a 40-minute job timeout.
 
-This rollout is report-only: findings and review failures cannot block
-merging or publication. The job is independent of the required qualification
-dependency chain. Its summary distinguishes complete, incomplete, and failed execution
+This rollout is report-only: findings and review failures remain advisory.
+The qualification caller waits for the review to finish, but its result does not
+affect the required profile. Its summary distinguishes complete, incomplete, and failed execution
 from the agent's compatibility assessment. Missing credentials, invalid
 baselines, source mismatches, malformed reports, and timeouts are not clean
 reviews. A completed review still does not prove that no breaks exist.
@@ -311,8 +316,9 @@ jobs:
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-The tagged release workflow records protobuf, security, and integration outcomes in a
-qualification job after publishing its commit-addressed OCI images. A failed
+The tagged release workflow calls `release-qualification.yml` to run and record
+protobuf, security, and integration checks after building its candidate artifacts
+and publishing its commit-addressed OCI images. A failed
 check remains visible in the workflow, with build artifacts and evidence retained
 in Actions storage. Both pre-release and stable publication require the implemented
 `release-tag-v1` profile to pass; that profile is an incremental subset of RFC
@@ -569,6 +575,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
 | `.github/workflows/release-tag.yml` | Publishes stable releases and pre-releases on tag pushes or manual dispatch. Release Auto-Tag dispatches it explicitly because its `GITHUB_TOKEN` pushes do not trigger workflows. Both require the currently implemented qualification profile to pass before publication; the summary identifies the remaining RFC 0014 coverage. Failed candidates retain build artifacts and evidence in Actions storage. Source-SHA OCI images remain available as qualification inputs. |
+| `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev and Release Tag without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release Tag calls it for `latest/stable` only for stable releases, after qualification and release assembly succeed. |
 | `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |

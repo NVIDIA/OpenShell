@@ -123,21 +123,39 @@ enum ReadinessEndpoint {
 }
 
 enum ReadinessListener {
+    #[cfg(unix)]
     Unix(tokio::net::UnixListener),
     Tcp(tokio::net::TcpListener),
 }
 
 impl ReadinessEndpoint {
+    fn prepare(&self) -> Result<()> {
+        match self {
+            Self::Unix(path) => prepare_control_readiness_path(path),
+            Self::Tcp(_) => Ok(()),
+        }
+    }
+
     fn bind(&self) -> Result<ReadinessListener> {
         match self {
             Self::Unix(path) => {
-                prepare_control_readiness_path(path)?;
-                tokio::net::UnixListener::bind(path)
-                    .map(ReadinessListener::Unix)
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("bind supervisor readiness socket on {}", path.display())
-                    })
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(miette::miette!(
+                        "Unix readiness sockets are unsupported on this host"
+                    ))
+                }
+                #[cfg(unix)]
+                {
+                    prepare_control_readiness_path(path)?;
+                    tokio::net::UnixListener::bind(path)
+                        .map(ReadinessListener::Unix)
+                        .into_diagnostic()
+                        .wrap_err_with(|| {
+                            format!("bind supervisor readiness socket on {}", path.display())
+                        })
+                }
             }
             Self::Tcp(port) => bind_readiness_tcp(*port)
                 .and_then(tokio::net::TcpListener::from_std)
@@ -149,7 +167,10 @@ impl ReadinessEndpoint {
 
     fn remove(&self) {
         if let Self::Unix(path) = self {
+            #[cfg(unix)]
             let _ = std::fs::remove_file(path);
+            #[cfg(not(unix))]
+            let _ = path; // Unix endpoints are rejected before binding on this host.
         }
     }
 }
@@ -176,6 +197,7 @@ fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
 impl ReadinessListener {
     async fn accept(&self) -> std::io::Result<()> {
         match self {
+            #[cfg(unix)]
             Self::Unix(listener) => listener.accept().await.map(drop),
             Self::Tcp(listener) => listener.accept().await.map(drop),
         }
@@ -192,9 +214,7 @@ impl ControlReadiness {
         endpoint: ReadinessEndpoint,
         mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Self> {
-        if let ReadinessEndpoint::Unix(path) = &endpoint {
-            prepare_control_readiness_path(path)?;
-        }
+        endpoint.prepare()?;
         let listener = if session_readiness
             .as_ref()
             .is_some_and(|readiness| !*readiness.borrow())
@@ -302,6 +322,13 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_control_readiness_path(_path: &std::path::Path) -> Result<()> {
+    Err(miette::miette!(
+        "Unix readiness sockets are unsupported on this host"
+    ))
 }
 
 impl Drop for ControlReadiness {
@@ -595,6 +622,7 @@ pub async fn run_network_proxy(
         #[cfg(target_os = "linux")]
         None,
         None,
+        None,
     )
     .await?;
 
@@ -741,6 +769,13 @@ async fn run_sandbox_with_backend(
         admitted_isolation_backend,
         main_exit_marker,
     } = config;
+    // The current client attachment adapter is SSH; retaining a process's I/O
+    // internally does not make it reachable by a foreground client.
+    if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
+        return Err(miette::miette!(
+            "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
+        ));
+    }
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -786,11 +821,21 @@ async fn run_sandbox_with_backend(
         &auth_bundle,
     )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    #[cfg(unix)]
     let ssh_host_key = if ssh_socket_path.is_some() {
         Some(openshell_supervisor_process::ssh::parse_host_key(
             auth_bundle.ssh_host_private_key.as_ref(),
         )?)
     } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let ssh_host_key = {
+        if ssh_socket_path.is_some() {
+            return Err(miette::miette!(
+                "SSH access sockets are unsupported on this host"
+            ));
+        }
         None
     };
     // Startup joins the trace that created the sandbox when the driver passes
@@ -942,7 +987,7 @@ async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let bound = selected_backend
+    let (bound, proxy_listener) = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1031,7 +1076,9 @@ async fn run_sandbox_with_backend(
     let mut config_apply_rx = Some(config_apply_rx);
     let (config_push_updates, config_push_enabled) = tokio::sync::watch::channel(false);
 
-    let remote_network_source = remote_boundary.0.network_mediation_source();
+    let remote_network_source = proxy_listener
+        .is_none()
+        .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
@@ -1070,7 +1117,8 @@ async fn run_sandbox_with_backend(
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
-            Some(remote_network_source),
+            remote_network_source,
+            proxy_listener,
         )
         .await?,
     );
@@ -1462,7 +1510,11 @@ fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::
     writeln!(file, "exit_code={exit_code}")?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()
+    // Windows cannot open directories through File::open. The marker data is
+    // flushed above and rename still atomically replaces the previous value.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
@@ -4191,6 +4243,7 @@ mod tests {
                 .expect("token"),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         };
         let error = run_sandbox(
             vec!["true".to_string()],
@@ -4263,6 +4316,7 @@ mod tests {
         assert!(prepare_network_proxy_tls_dir(Some(writable)).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
@@ -4276,6 +4330,7 @@ mod tests {
         assert!(check_control_readiness(&path).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
@@ -4342,12 +4397,19 @@ mod tests {
         let (session_tx, session_rx) = tokio::sync::watch::channel(true);
         let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(session_rx))
             .expect("start TCP readiness listener");
-        let connects = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
-        assert!(connects(), "accepted session is ready");
+        let connects = || async {
+            timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        };
+        assert!(connects().await, "accepted session is ready");
 
         session_tx.send_replace(false);
         timeout(Duration::from_secs(1), async {
-            while connects() {
+            while connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -4356,7 +4418,7 @@ mod tests {
 
         session_tx.send_replace(true);
         timeout(Duration::from_secs(1), async {
-            while !connects() {
+            while !connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -4365,7 +4427,7 @@ mod tests {
 
         drop(readiness);
         timeout(Duration::from_secs(1), async {
-            while connects() {
+            while connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -4373,7 +4435,61 @@ mod tests {
         .expect("dropped guard closes readiness listener");
     }
 
+    #[tokio::test]
+    async fn tcp_readiness_waits_for_initial_session_acceptance() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(rx)).unwrap();
+        assert!(
+            !timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        );
+        tx.send_replace(true);
+        timeout(Duration::from_secs(2), async {
+            while !timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted session opens TCP readiness");
+        drop(readiness);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unix_readiness_is_rejected_without_disabling_tcp() {
+        let result = ControlReadiness::start(ReadinessEndpoint::Unix("health.sock".into()), None);
+        assert!(
+            result
+                .err()
+                .expect("Unix sockets unsupported")
+                .to_string()
+                .contains("unsupported")
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(
+            ControlReadiness::start(ReadinessEndpoint::Unix("health.sock".into()), Some(rx))
+                .is_err(),
+            "invalid adapter must fail even before session acceptance"
+        );
+    }
+
     #[test]
+    #[cfg(unix)]
     fn control_readiness_rejects_relative_path() {
         let error = prepare_control_readiness_path(std::path::Path::new("health.sock"))
             .expect_err("relative readiness path must be rejected");

@@ -110,6 +110,8 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
+| Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
@@ -385,6 +387,10 @@ Release Dev publishes the `dev` docs version from `main`. Release Tag publishes 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
+
+## Stale Issues and Pull Requests
+
+Issues and pull requests receive `state:stale` after 14 days without activity. Only `lifecycle:frozen` or `state:frozen` exempts an issue from stale handling. Both labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
 
 ## Pull Requests
 

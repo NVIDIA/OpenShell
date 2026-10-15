@@ -85,6 +85,7 @@ async fn postgres_concurrent_sandbox_creates_with_ssh_identity_do_not_exhaust_lo
             sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         },
         gateway_id: "gateway".to_string(),
         verification_keys: Vec::new(),

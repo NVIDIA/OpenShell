@@ -36,7 +36,7 @@ hickory-proto = "0.26.1"
 ipnet = "2"
 miette = { workspace = true }
 prost-types = { workspace = true }
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
 reqwest = { workspace = true }
 rustls = { workspace = true }

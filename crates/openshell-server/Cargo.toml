@@ -73,7 +73,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 
-# OpenTelemetry (OTLP trace export, opt-in via [openshell.gateway.otlp])
+# OpenTelemetry (OTLP trace and OCSF log export, opt-in via [openshell.gateway.otlp])
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -143,6 +143,7 @@ rsa = { version = "0.9", features = ["pem"] }
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
 wiremock = "0.6"
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
 # `testing` provides InMemorySpanExporter, so span assertions do not need a
 # collector, a network hop, or a flush barrier.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

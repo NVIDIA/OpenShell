@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use backend_setup::{BackendServices, BackendSetup, LaunchIdentity, PreparedBackend};
+use backend_setup::{BackendServices, BackendSetup, BuiltBackend, LaunchIdentity, PreparedBackend};
 use openshell_core::proto::{
     GatewayMessage, GetSandboxConfigRequest, GetSandboxConfigResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
@@ -10,9 +10,7 @@ use openshell_core::proto::{
     ReportSandboxConfigurationResponse, SessionAccepted, SupervisorMessage, UpdateConfigRequest,
     UpdateConfigResponse, gateway_message, supervisor_message,
 };
-use openshell_isolation_interface::contract::{
-    BackendError, IsolationBackend, ResolvedWorkloadIdentity,
-};
+use openshell_isolation_interface::contract::{BackendError, ResolvedWorkloadIdentity};
 use std::sync::{Mutex, atomic::Ordering};
 use tonic::codegen::tokio_stream::{StreamExt as _, wrappers::TcpListenerStream};
 use tonic::codegen::{Body, BoxFuture, BoxStream, Bytes, Service, StdError, http};
@@ -242,10 +240,7 @@ impl PreparedBackend for HeldPreparedBackend {
         Ok((None, false))
     }
 
-    fn build(
-        self: Box<Self>,
-        _services: BackendServices,
-    ) -> Result<Arc<dyn IsolationBackend>, BackendError> {
+    fn build(self: Box<Self>, _services: BackendServices) -> Result<BuiltBackend, BackendError> {
         Err(BackendError::Attach("test boundary remains held".into()))
     }
 }
@@ -276,6 +271,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
         sandbox_token: openshell_core::jwt::SecretJwt::parse("test-sandbox-token").unwrap(),
         sandbox_expires_at: 0,
         ssh_host_private_key: None,
+        ocsf_otlp_headers: None,
     };
     let setup = HeldBackendSetup {
         session_id,

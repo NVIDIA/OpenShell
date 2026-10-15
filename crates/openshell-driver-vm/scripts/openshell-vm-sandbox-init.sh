@@ -203,34 +203,13 @@ prepare_guest_image_rootfs() {
 
 exec_supervisor_in_newroot() {
     local chroot_bin
-    local bootstrap="/.openshell-bootstrap"
-    local supervisor="${bootstrap}/opt/openshell/bin/openshell-sandbox"
-    local loader
-    local lib_path
+    local supervisor="/.openshell-bootstrap/opt/openshell/bin/openshell-sandbox"
 
     for chroot_bin in /usr/sbin/chroot /usr/bin/chroot /sbin/chroot /bin/chroot; do
         [ -x "$chroot_bin" ] || continue
 
         if [ -x "/newroot${supervisor}" ]; then
-            for loader in \
-                "${bootstrap}/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-                "${bootstrap}/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib64/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-                "${bootstrap}/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-                "${bootstrap}/lib/ld-linux-aarch64.so.1" \
-                "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
-                if [ -x "/newroot${loader}" ]; then
-                    lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" "$@"
-                fi
-            done
             exec "$chroot_bin" /newroot "$supervisor" "$@"
-        fi
-
-        if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox "$@"
         fi
     done
 

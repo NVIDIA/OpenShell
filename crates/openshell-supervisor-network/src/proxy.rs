@@ -263,6 +263,7 @@ impl ProxyHandle {
         network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
         direct_listener_identity: Option<ContractBinaryIdentity>,
+        required_proxy_authorization: Option<Arc<str>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -279,6 +280,11 @@ impl ProxyHandle {
         }
 
         let source_backed = network_mediation_source.is_some();
+        if source_backed && required_proxy_authorization.is_some() {
+            return Err(miette::miette!(
+                "proxy authorization cannot be required for a network mediation source"
+            ));
+        }
         let listener = if source_backed {
             None
         } else {
@@ -501,6 +507,7 @@ impl ProxyHandle {
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
+                        let required_authorization = required_proxy_authorization.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_mediated_connection(
@@ -524,6 +531,7 @@ impl ProxyHandle {
                                 dtx,
                                 atx,
                                 endpoint_observations,
+                                required_authorization,
                             )
                             .await
                             {
@@ -1535,7 +1543,6 @@ fn build_accept_error_event(
         .message(message)
         .build()
 }
-
 fn classify_accept_error(
     err: &std::io::Error,
     consecutive_resource_errors: &mut u32,
@@ -1543,7 +1550,6 @@ fn classify_accept_error(
 ) -> AcceptAction {
     #[cfg(not(unix))]
     let _ = (err, &mut *consecutive_resource_errors);
-
     #[cfg(unix)]
     if matches!(
         err.raw_os_error(),
@@ -2295,6 +2301,40 @@ where
     .await
 }
 
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        difference |= usize::from(left_byte ^ right_byte);
+    }
+    difference == 0
+}
+
+fn has_valid_proxy_authorization(request: &str, expected: &str) -> bool {
+    let mut provided = None;
+    for line in request.split("\r\n").skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            // Reject duplicates even when both values are correct. Accepting
+            // ambiguous credentials can produce parser differentials between
+            // this proxy and downstream HTTP implementations.
+            if provided.is_some() {
+                return false;
+            }
+            provided = Some(value.trim());
+        }
+    }
+
+    provided.is_some_and(|value| constant_time_bytes_eq(value.as_bytes(), expected.as_bytes()))
+}
+
 // Many distinct, non-related context parameters are required for a CONNECT
 // dispatch; bundling them into a struct would just shift the noise into call
 // sites.
@@ -2347,6 +2387,7 @@ async fn handle_tcp_connection(
         denial_tx,
         activity_tx,
         endpoint_observation_tx,
+        None,
     ))
     .await
 }
@@ -2418,6 +2459,7 @@ async fn handle_mediated_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
+    required_proxy_authorization: Option<Arc<str>>,
 ) -> Result<()> {
     // Bind observations to the policy/provider inventory active when this
     // connection was accepted, even if configuration changes while it runs.
@@ -2518,6 +2560,20 @@ async fn handle_mediated_connection(
         std::str::from_utf8(&buf[..header_end]).expect("validated HTTP request headers are UTF-8");
     if crate::l7::rest::parse_body_length(request).is_err() {
         respond(&mut client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+        return Ok(());
+    }
+    if let Some(expected) = required_proxy_authorization.as_deref()
+        && !has_valid_proxy_authorization(request, expected)
+    {
+        warn!("Rejected host proxy request with missing or invalid per-sandbox credentials");
+        respond(
+            &mut client,
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+              Proxy-Authenticate: Basic realm=\"OpenShell\"\r\n\
+              Content-Length: 0\r\n\
+              Connection: close\r\n\r\n",
+        )
+        .await?;
         return Ok(());
     }
     let mut lines = request.split("\r\n");
@@ -6989,6 +7045,25 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     reason = "Test code: test fixtures and explicit control-flow markers are idiomatic in tests."
 )]
 mod tests {
+    #[test]
+    fn proxy_authorization_rejects_missing_wrong_cross_and_duplicate_credentials() {
+        let expected = "Basic sandbox-a-generation";
+        let request = |headers: &str| format!("CONNECT example.com:443 HTTP/1.1\r\n{headers}\r\n");
+        for headers in [
+            "",
+            "Proxy-Authorization: Basic wrong\r\n",
+            "Proxy-Authorization: Basic sandbox-b-generation\r\n",
+            "Proxy-Authorization: Basic sandbox-a-generation\r\nProxy-Authorization: Basic sandbox-a-generation\r\n",
+            "Malformed-header\r\nProxy-Authorization: Basic sandbox-a-generation\r\n",
+        ] {
+            assert!(!has_valid_proxy_authorization(&request(headers), expected));
+        }
+        assert!(has_valid_proxy_authorization(
+            &request("proxy-authorization: Basic sandbox-a-generation\r\n"),
+            expected,
+        ));
+    }
+
     use super::*;
     use crate::test_support::{executable_path, policy_with_native_executable_paths};
     use openshell_core::proposals::AgentProposals;
@@ -6998,9 +7073,15 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    // These contract tests use host-native absolute identities and matching
+    // policy declarations. Relative-path rejection remains independently tested.
+    fn native_identity_engine(rego: &str, source: &str) -> Result<OpaEngine> {
+        OpaEngine::from_strings(rego, &policy_with_native_executable_paths(source))
+    }
+
     #[test]
     fn supplied_identity_preserves_authorized_endpoint_metadata() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(
                 r#"
@@ -7059,7 +7140,7 @@ process:
 
     #[test]
     fn supplied_identity_rejects_same_path_replacement() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(
                 r#"
@@ -7118,7 +7199,7 @@ process:
 
     #[test]
     fn supplied_identity_rejects_replaced_authorizing_ancestor() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(
                 r#"
@@ -7229,7 +7310,7 @@ process:
 
     #[test]
     fn supplied_identity_rejects_missing_ancestor_digest_before_policy() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(
                 r#"
@@ -7282,7 +7363,7 @@ process:
 
     #[tokio::test]
     async fn staged_transparent_open_waits_for_l4_policy() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(
                 r#"
@@ -7588,6 +7669,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 None,
                 None,
                 None,
+                None,
             ))
             .await
             .unwrap();
@@ -7696,7 +7778,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn staged_transparent_open_dials_only_pinned_policy_dns_addresses() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
@@ -7736,7 +7818,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn staged_transparent_open_proposes_a_denied_observation_hostname() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
@@ -7779,7 +7861,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[tokio::test]
     async fn staged_transparent_open_never_relays_an_observation_that_policy_allows() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
@@ -7845,7 +7927,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
 
     #[test]
     fn pinned_plan_requires_the_mapping_of_the_deciding_generation() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(POLICY_DNS_OPEN_POLICY),
         )
@@ -7939,7 +8021,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
     #[tokio::test]
     async fn staged_policy_local_open_reaches_the_sandbox_scoped_api() {
         let engine = Arc::new(
-            OpaEngine::from_strings(
+            native_identity_engine(
                 include_str!("../data/sandbox-policy.rego"),
                 "network_policies: {}\n",
             )
@@ -8008,6 +8090,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             None,
             None,
             None,
+            None,
         ));
         workload
             .write_all(b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n")
@@ -8058,7 +8141,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 .unwrap();
         });
         let engine = Arc::new(
-            OpaEngine::from_strings(
+            native_identity_engine(
                 include_str!("../data/sandbox-policy.rego"),
                 &policy_with_native_executable_paths(&format!(
                     r#"
@@ -8130,6 +8213,7 @@ network_policies:
             Arc::new(None),
             Arc::new(None),
             Arc::new(None),
+            None,
             None,
             None,
             None,
@@ -8264,7 +8348,7 @@ process:
 
     #[tokio::test]
     async fn staged_transparent_open_reports_identity_cache_capacity_exhaustion() {
-        let engine = OpaEngine::from_strings(
+        let engine = native_identity_engine(
             include_str!("../data/sandbox-policy.rego"),
             &policy_with_native_executable_paths(
                 r#"
@@ -8744,6 +8828,7 @@ network_policies: {}
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
             Some(Arc::new(FailedMediationSource)),
+            None,
             None,
             None,
         )

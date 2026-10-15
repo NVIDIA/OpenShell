@@ -42,6 +42,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that supervisors downgrade exported events to.
+    #[arg(
+        long,
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        requires = "otlp_ocsf_endpoint"
+    )]
+    otlp_ocsf_schema_version: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -215,6 +227,13 @@ async fn main() -> Result<()> {
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_gateway_name: args.gateway_name.clone(),
+        supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
+            openshell_core::sandbox_env::OcsfOtlpExport {
+                endpoint,
+                schema_version: args.otlp_ocsf_schema_version.clone(),
+            }
+        }),
         gateway_port: args.gateway_port,
         host_gateway_ip: args
             .host_gateway_ip

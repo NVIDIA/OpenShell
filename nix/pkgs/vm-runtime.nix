@@ -13,7 +13,7 @@ let
     {
       x86_64-linux = {
         platform = "linux-x86_64";
-        hash = "sha256-kA6ZQz53geBp2zHx8tv+D8VcGkSrnC74Op/60H4fmck=";
+        hash = "sha256-mZwSUhs9IZ0pPLxzVs4AbRLdYWkUlHwP4lmfsbeiUGw=";
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"
@@ -22,7 +22,7 @@ let
       };
       aarch64-linux = {
         platform = "linux-aarch64";
-        hash = "sha256-7FNqUtC6ixfw202EyoYCgZOLdyxJYfg/YzdlkTT/+sM=";
+        hash = "sha256-Yk5Rxn6JWxMu82Vkyx3eSAxh5/mnfUwcNDNeDIQJz4c=";
         artifacts = [
           "libkrun.so"
           "libkrunfw.so.5"

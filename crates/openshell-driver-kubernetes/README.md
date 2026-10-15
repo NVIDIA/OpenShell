@@ -10,6 +10,11 @@ attachments. Managed mode stages an immutable copy for each sandbox runtime
 generation.
 See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
+Caller PVC mounts cannot overlap the driver-managed `/.openshell` control tree
+or `/run`, including nested `subPath` mounts. Resource approval labels do not
+permit mounting over these paths. Use data paths such as `/data` or a directory
+below `/sandbox`.
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:
@@ -27,7 +32,10 @@ workspace namespace modes via `workspace_mode`:
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
   (`operator_namespace_file`). Sandbox creation fails closed if the workspace
-  namespace is not in the current allowlist. Workspace deletion only removes
+  namespace is not in the current allowlist. With a label selector, workspace
+  checks that run before the watcher's first namespace listing wait up to 10
+  seconds for it and then return `Unavailable`, so a gateway restart does not
+  reject labeled workspaces as unknown. Workspace deletion only removes
   gateway state; it never deletes or otherwise accesses the operator-managed
   Kubernetes namespace.
 

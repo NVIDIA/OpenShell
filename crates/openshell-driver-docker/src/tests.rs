@@ -64,6 +64,7 @@ fn test_launch_authentication() -> Vec<u8> {
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -212,6 +213,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_image_id: "sha256:supervisor-test".to_string(),
         supervisor_grpc_endpoint: "https://host.openshell.internal:8443".to_string(),
         supervisor_otlp_endpoint: None,
+        supervisor_ocsf_export: None,
+        supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -1392,17 +1395,37 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 }
 
 #[test]
-fn supervisor_tracing_environment_requires_an_endpoint() {
+fn supervisor_otlp_environment_carries_only_configured_signals() {
+    use openshell_core::sandbox_env::{
+        GATEWAY_NAME, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+    };
+
     let mut config = runtime_config();
-    assert!(supervisor_tracing_environment(&config).is_empty());
+    assert!(supervisor_otlp_environment(&config).is_empty());
 
     config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
     assert_eq!(
-        supervisor_tracing_environment(&config),
-        [format!(
-            "{}=http://127.0.0.1:4317",
-            openshell_core::sandbox_env::OTLP_ENDPOINT
-        )]
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_ENDPOINT}=http://127.0.0.1:4317")]
+    );
+
+    config.supervisor_otlp_endpoint = None;
+    config.supervisor_ocsf_export = Some(OcsfOtlpExport {
+        endpoint: "http://siem:4317".to_string(),
+        schema_version: Some("1.3".to_string()),
+    });
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317"),
+            format!("{OTLP_OCSF_SCHEMA_VERSION}=1.3"),
+        ]
+    );
+
+    config.supervisor_gateway_name = Some("prod-west".to_string());
+    assert_eq!(
+        supervisor_otlp_environment(&config).last(),
+        Some(&format!("{GATEWAY_NAME}=prod-west"))
     );
 }
 

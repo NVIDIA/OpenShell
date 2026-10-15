@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared OpenTelemetry trace export support for `OpenShell` services.
+//! Shared OpenTelemetry trace and log export support for `OpenShell` services.
 
 mod driver;
 mod grpc;
+mod logs;
+mod ocsf;
 mod propagation;
 
 pub use driver::{
@@ -17,6 +19,7 @@ pub use grpc::{
     RecordGrpcStatus, TracedGrpcStream, compute_driver_rpc_layer, compute_driver_rpc_operation,
     grpc_status_code_name, record_grpc_status, rpc,
 };
+pub use ocsf::{OcsfOtlp, OcsfOtlpLayer};
 pub use propagation::{
     HeaderMapExtractor, MetadataMapInjector, TRACEPARENT_ENV, TRACESTATE_ENV,
     TraceContextInterceptor, current_trace_context_carrier, current_trace_context_environment,
@@ -25,6 +28,7 @@ pub use propagation::{
 
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
+pub use opentelemetry_otlp::LogExporter;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig, WithTonicConfig};
 use opentelemetry_sdk::Resource;
@@ -119,16 +123,16 @@ pub enum ServiceName<'a> {
     EnvironmentOr(&'a str),
 }
 
-/// Inputs for an OTLP/gRPC trace provider.
+/// Inputs for OTLP/gRPC export.
 #[derive(Debug, Clone)]
-pub struct OtlpTraceConfig<'a> {
+pub struct OtlpExportConfig<'a> {
     pub endpoint: &'a str,
     pub service_name: ServiceName<'a>,
     pub service_version: Option<&'a str>,
     pub resource_attributes: Vec<KeyValue>,
 }
 
-/// Failure to construct an OTLP trace provider.
+/// Failure to set up OTLP export.
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
     #[error("OTLP endpoint is empty")]
@@ -140,11 +144,11 @@ pub enum SetupError {
         source: http::uri::InvalidUri,
     },
 
-    #[error("failed to build the OTLP span exporter: {0}")]
+    #[error("failed to build the OTLP exporter: {0}")]
     Exporter(#[from] opentelemetry_otlp::ExporterBuildError),
 }
 
-fn resource_attributes(config: &OtlpTraceConfig<'_>) -> Vec<KeyValue> {
+fn resource_attributes(config: &OtlpExportConfig<'_>) -> Vec<KeyValue> {
     let mut attributes = config.resource_attributes.clone();
     if let Some(version) = config
         .service_version
@@ -156,9 +160,9 @@ fn resource_attributes(config: &OtlpTraceConfig<'_>) -> Vec<KeyValue> {
     attributes
 }
 
-/// Build the OpenTelemetry resource for a trace provider configuration.
+/// Build the OpenTelemetry resource for an export configuration.
 #[must_use]
-pub fn resource_for(config: &OtlpTraceConfig<'_>) -> Resource {
+pub fn resource_for(config: &OtlpExportConfig<'_>) -> Resource {
     let attributes = resource_attributes(config);
     match config.service_name {
         ServiceName::Fixed(name) => Resource::builder()
@@ -184,9 +188,9 @@ pub fn resource_for(config: &OtlpTraceConfig<'_>) -> Resource {
     }
 }
 
-/// Build an OTLP/gRPC trace provider.
-pub fn build_provider(config: &OtlpTraceConfig<'_>) -> Result<SdkTracerProvider, SetupError> {
-    let endpoint = config.endpoint.trim();
+/// Trim and validate an OTLP endpoint before handing it to an exporter.
+fn validated_endpoint(endpoint: &str) -> Result<(&str, http::Uri), SetupError> {
+    let endpoint = endpoint.trim();
     if endpoint.is_empty() {
         return Err(SetupError::EmptyEndpoint);
     }
@@ -196,18 +200,68 @@ pub fn build_provider(config: &OtlpTraceConfig<'_>) -> Result<SdkTracerProvider,
             endpoint: endpoint.to_string(),
             source,
         })?;
+    Ok((endpoint, uri))
+}
 
-    let mut builder = SpanExporter::builder().with_tonic().with_endpoint(endpoint);
-    if uri.scheme() == Some(&http::uri::Scheme::HTTPS) {
-        // Tonic trusts nothing by default, so enable the platform roots.
-        builder = builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots());
+/// A validated OTLP/gRPC collector endpoint and the resource that every
+/// signal exported to it describes.
+#[derive(Debug, Clone)]
+pub struct OtlpTarget {
+    endpoint: String,
+    tls: bool,
+    resource: Resource,
+}
+
+impl OtlpTarget {
+    /// Validate the endpoint and build the resource.
+    pub fn new(config: &OtlpExportConfig<'_>) -> Result<Self, SetupError> {
+        let (endpoint, uri) = validated_endpoint(config.endpoint)?;
+        Ok(Self {
+            endpoint: endpoint.to_string(),
+            tls: uri.scheme() == Some(&http::uri::Scheme::HTTPS),
+            resource: resource_for(config),
+        })
     }
-    let exporter = builder.build()?;
 
-    Ok(SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource_for(config))
-        .build())
+    /// Point an exporter builder at this target, over TLS for `https://`.
+    pub(crate) fn configure<B>(&self, builder: B) -> B
+    where
+        B: WithExportConfig + WithTonicConfig,
+    {
+        let builder = builder.with_endpoint(self.endpoint.clone());
+        if self.tls {
+            // Tonic trusts nothing by default, so enable the platform roots.
+            builder.with_tls_config(ClientTlsConfig::new().with_enabled_roots())
+        } else {
+            builder
+        }
+    }
+
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    #[must_use]
+    pub fn resource(&self) -> &Resource {
+        &self.resource
+    }
+
+    /// Build a trace provider that exports spans to this target in batches.
+    pub fn tracer_provider(&self) -> Result<SdkTracerProvider, SetupError> {
+        let exporter = self
+            .configure(SpanExporter::builder().with_tonic())
+            .build()?;
+        Ok(SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(self.resource.clone())
+            .build())
+    }
+}
+
+/// Build an OTLP/gRPC trace provider.
+pub fn build_provider(config: &OtlpExportConfig<'_>) -> Result<SdkTracerProvider, SetupError> {
+    OtlpTarget::new(config)?.tracer_provider()
 }
 
 /// Build the provider for an optional OTLP configuration.
@@ -216,7 +270,7 @@ pub fn build_provider(config: &OtlpTraceConfig<'_>) -> Result<SdkTracerProvider,
 /// to report after its tracing subscriber is installed.
 #[must_use]
 pub fn provider_for(
-    config: Option<OtlpTraceConfig<'_>>,
+    config: Option<OtlpExportConfig<'_>>,
 ) -> (Option<SdkTracerProvider>, Option<SetupError>) {
     match config.as_ref().map(build_provider) {
         None => (None, None),
@@ -470,7 +524,7 @@ mod tests {
 
     #[test]
     fn resource_uses_fixed_service_identity_and_custom_attributes() {
-        let resource = resource_for(&OtlpTraceConfig {
+        let resource = resource_for(&OtlpExportConfig {
             endpoint: "http://127.0.0.1:4317",
             service_name: ServiceName::Fixed("openshell-driver-vm"),
             service_version: Some("1.2.3"),
@@ -501,7 +555,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_endpoint_disables_export_with_a_reportable_error() {
-        let (provider, error) = provider_for(Some(OtlpTraceConfig {
+        let (provider, error) = provider_for(Some(OtlpExportConfig {
             endpoint: "definitely not a url",
             service_name: ServiceName::Fixed("test-service"),
             service_version: None,
