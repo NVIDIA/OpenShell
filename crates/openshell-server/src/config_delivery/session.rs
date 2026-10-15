@@ -275,15 +275,20 @@ impl SupervisorSessionRegistry {
 
     /// Hold configuration updates for a session until the bootstrap it was
     /// accepted with is answered.
+    /// Start the session with its bootstrap in flight. `persisted_admission`
+    /// is the admission the sandbox record already holds, which a result
+    /// reporting the same admission does not write again.
     pub(crate) fn begin_config_bootstrap(
         &self,
         sandbox_id: &str,
         session_id: &str,
         bootstrap: BootstrapInFlight,
+        persisted_admission: Option<SandboxConfigurationAdmission>,
     ) {
         self.with_config_session(sandbox_id, session_id, |session| {
             if let Some(session) = session {
                 session.in_flight = Some(bootstrap.0);
+                session.persisted_admission = persisted_admission;
             }
         });
     }
@@ -656,6 +661,15 @@ pub async fn build_session_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
 ) -> Result<SupervisorConfig, Status> {
+    // Bootstraps share the build permits with session reconciliation, so a
+    // burst of reconnects, such as a replica's sessions redirected at
+    // shutdown, cannot exhaust the database pool user requests need.
+    let _permit = state
+        .config_delivery
+        .builds
+        .acquire()
+        .await
+        .expect("the build semaphore is never closed");
     let bootstrap = build_config_bootstrap(state, sandbox).await;
     let outcome = if bootstrap.is_ok() {
         "built"
@@ -1045,7 +1059,7 @@ mod tests {
     ) -> (mpsc::Receiver<GatewayMessage>, ConfigUpdate) {
         let slots = register_apply_session(registry, sandbox_id, session_id);
         let (update, in_flight) = bootstrap_update(bootstrap);
-        registry.begin_config_bootstrap(sandbox_id, session_id, in_flight);
+        registry.begin_config_bootstrap(sandbox_id, session_id, in_flight, None);
         (slots, update)
     }
 
@@ -1741,7 +1755,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         let (update, in_flight) = bootstrap_update(config);
         state
             .supervisor_sessions
-            .begin_config_bootstrap(sandbox_id, "session-1", in_flight);
+            .begin_config_bootstrap(sandbox_id, "session-1", in_flight, None);
         update
     }
 
@@ -1774,6 +1788,49 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             DeliveryDisposition::SuppressedUnchanged
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn reconnect_reporting_the_stored_admission_writes_nothing() {
+        let sandbox_id = "sb-reconnect";
+        let state = push_state_with_sandbox_spec(sandbox_id).await;
+        let config = current_config(&state, sandbox_id).await;
+
+        // The first session persists its admission.
+        let (tx, _rx) = register_apply_session_in_state(&state, sandbox_id);
+        let bootstrap = begin_bootstrap(&state, sandbox_id, config.clone());
+        assert!(
+            handle_config_update_result(
+                &accepted_session(&state, sandbox_id, tx),
+                &applied_result(&bootstrap),
+            )
+            .await
+        );
+        let stored = stored_sandbox(&state, sandbox_id).await;
+        let admission = sandbox_admission(&stored).cloned().expect("admission");
+
+        // The reconnect starts from the stored admission and reports it again.
+        let (tx, _rx) = register_apply_session_in_state(&state, sandbox_id);
+        let (update, in_flight) = bootstrap_update(config);
+        state.supervisor_sessions.begin_config_bootstrap(
+            sandbox_id,
+            "session-1",
+            in_flight,
+            Some(admission),
+        );
+        assert!(
+            handle_config_update_result(
+                &accepted_session(&state, sandbox_id, tx),
+                &applied_result(&update),
+            )
+            .await
+        );
+        let unchanged = stored_sandbox(&state, sandbox_id).await;
+        assert_eq!(
+            unchanged.metadata.as_ref().unwrap().resource_version,
+            stored.metadata.as_ref().unwrap().resource_version,
+            "an unchanged admission takes no sandbox write"
+        );
     }
 
     #[tokio::test]

@@ -2164,6 +2164,9 @@ struct ConfigPushSetup {
     captured_seq: u64,
     workspace: String,
     providers: HashSet<String>,
+    /// The admission the sandbox record holds, so a reconnect that reports
+    /// the same admission writes nothing.
+    persisted_admission: Option<openshell_core::proto::SandboxConfigurationAdmission>,
 }
 
 /// Everything needed to accept a supervisor session once its bootstrap is
@@ -2265,9 +2268,14 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         );
     }
     if let Some(bootstrap) = bootstrap_in_flight {
-        state
-            .supervisor_sessions
-            .begin_config_bootstrap(&sandbox_id, &session_id, bootstrap);
+        state.supervisor_sessions.begin_config_bootstrap(
+            &sandbox_id,
+            &session_id,
+            bootstrap,
+            config_push
+                .as_ref()
+                .and_then(|setup| setup.persisted_admission.clone()),
+        );
     }
 
     // A replacement stream is a new observation authority. Reset its endpoint
@@ -2533,6 +2541,10 @@ pub async fn handle_connect_supervisor(
             .as_ref()
             .map(|spec| spec.providers.iter().cloned().collect())
             .unwrap_or_default(),
+        persisted_admission: sandbox
+            .status
+            .as_ref()
+            .and_then(|status| status.configuration_admission.clone()),
     });
     let bootstrap = if pushes_config {
         Some(config_session::build_session_bootstrap(state, &sandbox).await?)
