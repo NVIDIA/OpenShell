@@ -11,6 +11,20 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Resolve installed gateway context
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+
+    - name: Detect tmachine container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
+
+    - name: Require Podman for the E2E workload fixtures
+      ansible.builtin.assert:
+        that:
+          - tmachine_container_runtime_name == 'podman'
+        fail_msg: The Podman E2E archive requires a Podman environment
+
     - name: Create Podman E2E test directory
       become: true
       ansible.builtin.file:
@@ -41,22 +55,15 @@
       ansible.builtin.command:
         argv:
           - podman
+          - --remote
+          - --url
+          - "unix://{{ tmachine_container_runtime_socket }}"
           - load
           - --input
           - "{{ podman_e2e_test_root }}/openshell-e2e-python-dev.tar"
       environment:
         HOME: /home/tmachine
-        XDG_RUNTIME_DIR: /run/user/1000
-
-    - name: Remove any previous OpenShell gateway registration
-      ansible.builtin.command:
-        argv: [/usr/local/bin/openshell, gateway, remove, tmachine]
-      changed_when: false
-      failed_when: false
-
-    - name: Register the configured OpenShell gateway
-      ansible.builtin.command:
-        argv: [/usr/local/bin/openshell, gateway, add, http://127.0.0.1:17670, --local, --name, tmachine]
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
 
     - name: Run Podman E2E archive tests
       ansible.builtin.command:
@@ -73,16 +80,16 @@
           - --no-fail-fast
       environment:
         CONTAINER_ENGINE: podman
-        CONTAINER_HOST: unix:///run/user/1000/podman/podman.sock
+        CONTAINER_HOST: "unix://{{ tmachine_container_runtime_socket }}"
         HOME: /home/tmachine
-        OPENSHELL_BIN: /usr/local/bin/openshell
+        OPENSHELL_BIN: "{{ openshell_test_cli.stdout }}"
         OPENSHELL_E2E_CONTAINER_ENGINE_UNSET_XDG_CONFIG_HOME: "1"
         OPENSHELL_E2E_DRIVER: podman
-        OPENSHELL_E2E_NETWORK_NAME: tmachine
+        OPENSHELL_E2E_NETWORK_NAME: "{{ openshell_test_gateway.network_name }}"
         OPENSHELL_E2E_SANDBOX_NAMESPACE: tmachine
-        OPENSHELL_GATEWAY: tmachine
-        OPENSHELL_PODMAN_SOCKET: /run/user/1000/podman/podman.sock
-        XDG_RUNTIME_DIR: /run/user/1000
+        OPENSHELL_GATEWAY: "{{ openshell_test_gateway.name }}"
+        OPENSHELL_PODMAN_SOCKET: "{{ tmachine_container_runtime_socket }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_container_runtime_tmachine_uid.stdout }}"
       register: podman_e2e_test_result
       changed_when: false
       failed_when: false
@@ -95,18 +102,10 @@
       ansible.builtin.debug:
         var: podman_e2e_test_result.stdout_lines
 
-    - name: Capture OpenShell gateway journal after Podman E2E test failure
-      become: true
-      ansible.builtin.command:
-        argv: [journalctl, --unit, openshell-gateway.service, --no-pager, --lines, "200"]
-      changed_when: false
-      failed_when: false
-      when: podman_e2e_test_result.rc != 0
-      register: podman_e2e_gateway_journal
-
-    - name: Show OpenShell gateway journal after Podman E2E test failure
-      ansible.builtin.debug:
-        var: podman_e2e_gateway_journal.stdout_lines
+    - name: Collect installed gateway diagnostics after test failure
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+        tasks_from: journal.yaml
       when: podman_e2e_test_result.rc != 0
 
     - name: Require Podman E2E archive success

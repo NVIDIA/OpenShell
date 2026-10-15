@@ -12,6 +12,10 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    - name: Resolve installed gateway context
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+
     - name: Detect tmachine container runtime
       ansible.builtin.include_role:
         name: tmachine_container_runtime
@@ -38,14 +42,15 @@
     - name: Read OpenShell gateway configuration
       become: true
       ansible.builtin.slurp:
-        src: /etc/openshell/gateway.toml
+        src: "{{ openshell_test_gateway.config_path }}"
       register: openshell_gateway_config
+      when: openshell_test_gateway_config.stat.exists
 
     - name: Require unconfigured Podman user namespaces
       ansible.builtin.assert:
         that:
           - >-
-            (openshell_gateway_config.content | b64decode)
+            (openshell_gateway_config.content | default('') | b64decode)
             is not regex('(?m)^\\s*(userns|uidmap|gidmap)\\s*=')
         fail_msg: >-
           The Podman default-userns suite requires gateway.toml to omit userns,
