@@ -155,6 +155,71 @@ pub async fn exec(
     result.require_success()
 }
 
+/// Create a detached sandbox with one `--upload <source>:<destination>` flag
+/// per entry. `--upload` cannot be combined with a command, so stories verify
+/// the files with `sandbox exec` once the sandbox is created.
+pub async fn create_with_uploads(
+    runner: &mut OpenShellRunner,
+    step: &str,
+    sandbox_name: &str,
+    uploads: &[(&Path, &str)],
+) -> Result<(), String> {
+    runner.track_sandbox(sandbox_name);
+    let mut args = vec![
+        "sandbox".to_string(),
+        "create".to_string(),
+        "--name".to_string(),
+        sandbox_name.to_string(),
+        "--detach".to_string(),
+    ];
+    for (source, destination) in uploads {
+        let source = source
+            .to_str()
+            .ok_or_else(|| format!("local upload path is not UTF-8: {}", source.display()))?;
+        args.push("--upload".to_string());
+        args.push(format!("{source}:{destination}"));
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let result = runner
+        .step(step)
+        .description(format!("sandbox '{sandbox_name}' is created with uploads"))
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&args)
+        .await
+        .map_err(|error| error.to_string())?;
+    result.require_success()
+}
+
+/// Run `script` in the sandbox and require its standard output to equal
+/// `expected` exactly.
+pub async fn expect_stdout(
+    runner: &OpenShellRunner,
+    sandbox: &str,
+    step: &str,
+    script: &str,
+    expected: &str,
+) -> Result<(), String> {
+    let result = runner
+        .step(step)
+        .description(format!("sandbox '{sandbox}' prints the expected output"))
+        .with_timeout(COMMAND_TIMEOUT)
+        .run(&[
+            "sandbox", "exec", "--name", sandbox, "--no-tty", "--", "sh", "-c", script,
+        ])
+        .await
+        .map_err(|error| error.to_string())?;
+    result.require_success()?;
+    if result.stdout() == expected {
+        Ok(())
+    } else {
+        Err(result.failure_diagnostic(&format!(
+            "standard output equals {expected:?}, received {:?}",
+            result.stdout()
+        )))
+    }
+}
+
 pub async fn git_init(repository: &Path) -> Result<(), String> {
     git(repository, &["init", "--quiet"]).await
 }
