@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Read installed gateway context
+  ansible.builtin.slurp:
+    src: /var/lib/openshell-test/gateway.yaml
+  register: openshell_test_gateway_metadata
+
+- name: Load installed gateway context
+  ansible.builtin.set_fact:
+    openshell_test_gateway: "{{ (openshell_test_gateway_metadata.content | b64decode | from_yaml).openshell_test_gateway }}"
+
+- name: Validate installed gateway context
+  ansible.builtin.assert:
+    that:
+      - openshell_test_gateway.service_scope in ['system', 'user']
+      - openshell_test_gateway.config_path is match('^/')
+      - openshell_test_gateway.name | length > 0
+
+- name: Resolve installed OpenShell CLI from PATH
+  ansible.builtin.command:
+    argv: [/bin/sh, -c, command -v openshell]
+  register: openshell_test_cli
+  changed_when: false
+
+- name: Check active gateway configuration
+  become: true
+  ansible.builtin.stat:
+    path: "{{ openshell_test_gateway.config_path }}"
+  register: openshell_test_gateway_config
+
+- name: Require active gateway configuration
+  ansible.builtin.assert:
+    that: [openshell_test_gateway_config.stat.isreg | default(false)]
+
+- name: Resolve gateway service environment
+  ansible.builtin.set_fact:
+    openshell_test_gateway_service_environment:
+      HOME: "{{ openshell_test_gateway.service_home }}"
+      XDG_RUNTIME_DIR: "/run/user/{{ openshell_test_gateway.service_uid }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ openshell_test_gateway.service_uid }}/bus"
