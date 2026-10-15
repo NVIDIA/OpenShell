@@ -12,12 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use metrics::{counter, histogram};
-#[cfg(test)]
-use openshell_core::proto::PolicySource;
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigUpdate, ConfigUpdateResult, GatewayMessage, PolicyLoadResult,
-    Sandbox, SandboxConfigRevision, SandboxConfigSnapshot, SandboxConfigurationAdmission,
-    gateway_message,
+    PolicySource, Sandbox, SandboxConfigRevision, SandboxConfigSnapshot,
+    SandboxConfigurationAdmission, gateway_message,
 };
 use prost::Message;
 use tokio::sync::mpsc;
@@ -91,7 +89,8 @@ pub struct ConfigSessionState {
     /// nothing.
     persisted_admission: Option<SandboxConfigurationAdmission>,
     /// A policy load result whose write failed. The supervisor reports a
-    /// load only once, so it is written again with the next result.
+    /// load only once, so it is written again with the next result. If the
+    /// session ends first, the next session's bootstrap settles it.
     unrecorded_policy_load: Option<PolicyLoadResult>,
 }
 
@@ -544,13 +543,19 @@ pub async fn handle_config_update_result(
             return !completed.bootstrap;
         }
     };
+    let bootstrap_load = if completed.bootstrap && result.policy_load.is_none() {
+        bootstrap_policy_load(state, sandbox_id, &completed, &admission).await
+    } else {
+        None
+    };
     // A load whose write failed earlier goes first, so a newer one that
     // also fails is the one kept.
     let mut recorded = true;
     let policy_loads = registry
         .take_unrecorded_policy_load(sandbox_id, session_id)
         .into_iter()
-        .chain(result.policy_load.clone());
+        .chain(result.policy_load.clone())
+        .chain(bootstrap_load);
     for policy_load in policy_loads {
         match record_policy_load(state, sandbox_id, &policy_load).await {
             Ok(()) => {}
@@ -619,6 +624,62 @@ async fn record_policy_load(
         "stream",
     )
     .await
+}
+
+/// The load that a bootstrap result implies for the sandbox policy revision
+/// the supervisor enforces, unless that revision is already settled.
+///
+/// The supervisor reports a load only when an update changes its policy, so
+/// the bootstrap of a reconnect reports none. A load result lost with an
+/// earlier session, because its write failed or the session ended before the
+/// result arrived, would otherwise leave the revision pending. The bootstrap
+/// settles it, as a polling supervisor's startup acknowledgement does.
+async fn bootstrap_policy_load(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    completed: &CompletedConfigUpdate,
+    admission: &SandboxConfigurationAdmission,
+) -> Option<PolicyLoadResult> {
+    use crate::policy_store::PolicyStoreExt as _;
+    use openshell_core::proto::ConfigurationAdmissionState;
+
+    let revision = &completed.fingerprint.revision;
+    // Degraded enforces the policy with only built-in middleware. A local
+    // override enforces no gateway policy.
+    let enforced = matches!(
+        completed.outcome,
+        ConfigApplyOutcome::Applied
+            | ConfigApplyOutcome::IgnoredDuplicate
+            | ConfigApplyOutcome::Degraded
+    ) && admission.state == i32::from(ConfigurationAdmissionState::Accepted);
+    if !enforced
+        || revision.policy_source != i32::from(PolicySource::Sandbox)
+        || revision.policy_version == 0
+    {
+        return None;
+    }
+    let version = revision.policy_version;
+    match state
+        .store
+        .get_policy_by_version(sandbox_id, i64::from(version))
+        .await
+    {
+        Ok(Some(policy)) if matches!(policy.status.as_str(), "loaded" | "superseded") => {
+            return None;
+        }
+        Ok(None) => return None,
+        Ok(Some(_)) => {}
+        // Record it anyway. A failed write is kept and retried with the
+        // session's next result.
+        Err(error) => {
+            debug!(sandbox_id, version, error = %error, "failed to read the bootstrap policy revision");
+        }
+    }
+    Some(PolicyLoadResult {
+        version,
+        loaded: true,
+        error: String::new(),
+    })
 }
 
 /// Persist the session's admission when it differs from the one this session
@@ -1605,6 +1666,122 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             .unwrap()
             .expect("sandbox");
         assert_eq!(sandbox.current_policy_version(), 3);
+    }
+
+    fn sandbox_policy_config() -> SupervisorConfig {
+        SupervisorConfig {
+            sandbox_config: sandbox_policy_snapshot(),
+            provider_environment: ProviderEnvironmentSnapshot::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_bootstrap_settles_a_policy_load_lost_with_the_previous_session() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let sandbox_id = "sb-lost-policy-load";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        put_sandbox_policy_revision(&state, sandbox_id).await;
+
+        // The supervisor loads policy version 3, but writing its load result
+        // fails, and the session ends before reconciliation delivers the
+        // configuration again.
+        let (tx, mut rx) = mpsc::channel(4);
+        register_running_push_session(&state, sandbox_id, &tx);
+        state
+            .store
+            .execute_for_test(FAIL_POLICY_RECORD_WRITES)
+            .await;
+        let applied = deliver_and_report(
+            &state,
+            sandbox_id,
+            &mut rx,
+            &sandbox_policy_snapshot(),
+            ConfigApplyOutcome::Applied,
+        );
+        handle_config_update_result(&accepted_session(&state, sandbox_id, tx), &applied).await;
+        state.store.execute_for_test(RESTORE_RESULT_WRITES).await;
+        state
+            .supervisor_sessions
+            .remove_if_current(sandbox_id, "session-1");
+        let lost = state
+            .store
+            .get_policy_by_version(sandbox_id, 3)
+            .await
+            .unwrap()
+            .expect("policy revision");
+        assert_eq!(lost.status, "pending");
+
+        // The reconnect's bootstrap carries the same configuration, which
+        // the supervisor already enforces, so it reports no load.
+        let (tx, _rx) = mpsc::channel(4);
+        register_running_push_session(&state, sandbox_id, &tx);
+        let bootstrap = begin_bootstrap(&state, sandbox_id, sandbox_policy_config());
+        let duplicate = reported_result(&bootstrap, ConfigApplyOutcome::IgnoredDuplicate);
+        assert_eq!(duplicate.policy_load, None);
+        assert!(
+            handle_config_update_result(&accepted_session(&state, sandbox_id, tx), &duplicate)
+                .await
+        );
+
+        let policy = state
+            .store
+            .get_policy_by_version(sandbox_id, 3)
+            .await
+            .unwrap()
+            .expect("policy revision");
+        assert_eq!(policy.status, "loaded");
+        assert_eq!(
+            stored_sandbox(&state, sandbox_id)
+                .await
+                .current_policy_version(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_bootstrap_leaves_a_settled_policy_load_alone() {
+        let sandbox_id = "sb-settled-policy-load";
+        let state = push_state_with_sandbox(sandbox_id).await;
+        put_sandbox_policy_revision(&state, sandbox_id).await;
+        record_policy_load(
+            &state,
+            sandbox_id,
+            &PolicyLoadResult {
+                version: 3,
+                loaded: true,
+                error: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The reconnect starts from the stored admission, so only a policy
+        // write could change the sandbox record.
+        let (tx, _rx) = mpsc::channel(4);
+        register_running_push_session(&state, sandbox_id, &tx);
+        let (bootstrap, in_flight) = bootstrap_update(sandbox_policy_config());
+        state.supervisor_sessions.begin_config_bootstrap(
+            sandbox_id,
+            "session-1",
+            in_flight,
+            Some(expected_configuration_admission(&sandbox_policy_snapshot())),
+        );
+        let before = stored_sandbox(&state, sandbox_id).await;
+        assert!(
+            handle_config_update_result(
+                &accepted_session(&state, sandbox_id, tx),
+                &reported_result(&bootstrap, ConfigApplyOutcome::IgnoredDuplicate),
+            )
+            .await
+        );
+
+        let after = stored_sandbox(&state, sandbox_id).await;
+        assert_eq!(
+            after.metadata.as_ref().unwrap().resource_version,
+            before.metadata.as_ref().unwrap().resource_version,
+            "a settled policy revision takes no sandbox write"
+        );
     }
 
     #[tokio::test]
