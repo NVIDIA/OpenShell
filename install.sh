@@ -74,9 +74,8 @@ NOTES:
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
     that already have the OpenShell snap keep refreshing it. snap installs use
     latest/stable by default and latest/edge for dev, and do not support
-    explicit release tags or prereleases. The OpenShell snap requires a running
-    Docker Engine installed from a system package or Docker's package
-    repository. The Docker snap is not currently compatible with OpenShell.
+    explicit release tags or prereleases. The snap uses its bundled VM driver
+    by default; select a different compute driver in gateway.toml if needed.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
 EOF
@@ -1262,46 +1261,33 @@ openshell_snap_channel() {
   esac
 }
 
-wait_for_docker_daemon() {
-  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
-  _elapsed=0
-  _last_output=""
-
-  info "waiting for Docker daemon at /var/run/docker.sock to become reachable..."
-  while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_root env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info 2>&1)"; then
-      info "Docker daemon at /var/run/docker.sock is reachable"
-      return 0
-    fi
-    sleep 1
-    _elapsed=$((_elapsed + 1))
-  done
-
-  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
-  if snap list docker >/dev/null 2>&1; then
-    snap services docker >&2 || true
-    snap changes >&2 || true
+connect_snap_kvm() {
+  if ! as_root snap connect openshell:kvm; then
+    warn "could not connect the OpenShell kvm interface; connect it manually with: sudo snap connect openshell:kvm"
   fi
-  error "Docker daemon at /var/run/docker.sock did not become reachable within ${_timeout}s"
 }
 
-wait_for_user_docker_daemon() {
-  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
-  _elapsed=0
-  _last_output=""
+snap_kvm_device() {
+  printf '%s\n' /dev/kvm
+}
 
-  info "waiting for Docker daemon at /var/run/docker.sock to become reachable as ${TARGET_USER}..."
-  while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_target_user env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info 2>&1)"; then
-      info "Docker daemon at /var/run/docker.sock is reachable as ${TARGET_USER}"
-      return 0
-    fi
-    sleep 1
-    _elapsed=$((_elapsed + 1))
-  done
+check_snap_kvm_access() {
+  _kvm_device="$(snap_kvm_device)"
+  if as_target_user sh -c 'test -r "$1" && test -w "$1"' sh "$_kvm_device"; then
+    info "${TARGET_USER} can access ${_kvm_device}"
+    return 0
+  fi
 
-  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
-  error "Docker daemon at /var/run/docker.sock did not become reachable as ${TARGET_USER} within ${_timeout}s. Ensure ${TARGET_USER} can access the Docker socket, then log out and back in after changing group membership."
+  warn "${TARGET_USER} cannot access /dev/kvm, so the default VM compute driver cannot create sandboxes."
+  if [ -e "$_kvm_device" ] && getent group kvm >/dev/null 2>&1; then
+    warn "To use the VM driver, run: sudo usermod -aG kvm \"${TARGET_USER}\""
+    warn "Then log out and back in so the new group membership takes effect."
+  elif [ ! -e "$_kvm_device" ]; then
+    warn "/dev/kvm is unavailable; enable host virtualization before using the VM driver."
+  else
+    warn "The kvm group is unavailable; grant ${TARGET_USER} read/write access to /dev/kvm before using the VM driver."
+  fi
+  warn "Alternatively, set compute_driver to another installed driver, such as docker, in the snap gateway TOML configuration."
 }
 
 snap_gateway_mode() {
@@ -1468,21 +1454,6 @@ install_linux_snap() {
     error "OpenShell snap gateway mode is disabled. Complete the gateway transition with 'sudo snap set openshell gateway-mode=user' or 'sudo snap set openshell gateway-mode=system', then rerun the installer."
   fi
 
-  if snap list docker >/dev/null 2>&1; then
-    error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
-Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
-  fi
-  if ! has_cmd docker; then
-    error "Docker is required before installing the OpenShell snap.
-Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
-  fi
-  info "using existing Docker installation"
-  if [ "$_existing_mode" = user ]; then
-    wait_for_user_docker_daemon
-  else
-    wait_for_docker_daemon
-  fi
-
   _channel="$(openshell_snap_channel)"
   if [ "$_existing_snap" = true ]; then
     info "refreshing OpenShell snap from ${_channel}..."
@@ -1492,7 +1463,12 @@ Install Docker Engine from a system package or Docker's package repository, then
     as_root snap install openshell --channel="$_channel"
   fi
 
+  connect_snap_kvm
+
   _gateway_mode="$(snap_gateway_mode)"
+  if [ "$_gateway_mode" = user ]; then
+    check_snap_kvm_access
+  fi
   if [ "$_gateway_mode" = system ]; then
     warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
     as_root snap restart openshell.system-gateway

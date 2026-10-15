@@ -129,6 +129,10 @@ The gateway can manage sandboxes through several runtimes.
 | Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
 
+The snap bundles MicroVM support and selects it when no compute driver is set
+in the service environment or gateway TOML. Snap VM support is CPU-only; GPU
+VFIO passthrough is not available under snap confinement.
+
 ## Software Prerequisites
 
 Install the software for the compute driver you use:
