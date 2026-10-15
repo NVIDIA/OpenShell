@@ -6783,6 +6783,7 @@ fn public_status_from_driver(
         restart_count: 0,
         next_restart_time: None,
         main_process_started_time: None,
+        last_token_grant_failure: None,
     }
 }
 
@@ -6917,6 +6918,9 @@ fn apply_driver_snapshot(
     }
 
     if let (Some(status), Some(current_status)) = (status.as_mut(), sandbox.status.as_ref()) {
+        status
+            .last_token_grant_failure
+            .clone_from(&current_status.last_token_grant_failure);
         status
             .main_process_instance_id
             .clone_from(&current_status.main_process_instance_id);
@@ -11290,10 +11294,16 @@ mod tests {
             path: "/mcp".to_string(),
             last_result: openshell_core::proto::EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T01:01:00.000Z".parse().unwrap()),
+            last_failure: None,
         };
+        let grant_failure = Box::new(openshell_core::proto::TokenGrantFailureObservation {
+            destination_host: "api.example.com".to_string(),
+            ..Default::default()
+        });
         sandbox.status = Some(SandboxStatus {
             phase: SandboxPhase::Ready as i32,
             endpoint_statuses: vec![endpoint.clone()],
+            last_token_grant_failure: Some(grant_failure.clone()),
             ..Default::default()
         });
         let incoming = ready_driver_sandbox("sandbox-id", "sandbox-name");
@@ -11303,6 +11313,7 @@ mod tests {
         assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
         let status = sandbox.status.expect("driver status applied");
         assert_eq!(status.endpoint_statuses, vec![endpoint]);
+        assert_eq!(status.last_token_grant_failure, Some(grant_failure));
         assert!(
             status
                 .conditions

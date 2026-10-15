@@ -18,13 +18,6 @@ on:
         description: Whether the candidate is a pre-release
         required: true
         type: boolean
-    outputs:
-      artifact-name:
-        description: Artifact containing the qualification result
-        value: ${{ jobs.qualification-result.outputs.artifact-name }}
-      current-profile-passed:
-        description: Whether every required qualification suite passed
-        value: ${{ jobs.qualification-result.outputs.current-profile-passed }}
     secrets:
       CODEX_SECURITY_API_KEY:
         required: true
@@ -173,9 +166,7 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
-    outputs:
-      artifact-name: ${{ steps.summary.outputs.artifact-name }}
-      current-profile-passed: ${{ steps.summary.outputs.current-profile-passed }}
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -233,7 +224,44 @@ jobs:
           retention-days: 90
           if-no-files-found: error
 
-      - name: Require current qualification profile before publication
+      - name: Install ORAS
+        id: oras
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.0
+
+      - name: Log in to GHCR
+        id: ghcr
+        if: steps.oras.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish qualification summary
+        id: oci
+        if: steps.ghcr.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          oras push "${ref}" \
+            --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            qualification-summary.json:application/vnd.nvidia.openshell.qualification.summary.v1+json
+
+          echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Warn if OCI summary publication failed
+        if: ${{ !cancelled() && (steps.oras.outcome == 'failure' || steps.ghcr.outcome == 'failure' || steps.oci.outcome == 'failure') }}
+        run: |
+          echo "::warning::Could not publish the qualification summary to OCI. The summary remains available in this run's Actions artifacts."
+
+      - name: Require current qualification profile
         if: steps.summary.outputs.current-profile-passed != 'true'
         run: |
           echo "Release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2

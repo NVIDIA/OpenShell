@@ -1,0 +1,135 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Pre-release
+
+on:
+  push:
+    tags:
+      - "v*.*.*-pre.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Pre-release tag to publish and qualify (e.g. v0.0.4-pre.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-build.yml
+    with:
+      release-tag: ${{ inputs.tag || github.ref_name }}
+      is-prerelease: true
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  publish:
+    name: Publish
+    needs: build
+    permissions:
+      actions: read
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      release-tag: ${{ inputs.tag || github.ref_name }}
+      source-sha: ${{ needs.build.outputs.source_sha }}
+      semver: ${{ needs.build.outputs.semver }}
+      python-version: ${{ needs.build.outputs.python_version }}
+      npm-version: ${{ needs.build.outputs.npm_version }}
+      is-prerelease: true
+
+  qualify:
+    name: Qualify
+    needs: build
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+      security-events: write
+      pull-requests: read
+    uses: ./.github/workflows/release-qualification.yml
+    with:
+      release-tag: ${{ inputs.tag || github.ref_name }}
+      source-sha: ${{ needs.build.outputs.source_sha }}
+      is-prerelease: true
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  notify-prerelease-success:
+    name: Notify Prerelease Success
+    needs: [build, publish, qualify]
+    if: success()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Send Slack notification
+        continue-on-error: true
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+          TAG_URL: ${{ format('{0}/{1}/tree/{2}', github.server_url, github.repository, inputs.tag || github.ref_name) }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::notice::SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL is unset; skipping Slack notification."
+            exit 0
+          fi
+
+          jq -n --arg tag "${RELEASE_TAG}" --arg tag_url "${TAG_URL}" \
+            --arg attempt "${GITHUB_RUN_ATTEMPT}" --arg run_url "${RUN_URL}" \
+            '{text: (":white_check_mark: OpenShell prerelease <" + $tag_url + "|" + $tag + "> succeeded (attempt " + $attempt + ").\n<" + $run_url + "|View release run and artifacts>"), unfurl_links: false, unfurl_media: false}' |
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"
+
+  notify-prerelease-failure:
+    name: Notify Prerelease Failure
+    needs: [build, publish, qualify]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Send Slack notification
+        continue-on-error: true
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          PUBLICATION_RESULT: ${{ needs.publish.result }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
+          SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}
+          RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
+            echo "::notice::SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL is unset; skipping Slack notification."
+            exit 0
+          fi
+
+          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT})."
+          if [[ "${PUBLICATION_RESULT}" == "success" ]]; then
+            message+=" Published artifacts remain available."
+          fi
+          if [[ -n "${SLACK_MENTION}" ]]; then
+            message+=" ${SLACK_MENTION}"
+          fi
+          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
+            '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
+            curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
+              --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"

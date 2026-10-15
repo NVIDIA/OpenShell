@@ -726,9 +726,9 @@ openshell sandbox get my-sandbox --policy-only
 
 ### Diagnose Failed Calls to Tool Servers
 
-A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
+A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This is available for configured MCP-over-HTTP endpoints and does not change sandbox readiness.
 
-JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the corresponding timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`; SDKs render it using their native or curated time representation. Select the endpoint by its address to read the result directly. Treat `endpoint_id` as opaque.
+JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the same timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`, which SDKs render in their own time type. Select an endpoint by its address; `endpoint_id` is opaque.
 
 For example, use `jq` to select the tool server at `tools.example.com`, path `/mcp`, and port `443`:
 
@@ -742,22 +742,45 @@ openshell sandbox get my-sandbox --output json | jq -e \
 
 Read `last_result` to choose the next check:
 
-- `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
-- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
+- `NoObservedExchange`: nothing has been reported for the current configuration and supervisor session. Try the operation, then check the logs if no result appears.
+- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Check the client's response for protocol or tool errors, because an HTTP 200 can still carry one.
 - `PolicyDenied`: OpenShell denied the request, including MCP protocol-version, request-header, request-body, and HTTP-method checks. Check the sandbox policy and denial logs.
-- `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
+- `CredentialUnavailable`: a required credential was unavailable. Check the attached provider and [diagnose the token grant failure](#read-token-grant-failures).
 - `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
 - `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
-- `UpstreamRejected`: the server returned an HTTP status of 400 or higher. Check the server's response and logs.
-- `Unspecified`: the result is unrecognized or absent. Do not infer success from it.
+- `UpstreamRejected`: the server returned HTTP 400 or higher. Check the server's response and logs.
+- `Unspecified`: the result is unrecognized or absent. Do not infer success.
 
-For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After the server recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
+For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After it recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
 
-Results come from actual traffic and do not expire. A result can remain unchanged after the server stops until another observed exchange or configuration/session reset. Reports combine recent observations and can drop them when full, so this list is not a request history. The address remains available when a result resets to `NoObservedExchange`. To verify current tool availability, run the actual operation.
+Results come from actual traffic and do not expire, so one can outlast the server until another exchange is observed or the configuration or session resets. Reports can drop observations when full, so this is not a request history. The address remains after a reset to `NoObservedExchange`. To verify current availability, run the operation.
 
-`last_reported_at` is the RFC 3339 rendering of the protobuf `last_reported_time` when the gateway accepted the result. It is empty until a result is reported. New accepted observations advance it, including repeated results; identical report retries do not. If a configuration reset supersedes a report whose acknowledgement was lost, the gateway can accept still-valid pending evidence again and advance this timestamp without another exchange.
+`last_reported_at` is the RFC 3339 form of `last_reported_time`, the time the gateway accepted the result. It is empty until a result is reported. Each newly accepted observation advances it, including a repeated result; a retry of an identical report does not.
 
-Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record that combines observations from all callers and ports; it does not establish that every caller or port works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one distinct endpoint. If several configured paths share that host and port, inspect the logs for the failure.
+Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record across all callers and ports, so it does not show that every one works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one endpoint. Otherwise, check the logs.
+
+### Read Token Grant Failures
+
+When OpenShell cannot obtain a required token, the workload receives HTTP 502 with an `x-openshell-request-id` header. The response hides the cause. If you can read the sandbox, inspect its latest failure:
+
+```shell
+openshell sandbox get my-sandbox --output json | jq '.last_token_grant_failure'
+```
+
+Match `failure.request_id` to the response header; a newer failure may have replaced the record. It identifies the destination host and port, failure code, stage, and recovery action. Provider and credential names appear when known; credential values never appear.
+
+| Recovery action | Next step |
+|---|---|
+| `reauthorize` | Authorize the provider again. |
+| `fix_configuration` | Repair the provider, grant, or workload identity configuration. |
+| `retry` | Retry later. |
+| `investigate` | Check supervisor and gateway logs using the request ID. |
+
+For MCP-over-HTTP endpoints, `Tool server connections` also shows the cause as `last_failure` under `CredentialUnavailable`. A credential failure does not establish that the remote server is unhealthy.
+
+The sandbox retains one latest failure, not a request history. A successful grant for the same destination, provider, and credential clears it; failures before credential selection clear on the next successful grant to that destination. Policy, provider, and supervisor-session resets also clear it. JSON/YAML shows `null` when no failure remains.
+
+See [Token Grant Failures](/how-it-works/providers/profiles#token-grant-failures) for failure-code definitions and token-service behavior.
 
 ### Inspect Logs and Activity
 

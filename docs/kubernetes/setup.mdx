@@ -118,6 +118,10 @@ helm upgrade --install openshell \
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
 
+The default Kubernetes driver puts all workspaces in one sandbox namespace. To
+have the gateway create a namespace for each workspace, follow
+[Workspace on Kubernetes](/kubernetes/workspaces).
+
 ### Split gateway and workspace releases
 
 For a platform-managed namespace, install the gateway without namespace-scoped

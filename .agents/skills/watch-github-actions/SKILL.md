@@ -160,21 +160,22 @@ groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
 For `Protobuf Compatibility`, check the logged train and comparison baseline.
-Branch Checks compares the prospective merge tree with its target; Release Tag
+Branch Checks compares the prospective merge tree with its target; release qualification
 compares the tagged candidate with the previous stable release. Both use
 the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-compatibility -- <ref>`.
 During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Release Tag calls the reusable
+the `release-tag-v1` qualification profile. Release and Pre-release call the reusable
 `release-qualification.yml` workflow to run the checks and collect their results.
-Both tagged pre-release and stable
-publication require this profile to pass. Failed, cancelled, or skipped suites
-block publication; build artifacts and qualification evidence remain in Actions
-storage for diagnosis. Source-SHA images are staging inputs for qualification.
-Snap builds run in parallel with qualification, but tagged stable Store uploads
-consume those built artifacts only after qualification passes.
+Release builds, qualifies, then publishes. Pre-release builds, then publishes
+and qualifies in parallel in the same run. Failed, cancelled, or skipped required suites fail
+qualification; stable publication is blocked, while published pre-release
+artifacts remain available. The Pre-release failure notification includes the
+run link. Both callers share `release-build.yml` and `release-publish.yml`.
+Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
+Snap Store uploads happen only for stable releases after qualification passes.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the
@@ -192,7 +193,7 @@ share the `codex-release-review` concurrency group with `queue: max`, retaining
 up to 100 pending reviews while preventing overlapping API usage across runs.
 Either review can run first; other security scanners run in parallel.
 The qualification caller waits for both reviews to finish. Do not
-rerun Release Tag to debug this reviewer. Use its dedicated manual workflow
+rerun Release or Pre-release to debug this reviewer. Use its dedicated manual workflow
 with an existing candidate tag; that path does not publish release artifacts.
 
 View logs for a specific run:

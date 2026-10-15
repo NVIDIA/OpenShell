@@ -15,6 +15,7 @@ release to the maintainer; once approved, tag that exact commit as `vX.Y.Z`.
 If no prerelease exists, agree on the version and source commit, then create and
 push `vX.Y.Z-pre.1`. Wait for qualification to pass before promoting it.
 
-Both prerelease and stable tag pushes start Release Tag. Release Auto-Tag uses
-an explicit dispatch because its `GITHUB_TOKEN` pushes do not trigger workflows.
+Prerelease tag pushes start Pre-release; stable tag pushes start Release.
+Release Auto-Tag uses an explicit dispatch because its `GITHUB_TOKEN` pushes do
+not trigger workflows.
 Watch the stable release run and report its result.

@@ -1808,6 +1808,17 @@ where
         );
     }
 
+    if let Some(observation) = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.last_token_grant_failure.as_deref())
+    {
+        println!("  {}", "Last token grant failure:".dimmed());
+        for line in token_grant_failure_display_lines(observation) {
+            println!("    {line}");
+        }
+    }
+
     let policy_from_global = config.policy_source == PolicySource::Global as i32;
     println!(
         "  {} {}",
@@ -3037,10 +3048,22 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
                     "path": endpoint.path,
                     "last_result": endpoint_result_name(endpoint.last_result()),
                     "last_reported_at": endpoint.last_reported_time.as_ref().map(ToString::to_string).unwrap_or_default(),
+                    "last_failure": endpoint.last_failure.as_ref().map(endpoint_failure_to_json),
                 })
             })
             .collect::<Vec<_>>()
     });
+    let last_token_grant_failure = sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.last_token_grant_failure.as_deref())
+        .map(|observation| {
+            serde_json::json!({
+                "destination_host": observation.destination_host,
+                "destination_port": observation.destination_port,
+                "failure": observation.failure.as_ref().map(endpoint_failure_to_json),
+            })
+        });
     let admission = sandbox
         .status
         .as_ref()
@@ -3097,6 +3120,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "exit_code": sandbox.status.as_ref().and_then(|status| status.exit_code),
         "conditions": conditions,
         "endpoint_statuses": endpoint_statuses,
+        "last_token_grant_failure": last_token_grant_failure,
         "configuration_admission": admission,
         "provisioning": provisioning,
         "created_from_workload_template": created_from_workload_template,
@@ -3154,6 +3178,83 @@ fn endpoint_result_name(result: EndpointResult) -> &'static str {
     }
 }
 
+fn endpoint_failure_domain_name(domain: i32) -> &'static str {
+    match openshell_core::proto::EndpointFailureDomain::try_from(domain) {
+        Ok(openshell_core::proto::EndpointFailureDomain::TokenGrant) => "token_grant",
+        Ok(openshell_core::proto::EndpointFailureDomain::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn endpoint_failure_recovery_name(
+    action: openshell_core::proto::ProviderCredentialRefreshRecoveryAction,
+) -> &'static str {
+    match action {
+        // Structured output names every value; "-" is a table placeholder.
+        openshell_core::proto::ProviderCredentialRefreshRecoveryAction::Unspecified => {
+            "unspecified"
+        }
+        action => crate::commands::provider::provider_refresh_recovery_action_name(action),
+    }
+}
+
+fn endpoint_failure_to_json(failure: &openshell_core::proto::EndpointFailure) -> serde_json::Value {
+    serde_json::json!({
+        "domain": endpoint_failure_domain_name(failure.domain),
+        "code": failure.code,
+        "recovery_action": endpoint_failure_recovery_name(failure.recovery_action()),
+        "provider": failure.provider,
+        "credential_key": failure.credential_key,
+        "stage": failure.stage,
+        "upstream_http_status": failure.upstream_http_status,
+        "request_id": failure.request_id,
+    })
+}
+
+fn endpoint_failure_display_lines(failure: &openshell_core::proto::EndpointFailure) -> Vec<String> {
+    use openshell_core::proto::ProviderCredentialRefreshRecoveryAction as Recovery;
+    let upstream = failure
+        .upstream_http_status
+        .map(|status| format!(", upstream HTTP {status}"))
+        .unwrap_or_default();
+    let recovery = match failure.recovery_action() {
+        Recovery::Retry => "Retry later; the failure can be temporary.",
+        Recovery::Reauthorize => "Reauthorize the provider credential.",
+        Recovery::FixConfiguration => {
+            "An operator must fix the provider or identity configuration."
+        }
+        Recovery::Investigate => "An operator must investigate gateway and supervisor logs.",
+        Recovery::Unspecified => "No recovery action provided.",
+    };
+    let mut lines = vec![format!(
+        "Cause: {} ({}, stage {}{upstream})",
+        failure.code,
+        endpoint_failure_domain_name(failure.domain).replace('_', " "),
+        failure.stage,
+    )];
+    if !failure.provider.is_empty() {
+        lines.push(format!(
+            "Credential: {}/{}",
+            failure.provider, failure.credential_key
+        ));
+    }
+    lines.push(format!("Recovery: {recovery}"));
+    lines.push(format!("Request ID: {}", failure.request_id));
+    lines
+}
+
+fn token_grant_failure_display_lines(
+    observation: &openshell_core::proto::TokenGrantFailureObservation,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Destination: {} (port {})",
+        observation.destination_host, observation.destination_port
+    )];
+    if let Some(failure) = observation.failure.as_ref() {
+        lines.extend(endpoint_failure_display_lines(failure));
+    }
+    lines
+}
+
 fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
     let ports = endpoint
         .ports
@@ -3179,14 +3280,18 @@ fn endpoint_status_display_lines(endpoint: &EndpointStatus) -> Vec<String> {
         .last_reported_time
         .as_ref()
         .map_or_else(|| "no report yet".to_string(), ToString::to_string);
-    vec![
+    let mut lines = vec![
         format!(
             "{} (ports: {ports}; path: {})",
             endpoint.host, endpoint.path
         ),
         format!("Last result: {result}"),
-        format!("Reported at (gateway acceptance): {reported_at}"),
-    ]
+    ];
+    if let Some(failure) = endpoint.last_failure.as_ref() {
+        lines.extend(endpoint_failure_display_lines(failure));
+    }
+    lines.push(format!("Reported at (gateway acceptance): {reported_at}"));
+    lines
 }
 
 fn restart_policy_name(policy: i32) -> &'static str {
@@ -8678,6 +8783,7 @@ mod tests {
                     path: "/mcp".to_string(),
                     last_result: EndpointResult::TransportFailed as i32,
                     last_reported_time: Some("2026-09-05T10:01:00Z".parse().unwrap()),
+                    last_failure: None,
                 }],
                 conditions: vec![SandboxCondition {
                     r#type: "Ready".to_string(),
@@ -8725,6 +8831,7 @@ mod tests {
                     "path": "/mcp",
                     "last_result": "TransportFailed",
                     "last_reported_at": "2026-09-05T10:01:00Z",
+                    "last_failure": null,
                 }])
             );
         }
@@ -8739,6 +8846,7 @@ mod tests {
             path: "/mcp".to_string(),
             last_result: EndpointResult::TransportFailed as i32,
             last_reported_time: Some("2026-09-05T11:01:00Z".parse().unwrap()),
+            last_failure: None,
         };
 
         assert_eq!(
@@ -8760,6 +8868,7 @@ mod tests {
             path: "/**".to_string(),
             last_result: EndpointResult::NoObservedExchange as i32,
             last_reported_time: None,
+            last_failure: None,
         };
 
         assert_eq!(
@@ -8787,9 +8896,89 @@ mod tests {
                 "path": "/**",
                 "last_result": "NoObservedExchange",
                 "last_reported_at": "",
+                "last_failure": null,
             }])
         );
         assert_eq!(output["conditions"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn token_grant_failure_renders_in_text_and_structured_output() {
+        use openshell_core::proto::{
+            EndpointFailure, EndpointFailureDomain, ProviderCredentialRefreshRecoveryAction,
+            TokenGrantFailureObservation,
+        };
+        let failure = EndpointFailure {
+            domain: EndpointFailureDomain::TokenGrant.into(),
+            code: "provider_authorization_required".to_string(),
+            recovery_action: ProviderCredentialRefreshRecoveryAction::Reauthorize.into(),
+            provider: "github".to_string(),
+            credential_key: "access_token".to_string(),
+            stage: "token_endpoint".to_string(),
+            upstream_http_status: Some(409),
+            request_id: "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908".to_string(),
+        };
+        let endpoint = EndpointStatus {
+            host: "tools.example.test".to_string(),
+            last_failure: Some(failure.clone()),
+            ..Default::default()
+        };
+        let observation = TokenGrantFailureObservation {
+            destination_host: "api.example.test".to_string(),
+            destination_port: 8443,
+            failure: Some(failure),
+        };
+        let cause = [
+            "Cause: provider_authorization_required (token grant, stage token_endpoint, upstream HTTP 409)",
+            "Credential: github/access_token",
+            "Recovery: Reauthorize the provider credential.",
+            "Request ID: 7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+        ];
+        // MCP endpoint status places the cause between the result and report time.
+        let endpoint_lines = super::endpoint_status_display_lines(&endpoint);
+        assert_eq!(endpoint_lines[2..6], cause);
+        assert!(endpoint_lines[6].starts_with("Reported at"));
+        assert_eq!(
+            super::token_grant_failure_display_lines(&observation),
+            [&["Destination: api.example.test (port 8443)"][..], &cause].concat()
+        );
+
+        let output = super::sandbox_to_json(&Sandbox {
+            status: Some(SandboxStatus {
+                endpoint_statuses: vec![endpoint],
+                last_token_grant_failure: Some(Box::new(observation)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let failure_json = serde_json::json!({
+            "domain": "token_grant",
+            "code": "provider_authorization_required",
+            "recovery_action": "reauthorize",
+            "provider": "github",
+            "credential_key": "access_token",
+            "stage": "token_endpoint",
+            "upstream_http_status": 409,
+            "request_id": "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+        });
+        assert_eq!(output["endpoint_statuses"][0]["last_failure"], failure_json);
+        assert_eq!(
+            output["last_token_grant_failure"],
+            serde_json::json!({
+                "destination_host": "api.example.test",
+                "destination_port": 8443,
+                "failure": failure_json,
+            })
+        );
+        assert!(super::sandbox_to_json(&Sandbox::default())["last_token_grant_failure"].is_null());
+
+        let unknown = super::endpoint_failure_to_json(&EndpointFailure {
+            domain: 99,
+            recovery_action: 99,
+            ..Default::default()
+        });
+        assert_eq!(unknown["domain"], "unknown");
+        assert_eq!(unknown["recovery_action"], "unspecified");
     }
 
     #[test]

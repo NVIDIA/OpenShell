@@ -80,6 +80,35 @@ for _, endpoint := range sb.Status.EndpointStatuses {
 
 OpenShell observes real traffic passively and does not expire idle observations. Keep `LastReportedAt` visible when displaying a result: it records when the gateway accepted the observation, not when the request happened. Retained evidence can be accepted after a reset. `v1.EndpointNoObservedExchange` has an empty timestamp and retains the configured address, so the endpoint remains identifiable before traffic is observed or after evidence is invalidated.
 
+`LastFailure` explains a `v1.EndpointCredentialUnavailable` result when the supervisor classified the cause, and is `nil` otherwise. Each later observation replaces or clears it. `Code` and `Stage` come from closed sets, `Provider` and `CredentialKey` name the configured credential, and no field carries remote text. `RequestID` matches the `x-openshell-request-id` header the workload received, so you can correlate the refused request.
+
+```go
+for _, endpoint := range sb.Status.EndpointStatuses {
+    if f := endpoint.LastFailure; f != nil && f.Domain == v1.EndpointFailureDomainTokenGrant {
+        fmt.Printf("%s/%s: %s at %s (request %s)\n",
+            f.Provider, f.CredentialKey, f.Code, f.Stage, f.RequestID)
+        if f.RecoveryAction == v1.RefreshRecoveryActionReauthorize {
+            // Ask the user to replace the provider's OAuth grant.
+        }
+    }
+}
+```
+
+### Token grant failures
+
+`sb.Status.LastTokenGrantFailure` gives the latest classified grant refusal for any destination, including REST requests without an MCP inventory entry. It carries `DestinationHost`, `DestinationPort`, and the same bounded `EndpointFailure` as endpoint status.
+
+```go
+if observation := sb.Status.LastTokenGrantFailure; observation != nil && observation.Failure != nil {
+    f := observation.Failure
+    fmt.Printf("%s (port %d): %s, recovery %s, request %s\n",
+        observation.DestinationHost, observation.DestinationPort,
+        f.Code, f.RecoveryAction, f.RequestID)
+}
+```
+
+Check `RequestID` against the refused response before acting: a newer failure can replace this record. A successful grant for the same destination, provider, and credential clears it; a failure before credential selection clears on the next successful grant to that destination. Policy, provider, and supervisor-session resets also clear it. `nil` means no retained cause. This is one latest observation, not a request history or a server health check.
+
 ## List
 
 `List` constructs a lazy pager; `NextPage` fetches one page at a time.
