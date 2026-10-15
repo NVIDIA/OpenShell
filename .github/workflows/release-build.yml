@@ -199,7 +199,7 @@ jobs:
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions, build-binaries]
+    needs: [compute-versions, build-binaries, build-vm-driver]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}

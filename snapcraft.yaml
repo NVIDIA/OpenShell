@@ -17,18 +17,16 @@ description: |
 
   **Setup instructions**
 
-    1. Install and start Docker using your preferred package source before
-       installing the OpenShell snap. Use a system package or Docker's package
-       repository. The Docker snap is not currently compatible with OpenShell.
+    1. The snap uses the VM compute driver unless `compute_driver` is set in
+       gateway.toml or OPENSHELL_COMPUTE_DRIVER is set in the service
+       environment. The VM driver requires access to /dev/kvm. Desktop sessions
+       commonly receive access automatically; otherwise add the gateway user to
+       the kvm group and start a new login session:
 
-       Snap Store installations automatically connect the required interfaces.
+         sudo usermod -aG kvm "$USER"
 
-       If the OpenShell snap was installed before Docker was running, its user
-       service may have hit the systemd start limit. Resolve this from the
-       affected user's session after Docker is available:
-
-         systemctl --user reset-failed snap.openshell.user-gateway.service
-         snap start --user openshell.user-gateway
+       To use a different driver, such as Docker, set `compute_driver` under
+       `[openshell.gateway]` in gateway.toml.
 
     2. Register the per-user gateway after it provisions its mTLS credentials:
 
@@ -137,6 +135,7 @@ apps:
       OPENSHELL_LOCAL_TLS_DIR: "$SNAP_COMMON/tls"
     plugs:
       - docker
+      - kvm
       - log-observe
       - network
       - network-bind
@@ -155,6 +154,7 @@ apps:
       XDG_STATE_HOME: "$SNAP_USER_COMMON/.local/state"
     plugs:
       - docker
+      - kvm
       - log-observe
       - network
       - network-bind
@@ -171,7 +171,7 @@ parts:
       set -euo pipefail
 
       MISSING=()
-      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
+      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-driver-vm openshell-gateway-wrapper; do
         if [ ! -f "$CRAFT_PART_SRC/$bin" ]; then
           MISSING+=("$bin")
         fi
@@ -195,6 +195,8 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
+      install -D -m 0755 "$CRAFT_PART_SRC/openshell-driver-vm" \
+        "$CRAFT_PART_INSTALL/bin/openshell-driver-vm"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
       install -D -m 0644 "$CRAFT_PART_SRC/meta/gui/term.desktop" \
@@ -216,3 +218,10 @@ parts:
       - openssh-client
     prime:
       - usr/bin/ssh
+
+  e2fsprogs:
+    # The VM driver formats and modifies file-backed ext4 disks with these
+    # tools. Vendor them because strict snaps cannot execute host sbin tools.
+    plugin: nil
+    stage-packages:
+      - e2fsprogs
