@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+cdi_fixture_root: /var/lib/openshell-test-inputs/cdi
+
+# Specs the role installs into /var/run/cdi on every boot. The CDI feature
+# playbook checks the same list, so a new spec is added here only.
+cdi_fixture_spec_files:
+  - openshell-tmachine-scenarios.yaml

@@ -1,0 +1,5 @@
+# Hardware-free CDI fixtures for the disposable Docker test environment.
+d /run/cdi 0755 root root -
+{% for spec in cdi_fixture_spec_files %}
+C /run/cdi/{{ spec }} 0644 root root - {{ cdi_fixture_root }}/specs/{{ spec }}
+{% endfor %}

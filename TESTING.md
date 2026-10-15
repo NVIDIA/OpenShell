@@ -330,6 +330,77 @@ nix run .#tmachine -- test fedora-podman-rootless binaries e2e-podman
 nix run .#tmachine -- test fedora-podman-rootless binaries driver-podman
 ```
 
+The `cdi` feature suite tests device injection without GPU hardware in the
+`ubuntu-docker-rootful` environment. Build the candidate artifacts, then run:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test ubuntu-docker-rootful deb cdi
+```
+
+If candidate binaries, images, and packages are already built, rebuild just the
+CDI test archive with `nix run .#build-artifacts-cdi-tests`.
+
+The `binaries` installer also supports this suite. Docker environment setup
+creates the named scenario fixtures and a CDI spec that defines one device per
+scenario, selected as `tmachine.example/cdi-scenario=<scenario>`. Persistent
+spec sources live under `/var/lib/openshell-test-inputs/cdi/specs`; a
+systemd-tmpfiles configuration recreates them in `/var/run/cdi` on every VM
+boot. This preserves the fixtures across tmachine's setup, installation, and
+test disk layers and makes them available to every suite using the Docker
+environment. The tests need no GPU hardware.
+
+Each test creates a sandbox that selects one scenario explicitly with `--gpu 1`
+and the Docker `cdi_devices` driver option, then checks what the workload
+observes or that creation is rejected. Selection by count or default, and the
+`nvidia.com/gpu` inventory, are not covered here. Caller driver configuration
+is enabled temporarily in the installed gateway's active TOML. The test
+playbook restores the configuration and restarts the gateway even after test
+failure; the CDI fixtures remain part of the environment. Docker must support
+CDI. Branch and release feature-test matrices run this suite on Docker.
+
+| Scenario | Injected resource | Asserted today | Expected with PR #4204 |
+| --- | --- | --- | --- |
+| `mount-under-read-only-baseline` | File at `/usr/share/tmachine-cdi/baseline-read-only-file`, under a directory the sandbox already makes read-only | Read succeeds, write denied. | Unchanged. |
+| `read-only-file` | File at `/tmachine-cdi/read-only/file` | Read and write denied. | Read succeeds outside the baseline grants; write fails. |
+| `read-only-directory` | Directory at `/tmachine-cdi/read-only/directory` | Reading its marker and creating files denied. | Reading its marker succeeds; write fails. |
+| `library-parent` | Marker named `/tmachine-cdi/library/libfixture.so.1` | Read and write denied. | Resolver derives the library parent; the marker is not an actual shared library. |
+| `broad-library-parent` | Marker named `/libtmachinefixture.so.1` | Read and write denied. | Launch rejects expansion to `/`. |
+| `writable-file` | Writable file at `/tmachine-cdi/writable/file` | Read and write denied. | Launch rejects it even with exact or ancestor write grants. |
+| `writable-directory` | Writable directory at `/tmachine-cdi/writable/directory` | Write denied. | Launch rejects it even with exact or ancestor write grants. |
+| `omitted-access-file` | Bind without `ro` or `rw` | Read and write denied. | Effective writable access causes launch rejection. |
+| `device-node` | Null character device at `/dev/tmachine-cdi-null` | Non-root, write denied. | Non-root read/write succeeds; an exact authored read-only entry fails launch. |
+| `device-node-with-gid` | Group-restricted null device at `/dev/tmachine-cdi-group-null` | Non-root with the device's group, write denied. | The generated supplementary GID permits non-root access. |
+| `unix-socket` | Echo socket at `/tmachine-cdi/socket/echo.sock` | Sibling file in the host directory is not visible. | Socket communication succeeds without deriving parent filesystem grants. |
+
+Every scenario also supplies a spec-level environment marker and a read-only
+mount at `/usr/share/tmachine-cdi/common/spec-marker`, allowing checks of
+spec/device edit merging without depending on derived grants. The device group
+is allocated in the disposable guest. A systemd socket unit restores the echo
+endpoint after reboot; the existing tmpfiles configuration restores the
+scenario spec. Negative scenarios must be selected individually, not combined
+with positive cases.
+
+The role publishes each scenario's expectations as `scenarios.json` next to the
+fixtures. The `scenario_*` tests load them and assert the behavior recorded in
+`vars/scenarios.yaml`, which is the sandbox's behavior today. A change that
+alters a scenario's behavior, such as #4204 deriving grants from the spec,
+updates those values in the same diff. To record the current behavior, run the
+tests with `OPENSHELL_CDI_CAPTURE=1` set for the test process; they then print
+what each scenario observed instead of asserting.
+
+To add a scenario, add an entry to `cdi_scenarios` in
+`tests/ansible/roles/cdi_fixtures/vars/scenarios.yaml` with the host fixtures
+it needs, its CDI edits, and its `expect` (the checks on the workload, or a
+rejection), then list it in `cdi_scenarios!` in
+`tests/suites/features/cdi/tests/injection.rs`. A new spec file belongs in
+`cdi_fixture_spec_files` in the role defaults, which the setup and test
+playbooks share.
+
+Directory absence, daemon configuration refresh, and restart tests require
+orchestration around these fixtures. Spec projection secrecy is a separate
+workload assertion. Hardware CUDA initialization remains outside this suite.
+
 Print the exact tmachine archive selection as a shell `PODMAN_CI_TESTS` array:
 
 ```shell

@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Persistent sources are copied into /var/run/cdi by systemd-tmpfiles on every
+# boot, including the setup, installation, and test disk layers.
+- name: Check fixture paths before creating CDI specs
+  become: true
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop: "{{ cdi_fixture_spec_files | map('regex_replace', '^', '/var/run/cdi/') }}"
+  register: cdi_fixture_paths
+
+- name: Require a guest without existing fixture paths
+  ansible.builtin.assert:
+    that: [not item.stat.exists]
+    fail_msg: "Refusing to replace existing CDI fixture path {{ item.item }}"
+  loop: "{{ cdi_fixture_paths.results }}"
+
+- name: Create CDI spec directories
+  become: true
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  loop:
+    - "{{ cdi_fixture_root }}"
+    - "{{ cdi_fixture_root }}/specs"
+
+- name: Prepare named CDI scenarios
+  ansible.builtin.include_tasks: scenarios.yaml
+
+- name: Recreate volatile CDI specs on every VM boot
+  become: true
+  ansible.builtin.template:
+    src: tmpfiles.conf.j2
+    dest: /etc/tmpfiles.d/openshell-tmachine-cdi.conf
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Populate CDI specs for the current boot
+  become: true
+  ansible.builtin.command:
+    argv: [systemd-tmpfiles, --create, /etc/tmpfiles.d/openshell-tmachine-cdi.conf]
+  changed_when: true

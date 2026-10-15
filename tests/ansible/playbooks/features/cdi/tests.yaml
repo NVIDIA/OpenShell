@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Test CDI injection without GPU hardware
+  hosts: all
+  gather_facts: false
+  vars_files:
+    - ../../../roles/cdi_fixtures/defaults/main.yaml
+  vars:
+    cdi_test_root: /var/lib/openshell-feature-tests/cdi
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Resolve installed gateway context
+      ansible.builtin.include_role:
+        name: openshell_test_gateway
+
+    - name: Require environment CDI specs after boot
+      ansible.builtin.stat:
+        path: "/var/run/cdi/{{ item }}"
+      loop: "{{ cdi_fixture_spec_files }}"
+      register: cdi_environment_specs
+
+    - name: Require CDI fixtures supplied by the Docker environment
+      ansible.builtin.assert:
+        that: [item.stat.isreg | default(false)]
+        fail_msg: "Docker environment did not recreate CDI spec {{ item.item }} after boot"
+      loop: "{{ cdi_environment_specs.results }}"
+
+    - name: Save gateway configuration before enabling caller device selection
+      become: true
+      ansible.builtin.slurp:
+        src: "{{ openshell_test_gateway.config_path }}"
+      register: cdi_gateway_config
+
+    - name: Run CDI tests with caller device selection enabled
+      block:
+        - name: Enable caller driver configuration for CDI tests
+          become: true
+          ansible.builtin.blockinfile:
+            path: "{{ openshell_test_gateway.config_path }}"
+            insertafter: '^\[openshell\.drivers\.docker\]$'
+            marker: "# {mark} OpenShell CDI test fixture"
+            block: allow_driver_config = true
+
+        - name: Restart gateway with caller device selection enabled
+          ansible.builtin.include_role:
+            name: openshell_test_gateway
+            tasks_from: restart.yaml
+
+        - name: Create CDI test directory
+          become: true
+          ansible.builtin.file:
+            path: "{{ cdi_test_root }}"
+            state: directory
+            owner: tmachine
+            group: tmachine
+            mode: "0700"
+
+        - name: Install CDI test archive
+          become: true
+          ansible.builtin.unarchive:
+            src: "{{ openshell_cdi_test_bundle }}"
+            dest: "{{ cdi_test_root }}"
+            owner: tmachine
+            group: tmachine
+
+        - name: Run CDI feature tests
+          ansible.builtin.command:
+            argv: [cargo-nextest, nextest, run, --archive-file, "{{ cdi_test_root }}/tests.tar.zst", --workspace-remap, "{{ cdi_test_root }}", --no-fail-fast, --no-capture]
+          environment:
+            OPENSHELL_GATEWAY: "{{ openshell_test_gateway.name }}"
+            OPENSHELL_BIN: "{{ openshell_test_cli.stdout }}"
+          register: cdi_test_result
+          changed_when: false
+          failed_when: false
+
+        - name: Show CDI test result
+          ansible.builtin.debug:
+            var: cdi_test_result
+
+        - name: Collect gateway diagnostics after test failure
+          ansible.builtin.include_role:
+            name: openshell_test_gateway
+            tasks_from: journal.yaml
+          when: cdi_test_result.rc != 0
+
+        - name: Require CDI test success
+          ansible.builtin.assert:
+            that: [cdi_test_result.rc == 0]
+            fail_msg: CDI feature tests failed
+
+      always:
+        - name: Restore gateway configuration
+          become: true
+          ansible.builtin.copy:
+            content: "{{ cdi_gateway_config.content | b64decode }}"
+            dest: "{{ openshell_test_gateway.config_path }}"
+
+        - name: Restart gateway with its original configuration
+          ansible.builtin.include_role:
+            name: openshell_test_gateway
+            tasks_from: restart.yaml

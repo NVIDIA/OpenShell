@@ -169,6 +169,10 @@
             type = "app";
             program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";
           };
+          build-artifacts-cdi-tests = {
+            type = "app";
+            program = "${artifacts.cdiArchive}/bin/build-openshell-cdi-test-archive";
+          };
           build-artifacts-test-images = {
             type = "app";
             program = "${artifacts.testImages}/bin/build-artifacts-test-images";

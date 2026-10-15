@@ -91,15 +91,10 @@ assert_contains "$spec" '%files prover'
 assert_contains "$spec" '%{_bindir}/%{name}-prover'
 assert_not_contains "$spec" '%%S/openshell/tls'
 
-# Installed-package qualification must select the candidate trusted runtime
-# images through the same environment file consumed by preflight and startup,
-# without generating operator-owned gateway TOML.
+# Qualification retains the package-owned service's environment file. The
+# selected configuration and runtime images are exercised by tmachine's
+# installed-package integration lanes.
 assert_contains "$package_qualification" 'dest: "{{ openshell_gateway_home }}/.config/openshell/gateway.env"'
-assert_contains "$package_qualification" 'OPENSHELL_COMPUTE_DRIVER={{ openshell_gateway_driver }}'
-assert_contains "$package_qualification" 'OPENSHELL_SANDBOX_RUNTIME_IMAGE=docker.io/openshell/sandbox:tmachine'
-assert_contains "$package_qualification" 'OPENSHELL_SUPERVISOR_IMAGE=docker.io/openshell/supervisor:tmachine'
-assert_not_contains "$package_qualification" 'OPENSHELL_GATEWAY_CONFIG='
-assert_not_contains "$package_qualification" '/var/lib/openshell-qualification/gateway.toml'
 
 # Direct tmachine gateway services select trusted runtime images through the
 # process environment. Driver TOML remains available for settings that do not

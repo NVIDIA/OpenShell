@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[Unit]
+Description=OpenShell tmachine CDI Unix socket fixture
+
+[Socket]
+ListenStream=/var/lib/openshell-test-inputs/cdi/scenarios/socket/echo.sock
+SocketMode=0666
+Accept=yes
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

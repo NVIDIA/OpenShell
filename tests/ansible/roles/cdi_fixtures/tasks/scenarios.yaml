@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Allocate a supplementary group for the CDI device fixture
+  become: true
+  ansible.builtin.group:
+    name: openshell-cdi-fixture
+    system: true
+  register: cdi_fixture_group
+
+- name: Load named CDI scenarios
+  ansible.builtin.include_vars:
+    file: scenarios.yaml
+
+- name: Collect scenario fixtures
+  ansible.builtin.set_fact:
+    cdi_scenario_fixtures: >-
+      {{ cdi_scenario_common_fixtures
+         + (cdi_scenarios | map(attribute='fixtures', default=[]) | flatten) }}
+
+- name: Create the scenario fixture root
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create scenario fixture directories
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'dir') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Write scenario fixture files
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    content: "{{ item.content }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'file') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Create scenario fixture named pipes
+  become: true
+  ansible.builtin.command:
+    argv: [mkfifo, "--mode={{ item.mode }}", "{{ cdi_scenario_dir }}/{{ item.path }}"]
+    creates: "{{ cdi_scenario_dir }}/{{ item.path }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'fifo') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Create scenario fixture character devices
+  become: true
+  ansible.builtin.command:
+    argv: [mknod, "{{ cdi_scenario_dir }}/{{ item.path }}", c, "{{ item.major }}", "{{ item.minor }}"]
+    creates: "{{ cdi_scenario_dir }}/{{ item.path }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'eq', 'chardev') | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Set scenario fixture device ownership
+  become: true
+  ansible.builtin.file:
+    path: "{{ cdi_scenario_dir }}/{{ item.path }}"
+    owner: "{{ item.owner | default('root') }}"
+    group: "{{ item.group | default('root') }}"
+    mode: "{{ item.mode }}"
+  loop: "{{ cdi_scenario_fixtures | selectattr('type', 'in', ['chardev', 'fifo']) | list }}"
+  loop_control:
+    label: "{{ item.path }}"
+
+- name: Install socket fixture units
+  become: true
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop: [openshell-cdi-echo.socket, 'openshell-cdi-echo@.service']
+
+- name: Start the persistent socket fixture
+  become: true
+  ansible.builtin.systemd_service:
+    name: openshell-cdi-echo.socket
+    daemon_reload: true
+    enabled: true
+    state: started
+
+- name: Generate named CDI scenario devices
+  become: true
+  ansible.builtin.template:
+    src: scenarios.yaml.j2
+    dest: "{{ cdi_fixture_root }}/specs/openshell-tmachine-scenarios.yaml"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Publish scenario expectations for the CDI feature tests
+  become: true
+  ansible.builtin.copy:
+    dest: "{{ cdi_fixture_root }}/scenarios.json"
+    content: >-
+      {{ {'common_checks': cdi_scenario_common_checks,
+          'scenarios': cdi_scenarios | items2dict(key_name='name', value_name='expect')}
+         | to_nice_json }}
+    owner: root
+    group: root
+    mode: "0644"

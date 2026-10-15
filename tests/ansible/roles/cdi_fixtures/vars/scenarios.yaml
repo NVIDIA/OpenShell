@@ -1,0 +1,209 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Each case is one device of the tmachine.example/cdi-scenario class, selected as
+# `tmachine.example/cdi-scenario=<name>`. A case declares the host fixtures it
+# needs and the CDI edits that reference them; tasks/scenarios.yaml creates the
+# fixtures and templates/scenarios.yaml.j2 renders the spec.
+#
+# Fixture `path` is relative to {{ cdi_fixture_root }}/scenarios. Types:
+#   dir     directory (parents must be declared first)
+#   file    regular file with `content`
+#   fifo    named pipe
+#   chardev character device with `major` and `minor`
+# All accept `mode`, `owner` and `group`.
+#
+# `expect` records the behavior the CDI feature tests assert for the scenario,
+# and is rendered to {{ cdi_fixture_root }}/scenarios.json for them. It states
+# what the sandbox does today; a change that alters that behavior updates the
+# values here. Either:
+#   rejected: <text>   sandbox creation fails; <text> must appear in the
+#                      diagnostic (empty matches any failure). `checks` are then
+#                      observed but not asserted.
+#   checks: [...]      sandbox creation succeeds and each check holds, where a
+#                      check is one of
+#     {type: contents, path, expect}  file contents, null when it must not exist
+#     {type: read, path, expect}      `ok` or `denied`
+#     {type: write, path, expect}     `ok` or `denied` (nothing is written)
+#     {type: env, name, expect}       value, null when unset
+#     {type: non-root, expect}        whether the workload is not uid 0 (true)
+#     {type: group-of, path, expect}  whether the workload's groups include
+#                                     path's group (true)
+cdi_scenario_dir: "{{ cdi_fixture_root }}/scenarios"
+
+# Edits applied by every case, to check that spec and device edits merge. The
+# marker is mounted under /usr/share, which the sandbox already allows reading,
+# so these checks do not depend on grants derived from the CDI spec.
+cdi_scenario_spec_edits:
+  env:
+    - TMACHINE_CDI_SCENARIO_SPEC=fixture
+  mounts:
+    - hostPath: "{{ cdi_scenario_dir }}/spec-marker"
+      containerPath: /usr/share/tmachine-cdi/common/spec-marker
+      options: [bind, ro]
+
+# Checked in every scenario that is created, to show that spec and device edits
+# merge.
+cdi_scenario_common_checks:
+  - {type: env, name: TMACHINE_CDI_SCENARIO_SPEC, expect: fixture}
+  - {type: contents, path: /usr/share/tmachine-cdi/common/spec-marker, expect: tmachine-cdi-spec-marker}
+  - {type: write, path: /usr/share/tmachine-cdi/common/spec-marker, expect: denied}
+
+cdi_scenario_common_fixtures:
+  - {path: spec-marker, type: file, content: "tmachine-cdi-spec-marker\n", mode: "0644"}
+
+cdi_scenarios:
+  # The mount point is under a directory the sandbox baseline already makes
+  # read-only, so nothing needs to be derived for the mount to be readable.
+  - name: mount-under-read-only-baseline
+    fixtures:
+      - {path: baseline-read-only-file, type: file, content: "tmachine-cdi-baseline-read-only-file\n", mode: "0644"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/baseline-read-only-file"
+          containerPath: /usr/share/tmachine-cdi/baseline-read-only-file
+          options: [bind, ro]
+    expect:
+      checks:
+        - {type: contents, path: /usr/share/tmachine-cdi/baseline-read-only-file, expect: tmachine-cdi-baseline-read-only-file}
+        - {type: write, path: /usr/share/tmachine-cdi/baseline-read-only-file, expect: denied}
+
+  - name: read-only-file
+    fixtures:
+      - {path: read-only-file, type: file, content: "tmachine-cdi-read-only-file\n", mode: "0644"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/read-only-file"
+          containerPath: /tmachine-cdi/read-only/file
+          options: [bind, ro]
+    expect:
+      checks:
+        - {type: read, path: /tmachine-cdi/read-only/file, expect: denied}
+        - {type: write, path: /tmachine-cdi/read-only/file, expect: denied}
+
+  - name: read-only-directory
+    fixtures:
+      - {path: read-only-directory, type: dir, mode: "0755"}
+      - {path: read-only-directory/marker, type: file, content: "tmachine-cdi-read-only-directory/marker\n", mode: "0644"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/read-only-directory"
+          containerPath: /tmachine-cdi/read-only/directory
+          options: [bind, ro]
+    expect:
+      checks:
+        - {type: read, path: /tmachine-cdi/read-only/directory/marker, expect: denied}
+        - {type: write, path: /tmachine-cdi/read-only/directory/marker, expect: denied}
+        - {type: write, path: /tmachine-cdi/read-only/directory/new-file, expect: denied}
+
+  # Both library cases bind the same file; they differ in whether its parent
+  # directory is narrow or the container root.
+
+  - name: library-parent
+    fixtures:
+      - {path: libfixture.so.1, type: file, content: "tmachine-cdi-libfixture.so.1\n", mode: "0644"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/libfixture.so.1"
+          containerPath: /tmachine-cdi/library/libfixture.so.1
+          options: [bind, ro]
+    expect:
+      checks:
+        - {type: read, path: /tmachine-cdi/library/libfixture.so.1, expect: denied}
+        - {type: write, path: /tmachine-cdi/library/libfixture.so.1, expect: denied}
+
+  - name: broad-library-parent
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/libfixture.so.1"
+          containerPath: /libtmachinefixture.so.1
+          options: [bind, ro]
+    expect:
+      checks:
+        - {type: read, path: /libtmachinefixture.so.1, expect: denied}
+        - {type: write, path: /libtmachinefixture.so.1, expect: denied}
+
+  - name: writable-file
+    fixtures:
+      - {path: writable-file, type: file, content: "tmachine-cdi-original\n", mode: "0666"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/writable-file"
+          containerPath: /tmachine-cdi/writable/file
+          options: [bind, rw]
+    expect:
+      checks:
+        - {type: read, path: /tmachine-cdi/writable/file, expect: denied}
+        - {type: write, path: /tmachine-cdi/writable/file, expect: denied}
+
+  - name: writable-directory
+    fixtures:
+      - {path: writable-directory, type: dir, mode: "0777"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/writable-directory"
+          containerPath: /tmachine-cdi/writable/directory
+          options: [bind, rw]
+    expect:
+      checks:
+        - {type: write, path: /tmachine-cdi/writable/directory/probe, expect: denied}
+
+  - name: omitted-access-file
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/writable-file"
+          containerPath: /tmachine-cdi/writable/omitted-access
+          options: [bind]
+    expect:
+      checks:
+        - {type: read, path: /tmachine-cdi/writable/omitted-access, expect: denied}
+        - {type: write, path: /tmachine-cdi/writable/omitted-access, expect: denied}
+
+  - name: device-node
+    edits:
+      deviceNodes:
+        - path: /dev/tmachine-cdi-null
+          hostPath: /dev/null
+          permissions: rw
+    expect:
+      checks:
+        - {type: non-root}
+        - {type: write, path: /dev/tmachine-cdi-null, expect: denied}
+
+  # The device is mode 0660 with a group that only `additionalGids` grants.
+  - name: device-node-with-gid
+    fixtures:
+      - {path: group-device, type: chardev, major: 1, minor: 3, mode: "0660", group: openshell-cdi-fixture}
+    edits:
+      additionalGids: ["{{ cdi_fixture_group.gid | int }}"]
+      deviceNodes:
+        - path: /dev/tmachine-cdi-group-null
+          hostPath: "{{ cdi_scenario_dir }}/group-device"
+          permissions: rw
+          uid: 0
+          gid: "{{ cdi_fixture_group.gid | int }}"
+          fileMode: 432
+    expect:
+      checks:
+        - {type: non-root}
+        - {type: group-of, path: /dev/tmachine-cdi-group-null}
+        - {type: write, path: /dev/tmachine-cdi-group-null, expect: denied}
+
+  # The echo socket is served by the systemd units installed in scenarios.yaml.
+  # Its sibling file checks that only the socket path is exposed.
+
+  - name: unix-socket
+    fixtures:
+      - {path: socket, type: dir, mode: "0755"}
+      - {path: socket/sibling, type: file, content: "tmachine-cdi-socket/sibling\n", mode: "0644"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/socket/echo.sock"
+          containerPath: /tmachine-cdi/socket/echo.sock
+          options: [bind]
+    expect:
+      checks:
+        # Only the socket is mounted, so its sibling in the host directory is
+        # not visible. Connecting to the socket is not checked yet.
+        - {type: contents, path: /tmachine-cdi/socket/sibling, expect: null}

@@ -48,6 +48,7 @@ let
           playbooks = [
             "ansible/playbooks/nextest.yaml"
             "ansible/playbooks/docker.yaml"
+            "ansible/playbooks/cdi.yaml"
           ];
         };
       }
@@ -167,6 +168,13 @@ let
         playbooks = [ "ansible/playbooks/conformance/policy-advisor.yaml" ];
         inputs = {
           openshell_conformance_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-conformance-tests.tar";
+        };
+      }
+      {
+        name = "cdi";
+        playbooks = [ "ansible/playbooks/features/cdi/tests.yaml" ];
+        inputs = {
+          openshell_cdi_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-cdi-tests.tar";
         };
       }
       {

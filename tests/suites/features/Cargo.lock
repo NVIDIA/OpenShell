@@ -919,6 +919,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-test-feature-cdi"
+version = "0.0.0"
+dependencies = [
+ "openshell-conformance",
+ "serde_json",
+ "tokio",
+]
+
+
+[[package]]
 name = "openshell-test-feature-oci-image"
 version = "0.0.0"
 dependencies = [

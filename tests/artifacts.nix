@@ -98,6 +98,14 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
+  cdiArchive = mkTestArchive {
+    name = "openshell-cdi";
+    workspacePath = "tests/suites/features";
+    manifestPath = "tests/suites/features/Cargo.toml";
+    package = "openshell-test-feature-cdi";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/openshell-cdi-tests.tar";
+  };
   ociImageArchive = mkTestArchive {
     name = "oci-image";
     workspacePath = "tests/suites/features";
@@ -205,6 +213,7 @@ rec {
   inherit
     conformanceTestArchive
     providerRefreshKeycloakArchive
+    cdiArchive
     ociImageArchive
     podmanDriverArchive
     podmanE2eArchive
@@ -304,6 +313,7 @@ rec {
     runtimeInputs = [
       conformanceTestArchive
       providerRefreshKeycloakArchive
+      cdiArchive
       ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
@@ -311,6 +321,7 @@ rec {
     text = ''
       build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
+      build-openshell-cdi-test-archive
       build-oci-image-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
