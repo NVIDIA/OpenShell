@@ -155,6 +155,12 @@ For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
 updated Docker daemon capability.
 
+For CDI-enabled Docker sandboxes, OpenShell derives filesystem access from the
+selected CDI devices and validates those targets before each launch and exec.
+Invalid targets stop the launch. Refer to
+[GPU Sandboxes](/how-it-works/policies/default-policy#gpu-sandboxes) for the
+paths OpenShell adds and the mounts it rejects.
+
 Docker and Podman refresh the CDI inventory before validating or creating a
 default GPU request, so CDI devices added or removed after the driver starts can
 be reflected in later sandbox creates. On WSL2 all-only runtimes, the default

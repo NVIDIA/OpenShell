@@ -112,7 +112,7 @@ enum PathOpenMode {
 /// Returns `None` if there are no filesystem paths to restrict (no-op).
 /// Returns `Some(PreparedRuleset)` on success, or an error.
 pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<PreparedRuleset>> {
-    prepare_with_path_open_mode(policy, workdir, PathOpenMode::Privileged)
+    prepare_with_path_open_mode(policy, workdir, PathOpenMode::Privileged, None)
 }
 
 /// Phase 1 for already-unprivileged workloads.
@@ -124,8 +124,14 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
 pub fn prepare_current_user(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
+    launch_context: &crate::launch::WorkloadLaunchContext,
 ) -> Result<Option<PreparedRuleset>> {
-    prepare_with_path_open_mode(policy, workdir, PathOpenMode::CurrentUser)
+    prepare_with_path_open_mode(
+        policy,
+        workdir,
+        PathOpenMode::CurrentUser,
+        launch_context.cdi_requirements.as_ref(),
+    )
 }
 
 /// Build the mandatory same-UID self-protection baseline.
@@ -236,10 +242,36 @@ fn capability_free_baseline_entries(
     }))
 }
 
+/// CDI targets require enforcement, so they override a best-effort policy.
+fn effective_compatibility<'a>(
+    policy: &'a SandboxPolicy,
+    cdi_paths: &super::super::cdi_paths::CdiPaths,
+) -> &'a LandlockCompatibility {
+    if cdi_paths.is_empty() {
+        &policy.landlock.compatibility
+    } else {
+        &LandlockCompatibility::HardRequirement
+    }
+}
+
+/// Effective compatibility for a workload launch, for logging before preparation.
+pub(super) fn launch_compatibility<'a>(
+    policy: &'a SandboxPolicy,
+    launch_context: &crate::launch::WorkloadLaunchContext,
+) -> &'a LandlockCompatibility {
+    let cdi_paths = launch_context
+        .cdi_requirements
+        .as_ref()
+        .map(super::super::cdi_paths::CdiPaths::new)
+        .unwrap_or_default();
+    effective_compatibility(policy, &cdi_paths)
+}
+
 fn prepare_with_path_open_mode(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
     path_open_mode: PathOpenMode,
+    cdi_requirements: Option<&crate::launch::CdiDerivedRequirements>,
 ) -> Result<Option<PreparedRuleset>> {
     let read_only = policy.filesystem.read_only.clone();
     let mut read_write = policy.filesystem.read_write.clone();
@@ -253,11 +285,20 @@ fn prepare_with_path_open_mode(
         }
     }
 
-    if read_only.is_empty() && read_write.is_empty() {
+    // Keep only path requirements; CDI descriptors are opened and consumed
+    // sequentially when building rules, including validation-only targets.
+    let cdi_paths = cdi_requirements
+        .map(super::super::cdi_paths::CdiPaths::new)
+        .unwrap_or_default();
+
+    if read_only.is_empty() && read_write.is_empty() && cdi_paths.is_empty() {
         return Ok(None);
     }
 
-    let compatibility = &policy.landlock.compatibility;
+    // CDI target preparation and enforcement cannot fall back to an
+    // unrestricted launch. This does not change authored path opening:
+    // missing or inaccessible authored paths retain the policy's mode.
+    let compatibility = effective_compatibility(policy, &cdi_paths);
 
     // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
     // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
@@ -308,7 +349,7 @@ fn prepare_with_path_open_mode(
             .state(openshell_ocsf::StateId::Enabled, "applying")
             .message(format!(
                 "Applying Landlock filesystem sandbox [abi:{abi:?} compat:{:?} ro:{} rw:{}]",
-                policy.landlock.compatibility,
+                compatibility,
                 read_only.len(),
                 read_write.len(),
             ))
@@ -325,11 +366,50 @@ fn prepare_with_path_open_mode(
             .handle_access(access_all)
             .into_diagnostic()?;
 
-        let mut ruleset = ruleset.create().into_diagnostic()?;
-        let mut rules_applied: usize = 0;
+        let ruleset = ruleset.create().into_diagnostic()?;
+        let (mut ruleset, mut rules_applied) = cdi_paths.process_validated(
+            (ruleset, 0_usize),
+            // Use a direct O_PATH open for CDI objects. PathFd uses std
+            // OpenOptions, whose musl opener cannot open Unix socket inodes.
+            |path| {
+                rustix::fs::open(
+                    path,
+                    rustix::fs::OFlags::PATH | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                )
+                .into_diagnostic()
+            },
+            |(ruleset, count), path, fd| {
+                // A covered CDI target still needs validation, but no extra
+                // rule. Match exact policy entries without reopening the path.
+                let access = if read_write.iter().any(|allowed| allowed == path) {
+                    Some(access_all)
+                } else if read_only.iter().any(|allowed| allowed == path) {
+                    Some(access_read)
+                } else {
+                    None
+                };
+                let Some(access) = access else {
+                    return Ok((ruleset, count));
+                };
+                let allowed_access = access_for_path_fd(fd, access, abi)?;
+                debug!(path = %path.display(), "Landlock allow validated CDI target");
+                Ok((
+                    ruleset
+                        .add_rule(PathBeneath::new(fd, allowed_access))
+                        .into_diagnostic()?,
+                    count + 1,
+                ))
+            },
+        )?;
 
         for path in &read_only {
-            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
+            if cdi_paths.contains(path) {
+                continue;
+            }
+            if let Some(path_fd) =
+                try_open_path(path, &policy.landlock.compatibility, path_open_mode)?
+            {
                 let allowed_access = access_for_path_fd(&path_fd, access_read, abi)?;
                 debug!(path = %path.display(), "Landlock allow read-only");
                 ruleset = ruleset
@@ -340,7 +420,12 @@ fn prepare_with_path_open_mode(
         }
 
         for path in &read_write {
-            if let Some(path_fd) = try_open_path(path, compatibility, path_open_mode)? {
+            if cdi_paths.contains(path) {
+                continue;
+            }
+            if let Some(path_fd) =
+                try_open_path(path, &policy.landlock.compatibility, path_open_mode)?
+            {
                 let allowed_access = access_for_path_fd(&path_fd, access_all, abi)?;
                 debug!(path = %path.display(), "Landlock allow read-write");
                 ruleset = ruleset
@@ -609,6 +694,324 @@ mod tests {
     }
 
     #[test]
+    fn cdi_targets_make_the_logged_compatibility_a_hard_requirement() {
+        let mut policy = hard_requirement_policy(vec![], vec![]);
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        let without_cdi = crate::launch::WorkloadLaunchContext::default();
+        assert!(matches!(
+            launch_compatibility(&policy, &without_cdi),
+            LandlockCompatibility::BestEffort
+        ));
+        let empty_cdi = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements::default()),
+        };
+        assert!(matches!(
+            launch_compatibility(&policy, &empty_cdi),
+            LandlockCompatibility::BestEffort
+        ));
+        let with_cdi = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                device_node_paths: vec!["/dev/null".into()],
+                ..Default::default()
+            }),
+        };
+        assert!(matches!(
+            launch_compatibility(&policy, &with_cdi),
+            LandlockCompatibility::HardRequirement
+        ));
+    }
+
+    #[test]
+    fn cdi_preserves_authored_path_compatibility() {
+        if let Err(error) = require_abi() {
+            assert!(
+                std::env::var_os("OPENSHELL_TEST_REQUIRE_LANDLOCK").is_none(),
+                "{error}"
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("lib");
+        std::fs::create_dir(&library).unwrap();
+        let missing = directory.path().join("absent-from-image");
+        let requirements = crate::launch::CdiDerivedRequirements {
+            read_only_paths: vec![library.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let mut policy = hard_requirement_policy(vec![library.clone(), missing], vec![]);
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        let prepared = prepare_with_path_open_mode(
+            &policy,
+            None,
+            PathOpenMode::Privileged,
+            Some(&requirements),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            prepared.compatibility,
+            LandlockCompatibility::HardRequirement
+        ));
+        policy.landlock.compatibility = LandlockCompatibility::HardRequirement;
+        assert!(
+            prepare_with_path_open_mode(
+                &policy,
+                None,
+                PathOpenMode::Privileged,
+                Some(&requirements),
+            )
+            .is_err()
+        );
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        std::fs::remove_dir(&library).unwrap();
+        assert!(
+            prepare_with_path_open_mode(
+                &policy,
+                None,
+                PathOpenMode::Privileged,
+                Some(&requirements),
+            )
+            .is_err(),
+            "missing CDI targets remain fatal"
+        );
+    }
+
+    #[test]
+    fn cdi_socket_communication_does_not_grant_parent_file_access() {
+        use std::io::{Read, Write};
+
+        let availability = probe_availability();
+        if !matches!(availability, LandlockAvailability::Available { abi } if abi >= 3) {
+            assert!(
+                std::env::var_os("OPENSHELL_TEST_REQUIRE_LANDLOCK").is_none(),
+                "Landlock ABI v3 required: {availability}"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("socket");
+        let sibling = temp.path().join("secret");
+        std::fs::write(&sibling, b"secret").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&target).unwrap();
+        let allowed = temp.path().join("allowed");
+        std::fs::write(&allowed, b"allowed").unwrap();
+        let policy = hard_requirement_policy(vec![allowed], vec![]);
+        let launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                socket_paths: vec![target.to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        std::thread::spawn(move || {
+            let prepared = prepare_current_user(&policy, None, &launch_context)
+                .unwrap()
+                .unwrap();
+            enforce(prepared).unwrap();
+            let mut stream = std::os::unix::net::UnixStream::connect(&target).unwrap();
+            stream.write_all(b"ping").unwrap();
+            assert_eq!(
+                std::fs::read(&sibling).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                std::fs::write(&sibling, b"changed").unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        })
+        .join()
+        .unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut message = [0; 4];
+        stream.read_exact(&mut message).unwrap();
+        assert_eq!(&message, b"ping");
+    }
+
+    #[test]
+    fn cdi_ipc_directory_grants_pipe_access_without_widening_siblings() {
+        use rustix::fs::{Mode, OFlags, StatVfsMountFlags, mkfifoat, statvfs};
+        let availability = probe_availability();
+        if !matches!(availability, LandlockAvailability::Available { abi } if abi >= 3) {
+            assert!(
+                std::env::var_os("OPENSHELL_TEST_REQUIRE_LANDLOCK").is_none(),
+                "Landlock ABI v3 required: {availability}"
+            );
+            return;
+        }
+        // IPC directories must be on a nosuid,nodev,noexec mount, as the
+        // container /dev/shm normally is.
+        let shm = Path::new("/dev/shm");
+        let required =
+            StatVfsMountFlags::NOSUID | StatVfsMountFlags::NODEV | StatVfsMountFlags::NOEXEC;
+        if !shm.is_dir() || !statvfs(shm).unwrap().f_flag.contains(required) {
+            return;
+        }
+        let pipes = tempfile::tempdir_in(shm).unwrap();
+        let control = pipes.path().join("control");
+        mkfifoat(rustix::fs::CWD, &control, Mode::from_bits_truncate(0o600)).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sibling = outside.path().join("secret");
+        std::fs::write(&sibling, b"secret").unwrap();
+        // Policy enrichment adds the exact IPC directory as read-write.
+        let policy = hard_requirement_policy(vec![], vec![pipes.path().to_path_buf()]);
+        let launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                ipc_directory_paths: vec![pipes.path().to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        let client = pipes.path().join("client");
+        std::thread::spawn(move || {
+            let prepared = prepare_current_user(&policy, None, &launch_context)
+                .unwrap()
+                .unwrap();
+            enforce(prepared).unwrap();
+            // Opening a FIFO read-write needs no peer and requires write access.
+            rustix::fs::open(&control, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty()).unwrap();
+            std::fs::write(&client, b"client").unwrap();
+            assert_eq!(
+                std::fs::read(&sibling).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn cdi_rules_remain_pinned_after_symlink_swap() {
+        let availability = probe_availability();
+        if !matches!(availability, LandlockAvailability::Available { abi } if abi >= 3) {
+            assert!(
+                std::env::var_os("OPENSHELL_TEST_REQUIRE_LANDLOCK").is_none(),
+                "Landlock ABI v3 required for this regression: {availability}"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let library = temp.path().join("lib");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir(&library).unwrap();
+        std::fs::write(library.join("sentinel"), b"allowed").unwrap();
+        std::os::unix::fs::symlink(&library, &alias).unwrap();
+        let mut policy = hard_requirement_policy(vec![alias.clone()], vec![]);
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        let launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                read_only_paths: vec![alias.to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        std::thread::spawn(move || {
+            let prepared = prepare_current_user(&policy, None, &launch_context)
+                .unwrap()
+                .unwrap();
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink("/", &alias).unwrap();
+            // Later exec preparation must validate the swapped target afresh.
+            assert!(prepare_current_user(&policy, None, &launch_context).is_err());
+            enforce(prepared).unwrap();
+            assert_eq!(std::fs::read(library.join("sentinel")).unwrap(), b"allowed");
+            for path in [PathBuf::from("/etc/hosts"), alias.join("etc/hosts")] {
+                assert_eq!(
+                    std::fs::read(path).unwrap_err().kind(),
+                    std::io::ErrorKind::PermissionDenied
+                );
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn cdi_alias_validation_is_fatal_in_best_effort_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("lib");
+        std::os::unix::fs::symlink("/", &alias).unwrap();
+        let mut policy = hard_requirement_policy(vec![alias.clone()], vec![]);
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        let launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                read_only_paths: vec![alias.to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        assert!(prepare_current_user(&policy, None, &launch_context).is_err());
+    }
+
+    #[test]
+    fn cdi_targets_covered_by_authored_ancestors_are_still_validated() {
+        if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let alias = temp.path().join("lib");
+        std::os::unix::fs::symlink("/", &alias).unwrap();
+        let policy = hard_requirement_policy(vec![temp.path().to_path_buf()], vec![]);
+        let launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                read_only_paths: vec![alias.to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        let Err(error) = prepare_current_user(&policy, None, &launch_context) else {
+            panic!("covered CDI target must be validated");
+        };
+        assert!(error.to_string().contains("broad root"));
+    }
+
+    #[test]
+    fn cdi_missing_path_is_fatal_in_current_user_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing");
+        let mut policy = hard_requirement_policy(vec![path.clone()], vec![]);
+        policy.landlock.compatibility = LandlockCompatibility::BestEffort;
+        let launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                read_only_paths: vec![path.to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        assert!(prepare_current_user(&policy, None, &launch_context).is_err());
+    }
+
+    #[test]
+    fn cdi_writable_mounts_reject_authored_write_grants_at_enforcement() {
+        let temp = tempfile::tempdir().unwrap();
+        let allowed = temp.path().join("allowed");
+        let cache = allowed.join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let file = cache.join("cache.db");
+        std::fs::write(&file, b"original").unwrap();
+        for path in [cache, file] {
+            for grant in [allowed.clone(), path.clone()] {
+                let policy = hard_requirement_policy(vec![temp.path().into()], vec![grant]);
+                // Check both a persisted writable requirement and mount metadata
+                // alone, so neither representation can bypass enforcement.
+                for explicit_requirement in [false, true] {
+                    let launch_context = crate::launch::WorkloadLaunchContext {
+                        cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                            read_write_mount_paths: if explicit_requirement {
+                                vec![path.to_string_lossy().into_owned()]
+                            } else {
+                                Vec::new()
+                            },
+                            mounts: vec![crate::launch::CdiMountRequirement {
+                                path: path.to_string_lossy().into_owned(),
+                                read_only: false,
+                            }],
+                            ..Default::default()
+                        }),
+                    };
+                    let error = prepare_current_user(&policy, None, &launch_context)
+                        .err()
+                        .unwrap();
+                    assert!(error.to_string().contains("CDI writable mount"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn prepare_hard_requirement_accepts_device_paths() {
         if !matches!(probe_availability(), LandlockAvailability::Available { .. }) {
             return;
@@ -720,11 +1123,25 @@ mod tests {
         std::fs::create_dir(&private).unwrap();
         std::fs::write(public.join("sentinel"), b"allowed").unwrap();
         std::fs::write(private.join("secret"), b"protected").unwrap();
+        let spec = root
+            .path()
+            .join(openshell_core::cdi::cdi_spec_mount_path(0).trim_start_matches('/'))
+            .join("other-vendor.yaml");
+        std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
+        std::fs::write(&spec, b"trusted runtime CDI metadata").unwrap();
         std::os::unix::fs::symlink(root.path(), root.path().join("root-alias")).unwrap();
         std::os::unix::fs::symlink(&private, root.path().join("private-alias")).unwrap();
         let path = root.path().to_path_buf();
         std::thread::spawn(move || {
+            let authored = prepare(&hard_requirement_policy(vec![path.clone()], vec![]), None)
+                .unwrap()
+                .unwrap();
             enforce(prepare_capability_free_baseline_at(&path).unwrap()).unwrap();
+            enforce(authored).unwrap();
+            assert_eq!(
+                std::fs::read(&spec).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
             assert_eq!(
                 std::fs::read(path.join("public/sentinel")).unwrap(),
                 b"allowed"
@@ -733,6 +1150,8 @@ mod tests {
                 ".openshell/secret",
                 "root-alias/.openshell/secret",
                 "private-alias/secret",
+                ".openshell/cdi-specs/0/other-vendor.yaml",
+                "private-alias/cdi-specs/0/other-vendor.yaml",
             ] {
                 let target = path.join(name);
                 assert_eq!(
@@ -751,7 +1170,16 @@ mod tests {
                 );
             }
             let policy = hard_requirement_policy(vec![path.join("public")], Vec::new());
-            enforce(prepare_current_user(&policy, None).unwrap().unwrap()).unwrap();
+            enforce(
+                prepare_current_user(
+                    &policy,
+                    None,
+                    &crate::launch::WorkloadLaunchContext::default(),
+                )
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
             let read_only =
                 std::ffi::CString::new(path.join("public/sentinel").as_os_str().as_encoded_bytes())
                     .unwrap();

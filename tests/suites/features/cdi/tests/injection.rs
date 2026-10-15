@@ -408,6 +408,8 @@ cdi_scenarios! {
     scenario_writable_file => "writable-file",
     scenario_writable_directory => "writable-directory",
     scenario_omitted_access_file => "omitted-access-file",
+    scenario_mps_pipe_directory => "mps-pipe-directory",
+    scenario_mps_pipe_directory_without_noexec => "mps-pipe-directory-without-noexec",
     scenario_device_node => "device-node",
     scenario_device_node_with_gid => "device-node-with-gid",
     scenario_unix_socket => "unix-socket",

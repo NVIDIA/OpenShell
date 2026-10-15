@@ -40,7 +40,11 @@ pub fn prepare_current_user(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
 ) -> Result<PreparedSandbox> {
-    let landlock = landlock::prepare_current_user(policy, workdir)?;
+    let landlock = landlock::prepare_current_user(
+        policy,
+        workdir,
+        &crate::launch::WorkloadLaunchContext::default(),
+    )?;
     Ok(PreparedSandbox {
         landlock: landlock.into_iter().collect(),
         policy: policy.clone(),
@@ -58,9 +62,10 @@ pub fn prepare_current_user(
 pub fn prepare_capability_free(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
+    launch_context: &crate::launch::WorkloadLaunchContext,
 ) -> Result<PreparedSandbox> {
     let baseline = landlock::prepare_capability_free_baseline()?;
-    let user = landlock::prepare_current_user(policy, workdir)?;
+    let user = landlock::prepare_current_user(policy, workdir, launch_context)?;
     let mut landlock = vec![baseline];
     landlock.extend(user);
     Ok(PreparedSandbox {
@@ -110,7 +115,11 @@ pub fn apply_supervisor_prelude() -> Result<()> {
 /// This must be called **before** `pre_exec` / `fork()` so that the OCSF events
 /// are emitted through the parent's tracing subscriber (the child process after
 /// fork does not have a working tracing pipeline).
-pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
+pub fn log_sandbox_readiness(
+    policy: &SandboxPolicy,
+    workdir: Option<&str>,
+    launch_context: &crate::launch::WorkloadLaunchContext,
+) {
     static PROBED: Once = Once::new();
     let mut already_probed = true;
     PROBED.call_once(|| already_probed = false);
@@ -144,6 +153,7 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
         return;
     }
 
+    let compatibility = landlock::launch_compatibility(policy, launch_context);
     let availability = landlock::probe_availability();
     if let landlock::LandlockAvailability::Available { abi } = &availability {
         openshell_ocsf::ocsf_emit!(
@@ -154,7 +164,7 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
                 .message(format!(
                     "Landlock filesystem sandbox available \
                      [abi:v{abi} compat:{:?} ro:{} rw:{}]",
-                    policy.landlock.compatibility,
+                    compatibility,
                     read_only.len(),
                     read_write.len(),
                 ))
@@ -164,7 +174,7 @@ pub fn log_sandbox_readiness(policy: &SandboxPolicy, workdir: Option<&str>) {
         // Landlock is NOT available — this is the critical log that was
         // previously invisible because it only fired inside pre_exec.
         let is_best_effort = matches!(
-            policy.landlock.compatibility,
+            compatibility,
             openshell_core::policy::LandlockCompatibility::BestEffort
         );
         let (desc, msg) = if is_best_effort {

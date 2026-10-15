@@ -87,18 +87,58 @@ the sandbox's policy.
 
 ### GPU Sandboxes
 
-On the Docker and VM compute drivers, a sandbox that requests a GPU receives
-additional paths when the corresponding GPU device is present:
+GPU sandboxes without a CDI context receive additional paths when the
+corresponding GPU device is present:
 
 | Access | Paths |
 |---|---|
 | Read-only | `/run/nvidia-persistenced`, `/usr/lib/wsl` |
-| Read-write | `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dxg`, numbered `/dev/nvidia<N>` device nodes, and `/proc` |
+| Read-write | `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/dev/nvidia-modeset`, `/dev/dxg`, numbered `/dev/nvidia<N>` device nodes |
 
-CUDA writes thread names under `/proc` during initialization, so GPU enrichment
-moves `/proc` from read-only to read-write. OpenShell adds each path only when
-it exists in the workload. These paths apply at runtime and are not saved in
-the sandbox's policy.
+CUDA thread-name writes under `/proc` are handled by the existing process
+open mediation. GPU enrichment preserves authored `/proc` access instead of
+adding a blanket write grant. OpenShell adds each path
+only when it exists in the workload. These paths apply at runtime and are not
+saved in the sandbox's policy.
+
+Docker GPU sandboxes receive CDI-derived filesystem
+requirements instead of the hard-coded GPU device and library baseline. The
+workload-side sandbox runtime resolves the selected CDI device specs and adds
+CDI device nodes as read-write paths; listing a device node in
+`filesystem_policy.read_only` stops the launch. For read-only mounts, it adds the parent
+directories of shared libraries whose filenames end in `.so` or a numeric
+SONAME suffix with any number of dot-separated components, such as `.so.1`,
+`.so.1.2`, or `.so.1.2.3`. It retains exact destinations for other read-only
+mounts. OpenShell does not add a derived path when an existing read-only or
+read-write parent already covers it. The container runtime supplies CDI `additionalGids` as supplemental groups.
+Docker releases before 29.5 ignore them. OpenShell checks the workload's groups
+before initial launch and subsequent execs and logs a warning naming any missing
+group. The process still starts, but devices restricted to that group may be
+inaccessible.
+
+Unix socket mounts are validated as sockets at their exact destinations at each
+launch or exec. They do not add filesystem grants or parent directory access and
+do not require `read_write` entries, regardless of mount flags. Communication
+uses the existing Unix IPC and socket permission checks.
+
+Ordinary CDI file and directory mounts must be effectively read-only. OpenShell
+rejects writable mounts even when `filesystem_policy.read_write` names their
+exact destination or an ancestor. Explicit authorization for CDI host writes is
+not currently supported. This restriction does not apply to device nodes or
+Unix socket communication.
+
+The NVIDIA MPS pipe directory `/tmp/nvidia-mps` is the only writable directory
+mount allowed. When CDI mounts it with `nosuid`, `nodev`, and `noexec`, OpenShell
+grants read-write access to that exact directory so MPS clients can open its
+pipes. OpenShell checks the directory and its mount flags at each launch or
+exec. Listing it in `filesystem_policy.read_only` stops the launch.
+
+CDI paths such as `/`, `/dev`, `/proc`, `/sys`, `/run`, or `/usr` remain rejected
+during sandbox startup, even when authored policy grants access to those roots.
+
+CDI does not add a blanket `/sys` grant. If an application needs sysfs paths
+that the selected CDI spec does not supply, include those paths in your authored
+filesystem policy.
 
 ### Protected Paths
 
@@ -107,6 +147,12 @@ protects the private `/.openshell` directory and requires Landlock ABI v3. Your
 filesystem policy is applied on top of that baseline and can narrow access, but
 it cannot expose `/.openshell`. The `best_effort` compatibility setting does not
 disable this protection or allow a kernel without ABI v3.
+
+CDI targets are validated strictly before each launch or exec. Authored paths
+retain their configured opening behavior, so an absent authored path can still
+be skipped in best-effort mode. When CDI filesystem targets are present,
+ruleset construction and enforcement failures abort launch instead of falling
+back to an unrestricted workload.
 
 ## Inspect the Selected Policy
 

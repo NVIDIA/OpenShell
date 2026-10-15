@@ -13,8 +13,9 @@ use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerState, ContainerStateStatusEnum, ContainerSummary,
     ContainerSummaryStateEnum, ContainerWaitResponse, CreateImageInfo, DeviceRequest, HealthConfig,
-    HealthStatusEnum, HostConfig, Mount, MountTmpfsOptions, MountTypeEnum, MountVolumeOptions,
-    ProgressDetail, SystemInfo, VolumeCreateRequest,
+    HealthStatusEnum, HostConfig, Mount, MountBindOptions, MountBindOptionsPropagationEnum,
+    MountTmpfsOptions, MountTypeEnum, MountVolumeOptions, ProgressDetail, SystemInfo,
+    VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -23,6 +24,7 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use openshell_core::cdi::{CdiContext, CdiSpecDirectory, cdi_spec_mount_path};
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
@@ -76,7 +78,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -98,6 +100,10 @@ const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
 const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
 const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
 
+/// Driver-owned paths in sandbox containers that user mounts, image volumes
+/// and the workspace must not overlap.
+const DOCKER_RESERVED_CONTROL_PATHS: &[&str] =
+    &[BOUNDARY_MOUNT_PATH, openshell_core::cdi::CDI_SPEC_DIR_BASE];
 const SANDBOX_BINARY_PATH: &str = "/.openshell/runtime/openshell-sandbox";
 const SUPERVISOR_IMAGE_CONTROL_BINARY_PATH: &str = "/openshell-supervisor";
 const SUPERVISOR_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
@@ -122,6 +128,7 @@ const LABEL_ISOLATION_ROLE_SANDBOX: &str = "sandbox";
 const LABEL_ISOLATION_ROLE_SUPERVISOR: &str = "supervisor";
 const LABEL_ISOLATION_ROLE_STAGING: &str = "staging";
 const LABEL_ISOLATION_ROLE_IDENTITY: &str = "identity";
+const LABEL_ISOLATION_ROLE_CDI_PROBE: &str = "cdi-probe";
 const RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const MAIN_PROCESS_SPEC_FILE: &str = "main-process.json";
 const WORKSPACE_ROOT_FILE: &str = "workspace-root";
@@ -344,10 +351,270 @@ struct DockerDriverRuntimeConfig {
     app_armor_profile: Option<AppArmorProfile>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct DockerGpuRuntimeCapabilities {
     cdi_supported: bool,
+    /// Startup snapshot used by tests. Sandbox creation uses the directories
+    /// the daemon currently reports.
+    #[cfg(test)]
+    cdi_spec_dirs: Vec<String>,
     wsl_all_gpu_fallback_enabled: bool,
+}
+
+impl DockerGpuRuntimeCapabilities {
+    #[cfg(test)]
+    fn cdi_context(&self, gpu_device_ids: Option<&[String]>) -> Result<Option<CdiContext>, Status> {
+        cdi_context_for_spec_dirs(gpu_device_ids, &self.cdi_spec_dirs)
+    }
+}
+
+/// Build the CDI context from the spec directories the daemon currently reports.
+fn cdi_context_for_spec_dirs(
+    gpu_device_ids: Option<&[String]>,
+    spec_dirs: &[String],
+) -> Result<Option<CdiContext>, Status> {
+    let Some(gpu_device_ids) = gpu_device_ids.filter(|device_ids| !device_ids.is_empty()) else {
+        return Ok(None);
+    };
+    require_cdi_spec_dirs(spec_dirs)?;
+    Ok(Some(CdiContext::new(
+        gpu_device_ids.to_vec(),
+        spec_dirs
+            .iter()
+            .enumerate()
+            .map(|(index, source)| CdiSpecDirectory::new(cdi_spec_mount_path(index), source))
+            .collect(),
+    )))
+}
+
+fn require_cdi_spec_dirs(spec_dirs: &[String]) -> Result<(), Status> {
+    if spec_dirs.is_empty() {
+        return Err(Status::failed_precondition(
+            "docker GPU sandboxes require Docker CDI spec directories reported by the daemon",
+        ));
+    }
+    Ok(())
+}
+
+fn cdi_spec_mount(target: &str, source: &str) -> Result<Mount, Status> {
+    driver_mounts::validate_absolute_mount_source(source, "CDI spec directory")
+        .map_err(Status::failed_precondition)?;
+    // Validate existence on the daemon host, which may have a different
+    // filesystem from the gateway. Structured binds reject missing sources and
+    // do not implicitly relabel them.
+    Ok(Mount {
+        typ: Some(MountTypeEnum::BIND),
+        source: Some(source.to_string()),
+        target: Some(target.to_string()),
+        read_only: Some(true),
+        bind_options: Some(MountBindOptions {
+            propagation: Some(MountBindOptionsPropagationEnum::RPRIVATE),
+            create_mountpoint: Some(false),
+            non_recursive: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+const CDI_SPEC_DIRECTORY_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Probes run while holding the directory cache lock, so bound each one to keep
+/// a stalled daemon from blocking every GPU sandbox creation.
+const CDI_SPEC_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const CDI_SPEC_PROBE_TARGET: &str = "/.openshell/cdi-probe";
+
+#[derive(Default)]
+struct CdiSpecDirectoryCache {
+    entries: HashMap<String, (Instant, bool)>,
+    inventory: Option<CdiGpuInventory>,
+    daemon_id: Option<String>,
+    spec_dirs: Vec<String>,
+}
+
+impl CdiSpecDirectoryCache {
+    fn observe_daemon(&mut self, info: &SystemInfo) {
+        let inventory = docker_cdi_gpu_inventory(info);
+        let dirs = info.cdi_spec_dirs.clone().unwrap_or_default();
+        if self.inventory.as_ref() != Some(&inventory)
+            || self.daemon_id != info.id
+            || self.spec_dirs != dirs
+        {
+            self.entries.clear();
+            self.inventory = Some(inventory);
+            self.daemon_id.clone_from(&info.id);
+            self.spec_dirs = dirs;
+        }
+    }
+
+    async fn available_context<F, Fut>(
+        &mut self,
+        mut context: CdiContext,
+        now: Instant,
+        mut probe: F,
+    ) -> Result<CdiContext, Status>
+    where
+        F: FnMut(CdiSpecDirectory) -> Fut,
+        Fut: Future<Output = Result<bool, Status>>,
+    {
+        self.entries.retain(|_, (checked, _)| {
+            now.saturating_duration_since(*checked) < CDI_SPEC_DIRECTORY_CACHE_TTL
+        });
+        let mut available = Vec::new();
+        for directory in context.spec_dirs {
+            let present = if let Some((_, present)) = self.entries.get(&directory.source) {
+                *present
+            } else {
+                let present = probe(directory.clone()).await?;
+                self.entries
+                    .insert(directory.source.clone(), (now, present));
+                present
+            };
+            if present {
+                available.push(directory);
+            }
+        }
+        if available.is_empty() {
+            return Err(Status::failed_precondition(
+                "no configured CDI spec directory exists on the Docker daemon host",
+            ));
+        }
+        context.spec_dirs = available;
+        Ok(context)
+    }
+}
+
+/// Replace any CDI spec projections in the create body with exactly the
+/// directories recorded in the context, so the mounts and the persisted
+/// context cannot diverge.
+fn retain_cdi_spec_projections(
+    body: &mut ContainerCreateBody,
+    context: &CdiContext,
+) -> Result<(), Status> {
+    let projections = context
+        .spec_dirs
+        .iter()
+        .map(|dir| cdi_spec_mount(&dir.path, &dir.source))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mounts = body
+        .host_config
+        .get_or_insert_with(Default::default)
+        .mounts
+        .get_or_insert_with(Vec::new);
+    mounts.retain(|mount| {
+        !mount.target.as_deref().is_some_and(|target| {
+            Path::new(target).starts_with(openshell_core::cdi::CDI_SPEC_DIR_BASE)
+        })
+    });
+    mounts.extend(projections);
+    Ok(())
+}
+
+fn is_missing_bind_source_error(error: &BollardError, source: &str) -> bool {
+    // Match the stable phrase and the source rather than the full daemon
+    // message, whose prefix varies across Docker versions and API proxies.
+    matches!(
+        error,
+        BollardError::DockerResponseServerError { status_code: 400, message }
+            if message.contains("bind source path does not exist") && message.contains(source)
+    )
+}
+
+/// Validate one daemon-host source without starting any process. Deleting the
+/// stopped container also removes anonymous volumes declared by the image.
+async fn probe_cdi_spec_directory(
+    docker: &Docker,
+    image: &str,
+    labels: HashMap<String, String>,
+    directory: CdiSpecDirectory,
+) -> Result<bool, Status> {
+    // Finish cleanup even if sandbox provisioning is cancelled mid-probe or
+    // the probe times out.
+    let docker = docker.clone();
+    let image = image.to_string();
+    let task = tokio::spawn(
+        async move { run_cdi_spec_directory_probe(&docker, &image, labels, directory).await }
+            .in_current_span(),
+    );
+    await_cdi_spec_directory_probe(task, CDI_SPEC_PROBE_TIMEOUT).await
+}
+
+async fn await_cdi_spec_directory_probe(
+    task: JoinHandle<Result<bool, Status>>,
+    timeout: Duration,
+) -> Result<bool, Status> {
+    match tokio::time::timeout(timeout, task).await {
+        Ok(joined) => joined.map_err(|error| {
+            Status::internal(format!("CDI spec directory probe task failed: {error}"))
+        })?,
+        Err(_) => Err(Status::unavailable(format!(
+            "CDI spec directory probe did not finish within {}s",
+            timeout.as_secs()
+        ))),
+    }
+}
+
+async fn run_cdi_spec_directory_probe(
+    docker: &Docker,
+    image: &str,
+    labels: HashMap<String, String>,
+    directory: CdiSpecDirectory,
+) -> Result<bool, Status> {
+    driver_mounts::validate_absolute_mount_source(&directory.source, "CDI spec directory")
+        .map_err(Status::failed_precondition)?;
+    // Auxiliary labels let the stale-resource sweep remove a probe left behind
+    // by a failed removal or a gateway crash.
+    let body = ContainerCreateBody {
+        image: Some(image.into()),
+        labels: Some(labels),
+        host_config: Some(HostConfig {
+            network_mode: Some("none".into()),
+            readonly_rootfs: Some(true),
+            mounts: Some(vec![Mount {
+                typ: Some(MountTypeEnum::BIND),
+                source: Some(directory.source.clone()),
+                target: Some(CDI_SPEC_PROBE_TARGET.into()),
+                read_only: Some(true),
+                bind_options: Some(MountBindOptions {
+                    propagation: Some(MountBindOptionsPropagationEnum::RPRIVATE),
+                    create_mountpoint: Some(false),
+                    non_recursive: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    match docker
+        .create_container(
+            None::<bollard::query_parameters::CreateContainerOptions>,
+            body,
+        )
+        .await
+    {
+        Ok(created) => {
+            // The directory exists once the probe is created. A probe left by a
+            // failed removal carries the sandbox's auxiliary labels, so it is
+            // removed with the sandbox or by the startup sweep.
+            if let Err(error) = docker
+                .remove_container(
+                    &created.id,
+                    Some(RemoveContainerOptionsBuilder::default().v(true).build()),
+                )
+                .await
+            {
+                warn!(
+                    container_id = %created.id,
+                    error = %error,
+                    "Failed to remove CDI spec directory probe; it is removed with the sandbox"
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if is_missing_bind_source_error(&error, &directory.source) => Ok(false),
+        Err(error) => Err(internal_status("probe CDI spec directory", error)),
+    }
 }
 
 #[derive(Clone)]
@@ -357,6 +624,7 @@ pub struct DockerComputeDriver {
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
+    cdi_spec_directory_cache: Arc<Mutex<CdiSpecDirectoryCache>>,
     lifecycle_event_fences: DockerLifecycleEventFences,
     control_processes: Arc<Mutex<HashMap<String, DockerControlProcess>>>,
     runtime_failures: Arc<Mutex<HashMap<String, DockerRuntimeFailure>>>,
@@ -893,14 +1161,14 @@ impl DockerComputeDriver {
         let info = docker.info().await.map_err(|err| {
             Error::execution(format!("failed to query Docker daemon info: {err}"))
         })?;
-        let cdi_supported = info
-            .cdi_spec_dirs
-            .as_ref()
-            .is_some_and(|dirs| !dirs.is_empty());
+        let cdi_spec_dirs = info.cdi_spec_dirs.clone().unwrap_or_default();
+        let cdi_supported = !cdi_spec_dirs.is_empty();
         let cdi_gpu_inventory = docker_cdi_gpu_inventory(&info);
         let wsl_all_gpu_fallback_enabled = docker_info_reports_wsl2(&info);
         let gpu = DockerGpuRuntimeCapabilities {
             cdi_supported,
+            #[cfg(test)]
+            cdi_spec_dirs,
             wsl_all_gpu_fallback_enabled,
         };
         validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
@@ -967,7 +1235,7 @@ impl DockerComputeDriver {
                 supervisor_gateway_name: docker_config.supervisor_gateway_name.clone(),
                 ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 guest_tls,
-                gpu,
+                gpu: gpu.clone(),
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
                 enable_bind_mounts: docker_config.enable_bind_mounts,
                 allow_driver_config: docker_config.allow_driver_config,
@@ -985,6 +1253,7 @@ impl DockerComputeDriver {
                 cdi_gpu_inventory,
                 gpu.wsl_all_gpu_fallback_enabled,
             )),
+            cdi_spec_directory_cache: Arc::new(Mutex::new(CdiSpecDirectoryCache::default())),
             lifecycle_event_fences: DockerLifecycleEventFences::default(),
             control_processes: Arc::new(Mutex::new(HashMap::new())),
             runtime_failures: Arc::new(Mutex::new(HashMap::new())),
@@ -1202,6 +1471,10 @@ impl DockerComputeDriver {
             .info()
             .await
             .map_err(|err| internal_status("query Docker daemon info", err))?;
+        self.cdi_spec_directory_cache
+            .lock()
+            .await
+            .observe_daemon(&info);
         self.gpu_selector.refresh(
             docker_cdi_gpu_inventory(&info),
             self.config.gpu.wsl_all_gpu_fallback_enabled,
@@ -1212,6 +1485,31 @@ impl DockerComputeDriver {
     async fn admit_container_resources(
         &self,
         container: &bollard::models::ContainerInspectResponse,
+    ) -> Result<(), Status> {
+        // Only CDI containers carry a projection context, so other containers
+        // are admitted without depending on the bootstrap file.
+        if !self.config.resource_admission.enabled || !has_cdi_device_request(container) {
+            return self
+                .admit_container_resources_with_cdi_context(container, None)
+                .await;
+        }
+        let sandbox_id = container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .ok_or_else(|| Status::failed_precondition("sandbox lacks identity"))?;
+        let path =
+            docker_boundary_state_dir_by_id(sandbox_id, &self.config)?.join(BOUNDARY_CONFIG_FILE);
+        let cdi_context = read_docker_cdi_context(&path).await?;
+        self.admit_container_resources_with_cdi_context(container, cdi_context.as_ref())
+            .await
+    }
+
+    async fn admit_container_resources_with_cdi_context(
+        &self,
+        container: &bollard::models::ContainerInspectResponse,
+        cdi_context: Option<&CdiContext>,
     ) -> Result<(), Status> {
         if self.config.allow_driver_config && !self.config.resource_admission.enabled {
             return Ok(());
@@ -1240,12 +1538,67 @@ impl DockerComputeDriver {
             .get(openshell_core::resource_admission::IDENTITIES_LABEL)
             .and_then(|value| serde_json::from_str(value).ok())
             .ok_or_else(|| Status::failed_precondition("sandbox lacks resource identity record"))?;
+        // The driver-owned context defines the projections for this container.
+        // A legacy GPU container without context retains baseline handling; a
+        // device request alone does not imply that spec directories were mounted.
+        // Caller-provided bind mounts still require ordinary admission checks.
+        let cdi_requested = has_cdi_device_request(container);
+        let mut cdi_projections = std::collections::BTreeMap::new();
+        if let Some(context) = cdi_context {
+            if !cdi_requested || context.spec_dirs.is_empty() {
+                return Err(Status::failed_precondition(
+                    "CDI context requires a device request and spec projections",
+                ));
+            }
+            if context.version != openshell_core::cdi::CDI_CONTEXT_VERSION {
+                return Err(Status::failed_precondition(format!(
+                    "unsupported CDI context version {}",
+                    context.version
+                )));
+            }
+            let selected = context
+                .selected_devices
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            if cdi_device_request_ids(container) != selected {
+                return Err(Status::failed_precondition(
+                    "CDI device request does not match the recorded CDI context",
+                ));
+            }
+            for directory in &context.spec_dirs {
+                validate_cdi_spec_mount_config(container, &directory.path)?;
+                cdi_projections.insert(directory.path.clone(), directory.source.as_str());
+            }
+        }
         let mut actual = std::collections::BTreeMap::new();
         let anonymous_targets: Vec<String> = labels
             .get("openshell.ai/private-image-volume-targets")
             .and_then(|value| serde_json::from_str(value).ok())
             .unwrap_or_default();
         for mount in container.mounts.as_deref().unwrap_or_default() {
+            if let Some(source) = mount
+                .destination
+                .as_deref()
+                .and_then(|destination| cdi_projections.get(destination))
+            {
+                if mount.typ != Some(bollard::models::MountPointTypeEnum::BIND)
+                    || mount.source.as_deref() != Some(*source)
+                    || mount.rw != Some(false)
+                    || mount.propagation.as_deref() != Some("rprivate")
+                {
+                    return Err(Status::failed_precondition(
+                        "CDI spec projection source, type, access or propagation changed",
+                    ));
+                }
+                cdi_projections.remove(
+                    mount
+                        .destination
+                        .as_deref()
+                        .expect("projection destination"),
+                );
+                continue;
+            }
             match mount.typ {
                 Some(bollard::models::MountPointTypeEnum::VOLUME) => {
                     let name = mount
@@ -1309,6 +1662,11 @@ impl DockerComputeDriver {
                     .reject_unlabelable("effective container mount")?,
             }
         }
+        if !cdi_projections.is_empty() {
+            return Err(Status::failed_precondition(
+                "CDI spec projection is missing",
+            ));
+        }
         if actual != expected {
             return Err(Status::failed_precondition(
                 "external volume identity or attachment inventory changed",
@@ -1333,6 +1691,9 @@ impl DockerComputeDriver {
                 "driver_config.cdi_devices",
             )
             .map_err(Status::invalid_argument)?;
+            // Observe the daemon so CDI spec directories and cache
+            // invalidation reflect its current configuration.
+            self.refresh_gpu_inventory().await?;
             return Ok(Some(cdi_devices.to_vec()));
         }
 
@@ -1660,6 +2021,45 @@ impl DockerComputeDriver {
                 ));
             }
         };
+        let cdi_context = if gpu_devices
+            .as_ref()
+            .is_some_and(|devices| !devices.is_empty())
+        {
+            let mut cache = self.cdi_spec_directory_cache.lock().await;
+            let probe_labels = docker_auxiliary_container_labels(
+                sandbox,
+                &self.config,
+                LABEL_ISOLATION_ROLE_CDI_PROBE,
+            );
+            match cdi_context_for_spec_dirs(gpu_devices.as_deref(), &cache.spec_dirs) {
+                Ok(Some(context)) => cache
+                    .available_context(context, Instant::now(), |directory| {
+                        probe_cdi_spec_directory(
+                            &self.docker,
+                            &image.id,
+                            probe_labels.clone(),
+                            directory,
+                        )
+                    })
+                    .await
+                    .map(Some),
+                result => result,
+            }
+        } else {
+            Ok(None)
+        };
+        let cdi_context = match cdi_context {
+            Ok(context) => context,
+            Err(status) => {
+                let _ = remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config)
+                    .await;
+                cleanup_docker_boundary_state(sandbox, &self.config);
+                return Err(DockerProvisioningFailure::new(
+                    "CdiSpecDirectoryProbeFailed",
+                    status.message(),
+                ));
+            }
+        };
         let mut create_body = match build_container_create_body_for_image(
             sandbox,
             &self.config,
@@ -1679,6 +2079,17 @@ impl DockerComputeDriver {
                 ));
             }
         };
+        if let Some(context) = &cdi_context
+            && let Err(status) = retain_cdi_spec_projections(&mut create_body, context)
+        {
+            let _ =
+                remove_docker_channel_volume_by_id(&self.docker, &sandbox.id, &self.config).await;
+            cleanup_docker_boundary_state(sandbox, &self.config);
+            return Err(DockerProvisioningFailure::new(
+                "ContainerCreateFailed",
+                status.message(),
+            ));
+        }
         let identities = match self
             .validate_user_volume_mounts_available(&validated.driver_config, &sandbox.workspace)
             .await
@@ -1754,7 +2165,10 @@ impl DockerComputeDriver {
             }
         };
         let outer_fence_error = match validate_docker_outer_fence(&inspected) {
-            Ok(()) => self.admit_container_resources(&inspected).await.err(),
+            Ok(()) => self
+                .admit_container_resources_with_cdi_context(&inspected, cdi_context.as_ref())
+                .await
+                .err(),
             Err(error) => Some(error),
         };
         drop(inspected);
@@ -1788,7 +2202,7 @@ impl DockerComputeDriver {
             &created.id,
             &image,
             &workload_identity,
-            gpu_devices.is_some(),
+            cdi_context.as_ref(),
         )
         .await
         {
@@ -1993,6 +2407,7 @@ impl DockerComputeDriver {
                     LABEL_ISOLATION_ROLE_SUPERVISOR
                         | LABEL_ISOLATION_ROLE_STAGING
                         | LABEL_ISOLATION_ROLE_IDENTITY
+                        | LABEL_ISOLATION_ROLE_CDI_PROBE
                 )
             ) {
                 continue;
@@ -2001,10 +2416,7 @@ impl DockerComputeDriver {
                 continue;
             };
             self.docker
-                .remove_container(
-                    &target,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
+                .remove_container(&target, Some(auxiliary_container_remove_options(role)))
                 .await
                 .or_else(|error| {
                     if is_not_found_error(&error) || is_removal_in_progress_error(&error) {
@@ -2055,6 +2467,7 @@ impl DockerComputeDriver {
                     LABEL_ISOLATION_ROLE_SUPERVISOR
                         | LABEL_ISOLATION_ROLE_STAGING
                         | LABEL_ISOLATION_ROLE_IDENTITY
+                        | LABEL_ISOLATION_ROLE_CDI_PROBE
                 )
             ) {
                 continue;
@@ -2063,10 +2476,7 @@ impl DockerComputeDriver {
                 continue;
             };
             self.docker
-                .remove_container(
-                    &target,
-                    Some(RemoveContainerOptionsBuilder::default().force(true).build()),
-                )
+                .remove_container(&target, Some(auxiliary_container_remove_options(role)))
                 .await
                 .or_else(|error| {
                     if is_not_found_error(&error) {
@@ -4253,16 +4663,105 @@ fn prepare_docker_boundary_state_dir(
     Ok(directory)
 }
 
+/// Read the complete driver-owned bootstrap; unavailable or malformed state is
+/// an inspection failure, never evidence that a container uses the legacy path.
+fn has_cdi_device_request(container: &bollard::models::ContainerInspectResponse) -> bool {
+    !cdi_device_request_ids(container).is_empty()
+}
+
+fn cdi_device_request_ids(
+    container: &bollard::models::ContainerInspectResponse,
+) -> std::collections::BTreeSet<&str> {
+    container
+        .host_config
+        .as_ref()
+        .and_then(|host| host.device_requests.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| request.driver.as_deref() == Some("cdi"))
+        .flat_map(|request| request.device_ids.as_deref().unwrap_or_default())
+        .map(String::as_str)
+        .collect()
+}
+
+/// The effective mount list does not report bind recursion, so check the
+/// container's mount configuration for each recorded projection.
+fn validate_cdi_spec_mount_config(
+    container: &bollard::models::ContainerInspectResponse,
+    target: &str,
+) -> Result<(), Status> {
+    let mut configured = container
+        .host_config
+        .as_ref()
+        .and_then(|host| host.mounts.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .filter(|mount| mount.target.as_deref() == Some(target));
+    let valid = configured.next().is_some_and(|mount| {
+        mount.typ == Some(MountTypeEnum::BIND)
+            && mount.read_only == Some(true)
+            && mount
+                .bind_options
+                .as_ref()
+                .is_some_and(|options| options.non_recursive == Some(true))
+    }) && configured.next().is_none();
+    if valid {
+        Ok(())
+    } else {
+        Err(Status::failed_precondition(
+            "CDI spec projection must be configured as one read-only non-recursive bind",
+        ))
+    }
+}
+
+/// A missing or undecodable bootstrap is persistent and fails admission.
+/// Other read errors may be transient and defer admission to the next pass.
+async fn read_docker_cdi_context(path: &Path) -> Result<Option<CdiContext>, Status> {
+    let contents = tokio::fs::read(path).await.map_err(|error| {
+        let message = format!("read Docker sandbox bootstrap for admission: {error}");
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Status::failed_precondition(message)
+        } else {
+            Status::unavailable(message)
+        }
+    })?;
+    let config: BoundaryConfig = serde_json::from_slice(&contents).map_err(|error| {
+        Status::failed_precondition(format!(
+            "decode Docker sandbox bootstrap for admission: {error}"
+        ))
+    })?;
+    Ok(config.cdi_context)
+}
+
+/// Replace the file atomically so concurrent readers never see a partial write.
 async fn write_docker_boundary_file(path: &Path, contents: &[u8]) -> Result<(), Status> {
-    tokio::fs::write(path, contents).await.map_err(|error| {
+    let file_name = path.file_name().ok_or_else(|| {
         Status::internal(format!(
-            "write Docker boundary file {}: {error}",
+            "write Docker boundary file {}: path has no file name",
             path.display()
         ))
     })?;
-    openshell_core::paths::set_file_owner_only(path).map_err(|error| {
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(file_name);
+    temporary_name.push(".tmp");
+    let temporary = path.with_file_name(temporary_name);
+    tokio::fs::write(&temporary, contents)
+        .await
+        .map_err(|error| {
+            Status::internal(format!(
+                "write Docker boundary file {}: {error}",
+                path.display()
+            ))
+        })?;
+    openshell_core::paths::set_file_owner_only(&temporary).map_err(|error| {
         Status::internal(format!(
             "restrict Docker boundary file {}: {error}",
+            path.display()
+        ))
+    })?;
+    tokio::fs::rename(&temporary, path).await.map_err(|error| {
+        Status::internal(format!(
+            "replace Docker boundary file {}: {error}",
             path.display()
         ))
     })
@@ -4548,7 +5047,7 @@ async fn prepare_docker_boundary_files(
     container_id: &str,
     image: &DockerImageMetadata,
     workload_identity: &ResolvedWorkloadIdentity,
-    gpu_requested: bool,
+    cdi_context: Option<&CdiContext>,
 ) -> Result<(), Status> {
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
@@ -4578,7 +5077,8 @@ async fn prepare_docker_boundary_files(
         verification_keys,
         container_id: container_id.to_string(),
         image_identity: image.id.clone(),
-        gpu_requested,
+        gpu_requested: cdi_context.is_some(),
+        cdi_context: cdi_context.cloned(),
         listener_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
         control_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
         sandbox_tls: SandboxTlsServerConfig {
@@ -4977,6 +5477,17 @@ async fn stage_docker_supervisor_bundle(
         });
     result?;
     cleanup
+}
+
+/// Probe containers are created from the workload image, so removing them
+/// must also remove the anonymous volumes the image declares.
+fn auxiliary_container_remove_options(
+    role: Option<&str>,
+) -> bollard::query_parameters::RemoveContainerOptions {
+    RemoveContainerOptionsBuilder::default()
+        .force(true)
+        .v(role == Some(LABEL_ISOLATION_ROLE_CDI_PROBE))
+        .build()
 }
 
 fn docker_auxiliary_container_labels(
@@ -5765,7 +6276,7 @@ fn build_container_create_body_with_gpu_devices(
         template.image.clone(),
     )
     .map_err(|error| Status::internal(error.to_string()))?;
-    build_container_create_body_for_image(
+    let mut body = build_container_create_body_for_image(
         sandbox,
         config,
         driver_config,
@@ -5777,7 +6288,12 @@ fn build_container_create_body_with_gpu_devices(
             volumes: Vec::new(),
         },
         &workload_identity,
-    )
+    )?;
+    // Mirror sandbox creation, which adds projections from the CDI context.
+    if let Some(context) = config.gpu.cdi_context(gpu_device_ids)? {
+        retain_cdi_spec_projections(&mut body, &context)?;
+    }
+    Ok(body)
 }
 
 fn build_container_create_body_for_image(
@@ -5803,8 +6319,10 @@ fn build_container_create_body_for_image(
     let resource_limits = docker_resource_limits(template)?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
         .map_err(Status::failed_precondition)?;
-    driver_mounts::validate_workspace_control_path(&workspace_root, BOUNDARY_MOUNT_PATH)
-        .map_err(Status::failed_precondition)?;
+    for control_path in DOCKER_RESERVED_CONTROL_PATHS {
+        driver_mounts::validate_workspace_control_path(&workspace_root, control_path)
+            .map_err(Status::failed_precondition)?;
+    }
     for volume in &image.volumes {
         driver_mounts::validate_container_mount_target(volume).map_err(|error| {
             Status::failed_precondition(format!(
@@ -5816,8 +6334,10 @@ fn build_container_create_body_for_image(
                 "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
             ))
         })?;
-        driver_mounts::validate_mount_control_path(volume, BOUNDARY_MOUNT_PATH)
-            .map_err(Status::failed_precondition)?;
+        for control_path in DOCKER_RESERVED_CONTROL_PATHS {
+            driver_mounts::validate_mount_control_path(volume, control_path)
+                .map_err(Status::failed_precondition)?;
+        }
     }
     let mount_targets = driver_config.mounts.iter().map(|mount| {
         match mount {
@@ -5831,7 +6351,7 @@ fn build_container_create_body_for_image(
     driver_mounts::validate_workspace_mount_targets(
         mount_targets,
         &workspace_root,
-        &[BOUNDARY_MOUNT_PATH],
+        DOCKER_RESERVED_CONTROL_PATHS,
     )
     .map_err(Status::failed_precondition)?;
     let mut user_mounts = docker_driver_mounts(driver_config)?;

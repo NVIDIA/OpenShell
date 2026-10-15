@@ -626,7 +626,11 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
     printf 'sandbox_runtime_image = %s\n' "$(toml_string "${SANDBOX_RUNTIME_IMAGE}")"
     printf 'supervisor_image = %s\n'     "$(toml_string "${SUPERVISOR_IMAGE}")"
     printf '\n[openshell.drivers.docker.resource_admission]\n'
-    printf 'enabled = false\n'
+    if [ "${GPU_MODE}" = "1" ]; then
+      printf 'enabled = true\n'
+    else
+      printf 'enabled = false\n'
+    fi
   fi
 } > "${GATEWAY_CONFIG}"
 

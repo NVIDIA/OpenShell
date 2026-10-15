@@ -121,6 +121,31 @@ Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint
 
 Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
+For Docker GPU/CDI sandboxes, OpenShell uses Docker's selected CDI device IDs
+and daemon-reported CDI spec directories to build a workload CDI context. The
+driver embeds the context in the protected boundary configuration and
+projects the spec directories read-only under the protected `/.openshell/cdi-specs`
+hierarchy. User mounts and image volumes cannot target this hierarchy. These
+structured binds neither create missing host directories nor relabel existing
+directories. OpenShell skips spec directories that do not exist on the Docker
+host. At least one directory must remain and every selected device must resolve from
+its specs. On SELinux hosts, the host policy must allow containers to read the
+directories; a denial fails the workload launch. Agent processes cannot read the
+projections, even with a broad authored filesystem grant. The sandbox runtime derives filesystem requirements from CDI specs and
+checks supplemental groups before launching agent processes. Non-GPU Docker
+sandboxes do not receive the CDI context, spec mounts, or CDI-derived policy
+changes.
+
+Existing Docker GPU containers without CDI context retain the legacy GPU
+filesystem baseline on restart. Admission requires spec projections only when
+the driver-owned boundary configuration contains CDI context, and validates
+those projections against the directories recorded at creation. Missing or
+unreadable boundary configuration blocks restart. To use CDI-derived access on
+an older sandbox, recreate it. Ordinary CDI file and directory mounts must be
+effectively read-only. Filesystem `read_write` grants do not authorize writable
+CDI mounts; explicit authorization for CDI host writes is not currently
+supported. Device nodes and Unix socket communication remain supported.
+
 ### Docker Corporate Proxy Egress
 
 For proxy-required networks, the Docker driver accepts `https_proxy`,

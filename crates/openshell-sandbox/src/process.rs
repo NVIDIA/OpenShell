@@ -71,9 +71,12 @@ pub(crate) fn prepare_child_sandbox(
     policy: &SandboxPolicy,
     workdir: Option<&str>,
     runtime_read_only: &[PathBuf],
+    launch_context: &crate::launch::WorkloadLaunchContext,
 ) -> Result<Option<sandbox::linux::PreparedSandbox>> {
+    launch_context.validate_running_groups()?;
     let effective_policy = policy_with_runtime_read_only(policy, runtime_read_only);
-    let prepared = sandbox::linux::prepare_capability_free(&effective_policy, workdir)?;
+    let prepared =
+        sandbox::linux::prepare_capability_free(&effective_policy, workdir, launch_context)?;
     Ok(Some(prepared))
 }
 
@@ -427,6 +430,7 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
+        launch_context: &crate::launch::WorkloadLaunchContext,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -437,6 +441,7 @@ impl ProcessHandle {
             workspace,
             interactive,
             policy,
+            launch_context,
             ca_paths,
             provider_env,
         )
@@ -478,6 +483,7 @@ impl ProcessHandle {
         workspace: &ResolvedWorkspace,
         interactive: bool,
         policy: &SandboxPolicy,
+        launch_context: &crate::launch::WorkloadLaunchContext,
         ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
@@ -539,14 +545,15 @@ impl ProcessHandle {
         // process where the tracing subscriber is functional. The child's
         // pre_exec context cannot reliably emit structured logs.
         #[cfg(target_os = "linux")]
-        sandbox::linux::log_sandbox_readiness(policy, workspace.root());
+        sandbox::linux::log_sandbox_readiness(policy, workspace.root(), launch_context);
 
         // Prepare the Landlock ruleset as the workload UID. Inaccessible paths
         // are already unavailable to the child and remain omitted.
         #[cfg(target_os = "linux")]
         let runtime_read_only = ca_runtime_read_only_paths(ca_paths);
-        let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
-            .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        let prepared_sandbox =
+            prepare_child_sandbox(policy, workspace.root(), &runtime_read_only, launch_context)
+                .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
         let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
             .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
@@ -1566,7 +1573,12 @@ mod tests {
         };
         let runtime_paths =
             ca_runtime_read_only_paths(Some(&(certificate.clone(), bundle.clone())));
-        let Ok(Some(prepared)) = prepare_child_sandbox(&policy, None, &runtime_paths) else {
+        let Ok(Some(prepared)) = prepare_child_sandbox(
+            &policy,
+            None,
+            &runtime_paths,
+            &crate::launch::WorkloadLaunchContext::default(),
+        ) else {
             return;
         };
 

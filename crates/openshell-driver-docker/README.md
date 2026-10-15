@@ -93,7 +93,8 @@ traverse every parent and write and enter the workdir; OpenShell does not
 change its ownership or mode.
 
 Image `VOLUME` declarations and user mounts must not cover the workdir, one of
-its parents, or the reserved `/.openshell` runtime/channel tree. OpenShell asks
+its parents, or the reserved `/.openshell/channel` and `/.openshell/cdi-specs`
+paths. OpenShell asks
 the kernel to validate access under the final identity, so POSIX ACL and host
 LSM decisions remain authoritative.
 
@@ -111,6 +112,7 @@ LSM decisions remain authoritative.
 | Private named volumes | One carries the authenticated sandbox/supervisor channel. The other is mounted only into the supervisor and contains its JWT and private gateway credentials. |
 | In-memory `/run/openshell-supervisor-ca` tmpfs | Holds only the public supervisor CA certificate and trust bundle without making all of `/run` writable. |
 | CDI GPU request | Assigns the exact validated CDI devices requested by driver config or count-based selection. |
+| CDI workload projection | For GPU sandboxes only, embeds selected device metadata in the protected boundary config and mounts Docker daemon CDI spec directories read-only into the workload. |
 
 ## Stop, Start, and Delete
 
@@ -123,6 +125,39 @@ across gateway restarts.
 Delete force-removes both containers, the driver-owned runtime volumes, and the
 host-private runtime descriptor. Missing or altered descriptor and channel resources
 fail closed; the driver does not run an older combined-supervisor layout.
+
+## CDI GPU Metadata
+
+Docker remains the source of truth for GPU injection. The driver selects opaque
+CDI device IDs from `driver_config.cdi_devices` or the daemon's discovered CDI
+inventory, then passes the same IDs to Docker with a CDI `DeviceRequest`.
+
+For a GPU sandbox, the driver writes those IDs and projected CDI spec directory
+paths to a versioned context in the protected workload boundary configuration.
+It uses structured, read-only, non-recursive binds at `/.openshell/cdi-specs/<index>`.
+The driver checks source existence on the daemon host using one temporary,
+stopped container per directory and the prepared workload image. Each probe has
+one read-only, private bind with source creation disabled. Successful probes are
+removed with anonymous image-volume cleanup, including after provisioning
+cancellation. Confirmed missing directories are omitted; other errors fail
+provisioning. Results are cached for 30 seconds and refreshed on demand; observed
+changes to daemon identity, configured directories, or GPU inventory invalidate
+the cache. The resulting context records only available projections. The actual
+sandbox is created once, and selected devices must still resolve from the
+projected specs. No probe starts a process, creates missing directories, or
+relabels host spec directories. Administrators must make the existing directories readable
+under the host's SELinux policy when SELinux is enabled.
+
+Whole spec directories are available to the trusted runtime, which resolves only
+the selected devices. The mandatory Landlock baseline hides these projections
+from agent processes, even when the authored policy grants a broad ancestor.
+The sandbox runtime resolves the selected devices in that mount namespace before
+it launches agent processes, derives Landlock paths from CDI `containerEdits`,
+and warns when the runtime did not apply the spec's `additionalGids`. Containers with CDI context fail startup if their
+selected devices cannot be resolved. Existing GPU containers without context
+retain legacy baseline handling on restart. Admission checks persisted context
+for existing containers and the creation context for new ones. Non-GPU sandboxes
+receive no CDI context or spec mounts.
 
 ## Driver Config Mounts
 

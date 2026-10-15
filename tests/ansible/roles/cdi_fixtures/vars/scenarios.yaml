@@ -79,7 +79,7 @@ cdi_scenarios:
           options: [bind, ro]
     expect:
       checks:
-        - {type: read, path: /tmachine-cdi/read-only/file, expect: denied}
+        - {type: contents, path: /tmachine-cdi/read-only/file, expect: tmachine-cdi-read-only-file}
         - {type: write, path: /tmachine-cdi/read-only/file, expect: denied}
 
   - name: read-only-directory
@@ -93,7 +93,7 @@ cdi_scenarios:
           options: [bind, ro]
     expect:
       checks:
-        - {type: read, path: /tmachine-cdi/read-only/directory/marker, expect: denied}
+        - {type: contents, path: /tmachine-cdi/read-only/directory/marker, expect: tmachine-cdi-read-only-directory/marker}
         - {type: write, path: /tmachine-cdi/read-only/directory/marker, expect: denied}
         - {type: write, path: /tmachine-cdi/read-only/directory/new-file, expect: denied}
 
@@ -110,7 +110,7 @@ cdi_scenarios:
           options: [bind, ro]
     expect:
       checks:
-        - {type: read, path: /tmachine-cdi/library/libfixture.so.1, expect: denied}
+        - {type: contents, path: /tmachine-cdi/library/libfixture.so.1, expect: tmachine-cdi-libfixture.so.1}
         - {type: write, path: /tmachine-cdi/library/libfixture.so.1, expect: denied}
 
   - name: broad-library-parent
@@ -120,9 +120,7 @@ cdi_scenarios:
           containerPath: /libtmachinefixture.so.1
           options: [bind, ro]
     expect:
-      checks:
-        - {type: read, path: /libtmachinefixture.so.1, expect: denied}
-        - {type: write, path: /libtmachinefixture.so.1, expect: denied}
+      rejected: unsafe
 
   - name: writable-file
     fixtures:
@@ -133,9 +131,7 @@ cdi_scenarios:
           containerPath: /tmachine-cdi/writable/file
           options: [bind, rw]
     expect:
-      checks:
-        - {type: read, path: /tmachine-cdi/writable/file, expect: denied}
-        - {type: write, path: /tmachine-cdi/writable/file, expect: denied}
+      rejected: CDI writable mount
 
   - name: writable-directory
     fixtures:
@@ -146,8 +142,7 @@ cdi_scenarios:
           containerPath: /tmachine-cdi/writable/directory
           options: [bind, rw]
     expect:
-      checks:
-        - {type: write, path: /tmachine-cdi/writable/directory/probe, expect: denied}
+      rejected: CDI writable mount
 
   - name: omitted-access-file
     edits:
@@ -156,9 +151,7 @@ cdi_scenarios:
           containerPath: /tmachine-cdi/writable/omitted-access
           options: [bind]
     expect:
-      checks:
-        - {type: read, path: /tmachine-cdi/writable/omitted-access, expect: denied}
-        - {type: write, path: /tmachine-cdi/writable/omitted-access, expect: denied}
+      rejected: CDI writable mount
 
   - name: device-node
     edits:
@@ -169,7 +162,32 @@ cdi_scenarios:
     expect:
       checks:
         - {type: non-root}
-        - {type: write, path: /dev/tmachine-cdi-null, expect: denied}
+        - {type: write, path: /dev/tmachine-cdi-null, expect: ok}
+
+  # NVIDIA MPS clients open pipes under /tmp/nvidia-mps. The fixture uses a
+  # regular file in place of a pipe so the checks cannot block on open.
+  - name: mps-pipe-directory
+    fixtures:
+      - {path: mps-pipes, type: dir, mode: "0777"}
+      - {path: mps-pipes/control, type: file, content: "tmachine-cdi-mps-control\n", mode: "0666"}
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/mps-pipes"
+          containerPath: /tmp/nvidia-mps
+          options: [nosuid, nodev, rbind, rprivate, noexec]
+    expect:
+      checks:
+        - {type: contents, path: /tmp/nvidia-mps/control, expect: tmachine-cdi-mps-control}
+        - {type: write, path: /tmp/nvidia-mps/control, expect: ok}
+
+  - name: mps-pipe-directory-without-noexec
+    edits:
+      mounts:
+        - hostPath: "{{ cdi_scenario_dir }}/mps-pipes"
+          containerPath: /tmp/nvidia-mps
+          options: [nosuid, nodev, rbind, rprivate]
+    expect:
+      rejected: CDI IPC directory
 
   # The device is mode 0660 with a group that only `additionalGids` grants.
   - name: device-node-with-gid
@@ -188,7 +206,7 @@ cdi_scenarios:
       checks:
         - {type: non-root}
         - {type: group-of, path: /dev/tmachine-cdi-group-null}
-        - {type: write, path: /dev/tmachine-cdi-group-null, expect: denied}
+        - {type: write, path: /dev/tmachine-cdi-group-null, expect: ok}
 
   # The echo socket is served by the systemd units installed in scenarios.yaml.
   # Its sibling file checks that only the socket path is exposed.

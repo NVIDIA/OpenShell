@@ -31,6 +31,8 @@ use openshell_isolation_interface::contract::{
 #[derive(Clone)]
 pub struct LocalBoundaryExec {
     policy: SandboxPolicy,
+    #[cfg(target_os = "linux")]
+    launch_context: crate::launch::WorkloadLaunchContext,
     base_workdir: Option<String>,
     ca_file_paths: Option<Arc<(std::path::PathBuf, std::path::PathBuf)>>,
     provider_credentials: ProviderCredentialState,
@@ -43,8 +45,10 @@ pub struct LocalBoundaryExec {
 impl LocalBoundaryExec {
     /// Construct the executor owned by an active sandbox boundary.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy: SandboxPolicy,
+        #[cfg(target_os = "linux")] launch_context: crate::launch::WorkloadLaunchContext,
         base_workdir: Option<String>,
         ca_file_paths: Option<Arc<(std::path::PathBuf, std::path::PathBuf)>>,
         provider_credentials: ProviderCredentialState,
@@ -54,6 +58,8 @@ impl LocalBoundaryExec {
     ) -> Self {
         Self {
             policy,
+            #[cfg(target_os = "linux")]
+            launch_context,
             base_workdir,
             ca_file_paths,
             provider_credentials,
@@ -198,11 +204,16 @@ impl LocalBoundaryExec {
         &self,
         workdir: Option<&str>,
     ) -> Result<Option<crate::sandbox::linux::PreparedSandbox>, BackendError> {
-        crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir);
+        crate::sandbox::linux::log_sandbox_readiness(&self.policy, workdir, &self.launch_context);
         let runtime_read_only =
             crate::process::ca_runtime_read_only_paths(self.ca_file_paths.as_deref());
-        crate::process::prepare_child_sandbox(&self.policy, workdir, &runtime_read_only)
-            .map_err(|error| BackendError::Process(error.to_string()))
+        crate::process::prepare_child_sandbox(
+            &self.policy,
+            workdir,
+            &runtime_read_only,
+            &self.launch_context,
+        )
+        .map_err(|error| BackendError::Process(error.to_string()))
     }
 
     fn spawn_piped(&self, spec: &ExecSpec) -> Result<SpawnedExec, BackendError> {
@@ -706,6 +717,7 @@ mod tests {
                 landlock: openshell_core::policy::LandlockPolicy::default(),
                 process: openshell_core::policy::ProcessPolicy::default(),
             },
+            crate::launch::WorkloadLaunchContext::default(),
             None,
             None,
             ProviderCredentialState::from_environment(
@@ -718,6 +730,90 @@ mod tests {
             crate::boundary_io::BoundaryRuntimeState::new(),
             launcher,
         )
+    }
+
+    #[test]
+    fn cdi_launch_context_is_retained_and_revalidated_by_exec() {
+        if let Err(error) = crate::sandbox::linux::require_landlock_abi() {
+            assert!(
+                std::env::var_os("OPENSHELL_TEST_REQUIRE_LANDLOCK").is_none(),
+                "{error}"
+            );
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let library = directory.path().join("lib");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&library).unwrap();
+        std::os::unix::fs::symlink(&library, &alias).unwrap();
+        let mut executor = executor();
+        executor.policy.filesystem.read_only = vec![directory.path().to_path_buf()];
+        executor.launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                read_only_paths: vec![alias.to_string_lossy().into_owned()],
+                ..Default::default()
+            }),
+        };
+        crate::process::prepare_child_sandbox(
+            &executor.policy,
+            None,
+            &[],
+            &executor.launch_context,
+        )
+        .expect("initial launch validates CDI targets");
+        let retained = executor.clone();
+        executor
+            .prepare_sandbox(None)
+            .expect("original executor retains valid CDI context");
+        retained
+            .prepare_sandbox(None)
+            .expect("exec validates retained CDI targets");
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("/", &alias).unwrap();
+        let Err(error) = retained.prepare_sandbox(None) else {
+            panic!("exec must reject a CDI target replaced by a broad root");
+        };
+        assert!(error.to_string().contains("broad root"), "{error}");
+    }
+
+    #[test]
+    fn missing_cdi_groups_do_not_block_initial_launch_or_exec() {
+        let mut executor = executor();
+        executor.launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                additional_gids: vec![u32::MAX],
+                ..Default::default()
+            }),
+        };
+        crate::process::prepare_child_sandbox(
+            &executor.policy,
+            None,
+            &[],
+            &executor.launch_context,
+        )
+        .expect("initial launch only reports missing CDI groups");
+        let retained = executor.clone();
+        executor
+            .prepare_sandbox(None)
+            .expect("original executor only reports missing CDI groups");
+        retained
+            .prepare_sandbox(None)
+            .expect("exec only reports missing CDI groups");
+    }
+
+    #[test]
+    fn root_cdi_group_is_rejected_for_initial_launch_and_exec() {
+        let mut executor = executor();
+        executor.launch_context = crate::launch::WorkloadLaunchContext {
+            cdi_requirements: Some(crate::launch::CdiDerivedRequirements {
+                additional_gids: vec![0],
+                ..Default::default()
+            }),
+        };
+        let Err(error) = executor.prepare_sandbox(None) else {
+            panic!("exec must reject root GID 0 in CDI groups");
+        };
+        assert!(error.to_string().contains("root GID 0"), "{error}");
     }
 
     #[test]

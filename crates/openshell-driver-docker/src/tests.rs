@@ -49,6 +49,9 @@ fn startup_error_log_tails_fit_grpc_header_budget() {
     assert!(format_log_tail("").is_empty());
 }
 
+const TEST_CDI_SPEC_DIR: &str = "/opt/openshell-test/cdi";
+const TEST_CDI_SPEC_DIR_ALT: &str = "/srv/openshell-test/cdi";
+
 fn test_launch_authentication() -> Vec<u8> {
     serde_json::to_vec(&SandboxLaunchAuthentication {
         supervisor: SupervisorAuthBundle {
@@ -105,6 +108,394 @@ fn test_sandbox() -> DriverSandbox {
         status: None,
         workspace: String::new(),
     }
+}
+
+#[tokio::test]
+async fn admission_accepts_only_exact_read_only_cdi_spec_projections() {
+    let mut config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
+    config.resource_admission =
+        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+    let driver = test_driver_with_config(config);
+    let context = driver
+        .config
+        .gpu
+        .cdi_context(Some(&["nvidia.com/gpu=0".into()]))
+        .unwrap()
+        .unwrap();
+    let value = serde_json::json!({
+        "Config": {"Labels": {
+            LABEL_SANDBOX_WORKSPACE: "team-a",
+            LABEL_SANDBOX_ID: "cdi-admission",
+            openshell_core::resource_admission::CONFIG_USED_LABEL: "false",
+            openshell_core::resource_admission::IDENTITIES_LABEL: "{}"
+        }},
+        "HostConfig": {
+            "DeviceRequests": [{"Driver": "cdi", "DeviceIDs": ["nvidia.com/gpu=0"]}],
+            "Mounts": [cdi_spec_mount_config(TEST_CDI_SPEC_DIR, &cdi_spec_mount_path(0))]
+        },
+        "Mounts": [{"Type": "bind", "Source": TEST_CDI_SPEC_DIR,
+            "Destination": cdi_spec_mount_path(0), "RW": false, "Propagation": "rprivate"}]
+    });
+    let inspect = serde_json::from_value(value.clone()).unwrap();
+    driver
+        .admit_container_resources_with_cdi_context(&inspect, Some(&context))
+        .await
+        .unwrap();
+    // The configured mount must stay a single read-only, non-recursive bind.
+    for (pointer, replacement) in [
+        (
+            "/HostConfig/Mounts/0/BindOptions/NonRecursive",
+            serde_json::json!(false),
+        ),
+        ("/HostConfig/Mounts/0/ReadOnly", serde_json::json!(false)),
+        ("/HostConfig/Mounts/0/Type", serde_json::json!("volume")),
+        ("/HostConfig/Mounts", serde_json::json!([])),
+        (
+            "/HostConfig/Mounts",
+            serde_json::json!([
+                cdi_spec_mount_config(TEST_CDI_SPEC_DIR, &cdi_spec_mount_path(0)),
+                cdi_spec_mount_config(TEST_CDI_SPEC_DIR, &cdi_spec_mount_path(0)),
+            ]),
+        ),
+    ] {
+        let mut changed = value.clone();
+        *changed.pointer_mut(pointer).unwrap() = replacement;
+        let inspect = serde_json::from_value(changed).unwrap();
+        let error = driver
+            .admit_container_resources_with_cdi_context(&inspect, Some(&context))
+            .await
+            .unwrap_err();
+        assert!(
+            error.message().contains("non-recursive bind"),
+            "{pointer}: {error}"
+        );
+    }
+    // The device request must match the recorded selection exactly.
+    for device_ids in [
+        serde_json::json!(["nvidia.com/gpu=1"]),
+        serde_json::json!(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),
+    ] {
+        let mut changed = value.clone();
+        changed["HostConfig"]["DeviceRequests"][0]["DeviceIDs"] = device_ids.clone();
+        let inspect = serde_json::from_value(changed).unwrap();
+        let error = driver
+            .admit_container_resources_with_cdi_context(&inspect, Some(&context))
+            .await
+            .unwrap_err();
+        assert!(error.message().contains("does not match"), "{device_ids}");
+    }
+    let mut future_context = context.clone();
+    future_context.version += 1;
+    let error = driver
+        .admit_container_resources_with_cdi_context(&inspect, Some(&future_context))
+        .await
+        .unwrap_err();
+    assert!(error.message().contains("unsupported CDI context version"));
+    for (field, replacement) in [
+        ("Source", serde_json::json!("/untrusted")),
+        ("Destination", serde_json::json!("/elsewhere")),
+        ("RW", serde_json::json!(true)),
+        ("Type", serde_json::json!("volume")),
+        ("Propagation", serde_json::json!("rshared")),
+    ] {
+        let mut changed = value.clone();
+        changed["Mounts"][0][field] = replacement;
+        // Avoid a daemon lookup for the wrong mount type.
+        if field == "Type" {
+            changed["Mounts"][0]["Name"] = serde_json::json!("unexpected");
+        }
+        let inspect = serde_json::from_value(changed).unwrap();
+        assert!(
+            driver
+                .admit_container_resources_with_cdi_context(&inspect, Some(&context))
+                .await
+                .is_err(),
+            "{field}"
+        );
+    }
+    for change in ["missing", "duplicate", "extra", "no-request"] {
+        let mut changed = value.clone();
+        match change {
+            "missing" => changed["Mounts"] = serde_json::json!([]),
+            "duplicate" => changed["Mounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(value["Mounts"][0].clone()),
+            "extra" => changed["Mounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "Type": "bind", "Source": "/data", "Destination": "/data", "RW": false
+                })),
+            "no-request" => changed["HostConfig"]["DeviceRequests"] = serde_json::json!([]),
+            _ => unreachable!(),
+        }
+        let inspect = serde_json::from_value(changed).unwrap();
+        assert!(
+            driver
+                .admit_container_resources_with_cdi_context(&inspect, Some(&context))
+                .await
+                .is_err(),
+            "{change}"
+        );
+    }
+}
+
+fn cdi_spec_mount_config(source: &str, target: &str) -> serde_json::Value {
+    serde_json::json!({
+        "Type": "bind", "Source": source, "Target": target, "ReadOnly": true,
+        "BindOptions": {"Propagation": "rprivate", "NonRecursive": true, "CreateMountpoint": false}
+    })
+}
+
+#[test]
+fn cdi_context_rejects_unknown_fields() {
+    let mut value = serde_json::to_value(CdiContext::new(
+        vec!["nvidia.com/gpu=0".into()],
+        vec![CdiSpecDirectory::new(
+            cdi_spec_mount_path(0),
+            TEST_CDI_SPEC_DIR,
+        )],
+    ))
+    .unwrap();
+    value["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<CdiContext>(value.clone()).is_err());
+    value.as_object_mut().unwrap().remove("unexpected");
+    value["spec_dirs"][0]["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<CdiContext>(value).is_err());
+}
+
+fn admission_boundary_config(cdi_context: Option<CdiContext>) -> BoundaryConfig {
+    let auth = decode_docker_launch_authentication(&test_launch_authentication()).unwrap();
+    isolation::DockerBoundarySpec {
+        boundary_id: "cdi-admission".into(),
+        generation: auth.supervisor.runtime_generation.to_string(),
+        session_id: auth.supervisor.session_id,
+        session_rotation: auth.supervisor.session_rotation,
+        auth_epoch: auth.supervisor.auth_epoch,
+        gateway_id: auth.gateway_id,
+        verification_keys: gateway_verification_keys(&auth.verification_keys).unwrap(),
+        container_id: "container-test".into(),
+        image_identity: "sha256:image".into(),
+        gpu_requested: true,
+        cdi_context,
+        listener_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        control_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        sandbox_tls: SandboxTlsServerConfig {
+            certificate_chain_path: BOUNDARY_CERTIFICATE_MOUNT_PATH.into(),
+            private_key_path: BOUNDARY_PRIVATE_KEY_MOUNT_PATH.into(),
+        },
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: "sandbox-test".into(),
+            trust_anchor_pem: "test-ca".into(),
+        },
+        host_gateway_ip: None,
+        workload_identity: ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            Vec::new(),
+            "image".into(),
+            "sha256:image".into(),
+        )
+        .unwrap(),
+        child_env: HashMap::new(),
+    }
+    .provision()
+    .unwrap()
+    .boundary_config
+}
+
+#[tokio::test]
+async fn admission_uses_persisted_cdi_context_for_existing_containers() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(BOUNDARY_CONFIG_FILE);
+    let mut config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR_ALT]);
+    config.resource_admission =
+        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+    let driver = test_driver_with_config(config);
+    let mut value = serde_json::json!({
+        "Config": {"Labels": {
+            LABEL_SANDBOX_WORKSPACE: "team-a",
+            LABEL_SANDBOX_ID: "cdi-admission",
+            openshell_core::resource_admission::CONFIG_USED_LABEL: "false",
+            openshell_core::resource_admission::IDENTITIES_LABEL: "{}"
+        }},
+        "HostConfig": {"DeviceRequests": [{"Driver": "cdi", "DeviceIDs": ["nvidia.com/gpu=0"]}]},
+        "Mounts": []
+    });
+    // Older bootstraps omit the field entirely. GPU and ordinary containers
+    // without context need no projections, even on a now-CDI-capable daemon.
+    let mut legacy = serde_json::to_value(admission_boundary_config(None)).unwrap();
+    legacy.as_object_mut().unwrap().remove("cdi_context");
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let context = read_docker_cdi_context(&path).await.unwrap();
+    assert!(context.is_none());
+    for requests in [
+        value["HostConfig"]["DeviceRequests"].clone(),
+        serde_json::json!([]),
+    ] {
+        value["HostConfig"]["DeviceRequests"] = requests;
+        let inspect = serde_json::from_value(value.clone()).unwrap();
+        driver
+            .admit_container_resources_with_cdi_context(&inspect, context.as_ref())
+            .await
+            .unwrap();
+    }
+    value["HostConfig"]["DeviceRequests"] = serde_json::json!([
+        {"Driver": "cdi", "DeviceIDs": ["nvidia.com/gpu=0"]}
+    ]);
+    value["Mounts"] = serde_json::json!([
+        {"Type": "bind", "Source": "/data", "Destination": "/data", "RW": false}
+    ]);
+    let inspect = serde_json::from_value(value.clone()).unwrap();
+    assert!(
+        driver
+            .admit_container_resources_with_cdi_context(&inspect, None)
+            .await
+            .is_err()
+    );
+
+    // The original context remains authoritative after daemon settings change.
+    let context = CdiContext::new(
+        vec!["nvidia.com/gpu=0".into()],
+        vec![CdiSpecDirectory::new(
+            cdi_spec_mount_path(0),
+            TEST_CDI_SPEC_DIR,
+        )],
+    );
+    fs::write(
+        &path,
+        admission_boundary_config(Some(context)).encode().unwrap(),
+    )
+    .unwrap();
+    let context = read_docker_cdi_context(&path).await.unwrap();
+    value["HostConfig"]["Mounts"] = serde_json::json!([cdi_spec_mount_config(
+        TEST_CDI_SPEC_DIR,
+        &cdi_spec_mount_path(0)
+    )]);
+    value["Mounts"] = serde_json::json!([]);
+    let inspect = serde_json::from_value(value.clone()).unwrap();
+    let error = driver
+        .admit_container_resources_with_cdi_context(&inspect, context.as_ref())
+        .await
+        .unwrap_err();
+    assert_eq!(error.message(), "CDI spec projection is missing");
+    value["Mounts"] = serde_json::json!([
+        {"Type": "bind", "Source": TEST_CDI_SPEC_DIR, "Destination": cdi_spec_mount_path(0),
+         "RW": false, "Propagation": "rprivate"}
+    ]);
+    let inspect = serde_json::from_value(value.clone()).unwrap();
+    driver
+        .admit_container_resources_with_cdi_context(&inspect, context.as_ref())
+        .await
+        .unwrap();
+    value["Mounts"][0]["Source"] = serde_json::json!(TEST_CDI_SPEC_DIR_ALT);
+    let inspect = serde_json::from_value(value).unwrap();
+    assert!(
+        driver
+            .admit_container_resources_with_cdi_context(&inspect, context.as_ref())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn stalled_cdi_spec_directory_probe_times_out_without_cancelling_cleanup() {
+    let (finished_tx, finished_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        let _ = release_rx.await;
+        let _ = finished_tx.send(());
+        Ok(true)
+    });
+    let error = await_cdi_spec_directory_probe(task, Duration::from_millis(10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    // The detached probe still runs to completion so it can remove its container.
+    release_tx.send(()).unwrap();
+    finished_rx.await.unwrap();
+}
+
+#[tokio::test]
+async fn admission_reads_bootstrap_only_for_cdi_containers() {
+    let mut config = runtime_config();
+    config.resource_admission =
+        openshell_core::resource_admission::ResourceAdmissionConfig::default();
+    let driver = test_driver_with_config(config);
+    // No bootstrap exists for this sandbox. Ordinary containers must still be
+    // admitted, while CDI containers fail closed.
+    let mut value = serde_json::json!({
+        "Config": {"Labels": {
+            LABEL_SANDBOX_WORKSPACE: "team-a",
+            LABEL_SANDBOX_ID: "admission-without-bootstrap-0f3c9a",
+            openshell_core::resource_admission::CONFIG_USED_LABEL: "false",
+            openshell_core::resource_admission::IDENTITIES_LABEL: "{}"
+        }},
+        "HostConfig": {"DeviceRequests": []},
+        "Mounts": []
+    });
+    let inspect = serde_json::from_value(value.clone()).unwrap();
+    driver.admit_container_resources(&inspect).await.unwrap();
+
+    value["HostConfig"]["DeviceRequests"] = serde_json::json!([
+        {"Driver": "cdi", "DeviceIDs": ["nvidia.com/gpu=0"]}
+    ]);
+    let inspect = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        driver
+            .admit_container_resources(&inspect)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn boundary_files_are_replaced_atomically() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(BOUNDARY_CONFIG_FILE);
+    write_docker_boundary_file(&path, b"first").await.unwrap();
+    write_docker_boundary_file(&path, b"second").await.unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"second");
+    let entries = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from(BOUNDARY_CONFIG_FILE)]
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[tokio::test]
+async fn admission_cdi_context_lookup_failures_do_not_select_legacy_handling() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join(BOUNDARY_CONFIG_FILE);
+    // Missing and malformed state is persistent and fails admission; other
+    // read errors are deferred to the next pass.
+    for contents in [None, Some("invalid json"), Some("{}")] {
+        if let Some(contents) = contents {
+            fs::write(&path, contents).unwrap();
+        }
+        let error = read_docker_cdi_context(&path).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert_eq!(
+        read_docker_cdi_context(&path).await.unwrap_err().code(),
+        tonic::Code::Unavailable
+    );
 }
 
 #[test]
@@ -221,6 +612,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         gpu: DockerGpuRuntimeCapabilities {
             cdi_supported: false,
+            cdi_spec_dirs: Vec::new(),
             wsl_all_gpu_fallback_enabled: false,
         },
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
@@ -394,6 +786,571 @@ fn sandbox_driver_config_cannot_override_proxy_ca_bundle() {
     assert!(error.message().contains("proxy_ca_bundle"), "{error}");
 }
 
+fn runtime_config_with_cdi_spec_dirs(cdi_spec_dirs: &[&str]) -> DockerDriverRuntimeConfig {
+    let mut config = runtime_config();
+    config.gpu.cdi_supported = !cdi_spec_dirs.is_empty();
+    config.gpu.cdi_spec_dirs = cdi_spec_dirs
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect();
+    config
+}
+
+#[test]
+fn gpu_runtime_builds_cdi_context_from_selected_devices_and_daemon_dirs() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT]);
+    let selected_devices = vec![
+        "nvidia.com/gpu=0".to_string(),
+        "nvidia.com/gpu=1".to_string(),
+    ];
+
+    let context = config
+        .gpu
+        .cdi_context(Some(&selected_devices))
+        .unwrap()
+        .expect("GPU selection should produce a CDI context");
+
+    assert_eq!(context.selected_devices, selected_devices);
+    assert_eq!(
+        context.spec_dirs,
+        vec![
+            CdiSpecDirectory::new(cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR),
+            CdiSpecDirectory::new(cdi_spec_mount_path(1), TEST_CDI_SPEC_DIR_ALT),
+        ]
+    );
+}
+
+#[test]
+fn gpu_runtime_omits_cdi_projection_without_selected_devices() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
+    assert_eq!(config.gpu.cdi_context(None).unwrap(), None);
+}
+
+#[test]
+fn gpu_runtime_builds_read_only_cdi_bind_mounts() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT]);
+    let context = config
+        .gpu
+        .cdi_context(Some(&["nvidia.com/gpu=0".into()]))
+        .unwrap()
+        .unwrap();
+    let mut body = ContainerCreateBody::default();
+    retain_cdi_spec_projections(&mut body, &context).unwrap();
+    let mounts = body.host_config.unwrap().mounts.unwrap();
+    assert_eq!(mounts.len(), 2);
+    for (index, (mount, source)) in mounts
+        .iter()
+        .zip([TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT])
+        .enumerate()
+    {
+        assert_eq!(mount.typ, Some(MountTypeEnum::BIND));
+        assert_eq!(mount.source.as_deref(), Some(source));
+        assert_eq!(
+            mount.target.as_deref(),
+            Some(cdi_spec_mount_path(index).as_str())
+        );
+        assert_eq!(mount.read_only, Some(true));
+        let options = mount.bind_options.as_ref().unwrap();
+        assert_eq!(options.create_mountpoint, Some(false));
+        assert_eq!(options.non_recursive, Some(true));
+        assert_eq!(
+            options.propagation,
+            Some(MountBindOptionsPropagationEnum::RPRIVATE)
+        );
+    }
+}
+
+#[test]
+fn cdi_projections_delegate_missing_source_checks_to_the_daemon() {
+    // The source is a daemon-host path, not a gateway-local path. It must not
+    // be passed as a legacy bind that would create it on the daemon host.
+    let config = runtime_config_with_cdi_spec_dirs(&["/missing/openshell/cdi-specs"]);
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
+    let body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        Some(&["nvidia.com/gpu=0".into()]),
+    )
+    .unwrap();
+    let host = body.host_config.unwrap();
+    assert!(
+        host.binds
+            .unwrap_or_default()
+            .iter()
+            .all(|bind| !bind.contains("cdi-specs"))
+    );
+    let mount = host
+        .mounts
+        .unwrap()
+        .into_iter()
+        .find(|mount| mount.source.as_deref() == Some("/missing/openshell/cdi-specs"))
+        .unwrap();
+    assert_eq!(mount.bind_options.unwrap().create_mountpoint, Some(false));
+}
+
+#[test]
+fn cdi_projection_mounts_match_probed_context_without_changing_gpu_selection() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR, TEST_CDI_SPEC_DIR_ALT]);
+    let devices = vec!["nvidia.com/gpu=0".into()];
+    let mut body = build_container_create_body_with_gpu_devices(
+        &test_sandbox(),
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        Some(&devices),
+    )
+    .unwrap();
+    let mut context = config.gpu.cdi_context(Some(&devices)).unwrap().unwrap();
+    context.spec_dirs.remove(0);
+    let host = body.host_config.as_mut().unwrap();
+    host.mounts.as_mut().unwrap().push(Mount {
+        typ: Some(MountTypeEnum::BIND),
+        source: Some(TEST_CDI_SPEC_DIR.into()),
+        target: Some("/unrelated".into()),
+        ..Default::default()
+    });
+    // A stale projection for a directory the probe dropped must be removed.
+    host.mounts
+        .as_mut()
+        .unwrap()
+        .push(cdi_spec_mount(&cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR).unwrap());
+    let requests = host.device_requests.clone();
+    retain_cdi_spec_projections(&mut body, &context).unwrap();
+    let host = body.host_config.unwrap();
+    assert_eq!(host.device_requests, requests);
+    let mounts = host.mounts.unwrap();
+    assert!(
+        !mounts
+            .iter()
+            .any(|mount| mount.target.as_deref() == Some(cdi_spec_mount_path(0).as_str()))
+    );
+    assert!(mounts.iter().any(|mount| mount.target.as_deref()
+        == Some(cdi_spec_mount_path(1).as_str())
+        && mount.source.as_deref() == Some(TEST_CDI_SPEC_DIR_ALT)));
+    assert!(
+        mounts
+            .iter()
+            .any(|mount| mount.target.as_deref() == Some("/unrelated"))
+    );
+    assert!(
+        mounts
+            .iter()
+            .any(|mount| mount.typ == Some(MountTypeEnum::VOLUME))
+    );
+}
+
+#[test]
+fn cdi_projections_follow_live_daemon_directories_over_startup_snapshot() {
+    // Startup reported only the primary directory; the daemon now reports the
+    // alternate one. The context and the mounts must both follow the daemon.
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
+    let devices = vec!["nvidia.com/gpu=0".to_string()];
+    let mut cache = CdiSpecDirectoryCache::default();
+    let info: SystemInfo = serde_json::from_value(serde_json::json!({
+        "ID": "daemon-a",
+        "CDISpecDirs": [TEST_CDI_SPEC_DIR_ALT],
+    }))
+    .unwrap();
+    cache.observe_daemon(&info);
+
+    let context = cdi_context_for_spec_dirs(Some(&devices), &cache.spec_dirs)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        context.spec_dirs,
+        vec![CdiSpecDirectory::new(
+            cdi_spec_mount_path(0),
+            TEST_CDI_SPEC_DIR_ALT
+        )]
+    );
+
+    let mut body = build_container_create_body_with_gpu_devices(
+        &test_sandbox(),
+        &config,
+        &DockerSandboxDriverConfig::default(),
+        Some(&devices),
+    )
+    .unwrap();
+    retain_cdi_spec_projections(&mut body, &context).unwrap();
+    let projections =
+        body.host_config
+            .unwrap()
+            .mounts
+            .unwrap()
+            .into_iter()
+            .filter(|mount| {
+                mount.target.as_deref().is_some_and(|target| {
+                    target.starts_with(openshell_core::cdi::CDI_SPEC_DIR_BASE)
+                })
+            })
+            .collect::<Vec<_>>();
+    assert_eq!(projections.len(), 1);
+    assert_eq!(
+        projections[0].source.as_deref(),
+        Some(TEST_CDI_SPEC_DIR_ALT)
+    );
+    assert_eq!(projections[0].read_only, Some(true));
+}
+
+#[test]
+fn stale_cdi_probe_sweeps_remove_anonymous_volumes() {
+    let probe = auxiliary_container_remove_options(Some(LABEL_ISOLATION_ROLE_CDI_PROBE));
+    assert!(probe.force);
+    assert!(probe.v);
+    let identity = auxiliary_container_remove_options(Some(LABEL_ISOLATION_ROLE_IDENTITY));
+    assert!(identity.force);
+    assert!(!identity.v);
+}
+
+#[test]
+fn cdi_context_requires_daemon_reported_directories() {
+    let devices = vec!["nvidia.com/gpu=0".to_string()];
+    assert_eq!(
+        cdi_context_for_spec_dirs(Some(&devices), &[])
+            .unwrap_err()
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(cdi_context_for_spec_dirs(None, &[]).unwrap(), None);
+}
+
+#[tokio::test]
+async fn cdi_directory_cache_filters_missing_sources_and_expires() {
+    let config = runtime_config_with_cdi_spec_dirs(&["/missing/cdi", TEST_CDI_SPEC_DIR]);
+    let context = config
+        .gpu
+        .cdi_context(Some(&["nvidia.com/gpu=0".into()]))
+        .unwrap()
+        .unwrap();
+    let mut cache = CdiSpecDirectoryCache::default();
+    let now = Instant::now();
+    let probes = std::cell::Cell::new(0);
+    let available = cache
+        .available_context(context.clone(), now, |dir| {
+            probes.set(probes.get() + 1);
+            std::future::ready(Ok(dir.source != "/missing/cdi"))
+        })
+        .await
+        .unwrap();
+    assert_eq!(probes.get(), 2);
+    assert_eq!(
+        available.spec_dirs,
+        vec![CdiSpecDirectory::new(
+            cdi_spec_mount_path(1),
+            TEST_CDI_SPEC_DIR
+        )]
+    );
+    assert_eq!(available.selected_devices, context.selected_devices);
+    cache
+        .available_context(context.clone(), now + Duration::from_secs(1), |_| {
+            std::future::ready(Err(Status::internal(
+                "fresh cache entry unexpectedly probed",
+            )))
+        })
+        .await
+        .unwrap();
+    let available = cache
+        .available_context(context, now + CDI_SPEC_DIRECTORY_CACHE_TTL, |_| {
+            probes.set(probes.get() + 1);
+            std::future::ready(Ok(true))
+        })
+        .await
+        .unwrap();
+    assert_eq!(probes.get(), 4);
+    assert_eq!(available.spec_dirs.len(), 2);
+}
+
+#[tokio::test]
+async fn cdi_directory_cache_does_not_cache_probe_errors() {
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
+    let context = config
+        .gpu
+        .cdi_context(Some(&["nvidia.com/gpu=0".into()]))
+        .unwrap()
+        .unwrap();
+    let mut cache = CdiSpecDirectoryCache::default();
+    let probes = std::cell::Cell::new(0);
+    for _ in 0..2 {
+        let result = cache
+            .available_context(context.clone(), Instant::now(), |_| {
+                probes.set(probes.get() + 1);
+                std::future::ready(Err(Status::unavailable("daemon failure")))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(cache.entries.is_empty());
+    }
+    assert_eq!(probes.get(), 2);
+    let result = cache
+        .available_context(context, Instant::now(), |_| std::future::ready(Ok(false)))
+        .await;
+    assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+}
+
+#[test]
+fn cdi_directory_cache_invalidates_on_daemon_discovery_changes() {
+    let mut cache = CdiSpecDirectoryCache::default();
+    let mut value = serde_json::json!({"ID":"daemon-a", "CDISpecDirs":[TEST_CDI_SPEC_DIR],
+        "DiscoveredDevices":[{"ID":"nvidia.com/gpu=0", "Source":"cdi"}]});
+    let info: SystemInfo = serde_json::from_value(value.clone()).unwrap();
+    cache.observe_daemon(&info);
+    cache
+        .entries
+        .insert(TEST_CDI_SPEC_DIR.into(), (Instant::now(), true));
+    cache.observe_daemon(&info);
+    assert_eq!(cache.entries.len(), 1);
+    for change in ["daemon", "directories", "inventory"] {
+        match change {
+            "daemon" => value["ID"] = serde_json::json!("daemon-b"),
+            "directories" => value["CDISpecDirs"] = serde_json::json!([TEST_CDI_SPEC_DIR_ALT]),
+            "inventory" => {
+                value["DiscoveredDevices"][0]["ID"] = serde_json::json!("nvidia.com/gpu=1");
+            }
+            _ => unreachable!(),
+        }
+        cache.observe_daemon(&serde_json::from_value(value.clone()).unwrap());
+        assert!(cache.entries.is_empty());
+        cache
+            .entries
+            .insert(TEST_CDI_SPEC_DIR.into(), (Instant::now(), true));
+    }
+}
+
+async fn mock_cdi_probe_api(responses: Vec<(u16, String)>) -> (Docker, JoinHandle<Vec<String>>) {
+    mock_cdi_probe_api_with_gate(responses, None).await
+}
+
+async fn mock_cdi_probe_api_with_gate(
+    responses: Vec<(u16, String)>,
+    gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+) -> (Docker, JoinHandle<Vec<String>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let mut requests = Vec::new();
+        for (index, (status, body)) in responses.into_iter().enumerate() {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            openshell_core::net::set_tcp_nodelay_best_effort(&socket);
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (key, value) = line.split_once(':')?;
+                            key.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            requests.push(String::from_utf8(request).unwrap());
+            if index == 0
+                && let Some((received, release)) = &gate
+            {
+                received.notify_one();
+                release.notified().await;
+            }
+            let response = format!(
+                "HTTP/1.1 {status} Result\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+        requests
+    });
+    let docker = Docker::connect_with_http(
+        &format!("http://{address}"),
+        5,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap();
+    (docker, task)
+}
+
+#[tokio::test]
+async fn cdi_probe_uses_prepared_image_one_bind_and_removes_volumes_without_starting() {
+    let (docker, requests) = mock_cdi_probe_api(vec![
+        (201, r#"{"Id":"probe-test","Warnings":[]}"#.into()),
+        (204, String::new()),
+    ])
+    .await;
+    assert!(
+        probe_cdi_spec_directory(
+            &docker,
+            "sha256:prepared-workload",
+            HashMap::from([(
+                LABEL_ISOLATION_ROLE.to_string(),
+                LABEL_ISOLATION_ROLE_CDI_PROBE.to_string(),
+            )]),
+            CdiSpecDirectory::new(cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR)
+        )
+        .await
+        .unwrap()
+    );
+    let requests = requests.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST "));
+    assert!(requests[0].contains("/containers/create"));
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(body["Image"], "sha256:prepared-workload");
+    assert_eq!(
+        body["Labels"][LABEL_ISOLATION_ROLE],
+        LABEL_ISOLATION_ROLE_CDI_PROBE
+    );
+    assert_eq!(body["HostConfig"]["NetworkMode"], "none");
+    let mounts = body["HostConfig"]["Mounts"].as_array().unwrap();
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0]["Source"], TEST_CDI_SPEC_DIR);
+    assert_eq!(mounts[0]["ReadOnly"], true);
+    assert_eq!(mounts[0]["BindOptions"]["CreateMountpoint"], false);
+    assert_eq!(mounts[0]["BindOptions"]["Propagation"], "rprivate");
+    assert!(body.get("Env").is_none_or(serde_json::Value::is_null));
+    assert!(requests[1].starts_with("DELETE "));
+    assert!(requests[1].contains("/containers/probe-test?"));
+    assert!(requests[1].contains("v=true"));
+}
+
+#[tokio::test]
+async fn cdi_probe_skips_only_its_missing_source_and_surfaces_other_failures() {
+    let missing = format!(
+        "invalid mount config for type \"bind\": bind source path does not exist: {TEST_CDI_SPEC_DIR}"
+    );
+    let reworded = format!("bind source path does not exist: {TEST_CDI_SPEC_DIR}");
+    for (code, message, expected_missing) in [
+        (400, missing.as_str(), true),
+        (400, reworded.as_str(), true),
+        (403, "permission denied", false),
+        (500, "daemon failed", false),
+        (
+            400,
+            "invalid mount config for type \"bind\": bind source path does not exist: /unrelated",
+            false,
+        ),
+    ] {
+        let (docker, requests) = mock_cdi_probe_api(vec![(
+            code,
+            serde_json::json!({"message":message}).to_string(),
+        )])
+        .await;
+        let result = probe_cdi_spec_directory(
+            &docker,
+            "image",
+            HashMap::new(),
+            CdiSpecDirectory::new(cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR),
+        )
+        .await;
+        if expected_missing {
+            assert!(!result.unwrap());
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(requests.await.unwrap().len(), 1);
+    }
+    let (docker, requests) = mock_cdi_probe_api(vec![
+        (201, r#"{"Id":"probe-test","Warnings":[]}"#.into()),
+        (500, r#"{"message":"cleanup failed"}"#.into()),
+    ])
+    .await;
+    // A probe that was created proves the directory exists, even if its
+    // removal fails; the leftover probe is removed with the sandbox.
+    assert!(
+        probe_cdi_spec_directory(
+            &docker,
+            "image",
+            HashMap::new(),
+            CdiSpecDirectory::new(cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR),
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(requests.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cdi_probe_cleans_up_after_provisioning_is_cancelled() {
+    let received = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (docker, requests) = mock_cdi_probe_api_with_gate(
+        vec![
+            (201, r#"{"Id":"probe-cancelled","Warnings":[]}"#.into()),
+            (204, String::new()),
+        ],
+        Some((received.clone(), release.clone())),
+    )
+    .await;
+    let caller = tokio::spawn(async move {
+        probe_cdi_spec_directory(
+            &docker,
+            "image",
+            HashMap::new(),
+            CdiSpecDirectory::new(cdi_spec_mount_path(0), TEST_CDI_SPEC_DIR),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(5), received.notified())
+        .await
+        .unwrap();
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    release.notify_one();
+    let requests = tokio::time::timeout(Duration::from_secs(5), requests)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(requests[1].starts_with("DELETE "));
+    assert!(requests[1].contains("/containers/probe-cancelled?"));
+    assert!(requests[1].contains("v=true"));
+}
+
+#[tokio::test]
+#[ignore = "requires a local Docker daemon and the Ubuntu 24.04 test image"]
+async fn live_docker_cdi_directory_probes_do_not_start_or_create_missing_sources() {
+    let directory = TempDir::new().unwrap();
+    let docker = Docker::connect_with_local_defaults().unwrap();
+    let image = "nvcr.io/nvidia/base/ubuntu:24.04";
+    let existing =
+        CdiSpecDirectory::new(cdi_spec_mount_path(0), directory.path().to_string_lossy());
+    let missing = directory.path().join("missing");
+    assert!(
+        probe_cdi_spec_directory(&docker, image, HashMap::new(), existing)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !probe_cdi_spec_directory(
+            &docker,
+            image,
+            HashMap::new(),
+            CdiSpecDirectory::new(cdi_spec_mount_path(1), missing.to_string_lossy())
+        )
+        .await
+        .unwrap()
+    );
+    assert!(!missing.exists());
+}
+
+#[test]
+fn cdi_projections_reject_invalid_daemon_source_paths() {
+    for path in ["relative", "", " /etc/cdi", "/etc/cdi\0"] {
+        assert!(
+            cdi_spec_mount(&cdi_spec_mount_path(0), path).is_err(),
+            "{path}"
+        );
+    }
+}
+
 fn test_workload_identity() -> ResolvedWorkloadIdentity {
     ResolvedWorkloadIdentity::new(
         1234,
@@ -442,6 +1399,7 @@ fn test_driver_with_config(config: DockerDriverRuntimeConfig) -> DockerComputeDr
             CdiGpuInventory::default(),
             wsl_all_gpu_fallback_enabled,
         )),
+        cdi_spec_directory_cache: Arc::new(Mutex::new(CdiSpecDirectoryCache::default())),
         lifecycle_event_fences: DockerLifecycleEventFences::default(),
         control_processes: Arc::new(Mutex::new(HashMap::new())),
         runtime_failures: Arc::new(Mutex::new(HashMap::new())),
@@ -1799,6 +2757,70 @@ fn container_creation_rejects_openshell_control_path_working_dir() {
 }
 
 #[test]
+fn container_creation_reserves_cdi_spec_projection_paths() {
+    let metadata = DockerImageMetadata {
+        id: "sha256:immutable".to_string(),
+        user: "1234:1235".to_string(),
+        working_dir: "/workspace".to_string(),
+        volumes: Vec::new(),
+    };
+    // These mounts were previously dropped silently or failed as duplicates.
+    for mount in [
+        serde_json::json!({"type": "tmpfs", "target": "/.openshell/cdi-specs/0"}),
+        serde_json::json!({"type": "volume", "source": "data", "target": "/.openshell/cdi-specs"}),
+        serde_json::json!({"type": "bind", "source": "/srv", "target": "/.openshell/cdi-specs/1"}),
+        serde_json::json!({"type": "tmpfs", "target": "/.openshell"}),
+    ] {
+        let driver_config: DockerSandboxDriverConfig =
+            serde_json::from_value(serde_json::json!({ "mounts": [mount.clone()] })).unwrap();
+        let err = build_container_create_body_for_image(
+            &test_sandbox(),
+            &runtime_config(),
+            &driver_config,
+            None,
+            &metadata,
+            &test_workload_identity(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{mount}");
+        assert!(
+            err.message().contains("OpenShell control path"),
+            "{mount}: {err}"
+        );
+    }
+
+    let volume_metadata = DockerImageMetadata {
+        volumes: vec!["/.openshell/cdi-specs/0".to_string()],
+        ..metadata.clone()
+    };
+    let err = build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &DockerSandboxDriverConfig::default(),
+        None,
+        &volume_metadata,
+        &test_workload_identity(),
+    )
+    .unwrap_err();
+    assert!(err.message().contains("OpenShell control path"), "{err}");
+
+    // Sibling paths are not reserved yet.
+    let sibling: DockerSandboxDriverConfig = serde_json::from_value(serde_json::json!({
+        "mounts": [{"type": "tmpfs", "target": "/.openshell/cdi-specs-cache"}]
+    }))
+    .unwrap();
+    build_container_create_body_for_image(
+        &test_sandbox(),
+        &runtime_config(),
+        &sibling,
+        None,
+        &metadata,
+        &test_workload_identity(),
+    )
+    .unwrap();
+}
+
+#[test]
 fn container_creation_rejects_image_volume_that_masks_working_dir() {
     let sandbox = test_sandbox();
     let metadata = DockerImageMetadata {
@@ -2697,8 +3719,7 @@ fn validate_sandbox_auth_accepts_launch_authentication() {
 
 #[test]
 fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
 
@@ -2723,6 +3744,22 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
         request.device_ids.as_ref().unwrap(),
         &vec!["nvidia.com/gpu=1".to_string()]
     );
+    let host = create_body.host_config.as_ref().unwrap();
+    let mounts = host
+        .mounts
+        .as_ref()
+        .expect("GPU request should project CDI specs into the workload");
+    let projection = mounts
+        .iter()
+        .find(|mount| mount.target.as_deref() == Some(cdi_spec_mount_path(0).as_str()))
+        .unwrap();
+    assert_eq!(projection.source.as_deref(), Some(TEST_CDI_SPEC_DIR));
+    assert_eq!(projection.read_only, Some(true));
+    assert!(
+        host.binds
+            .as_ref()
+            .is_none_or(|binds| binds.iter().all(|bind| !bind.contains(TEST_CDI_SPEC_DIR)))
+    );
 }
 
 #[test]
@@ -2745,8 +3782,7 @@ fn build_container_create_body_omits_devices_without_resolved_default_cdi_device
 
 #[test]
 fn container_spec_accepts_non_nvidia_explicit_and_resolved_cdi_devices() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources(None));
     for device in ["example.com/gpu=0", "intel.com/gpu=0", "amd.com/gpu=0"] {
@@ -2830,8 +3866,7 @@ fn container_spec_rejects_host_paths_in_explicit_and_resolved_cdi_devices() {
 
 #[test]
 fn build_container_create_body_passes_explicit_cdi_device_id_through() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.resource_requirements = Some(gpu_resources(None));
@@ -2901,8 +3936,7 @@ fn build_container_create_body_rejects_empty_cdi_devices() {
 
 #[test]
 fn driver_default_gpu_selection_consumes_distinct_devices_for_creates() {
-    let mut config = runtime_config();
-    config.gpu.cdi_supported = true;
+    let config = runtime_config_with_cdi_spec_dirs(&[TEST_CDI_SPEC_DIR]);
     let driver = test_driver_with_config(config);
     driver.gpu_selector.refresh(
         CdiGpuInventory::new(["nvidia.com/gpu=0", "nvidia.com/gpu=1"]),

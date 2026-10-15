@@ -510,6 +510,14 @@ pub struct BoundaryConfig {
     /// Downward API. Other drivers may leave the map empty.
     #[serde(default)]
     pub resource_claim_files: std::collections::BTreeMap<String, PathBuf>,
+    /// Driver-protected CDI selection and workload-local specification projections.
+    ///
+    /// The sandbox runtime resolves this context inside the workload mount
+    /// namespace before applying launch-time filesystem controls. Omitted
+    /// when absent so non-GPU bootstraps stay readable by runtimes that
+    /// predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdi_context: Option<openshell_core::cdi::CdiContext>,
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Backend-neutral projection of the validated outer network fence.
@@ -540,6 +548,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("listener", &self.listener)
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
+            .field("has_cdi_context", &self.cdi_context.is_some())
             .field("workload_identity", &self.workload_identity)
             .field("outer_fence", &self.outer_fence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())

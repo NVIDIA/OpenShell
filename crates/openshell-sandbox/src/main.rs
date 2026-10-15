@@ -315,7 +315,11 @@ fn run_capability_landlock_child(args: &[String]) -> Result<()> {
         },
         process: ProcessPolicy::default(),
     };
-    let prepared = openshell_sandbox::sandbox::linux::prepare_capability_free(&policy, None)?;
+    let prepared = openshell_sandbox::sandbox::linux::prepare_capability_free(
+        &policy,
+        None,
+        &openshell_sandbox::launch::WorkloadLaunchContext::default(),
+    )?;
     openshell_sandbox::sandbox::linux::enforce(prepared)?;
     if std::fs::read(allowed.join("sentinel")).into_diagnostic()? != b"allowed" {
         return Err(miette::miette!("Landlock probe allowed-path mismatch"));

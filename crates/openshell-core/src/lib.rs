@@ -11,6 +11,7 @@
 
 pub mod activity;
 pub mod auth;
+pub mod cdi;
 #[cfg(target_os = "linux")]
 pub mod cdi_name {
     pub use container_device_interface::parser::is_qualified_name;

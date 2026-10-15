@@ -64,3 +64,10 @@ Use `openshell_core::proto_struct` when crossing between `serde_json` values and
 `prost_types::{Struct, Value}`. Both conversion directions live in this module;
 JSON-to-protobuf conversion is fallible so callers cannot silently replace an
 unrepresentable number.
+
+## CDI context
+
+The shared `cdi` module defines the versioned context passed from compute drivers
+to the workload, including selected devices and projected specification directories.
+The CDI resolver and its dependency live in `openshell-sandbox`; see that crate's
+README for resource validation and enforcement.
