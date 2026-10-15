@@ -87,6 +87,14 @@ async fn mps_pipe_directory_without_noexec(cx: &mut Context) -> testkit::Result 
     cdi::scenario(cx, "mps-pipe-directory-without-noexec").await
 }
 
+/// A spec that narrows `PATH` to directories without sbin. The standard sbin
+/// directories are appended for the workload, where tools such as `ldconfig`
+/// and `nvidia-smi` can live.
+#[testkit::test]
+async fn sbin_path(cx: &mut Context) -> testkit::Result {
+    cdi::scenario(cx, "sbin-path").await
+}
+
 /// A character device node injected from `/dev/null` with read-write
 /// permissions. The expectations record whether a non-root workload can write
 /// it.

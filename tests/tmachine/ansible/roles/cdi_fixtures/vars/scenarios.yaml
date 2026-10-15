@@ -40,6 +40,7 @@
 #                                     needs perl in the workload image
 #     {type: env, name, expect}       value, null when unset
 #     {type: non-root, expect}        whether the workload is not uid 0 (true)
+#     {type: path-has, dir, expect}   whether dir is an entry of PATH (true)
 #     {type: in-group-of, path, expect}
 #                                     whether the workload's groups include
 #                                     the group that owns path (true)
@@ -178,6 +179,19 @@ cdi_scenarios:
         - {type: filetype, path: /dev/tmachine-cdi-null, expect: character-device}
         - {type: non-root}
         - {type: write, path: /dev/tmachine-cdi-null, expect: ok}
+
+  # The spec narrows PATH to directories without sbin. The standard sbin
+  # directories are appended for workloads of CDI sandboxes, where tools such
+  # as ldconfig and nvidia-smi can live.
+  - name: sbin-path
+    edits:
+      env:
+        - PATH=/usr/local/bin:/usr/bin:/bin
+    expect:
+      checks:
+        - {type: path-has, dir: /usr/local/sbin, expect: true}
+        - {type: path-has, dir: /usr/sbin, expect: true}
+        - {type: path-has, dir: /sbin, expect: true}
 
   # NVIDIA MPS clients open pipes under /tmp/nvidia-mps. The fixture uses a
   # regular file in place of a pipe so the checks cannot block on open.
