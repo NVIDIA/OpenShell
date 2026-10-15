@@ -1225,6 +1225,21 @@ For `vm.mounts` (virtiofs host bind mounts) failures, also verify:
 - The sandbox launches on libkrun. GPU sandboxes and QEMU launches do not support VM mounts.
 - On Linux with a non-root gateway, file creation in a read-write mount fails unless `sandbox_uid`/`sandbox_gid` match the gateway user's UID/GID. Compare `id -u`/`id -g` of the gateway user with the configured values.
 
+For snap gateways, also check the package default, interface, and effective
+device access. A healthy gateway or successful `openshell status` does not prove
+that its user can launch a VM:
+
+```bash
+snap connections openshell | grep kvm
+test -r /dev/kvm && test -w /dev/kvm
+getfacl /dev/kvm
+snap run --shell openshell.user-gateway -c 'command -v mke2fs; command -v debugfs; command -v e2fsck'
+```
+
+When `gateway.toml` has no `compute_driver`, the snap wrapper selects `vm`.
+Set `[openshell.gateway].compute_driver` explicitly to choose another installed
+driver. Snap VM support is CPU-only and does not include VFIO passthrough.
+
 Then run:
 
 ```bash

@@ -37,7 +37,7 @@ compute_driver = "docker"
 
 Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
-When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected by the gateway binary. The snap wrapper supplies `vm` as its package default when neither the service environment nor gateway TOML selects a driver.
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
 
@@ -214,7 +214,8 @@ Podman also supports `image` mounts, which mount a container image read-only at 
 
 The MicroVM driver runs each sandbox in its own lightweight VM. It requires host virtualization: Apple Hypervisor on macOS or KVM on Linux.
 
-The VM driver is opt-in. Enable it in the gateway TOML file:
+The VM driver is opt-in for ordinary gateway packages. The snap bundles it and
+uses it by default. Enable it explicitly elsewhere with gateway TOML:
 
 ```toml
 [openshell.gateway]

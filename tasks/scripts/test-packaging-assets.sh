@@ -138,6 +138,11 @@ assert_contains "$package_deb" "\$pkgroot/usr/lib/systemd/user/openshell-gateway
 assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]'
 assert_contains "$snap_wrapper" '[ -e "$OPENSHELL_SNAP_CONFIG_FILE" ] || [ -L "$OPENSHELL_SNAP_CONFIG_FILE" ]'
 assert_contains "$snap_wrapper" 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"'
+assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_COMPUTE_DRIVER+x}" ]'
+assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_DRIVERS+x}" ]'
+assert_contains "$snap_wrapper" "(compute_driver|\\\"compute_driver\\\"|'compute_driver')"
+assert_contains "$snap_wrapper" "(openshell|\\\"openshell\\\"|'openshell')"
+assert_contains "$snap_wrapper" 'export OPENSHELL_COMPUTE_DRIVER=vm'
 assert_contains "$snap_wrapper" 'config preflight -- "$@"'
 assert_not_contains "$snap_wrapper" "CANONICAL_CONFIG_FILE"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
@@ -208,8 +213,19 @@ bash "$ROOT/tasks/scripts/test-snap-post-refresh-hook.sh" "$snap_post_refresh_ho
 assert_contains "$snap_workflow" 'name: openshell-prover-${{ matrix.rust_arch }}-unknown-linux-musl'
 assert_contains "$snap_workflow" 'chmod +x prebuilt/prover/openshell-prover'
 assert_contains "$snap_workflow" 'cp prebuilt/prover/openshell-prover snap/prebuilt/openshell-prover'
-assert_contains "$snapcraft" 'for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do'
+assert_contains "$snap_workflow" 'name: openshell-driver-vm-${{ matrix.rust_arch }}-unknown-linux-gnu'
+assert_contains "$snap_workflow" 'chmod +x prebuilt/driver-vm/openshell-driver-vm'
+assert_contains "$snap_workflow" 'cp prebuilt/driver-vm/openshell-driver-vm snap/prebuilt/openshell-driver-vm'
+assert_contains "$snapcraft" 'for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-driver-vm openshell-gateway-wrapper; do'
 assert_contains "$snapcraft" '"$CRAFT_PART_INSTALL/bin/openshell-prover"'
+assert_contains "$snapcraft" '"$CRAFT_PART_INSTALL/bin/openshell-driver-vm"'
+assert_not_contains "$snapcraft" '/usr/libexec/openshell:'
+assert_not_contains "$snapcraft" 'symlink: $SNAP/usr/libexec/openshell'
+assert_contains "$snapcraft" '      - e2fsprogs'
+if [[ $(grep -c '^      - kvm$' "$snapcraft") -ne 2 ]]; then
+  echo "FAIL: both snap gateway apps must plug kvm" >&2
+  exit 1
+fi
 if ! awk '
   /^  prover:$/ { in_prover = 1; next }
   in_prover && /^  [[:alnum:]_-]+:$/ { finished = 1; exit }
@@ -228,8 +244,8 @@ fi
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
-assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
-assert_contains "$snap_install_docs" "systemctl --user reset-failed snap.openshell.user-gateway.service"
+assert_contains "$snap_install_docs" "snap connect openshell:kvm"
+assert_contains "$snap_install_docs" 'compute_driver = "docker"'
 assert_contains "$snap_install_docs" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$snapcraft" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$ROOT/install.sh" "systemctl --user enable --now snap.openshell.user-gateway.service"
@@ -258,11 +274,12 @@ assert_contains "$snap_install_docs" "sudo snap set openshell gateway-mode=syste
 assert_contains "$snapcraft" "gateway-mode=disable"
 assert_not_contains "$snap_install_docs" "snap services --user"
 assert_contains "$snap_canary" "install.sh | sh"
-assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
-assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
+assert_contains "$snap_canary" "ubuntu-snap-vm:"
+assert_contains "$snap_canary" "openshell-driver-vm"
+assert_contains "$snap_canary" "snap connections openshell"
 assert_contains "$snap_canary" "openshell.prover check"
 assert_not_contains "$snap_canary" "--dangerous"
-assert_not_contains "$snap_canary" "snap connect openshell:docker"
+assert_not_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1
