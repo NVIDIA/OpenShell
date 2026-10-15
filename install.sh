@@ -4,7 +4,8 @@
 #
 # Install OpenShell from a GitHub release.
 #
-# Linux installs either the Debian or RPM packages from the selected release.
+# Linux automatically installs the snap when snapd is available and
+# the version is unset or dev; exact releases and prereleases use native packages.
 # Apple Silicon macOS installs the generated Homebrew formula, so Homebrew owns
 # the binary layout and launchd service lifecycle.
 #
@@ -63,19 +64,19 @@ ENVIRONMENT VARIABLES:
                         pre-v0.0.37 or non-snap installation.
     OPENSHELL_INSTALL_METHOD
                         Linux package to install: snap, deb, or rpm. Unset
-                        selects deb or rpm from the host package manager.
+                        selects snap when snapd is available, otherwise deb or rpm.
 
 NOTES:
     When OPENSHELL_VERSION is unset, this resolves the latest tagged release
     from ${GITHUB_URL}/releases/latest.
 
-    Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager. Set
-    OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
-    that already have the OpenShell snap keep refreshing it. snap installs use
-    latest/stable by default and latest/edge for dev, and do not support
-    explicit release tags or prereleases. The OpenShell snap requires a running
-    Docker Engine installed from a system package or Docker's package
+    Linux installs the OpenShell snap when snapd is available and
+    OPENSHELL_VERSION is unset or dev. Snap installs use latest/stable by
+    default and latest/edge for dev. Explicit release tags and prereleases use
+    the Debian package on amd64/arm64 or the RPM packages on x86_64/aarch64,
+    depending on the host package manager. Set OPENSHELL_INSTALL_METHOD=deb or
+    rpm to select a native package explicitly. The OpenShell snap requires a
+    running Docker Engine installed from a system package or Docker's package
     repository. The Docker snap is not currently compatible with OpenShell.
     macOS installs the release Homebrew formula on Apple Silicon and starts a
     brew services-backed local gateway.
@@ -84,6 +85,11 @@ EOF
 
 has_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+snapd_available() {
+  has_cmd snap || return 1
+  snap version 2>/dev/null | grep -Eq '^snapd[[:space:]]+[0-9]'
 }
 
 require_cmd() {
@@ -668,11 +674,9 @@ linux_package_method() {
     *) error "unsupported OPENSHELL_INSTALL_METHOD=${OPENSHELL_INSTALL_METHOD}; use snap, deb, or rpm" ;;
   esac
 
-  # Keep refreshing an existing snap install instead of adding a second
-  # gateway on the same port.
   case "${OPENSHELL_VERSION:-}" in
     '' | dev)
-      if has_cmd snap && snap list openshell >/dev/null 2>&1; then
+      if snapd_available; then
         echo "snap"
         return 0
       fi
@@ -1451,6 +1455,9 @@ wait_for_user_snap_gateway_listener() {
 
 install_linux_snap() {
   require_cmd snap
+  snapd_available || error "snapd is not available; ensure snapd is running, then rerun this installer"
+  info "waiting for snapd initialization to complete..."
+  as_root snap wait system seed.loaded || error "snapd initialization did not complete"
   set_linux_target_runtime_dir
 
   if snap list openshell >/dev/null 2>&1; then
@@ -1467,11 +1474,11 @@ install_linux_snap() {
 
   if snap list docker >/dev/null 2>&1; then
     error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
-Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer."
+Remove the Docker snap and install Docker Engine from a system package or Docker's package repository, then rerun this installer. To use a native OpenShell package instead, set OPENSHELL_INSTALL_METHOD=deb or OPENSHELL_INSTALL_METHOD=rpm."
   fi
   if ! has_cmd docker; then
     error "Docker is required before installing the OpenShell snap.
-Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
+Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell. To use a native OpenShell package instead, set OPENSHELL_INSTALL_METHOD=deb or OPENSHELL_INSTALL_METHOD=rpm."
   fi
   info "using existing Docker installation"
   if [ "$_existing_mode" = user ]; then

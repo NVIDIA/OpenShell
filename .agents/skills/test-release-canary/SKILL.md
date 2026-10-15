@@ -16,8 +16,8 @@ The Release Canary (`.github/workflows/release-canary.yml`) smoke-tests the arti
 | `macos` | `macos-latest-xlarge` | Installs the dev Homebrew artifacts, reaches the VM gateway, and creates, executes in, and deletes a sandbox. |
 | `ubuntu-deb` | `ubuntu-latest` | Installs the dev Debian package, reaches the Docker gateway, and creates, executes in, and deletes a sandbox. |
 | `fedora` | `fedora:latest` container | Installs the dev RPM packages, reaches the Podman gateway, and creates, executes in, and deletes a sandbox. |
-| `ubuntu-snap-system-docker` | `ubuntu-latest` | Uses `install.sh` to install the snap from `latest/edge`, reuses system Docker, verifies the packaged prover version and a local policy boundary check, reaches the Docker gateway, creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
-| `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that `install.sh` rejects the OpenShell snap path when Docker is absent or supplied by the Docker snap, without installing OpenShell. |
+| `ubuntu-snap-system-docker` | `ubuntu-latest` | Verifies that `install.sh` selects the snap automatically when the `snap` command is available, installs it from `latest/edge`, reuses system Docker, verifies the packaged prover version and a local policy boundary check, reaches the Docker gateway, creates, executes in, and deletes a sandbox, and verifies that the Docker snap is not installed. |
+| `ubuntu-snap-docker-preflight` | `ubuntu-latest` | Verifies that automatic snap selection rejects installation when Docker is absent or supplied by the Docker snap, without installing OpenShell. |
 | `kubernetes` | `ubuntu-latest` + kind | Installs the dev Helm chart, reaches the in-cluster gateway, and creates, executes in, and deletes a sandbox using the published runtime images. |
 
 All canary jobs disable anonymous OpenShell telemetry. Host package jobs inject
@@ -26,11 +26,13 @@ Kubernetes job installs with `server.telemetryEnabled=false`, so smoke traffic
 does not contribute to product usage metrics.
 
 The workflow sets `OPENSHELL_VERSION=dev` for every `install.sh` job. Positive
-jobs consume the rolling dev release produced by the triggering workflow. The
-system-Docker snap lane tracks `latest/edge`; the missing-Docker lane exits
-before installing a snap. The Debian and Kubernetes CLI lanes remove snapd so
-they continue to exercise the dev Debian package. Kubernetes pins the matching
-`0.0.0-dev` chart and `:dev` images.
+jobs consume the rolling dev release produced by the triggering workflow. Both
+snap lanes rely on the installed `snap` command to exercise automatic snap
+selection without setting `OPENSHELL_INSTALL_METHOD`. The system-Docker lane
+tracks `latest/edge`; the missing-Docker lane exits before installing a snap.
+The Debian and Kubernetes CLI lanes remove snapd so they continue to exercise
+the dev Debian package. Kubernetes pins the matching `0.0.0-dev` chart and
+`:dev` images.
 
 RPM package installation also has tmachine conformance coverage in
 `Branch E2E Checks` (with `test:e2e`), `Release Dev`, and `Release Tag`. Those

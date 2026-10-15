@@ -239,6 +239,7 @@ assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-system-docker:"
 assert_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 assert_contains "$snap_canary" "openshell.prover check"
+assert_not_contains "$snap_canary" "OPENSHELL_INSTALL_METHOD"
 assert_not_contains "$snap_canary" "--dangerous"
 assert_not_contains "$snap_canary" "snap connect openshell:docker"
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then

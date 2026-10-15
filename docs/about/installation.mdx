@@ -86,9 +86,11 @@ The gateway reads `~/.config/openshell/gateway.toml` if it exists, otherwise the
 
 ## Linux
 
-The script installs a Debian package on Debian and Ubuntu or an RPM package on Fedora and RHEL. Set `OPENSHELL_INSTALL_METHOD=snap` to install the [snap](#snap) package instead; hosts that already have the OpenShell snap keep refreshing it. Linux packages require glibc 2.28 or newer.
+When snapd is available, the script installs the [snap](#snap) package for the latest stable release or the rolling `dev` release. Otherwise, it installs a Debian package on Debian and Ubuntu or RPM packages on Fedora and RHEL. Prereleases and explicit release tags use native packages. Explicit `OPENSHELL_INSTALL_METHOD=snap` supports only an unset version or `OPENSHELL_VERSION=dev`.
 
-The gateway runs as a systemd user service at `https://127.0.0.1:17670` and reads `~/.config/openshell/gateway.toml`.
+Set `OPENSHELL_INSTALL_METHOD=deb` or `OPENSHELL_INSTALL_METHOD=rpm` to select a native package explicitly. Native Linux packages require glibc 2.28 or newer.
+
+For Debian and RPM installations, the gateway runs as a systemd user service at `https://127.0.0.1:17670` and reads `~/.config/openshell/gateway.toml`.
 
 Both Debian and RPM load `~/.config/openshell/gateway.env` for configuration
 preflight and gateway startup. Use it to select exact trusted runtime artifacts
@@ -119,9 +121,9 @@ sudo loginctl enable-linger $USER
 
 ## Snap
 
-The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible.
+The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible. To use Podman or the VM driver instead, select a native package with `OPENSHELL_INSTALL_METHOD=deb` or `OPENSHELL_INSTALL_METHOD=rpm`.
 
-The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then either rerun the `install.sh` script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`, or install the snap directly:
+The snap does not migrate existing Debian, RPM, or Homebrew installs. If the script detects an existing native installation while selecting the snap, it stops before making changes. To keep the native installation, rerun it with `OPENSHELL_INSTALL_METHOD=deb` or `OPENSHELL_INSTALL_METHOD=rpm`. To migrate, back up any state you need, remove the native installation, and rerun the script. Set `OPENSHELL_ACK_BREAKING_UPGRADE=1` only if a detected native `openshell` binary remains after cleanup. You can also install the snap directly:
 
 ```shell
 sudo snap install openshell

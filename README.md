@@ -31,6 +31,8 @@ See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture) 
 
 You need Linux, macOS on Apple Silicon, or Windows with WSL 2 (experimental), plus Docker, Podman, or host virtualization. See the [Support Matrix](https://docs.nvidia.com/openshell/latest/about/support-matrix) for details.
 
+On Linux with snapd, the default installation requires Docker Engine from a system package or Docker's repository; the Docker snap is unsupported. If you have snapd installed but want to use Podman or VMs instead of Docker, or you prefer a [native package](https://docs.nvidia.com/openshell/latest/about/installation#linux), you may do so with `OPENSHELL_INSTALL_METHOD=deb` or `rpm`.
+
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 openshell sandbox create --name demo

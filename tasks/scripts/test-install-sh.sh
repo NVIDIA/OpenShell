@@ -100,8 +100,8 @@ assert_glibc_preflight_fails \
   "OpenShell Linux packages require glibc >= 2.28; detected musl or unsupported libc." \
   setup_ldd_musl
 
-# snap_state: 0 = no snap command, 1 = snap command only,
-# installed = the OpenShell snap is already installed.
+# snap_state: 0 = no snap command, cli = snap command without a reachable snapd,
+# ready = functional snapd, installed = functional snapd with OpenShell installed.
 assert_linux_package_method() {
   local name=$1
   local install_method=$2
@@ -123,7 +123,18 @@ assert_linux_package_method() {
         *) return 1 ;;
       esac
     }
-    snap() { [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ]; }
+    snap() {
+      case "$1" in
+        version)
+          case "$snap_state" in
+            ready | installed) printf '%s\n' "snap 2.78" "snapd 2.78" ;;
+            *) return 1 ;;
+          esac
+          ;;
+        list) [ "$*" = "list openshell" ] && [ "$snap_state" = "installed" ] ;;
+        *) return 1 ;;
+      esac
+    }
     linux_package_method
   ) >"$out"
   actual="$(cat "$out")"
@@ -133,20 +144,58 @@ assert_linux_package_method() {
   fi
 }
 
-assert_linux_package_method "deb is the default despite snap" "" "" 1 1 1 deb
-assert_linux_package_method "rpm is the default despite snap" "" "" 1 0 1 rpm
-assert_linux_package_method "dev uses deb despite snap" "" dev 1 1 1 deb
-assert_linux_package_method "snap is opt-in" snap "" 1 1 1 snap
-assert_linux_package_method "snap opt-in with dev" snap dev 1 1 1 snap
+assert_linux_package_method "snap takes precedence over deb and rpm" "" "" ready 1 1 snap
+assert_linux_package_method "snap takes precedence over rpm" "" "" ready 0 1 snap
+assert_linux_package_method "dev uses snap" "" dev ready 1 1 snap
+assert_linux_package_method "explicit snap" snap "" cli 1 1 snap
+assert_linux_package_method "explicit snap with dev" snap dev cli 1 1 snap
+assert_linux_package_method "explicit snap wins with pinned stable" snap v1.2.3 cli 1 1 snap
 assert_linux_package_method "explicit deb" deb "" installed 0 1 deb
-assert_linux_package_method "explicit rpm" rpm "" 1 1 1 rpm
+assert_linux_package_method "explicit rpm" rpm "" ready 1 1 rpm
 assert_linux_package_method "existing snap install keeps refreshing" "" "" installed 1 1 snap
 assert_linux_package_method "existing snap install keeps refreshing dev" "" dev installed 1 1 snap
 assert_linux_package_method "pre uses deb despite existing snap" "" pre installed 1 1 deb
+assert_linux_package_method "pre uses rpm despite snap" "" pre ready 0 1 rpm
 assert_linux_package_method "numbered prerelease uses deb despite existing snap" "" v0.1.0-pre.3 installed 1 1 deb
+assert_linux_package_method "pinned stable uses deb despite snap" "" v1.2.3 ready 1 1 deb
 assert_linux_package_method "pinned stable uses rpm despite existing snap" "" v1.2.3 installed 0 1 rpm
 assert_linux_package_method "deb is selected without snap" "" "" 0 1 1 deb
+assert_linux_package_method "dev uses deb without snap" "" dev 0 1 1 deb
+assert_linux_package_method "deb is selected when snapd is unreachable" "" "" cli 1 1 deb
+assert_linux_package_method "dev uses rpm when snapd is unreachable" "" dev cli 0 1 rpm
 assert_linux_package_method "rpm is selected without snap or deb" "" "" 0 0 1 rpm
+
+if (
+  has_cmd() { [ "$1" = snap ]; }
+  snap() { return 1; }
+  install_linux_snap
+) >"$out" 2>"$err"; then
+  echo "FAIL: explicit snap install should reject unreachable snapd" >&2
+  exit 1
+fi
+if ! grep -Fq "snapd is not available" "$err"; then
+  echo "FAIL: unreachable snapd rejection was not explained" >&2
+  cat "$err" >&2
+  exit 1
+fi
+
+if (
+  has_cmd() { [ "$1" = snap ]; }
+  snap() {
+    [ "${1:-}" = version ] && printf '%s\n' "snap 2.78" "snapd 2.78"
+  }
+  as_root() { return 1; }
+  info() { :; }
+  install_linux_snap
+) >"$out" 2>"$err"; then
+  echo "FAIL: explicit snap install should reject failed snapd initialization" >&2
+  exit 1
+fi
+if ! grep -Fq "snapd initialization did not complete" "$err"; then
+  echo "FAIL: failed snapd initialization was not explained" >&2
+  cat "$err" >&2
+  exit 1
+fi
 
 if (OPENSHELL_INSTALL_METHOD=flatpak linux_package_method) >"$out" 2>"$err"; then
   echo "FAIL: unsupported OPENSHELL_INSTALL_METHOD should be rejected" >&2
@@ -281,6 +330,7 @@ assert_snap_install_flow() {
     }
     snap() {
       case "${1:-}:${2:-}" in
+        version:) printf '%s\n' "snap 2.78" "snapd 2.78" ;;
         list:docker) return 1 ;;
         list:openshell) [ "$openshell_present" = "1" ] ;;
         get:openshell) printf '%s\n' system ;;
@@ -338,6 +388,7 @@ assert_snap_user_refresh_flow() {
     }
     snap() {
       case "${1:-}:${2:-}" in
+        version:) printf '%s\n' "snap 2.78" "snapd 2.78" ;;
         list:docker) return 1 ;;
         list:openshell) return 0 ;;
         get:openshell) printf '%s\n' user ;;
@@ -364,7 +415,8 @@ assert_snap_user_refresh_flow() {
     install_linux_snap
   ) >"$out"
   calls="$(cat "$out")"
-  expected="wait:user-docker
+  expected="root:snap wait system seed.loaded
+wait:user-docker
 root:snap refresh openshell --channel=latest/stable
 root:snap restart openshell.user-gateway
 wait:user-gateway-listener
@@ -380,7 +432,8 @@ wait:gateway-status"
 assert_snap_install_flow \
   "existing Docker is reused" \
   1 0 "" \
-  "wait:user-docker
+  "root:snap wait system seed.loaded
+wait:user-docker
 root:snap install openshell --channel=latest/stable
 wait:user-gateway-listener
 register:user-gateway
@@ -391,7 +444,8 @@ assert_snap_user_refresh_flow
 assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
   1 1 "" \
-  "wait:docker
+  "root:snap wait system seed.loaded
+wait:docker
 root:snap refresh openshell --channel=latest/stable
 root:snap restart openshell.system-gateway
 wait:system-gateway-listener
@@ -408,6 +462,7 @@ if (
   }
   snap() {
     case "${1:-}:${2:-}" in
+      version:) printf '%s\n' "snap 2.78" "snapd 2.78" ;;
       list:docker) return 1 ;;
       list:openshell) return 0 ;;
       get:openshell) printf '%s\n' disable ;;
@@ -415,13 +470,11 @@ if (
     esac
   }
   as_root() {
-    if [ "${1:-}:${2:-}" = snap:get ]; then
-      shift
-      snap "$@"
-    else
-      echo "FAIL: disabled mode reached root command: $*" >&2
-      return 99
-    fi
+    case "${1:-}:${2:-}" in
+      snap:wait) return 0 ;;
+      snap:get) shift; snap "$@" ;;
+      *) echo "FAIL: disabled mode reached root command: $*" >&2; return 99 ;;
+    esac
   }
   set_linux_target_runtime_dir() { :; }
   install_linux_snap
@@ -454,14 +507,17 @@ assert_snap_install_rejected() {
       esac
     }
     snap() {
-      if [ "${1:-}:${2:-}" = list:docker ]; then
-        [ "$docker_snap_present" = "1" ]
-      else
-        echo "FAIL: ${name}: unexpected snap command: $*" >&2
-        return 99
-      fi
+      case "${1:-}:${2:-}" in
+        version:) printf '%s\n' "snap 2.78" "snapd 2.78" ;;
+        list:openshell) return 1 ;;
+        list:docker) [ "$docker_snap_present" = "1" ] ;;
+        *) echo "FAIL: ${name}: unexpected snap command: $*" >&2; return 99 ;;
+      esac
     }
     as_root() {
+      if [ "${1:-}:${2:-}" = snap:wait ]; then
+        return 0
+      fi
       echo "FAIL: ${name}: installation reached root command: $*" >&2
       return 99
     }
