@@ -30,6 +30,7 @@
 #     {type: non-root, expect}        whether the workload is not uid 0 (true)
 #     {type: group-of, path, expect}  whether the workload's groups include
 #                                     path's group (true)
+#     {type: path-has, dir, expect}   whether dir is an entry of PATH (true)
 cdi_scenario_dir: "{{ cdi_fixture_root }}/scenarios"
 
 # Edits applied by every case, to check that spec and device edits merge. The
@@ -163,6 +164,19 @@ cdi_scenarios:
       checks:
         - {type: non-root}
         - {type: write, path: /dev/tmachine-cdi-null, expect: ok}
+
+  # The spec narrows PATH to directories without sbin. The standard sbin
+  # directories are appended for workloads of CDI sandboxes, where tools such
+  # as ldconfig and nvidia-smi can live.
+  - name: sbin-path
+    edits:
+      env:
+        - PATH=/usr/local/bin:/usr/bin:/bin
+    expect:
+      checks:
+        - {type: path-has, dir: /usr/local/sbin, expect: true}
+        - {type: path-has, dir: /usr/sbin, expect: true}
+        - {type: path-has, dir: /sbin, expect: true}
 
   # NVIDIA MPS clients open pipes under /tmp/nvidia-mps. The fixture uses a
   # regular file in place of a pipe so the checks cannot block on open.

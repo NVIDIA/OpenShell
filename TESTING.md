@@ -371,6 +371,7 @@ CDI. Branch and release feature-test matrices run this suite on Docker.
 | `omitted-access-file` | Bind without `ro` or `rw` | Launch rejects the effectively writable mount. |
 | `mps-pipe-directory` | Directory at `/tmp/nvidia-mps` mounted `nosuid`, `nodev`, `noexec` | Read and write succeed on its contents. |
 | `mps-pipe-directory-without-noexec` | The same directory without `noexec` | Launch rejects the mount. |
+| `sbin-path` | Spec environment edit narrowing `PATH` to `/usr/local/bin:/usr/bin:/bin` | The standard sbin directories are appended to the workload's `PATH`. |
 | `device-node` | Null character device at `/dev/tmachine-cdi-null` | Non-root; write succeeds. |
 | `device-node-with-gid` | Group-restricted null device at `/dev/tmachine-cdi-group-null` | Non-root with the device's group; write succeeds. |
 | `unix-socket` | Echo socket at `/tmachine-cdi/socket/echo.sock` | Sibling file in the host directory is not visible. |

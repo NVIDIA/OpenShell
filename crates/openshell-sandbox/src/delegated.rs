@@ -36,6 +36,7 @@ pub async fn spawn_workload(
     interactive: bool,
     policy: &SandboxPolicy,
     launch_context: &crate::launch::WorkloadLaunchContext,
+    cdi_active: bool,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
@@ -47,6 +48,12 @@ pub async fn spawn_workload(
     // the managed /sandbox fallback without consulting privileged account
     // setup inside the capability-free boundary.
     let workspace = ResolvedWorkspace::new(workdir.map(str::to_string), true);
+
+    let repair_standard_sbin =
+        crate::child_env::standard_sbin_path_repair_enabled(policy, cdi_active);
+    if repair_standard_sbin {
+        crate::child_env::install_standard_sbin_path_startup_files(workspace.home());
+    }
 
     #[cfg(target_os = "linux")]
     if let Some(workspace_root) = workspace.root()
@@ -75,8 +82,8 @@ pub async fn spawn_workload(
     let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
         crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),
     );
-    let boundary_exec: Arc<dyn BoundaryExec> =
-        Arc::new(crate::boundary_exec::LocalBoundaryExec::new(
+    let boundary_exec: Arc<dyn BoundaryExec> = Arc::new(
+        crate::boundary_exec::LocalBoundaryExec::new(
             policy.clone(),
             launch_context.clone(),
             workspace.owned_root(),
@@ -85,7 +92,9 @@ pub async fn spawn_workload(
             user_environment,
             boundary_runtime.clone(),
             launcher.clone(),
-        ));
+        )
+        .with_standard_sbin_path_repair(repair_standard_sbin),
+    );
 
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(
@@ -96,6 +105,7 @@ pub async fn spawn_workload(
         interactive,
         policy,
         launch_context,
+        repair_standard_sbin,
         ca_file_paths.as_ref(),
         &provider_env,
     )
@@ -107,6 +117,7 @@ pub async fn spawn_workload(
         &workspace,
         interactive,
         policy,
+        repair_standard_sbin,
         ca_file_paths.as_ref(),
         &provider_env,
     )?;

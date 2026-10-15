@@ -61,6 +61,8 @@ enum Check {
     NonRoot { expect: bool },
     /// Whether the workload's groups include the group that owns `path`.
     HasGroupOf { path: String, expect: bool },
+    /// Whether a directory is an entry of the workload's `PATH`.
+    PathHas { dir: String, expect: bool },
 }
 
 impl Check {
@@ -130,6 +132,10 @@ impl Check {
                 path: text("path")?,
                 expect: flag("expect")?,
             }),
+            Some("path-has") => Ok(Self::PathHas {
+                dir: text("dir")?,
+                expect: flag("expect")?,
+            }),
             other => Err(format!("unknown check type {other:?} in {value}")),
         }
     }
@@ -143,6 +149,7 @@ impl Check {
             Self::Write { path, .. } => format!("write:{path}"),
             Self::NonRoot { .. } => "non-root".to_string(),
             Self::HasGroupOf { path, .. } => format!("group-of:{path}"),
+            Self::PathHas { dir, .. } => format!("path-has:{dir}"),
         }
     }
 
@@ -167,6 +174,9 @@ impl Check {
             Self::HasGroupOf { path, .. } => format!(
                 r#"set -- $(ls -ln '{path}' 2>/dev/null); case " $(id -G) " in *" $4 "*) printf ok ;; *) printf missing-group ;; esac"#
             ),
+            Self::PathHas { dir, .. } => format!(
+                r#"case ":$PATH:" in *:'{dir}':*) printf ok ;; *) printf absent ;; esac"#
+            ),
         }
     }
 
@@ -184,6 +194,7 @@ impl Check {
             Self::HasGroupOf { expect, .. } => {
                 if *expect { "ok" } else { "missing-group" }.to_string()
             }
+            Self::PathHas { expect, .. } => if *expect { "ok" } else { "absent" }.to_string(),
         }
     }
 }
@@ -410,6 +421,7 @@ cdi_scenarios! {
     scenario_omitted_access_file => "omitted-access-file",
     scenario_mps_pipe_directory => "mps-pipe-directory",
     scenario_mps_pipe_directory_without_noexec => "mps-pipe-directory-without-noexec",
+    scenario_sbin_path => "sbin-path",
     scenario_device_node => "device-node",
     scenario_device_node_with_gid => "device-node-with-gid",
     scenario_unix_socket => "unix-socket",
@@ -466,6 +478,14 @@ mod probe {
             Check::HasGroupOf {
                 path: path.to_string(),
                 expect: true,
+            },
+            Check::PathHas {
+                dir: "/bin".to_string(),
+                expect: true,
+            },
+            Check::PathHas {
+                dir: "/no/such/directory".to_string(),
+                expect: false,
             },
         ];
         let stdout = run_probe(&checks);
