@@ -5966,6 +5966,8 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     if let Some(spec) = sandbox.spec.as_ref() {
         environment.extend(spec.environment.clone());
     }
+    environment.remove(openshell_core::sandbox_env::SANDBOX_USERNAME);
+
     environment
 }
 
@@ -5996,6 +5998,19 @@ fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<St
         openshell_core::sandbox_env::SANDBOX.to_string(),
         sandbox.name.clone(),
     );
+
+    if let Some(username) = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.sandbox_username.as_str())
+        .filter(|username| !username.is_empty())
+    {
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_USERNAME.to_string(),
+            username.to_string(),
+        );
+    }
+
     environment.insert(
         openshell_core::sandbox_env::LOG_LEVEL.to_string(),
         openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
@@ -10665,7 +10680,13 @@ mod tests {
     fn merged_environment_prefers_spec_values() {
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                environment: HashMap::from([("A".to_string(), "spec".to_string())]),
+                environment: HashMap::from([
+                    ("A".to_string(), "spec".to_string()),
+                    (
+                        openshell_core::sandbox_env::SANDBOX_USERNAME.to_string(),
+                        "spoofed".to_string(),
+                    ),
+                ]),
                 template: Some(SandboxTemplate {
                     environment: HashMap::from([
                         ("A".to_string(), "template".to_string()),
@@ -10680,6 +10701,24 @@ mod tests {
         let merged = merged_environment(&sandbox);
         assert_eq!(merged.get("A"), Some(&"spec".to_string()));
         assert_eq!(merged.get("B"), Some(&"template".to_string()));
+        assert!(!merged.contains_key(openshell_core::sandbox_env::SANDBOX_USERNAME));
+    }
+
+    #[test]
+    fn build_guest_environment_omits_unrequested_sandbox_username() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+
+        let act = build_guest_environment(&sandbox, &VmDriverConfig::default());
+
+        assert!(!act.iter().any(|entry| {
+            entry.starts_with(&format!(
+                "{}=",
+                openshell_core::sandbox_env::SANDBOX_USERNAME
+            ))
+        }));
     }
 
     #[test]
@@ -10691,7 +10730,10 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             name: "breezy-rhinoceros".to_string(),
-            spec: Some(SandboxSpec::default()),
+            spec: Some(SandboxSpec {
+                sandbox_username: "ebusto".to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -10699,6 +10741,7 @@ mod tests {
         assert!(env.contains(&"HOME=/root".to_string()));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&"OPENSHELL_SANDBOX=breezy-rhinoceros".to_string()));
+        assert!(env.contains(&"OPENSHELL_SANDBOX_USERNAME=ebusto".to_string()));
         assert!(
             !env.iter()
                 .any(|entry| entry.starts_with("OPENSHELL_ENDPOINT="))

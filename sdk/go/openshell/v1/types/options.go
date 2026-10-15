@@ -10,6 +10,12 @@ type CreateOptions struct {
 	Annotations map[string]string
 	// ServiceExposures are loopback HTTP services registered with the sandbox.
 	ServiceExposures []ServiceExposure
+	// UseAuthenticatedUsername uses the caller's name for a sandbox account.
+	// Other resource clients ignore this field.
+	UseAuthenticatedUsername bool
+	// UseParentHostname uses the gateway FQDN for a sandbox container hostname.
+	// Other resource clients ignore this field.
+	UseParentHostname bool
 }
 
 // ListOptions configures resource listing with pagination and filtering.

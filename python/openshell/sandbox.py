@@ -854,6 +854,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
@@ -863,6 +865,8 @@ class SandboxClient:
                 name=name or "",
                 labels=dict(labels) if labels else {},
                 service_exposures=_service_exposure_messages(service_exposures),
+                use_authenticated_username=use_authenticated_username,
+                use_parent_hostname=use_parent_hostname,
             ),
             timeout=self._timeout,
         )
@@ -880,6 +884,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
     ) -> SandboxRef:
         if not workload_template.strip():
             raise SandboxError("workload_template is required")
@@ -892,6 +898,8 @@ class SandboxClient:
                 labels=dict(labels) if labels else {},
                 workload_template=workload_template,
                 service_exposures=_service_exposure_messages(service_exposures),
+                use_authenticated_username=use_authenticated_username,
+                use_parent_hostname=use_parent_hostname,
             ),
             timeout=self._timeout,
         )
@@ -908,6 +916,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -917,6 +927,8 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
+                use_authenticated_username=use_authenticated_username,
+                use_parent_hostname=use_parent_hostname,
             ),
         )
 
@@ -929,6 +941,8 @@ class SandboxClient:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         service_exposures: Sequence[ServiceExposure] | None = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
     ) -> SandboxSession:
         return SandboxSession(
             self,
@@ -939,6 +953,8 @@ class SandboxClient:
                 name=name,
                 labels=labels,
                 service_exposures=service_exposures,
+                use_authenticated_username=use_authenticated_username,
+                use_parent_hostname=use_parent_hostname,
             ),
         )
 
@@ -1584,6 +1600,8 @@ class Sandbox:
         name: str | None = None,
         labels: Mapping[str, str] | None = None,
         workload_template: str | None = None,
+        use_authenticated_username: bool = False,
+        use_parent_hostname: bool = False,
         timeout: float = 30.0,
         ready_timeout_seconds: float = 120.0,
         auto_refresh: bool = True,
@@ -1610,6 +1628,8 @@ class Sandbox:
         # Copy so later caller mutation cannot change what gets sent on enter.
         self._labels = dict(labels) if labels is not None else None
         self._workload_template = workload_template
+        self._use_authenticated_username = use_authenticated_username
+        self._use_parent_hostname = use_parent_hostname
         self._timeout = timeout
         self._ready_timeout_seconds = ready_timeout_seconds
         self._auto_refresh = auto_refresh
@@ -1638,9 +1658,11 @@ class Sandbox:
             self._name is not None
             or self._labels is not None
             or self._workload_template is not None
+            or self._use_authenticated_username
+            or self._use_parent_hostname
         ):
             raise SandboxError(
-                "name, labels, and workload_template cannot be set when attaching to an existing sandbox"
+                "creation options cannot be set when attaching to an existing sandbox"
             )
 
         self._client = SandboxClient.from_active_cluster(
@@ -1669,6 +1691,8 @@ class Sandbox:
                 spec=self._spec,
                 name=self._name,
                 labels=self._labels,
+                use_authenticated_username=self._use_authenticated_username,
+                use_parent_hostname=self._use_parent_hostname,
             )
         elif self._sandbox_input is None:
             self._session = client.create_session(
@@ -1676,6 +1700,8 @@ class Sandbox:
                 spec=self._spec,
                 name=self._name,
                 labels=self._labels,
+                use_authenticated_username=self._use_authenticated_username,
+                use_parent_hostname=self._use_parent_hostname,
             )
         elif isinstance(self._sandbox_input, SandboxRef):
             self._session = SandboxSession(client, self._sandbox_input)
