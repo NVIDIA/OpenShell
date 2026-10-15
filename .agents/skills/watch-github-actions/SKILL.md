@@ -181,14 +181,12 @@ For `Codex Compatibility Review`, inspect its job summary and the
 candidate and baseline SHAs before interpreting findings. `complete` describes
 execution and coverage, not compatibility: also read the assessment and findings.
 An `error`, incomplete coverage, or missing artifact means no clean review is
-available. The job is advisory and independent of publication gates. The
-review uses high reasoning effort and focuses on breaking changes. Explicit
-risk acceptance requires a linked author or verified-maintainer comment or
-review; a PR description, general approval, or earlier bot report is insufficient.
-The full report retains unchanged findings with previous-comment links.
-`comment.md` contains only new or materially updated findings, and an unchanged
-review does not post another PR comment. Inspect the full artifact for outstanding
-breaks even when the bot is silent. The qualification summary points to it.
+available. Findings are advisory. The review targets breaking changes with high
+reasoning effort. Risk acceptance needs a linked author or verified-maintainer
+comment or review, not a PR description, general approval, or bot report.
+The full report keeps all findings and prior-comment links. `comment.md` includes
+only new or materially changed findings; unchanged reviews post no comment. Check
+the full artifact linked by qualification even when the bot is silent.
 The review is scheduled independently of Security Scan. The two Codex workflows
 share the `codex-release-review` concurrency group with `queue: max`, retaining
 up to 100 pending reviews while preventing overlapping API usage across runs.
