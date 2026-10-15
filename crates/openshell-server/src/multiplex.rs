@@ -43,6 +43,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     OpenShellService, ServerState,
+    auth::audit::{self, AuthFailureReason, AuthMechanism},
     auth::authenticator::AuthenticatorChain,
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
@@ -1124,6 +1125,11 @@ where
 
             let principal = if let Some(operator) = operator {
                 if req.headers().contains_key(http::header::AUTHORIZATION) {
+                    audit::emit_authentication_failure(
+                        &path,
+                        Some(AuthMechanism::Mtls),
+                        AuthFailureReason::ConflictingCredentials,
+                    );
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "operator certificates must not be combined with authorization headers",
                     )));
@@ -1136,6 +1142,11 @@ where
                         (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
                         _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
                         _ => {
+                            audit::emit_authentication_failure(
+                                &path,
+                                None,
+                                AuthFailureReason::MissingCredential,
+                            );
                             return Ok(status_response(tonic::Status::unauthenticated(
                                 "missing authorization header",
                             )));
@@ -1145,6 +1156,11 @@ where
                 }
             } else if mtls_auth_enabled {
                 let Some(identity) = peer_identity else {
+                    audit::emit_authentication_failure(
+                        &path,
+                        Some(AuthMechanism::Mtls),
+                        AuthFailureReason::MissingCredential,
+                    );
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "missing client certificate",
                     )));
@@ -3208,6 +3224,10 @@ mod tests {
         };
         use http_body_util::Full;
         use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+        use openshell_ocsf::test_support::OcsfCapture;
+        use openshell_ocsf::validation::schema::{
+            load_class_schema, validate_known_fields, validate_required_fields,
+        };
         use serde::Serialize;
         use std::sync::Arc;
         use std::sync::Mutex;
@@ -3796,6 +3816,123 @@ mod tests {
                 .unwrap();
             assert!(seen.lock().unwrap().is_none());
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+        }
+
+        fn captured_json(capture: &OcsfCapture) -> Vec<serde_json::Value> {
+            capture
+                .events()
+                .iter()
+                .map(|event| event.to_json().unwrap())
+                .collect()
+        }
+
+        fn assert_authentication_failure(
+            event: &serde_json::Value,
+            path: &str,
+            reason: &str,
+            severity_id: u8,
+        ) {
+            let schema = load_class_schema("authentication");
+            validate_required_fields(event, &schema);
+            validate_known_fields(event, &schema);
+            assert_eq!(event["class_uid"], 3002);
+            assert_eq!(event["activity_id"], 1);
+            assert_eq!(event["status_id"], 2);
+            assert_eq!(event["action_id"], 2);
+            assert_eq!(event["disposition_id"], 2);
+            assert_eq!(event["severity_id"], severity_id);
+            assert_eq!(event["status_detail"], reason);
+            assert_eq!(event["user"]["type_id"], 0);
+            assert_eq!(event["service"]["name"], "openshell-gateway");
+            assert_eq!(event["http_request"]["url"]["path"], path);
+            assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
+        }
+
+        #[tokio::test]
+        async fn missing_credential_emits_authentication_failure() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain =
+                AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(None)))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            let res = router.call(empty_request(path)).await.unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+            let events = captured_json(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authentication_failure(&events[0], path, "missing_credential", 2);
+            assert!(events[0].get("auth_protocol_id").is_none());
+        }
+
+        #[tokio::test]
+        async fn missing_client_certificate_emits_mtls_authentication_failure() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false);
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            let res = router.call(empty_request(path)).await.unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+            let events = captured_json(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authentication_failure(&events[0], path, "missing_credential", 2);
+            assert_eq!(events[0]["auth_protocol_id"], 99);
+            assert_eq!(events[0]["auth_protocol"], "mtls");
+        }
+
+        #[tokio::test]
+        async fn operator_with_authorization_header_emits_conflicting_credentials() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false)
+                    .with_operator(Some(operator_principal()));
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            let canary = "Bearer canary-secret-token-9f2c";
+            let request = Request::builder()
+                .uri(path)
+                .header("authorization", canary)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let res = router.call(request).await.unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
+            let events = captured_json(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authentication_failure(&events[0], path, "conflicting_credentials", 3);
+            assert_eq!(events[0]["auth_protocol"], "mtls");
+            assert!(!events[0].to_string().contains("canary-secret-token"));
+        }
+
+        #[tokio::test]
+        async fn authenticated_and_exempt_requests_emit_no_authentication_event() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Some(user_principal("alice")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            for path in [
+                "/openshell.v1.OpenShell/ListSandboxes",
+                "/openshell.v1.OpenShell/Health",
+            ] {
+                let res = router.call(empty_request(path)).await.unwrap();
+                assert!(grpc_status(&res).is_none(), "{path}");
+            }
+
+            let events = captured_json(&capture);
+            assert!(events.is_empty(), "{events:?}");
         }
 
         #[tokio::test]
