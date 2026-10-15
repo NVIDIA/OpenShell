@@ -128,6 +128,36 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_DB_URL")]
     db_url: Option<String>,
 
+    /// Connection ceiling for the database pool, shared by every
+    /// database-backed request.
+    ///
+    /// When unset, the gateway uses its backend default: 10 with Postgres,
+    /// 5 with an on-disk `SQLite` database. An in-memory `SQLite` database is
+    /// always a single connection. Postgres needs at least 2, because the SSH
+    /// identity lock keeps one connection while it queries the pool, so the
+    /// gateway rejects 1 there at startup. Each replica opens its own pool,
+    /// plus a mutation lock pool on Postgres (`--db-lock-max-connections`), so
+    /// keep the total below what the database server itself admits.
+    #[arg(
+        long,
+        env = "OPENSHELL_DB_MAX_CONNECTIONS",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    db_max_connections: Option<u32>,
+
+    /// Connection ceiling for the Postgres mutation lock pool.
+    ///
+    /// Each mutation guard holds one lock connection, so this bounds how many
+    /// guarded mutations a replica runs or waits on in Postgres at once.
+    /// When unset, the gateway uses 4. Each replica opens these on top of
+    /// its database pool. `SQLite` has no lock pool and ignores it.
+    #[arg(
+        long,
+        env = "OPENSHELL_DB_LOCK_MAX_CONNECTIONS",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    db_lock_max_connections: Option<u32>,
+
     /// Compute driver configured for this gateway.
     ///
     /// Accepts one registered driver name. When unset, the gateway runs
@@ -516,7 +546,10 @@ fn prepare_server_config_with_drivers(
         config = config.with_metrics_bind_address(addr);
     }
 
-    config = config.with_database_url(db_url);
+    config = config
+        .with_database_url(db_url)
+        .with_database_max_connections(args.db_max_connections)
+        .with_database_lock_max_connections(args.db_lock_max_connections);
     if let Some(driver) = &args.compute_driver {
         config = config.with_compute_driver(driver);
     }
@@ -651,13 +684,15 @@ async fn run_from_args(
         &prepared.compute_driver,
         &prepared.config.compute_driver_endpoints,
     );
-    let (tracing_handle, setup_error) = crate::tracing_setup::install(
+    let (otlp_export, otlp_error) =
+        crate::otel_tracing::OtlpExport::start(otlp_config, gateway_resource);
+    let (tracing_handle, driver_otlp_error) = crate::tracing_setup::install(
         &EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new(&prepared.config.log_level))
             .to_string(),
         &tracing_log_bus,
         ocsf_log.as_ref(),
-        otlp_config,
+        otlp_export.as_ref(),
         compute_driver_tracing,
         gateway_resource,
     );
@@ -694,17 +729,17 @@ async fn run_from_args(
     if has_oidc {
         info!("OIDC authentication enabled");
     }
-    if let Some(err) = &setup_error {
+    if let Some(err) = otlp_error.as_ref().or(driver_otlp_error.as_ref()) {
         error!(
             error = %err,
             "OTLP exporting is configured but could not be started; continuing without it"
         );
-    } else if let Some(otlp) = prepared
-        .config_file
-        .as_ref()
-        .and_then(|f| f.openshell.gateway.otlp.as_ref())
-    {
-        info!(endpoint = %otlp.endpoint, "OTLP exporting enabled");
+    } else if let Some(otlp) = &otlp_export {
+        info!(
+            traces_endpoint = otlp.traces_endpoint().map(tracing::field::display),
+            ocsf_endpoint = otlp.ocsf_endpoint().map(tracing::field::display),
+            "OTLP exporting enabled"
+        );
     }
     if prepared.config.auth.allow_unauthenticated_users {
         warn!(
@@ -730,6 +765,9 @@ async fn run_from_args(
 
     tracing_handle.shutdown();
 
+    if let Some(otlp) = otlp_export {
+        otlp.shutdown().await;
+    }
     if let Some(log) = ocsf_log {
         log.shutdown().await;
     }
@@ -1266,6 +1304,18 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "grpc_rate_limit_window_seconds")
     {
         args.grpc_rate_limit_window_seconds = Some(window);
+    }
+    if let Some(max_connections) = file.database_max_connections
+        && args.db_max_connections.is_none()
+        && arg_defaulted(matches, "db_max_connections")
+    {
+        args.db_max_connections = Some(max_connections);
+    }
+    if let Some(max_connections) = file.database_lock_max_connections
+        && args.db_lock_max_connections.is_none()
+        && arg_defaulted(matches, "db_lock_max_connections")
+    {
+        args.db_lock_max_connections = Some(max_connections);
     }
 }
 
@@ -3131,6 +3181,137 @@ grpc_rate_limit_window_seconds = 30
 
         assert_eq!(args.grpc_rate_limit_requests, Some(20));
         assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn file_db_max_connections_populates_args_when_cli_omits() {
+        Environment::new()
+            .remove("OPENSHELL_DB_MAX_CONNECTIONS")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                assert_eq!(
+                    args.db_max_connections, None,
+                    "default leaves the pool alone"
+                );
+                let file = config_file_from_toml(
+                    r"
+[openshell.gateway]
+database_max_connections = 64
+",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(args.db_max_connections, Some(64));
+            });
+    }
+
+    #[test]
+    fn env_db_max_connections_overrides_file_value() {
+        Environment::new()
+            .set("OPENSHELL_DB_MAX_CONNECTIONS", "128")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    r"
+[openshell.gateway]
+database_max_connections = 64
+",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(args.db_max_connections, Some(128));
+            });
+    }
+
+    #[test]
+    fn db_max_connections_rejects_a_zero_or_unparseable_ceiling() {
+        Environment::new()
+            .remove("OPENSHELL_DB_MAX_CONNECTIONS")
+            .run(|| {
+                // Zero would deadlock every `acquire`, and a silent fallback to the
+                // default would reproduce the ceiling the operator is trying to lift.
+                for bad in ["0", "-5", "many"] {
+                    assert!(
+                        command()
+                            .try_get_matches_from([
+                                "openshell-gateway",
+                                "--db-url",
+                                "sqlite::memory:",
+                                "--db-max-connections",
+                                bad,
+                            ])
+                            .is_err(),
+                        "input {bad:?} must be rejected"
+                    );
+                }
+            });
+    }
+
+    #[test]
+    fn file_db_lock_max_connections_populates_args_when_cli_omits() {
+        Environment::new()
+            .remove("OPENSHELL_DB_LOCK_MAX_CONNECTIONS")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                assert_eq!(
+                    args.db_lock_max_connections, None,
+                    "default leaves the lock pool alone"
+                );
+                let file = config_file_from_toml(
+                    r"
+[openshell.gateway]
+database_lock_max_connections = 8
+",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(args.db_lock_max_connections, Some(8));
+            });
+    }
+
+    #[test]
+    fn env_db_lock_max_connections_overrides_file_value() {
+        Environment::new()
+            .set("OPENSHELL_DB_LOCK_MAX_CONNECTIONS", "16")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    r"
+[openshell.gateway]
+database_lock_max_connections = 8
+",
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+                assert_eq!(args.db_lock_max_connections, Some(16));
+            });
+    }
+
+    #[test]
+    fn db_lock_max_connections_rejects_a_zero_or_unparseable_ceiling() {
+        Environment::new()
+            .remove("OPENSHELL_DB_LOCK_MAX_CONNECTIONS")
+            .run(|| {
+                // A zero-sized lock pool would time out every guarded mutation.
+                for bad in ["0", "-5", "many"] {
+                    assert!(
+                        command()
+                            .try_get_matches_from([
+                                "openshell-gateway",
+                                "--db-url",
+                                "sqlite::memory:",
+                                "--db-lock-max-connections",
+                                bad,
+                            ])
+                            .is_err(),
+                        "input {bad:?} must be rejected"
+                    );
+                }
+            });
     }
 
     #[test]

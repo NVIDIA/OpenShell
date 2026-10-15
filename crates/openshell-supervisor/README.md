@@ -16,6 +16,12 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature and standard backend selection remain unchanged.
 
+The private startup result separates the backend transport payload from optional
+authenticated CONNECT listener settings. Shared networking starts the listener
+only after boundary attachment and confirmation; the supervisor owns policy
+evaluation, live credentials, and listener lifetime. These settings do not add
+a proxy hook to the isolation interface or the shared Sandbox Protocol descriptor.
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.
@@ -34,3 +40,23 @@ protects both original pipe endpoints with close-on-exec and lets `Stdio` transf
 the read endpoint to the child's stdin. The supervisor uses the standard stdin
 reader and does not adopt a numeric raw descriptor. This mode reserves stdin for
 liveness; sandbox workload input travels over the boundary protocol.
+
+## Portable supervisor access
+
+The supervisor consumes the shared isolation backend contract. Its gateway
+session, canonical process attachment, and TCP readiness do not require SSH or
+a Unix host.
+
+TCP readiness opens only after the gateway accepts the authenticated session.
+Session loss closes readiness; accepted reconnection restores it. Dropping the
+readiness guard closes the listener. A requested Unix readiness endpoint fails
+explicitly on unsupported hosts, even before session acceptance.
+
+The optional Unix SSH adapter remains separate from boundary-based process I/O.
+The process-access multiplexer consumes boundary-provided streams and delegates
+terminal resizing and signals through the existing isolation contract. It does
+not own local PIDs, PTYs, or process-group signaling; native process operations
+belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
+
+These portable control-plane foundations do not qualify a platform isolation
+backend or enable a Windows workload runtime.

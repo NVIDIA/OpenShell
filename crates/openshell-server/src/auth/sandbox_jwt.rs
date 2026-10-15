@@ -233,6 +233,7 @@ impl SandboxSessionJwtAuthority {
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: self.gateway_id.clone(),
             verification_keys: self.verification_keys.clone(),

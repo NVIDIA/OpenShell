@@ -288,12 +288,6 @@ pub struct ServerState {
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 
-    /// Serializes settings mutations (global and sandbox) to prevent
-    /// read-modify-write races. Held for the duration of any setting
-    /// set/delete operation, including the precedence check on sandbox
-    /// mutations that reads global state.
-    pub settings_mutex: tokio::sync::Mutex<()>,
-
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compiled compute drivers can be constructed before
@@ -447,7 +441,6 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
-            settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
             replica_id,
@@ -615,7 +608,14 @@ pub(crate) async fn run_server(
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
-    let store = Arc::new(Store::connect(database_url).await?);
+    let store = Arc::new(
+        Store::connect_with_pool_sizes(
+            database_url,
+            config.database_max_connections,
+            config.database_lock_max_connections,
+        )
+        .await?,
+    );
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,
         config_file.as_ref(),
@@ -664,6 +664,11 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
+    compute.configure_supervisor_ocsf_headers(otel_tracing::supervisor_ocsf_headers(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
     let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {
@@ -870,9 +875,11 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle =
-            gateway_metrics::install_global_recorder(supervisor_session::RELAY_CAPACITY)
-                .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+        let prometheus_handle = gateway_metrics::install_global_recorder(
+            supervisor_session::RELAY_CAPACITY,
+            store.mutation_lock_connections(),
+        )
+        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
@@ -1248,6 +1255,19 @@ pub enum ComputeDriverInstance {
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
+    /// Resolve the driver's external-resource admission contract. Defaults to
+    /// the operator-configured policy, including secure admission defaults.
+    /// Drivers without resource-label support may override this explicitly.
+    fn admission_policy(
+        &self,
+        context: ComputeDriverConfigContext<'_>,
+    ) -> Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+        compute::driver_config::admission_config_from_context(
+            context.driver_startup,
+            context.driver_name,
+        )
+    }
+
     /// Validate selected-driver configuration without starting a driver,
     /// connecting a transport, or modifying runtime state.
     ///
@@ -1649,8 +1669,20 @@ async fn build_compute_runtime(
         false,
     )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
-    let admission =
-        compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
+    let admission = match &driver {
+        ConfiguredComputeDriver::Registered(registration) => registration
+            .factory
+            .admission_policy(ComputeDriverConfigContext {
+                driver_name: &registration.name,
+                gateway_name: &config.name,
+                gateway_bind_address: config.bind_address,
+                gateway_log_level: &config.log_level,
+                driver_startup,
+            })?,
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::admission_config_from_context(driver_startup, name)?
+        }
+    };
     info!(driver = %driver.name(), "Using compute driver");
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
@@ -2117,6 +2149,29 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct TestComputeDriverFactory;
+
+    #[test]
+    fn factory_admission_defaults_remain_enabled() {
+        use super::ComputeDriverFactory as _;
+        let endpoint_overrides = std::collections::BTreeMap::new();
+        let context = super::ComputeDriverConfigContext {
+            driver_name: "custom",
+            gateway_name: "test",
+            gateway_bind_address: "127.0.0.1:8080".parse().unwrap(),
+            gateway_log_level: "info",
+            driver_startup: crate::compute::driver_config::DriverStartupContext {
+                file: None,
+                guest_tls: None,
+                gateway_port: 8080,
+                gateway_tls_enabled: false,
+                endpoint_overrides: &endpoint_overrides,
+            },
+        };
+        let policy = TestComputeDriverFactory.admission_policy(context).unwrap();
+        assert!(policy.resource_admission.enabled);
+        assert_eq!(policy.resource_admission.required_labels.len(), 2);
+        assert!(!policy.allow_driver_config);
+    }
 
     // Omitting validate_config exercises source compatibility for out-of-tree
     // factories written before package preflight introduced that hook.

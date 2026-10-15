@@ -303,9 +303,10 @@ Key flags:
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
-- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, `--env-from`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
@@ -315,6 +316,8 @@ Key flags:
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+If the driver rejects foreground attachment during create validation, use `--detach`.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
@@ -530,6 +533,8 @@ SSH-session response and pin it to the sandbox ID. Recreating a deleted
 sandbox, even under the same name, creates a different identity. See the
 [sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
 for verification behavior and release compatibility.
+
+For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
 ---
 

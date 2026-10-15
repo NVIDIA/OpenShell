@@ -26,7 +26,7 @@ jobs:
           operations-per-run: 300
           sort-by: updated
 
-          exempt-issue-labels: state:triage-needed,state:validated,state:accepted,state:agent-ready,state:in-progress,state:review-ready,state:pr-opened,roadmap
+          exempt-issue-labels: lifecycle:frozen,state:frozen
           close-issue-reason: not_planned
 
           stale-issue-message: >

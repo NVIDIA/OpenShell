@@ -41,7 +41,7 @@ h2 = "0.4"
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "logging", "tls12", "aws_lc_rs"] }
 rustls-pemfile = "2"
-rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs", "x509-parser"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 webpki-roots = "1"
 rustls-native-certs = "0.8"
 
@@ -71,7 +71,7 @@ tracing-appender = "0.2"
 # tonic 0.14 / prost 0.14 via opentelemetry-proto's `grpc-tonic` feature.
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "trace"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["grpc-tonic", "gzip-tonic", "tls-aws-lc", "tls-roots", "trace"] }
 tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
 
 # Metrics

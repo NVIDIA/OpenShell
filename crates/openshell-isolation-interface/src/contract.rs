@@ -857,7 +857,7 @@ pub trait BoundaryLoopbackConnector: Send + Sync {
 /// that owns a connection or one of its executable ancestors. A missing digest
 /// is `None`, never an empty value; binary-scoped policy cannot authorize an
 /// executable whose digest is unavailable.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutableIdentity {
     /// Absolute executable path in the workload filesystem namespace.
     pub path: PathBuf,
@@ -871,7 +871,7 @@ pub struct ExecutableIdentity {
 ///
 /// How a backend resolves identity is private to that backend; the shape and
 /// fail-closed semantics do not change.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinaryIdentity {
     /// Executable that owns the accepted connection.
     pub executable: ExecutableIdentity,

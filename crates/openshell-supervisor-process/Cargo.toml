@@ -21,7 +21,6 @@ base64 = { workspace = true }
 bytes = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
-nix = { workspace = true }
 rand = "0.10"
 russh = "0.63.1"
 serde_json = { workspace = true }

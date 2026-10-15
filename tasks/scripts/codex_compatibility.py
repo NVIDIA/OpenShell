@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run an advisory, cumulative release compatibility review with Codex."""
+"""Run an advisory branch or cumulative release compatibility review with Codex."""
 
 import argparse
 import asyncio
@@ -35,12 +35,34 @@ def resolve_candidate(tag: str, expected_sha: str) -> dict:
     return {
         "candidate_tag": tag,
         "candidate_sha": candidate,
+        "source_sha": candidate,
         "baseline_tag": baseline,
         "baseline_sha": git(
             "rev-parse", "--verify", f"refs/tags/{baseline}^{{commit}}"
         ),
         "train": train,
         "allows_breaks": allows_breaks,
+    }
+
+
+def resolve_branch(base_ref: str, source_sha: str, pr_number: int) -> dict:
+    if not re.fullmatch(r"[a-fA-F0-9]{40}", source_sha):
+        raise ValueError("Branch review requires the exact source commit SHA.")
+    baseline = git(
+        "rev-parse", "--verify", "--end-of-options", f"{base_ref}^{{commit}}"
+    )
+    candidate = git("rev-parse", "--verify", f"{source_sha}^{{commit}}")
+    _, train, allows_breaks = train_policy(baseline, None)
+    merged = git("merge-tree", "--write-tree", baseline, candidate).splitlines()[0]
+    return {
+        "candidate_tag": f"PR #{pr_number}" if pr_number else candidate[:12],
+        "candidate_sha": merged,
+        "source_sha": candidate,
+        "baseline_tag": base_ref,
+        "baseline_sha": baseline,
+        "train": train,
+        "allows_breaks": allows_breaks,
+        "mode": "branch",
     }
 
 
@@ -62,6 +84,14 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
     )
     settings = (
         "allow_login_shell=false",
+        'default_permissions="compatibility"',
+        'permissions.compatibility.extends=":read-only"',
+        "permissions.compatibility.network.enabled=true",
+        'permissions.compatibility.network.domains={"api.github.com"="allow"}',
+        "permissions.compatibility.network.allow_upstream_proxy=false",
+        "permissions.compatibility.network.enable_socks5=false",
+        "permissions.compatibility.network.enable_socks5_udp=false",
+        "features.network_proxy=true",
         'model_providers.nvidia.name="NVIDIA Inference"',
         f'model_providers.nvidia.base_url="{ENDPOINT}"',
         'model_providers.nvidia.env_key="NVIDIA_INFERENCE_API_KEY"',
@@ -74,8 +104,10 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
         "features.plugins=false",
         "features.multi_agent=false",
         "features.multi_agent_v2=false",
-        'shell_environment_policy.inherit="none"',
-        "shell_environment_policy.ignore_default_excludes=false",
+        'shell_environment_policy.inherit="all"',
+        "shell_environment_policy.ignore_default_excludes=true",
+        'shell_environment_policy.filters={PATH="include", HOME="include", GH_TOKEN="include", '
+        'SSL_CERT_FILE="include", SSL_CERT_DIR="include"}',
     )
     prompt = (ASSETS / "compatibility-review.md").read_text()
     prompt += "\nReview context:\n" + json.dumps(context)
@@ -91,7 +123,6 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
                 cwd=str(directory),
                 model=MODEL,
                 model_provider="nvidia",
-                sandbox=openai_codex.Sandbox.read_only,
                 approval_mode=openai_codex.ApprovalMode.deny_all,
                 ephemeral=True,
             )
@@ -109,9 +140,11 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
     return review
 
 
-def run_review(tag: str, expected_sha: str, output: Path) -> dict:
+def run_review(
+    tag: str, expected_sha: str, output: Path, base_ref: str, pr_number: int
+) -> dict:
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "advisory": True,
         "status": "error",
         "context": {},
@@ -126,11 +159,17 @@ def run_review(tag: str, expected_sha: str, output: Path) -> dict:
         "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
     }
     try:
-        result["context"] = resolve_candidate(tag, expected_sha)
+        result["context"] = (
+            resolve_branch(base_ref, expected_sha, pr_number)
+            if base_ref
+            else resolve_candidate(tag, expected_sha)
+        )
         if not os.environ.get("NVIDIA_INFERENCE_API_KEY"):
             raise ValueError("NVIDIA inference credential is missing.")
         result["codex_version"] = version("openai-codex-cli-bin")
         result["codex_sdk_version"] = version("openai-codex")
+        result["context"]["repository"] = os.environ.get("GITHUB_REPOSITORY", "")
+        result["context"]["pr_number"] = pr_number
         with tempfile.TemporaryDirectory(
             prefix="openshell-compatibility-"
         ) as temporary:
@@ -160,17 +199,25 @@ def run_review(tag: str, expected_sha: str, output: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("candidate", help="Candidate or stable release tag.")
+    parser.add_argument("candidate", help="Release tag, or source SHA in branch mode.")
     parser.add_argument(
         "--source-sha", default="", help="Expected qualification commit."
     )
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--base-ref", default="", help="Target ref for a branch review."
+    )
+    parser.add_argument("--pr-number", default=0, type=int, help="Mirrored PR number.")
     args = parser.parse_args()
-    result = run_review(args.candidate, args.source_sha, args.output_dir)
+    result = run_review(
+        args.candidate, args.source_sha, args.output_dir, args.base_ref, args.pr_number
+    )
     verdict = result["review"]["verdict"] if result["review"] else "unavailable"
+    has_findings = bool(result["review"] and result["review"]["findings"])
     if output := os.environ.get("GITHUB_OUTPUT"):
         with Path(output).open("a") as handle:
             handle.write(f"status={result['status']}\nverdict={verdict}\n")
+            handle.write(f"has_findings={str(has_findings).lower()}\n")
     if result["status"] != "complete" or verdict != "no_unaddressed_breaks":
         print(
             f"::warning::Advisory compatibility review: {result['status']}, {verdict}. See report."

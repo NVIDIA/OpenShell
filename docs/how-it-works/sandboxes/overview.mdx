@@ -33,6 +33,9 @@ attaching:
 openshell sandbox create --name worker --detach -- ./worker
 ```
 
+Drivers that do not support foreground attachment reject the request before
+provisioning. Use `--detach` with those drivers.
+
 Use `--restart-policy on-failure` to replace the runtime after a nonzero main
 process exit, or `--restart-policy always` to replace it after every exit:
 
@@ -75,6 +78,10 @@ sandbox after that process exits.
 finish after the canonical process starts. Create a scratch sandbox, upload the
 files, then launch the workload with `sandbox exec`, or build the files into the
 sandbox image.
+
+The trailing command takes at most 256 arguments. Each argument is limited to
+32 KiB and all arguments together to 256 KiB. Send a larger input, such as a
+long system prompt, with `sandbox upload` and read it inside the sandbox.
 
 For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
 
@@ -389,6 +396,16 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
+Use `--env-from KEY[=ENVVAR]` when the value should come from the CLI process environment instead of appearing in the CLI process arguments. If `ENVVAR` is omitted, OpenShell reads `KEY`:
+
+```shell
+export SESSION_TOKEN="..."
+openshell sandbox create --env-from SESSION_TOKEN -- my-agent
+openshell sandbox create --env-from AGENT_TOKEN=SESSION_TOKEN -- my-agent
+```
+
+`--env-from` changes only how the CLI receives the value. The resulting variable is still available to processes in the sandbox, just like `--env`.
+
 When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/how-it-works/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:
@@ -400,6 +417,10 @@ openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
 Per-command variables override the sandbox-level environment for that command only.
 
 Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
+
+`sandbox create` accepts at most 128 variables. Each value is limited to 8 KiB
+and cannot contain a newline, and all names and values together are limited to
+256 KiB. Send larger or multi-line values with `sandbox upload`.
 
 ## Label a Sandbox
 
@@ -808,6 +829,14 @@ openshell forward start 8000 my-sandbox -d    # run in background
 ```
 
 OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
+
+To bind the local side to an IPv6 loopback address, pass it positionally as `[bind_address:]port`. IPv6 addresses are bracketed in both the SSH forward argument and the printed access URL:
+
+```shell
+openshell forward start ::1:8000 my-sandbox
+# Local URL: http://[::1]:8000/
+```
+
 CLI forwards run independently of SSH multiplexing settings in your SSH config.
 Foreground forwards end when the command exits; only background forwards appear in `forward list`.
 
@@ -973,6 +1002,10 @@ Stop and start are idempotent. You can also start a retained `Completed` or
 command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
+
+If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
+
+For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
 ## Delete Sandboxes
 

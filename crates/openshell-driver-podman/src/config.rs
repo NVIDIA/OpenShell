@@ -47,6 +47,15 @@ pub struct PodmanComputeConfig {
     /// supplies its own export endpoint; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+
+    /// Gateway name passed to supervisors for their telemetry. The gateway
+    /// supplies its own name; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_gateway_name: Option<String>,
     /// Port the gateway server is actually listening on.
     ///
     /// Used by the driver's auto-detection fallback when `grpc_endpoint`
@@ -498,6 +507,8 @@ impl Default for PodmanComputeConfig {
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),

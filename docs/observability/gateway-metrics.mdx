@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Gateway Metrics"
 sidebar-title: "Gateway Metrics"
-description: "Scrape Prometheus metrics from the OpenShell gateway, including supervisor session, relay capacity, and peer routing signals for multi-replica deployments."
+description: "Scrape Prometheus metrics from the OpenShell gateway, including supervisor session, relay capacity, peer routing, and mutation lock signals for multi-replica deployments."
 keywords: "Generative AI, Cybersecurity, Observability, Metrics, Prometheus, Gateway, Kubernetes, High Availability"
+position: 3
 ---
 
 The gateway exports Prometheus metrics for API requests, database readiness,
@@ -136,6 +137,22 @@ Then read the metrics from another terminal:
 curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessions'
 ```
 
+## Metric Names
+
+Every metric name starts with `openshell_`, followed by the subsystem that
+records it:
+
+| Prefix | Covers |
+|---|---|
+| `openshell_server_` | API requests, readiness, supervisor sessions, relays, and requests forwarded between replicas |
+| `openshell_gateway_interceptor_` | Gateway interceptor evaluations, failures, and latency |
+| `openshell_ocsf_log_` | The gateway's OCSF JSONL file |
+| `openshell_ocsf_otlp_` | OCSF log export over OTLP |
+
+Names follow Prometheus conventions. Counters end in `_total`, and names with a
+unit end in that unit, such as `_seconds` or `_bytes`. Metrics carry no gateway
+name label, so use your scrape configuration to tell installations apart.
+
 ## Histograms and Summaries
 
 The multi-replica latency metrics are Prometheus histograms with `_bucket`,
@@ -175,6 +192,17 @@ that owns a sandbox's supervisor session:
 | `openshell_server_routed_request_attempts_total` | Counter | `operation`, `route`, `relay_kind`, `outcome`, `grpc_code` | Local relay setup and outbound peer attempts, counted once when they finish or are cancelled. Each retry counts separately. |
 | `openshell_server_peer_request_duration_seconds` | Histogram | `operation`, `outcome` | Latency of outbound peer requests only (`route="peer"`). For relays, until the owner's supervisor claimed the relay. |
 
+Mutation locks:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_mutation_lock_wait_seconds` | Histogram | `scope` | Time to acquire a mutation lock, recorded for successful acquisitions. |
+| `openshell_server_mutation_lock_hold_seconds` | Histogram | `scope` | Time a mutation lock was held, recorded when it is released, including requests cancelled while they held it. A conflicting acquisition times out after 10 seconds, so the gateway also logs `mutation lock held longer than the lock wait timeout` with `scope` and `held_ms` when it releases a lock held longer than that. |
+| `openshell_server_mutation_lock_timeouts_total` | Counter | `scope` | Acquisitions that waited longer than 10 seconds, including background work such as supervisor disconnect handling and provider credential refresh. API requests fail with `UNAVAILABLE` and reason `MUTATION_LOCK_TIMEOUT`, and [API Errors](/sdk/api-errors) describes how to retry them. A lock connection that PostgreSQL does not open, although at least a second of the wait remained, counts in `openshell_server_mutation_lock_errors_total` instead. |
+| `openshell_server_mutation_lock_errors_total` | Counter | `scope` | Acquisitions that failed without timing out: PostgreSQL did not open a lock connection, or a lock statement failed. API requests fail with `INTERNAL`. |
+| `openshell_server_mutation_lock_connections_in_use` | Gauge | None | PostgreSQL lock-pool connections checked out on this replica: holding mutation locks, waiting for a PostgreSQL lock, or being returned to the pool, which can take up to 5 seconds. Exported only with PostgreSQL. |
+| `openshell_server_mutation_lock_connections_capacity` | Gauge | None | Lock-pool size per replica, `4` unless [`database_lock_max_connections`](/how-it-works/gateways/configuration#database-pool) sets it. Exported only with PostgreSQL. |
+
 The labels take these values:
 
 - `operation` is `relay`, `report_provider_readiness`, `report_endpoint_status`,
@@ -210,9 +238,12 @@ The labels take these values:
   unchanged. The label is not named `code` because
   `openshell_server_grpc_requests_total` uses that name for the numeric status
   code.
+- `scope` is `global`, `workspace`, or `sandbox`.
 
 Gauges and counters exist from startup. They start at `0`, except
-`openshell_server_relay_pending_capacity`, which starts at its limit. `openshell_server_routed_request_attempts_total` starts with seven
+`openshell_server_relay_pending_capacity` and
+`openshell_server_mutation_lock_connections_capacity`, which start at their
+limits. `openshell_server_routed_request_attempts_total` starts with seven
 `outcome="success", grpc_code="ok"` series: four relay kind and route
 combinations, and three other peer operations with `relay_kind="none"`. Other outcomes and codes,
 and every histogram, appear after their first sample, so write alert expressions
@@ -261,8 +292,23 @@ record its queue and writer:
 | `openshell_ocsf_log_queue_records` | Gauge | None | Records waiting to be written. |
 | `openshell_ocsf_log_queue_bytes` | Gauge | None | Encoded bytes waiting to be written. |
 
+## OCSF Log Export Metrics
+
+Gateways with
+[OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export)
+enabled record its queue and exporter:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_ocsf_otlp_queued_total` | Counter | None | Records queued for export. |
+| `openshell_ocsf_otlp_exported_total` | Counter | None | Records in batches the collector acknowledged, including records it rejected in a partial success. |
+| `openshell_ocsf_otlp_dropped_total` | Counter | `reason` | Records the gateway discarded: `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`. |
+| `openshell_ocsf_otlp_export_errors_total` | Counter | None | Failed export attempts, including attempts that are retried. |
+| `openshell_ocsf_otlp_retries_total` | Counter | None | Export attempts retried after a failure. |
+
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) for traces and OCSF events.
 - To monitor capacity and choose autoscaling signals for multiple gateway
   replicas, refer to
   [High Availability](/kubernetes/high-availability#monitor-capacity).

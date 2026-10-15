@@ -75,11 +75,8 @@ const MAX_DENIALS_LIMIT: usize = 100;
 /// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
 const LOG_DIR: &str = "/var/log";
-/// Shorthand log filenames are `openshell.YYYY-MM-DD.log`. The trailing dot in
-/// the prefix is intentional: it disambiguates from the OCSF JSONL appender's
-/// `openshell-ocsf.YYYY-MM-DD.log`, which we never want to surface here (the
-/// JSONL is opt-in via `ocsf_json_enabled` and not the source of truth for
-/// `/v1/denials`).
+/// `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files,
+/// which are opt-in via `ocsf_json_enabled`.
 const SHORTHAND_LOG_PREFIX: &str = "openshell.";
 /// Defensive cap on per-line length returned to the agent so a pathological
 /// log entry (very long URL path, etc.) cannot blow up the response.
@@ -471,8 +468,7 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // `openshell.YYYY-MM-DD.log` only — the trailing dot in the prefix
-            // disambiguates from `openshell-ocsf.YYYY-MM-DD.log`.
+            // `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files.
             if !name.starts_with(SHORTHAND_LOG_PREFIX) || !name.ends_with(".log") {
                 return None;
             }
@@ -1654,11 +1650,11 @@ mod tests {
 
     #[tokio::test]
     async fn recent_denials_skips_jsonl_log_files() {
-        // The shorthand reader must not surface `openshell-ocsf.*.log` content
+        // The shorthand reader must not surface `openshell-ocsf.*.jsonl` content
         // even if a deny-looking line is present, so the response stays
         // independent of the JSONL appender's enabled state.
         let dir = tempfile::tempdir().unwrap();
-        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.log");
+        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.jsonl");
         std::fs::write(
             &jsonl,
             r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,

@@ -7,13 +7,30 @@ on:
   workflow_call:
     inputs:
       candidate_ref:
-        description: Candidate or stable 0.x release tag to review
+        description: Candidate or stable 0.x release tag, or branch source SHA
         required: true
         type: string
       source_sha:
-        description: Expected candidate commit from release qualification
+        description: Expected candidate commit from branch checks or release qualification
         required: true
         type: string
+      base_ref:
+        description: Target branch ref or SHA; empty for tagged release qualification
+        required: false
+        default: ""
+        type: string
+      pr_number:
+        description: Mirrored PR whose discussion to review; zero for other events
+        required: false
+        default: 0
+        type: number
+    outputs:
+      has_findings:
+        description: Whether the reviewer reported any compatibility findings
+        value: ${{ jobs.review.outputs.has_findings }}
+      report_artifact:
+        description: Uploaded report artifact ID, or empty if unavailable
+        value: ${{ jobs.review.outputs.report_artifact }}
     secrets:
       CODEX_SECURITY_API_KEY:
         required: true
@@ -26,6 +43,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: codex-compatibility-${{ inputs.candidate_ref }}-${{ github.run_id }}
@@ -37,14 +55,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     continue-on-error: true
+    outputs:
+      has_findings: ${{ steps.review.outputs.has_findings }}
+      report_artifact: ${{ steps.report.outputs.artifact-id }}
     steps:
       - name: Check out review tooling and release history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          # Keep the tooling and workflow argument interface at the same revision.
           ref: ${{ github.workflow_sha }}
           path: review-tools
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Fetch branch source commit
+        if: inputs.base_ref != ''
+        working-directory: review-tools
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: git -c core.hooksPath=/dev/null fetch --no-tags origin "$SOURCE_SHA"
 
       - name: Set up Nix
         uses: ./review-tools/.github/actions/setup-nix
@@ -60,18 +89,23 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
 
-      - name: Review cumulative compatibility
+      - name: Review compatibility
         id: review
         working-directory: review-tools
         shell: nix develop --no-write-lock-file -c bash -euo pipefail {0}
         env:
           CANDIDATE_REF: ${{ inputs.candidate_ref }}
           SOURCE_SHA: ${{ inputs.source_sha || '' }}
+          BASE_REF: ${{ inputs.base_ref || '' }}
+          PR_NUMBER: ${{ inputs.pr_number || 0 }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NVIDIA_INFERENCE_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
         run: |
           uv run --no-project --with openai-codex==0.160.0 \
             python tasks/scripts/codex_compatibility.py "$CANDIDATE_REF" \
             --source-sha "$SOURCE_SHA" \
+            --base-ref "$BASE_REF" \
+            --pr-number "$PR_NUMBER" \
             --output-dir "$RUNNER_TEMP/compatibility-report"
 
       - name: Summarize advisory review

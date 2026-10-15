@@ -2,10 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Preserve the vendored include-tree guarantee even when the caller has
-    // PROTOC_INCLUDE set: prost validates that ambient path independently of
-    // explicit includes. Re-enter with a child-only environment override.
-    if std::env::var_os("PROTOC_INCLUDE").is_some() {
+    // A caller-supplied PROTOC (for example a distro package's system
+    // compiler) is used as-is and prost resolves its own includes. Without it,
+    // use the vendored compiler and include tree.
+    println!("cargo:rerun-if-env-changed=PROTOC");
+    println!("cargo:rerun-if-env-changed=PROTOC_INCLUDE");
+    let use_vendored_protoc = std::env::var_os("PROTOC").is_none();
+
+    // In vendored mode, preserve the vendored include-tree guarantee even when
+    // the caller has PROTOC_INCLUDE set: prost validates that ambient path
+    // independently of explicit includes. Re-enter with a child-only
+    // environment override.
+    if use_vendored_protoc && std::env::var_os("PROTOC_INCLUDE").is_some() {
         let status = std::process::Command::new(std::env::current_exe()?)
             .env_remove("PROTOC_INCLUDE")
             .status()?;
@@ -18,10 +26,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/openshell_sandbox.proto");
 
     // Configure the vendored compiler and well-known includes without changing
-    // the build process environment.
+    // the build process environment. With a caller-supplied PROTOC, leave both
+    // to prost.
     let mut proto_config = tonic_prost_build::Config::new();
-    proto_config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
-    let proto_include = protoc_bin_vendored::include_path()?;
+    let proto_include = if use_vendored_protoc {
+        proto_config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
+        Some(protoc_bin_vendored::include_path()?)
+    } else {
+        None
+    };
+    let mut include_dirs = vec![std::path::PathBuf::from("proto")];
+    include_dirs.extend(proto_include);
 
     tonic_prost_build::configure()
         .build_server(true)
@@ -29,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compile_with_config(
             proto_config,
             &[std::path::PathBuf::from("proto/openshell_sandbox.proto")],
-            &[std::path::PathBuf::from("proto"), proto_include],
+            &include_dirs,
         )?;
     Ok(())
 }

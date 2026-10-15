@@ -72,14 +72,32 @@ Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
 
-### Advisory release compatibility review
+### Advisory compatibility review
 
-`Codex Compatibility Review` runs alongside tagged release qualification. It
-reviews the cumulative diff from the previous reachable stable release to the
-exact candidate commit, using the same tag-derived patch/minor policy as the
-protobuf check. It reviews public Rust, Python, Go, and TypeScript SDKs, API
-behavior, CLI contracts, configuration, policy, Helm, and persisted state.
+`Codex Compatibility Review` runs in Branch Checks and alongside tagged release
+qualification. Branch checks compare the prospective merge tree with its target,
+using workflow-revision review tooling and the target's tag-derived train policy.
+Release qualification reviews the cumulative diff from the previous reachable
+stable release to the exact candidate commit, using the same tag-derived
+patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
+and TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
+and persisted state.
 It does not replace Buf or change the release train's version.
+
+The agent inspects code first, then uses `gh` with a read-only GitHub token to
+look up the introducing PR and its discussion for each finding. Release reviews
+resolve introducing PRs from commit associations. Findings show `ACKED`
+only for explicit acceptance of the specific risk by the PR author or a verified
+maintainer. Missing context produces `UNKNOWN` when acceptance cannot be
+established; acknowledgement does not override release policy. Reports lead with
+the concrete change, consumer impact, action, and PR, with coverage details
+collapsed.
+
+Mirrored PR branch runs with findings post a fresh PR comment on every run,
+including reruns. Runs without findings post no comment. The publisher checks
+that the PR is still open at the reviewed head before commenting. Merge-group
+and manual branch runs retain reports without posting PR comments. The reviewer
+has read access; a separate branch job has permission to publish comments.
 
 The reviewer uses the Python Codex SDK (`openai-codex==0.160.0`) and its bundled
 runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
@@ -87,12 +105,17 @@ runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
 existing Nix devShell; the SDK is not an OpenShell package dependency.
 It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
 repository; candidate-side agent configuration and instructions are not loaded.
+Its permission profile keeps files read-only and routes shell network access
+through the Codex network proxy, allowing only `api.github.com` for GitHub
+lookups. Upstream proxy chaining and SOCKS access are disabled.
+Only the GitHub token and tool/certificate paths are passed to
+agent shell commands; the inference credential is excluded.
 It does not run candidate builds or tests. The review has a 30-minute execution
 limit inside a 40-minute job timeout.
 
 This rollout is report-only: findings and review failures cannot block
-publication. The job is independent of the required qualification dependency
-chain. Its summary distinguishes complete, incomplete, and failed execution
+merging or publication. The job is independent of the required qualification
+dependency chain. Its summary distinguishes complete, incomplete, and failed execution
 from the agent's compatibility assessment. Missing credentials, invalid
 baselines, source mismatches, malformed reports, and timeouts are not clean
 reviews. A completed review still does not prove that no breaks exist.
@@ -100,8 +123,9 @@ reviews. A completed review still does not prove that no breaks exist.
 Each run retains `report.json` and `report.md` for 90 days in
 `compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
 revisions, the train, tool/model metadata, coverage gaps, and actionable
-findings. Raw agent transcripts are not published. The qualification summary
-links this separate advisory evidence without waiting for it; compatibility
+findings. Raw agent transcripts and PR discussions are not published.
+The qualification summary links this separate advisory evidence without waiting
+for it; compatibility
 review remains missing from the blocking RFC profile during this rollout.
 
 After the workflow is available on the default branch, run a review without
@@ -533,7 +557,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
-| `.github/workflows/codex-compatibility.yml` | Reviews cumulative tagged-release compatibility with Codex and retains advisory findings and coverage; it does not gate publication. |
+| `.github/workflows/codex-compatibility.yml` | Reviews branch and cumulative tagged-release compatibility with Codex and retains advisory findings, PR acknowledgements, and coverage; it does not gate merging or publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 

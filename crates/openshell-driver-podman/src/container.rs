@@ -695,6 +695,20 @@ fn build_env(
                 .map(|(name, value)| (name.to_string(), value)),
         );
     }
+    if let Some(export) = &config.supervisor_ocsf_export {
+        env.extend(
+            export
+                .environment()
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value)),
+        );
+    }
+    if let Some(name) = &config.supervisor_gateway_name {
+        env.insert(
+            openshell_core::sandbox_env::GATEWAY_NAME.into(),
+            name.clone(),
+        );
+    }
     // Runtime capabilities are driver-owned. Override image/user input with
     // only the substrate that this driver configures for the supervisor.
     env.insert(
@@ -2690,6 +2704,38 @@ mod tests {
         assert_eq!(
             spec["env"][openshell_core::sandbox_env::OTLP_ENDPOINT],
             "http://127.0.0.1:4317"
+        );
+        assert!(
+            spec["env"]
+                .get(openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT)
+                .is_none()
+        );
+
+        let config = PodmanComputeConfig {
+            supervisor_ocsf_export: Some(openshell_core::sandbox_env::OcsfOtlpExport {
+                endpoint: "http://siem:4317".to_string(),
+                schema_version: Some("1.1".to_string()),
+            }),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT],
+            "http://siem:4317"
+        );
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION],
+            "1.1"
+        );
+
+        let config = PodmanComputeConfig {
+            supervisor_gateway_name: Some("prod-west".to_string()),
+            ..test_config()
+        };
+        let spec = build_container_spec(&sandbox, &config);
+        assert_eq!(
+            spec["env"][openshell_core::sandbox_env::GATEWAY_NAME],
+            "prod-west"
         );
     }
 

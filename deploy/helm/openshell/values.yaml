@@ -189,6 +189,9 @@ securityContext:
     # -- Linux capabilities dropped from the gateway container.
     drop:
       - ALL
+  seccompProfile:
+    # -- Seccomp profile applied to the gateway container.
+    type: RuntimeDefault
 
 service:
   # -- Kubernetes Service type for the gateway.
@@ -231,9 +234,13 @@ autoscaling:
   enabled: false
   # -- Minimum gateway replicas. Use 2 or more to survive a pod failure.
   minReplicas: 2
-  # -- Maximum gateway replicas. Each replica opens its own PostgreSQL
-  # connection pool; size the database for rollouts at this count, as the High
-  # Availability guide describes.
+  # -- Maximum gateway replicas. Each replica opens up to
+  # database_max_connections + database_lock_max_connections PostgreSQL
+  # connections (14 with the defaults; set them under
+  # gatewayConfig.openshell.gateway); size the database for rollouts at this
+  # count, as the High Availability guide describes. With a Deployment and the
+  # default pool sizes, the default of 4 needs `max_connections` of at least
+  # 126, more than the PostgreSQL default of 100.
   maxReplicas: 4
   # -- Target average CPU utilization, as a percentage of
   # resources.requests.cpu. Set to null to disable. Requires
@@ -645,6 +652,20 @@ pkiInitJob:
   # see "TLS error: Secret is not supplied by SDS" when connecting to the gateway,
   # check if the TLS secret exists and run `helm upgrade` to create the ConfigMap.
   failOnTimeout: true
+  # Leave runAsUser unset so the OpenShift restricted-v2 SCC can assign the
+  # namespace UID.
+  securityContext:
+    # -- Require the certgen hook container to run as a non-root user.
+    runAsNonRoot: true
+    # -- Whether the certgen hook container can gain additional privileges.
+    allowPrivilegeEscalation: false
+    capabilities:
+      # -- Linux capabilities dropped from the certgen hook container.
+      drop:
+        - ALL
+    seccompProfile:
+      # -- Seccomp profile applied to the certgen hook container.
+      type: RuntimeDefault
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Does not install cert-manager itself.

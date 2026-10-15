@@ -15,13 +15,18 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["surface", "change", "impact", "evidence", "recommendation"],
+        "required": ["surface", "change", "impact", "evidence", "recommendation", "pull_request", "acknowledgement"],
         "properties": {
           "surface": {"type": "string"},
           "change": {"type": "string"},
           "impact": {"type": "string"},
           "evidence": {"type": "string"},
-          "recommendation": {"type": "string"}
+          "recommendation": {"type": "string"},
+          "pull_request": {"type": "string"},
+          "acknowledgement": {
+            "type": "string",
+            "enum": ["ACKED", "NOT ACKED", "UNKNOWN"]
+          }
         }
       }
     }

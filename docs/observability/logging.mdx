@@ -263,9 +263,12 @@ The supervisor writes logs to `/var/log/` in its own filesystem, separate from t
 | File | Format | Rotation |
 |---|---|---|
 | `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily |
-| `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily |
+| `openshell-ocsf.YYYY-MM-DD.jsonl` | OCSF JSONL when enabled | Daily |
 
-Each supervisor file appender is configured with a three-file limit. The shorthand appender's filename prefix also matches JSONL files, so its cleanup can delete JSONL history on filesystems that expose file creation timestamps. Do not rely on independent three-file retention for each format.
+Each format rotates daily with an independent three-file limit.
+
+Configure supervisor OCSF collectors to match `openshell-ocsf.*.jsonl`.
+Shorthand filenames and Windows MXC gateway filenames are unchanged.
 
 File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output. Enabling `ocsf_json_enabled` adds full `OCSF-JSON` records to stderr even without a file sink; see [OCSF JSON collection](/observability/ocsf-json-export#output-location).
 
@@ -273,6 +276,7 @@ Docker and Podman use tmpfs for this directory; Kubernetes uses an `emptyDir` in
 
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) for every signal OpenShell produces and how to enable it.
 - [Access logs](/observability/accessing-logs) through the CLI, TUI, or supervisor resources.
 - [Enable OCSF JSON export](/observability/ocsf-json-export) for SIEM integration and compliance.
 - Learn about [network policies](/how-it-works/policies/overview) that generate these events.

@@ -5,9 +5,13 @@
 
 pub mod driver_config;
 pub mod lease;
+mod mutation_guard;
 pub mod provisioning_deadline;
 mod provisioning_operation;
 pub mod rootfs_tar;
+
+pub use mutation_guard::MutationScope;
+use mutation_guard::{LocalMutationGuard, LocalMutationLocks, MutationGuard};
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
 use crate::otel_tracing::TraceContextInterceptor;
@@ -41,8 +45,9 @@ use openshell_core::proto::compute::v1::{
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxRestartPolicy, SandboxSpec,
-    SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate, ServiceEndpoint, SshSession,
+    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxRestartPolicy, SandboxSpec, SandboxStatus, SandboxTemplate, SandboxWorkloadTemplate,
+    ServiceEndpoint, SshSession,
 };
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{ObjectLabels, ObjectWorkspace, SetResourceVersion};
@@ -75,6 +80,23 @@ pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 use provisioning_operation::ProvisioningOperationError;
+/// Driver-specific values that must be delivered atomically with sandbox
+/// creation without expanding the public compute-driver protobuf contract.
+#[derive(Clone, Default)]
+pub struct SandboxCreateRuntimeInputs {
+    pub effective_policy: Option<ProtoSandboxPolicy>,
+    pub launch_authentication: Option<Vec<u8>>,
+}
+
+impl SandboxCreateRuntimeInputs {
+    #[must_use]
+    pub(crate) fn new(effective_policy: ProtoSandboxPolicy) -> Self {
+        Self {
+            effective_policy: Some(effective_policy),
+            launch_authentication: None,
+        }
+    }
+}
 use traced_driver::TracedDriver;
 
 const LIFECYCLE_SWEEP_PAGE_SIZE: u32 = 1000;
@@ -218,10 +240,22 @@ struct LifecycleGateRegistry {
 
 impl LifecycleGateRegistry {
     async fn lock_for(&self, sandbox_id: &str) -> SandboxLifecycleGuard {
+        crate::persistence::lock_order::check(crate::persistence::lock_order::Lock::LifecycleGate);
         let gate = self.gate_for(sandbox_id);
         SandboxLifecycleGuard {
+            sandbox_id: sandbox_id.to_string(),
             _guard: gate.lock_owned().await,
         }
+    }
+
+    /// Take the gate only when nobody holds it. Never waits, so a caller may
+    /// use it while holding the sandbox's local mutation lock.
+    fn try_lock_for(&self, sandbox_id: &str) -> Option<SandboxLifecycleGuard> {
+        let guard = self.gate_for(sandbox_id).try_lock_owned().ok()?;
+        Some(SandboxLifecycleGuard {
+            sandbox_id: sandbox_id.to_string(),
+            _guard: guard,
+        })
     }
 
     fn gate_for(&self, sandbox_id: &str) -> Arc<Mutex<()>> {
@@ -251,11 +285,12 @@ impl LifecycleGateRegistry {
 
 /// Proof that the current operation holds its sandbox-ID lifecycle gate.
 ///
-/// Lifecycle code must acquire this guard before taking `ComputeRuntime::sync_lock`.
-/// Passing it to `lock_global_for_lifecycle` makes that ordering visible at
-/// every global-lock acquisition in a lifecycle path.
+/// Lifecycle code must acquire this guard before taking the sandbox's local
+/// mutation lock (`lock_sandbox_for_lifecycle`). Passing it there makes that
+/// ordering visible at every mutation-lock acquisition in a lifecycle path.
 #[derive(Debug)]
 pub struct SandboxLifecycleGuard {
+    sandbox_id: String,
     _guard: tokio::sync::OwnedMutexGuard<()>,
 }
 
@@ -263,6 +298,16 @@ pub struct SandboxLifecycleGuard {
 struct SandboxDeleteTarget {
     sandbox_id: String,
     sandbox_name: String,
+}
+
+/// Optional caller-owned preconditions for an identity-safe sandbox delete.
+///
+/// These values are validated again while holding the sandbox lifecycle and
+/// scoped mutation locks, immediately before the durable `Deleting` mutation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SandboxDeletePreconditions {
+    pub expected_sandbox_id: Option<String>,
+    pub expected_resource_version: Option<u64>,
 }
 
 /// Identity and driver result for a completed delete request.
@@ -302,6 +347,7 @@ enum BeginDelete {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct ComputeDriverInfoSnapshot {
     /// Gateway-selected driver name used for routing and `driver_config` keys.
     pub name: String,
@@ -672,7 +718,7 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
-    sync_lock: Arc<Mutex<()>>,
+    mutation_locks: Arc<LocalMutationLocks>,
     lifecycle_gates: Arc<LifecycleGateRegistry>,
     replica_id: String,
     /// Gateway-issued staging slots for rootfs tar archives. Shared across
@@ -683,13 +729,7 @@ pub struct ComputeRuntime {
         Arc<OnceLock<Option<Arc<crate::auth::sandbox_jwt::SandboxSessionJwtAuthority>>>>,
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
-}
-
-pub struct SandboxSyncGuard {
-    // Drop the database guard before the local mutex so another local waiter
-    // cannot race ahead while this replica still owns the cluster-wide lock.
-    _distributed: crate::persistence::DistributedMutationGuard,
-    _local: tokio::sync::OwnedMutexGuard<()>,
+    supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -775,13 +815,14 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
-            sync_lock: Arc::new(Mutex::new(())),
+            mutation_locks: Arc::new(LocalMutationLocks::new()),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             replica_id: lease::replica_id(),
             rootfs_tar_staging,
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
+            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
         })
     }
 
@@ -795,6 +836,17 @@ impl ComputeRuntime {
                 self.store.clone(),
                 credentials,
             ));
+    }
+
+    /// Collector headers that launch bundles carry to supervisors for OCSF
+    /// export.
+    pub(crate) fn configure_supervisor_ocsf_headers(
+        &self,
+        headers: Option<openshell_core::jwt::SecretOtlpHeaders>,
+    ) {
+        if let Some(headers) = headers {
+            let _ = self.supervisor_ocsf_headers.set(headers);
+        }
     }
 
     pub(crate) async fn prepare_ssh_identity(
@@ -823,6 +875,7 @@ impl ComputeRuntime {
         let mut with_identity = sandbox.clone();
         self.prepare_ssh_identity(&mut with_identity, &mut authentication)
             .await?;
+        authentication.supervisor.ocsf_otlp_headers = self.supervisor_ocsf_headers.get().cloned();
         serialize_launch_authentication(authentication)
     }
 
@@ -846,41 +899,6 @@ impl ComputeRuntime {
             authority.mint_persisted_launch(sandbox.object_id(), &identity)?,
         )
         .await
-    }
-
-    /// Serializes sandbox/provider-profile invariant checks and object writes
-    /// across gateway replicas.
-    ///
-    /// The local mutex preserves lock ordering within one process. `PostgreSQL`
-    /// deployments also hold a session-level advisory lock for the duration.
-    pub(crate) async fn sandbox_sync_guard(
-        &self,
-    ) -> crate::persistence::PersistenceResult<SandboxSyncGuard> {
-        let local = self.sync_lock.clone().lock_owned().await;
-        let distributed = self.store.acquire_distributed_mutation_guard().await?;
-        Ok(SandboxSyncGuard {
-            _distributed: distributed,
-            _local: local,
-        })
-    }
-
-    pub(crate) async fn sandbox_create_guards(
-        &self,
-        sandbox_id: &str,
-    ) -> crate::persistence::PersistenceResult<(SandboxLifecycleGuard, SandboxSyncGuard)> {
-        let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
-        let global_guard = self.sandbox_sync_guard().await?;
-        Ok((lifecycle_guard, global_guard))
-    }
-
-    /// Acquires the process-wide lock for code that already holds the
-    /// sandbox-ID lifecycle gate. The guard parameter documents and enforces
-    /// that callers acquire locks in lifecycle-gate -> global-lock order.
-    async fn lock_global_for_lifecycle(
-        &self,
-        _lifecycle_guard: &SandboxLifecycleGuard,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
-        self.sync_lock.clone().lock_owned().await
     }
 
     #[cfg(test)]
@@ -1055,6 +1073,20 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
+        self.validate_sandbox_create_with_runtime_inputs(
+            sandbox,
+            &SandboxCreateRuntimeInputs::default(),
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn validate_sandbox_create_with_runtime_inputs(
+        &self,
+        sandbox: &Sandbox,
+        runtime_inputs: &SandboxCreateRuntimeInputs,
+        await_main_process_attachment: bool,
+    ) -> Result<(), Status> {
         self.validate_caller_driver_config(
             sandbox
                 .spec
@@ -1063,6 +1095,14 @@ impl ComputeRuntime {
         )?;
         let mut driver_sandbox = driver_sandbox_from_public(sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(spec) = driver_sandbox.spec.as_mut() {
+            spec.await_main_process_attachment = await_main_process_attachment;
+        }
+        if let Some(effective_policy) = runtime_inputs.effective_policy.as_ref()
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.policy = Some(effective_policy.clone());
+        }
         // Peek, never consume: create runs the same path immediately after and
         // must still find the token.
         if let Some(token) = take_staging_token(&mut driver_sandbox) {
@@ -1130,8 +1170,8 @@ impl ComputeRuntime {
         launch_authentication: Option<Vec<u8>>,
         await_main_process_attachment: bool,
     ) -> Result<Sandbox, Status> {
-        let (lifecycle_guard, global_guard) = self
-            .sandbox_create_guards(sandbox.object_id())
+        let (lifecycle_guard, mutation_guard) = self
+            .sandbox_create_guards(sandbox.object_workspace(), sandbox.object_id())
             .await
             .map_err(|error| {
                 crate::grpc::persistence_error_to_status(error, "acquire sandbox mutation lock")
@@ -1142,7 +1182,7 @@ impl ComputeRuntime {
             launch_authentication,
             await_main_process_attachment,
             lifecycle_guard,
-            global_guard,
+            mutation_guard,
         ))
         .await
     }
@@ -1155,12 +1195,61 @@ impl ComputeRuntime {
         launch_authentication: Option<Vec<u8>>,
         await_main_process_attachment: bool,
         lifecycle_guard: SandboxLifecycleGuard,
-        global_guard: SandboxSyncGuard,
+        mutation_guard: MutationGuard,
+    ) -> Result<Sandbox, Status> {
+        Box::pin(self.create_sandbox_with_runtime_inputs_and_guards(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            SandboxCreateRuntimeInputs {
+                launch_authentication,
+                ..Default::default()
+            },
+            lifecycle_guard,
+            mutation_guard,
+        ))
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn create_sandbox_with_runtime_inputs(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+        await_main_process_attachment: bool,
+        runtime_inputs: SandboxCreateRuntimeInputs,
+    ) -> Result<Sandbox, Status> {
+        let (lifecycle_guard, mutation_guard) = self
+            .sandbox_create_guards(sandbox.object_workspace(), sandbox.object_id())
+            .await
+            .map_err(|error| {
+                crate::grpc::persistence_error_to_status(error, "acquire sandbox mutation lock")
+            })?;
+        Box::pin(self.create_sandbox_with_runtime_inputs_and_guards(
+            sandbox,
+            sandbox_token,
+            await_main_process_attachment,
+            runtime_inputs,
+            lifecycle_guard,
+            mutation_guard,
+        ))
+        .await
+    }
+
+    pub(crate) async fn create_sandbox_with_runtime_inputs_and_guards(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+        await_main_process_attachment: bool,
+        runtime_inputs: SandboxCreateRuntimeInputs,
+        lifecycle_guard: SandboxLifecycleGuard,
+        mutation_guard: MutationGuard,
     ) -> Result<Sandbox, Status> {
         // Defend the internal create path too, before consuming a staged archive
         // or persisting the sandbox. The gRPC handler checks before driver validation.
         self.validate_launch_signer_configured(
-            launch_authentication
+            runtime_inputs
+                .launch_authentication
                 .as_ref()
                 .is_some_and(|auth| !auth.is_empty()),
         )?;
@@ -1184,6 +1273,11 @@ impl ComputeRuntime {
 
         let mut driver_sandbox = driver_sandbox_from_public(&sandbox, &self.driver_info.name)
             .map_err(|status| *status)?;
+        if let Some(effective_policy) = runtime_inputs.effective_policy
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.policy = Some(effective_policy);
+        }
         if let Some(staged) = staged.as_ref() {
             set_rootfs_tar_path(&mut driver_sandbox, staged.path());
         }
@@ -1231,7 +1325,7 @@ impl ComputeRuntime {
         // cancelled. Keep the creation guard until its public identity and
         // protected launch bundle have been committed.
         let prepared = async {
-            if let Some(encoded) = launch_authentication {
+            if let Some(encoded) = runtime_inputs.launch_authentication {
                 let authentication = serde_json::from_slice(&encoded)
                     .map_err(|_| Status::internal("invalid sandbox launch authentication"))?;
                 let encoded = self
@@ -1249,7 +1343,7 @@ impl ComputeRuntime {
             }
         }
         .await;
-        drop(global_guard);
+        drop(mutation_guard);
         let launch_authentication = match prepared {
             Ok(authentication) => authentication,
             Err(status) => {
@@ -1312,7 +1406,7 @@ impl ComputeRuntime {
                     .await);
             }
         };
-        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         // The scanner can expire preparation while create owns the lifecycle
         // gate. Every driver outcome must observe that durable decision before
         // deleting records, publishing status, or compensating a failed create.
@@ -1333,7 +1427,7 @@ impl ComputeRuntime {
         if self.supports_sandbox_authentication() && runtime_identity.is_empty() {
             let status = Status::internal("compute driver did not return a runtime identity");
             return Err(self
-                .compensate_failed_create(&sandbox, lifecycle_guard, Some(global_guard), status)
+                .compensate_failed_create(&sandbox, lifecycle_guard, Some(sandbox_guard), status)
                 .await);
         }
         if self.supports_sandbox_authentication() {
@@ -1362,7 +1456,7 @@ impl ComputeRuntime {
                         .compensate_failed_create(
                             &sandbox,
                             lifecycle_guard,
-                            Some(global_guard),
+                            Some(sandbox_guard),
                             status,
                         )
                         .await);
@@ -1378,7 +1472,7 @@ impl ComputeRuntime {
         &self,
         created: &Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
-        global_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+        sandbox_guard: Option<LocalMutationGuard>,
         original: Status,
     ) -> Status {
         // Once create has committed its parent, cancellation must not interrupt
@@ -1389,15 +1483,15 @@ impl ComputeRuntime {
         let request_span = tracing::Span::current();
         tokio::spawn(
             async move {
-                let global_guard = match global_guard {
+                let sandbox_guard = match sandbox_guard {
                     Some(guard) => guard,
-                    None => runtime.lock_global_for_lifecycle(&lifecycle_guard).await,
+                    None => runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await,
                 };
                 runtime
                     .compensate_failed_create_inner(
                         &created,
                         lifecycle_guard,
-                        global_guard,
+                        sandbox_guard,
                         original,
                     )
                     .await
@@ -1420,7 +1514,7 @@ impl ComputeRuntime {
         &self,
         created: &Sandbox,
         lifecycle_guard: SandboxLifecycleGuard,
-        global_guard: tokio::sync::OwnedMutexGuard<()>,
+        sandbox_guard: LocalMutationGuard,
         original: Status,
     ) -> Status {
         let sandbox_id = created.object_id();
@@ -1463,7 +1557,7 @@ impl ComputeRuntime {
         };
         self.sandbox_index.update_from_sandbox(&transition.deleting);
         self.sandbox_watch_bus.notify(sandbox_id);
-        drop(global_guard);
+        drop(sandbox_guard);
 
         let delete_result = self
             .delete_backend_after_failed_create(sandbox_id, sandbox_name)
@@ -1559,7 +1653,7 @@ impl ComputeRuntime {
         let sandbox_id = candidate.object_id().to_string();
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
-        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
@@ -1585,10 +1679,24 @@ impl ComputeRuntime {
                 return Ok(current);
             }
             let automatic_restart = is_automatic_restart_transition(&current);
-            if !matches!(phase, SandboxPhase::Ready | SandboxPhase::Stopping) && !automatic_restart
+            // Timeout cleanup owns reclamation while the record remains Error.
+            // Its later start may recreate missing compute; an ordinary stop must
+            // not replace that recovery state with Stopping or Stopped.
+            if phase == SandboxPhase::Error && provisioning_deadline::timed_out(&current) {
+                return Err(Status::failed_precondition(
+                    "sandbox provisioning timed out; retry start after timeout cleanup completes",
+                ));
+            }
+            // Error does not prove compute has stopped. Use the normal driver stop
+            // and session cleanup before a subsequent start renews authentication
+            // and repeats configuration admission for the retained sandbox.
+            if !matches!(
+                phase,
+                SandboxPhase::Ready | SandboxPhase::Stopping | SandboxPhase::Error
+            ) && !automatic_restart
             {
                 return Err(Status::failed_precondition(format!(
-                    "sandbox must be Ready or in an automatic restart to stop (current phase: {phase:?})"
+                    "sandbox must be Ready, Error, or in an automatic restart to stop (current phase: {phase:?})"
                 )));
             }
 
@@ -1638,7 +1746,7 @@ impl ComputeRuntime {
                 }
             }
         };
-        drop(global_guard);
+        drop(sandbox_guard);
 
         // Once the durable transition is committed, request cancellation must
         // not cancel the driver operation and strand the sandbox in
@@ -1697,7 +1805,7 @@ impl ComputeRuntime {
 
         match result {
             Ok(_) => {
-                let _global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+                let _sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
                 let stopped = self.commit_sandbox_stopped(&sandbox_id).await?;
                 self.cleanup_stopped_sandbox_sessions(&stopped)
                     .await
@@ -1754,7 +1862,7 @@ impl ComputeRuntime {
         let sandbox_id = candidate.object_id().to_string();
         let sandbox_name = candidate.object_name().to_string();
         let lifecycle_guard = self.lifecycle_gates.lock_for(&sandbox_id).await;
-        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         let mut current = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
@@ -1800,8 +1908,13 @@ impl ComputeRuntime {
             ) && !is_failed_main_process_result(&current)
                 && !provisioning_timeout
             {
+                let recovery_hint = if phase == SandboxPhase::Error {
+                    "; stop the sandbox before retrying start"
+                } else {
+                    ""
+                };
                 return Err(Status::failed_precondition(format!(
-                    "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?})"
+                    "sandbox must be Stopped, Completed, or a failed main-process Error to start (current phase: {phase:?}){recovery_hint}"
                 )));
             }
             if phase == SandboxPhase::Completed || is_failed_main_process_result(&current) {
@@ -1900,7 +2013,7 @@ impl ComputeRuntime {
                 }
             }
         };
-        drop(global_guard);
+        drop(sandbox_guard);
 
         // The durable `Starting` transition commits the operation. Let an
         // owned worker finish it even if the initiating RPC is canceled.
@@ -2017,7 +2130,7 @@ impl ComputeRuntime {
                         .compensate_successful_start(&lifecycle_guard, &starting, &previous, status)
                         .await);
                 }
-                let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+                let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
                 let latest = if self.supports_sandbox_authentication() {
                     let driver_name = self.configured_driver_name().to_string();
                     let persisted = self
@@ -2036,7 +2149,7 @@ impl ComputeRuntime {
                     match persisted {
                         Ok(sandbox) => sandbox,
                         Err(error) => {
-                            drop(global_guard);
+                            drop(sandbox_guard);
                             let status = Status::internal(format!(
                                 "persist compute runtime identity failed: {error}"
                             ));
@@ -2207,7 +2320,7 @@ impl ComputeRuntime {
             }
         };
 
-        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
         if self.restore_lifecycle_snapshot(&settled, previous).await {
             original
         } else {
@@ -2225,8 +2338,9 @@ impl ComputeRuntime {
     /// state before deciding whether the pre-operation snapshot is still true.
     ///
     /// A transport error can arrive after the runtime applied stop or start.
-    /// The driver lookup deliberately runs without the process-wide lock; the
-    /// exact transition resource version then fences the recovery write.
+    /// The driver lookup deliberately runs without the sandbox's local
+    /// mutation lock; the exact transition resource version then fences the
+    /// recovery write.
     async fn recover_failed_lifecycle(
         &self,
         lifecycle_guard: &SandboxLifecycleGuard,
@@ -2242,7 +2356,7 @@ impl ComputeRuntime {
         )
         .await
         .unwrap_or_else(|_| Err("compute lifecycle reconciliation timed out".into()));
-        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
@@ -2461,8 +2575,12 @@ impl ComputeRuntime {
         workspace: &str,
         name: &str,
     ) -> Result<DeleteSandboxResult, Status> {
-        self.delete_sandbox_allow_missing(workspace, name, false)
-            .await
+        self.delete_sandbox_with_preconditions(
+            workspace,
+            name,
+            SandboxDeletePreconditions::default(),
+        )
+        .await
     }
 
     pub(crate) async fn delete_sandbox_allow_missing(
@@ -2471,6 +2589,56 @@ impl ComputeRuntime {
         name: &str,
         allow_missing: bool,
     ) -> Result<DeleteSandboxResult, Status> {
+        self.delete_sandbox_with_options(
+            workspace,
+            name,
+            allow_missing,
+            SandboxDeletePreconditions::default(),
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn delete_sandbox_with_preconditions(
+        &self,
+        workspace: &str,
+        name: &str,
+        preconditions: SandboxDeletePreconditions,
+    ) -> Result<DeleteSandboxResult, Status> {
+        self.delete_sandbox_with_options(workspace, name, false, preconditions)
+            .await
+    }
+
+    pub(crate) async fn delete_sandbox_allow_missing_with_preconditions(
+        &self,
+        workspace: &str,
+        name: &str,
+        allow_missing: bool,
+        preconditions: SandboxDeletePreconditions,
+    ) -> Result<DeleteSandboxResult, Status> {
+        if preconditions == SandboxDeletePreconditions::default() {
+            return self
+                .delete_sandbox_allow_missing(workspace, name, allow_missing)
+                .await;
+        }
+        self.delete_sandbox_with_options(workspace, name, allow_missing, preconditions)
+            .await
+    }
+
+    async fn delete_sandbox_with_options(
+        &self,
+        workspace: &str,
+        name: &str,
+        allow_missing: bool,
+        preconditions: SandboxDeletePreconditions,
+    ) -> Result<DeleteSandboxResult, Status> {
+        if preconditions.expected_resource_version.is_some()
+            && preconditions.expected_sandbox_id.is_none()
+        {
+            return Err(Status::invalid_argument(
+                "expected_resource_version requires expected_sandbox_id",
+            ));
+        }
         // Resolve and acquire both request-side locks before spawning the
         // owned worker. Cancellation while any of these awaits is pending is
         // harmless because no mutation or detached work has started.
@@ -2488,11 +2656,20 @@ impl ComputeRuntime {
             }
             return Err(Status::not_found("sandbox not found"));
         };
+        if preconditions
+            .expected_sandbox_id
+            .as_deref()
+            .is_some_and(|expected| expected != candidate.object_id())
+        {
+            return Err(Status::aborted(
+                "sandbox identity does not match expected_sandbox_id",
+            ));
+        }
         let target = SandboxDeleteTarget {
             sandbox_id: candidate.object_id().to_string(),
             sandbox_name: candidate.object_name().to_string(),
         };
-        self.delete_sandbox_target(target).await
+        self.delete_sandbox_target(target, preconditions).await
     }
 
     pub(crate) async fn delete_sandbox_by_id(
@@ -2500,19 +2677,23 @@ impl ComputeRuntime {
         sandbox_id: &str,
         sandbox_name: &str,
     ) -> Result<DeleteSandboxResult, Status> {
-        self.delete_sandbox_target(SandboxDeleteTarget {
-            sandbox_id: sandbox_id.to_string(),
-            sandbox_name: sandbox_name.to_string(),
-        })
+        self.delete_sandbox_target(
+            SandboxDeleteTarget {
+                sandbox_id: sandbox_id.to_string(),
+                sandbox_name: sandbox_name.to_string(),
+            },
+            SandboxDeletePreconditions::default(),
+        )
         .await
     }
 
     async fn delete_sandbox_target(
         &self,
         target: SandboxDeleteTarget,
+        preconditions: SandboxDeletePreconditions,
     ) -> Result<DeleteSandboxResult, Status> {
         let delete_guard = self.lifecycle_gates.lock_for(&target.sandbox_id).await;
-        let global_guard = self.lock_global_for_lifecycle(&delete_guard).await;
+        let sandbox_guard = self.lock_sandbox_for_lifecycle(&delete_guard).await;
 
         // There is no await between acquiring the initial guards and spawning
         // the worker. From this commitment point onward, request cancellation
@@ -2523,7 +2704,13 @@ impl ComputeRuntime {
         let request_span = tracing::Span::current();
         tokio::spawn(
             async move {
-                Box::pin(runtime.delete_sandbox_inner(target, delete_guard, global_guard)).await
+                Box::pin(runtime.delete_sandbox_inner(
+                    target,
+                    preconditions,
+                    delete_guard,
+                    sandbox_guard,
+                ))
+                .await
             }
             .instrument(request_span),
         )
@@ -2538,8 +2725,9 @@ impl ComputeRuntime {
     async fn delete_sandbox_inner(
         &self,
         target: SandboxDeleteTarget,
+        preconditions: SandboxDeletePreconditions,
         delete_guard: SandboxLifecycleGuard,
-        guard: tokio::sync::OwnedMutexGuard<()>,
+        guard: LocalMutationGuard,
     ) -> Result<DeleteSandboxResult, Status> {
         let current = self
             .store
@@ -2559,6 +2747,23 @@ impl ComputeRuntime {
         if current.object_name() != target.sandbox_name {
             return Err(Status::aborted(
                 "sandbox name changed while the delete request was waiting; retry explicitly",
+            ));
+        }
+        if preconditions
+            .expected_sandbox_id
+            .as_deref()
+            .is_some_and(|expected| expected != current.object_id())
+        {
+            return Err(Status::aborted(
+                "sandbox identity changed before delete mutation",
+            ));
+        }
+        if preconditions
+            .expected_resource_version
+            .is_some_and(|expected| expected != sandbox_resource_version(&current))
+        {
+            return Err(Status::aborted(
+                "sandbox resource version changed before delete mutation",
             ));
         }
 
@@ -2726,7 +2931,7 @@ impl ComputeRuntime {
         delete_guard: &SandboxLifecycleGuard,
         sandbox_id: &str,
     ) -> bool {
-        let _guard = self.lock_global_for_lifecycle(delete_guard).await;
+        let _guard = self.lock_sandbox_for_lifecycle(delete_guard).await;
         for attempt in 1..=DELETE_PHASE_CAS_RETRY_LIMIT {
             let record = match self.store.get(Sandbox::object_type(), sandbox_id).await {
                 Ok(Some(record)) => record,
@@ -2784,10 +2989,10 @@ impl ComputeRuntime {
     }
 
     /// Removes the sandbox by stable ID only when the expected resource
-    /// version still owns the row. The caller holds `sync_lock`; a successful
-    /// delete also removes sandbox-owned records, while successful or
-    /// already-completed removal clears this replica's index and watch/log
-    /// buses.
+    /// version still owns the row. The caller holds this sandbox's local
+    /// mutation lock; a successful delete also removes sandbox-owned records,
+    /// while successful or already-completed removal clears this replica's
+    /// index and watch/log buses.
     async fn remove_sandbox_record_if_version_locked(
         &self,
         sandbox_id: &str,
@@ -2872,10 +3077,11 @@ impl ComputeRuntime {
     /// Resolves an ambiguous driver delete error without overwriting newer
     /// gateway state.
     ///
-    /// The external lookup runs without `sync_lock`. Recovery then uses the
-    /// exact `Deleting` resource version to apply one of three outcomes:
-    /// reconcile an observed backend snapshot, remove a confirmed-absent
-    /// backend, or restore the pre-delete snapshot when lookup is inconclusive.
+    /// The external lookup runs without the sandbox's local mutation lock.
+    /// Recovery then uses the exact `Deleting` resource version to apply one of
+    /// three outcomes: reconcile an observed backend snapshot, remove a
+    /// confirmed-absent backend, or restore the pre-delete snapshot when lookup
+    /// is inconclusive.
     async fn recover_failed_delete(
         &self,
         delete_guard: &SandboxLifecycleGuard,
@@ -2885,9 +3091,9 @@ impl ComputeRuntime {
         let sandbox_name = transition.deleting.object_name();
         let deleting_resource_version = sandbox_resource_version(&transition.deleting);
 
-        // The driver lookup is deliberately outside the process-wide guard.
+        // The driver lookup is deliberately outside the local mutation lock.
         let observed = self.get_driver_sandbox(sandbox_id, sandbox_name).await;
-        let _guard = self.lock_global_for_lifecycle(delete_guard).await;
+        let _guard = self.lock_sandbox_for_lifecycle(delete_guard).await;
 
         match observed {
             Ok(Some(snapshot)) if snapshot.id == sandbox_id && snapshot.status.is_some() => {
@@ -3031,7 +3237,8 @@ impl ComputeRuntime {
         }
     }
 
-    /// Handles a recovery CAS conflict while the caller holds `sync_lock`.
+    /// Handles a recovery CAS conflict while the caller holds the sandbox's
+    /// local mutation lock.
     /// Another replica may have removed the durable row during the external
     /// driver lookup; in that case this replica still needs local cleanup.
     async fn handle_delete_recovery_conflict(
@@ -3727,7 +3934,7 @@ impl ComputeRuntime {
     }
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox.object_id()).await;
         let sandbox_id = sandbox.object_id().to_string();
         let reason = reason.to_string();
         let message = message.to_string();
@@ -3773,7 +3980,7 @@ impl ComputeRuntime {
     /// `Provisioning` with a `Resumed` Ready condition. Returns `true` if the
     /// store update succeeded.
     async fn clear_recoverable_error(&self, sandbox: &Sandbox) -> bool {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox.object_id()).await;
         let sandbox_id = sandbox.object_id().to_string();
         match self
             .store
@@ -4058,7 +4265,7 @@ impl ComputeRuntime {
         }
 
         let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
-        let global_guard = self.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         let Some(current) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -4139,7 +4346,7 @@ impl ComputeRuntime {
         };
         self.sandbox_index.update_from_sandbox(&claimed);
         self.sandbox_watch_bus.notify(sandbox_id);
-        drop(global_guard);
+        drop(sandbox_guard);
 
         let runtime = self.clone();
         let owned = claimed.clone();
@@ -4409,7 +4616,7 @@ impl ComputeRuntime {
         driver_status: Status,
     ) -> Result<(), String> {
         let sandbox_id = settled.object_id();
-        let _global_guard = self.lock_global_for_lifecycle(lifecycle_guard).await;
+        let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
         let Some(current) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -4612,7 +4819,7 @@ impl ComputeRuntime {
     }
 
     async fn apply_sandbox_update(&self, mut incoming: DriverSandbox) -> Result<(), String> {
-        let guard = self.sync_lock.lock().await;
+        let guard = self.lock_sandbox_local(&incoming.id).await;
         let mut existing = self
             .store
             .get(Sandbox::object_type(), &incoming.id)
@@ -4638,9 +4845,9 @@ impl ComputeRuntime {
         // stop the new generation before the replacement supervisor connects.
         // The replacement may already be Ready when the old exit arrives, so
         // terminal container snapshots need the same check after readiness.
-        // Release the global watch lock, wait for that lifecycle operation,
-        // and then reread both the driver and store before applying an
-        // authoritative observation. Taking the per-sandbox gate only for
+        // Release this sandbox's local mutation lock, wait for that lifecycle
+        // operation, and then reread both the driver and store before applying
+        // an authoritative observation. Taking the per-sandbox gate only for
         // these ambiguous snapshots avoids delaying unrelated watch events behind
         // slow lifecycle operations.
         let existing_name = existing_sandbox.as_ref().map_or_else(
@@ -4650,7 +4857,7 @@ impl ComputeRuntime {
         drop(guard);
         let _lifecycle_guard = self.lifecycle_gates.lock_for(&incoming.id).await;
         let observed = self.get_driver_sandbox(&incoming.id, &existing_name).await;
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(&incoming.id).await;
         existing = self
             .store
             .get(Sandbox::object_type(), &incoming.id)
@@ -4772,7 +4979,7 @@ impl ComputeRuntime {
         sandbox_id: &str,
         terminal_delivery_finalized: bool,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
 
         // A replacement session may already belong to another gateway. Do not
         // let cleanup from this replica overwrite the replacement's Ready state.
@@ -4852,7 +5059,7 @@ impl ComputeRuntime {
         instance_id: Option<&str>,
         terminal_delivery_finalized: bool,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
         let existing = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -5014,7 +5221,7 @@ impl ComputeRuntime {
         instance_id: &str,
         exit_code: i32,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
         let Some(existing) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -5108,7 +5315,7 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
         let Some(sandbox) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -5170,7 +5377,7 @@ impl ComputeRuntime {
         sandbox_id: &str,
         instance_id: &str,
     ) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
         let Some(sandbox) = self
             .store
             .get_message::<Sandbox>(sandbox_id)
@@ -5225,7 +5432,7 @@ impl ComputeRuntime {
     }
 
     async fn apply_deleted(&self, sandbox_id: &str) -> Result<(), String> {
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
         self.apply_deleted_locked(sandbox_id).await
     }
 
@@ -5328,9 +5535,9 @@ impl ComputeRuntime {
     /// The gate check is synchronous, but the actual `DeleteSandbox` RPC is
     /// always deferred to a background task, never awaited inline: both
     /// call sites run while holding a broader lock (the watch loop's
-    /// sequential event processing; the prune sweep's gateway-wide
-    /// `sync_lock`), and a slow or stuck driver call must never block that
-    /// wider scope. The gate itself is held for the background call's
+    /// sequential event processing; the prune sweep's local mutation lock
+    /// for this sandbox), and a slow or stuck driver call must never block
+    /// that wider scope. The gate itself is held for the background call's
     /// duration, so this still can't race a concurrent request-side
     /// operation — only the potentially-slow RPC is backgrounded.
     fn spawn_driver_sandbox_cleanup(&self, sandbox_id: &str, sandbox_name: &str) {
@@ -5500,7 +5707,7 @@ impl ComputeRuntime {
         delete_guard: &SandboxLifecycleGuard,
         sandbox_id: &str,
     ) -> Result<bool, Status> {
-        let _guard = self.lock_global_for_lifecycle(delete_guard).await;
+        let _guard = self.lock_sandbox_for_lifecycle(delete_guard).await;
         let record = self
             .store
             .get(Sandbox::object_type(), sandbox_id)
@@ -5531,7 +5738,7 @@ impl ComputeRuntime {
         sweep_started_at_ms: i64,
     ) -> Result<(), String> {
         let expected_resource_version = {
-            let _guard = self.sync_lock.lock().await;
+            let _guard = self.lock_sandbox_local(&snapshot.id).await;
             let Some(existing) = self
                 .store
                 .get(Sandbox::object_type(), &snapshot.id)
@@ -5554,7 +5761,7 @@ impl ComputeRuntime {
             return Ok(());
         };
 
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(&snapshot.id).await;
         let Some(existing) = self
             .store
             .get(Sandbox::object_type(), &snapshot.id)
@@ -5580,7 +5787,7 @@ impl ComputeRuntime {
         grace_ms: i64,
     ) -> Result<(), String> {
         let (sandbox_id, sandbox_name, expected_resource_version, age_ms) = {
-            let _guard = self.sync_lock.lock().await;
+            let _guard = self.lock_sandbox_local(&record.id).await;
             let Some(current_record) = self
                 .store
                 .get(Sandbox::object_type(), &record.id)
@@ -5615,7 +5822,7 @@ impl ComputeRuntime {
 
         let current = self.get_driver_sandbox(&sandbox_id, &sandbox_name).await?;
 
-        let _guard = self.sync_lock.lock().await;
+        let _guard = self.lock_sandbox_local(&sandbox_id).await;
         let Some(current_record) = self
             .store
             .get(Sandbox::object_type(), &sandbox_id)
@@ -5690,10 +5897,10 @@ impl ComputeRuntime {
         );
         // The driver's own snapshot never reported this sandbox, so no
         // request-side DeleteSandbox call is coming for it either — release
-        // driver-owned resources in the background. This function holds
-        // `sync_lock` (the gateway-wide state guard) through the rest of its
-        // body, so the driver call must not be awaited here: doing so would
-        // block every other sandbox operation gateway-wide on a single,
+        // driver-owned resources in the background. This function holds this
+        // sandbox's local mutation lock through the rest of its body, so the
+        // driver call must not be awaited here: doing so would block every
+        // operation on this sandbox and any global mutation on a single,
         // potentially slow or stuck driver RPC.
         self.spawn_driver_sandbox_cleanup(&sandbox_id, &sandbox_name);
         self.apply_deleted_if_version_locked(&sandbox, expected_resource_version)
@@ -7404,20 +7611,24 @@ pub fn new_test_runtime_with_driver(
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
-        sync_lock: Arc::new(Mutex::new(())),
+        mutation_locks: Arc::new(LocalMutationLocks::new()),
         lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
         replica_id: "test-replica".to_string(),
         rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
         restart_authority: Arc::new(OnceLock::new()),
         restart_notify: Arc::new(Notify::new()),
         ssh_identities: Arc::new(OnceLock::new()),
+        supervisor_ocsf_headers: Arc::new(OnceLock::new()),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    mod error_recovery;
+
     use super::*;
     use futures::stream;
+    use openshell_core::proto::SandboxPolicy as PublicSandboxPolicy;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
         GetSandboxResponse, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
@@ -7780,7 +7991,10 @@ mod tests {
         workspace_rpcs_unimplemented: bool,
         omit_protocol_metadata: bool,
         requires_launch_authentication: bool,
+        validate_create_calls: AtomicUsize,
+        validated_sandboxes: TestMutex<Vec<DriverSandbox>>,
         create_calls: AtomicUsize,
+        created_sandboxes: TestMutex<Vec<DriverSandbox>>,
     }
 
     #[tonic::async_trait]
@@ -7836,8 +8050,13 @@ mod tests {
 
         async fn validate_sandbox_create(
             &self,
-            _request: Request<ValidateSandboxCreateRequest>,
+            request: Request<ValidateSandboxCreateRequest>,
         ) -> Result<tonic::Response<ValidateSandboxCreateResponse>, Status> {
+            self.validate_create_calls.fetch_add(1, Ordering::Relaxed);
+            self.validated_sandboxes
+                .lock()
+                .expect("validated sandbox observation lock poisoned")
+                .push(request.into_inner().sandbox.expect("validation sandbox"));
             Ok(tonic::Response::new(ValidateSandboxCreateResponse {}))
         }
 
@@ -7887,9 +8106,15 @@ mod tests {
 
         async fn create_sandbox(
             &self,
-            _request: Request<CreateSandboxRequest>,
+            request: Request<CreateSandboxRequest>,
         ) -> Result<tonic::Response<CreateSandboxResponse>, Status> {
             self.create_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(sandbox) = request.into_inner().sandbox {
+                self.created_sandboxes
+                    .lock()
+                    .expect("created sandbox observation lock poisoned")
+                    .push(sandbox);
+            }
             Ok(tonic::Response::new(CreateSandboxResponse::default()))
         }
 
@@ -8498,13 +8723,132 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
-            sync_lock: Arc::new(Mutex::new(())),
+            mutation_locks: Arc::new(LocalMutationLocks::new()),
             lifecycle_gates: Arc::new(LifecycleGateRegistry::default()),
             replica_id: "test-replica".to_string(),
             rootfs_tar_staging: Arc::new(rootfs_tar::RootfsTarStagingRegistry::disabled()),
             restart_authority: Arc::new(OnceLock::new()),
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
+            supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_runtime_inputs_reach_driver_without_persisting_effective_policy_or_secrets() {
+        let driver = Arc::new(TestDriver::default());
+        let runtime = test_runtime(driver.clone()).await;
+
+        let mut sandbox = sandbox_record(
+            "sb-provider-inputs",
+            "provider-inputs",
+            SandboxPhase::Provisioning,
+        );
+        sandbox.spec = Some(SandboxSpec {
+            policy: Some(PublicSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut runtime_inputs = SandboxCreateRuntimeInputs::new(PublicSandboxPolicy {
+            version: 2,
+            ..Default::default()
+        });
+        let launch_authentication = test_launch_authentication(&sandbox);
+        runtime_inputs.launch_authentication = Some(launch_authentication.clone());
+
+        runtime
+            .create_sandbox_with_runtime_inputs(sandbox, None, false, runtime_inputs)
+            .await
+            .expect("create should succeed");
+
+        let observed_policy_version = {
+            let created = driver
+                .created_sandboxes
+                .lock()
+                .expect("created sandbox observation lock poisoned");
+            assert_eq!(
+                created[0].spec.as_ref().unwrap().launch_authentication,
+                launch_authentication,
+                "launch authentication must reach only the driver"
+            );
+            created[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version)
+        };
+        assert_eq!(
+            observed_policy_version,
+            Some(2),
+            "the driver must receive the effective policy"
+        );
+
+        let persisted = runtime
+            .store
+            .get_message::<Sandbox>("sb-provider-inputs")
+            .await
+            .expect("persisted sandbox lookup should succeed")
+            .expect("sandbox should be persisted");
+        assert!(
+            !persisted
+                .encode_to_vec()
+                .windows(launch_authentication.len())
+                .any(|bytes| bytes == launch_authentication),
+            "launch authentication must not enter the public sandbox record"
+        );
+        assert_eq!(
+            persisted
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.policy.as_ref())
+                .map(|policy| policy.version),
+            Some(1),
+            "the public sandbox must retain its base policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_and_create_receive_the_same_main_attachment_intent() {
+        for attachment_expected in [false, true] {
+            let driver = Arc::new(TestDriver::default());
+            let runtime = test_runtime(driver.clone()).await;
+            let mut sandbox =
+                sandbox_record("sb-attachment", "attachment", SandboxPhase::Provisioning);
+            sandbox.spec = Some(SandboxSpec {
+                command: vec!["echo".into(), "ok".into()],
+                ..Default::default()
+            });
+            let inputs = SandboxCreateRuntimeInputs::default();
+            runtime
+                .validate_sandbox_create_with_runtime_inputs(&sandbox, &inputs, attachment_expected)
+                .await
+                .expect("preflight");
+            runtime
+                .create_sandbox_with_runtime_inputs(sandbox, None, attachment_expected, inputs)
+                .await
+                .expect("create");
+            let validated = driver.validated_sandboxes.lock().unwrap();
+            let created = driver.created_sandboxes.lock().unwrap();
+            assert_eq!(validated.len(), 1);
+            assert_eq!(created.len(), 1);
+            assert_eq!(
+                validated[0]
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .await_main_process_attachment,
+                attachment_expected
+            );
+            assert_eq!(
+                created[0]
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .await_main_process_attachment,
+                attachment_expected
+            );
         }
     }
 
@@ -8886,13 +9230,15 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), driver.create_started.notified())
             .await
             .unwrap();
-        let guard = runtime.sync_lock.clone().lock_owned().await;
-        let held_references = Arc::strong_count(&runtime.sync_lock);
+        let guard = runtime.lock_sandbox_local("sb-cancel-cleanup-lock").await;
+        let sandbox_key =
+            crate::persistence::MutationLockKey::Sandbox("sb-cancel-cleanup-lock").advisory_key();
+        let held_references = runtime.mutation_locks.key_references(sandbox_key);
         driver.release_create();
-        // An additional owned reference shows cleanup has started waiting.
-        // The cleanup worker must be owned before waiting for this guard.
+        // An additional reference to the sandbox key shows cleanup has started
+        // waiting. The cleanup worker must be owned before waiting for this guard.
         tokio::time::timeout(Duration::from_secs(5), async {
-            while Arc::strong_count(&runtime.sync_lock) <= held_references {
+            while runtime.mutation_locks.key_references(sandbox_key) <= held_references {
                 tokio::task::yield_now().await;
             }
         })
@@ -10298,6 +10644,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalized_ephemeral_cleanup_waits_only_for_its_sandbox_lock() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        sandbox.metadata.as_mut().unwrap().annotations.insert(
+            "openshell.nvidia.com/retention".to_string(),
+            "ephemeral".to_string(),
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+        runtime
+            .supervisor_session_connected("sb-1", "instance-1")
+            .await
+            .unwrap();
+        runtime
+            .report_main_process_exit("sb-1", "instance-1", 0)
+            .await
+            .unwrap();
+        runtime
+            .finalize_main_process_exit("sb-1", "instance-1")
+            .await
+            .unwrap();
+
+        let unrelated = crate::persistence::lock_order::branch(
+            runtime.mutation_guard(MutationScope::sandbox("default", "sb-2")),
+        )
+        .await
+        .unwrap();
+        let held = runtime.lock_sandbox_local("sb-1").await;
+        let mut cleanup = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .cleanup_finalized_ephemeral_sandbox("sb-1", "instance-1")
+                    .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cleanup)
+                .await
+                .is_err(),
+            "cleanup should wait for the sandbox's local lock"
+        );
+        assert_eq!(driver.delete_calls(), 0);
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup should not wait for another sandbox's guard")
+            .expect("cleanup task")
+            .unwrap();
+        drop(unrelated);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while driver.delete_calls() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup should delete once the sandbox lock is released");
+    }
+
+    #[tokio::test]
     async fn conflicting_duplicate_main_process_exit_is_acknowledged() {
         let runtime = test_runtime(Arc::new(TestDriver::default())).await;
         let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
@@ -10834,7 +11241,7 @@ mod tests {
             r#type: "Ready".to_string(),
             status: "True".to_string(),
             reason: "AgentRunning".to_string(),
-            message: "MXC workload is running".to_string(),
+            message: "Workload is running".to_string(),
             transition_time: None,
         });
 
@@ -12000,6 +12407,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn launch_bundles_carry_supervisor_ocsf_headers() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        runtime.configure_supervisor_ocsf_headers(Some(
+            openshell_core::jwt::SecretOtlpHeaders::new(
+                "authorization=Bearer%20secret".to_string(),
+            ),
+        ));
+        let sandbox = sandbox_record(
+            "sb-ocsf-headers",
+            "sandbox-ocsf-headers",
+            SandboxPhase::Stopped,
+        );
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .start_sandbox_authenticated(
+                sandbox.object_workspace(),
+                sandbox.object_name(),
+                Some(&test_session_authority()),
+            )
+            .await
+            .unwrap();
+
+        let authentications = driver.start_authentications();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&authentications[0]).unwrap();
+        assert_eq!(
+            authentication
+                .supervisor
+                .ocsf_otlp_headers
+                .as_ref()
+                .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret),
+            Some("authorization=Bearer%20secret")
+        );
+    }
+
+    #[tokio::test]
     async fn request_cancellation_does_not_cancel_start_worker() {
         let driver = ControlledDriver::new();
         driver.block_start();
@@ -13158,6 +13603,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_guarded_delete_rejects_a_different_sandbox_before_mutation() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-current", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let error = runtime
+            .delete_sandbox_with_preconditions(
+                "default",
+                "sandbox-a",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some("sb-stale".to_string()),
+                    expected_resource_version: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.delete_calls(), 0);
+        let current = runtime
+            .store
+            .get_message::<Sandbox>("sb-current")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(current.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_guarded_delete_revalidates_resource_version_under_lifecycle_lock() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let expected_resource_version = sandbox_resource_version(&current);
+
+        let delete_gate = runtime.lifecycle_gates.gate_for(sandbox.object_id());
+        let delete_guard = delete_gate.lock().await;
+        let delete_runtime = runtime.clone();
+        let delete = tokio::spawn(async move {
+            delete_runtime
+                .delete_sandbox_with_preconditions(
+                    "default",
+                    "sandbox-a",
+                    SandboxDeletePreconditions {
+                        expected_sandbox_id: Some("sb-1".to_string()),
+                        expected_resource_version: Some(expected_resource_version),
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while Arc::strong_count(&delete_gate) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guarded delete did not start waiting on the sandbox gate");
+
+        runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                sandbox.object_id(),
+                expected_resource_version,
+                |sandbox| sandbox.set_current_policy_version(9),
+            )
+            .await
+            .unwrap();
+        drop(delete_guard);
+
+        let error = delete.await.unwrap().unwrap_err();
+        assert_eq!(error.code(), Code::Aborted);
+        assert_eq!(driver.delete_calls(), 0);
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.current_policy_version(), 9);
+        assert_eq!(
+            SandboxPhase::try_from(current.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_guarded_delete_accepts_the_exact_current_identity() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(sandbox.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let result = runtime
+            .delete_sandbox_with_preconditions(
+                "default",
+                "sandbox-a",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some(current.object_id().to_string()),
+                    expected_resource_version: Some(sandbox_resource_version(&current)),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(result.acknowledged());
+        assert_eq!(result.sandbox_id, "sb-1");
+        assert_eq!(driver.delete_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn request_cancellation_does_not_cancel_the_delete_worker() {
         let driver = ControlledDriver::new();
         driver.block_delete();
@@ -13512,8 +14084,8 @@ mod tests {
         );
 
         // The driver call is backgrounded (see `spawn_driver_sandbox_cleanup`)
-        // so the prune sweep never awaits it while holding the gateway-wide
-        // sync_lock; wait for it to actually land before asserting on it.
+        // so the prune sweep never awaits it while holding the sandbox's local
+        // mutation lock; wait for it to actually land before asserting on it.
         tokio::time::timeout(Duration::from_secs(1), driver.delete_started.notified())
             .await
             .expect("background driver cleanup did not run");
@@ -13526,7 +14098,7 @@ mod tests {
     #[tokio::test]
     async fn prune_sweep_does_not_block_on_a_stuck_driver_delete_call() {
         // Regression test: the prune sweep's driver cleanup must not be
-        // awaited while holding `sync_lock` (the gateway-wide state guard).
+        // awaited while holding the sandbox's local mutation lock.
         // Block the driver's delete call indefinitely and confirm the sweep
         // itself still completes promptly and removes the store record.
         let driver = ControlledDriver::new();
@@ -16516,7 +17088,7 @@ mod tests {
             let mut runtime = test_runtime(driver.clone()).await;
             enable_runtime_identity_binding(&mut runtime);
             let mut other = runtime.clone();
-            other.sync_lock = Arc::new(Mutex::new(()));
+            other.mutation_locks = Arc::new(LocalMutationLocks::new());
             other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
             other.driver_info.gateway_manages_lifecycle = true;
             let mut sandbox = sandbox_record(
@@ -16531,7 +17103,7 @@ mod tests {
             let create =
                 tokio::spawn(async move { creating.create_sandbox(sandbox, None, false).await });
             driver.create_started.notified().await;
-            let held = runtime.sync_lock.lock().await;
+            let held = runtime.lock_sandbox_local("sb-result-owner").await;
             driver.release_create();
             wait_driver_pending(&other, "sb-result-owner", false).await;
             driver.set_runtime_identity("recovery-runtime");
@@ -16614,7 +17186,7 @@ mod tests {
         driver.block_stop();
         let runtime = test_runtime(driver.clone()).await;
         let mut other = runtime.clone();
-        other.sync_lock = Arc::new(Mutex::new(()));
+        other.mutation_locks = Arc::new(LocalMutationLocks::new());
         other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
         let now = openshell_core::time::now_ms();
         let mut sandbox = sandbox_record("sb-stop-lease", "stop-lease", SandboxPhase::Provisioning);
@@ -16703,7 +17275,7 @@ mod tests {
         let mut runtime = test_runtime(driver.clone()).await;
         enable_runtime_identity_binding(&mut runtime);
         let mut other = runtime.clone();
-        other.sync_lock = Arc::new(Mutex::new(()));
+        other.mutation_locks = Arc::new(LocalMutationLocks::new());
         other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
         let mut sandbox =
             sandbox_record("sb-restart-pending", "restart-pending", SandboxPhase::Ready);
@@ -16807,7 +17379,7 @@ mod tests {
         driver.block_start();
         let runtime = test_runtime(driver.clone()).await;
         let mut other = runtime.clone();
-        other.sync_lock = Arc::new(Mutex::new(()));
+        other.mutation_locks = Arc::new(LocalMutationLocks::new());
         other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
         let mut sandbox = sandbox_record("sb-auto-owned", "auto-owned", SandboxPhase::Ready);
         sandbox
@@ -17002,12 +17574,12 @@ mod tests {
                 owned.clone()
             };
             let gate = runtime.lifecycle_gates.lock_for(sandbox.object_id()).await;
-            let global = runtime.lock_global_for_lifecycle(&gate).await;
+            let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
             let error = runtime
                 .compensate_failed_create(
                     &owned,
                     gate,
-                    Some(global),
+                    Some(sandbox_guard),
                     Status::internal("missing binding"),
                 )
                 .await;
@@ -17118,7 +17690,7 @@ mod tests {
         let create =
             tokio::spawn(async move { creating.create_sandbox(sandbox, None, false).await });
         driver.create_started.notified().await;
-        let held = runtime.sync_lock.lock().await;
+        let held = runtime.lock_sandbox_local("sb-monitor").await;
         sqlx::query("ALTER TABLE objects RENAME TO temporarily_hidden_objects")
             .execute(&pool)
             .await
@@ -17193,7 +17765,7 @@ mod tests {
         );
         let mut restarted = runtime.clone();
         restarted.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
-        restarted.sync_lock = Arc::new(Mutex::new(()));
+        restarted.mutation_locks = Arc::new(LocalMutationLocks::new());
         restarted.driver_info.gateway_manages_lifecycle = true;
         restarted
             .start_persisted_sandboxes_with_authentication(
@@ -17531,7 +18103,7 @@ mod tests {
             .reconcile_provisioning_deadlines(now + 1_000)
             .await
             .unwrap();
-        let _global_guard = runtime.lock_global_for_lifecycle(&lifecycle_guard).await;
+        let _sandbox_guard = runtime.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         let result = runtime
             .begin_sandbox_delete_with_initial_snapshot(
                 sandbox.object_id(),
@@ -17558,7 +18130,7 @@ mod tests {
         driver.track_compute.store(true, Ordering::SeqCst);
         let runtime = test_runtime(driver.clone()).await;
         let mut other = runtime.clone();
-        other.sync_lock = Arc::new(Mutex::new(()));
+        other.mutation_locks = Arc::new(LocalMutationLocks::new());
         other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
         other.replica_id = "other-replica".into();
         let now = openshell_core::time::now_ms();
@@ -17626,7 +18198,7 @@ mod tests {
 
         // STOP has observed absence. Keep its final reread blocked while the
         // original CREATE succeeds and durably clears pending ownership.
-        let held = other.sync_lock.lock().await;
+        let held = other.lock_sandbox_local("sb-create-retry").await;
         driver.release_stop();
         driver.stop_finished.notified().await;
         driver.release_create();
@@ -18015,7 +18587,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let gate = runtime.lifecycle_gates.lock_for("sb-prepare").await;
-        let global = runtime.lock_global_for_lifecycle(&gate).await;
+        let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
         assert!(
             runtime
                 .claim_provisioning_timeout(&sandbox, 600_000)
@@ -18048,7 +18620,7 @@ mod tests {
         assert!(record.admission_start_time.is_none());
         assert!(record.preparation_deadline.is_some());
         assert!(record.cleanup_completed_time.is_none());
-        drop(global);
+        drop(sandbox_guard);
         runtime
             .reclaim_provisioning_timeout(&expired, &gate)
             .await
@@ -18079,7 +18651,7 @@ mod tests {
         let runtime = test_runtime(driver.clone()).await;
         let sandbox = seed_provisioning_attempt(&runtime).await;
         let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;
-        let global = runtime.lock_global_for_lifecycle(&gate).await;
+        let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
         assert!(
             runtime
                 .claim_provisioning_timeout(&sandbox, 299_999)
@@ -18092,7 +18664,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        drop(global);
+        drop(sandbox_guard);
         assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
         assert!(
             ready_condition(&expired)
@@ -18186,13 +18758,13 @@ mod tests {
         let runtime = test_runtime(driver.clone()).await;
         let sandbox = seed_provisioning_attempt(&runtime).await;
         let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;
-        let global = runtime.lock_global_for_lifecycle(&gate).await;
+        let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
         let expired = runtime
             .claim_provisioning_timeout(&sandbox, 300_000)
             .await
             .unwrap()
             .unwrap();
-        drop(global);
+        drop(sandbox_guard);
         runtime
             .reclaim_provisioning_timeout(&expired, &gate)
             .await
@@ -18301,6 +18873,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn provisioning_reconcile_waits_for_a_local_workspace_writer() {
+        let runtime = test_runtime(ControlledDriver::new()).await;
+        runtime
+            .store
+            .put_message(&sandbox_record(
+                "sb-ws-writer",
+                "ws-writer",
+                SandboxPhase::Provisioning,
+            ))
+            .await
+            .unwrap();
+        // Reconcile re-derives configuration from provider and profile
+        // records, so it waits for their writers, which hold X(workspace).
+        let writer = runtime
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
+        let mut reconcile = {
+            let runtime = runtime.clone();
+            let now = openshell_core::time::now_ms();
+            tokio::spawn(async move { runtime.reconcile_provisioning_deadlines(now).await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut reconcile)
+                .await
+                .is_err(),
+            "provisioning reconcile must wait for the workspace writer"
+        );
+        drop(writer);
+        tokio::time::timeout(Duration::from_secs(5), reconcile)
+            .await
+            .expect("provisioning reconcile proceeds once the writer releases")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]
@@ -18440,13 +19049,13 @@ mod tests {
         let runtime = test_runtime(driver.clone()).await;
         let sandbox = seed_provisioning_attempt(&runtime).await;
         let gate = runtime.lifecycle_gates.lock_for("sb-ttl").await;
-        let global = runtime.lock_global_for_lifecycle(&gate).await;
+        let sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
         let expired = runtime
             .claim_provisioning_timeout(&sandbox, 300_000)
             .await
             .unwrap()
             .unwrap();
-        drop(global);
+        drop(sandbox_guard);
         runtime
             .reclaim_provisioning_timeout(&expired, &gate)
             .await

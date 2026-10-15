@@ -263,6 +263,12 @@ pub struct VmDriverConfig {
     /// supplies its own export endpoint; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    /// Gateway name passed to supervisors for their telemetry.
+    pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
@@ -317,6 +323,8 @@ impl std::fmt::Debug for VmDriverConfig {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
+            .field("supervisor_ocsf_export", &self.supervisor_ocsf_export)
+            .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
@@ -381,6 +389,8 @@ impl Default for VmDriverConfig {
         Self {
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
                 openshell_core::resource_admission::ResourceAdmissionConfig::default(),
@@ -987,6 +997,12 @@ impl VmDriver {
             command
                 .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
                 .envs(openshell_otel::current_trace_context_environment());
+        }
+        if let Some(export) = &self.config.supervisor_ocsf_export {
+            command.envs(export.environment());
+        }
+        if let Some(name) = &self.config.supervisor_gateway_name {
+            command.env(openshell_core::sandbox_env::GATEWAY_NAME, name);
         }
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
@@ -7201,8 +7217,13 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
 }
 
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
-    process.supervisor_liveness.take();
+    // Liveness EOF makes the supervisor exit at once, skipping workload
+    // teardown and its OCSF export flush, so close it only after SIGTERM has
+    // had its chance. Each process keeps its five-second budget, so a stop
+    // still completes within ten seconds; a slow workload stop can leave the
+    // supervisor too little time to flush.
     let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
+    process.supervisor_liveness.take();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
 
     match (supervisor_error, vm_error) {
@@ -10090,6 +10111,7 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -11718,6 +11740,59 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// A stand-in supervisor that drains for a second on SIGTERM and then
+    /// writes `marker`, unless liveness reached EOF while it drained, which
+    /// would have made the real supervisor exit at once.
+    #[cfg(unix)]
+    fn spawn_draining_supervisor(marker: &Path) -> (Child, fs::File) {
+        let (liveness_read, liveness_write) = nix::unistd::pipe().unwrap();
+        // As in production, so the child does not inherit the write end.
+        nix::fcntl::fcntl(
+            liveness_write.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"(cat >/dev/null; touch "$0.eof") <&0 &
+trap 'sleep 1; [ -e "$0.eof" ] || echo drained > "$0"; exit 0' TERM
+wait $!
+exit 1"#,
+            )
+            .arg(marker)
+            .stdin(Stdio::from(liveness_read))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Let the shell install its trap before the test signals it.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(child.try_wait().unwrap().is_none());
+        (child, fs::File::from(liveness_write))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_sandbox_lets_the_supervisor_drain_before_closing_liveness() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("drained");
+        let (supervisor, liveness) = spawn_draining_supervisor(&marker);
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(liveness),
+            deleting: true,
+        };
+
+        terminate_sandbox_processes(&mut process).await.unwrap();
+
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "drained\n");
+        assert!(process.supervisor_liveness.is_none());
+        let _ = fs::remove_dir_all(dir);
     }
 
     async fn insert_test_record(
