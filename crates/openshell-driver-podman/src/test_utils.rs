@@ -23,6 +23,7 @@ pub struct StubResponse {
     pub body: Bytes,
     pub delay: Duration,
     pub archive_members: Option<Vec<PathBuf>>,
+    pub gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 impl StubResponse {
@@ -32,7 +33,17 @@ impl StubResponse {
             body: body.into(),
             delay: Duration::ZERO,
             archive_members: None,
+            gate: None,
         }
+    }
+
+    pub fn with_gate(
+        mut self,
+        reached: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.gate = Some((reached, release));
+        self
     }
 
     pub fn with_delay(mut self, delay: Duration) -> Self {
@@ -88,56 +99,66 @@ pub fn spawn_podman_stub(
     let log_for_task = request_log.clone();
     let queue_for_task = response_queue;
     let handle = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
         for _ in 0..expected {
             let (stream, _) = listener.accept().await.expect("test stub should accept");
             let log = log_for_task.clone();
             let queue = queue_for_task.clone();
-            let result = http1::Builder::new()
-                .serve_connection(
-                    TokioIo::new(stream),
-                    service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let log = log.clone();
-                        let queue = queue.clone();
-                        async move {
-                            let path = req.uri().path_and_query().map_or_else(
-                                || req.uri().path().to_string(),
-                                |pq| pq.as_str().to_string(),
-                            );
-                            log.lock()
-                                .expect("request log lock should not be poisoned")
-                                .push(format!("{} {}", req.method(), path));
-                            let response = queue
-                                .lock()
-                                .expect("response queue lock should not be poisoned")
-                                .pop_front()
-                                .expect("stub response should exist");
-                            if let Some(expected_members) = &response.archive_members {
-                                assert_eq!(req.method(), hyper::Method::PUT);
-                                let body = req.into_body().collect().await.unwrap().to_bytes();
-                                let mut archive = tar::Archive::new(body.as_ref());
-                                let members: Vec<_> = archive
-                                    .entries()
-                                    .unwrap()
-                                    .map(|entry| entry.unwrap().path().unwrap().into_owned())
-                                    .collect();
-                                assert_eq!(&members, expected_members);
+            connections.spawn(async move {
+                let result = http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let log = log.clone();
+                            let queue = queue.clone();
+                            async move {
+                                let path = req.uri().path_and_query().map_or_else(
+                                    || req.uri().path().to_string(),
+                                    |pq| pq.as_str().to_string(),
+                                );
+                                log.lock()
+                                    .expect("request log lock should not be poisoned")
+                                    .push(format!("{} {}", req.method(), path));
+                                let response = queue
+                                    .lock()
+                                    .expect("response queue lock should not be poisoned")
+                                    .pop_front()
+                                    .expect("stub response should exist");
+                                if let Some(expected_members) = &response.archive_members {
+                                    assert_eq!(req.method(), hyper::Method::PUT);
+                                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                                    let mut archive = tar::Archive::new(body.as_ref());
+                                    let members: Vec<_> = archive
+                                        .entries()
+                                        .unwrap()
+                                        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+                                        .collect();
+                                    assert_eq!(&members, expected_members);
+                                }
+                                if let Some((reached, release)) = &response.gate {
+                                    reached.notify_one();
+                                    release.notified().await;
+                                }
+                                tokio::time::sleep(response.delay).await;
+                                Ok::<_, Infallible>(
+                                    hyper::Response::builder()
+                                        .status(response.status)
+                                        .body(Full::new(response.body))
+                                        .expect("stub response should build"),
+                                )
                             }
-                            tokio::time::sleep(response.delay).await;
-                            Ok::<_, Infallible>(
-                                hyper::Response::builder()
-                                    .status(response.status)
-                                    .body(Full::new(response.body))
-                                    .expect("stub response should build"),
-                            )
-                        }
-                    }),
-                )
-                .await;
-            // The one-shot test client can close the Unix socket after the
-            // response, which Hyper reports as a shutdown error. Let the
-            // request log assertions below decide whether the stub served
-            // the expected API calls.
-            let _ = result;
+                        }),
+                    )
+                    .await;
+                // The one-shot test client can close the Unix socket after the
+                // response, which Hyper reports as a shutdown error. Let the
+                // request log assertions below decide whether the stub served
+                // the expected API calls.
+                let _ = result;
+            });
+        }
+        while let Some(result) = connections.join_next().await {
+            result.unwrap();
         }
         let _ = std::fs::remove_file(&socket_path_for_task);
     });
