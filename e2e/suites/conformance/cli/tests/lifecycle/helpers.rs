@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use openshell_e2e_support::CommandResult;
 use openshell_e2e_support::OpenShellRunner;
 use openshell_e2e_support::Poll;
 use serde::Deserialize;
@@ -18,6 +19,16 @@ pub struct SandboxState {
     pub id: String,
     pub name: String,
     pub phase: String,
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub conditions: Vec<SandboxCondition>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SandboxCondition {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,29 +43,156 @@ pub async fn create_running_sandbox(
     main: &str,
     step: &str,
 ) -> Result<(), String> {
-    runner.track_sandbox(sandbox_name);
-    let create = runner
-        .step(format!("{step}/create"))
-        .description(format!("sandbox '{sandbox_name}' is created"))
-        .with_timeout(CREATE_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "create",
-            "--name",
-            sandbox_name,
-            "--detach",
-            "--no-tty",
-            "--",
-            "sh",
-            "-lc",
-            main,
-        ])
-        .await
-        .map_err(|error| error.to_string())?;
-    create.require_success()?;
+    create_with_main(
+        runner,
+        sandbox_name,
+        &["--detach"],
+        &["sh", "-lc", main],
+        &format!("{step}/create"),
+    )
+    .await?
+    .require_success()?;
     wait_for_phase(runner, sandbox_name, "Ready", &format!("{step}/ready"))
         .await
         .map(|_| ())
+}
+
+/// Create a sandbox whose main process is `main` and return the create result
+/// without judging it. `flags` are extra `sandbox create` flags such as
+/// `--detach`.
+pub async fn create_with_main(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    flags: &[&str],
+    main: &[&str],
+    step: &str,
+) -> Result<CommandResult, String> {
+    runner.track_sandbox(sandbox_name);
+    let mut args = vec!["sandbox", "create", "--name", sandbox_name, "--no-tty"];
+    args.extend_from_slice(flags);
+    args.push("--");
+    args.extend_from_slice(main);
+    runner
+        .step(step)
+        .description(format!("sandbox '{sandbox_name}' is created"))
+        .with_timeout(CREATE_TIMEOUT)
+        .run(&args)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Wait until the sandbox is in the terminal `phase` with the main process's
+/// `exit_code` recorded. The exit code can arrive after a driver-observed
+/// phase change, so a missing code is polled, not failed; a different code
+/// fails at once.
+pub async fn expect_terminal_result(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    phase: &str,
+    exit_code: i32,
+    step: &str,
+) -> Result<SandboxState, String> {
+    let sandbox_name = sandbox_name.to_string();
+    let phase = phase.to_string();
+    let step = step.to_string();
+    let poll_step = step.clone();
+    runner
+        .poll_until(
+            &poll_step,
+            TRANSITION_TIMEOUT,
+            TRANSITION_INTERVAL,
+            async move |runner| {
+                let result = runner
+                    .step(format!("{step}/get"))
+                    .description(format!(
+                        "sandbox '{sandbox_name}' is {phase} with exit code {exit_code}"
+                    ))
+                    .with_timeout(COMMAND_TIMEOUT)
+                    .run(&["sandbox", "get", &sandbox_name, "--output", "json"])
+                    .await;
+                match result {
+                    Ok(result) if !result.success() => Poll::Pending(result.failure_diagnostic(
+                        &format!("sandbox '{sandbox_name}' can be retrieved"),
+                    )),
+                    Ok(result) => match result.json::<SandboxState>() {
+                        Ok(state) if state.exit_code.is_some_and(|code| code != exit_code) => {
+                            Poll::Failed(format!(
+                                "sandbox '{sandbox_name}' recorded exit code {:?}; expected {exit_code}",
+                                state.exit_code
+                            ))
+                        }
+                        Ok(state) if state.phase == phase && state.exit_code == Some(exit_code) => {
+                            Poll::Ready(state)
+                        }
+                        Ok(state) => Poll::Pending(format!(
+                            "sandbox '{sandbox_name}' is {:?} with exit code {:?}; expected {phase:?} with {exit_code}",
+                            state.phase, state.exit_code
+                        )),
+                        Err(error) => Poll::Failed(error.to_string()),
+                    },
+                    Err(error) => Poll::Pending(error.to_string()),
+                }
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Create a detached sandbox whose main process waits for a release file and
+/// then exits with `exit_code`, and release it once the sandbox is created. The
+/// gate makes the exit happen after creation, not during it.
+pub async fn run_gated_main(
+    runner: &mut OpenShellRunner,
+    sandbox_name: &str,
+    exit_code: i32,
+    step: &str,
+) -> Result<(), String> {
+    let release = "/sandbox/.openshell-release";
+    let main = format!("while [ ! -e '{release}' ]; do sleep 0.05; done; exit {exit_code}");
+    create_with_main(
+        runner,
+        sandbox_name,
+        &["--detach"],
+        &["sh", "-c", &main],
+        &format!("{step}/create"),
+    )
+    .await?
+    .require_success()?;
+    exec_succeeds(
+        runner,
+        sandbox_name,
+        &["touch", release],
+        &format!("{step}/release"),
+    )
+    .await
+}
+
+/// Run `command` in the sandbox and require it to succeed.
+pub async fn exec_succeeds(
+    runner: &OpenShellRunner,
+    sandbox_name: &str,
+    command: &[&str],
+    step: &str,
+) -> Result<(), String> {
+    let mut args = vec!["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"];
+    args.extend_from_slice(command);
+    runner
+        .step(step)
+        .description(format!("sandbox '{sandbox_name}' exec succeeds"))
+        .with_timeout(COMMAND_TIMEOUT)
+        .run(&args)
+        .await
+        .map_err(|error| error.to_string())?
+        .require_success()
+}
+
+/// Require the main process's `line` among the create command's output.
+pub fn require_output_line(result: &CommandResult, line: &str) -> Result<(), String> {
+    if result.stdout().lines().any(|output| output.trim() == line) {
+        Ok(())
+    } else {
+        Err(result.failure_diagnostic(&format!("main process output includes {line:?}")))
+    }
 }
 
 pub async fn run_lifecycle_command(

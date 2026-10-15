@@ -4,5 +4,10 @@
 //! Lifecycle conformance stories.
 
 mod delete_stopped;
+mod detached_exit_nonzero;
+mod detached_exit_zero;
+mod detached_fast_exit;
 mod helpers;
+mod main_exit_nonzero;
+mod main_exit_zero;
 mod stop_start;
