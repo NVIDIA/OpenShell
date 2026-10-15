@@ -253,6 +253,17 @@ pub fn publish_all_connected(state: &Arc<ServerState>) {
     publish_fanout(state, &FanoutScope::AllConnected);
 }
 
+/// Push a change that every replica observes on its own, such as a refreshed
+/// provider profile source, to the sessions this replica holds. Each replica
+/// publishes its own change, so notifying peers would repeat it.
+pub fn publish_all_local(state: &Arc<ServerState>) {
+    if push_enabled(state) {
+        state
+            .config_delivery
+            .publish_fanout(&FanoutScope::AllConnected);
+    }
+}
+
 fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope) {
     if !push_enabled(state) {
         return;
@@ -1256,6 +1267,7 @@ mod tests {
         publish_workspace(&state, "default");
         publish_provider(&state, "default", "github");
         publish_all_connected(&state);
+        publish_all_local(&state);
 
         assert_eq!(state.config_delivery.publications(), 0);
         assert!(
@@ -1440,6 +1452,30 @@ mod tests {
             .await
             .expect("configuration update");
         assert!(is_config_update(&update));
+    }
+
+    #[tokio::test]
+    async fn local_publication_reaches_this_replicas_sessions_without_peers() {
+        let state = push_state().await;
+        put_sandbox(&state, "sandbox", &[]).await;
+        let (mut harness, _) = accepted_session(&state, "sandbox").await;
+        change_policy(&state, "sandbox", 1).await;
+
+        publish_all_local(&state);
+
+        let update = next_update(&mut harness, Duration::from_secs(5))
+            .await
+            .expect("configuration update");
+        assert!(is_config_update(&update));
+        assert!(
+            state
+                .config_delivery
+                .peer_notifies
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a local publication notifies no peers"
+        );
     }
 
     #[tokio::test]

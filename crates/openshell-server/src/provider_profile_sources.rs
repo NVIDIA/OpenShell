@@ -534,8 +534,9 @@ fn record_refresh(outcome: &'static str) {
 }
 
 /// Keep cached provider profile sources fresh, and push a changed catalog to
-/// supervisor sessions. The first refresh runs before the gateway serves, in
-/// `run_server`.
+/// this replica's supervisor sessions. Every replica runs its own refresh, so
+/// none notifies its peers. The first refresh runs before the gateway serves,
+/// in `run_server`.
 pub fn spawn_refresh(state: Arc<ServerState>) {
     let sources = &state.provider_profile_sources;
     if sources.cached.is_empty() {
@@ -553,7 +554,7 @@ pub fn spawn_refresh(state: Arc<ServerState>) {
                 .refresh_cached(&state.store)
                 .await
             {
-                crate::config_delivery::publish_all_connected(&state);
+                crate::config_delivery::publish_all_local(&state);
             }
         }
     });
