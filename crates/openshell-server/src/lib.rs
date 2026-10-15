@@ -526,6 +526,7 @@ pub(crate) async fn run_server(
     startup: ServerStartupConfig,
     tracing_log_bus: TracingLogBus,
     compute_drivers: ComputeDriverRegistry,
+    meter_provider: Option<openshell_otel::SdkMeterProvider>,
 ) -> Result<()> {
     let ServerStartupConfig {
         config,
@@ -873,13 +874,18 @@ pub(crate) async fn run_server(
         info!("Health server disabled");
     }
 
-    // Bind the Prometheus metrics endpoint on a dedicated port when configured.
-    if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = gateway_metrics::install_global_recorder(
-            supervisor_session::RELAY_CAPACITY,
-            store.mutation_lock_connections(),
-        )
-        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    // Record metrics when the Prometheus endpoint or OTLP push is configured, and serve the
+    // endpoint on a dedicated port when configured.
+    let prometheus_handle = gateway_metrics::install_global_recorder(
+        supervisor_session::RELAY_CAPACITY,
+        store.mutation_lock_connections(),
+        config.metrics_bind_address.is_some(),
+        meter_provider.as_ref(),
+    )
+    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    if let (Some(metrics_bind_address), Some(prometheus_handle)) =
+        (config.metrics_bind_address, prometheus_handle)
+    {
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",

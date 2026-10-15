@@ -10,6 +10,10 @@ use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsServiceRequest, ExportLogsServiceResponse,
     logs_service_server::{LogsService, LogsServiceServer},
 };
+use opentelemetry_proto::tonic::collector::metrics::v1::{
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    metrics_service_server::{MetricsService, MetricsServiceServer},
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
@@ -78,6 +82,8 @@ pub struct ReceivedTraces {
     pub log_bodies: Vec<String>,
     /// `authorization` metadata of each log export request.
     pub log_authorizations: Vec<String>,
+    /// Names of exported metrics.
+    pub metric_names: Vec<String>,
     pub service_names: Vec<String>,
     pub gateway_names: Vec<String>,
     pub compute_drivers: Vec<String>,
@@ -176,7 +182,32 @@ impl LogsService for Collector {
     }
 }
 
-/// Loopback OTLP/gRPC server that captures exported spans, logs, and resources.
+#[tonic::async_trait]
+impl MetricsService for Collector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportMetricsServiceRequest>,
+    ) -> Result<tonic::Response<ExportMetricsServiceResponse>, tonic::Status> {
+        {
+            let mut received = self
+                .received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for resource_metrics in request.into_inner().resource_metrics {
+                received.record_resource(resource_metrics.resource);
+                for scope_metrics in resource_metrics.scope_metrics {
+                    received
+                        .metric_names
+                        .extend(scope_metrics.metrics.into_iter().map(|metric| metric.name));
+                }
+            }
+        }
+        self.exported.notify_one();
+        Ok(tonic::Response::new(ExportMetricsServiceResponse::default()))
+    }
+}
+
+/// Loopback OTLP/gRPC server that captures exported spans, logs, metrics, and resources.
 pub struct OtlpTestServer {
     endpoint: String,
     received: Arc<Mutex<ReceivedTraces>>,
@@ -219,6 +250,8 @@ impl OtlpTestServer {
         }
         let trace_service = TraceServiceServer::new(collector.clone())
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let metrics_service = MetricsServiceServer::new(collector.clone())
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let logs_service = LogsServiceServer::new(collector)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
@@ -226,6 +259,7 @@ impl OtlpTestServer {
             server
                 .add_service(trace_service)
                 .add_service(logs_service)
+                .add_service(metrics_service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {
