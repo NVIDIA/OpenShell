@@ -1259,7 +1259,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn random_scope_mix_never_deadlocks() {
         let runtime = test_runtime().await;
-        run_random_scope_mix(&[runtime], "", 64, 50, Duration::from_secs(20)).await;
+        // Windows timers can exceed the requested 0-2 ms lock holds. Preserve
+        // the same parallel workload and exclusion checks with a larger budget.
+        let seconds = if cfg!(target_os = "windows") { 60 } else { 20 };
+        run_random_scope_mix(&[runtime], "", 64, 50, Duration::from_secs(seconds)).await;
     }
 
     #[cfg(debug_assertions)]

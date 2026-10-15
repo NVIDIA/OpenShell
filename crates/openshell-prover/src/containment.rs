@@ -621,36 +621,46 @@ fn concrete_network_witness(
             .first()
             .map_or("GET", |rule| rule.allow.method.as_str())
             .to_ascii_uppercase();
-        let path = endpoint
+        if !is_canonical_dns_host(&host) || !is_http_method(&method) {
+            continue;
+        }
+        // A broad REST rule can sample outside its endpoint selector. Sample
+        // both constraints, including nested paths: endpoint-selector stars
+        // cross separators while REST rule stars stay within one segment.
+        let rule_path = endpoint
             .rules
             .first()
             .map_or(endpoint.path.as_str(), |rule| rule.allow.path.as_str());
-        let path = if path.is_empty() {
-            "/".to_owned()
-        } else {
-            path.replace("**", "a").replace('*', "a")
-        };
-        if !is_canonical_dns_host(&host)
-            || !is_canonical_rest_path(&path)
-            || !is_http_method(&method)
-        {
-            continue;
+        let mut paths = Vec::with_capacity(4);
+        for pattern in [rule_path, endpoint.path.as_str()] {
+            for wildcard in ["a", "a/b"] {
+                let path = if pattern.is_empty() {
+                    "/".to_owned()
+                } else {
+                    pattern.replace("**", wildcard).replace('*', wildcard)
+                };
+                if is_canonical_rest_path(&path) && !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
         }
-        for destination_ip in ip::sample_addresses(endpoint) {
-            let witness = Counterexample::Network {
-                binary: binary.clone(),
-                ancestor_binary: binary.clone(),
-                binary_identity_required,
-                host: host.clone(),
-                destination_ip,
-                trusted_gateway: false,
-                port: endpoint.effective_ports()[0],
-                protocol: endpoint.protocol_kind(),
-                method: (endpoint.protocol_kind() == Protocol::Rest).then(|| method.clone()),
-                path: (endpoint.protocol_kind() == Protocol::Rest).then(|| path.clone()),
-            };
-            if counterexample_satisfies_predicate(boundary, candidate, &witness) {
-                return Some(witness);
+        for path in paths {
+            for destination_ip in ip::sample_addresses(endpoint) {
+                let witness = Counterexample::Network {
+                    binary: binary.clone(),
+                    ancestor_binary: binary.clone(),
+                    binary_identity_required,
+                    host: host.clone(),
+                    destination_ip,
+                    trusted_gateway: false,
+                    port: endpoint.effective_ports()[0],
+                    protocol: endpoint.protocol_kind(),
+                    method: (endpoint.protocol_kind() == Protocol::Rest).then(|| method.clone()),
+                    path: (endpoint.protocol_kind() == Protocol::Rest).then(|| path.clone()),
+                };
+                if counterexample_satisfies_predicate(boundary, candidate, &witness) {
+                    return Some(witness);
+                }
             }
         }
     }
@@ -2282,6 +2292,45 @@ mod tests {
             endpoint.allowed_ips = vec!["8.8.8.0/24".to_owned()];
         }
         policy
+    }
+
+    #[test]
+    fn concrete_witness_covers_endpoint_selector_expansion() {
+        let policy = r#"
+version: 1
+network_policies:
+  api:
+    binaries: [{ path: /usr/bin/curl }]
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        path: ""
+        rules: [{ allow: { method: GET, path: /v1/* } }]
+"#;
+        let boundary = parse(policy);
+        let candidate = parse(
+            &policy
+                .replace("path: \"\"", "path: /v1/*")
+                .replace("path: /v1/* }", "path: /** }"),
+        );
+        for binary_identity_required in [true, false] {
+            let witness = concrete_network_witness(&boundary, &candidate, binary_identity_required)
+                .expect("selector expansion must have a concrete witness without a solver query");
+            let Counterexample::Network {
+                path: Some(path), ..
+            } = witness
+            else {
+                panic!("expected a REST counterexample");
+            };
+            assert!(path.strip_prefix("/v1/").unwrap().contains('/'));
+            assert!(
+                concrete_network_witness(&candidate, &candidate, binary_identity_required)
+                    .is_none(),
+                "sampling must not invent an expansion for identical policies"
+            );
+        }
     }
 
     #[test]

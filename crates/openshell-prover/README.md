@@ -19,6 +19,11 @@ Containment rejects unknown fields and managed `metadata`/`review` annotations
 as invalid input, then checks schema-valid controls against its supported model.
 It uses shared filesystem defaults, port selection, and access-preset semantics.
 
+Before symbolic network solving, containment tries a bounded set of concrete
+requests sampled from REST rules and endpoint selectors, including nested paths.
+Every sample must satisfy the full candidate predicate and violate the boundary.
+If no sample proves an expansion, the unrestricted symbolic query still runs.
+
 The containment model accepts ASCII literals in network binary selectors,
 endpoint host and path selectors, and REST allow and deny method and path
 selectors. It returns `unsupported_policy_shape` when either policy uses a

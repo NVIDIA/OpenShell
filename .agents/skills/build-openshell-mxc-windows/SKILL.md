@@ -501,6 +501,12 @@ module being available inside the mise-launched Windows PowerShell process.
 
 ## Common Fix Patterns
 
+Keep supervisor admission fixtures independent of host Linux filesystem paths.
+Inject deterministic baseline enrichment into startup tests and reuse the
+production merge routine. Preserve prover runtime-parity assertions when fixing
+solver timeouts. Mutation-lock stress tests retain their parallel workload and
+exclusion checks with a larger Windows timer budget.
+
 When Windows validation fails:
 
 1. Identify whether the error is from a top-level Windows deliverable, a

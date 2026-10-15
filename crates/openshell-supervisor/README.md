@@ -18,6 +18,11 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 The setup interface stays private to the supervisor. It adds no runtime backend registration, endpoint configuration, or public factory API. The public `run_sandbox` signature remains unchanged.
 
+Gateway policy startup probes the host filesystem before adding proxy baseline
+paths. Admission tests inject deterministic baseline enrichment through the
+private loader and reuse the production merge routine, so repair and write-back
+coverage also runs on hosts without Linux filesystem paths.
+
 MXC proxy settings are decoded by Windows backend setup from an MXC-owned
 launch envelope. The private startup result carries the transport payload and
 concrete CONNECT listener options separately. Shared networking consumes those

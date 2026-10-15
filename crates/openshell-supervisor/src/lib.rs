@@ -887,6 +887,7 @@ async fn run_sandbox_with_backend(
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.clone().unwrap_or_default(),
         },
+        enrich_proto_baseline_paths,
     )
     .instrument(tracing::info_span!(parent: &startup, "supervisor.policy.load"))
     .await?;
@@ -2302,13 +2303,14 @@ async fn load_policy(
         &RemoteStartupGateway {
             endpoint: openshell_endpoint.unwrap_or_default(),
         },
+        enrich_proto_baseline_paths,
     )
     .await
 }
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "Startup gateway injection preserves the production policy-loading inputs"
+    reason = "Startup dependency injection preserves production inputs and independent test fixtures"
 )]
 async fn load_policy_with_gateway(
     sandbox_id: Option<String>,
@@ -2321,6 +2323,7 @@ async fn load_policy_with_gateway(
     vm_identity: Option<VmPolicyIdentity>,
     image_discovery: Option<ImagePolicyDiscovery>,
     gateway: &impl StartupGateway,
+    enrich_baseline_paths: fn(&mut openshell_core::proto::SandboxPolicy) -> bool,
 ) -> Result<(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
@@ -2476,7 +2479,7 @@ async fn load_policy_with_gateway(
                 };
                 // Enrich before syncing so the gateway baseline includes
                 // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
+                enrich_baseline_paths(&mut discovered);
                 strip_proto_provider_policy_entries(&mut discovered);
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
@@ -2537,7 +2540,7 @@ async fn load_policy_with_gateway(
             // a sandbox-sourced policy is written back. The gateway refuses
             // every sandbox policy write while a global policy is active, so a
             // global policy keeps the added paths in this process only.
-            let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+            let enriched = enrich_baseline_paths(&mut proto_policy);
             let sync_policy = proto_sync_payload_for_enriched_policy(&proto_policy, enriched)
                 .filter(|_| snapshot.policy_source == openshell_core::proto::PolicySource::Sandbox);
             if let Some(sync_policy) = sync_policy {
@@ -5715,6 +5718,17 @@ filesystem_policy:
 
     // ---- Initial policy acknowledgement tests ----
 
+    // Startup orchestration tests model a workload with the complete proxy
+    // baseline, independently of the host filesystem (including Windows).
+    // Production still probes each baseline path before adding it.
+    fn enrich_fixture_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
+        if proto.network_policies.is_empty() {
+            return false;
+        }
+        let (ro, rw) = proxy_baseline_paths();
+        enrich_proto_baseline_paths_with(proto, &ro, &rw, |_| true)
+    }
+
     fn proto_policy_fixture() -> openshell_core::proto::SandboxPolicy {
         openshell_policy::restrictive_default_policy()
     }
@@ -5867,7 +5881,7 @@ network_policies:
     async fn startup_rejects_vm_identity_until_matching_policy_is_available() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_fixture_baseline_paths(&mut policy);
         policy.process = Some(openshell_core::proto::ProcessPolicy {
             run_as_user: "10000".into(),
             run_as_group: "1001".into(),
@@ -5902,6 +5916,7 @@ network_policies:
                 }),
                 Some(ImagePolicyDiscovery::Missing),
                 &active_gateway,
+                enrich_fixture_baseline_paths,
             )
             .await
         });
@@ -6011,7 +6026,7 @@ network_policies:
     async fn startup_pending_gateway_calls_exhaust_their_budgets() {
         for pending_snapshot in [true, false] {
             let mut policy = proto_policy_fixture();
-            enrich_proto_baseline_paths(&mut policy);
+            enrich_fixture_baseline_paths(&mut policy);
             let (reports, _reported) = tokio::sync::mpsc::unbounded_channel();
             let gateway = TestStartupGateway {
                 desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
@@ -6039,6 +6054,7 @@ network_policies:
                     None,
                     Some(ImagePolicyDiscovery::Missing),
                     &gateway,
+                    enrich_fixture_baseline_paths,
                 ),
             )
             .await
@@ -6116,6 +6132,7 @@ network_policies:
                     None,
                     Some(ImagePolicyDiscovery::Missing),
                     &gateway,
+                    enrich_fixture_baseline_paths,
                 ),
             )
             .await
@@ -6136,7 +6153,7 @@ network_policies:
     async fn startup_waits_for_repair_and_retries_stale_activation_before_returning() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         let mut policy = proto_policy_fixture();
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_fixture_baseline_paths(&mut policy);
         let mut rejected = settings_poll_result(Some(policy), 1, PolicySource::Sandbox);
         rejected.configuration_admitted = false;
         let (reports, mut reported) = tokio::sync::mpsc::unbounded_channel();
@@ -6162,6 +6179,7 @@ network_policies:
                 None,
                 Some(ImagePolicyDiscovery::Missing),
                 &active_gateway,
+                enrich_fixture_baseline_paths,
             )
             .await
         });
@@ -6496,6 +6514,7 @@ network_policies:
                 None,
                 Some(discovery),
                 &startup_gateway,
+                enrich_fixture_baseline_paths,
             )
             .await
         });
@@ -6584,7 +6603,7 @@ network_policies:
         // paths, so startup writes an enriched copy back. The repaired policy
         // already carries those paths and needs no write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_fixture_baseline_paths(&mut repaired));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6645,6 +6664,7 @@ network_policies:
                 None,
                 Some(discovery),
                 &gateway,
+                enrich_fixture_baseline_paths,
             ),
         )
         .await
@@ -6710,7 +6730,7 @@ network_policies:
     #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_baseline_repair_before_report_refetches() {
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_fixture_baseline_paths(&mut repaired));
         Box::pin(assert_startup_repair_before_rejection_refetches(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6854,7 +6874,7 @@ network_policies:
     async fn startup_policy_write_refusal_write_back_outlasts_the_attempt_limit() {
         // The same limit applies to a refused baseline-path write-back.
         let mut repaired = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut repaired));
+        assert!(enrich_fixture_baseline_paths(&mut repaired));
         assert_refused_startup_write_waits_for_repair(
             settings_poll_result(
                 Some(proto_tcp_policy_fixture()),
@@ -6949,7 +6969,7 @@ network_policies:
         global.global_policy_version = 1;
         let global_generation = report_generation(&global);
         let mut enriched = proto_tcp_policy_fixture();
-        assert!(enrich_proto_baseline_paths(&mut enriched));
+        assert!(enrich_fixture_baseline_paths(&mut enriched));
         let (calls, mut observed) = tokio::sync::mpsc::unbounded_channel();
         let gateway = WriteRefusingStartupGateway {
             desired: Arc::new(std::sync::Mutex::new(global)),
@@ -6971,6 +6991,7 @@ network_policies:
                 None,
                 Some(ImagePolicyDiscovery::Missing),
                 &gateway,
+                enrich_fixture_baseline_paths,
             ),
         )
         .await
@@ -7066,6 +7087,7 @@ network_policies:
                         None,
                         Some(discovery.clone()),
                         &gateway,
+                        enrich_fixture_baseline_paths,
                     ),
                 )
                 .await
