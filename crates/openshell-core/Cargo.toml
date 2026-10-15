@@ -66,6 +66,7 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 

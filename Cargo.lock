@@ -4343,6 +4343,7 @@ dependencies = [
  "tonic-prost-build",
  "tonic-types",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "zeroize",

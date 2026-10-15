@@ -24,7 +24,6 @@ pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_tok
 const TOKEN_EXCHANGE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ERROR_CONTRACT: &str = "openshell.token-grant.v1";
 const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
-const MAX_LOGGED_ERROR_CHARS: usize = 256;
 
 /// HTTP client that authenticates HTTPS endpoints and never redirects assertions.
 ///
@@ -96,7 +95,6 @@ struct RawTokenResponse {
 #[derive(Deserialize)]
 struct OAuthErrorResponse {
     error: Option<String>,
-    error_description: Option<String>,
     openshell_error_contract: Option<String>,
 }
 
@@ -140,8 +138,16 @@ async fn post_oauth_token_request(
     let status = response.status();
     let body = read_bounded_body(response).await?;
     if !status.is_success() {
-        log_token_service_error(status, &body, request_id);
-        return Err(classify_http_failure(status, &body, authenticated));
+        let failure = classify_http_failure(status, &body, authenticated);
+        // A token service can echo submitted credentials in `error` or
+        // `error_description`, so the log keeps only the closed classification.
+        tracing::warn!(
+            request_id = request_id.unwrap_or("none"),
+            upstream_http_status = status.as_u16(),
+            failure_code = failure.code(),
+            "token service rejected the grant"
+        );
+        return Err(failure);
     }
 
     // Raw parse failures can quote response bytes. Retain only a closed failure
@@ -376,31 +382,6 @@ async fn read_bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, T
         body.extend_from_slice(&chunk);
     }
     Ok(body)
-}
-
-/// Record the token service's `OAuth` error text for operators.
-///
-/// Only the gateway and supervisor logs receive it; the workload cannot read
-/// either, and status reports and responses keep only the bounded failure.
-fn log_token_service_error(status: reqwest::StatusCode, body: &[u8], request_id: Option<&str>) {
-    let Ok(response) = serde_json::from_slice::<OAuthErrorResponse>(body) else {
-        return;
-    };
-    let printable = |value: Option<String>| -> String {
-        value
-            .unwrap_or_default()
-            .chars()
-            .filter(|character| !character.is_control())
-            .take(MAX_LOGGED_ERROR_CHARS)
-            .collect()
-    };
-    tracing::warn!(
-        request_id = request_id.unwrap_or("none"),
-        upstream_http_status = status.as_u16(),
-        error = %printable(response.error),
-        error_description = %printable(response.error_description),
-        "token service rejected the grant"
-    );
 }
 
 fn classify_http_failure(
