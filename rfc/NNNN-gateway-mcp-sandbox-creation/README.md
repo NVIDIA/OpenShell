@@ -128,7 +128,7 @@ policy, records lineage and launches the child through the compute driver.
 
 ```mermaid
 flowchart LR
-  U["User: start the lead with --grant"]:::user
+  U["User: start the lead with a grant"]:::user
   subgraph LEAD["Lead sandbox"]
     A["Agent harness, e.g. Pi (no credential)"]:::untrusted
     S["Supervisor door at openshell.local/mcp: add calling program and sandbox token"]:::new
@@ -142,7 +142,7 @@ flowchart LR
   end
   D["Compute driver"]:::exist
   K["Child sandbox (parent's template)"]:::trusted
-  U -- "sandbox create --grant" --> C
+  U -- "sandbox create --grant-*" --> C
   A -- "create_sandbox" --> S
   S -- "call plus token" --> M
   M --> C
@@ -278,11 +278,16 @@ openshell sandbox create \
   --from pi-agent:local \
   --provider pi-nvidia \
   --policy lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 \
+  --grant-expires 4h --grant-program /usr/local/bin/node \
   -- pi
 ```
 
-The CLI parses `--grant` into a `SandboxGrantSpec` on `CreateSandboxRequest`.
+The `--grant-*` flags are the same as those of `openshell grant create`, with a
+`grant-` prefix: `--grant-max-depth`, `--grant-max-breadth`, `--grant-max-total`,
+`--grant-expires`, `--grant-program` and `--grant-child-policy`. Any of them
+gives the new sandbox a grant, and `--grant-program` is then required. The CLI
+builds a `SandboxGrantSpec` on `CreateSandboxRequest` from them.
 Only a user principal may set it; the gateway rejects the field from any other
 principal. The holder's policy is the ceiling for its children.
 
@@ -373,6 +378,9 @@ rpc CreateSandboxGrant(CreateSandboxGrantRequest) returns (SandboxGrantResponse)
   option (authorization) = { auth_mode: "bearer" workspace_role: "user" scope: "sandbox:write" };
 }
 rpc ListSandboxGrants(ListSandboxGrantsRequest) returns (ListSandboxGrantsResponse) {
+  option (authorization) = { auth_mode: "bearer" workspace_role: "user" scope: "sandbox:read" };
+}
+rpc GetSandboxGrant(GetSandboxGrantRequest) returns (SandboxGrantResponse) {
   option (authorization) = { auth_mode: "bearer" workspace_role: "user" scope: "sandbox:read" };
 }
 rpc UpdateSandboxGrant(UpdateSandboxGrantRequest) returns (SandboxGrantResponse) {
@@ -822,7 +830,7 @@ while lineage records which sandbox asked.
 
 | Action | User | Holder or agent child with depth left | Agent child with no depth left | Tool child |
 |--------|------|------|------|------|
-| Start a sandbox with `--grant` | yes | no | no | no |
+| Start a sandbox with a grant (`--grant-*`) | yes | no | no | no |
 | Attach a grant later (`grant create`) | top-level sandboxes without a grant | no | no | no |
 | List grants | own workspace | no | no | no |
 | Update or revoke a grant | own grants; Workspace Admin for the workspace | no | no | no |
@@ -837,13 +845,17 @@ rather than a separate process, so it costs nothing until it is called, and it
 lets any agent that can reach the gateway start sandboxes, whether or not
 sub-agents are involved. Turning it on does not let any sandbox create
 children: that still requires a grant on the sandbox. Operators who do not want
-it turn it off in configuration or from the CLI:
+it turn it off in the gateway configuration.
 
-```shell
-openshell gateway mcp status
-openshell gateway mcp disable
-openshell gateway mcp enable
-```
+This is startup configuration, like the rest of the gateway configuration (RFC
+0003): it is merged from the TOML file and environment at start, with the usual
+precedence, and changing it requires restarting the gateway. There is no live
+switch and no `enable` or `disable` command. If a live switch is needed later,
+it would be a gateway-scope setting following the existing `openshell settings`
+vocabulary, for example `openshell settings set --global --key
+sandbox_mcp_enabled --value false`, after defining persistence, precedence over
+the configuration file, authorization and propagation across replicas.
+`openshell status` reports whether the endpoint is served.
 
 ```toml
 [openshell.gateway.sandbox_mcp]
@@ -864,12 +876,15 @@ MCP requests; the gRPC child-sandbox API, the SDKs and the CLI keep working.
 ```shell
 # Start a tree that may create children
 openshell sandbox create --policy lead.yaml \
-  --grant max_depth=1,max_breadth=2,max_total=3,expires=4h,program=/usr/local/bin/node \
+  --grant-max-depth 1 --grant-max-breadth 2 --grant-max-total 3 \
+  --grant-expires 4h --grant-program /usr/local/bin/node \
   -- pi
 
 # Inspect and change grants
-openshell grant create <sandbox> --max-depth 1 --max-breadth 2 --max-total 3 --expires 4h --program /usr/local/bin/node
+openshell grant create <sandbox> --max-depth 1 --max-breadth 2 --max-total 3 \
+  --expires 4h --program /usr/local/bin/node
 openshell grant list
+openshell grant get <grant-id>
 openshell grant update <grant-id> --max-breadth 3 --max-total 4
 openshell grant revoke <grant-id>
 
@@ -917,7 +932,7 @@ The work is phased so that each phase is usable and testable on its own:
   prototypes by replacing their host creation services with these RPCs.
 - **Phase 2: Gateway MCP endpoint and supervisor door.** Add `/mcp` over the
   same API, with authentication, the program check and a per-sandbox rate
-  limit, and the `openshell gateway mcp` commands. Add the door at
+  limit, and the startup configuration that turns the endpoint off. Add the door at
   `openshell.local` for MCP, open in every sandbox, and the
   `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
   callers. Carrying gRPC through the door comes in a later phase (see
@@ -969,7 +984,8 @@ dedicated token.
 - **Every sandbox reaches the gateway MCP.** The door is open in every sandbox,
   so the gateway's authentication and refusals are the only barrier, and every
   sandbox can learn that the endpoint exists. The rate limit bounds the load a
-  sandbox can cause; `openshell gateway mcp disable` closes the door everywhere.
+  sandbox can cause; turning the endpoint off in the gateway configuration
+  closes the door everywhere after a restart.
 
 - **Results channel.** A child's standard output does not reach the sandbox
   logs, and `get_file` needs the child to be running. A child that exits before
