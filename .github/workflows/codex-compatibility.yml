@@ -26,7 +26,7 @@ on:
         type: number
     outputs:
       has_findings:
-        description: Whether the reviewer reported any compatibility findings
+        description: Whether the reviewer reported new or materially updated breaking changes
         value: ${{ jobs.review.outputs.has_findings }}
       report_artifact:
         description: Uploaded report artifact ID, or empty if unavailable
@@ -133,6 +133,7 @@ jobs:
           path: |
             ${{ runner.temp }}/compatibility-report/report.json
             ${{ runner.temp }}/compatibility-report/report.md
+            ${{ runner.temp }}/compatibility-report/comment.md
           retention-days: 90
           if-no-files-found: warn
 

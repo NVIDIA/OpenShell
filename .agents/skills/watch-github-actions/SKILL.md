@@ -179,8 +179,15 @@ For `Codex Compatibility Review`, inspect its job summary and the
 candidate and baseline SHAs before interpreting findings. `complete` describes
 execution and coverage, not compatibility: also read the assessment and findings.
 An `error`, incomplete coverage, or missing artifact means no clean review is
-available. The job is advisory and independent of publication gates; the
-qualification summary points to it without waiting for completion. Do not
+available. The job is advisory and independent of publication gates. The
+review uses high reasoning effort and focuses on breaking changes. Explicit
+risk acceptance requires a linked author or verified-maintainer comment or
+review; a PR description, general approval, or earlier bot report is insufficient.
+The full report retains unchanged findings with previous-comment links.
+`comment.md` contains only new or materially updated findings, and an unchanged
+review does not post another PR comment. Inspect the full artifact for outstanding
+breaks even when the bot is silent. The qualification summary points to it
+without waiting for completion. Do not
 rerun Release Tag to debug this reviewer. Use its dedicated manual workflow
 with an existing candidate tag; that path does not publish release artifacts.
 
