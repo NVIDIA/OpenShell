@@ -633,7 +633,7 @@ async fn persist_admission(
     }
     if let Err(error) = state
         .compute
-        .supervisor_session_admission(sandbox_id, instance_id, admission)
+        .supervisor_session_admission(sandbox_id, session_id, instance_id, admission)
         .await
     {
         warn!(sandbox_id, session_id, error = %error, "failed to persist supervisor configuration admission");

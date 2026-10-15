@@ -5010,16 +5010,31 @@ impl ComputeRuntime {
     pub async fn supervisor_session_admission(
         &self,
         sandbox_id: &str,
+        session_id: &str,
         instance_id: &str,
         admission: &openshell_core::proto::SandboxConfigurationAdmission,
     ) -> Result<(), String> {
-        self.set_supervisor_session_state(
+        let _guard = self.lock_sandbox_local(sandbox_id).await;
+        // A session ending while this waited for the lock has already removed
+        // itself, so its disconnect, queued behind this guard, keeps the
+        // sandbox out of Ready. Checking before the lock could restore Ready
+        // after that disconnect.
+        let runtime_ready = self
+            .supervisor_sessions
+            .is_current_session(sandbox_id, session_id);
+        let existing = self
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        self.set_supervisor_session_state_from_snapshot(
             sandbox_id,
             SupervisorSessionStateUpdate::Connected {
                 instance_id,
                 admission: Some(admission),
-                runtime_ready: self.supervisor_sessions.has_session(sandbox_id),
+                runtime_ready,
             },
+            existing,
         )
         .await
     }
@@ -15016,7 +15031,7 @@ mod tests {
             ..Default::default()
         };
         runtime
-            .supervisor_session_admission("sb-1", "supervisor-1", &accepted)
+            .supervisor_session_admission("sb-1", "session-1", "supervisor-1", &accepted)
             .await
             .unwrap();
 
@@ -15029,7 +15044,7 @@ mod tests {
             ..accepted.clone()
         };
         runtime
-            .supervisor_session_admission("sb-1", "supervisor-1", &rejected)
+            .supervisor_session_admission("sb-1", "session-1", "supervisor-1", &rejected)
             .await
             .unwrap();
 
@@ -15052,6 +15067,62 @@ mod tests {
         assert!(status.conditions.iter().any(|condition| {
             condition.r#type == "DesiredConfigurationReady" && condition.status == "False"
         }));
+    }
+
+    #[tokio::test]
+    async fn stale_session_admission_does_not_restore_ready() {
+        use openshell_core::proto::{ConfigurationAdmissionState, SandboxConfigurationAdmission};
+
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        register_test_supervisor_session(&runtime, "sb-1");
+        runtime
+            .supervisor_session_connected("sb-1", "supervisor-1")
+            .await
+            .unwrap();
+
+        // session-1 ends and a replacement session is registered before its
+        // admission write takes the sandbox lock.
+        runtime
+            .supervisor_sessions
+            .remove_if_current("sb-1", "session-1");
+        runtime
+            .supervisor_session_disconnected("sb-1", false)
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        runtime.supervisor_sessions.register(
+            "sb-1".to_string(),
+            "session-2".to_string(),
+            tx,
+            shutdown_tx,
+        );
+
+        let admission = SandboxConfigurationAdmission {
+            instance_id: "configuration-1".into(),
+            state: ConfigurationAdmissionState::Accepted.into(),
+            policy_version: 1,
+            config_revision: 7,
+            ..Default::default()
+        };
+        runtime
+            .supervisor_session_admission("sb-1", "session-1", "supervisor-1", &admission)
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.phase(), SandboxPhase::Provisioning as i32);
+        assert_eq!(
+            stored.status.as_ref().unwrap().configuration_admission,
+            Some(admission)
+        );
     }
 
     #[tokio::test]
