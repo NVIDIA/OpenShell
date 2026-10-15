@@ -394,6 +394,17 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
+- Gateway fails to start with an `additional_ca_bundle` error: the Podman
+  driver validates the setting at startup. The file must exist on the gateway
+  host, be non-empty, and contain at least one PEM certificate.
+- Inspected HTTPS to a private-CA destination fails (for example
+  `curl: (52) Empty reply from server`), or the supervisor exits at startup,
+  with `additional_ca_bundle` set: the supervisor container needs the CA, not
+  just the workload. Check
+  `podman inspect <sandbox>-supervisor --format '{{json .Mounts}}'` for a
+  read-only bind of the bundle at `/etc/openshell/tls/additional/ca-bundle.pem`,
+  and `--format '{{json .Config.Cmd}}'` for `--additional-ca-bundle` with that
+  path. The `sandbox` role container must not have the mount.
 - On Linux, verify that the host-networked Podman supervisor can reach the
   gateway's primary loopback endpoint. On macOS, verify Podman Machine's
   host-loopback forwarding or configure an explicit `grpc_endpoint`.

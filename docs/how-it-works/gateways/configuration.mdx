@@ -1180,9 +1180,9 @@ health_check_interval_secs = 10
 # added to the trust bundle inside each sandbox, so workloads trust it directly.
 # It is trusted for every destination, not only the one that needs it, so use a
 # CA you control or one with name constraints. The file must
-# exist and contain at least one certificate; this is validated on the
-# gateway host at sandbox-create time, not deferred until the supervisor
-# container starts.
+# exist and contain at least one certificate; the gateway validates this on
+# the gateway host when the Podman driver starts, so a bad path or a
+# certificate-free bundle fails gateway startup rather than a later sandbox.
 # additional_ca_bundle      = "/etc/openshell/tls/additional-ca.pem"
 # Project a host Workload API Unix socket into the supervisor, or use an
 # explicit container-reachable TCP endpoint, for provider token exchange.

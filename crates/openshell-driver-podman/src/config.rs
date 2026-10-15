@@ -355,7 +355,7 @@ impl PodmanComputeConfig {
         // here (this path is not yet mounted into any container), rather
         // than only checking it is non-empty: an operator with a mistyped
         // path or a certificate-free bundle should see a config-validation
-        // error at sandbox-create time, not a failed/crash-looping sandbox
+        // error when the driver starts, not a failed/crash-looping sandbox
         // once the supervisor container starts and tries to read it.
         if let Some(path) = self.additional_ca_bundle.as_deref() {
             openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(

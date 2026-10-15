@@ -1762,7 +1762,10 @@ pub fn build_isolation_specs(
 fn trusted_mount(destination: &str) -> bool {
     matches!(
         destination,
-        TLS_CA_MOUNT_PATH | PROXY_CA_MOUNT_PATH | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
+        TLS_CA_MOUNT_PATH
+            | PROXY_CA_MOUNT_PATH
+            | ADDITIONAL_CA_MOUNT_PATH
+            | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
     ) || destination == openshell_core::container_paths::NETNS_MOUNT_ROOT
 }
 
@@ -2947,6 +2950,64 @@ mod tests {
                 .iter()
                 .any(|o| o.as_str() == Some("ro")),
             "additional CA bundle mount must be read-only"
+        );
+    }
+
+    #[test]
+    fn isolated_pair_mounts_additional_ca_bundle_only_on_supervisor() {
+        // build_isolation_specs() filters the base spec's mounts per role, so
+        // the base-spec test above does not prove the final supervisor keeps
+        // the CA the --additional-ca-bundle argv points at.
+        let sandbox = test_sandbox("additional-ca-pair", "additional-ca-pair");
+        let mut config = test_config();
+        config.additional_ca_bundle = Some("/host/additional-ca.pem".to_string());
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            Vec::new(),
+            "default".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: Some("jwt"),
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            image: &ResolvedPodmanImage::new("sha256:image"),
+            supervisor_bin: None,
+            tls_secrets: None,
+            identity: &identity,
+        })
+        .unwrap();
+
+        let ca_mount = specs
+            .supervisor
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == ADDITIONAL_CA_MOUNT_PATH)
+            .expect("supervisor keeps the additional CA bind mount");
+        assert_eq!(ca_mount.kind, "bind");
+        assert_eq!(ca_mount.source, "/host/additional-ca.pem");
+        assert!(ca_mount.options.contains(&"ro".to_string()));
+        let idx = specs
+            .supervisor
+            .command
+            .iter()
+            .position(|arg| arg == "--additional-ca-bundle")
+            .expect("supervisor argv carries the additional CA flag");
+        assert_eq!(
+            specs.supervisor.command.get(idx + 1).map(String::as_str),
+            Some(ADDITIONAL_CA_MOUNT_PATH)
+        );
+        assert!(
+            specs
+                .workload
+                .mounts
+                .iter()
+                .all(|mount| mount.destination != ADDITIONAL_CA_MOUNT_PATH),
+            "workload must not receive the additional CA mount"
         );
     }
 
