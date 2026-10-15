@@ -216,7 +216,6 @@ rec {
     runtimeInputs = [
       pkgs.coreutils
       pkgs.git
-      pkgs.zstd
       rustToolchain
     ];
     runtimeEnv = toolchainEnv;
@@ -249,6 +248,25 @@ rec {
         target/${gnuToolchain.target}/debug/openshell-supervisor \
         artifacts/binaries/${gnuToolchain.target}/openshell-supervisor
 
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell-prover \
+        artifacts/binaries/${muslToolchain.target}/openshell-prover
+    '';
+  };
+
+  vmDriver = pkgs.writeShellApplication {
+    name = "build-artifacts-vm-driver";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.git
+      pkgs.zstd
+      rustToolchain
+    ];
+    runtimeEnv = toolchainEnv;
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
       cargo build --target ${muslToolchain.target} \
         -p openshell-driver-vm --no-default-features --bin openshell-vm-init
 
@@ -275,9 +293,6 @@ rec {
         cargo build --target ${gnuToolchain.target} \
           -p openshell-driver-vm --bin openshell-driver-vm
 
-      install -D -m 0755 \
-        target/${muslToolchain.target}/debug/openshell-prover \
-        artifacts/binaries/${muslToolchain.target}/openshell-prover
       install -D -m 0755 \
         target/${gnuToolchain.target}/debug/openshell-driver-vm \
         artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm
@@ -435,6 +450,7 @@ rec {
     name = "build-artifacts";
     runtimeInputs = [
       binaries
+      vmDriver
       deb
       testArchives
       images
@@ -442,6 +458,7 @@ rec {
     ];
     text = ''
       build-artifacts-binaries
+      build-artifacts-vm-driver
       build-artifacts-deb
       build-artifacts-test-archives
       build-artifacts-images
