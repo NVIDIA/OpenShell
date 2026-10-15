@@ -209,7 +209,11 @@ impl ConfigSessionState {
         }
         self.in_flight = None;
         if acknowledge && outcome_acknowledges_revision(completed.outcome) {
-            self.acknowledged = Some(completed.fingerprint.clone());
+            // A degraded supervisor enforces this configuration but failed to
+            // reload part of its runtime, so reconciliation delivers it again
+            // to retry the reload, as the next poll would.
+            self.acknowledged = (completed.outcome != ConfigApplyOutcome::Degraded)
+                .then(|| completed.fingerprint.clone());
         }
         let pending = self.pending.take()?;
         if self.acknowledged.as_ref() == Some(&ConfigFingerprint::of(&pending.sandbox_config)) {
@@ -1168,6 +1172,39 @@ mod tests {
 
         report(ConfigApplyOutcome::FailedRetainedLastKnownGood);
         report(ConfigApplyOutcome::Applied);
+        assert_eq!(
+            registry.deliver_config("sb-1", "session-1", config(7)),
+            DeliveryDisposition::SuppressedUnchanged
+        );
+    }
+
+    #[test]
+    fn degraded_configuration_is_delivered_again_until_applied() {
+        let registry = SupervisorSessionRegistry::new();
+        let (mut slots, bootstrap) =
+            register_bootstrapped_session(&registry, "sb-1", "session-1", config(7));
+        answer_bootstrap(
+            &registry,
+            "sb-1",
+            "session-1",
+            &bootstrap,
+            ConfigApplyOutcome::Degraded,
+        );
+        let mut report = |outcome| {
+            assert_eq!(
+                registry.deliver_config("sb-1", "session-1", config(7)),
+                DeliveryDisposition::Queued,
+                "a degraded runtime reload stays eligible for reconciliation"
+            );
+            let update = take_update(&mut slots).expect("update");
+            let completed = registry
+                .complete_config_update("sb-1", "session-1", &update_result(&update, outcome))
+                .unwrap();
+            registry.finalize_config_update("sb-1", "session-1", &completed, true);
+        };
+
+        report(ConfigApplyOutcome::Degraded);
+        report(ConfigApplyOutcome::IgnoredDuplicate);
         assert_eq!(
             registry.deliver_config("sb-1", "session-1", config(7)),
             DeliveryDisposition::SuppressedUnchanged
