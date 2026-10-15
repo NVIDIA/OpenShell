@@ -309,6 +309,94 @@ jobs:
           snap logs openshell.user-gateway -n=300
           sudo ss -ltnp '( sport = :17670 )'
 
+  ubuntu-snap-docker:
+    name: Ubuntu snap with Docker driver
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      OPENSHELL_INSTALL_METHOD: snap
+    timeout-minutes: 20
+    steps:
+      - name: Install snapd
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+
+      - name: Ensure system Docker
+        run: |
+          set -euo pipefail
+          if ! command -v docker >/dev/null 2>&1; then
+            sudo apt-get install -y docker.io
+          fi
+          sudo systemctl start docker || sudo service docker start
+          if sudo snap list docker >/dev/null 2>&1; then
+            echo "the Docker snap must not provide the canary daemon" >&2
+            exit 1
+          fi
+          docker info
+
+      - name: Select Docker for the snap gateway
+        run: |
+          set -euo pipefail
+          systemctl --user set-environment \
+            OPENSHELL_COMPUTE_DRIVER=docker \
+            "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
+          systemctl --user show-environment |
+            grep -Fx 'OPENSHELL_COMPUTE_DRIVER=docker'
+
+      - name: Install and check status
+        run: |
+          set -euo pipefail
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh |
+            sh
+          sudo snap list openshell
+          snap info openshell | grep -E '^tracking: +latest/edge$'
+          sudo snap connections openshell |
+            grep -E '^docker +openshell:docker +:docker +'
+          docker info
+          snap services openshell
+          systemctl --user is-enabled --quiet snap.openshell.user-gateway.service
+          systemctl --user is-active snap.openshell.user-gateway.service
+          ! systemctl is-enabled --quiet snap.openshell.system-gateway.service
+          ! systemctl is-active --quiet snap.openshell.system-gateway.service
+          journalctl --user -u snap.openshell.user-gateway.service --no-pager |
+            grep -F 'Using compute driver' |
+            grep -F 'driver=docker'
+          openshell gateway list | grep -F 'https://127.0.0.1:17670'
+          openshell status
+
+      - name: Create and exercise a sandbox
+        run: |
+          set -euo pipefail
+          sandbox="rc-docker-${GITHUB_RUN_ID}"
+          openshell sandbox create --name "$sandbox" --detach
+          openshell sandbox exec --name "$sandbox" --no-tty -- true
+          openshell sandbox delete "$sandbox"
+
+      - name: Collect snap and Docker diagnostics
+        if: failure()
+        run: |
+          set +e
+          docker info
+          sudo systemctl status docker.service --no-pager
+          sudo journalctl -b -u docker.service --no-pager -n 300
+          systemctl --user show-environment |
+            grep -E '^OPENSHELL_(COMPUTE_DRIVER|TELEMETRY_ENABLED)='
+          sudo snap services openshell
+          sudo snap connections openshell
+          sudo snap changes
+          systemctl --user status snap.openshell.user-gateway.service --no-pager
+          journalctl --user -u snap.openshell.user-gateway.service --no-pager -n 300
+          sudo systemctl status snap.openshell.system-gateway.service --no-pager
+          sudo journalctl -b -u snap.openshell.system-gateway.service --no-pager -n 300
+          sudo journalctl -b -u snapd.service --no-pager -n 300
+          snap logs openshell.user-gateway -n=300
+          sudo ss -ltnp '( sport = :17670 )'
+
   kubernetes:
     name: Kubernetes Helm (kind)
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}

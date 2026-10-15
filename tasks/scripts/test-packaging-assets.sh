@@ -275,11 +275,28 @@ assert_contains "$snapcraft" "gateway-mode=disable"
 assert_not_contains "$snap_install_docs" "snap services --user"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-vm:"
+assert_contains "$snap_canary" "ubuntu-snap-docker:"
+assert_contains "$snap_canary" "OPENSHELL_COMPUTE_DRIVER=docker"
+assert_contains "$snap_canary" "^docker +openshell:docker +:docker +"
 assert_contains "$snap_canary" "openshell-driver-vm"
 assert_contains "$snap_canary" "snap connections openshell"
 assert_contains "$snap_canary" "openshell.prover check"
 assert_not_contains "$snap_canary" "--dangerous"
 assert_not_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
+if ! awk '
+  /^  ubuntu-snap-docker:$/ { in_job = 1; next }
+  in_job && /^  [[:alnum:]_-]+:$/ { in_job = 0 }
+  in_job && /systemctl --user set-environment/ { set_env = 1 }
+  in_job && set_env && /grep -Fx '\''OPENSHELL_COMPUTE_DRIVER=docker'\''/ { checked_env = 1 }
+  in_job && checked_env && /grep -E '\''\^docker \+openshell:docker \+:docker \+'\''/ { checked_plug = 1 }
+  in_job && checked_plug && /grep -F '\''Using compute driver'\''/ { checked_log = 1 }
+  in_job && checked_log && /grep -F '\''driver=docker'\''/ { checked_driver = 1 }
+  in_job && checked_driver && /openshell sandbox create/ { created_sandbox = 1 }
+  END { exit !(set_env && checked_env && checked_plug && checked_log && checked_driver && created_sandbox) }
+' "$snap_canary"; then
+  echo "FAIL: snap Docker canary must select and verify Docker before creating a sandbox" >&2
+  exit 1
+fi
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then
   echo "FAIL: Debian preflight must precede certificate generation" >&2
   exit 1
