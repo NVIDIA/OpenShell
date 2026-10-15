@@ -97,7 +97,7 @@ async def invoke_codex(context: dict, directory: Path) -> dict:
         'model_providers.nvidia.env_key="NVIDIA_INFERENCE_API_KEY"',
         'model_providers.nvidia.wire_api="responses"',
         "model_providers.nvidia.supports_websockets=false",
-        'model_reasoning_effort="medium"',
+        'model_reasoning_effort="high"',
         'web_search="disabled"',
         "project_doc_max_bytes=0",
         "features.hooks=false",
@@ -144,14 +144,14 @@ def run_review(
     tag: str, expected_sha: str, output: Path, base_ref: str, pr_number: int
 ) -> dict:
     result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "advisory": True,
         "status": "error",
         "context": {},
         "review": None,
         "error": "",
         "model": MODEL,
-        "reasoning_effort": "medium",
+        "reasoning_effort": "high",
         "codex_version": "",
         "codex_sdk_version": "",
         "workflow_sha": os.environ.get("GITHUB_WORKFLOW_SHA", ""),
@@ -213,7 +213,10 @@ def main() -> None:
         args.candidate, args.source_sha, args.output_dir, args.base_ref, args.pr_number
     )
     verdict = result["review"]["verdict"] if result["review"] else "unavailable"
-    has_findings = bool(result["review"] and result["review"]["findings"])
+    has_findings = bool(
+        result["review"]
+        and any(not f["previous_report_url"] for f in result["review"]["findings"])
+    )
     if output := os.environ.get("GITHUB_OUTPUT"):
         with Path(output).open("a") as handle:
             handle.write(f"status={result['status']}\nverdict={verdict}\n")

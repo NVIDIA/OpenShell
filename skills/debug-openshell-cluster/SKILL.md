@@ -111,6 +111,11 @@ namespace. Legacy workloads without
 admission provenance need recreation. Do not
 automatically label control-plane resources or disable enforcement as a repair.
 
+For Kubernetes mount-path conflicts, move caller PVC mounts away from
+`/.openshell` and `/run` to a data path such as `/data` or below `/sandbox`.
+These driver-managed paths remain reserved even for approved resources and
+`sub_path` mounts; changing approval labels does not resolve a path conflict.
+
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
 through its administrator-owned `--admission-config-json` option.

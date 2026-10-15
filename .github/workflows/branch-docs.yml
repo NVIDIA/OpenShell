@@ -12,6 +12,8 @@ on:
       - "tasks/scripts/check_docs_nav_test.py"
       - ".github/workflows/branch-docs.yml"
       - ".github/workflows/release-tag.yml"
+      - ".github/workflows/release-prerelease.yml"
+      - ".github/workflows/release-publish.yml"
 
 permissions:
   contents: read
