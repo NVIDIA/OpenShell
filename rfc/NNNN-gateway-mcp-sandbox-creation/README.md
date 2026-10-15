@@ -300,10 +300,16 @@ openshell grant create lead \
   --max-depth 1 --max-breadth 2 --max-total 3 --expires 4h --program /usr/local/bin/node
 ```
 
-The same rules apply as at creation: only a user may call it, the sandbox must
-not already hold a grant or belong to a tree, and the holder's current policy
-becomes the ceiling for its children. A sandbox that is itself a child cannot be
-given a grant of its own; its tree's grant already covers it.
+The same rules apply as at creation: only a user may call it, and the holder's
+current policy becomes the ceiling for its children. A sandbox that is itself a
+child cannot be given a grant of its own; its tree's grant already covers it.
+
+**Replacing a grant.** `grant create` on a holder whose grant was revoked or has
+expired attaches the new grant to the running tree: every sandbox in the tree
+moves to the new grant, and the sandboxes still running count toward its
+`max_total`. While the holder's grant is active, `grant create` is refused with
+`ALREADY_EXISTS`. Replacing an expired grant requires the same right as
+changing it (below).
 
 ```proto
 message SandboxGrantSpec {
@@ -366,7 +372,8 @@ openshell grant revoke gr-1a2b3c4d
 ```
 
 `grant update` changes only the limits it is given; `expires`, `program` and
-`child_policy` are changed by revoking the grant and creating a new one. Changes
+`child_policy` are changed by revoking the grant and creating a new one for the
+same sandbox (see Replacing a grant). Changes
 apply to the next call: a sandbox that had no depth left can create children as
 soon as the user raises `max_depth`, with no policy change, and an existing
 child keeps its policy. No sandbox can change a grant, including through the
@@ -391,8 +398,10 @@ rpc RevokeSandboxGrant(RevokeSandboxGrantRequest) returns (RevokeSandboxGrantRes
 }
 ```
 
-`UpdateSandboxGrant` and `RevokeSandboxGrant` additionally require the caller
-to be the grant's user or a Workspace Admin of the grant's workspace.
+`ListSandboxGrants` and `GetSandboxGrant` return only grants the caller may
+manage, and `UpdateSandboxGrant` and `RevokeSandboxGrant` refuse anyone else:
+the grant's user or a Workspace Admin of the grant's workspace. The check runs
+before any change.
 
 **The harness declares, OpenShell enforces.** A harness may send its own limits
 with a create request, for example "a lead has at most two workers". The
@@ -720,7 +729,7 @@ made.
 
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
-| `create_sandbox` | users and sandboxes | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `PROVER_INCONCLUSIVE`, `PROGRAM_NOT_ALLOWED`, `GLOBAL_POLICY_ACTIVE`, `EXCEEDS_GLOBAL_POLICY` |
+| `create_sandbox` | users and sandboxes | `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`, `grant` (users only) | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `PROVER_INCONCLUSIVE`, `PROGRAM_NOT_ALLOWED`, `GLOBAL_POLICY_ACTIVE`, `EXCEEDS_GLOBAL_POLICY`, `IN_PROGRESS` |
 | `wait` | sandboxes | `handle`, `timeout_s` | `phase`, `exit_code` | `NOT_YOUR_CHILD` |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
 | `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
@@ -805,10 +814,18 @@ other resources.
 
 Agents retry. If the reply to `create_sandbox` is lost, the agent sends the
 request again, and without deduplication the tree would get two children and
-spend its budget twice. Sandbox callers therefore send a `request_id`; the
-gateway stores the first result per grant and returns it for any repeat, which
-is counted once. Today `request_id` deduplication through `mutation_replay` is
-available to user principals only.
+spend its budget twice. Sandbox callers therefore send a `request_id`, scoped to
+the calling parent so that siblings cannot collide. The gateway reserves the
+`request_id` together with the child's slot, before launching the child; a
+repeat that arrives while the first is launching gets `IN_PROGRESS`, and a
+repeat after it finished gets the first child's handle, counted once. Today
+`request_id` deduplication through `mutation_replay` is available to user
+principals only.
+
+**Limits under concurrency.** Depth, breadth and total are checked and charged
+in one step when the slot is reserved, so two concurrent creates cannot both
+take the last slot. A create that fails after reserving releases the slot and
+its `request_id`.
 
 ### Authorization enforcement
 
@@ -832,8 +849,8 @@ while lineage records which sandbox asked.
 |--------|------|------|------|------|
 | Start a sandbox with a grant (`--grant-*`) | yes | no | no | no |
 | Attach a grant later (`grant create`) | top-level sandboxes without a grant | no | no | no |
-| List grants | own workspace | no | no | no |
-| Update or revoke a grant | own grants; Workspace Admin for the workspace | no | no | no |
+| List grants | grants the user set, or in workspaces it administers | no | no | no |
+| Update, revoke or replace a grant | own grants; Workspace Admin for the workspace | no | no | no |
 | Call the gateway MCP | not applicable | grant's program only (gateway checks) | grant's program only (gateway checks) | grant's program only (gateway checks) |
 | `create_sandbox` | top-level sandboxes, as with the CLI | within limits | tool sandboxes only, within breadth and total | refused |
 | `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | none (no children) |
@@ -955,14 +972,12 @@ check and the ceiling proof; gateway tests for refusals; and an end-to-end
 scenario with the Docker driver that exercises every refusal listed in this RFC.
 
 A proof of concept of phases 1 to 3 exists on the branch `gateway-mcp-poc`
-(`crates/openshell-server/src/mcp.rs`,
+(`crates/openshell-gateway-mcp/`, `crates/openshell-server/src/children.rs`,
 `crates/openshell-supervisor-network/src/gateway_mcp_door.rs`,
-`examples/gateway-mcp-poc/`). Against a development gateway with the Docker
-driver, its check script passes 29 of 31 checks, covering grants, the door,
-refusals, retries, tool sandboxes and cascade stop; the two failures are the
-script running out of grant budget. The proof of concept keeps grants and
-lineage in memory and forwards the supervisor's main session token instead of a
-dedicated token.
+`examples/gateway-mcp-poc/`). Its current end-to-end result, tied to a commit,
+is in `examples/gateway-mcp-poc/README.md` under Results. The proof of concept
+keeps grants and lineage in memory and forwards the supervisor's main session
+token instead of a dedicated token.
 
 ## Risks
 
@@ -1251,8 +1266,15 @@ UpdateSandboxGrant { grant_id, max_breadth: 3, max_total: 4 }
 
 **8. The lead collects the result and stops the worker.**
 
+`wait` reaching READY means the worker's sandbox is up, not that its agent has
+finished. The worker signals completion explicitly: it writes its result to a
+temporary file and renames it to `/tmp/result.txt` (a rename is atomic), and
+keeps running. The lead polls until the file exists.
+
 ```text
 wait { handle: worker } → READY
+get_file { handle: worker, path: /tmp/result.txt } → FILE_ERROR (not written yet)
+… poll …
 get_file { handle: worker, path: /tmp/result.txt } → content
 stop_sandbox { handle: worker }
 → worker's descendants (none) stopped first, then worker; identity revoked first
