@@ -168,12 +168,19 @@ the supervisor companion. The workload never receives the sandbox JWT, gateway
 client TLS key, policy authority, or interception CA private key.
 
 When no endpoint is configured, the supervisor connects to
-`127.0.0.1:<gateway-port>`. Set `grpc_endpoint` when the gateway is not on the
-Docker daemon host. A configured HTTPS server certificate must include the
-endpoint host in its subject alternative names.
+`127.0.0.1:<gateway-port>`. When the gateway runs inside a WSL 2 distribution
+and the daemon is Docker Desktop, the default is
+`host.docker.internal:<gateway-port>` instead: Docker Desktop's host network is
+its own VM, and WSL forwards the gateway's loopback listener to the Windows
+host that `host.docker.internal` names. Set `grpc_endpoint` when the gateway is
+not on the Docker daemon host. A configured HTTPS server certificate must
+include the endpoint host in its subject alternative names; the generated
+certificate includes `host.docker.internal`.
 
-The driver publishes host loopback as the backend address for
-`host.openshell.internal`. Policy DNS resolves that reserved name through the
+When the endpoint is an IP address or `localhost`, the driver publishes that
+address as the backend address for `host.openshell.internal`. A named endpoint,
+including the WSL 2 Docker Desktop default, is left to Docker's name
+resolution and does not pin `host.openshell.internal`. Policy DNS resolves that reserved name through the
 mediated path, so policies can reach host services without a Docker bridge,
 container DNS alias, or another gateway listener.
 
