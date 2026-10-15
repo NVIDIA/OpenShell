@@ -4225,7 +4225,7 @@ async fn resolve_and_check_trusted_gateway(
             "port {port} is a blocked control-plane port, connection rejected"
         )));
     }
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid, AddressBinding::IpConstrained)
         .await
         .map_err(DestinationCheckError::Resolution)?;
     if addrs.is_empty() {
@@ -4345,16 +4345,31 @@ async fn resolve_from_sandbox_hosts(
     None
 }
 
-async fn resolve_socket_addrs(
+/// Controls whether untrusted sandbox hosts entries may participate in resolution.
+///
+/// `IpConstrained` is only valid when the caller verifies every returned IP
+/// against an independent pin or CIDR before dialing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddressBinding {
+    NameAuthorized,
+    IpConstrained,
+}
+
+impl AddressBinding {
+    fn allows_sandbox_hosts(self) -> bool {
+        matches!(self, Self::IpConstrained)
+    }
+}
+
+async fn resolve_nonliteral_socket_addrs(
     host: &str,
     port: u16,
-    entrypoint_pid: u32,
+    address_binding: AddressBinding,
+    sandbox_hosts: Option<Vec<SocketAddr>>,
 ) -> std::result::Result<Vec<SocketAddr>, String> {
-    if let Some(addrs) = resolve_ip_literal(host, port) {
-        return Ok(addrs);
-    }
-
-    if let Some(addrs) = resolve_from_sandbox_hosts(host, port, entrypoint_pid).await {
+    if address_binding.allows_sandbox_hosts()
+        && let Some(addrs) = sandbox_hosts
+    {
         return Ok(addrs);
     }
 
@@ -4374,6 +4389,25 @@ async fn resolve_socket_addrs(
     }
 
     Ok(addrs)
+}
+
+async fn resolve_socket_addrs(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
+    address_binding: AddressBinding,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    if let Some(addrs) = resolve_ip_literal(host, port) {
+        return Ok(addrs);
+    }
+
+    let sandbox_hosts = if address_binding.allows_sandbox_hosts() {
+        resolve_from_sandbox_hosts(host, port, entrypoint_pid).await
+    } else {
+        None
+    };
+
+    resolve_nonliteral_socket_addrs(host, port, address_binding, sandbox_hosts).await
 }
 
 fn reject_internal_resolved_addrs(
@@ -4563,17 +4597,16 @@ async fn dial_transparent_upstream(
     ))
 }
 
-/// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
-/// reject if any resolved address is internal.
+/// Resolve a host:port using the supervisor resolver, then reject if any
+/// resolved address is internal.
 ///
 /// Returns the resolved `SocketAddr` list on success. Returns an error string
 /// if any resolved IP is in an internal range or if DNS resolution fails.
 async fn resolve_and_reject_internal(
     host: &str,
     port: u16,
-    entrypoint_pid: u32,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+    let addrs = resolve_socket_addrs(host, port, 0, AddressBinding::NameAuthorized)
         .await
         .map_err(DestinationCheckError::Resolution)?;
     reject_internal_resolved_addrs(host, &addrs).map_err(DestinationCheckError::Denied)?;
@@ -4594,7 +4627,7 @@ async fn resolve_and_check_allowed_ips(
     allowed_ips: &[ipnet::IpNet],
     entrypoint_pid: u32,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid, AddressBinding::IpConstrained)
         .await
         .map_err(DestinationCheckError::Resolution)?;
     validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)
@@ -4606,13 +4639,15 @@ async fn resolve_and_check_allowed_ips(
 ///
 /// Exact declared hostnames are the operator's trust signal, so RFC1918 and
 /// other private ranges are allowed without a duplicated `allowed_ips` entry.
-/// Loopback, link-local, unspecified, and control-plane ports remain blocked.
+/// The supervisor resolver is authoritative because accepting the sandbox's
+/// `/etc/hosts` here would let the workload choose the address authorized by
+/// the hostname. Loopback, link-local, unspecified, and control-plane ports
+/// remain blocked.
 async fn resolve_and_check_declared_endpoint(
     host: &str,
     port: u16,
-    entrypoint_pid: u32,
 ) -> std::result::Result<Vec<SocketAddr>, DestinationCheckError> {
-    let addrs = resolve_socket_addrs(host, port, entrypoint_pid)
+    let addrs = resolve_socket_addrs(host, port, 0, AddressBinding::NameAuthorized)
         .await
         .map_err(DestinationCheckError::Resolution)?;
     validate_declared_endpoint_resolved_addrs(host, port, &addrs)
@@ -11818,6 +11853,40 @@ network_policies:
 
     // -- resolve_and_reject_internal --
 
+    #[tokio::test]
+    async fn test_address_binding_controls_sandbox_hosts() {
+        let attacker_selected = resolve_from_hosts_file_contents(
+            "93.184.216.34 api.example.test\n",
+            "api.example.test",
+            80,
+        );
+
+        let name_authorized = resolve_nonliteral_socket_addrs(
+            "this-host-does-not-exist.invalid",
+            80,
+            AddressBinding::NameAuthorized,
+            Some(attacker_selected.clone()),
+        )
+        .await;
+        assert!(
+            name_authorized.is_err(),
+            "name-authorized resolution must ignore sandbox hosts"
+        );
+
+        let ip_constrained = resolve_nonliteral_socket_addrs(
+            "api.example.test",
+            80,
+            AddressBinding::IpConstrained,
+            Some(attacker_selected.clone()),
+        )
+        .await
+        .expect("IP-constrained resolution should accept sandbox hosts candidates");
+        assert_eq!(
+            ip_constrained, attacker_selected,
+            "IP-constrained callers validate the selected addresses independently"
+        );
+    }
+
     #[test]
     fn test_parse_hosts_file_for_host_handles_comments_invalid_rows_and_case() {
         let contents = r#"
@@ -11856,7 +11925,7 @@ network_policies:
     }
 
     #[test]
-    fn test_resolve_from_hosts_file_contents_public_ip_passes_default_ssrf_check() {
+    fn test_resolve_from_hosts_file_contents_public_ip_is_not_internal() {
         let addrs =
             resolve_from_hosts_file_contents("93.184.216.34 example.local\n", "example.local", 80);
         assert!(reject_internal_resolved_addrs("example.local", &addrs).is_ok());
@@ -11883,7 +11952,7 @@ network_policies:
     }
 
     #[test]
-    fn test_declared_endpoint_private_hosts_file_resolution_allowed() {
+    fn test_declared_endpoint_validator_allows_private_address() {
         let addrs = resolve_from_hosts_file_contents(
             "192.168.1.105 searxng.local\n",
             "searxng.local",
@@ -12395,7 +12464,7 @@ network_policies:
 
     #[tokio::test]
     async fn test_rejects_localhost_resolution() {
-        let result = resolve_and_reject_internal("localhost", 80, 0).await;
+        let result = resolve_and_reject_internal("localhost", 80).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -12406,7 +12475,7 @@ network_policies:
 
     #[tokio::test]
     async fn test_rejects_loopback_ip_literal() {
-        let result = resolve_and_reject_internal("127.0.0.1", 443, 0).await;
+        let result = resolve_and_reject_internal("127.0.0.1", 443).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -12417,7 +12486,7 @@ network_policies:
 
     #[tokio::test]
     async fn test_rejects_metadata_ip() {
-        let result = resolve_and_reject_internal("169.254.169.254", 80, 0).await;
+        let result = resolve_and_reject_internal("169.254.169.254", 80).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -12428,7 +12497,7 @@ network_policies:
 
     #[tokio::test]
     async fn test_dns_failure_returns_error() {
-        let result = resolve_and_reject_internal("this-host-does-not-exist.invalid", 80, 0).await;
+        let result = resolve_and_reject_internal("this-host-does-not-exist.invalid", 80).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -14117,7 +14186,7 @@ network_policies:
     async fn test_forward_public_ip_allowed_without_allowed_ips() {
         // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
         // resolve_and_reject_internal without needing allowed_ips.
-        let result = resolve_and_reject_internal("dns.google", 80, 0).await;
+        let result = resolve_and_reject_internal("dns.google", 80).await;
         assert!(
             result.is_ok(),
             "Public IP should be allowed without allowed_ips: {result:?}"
@@ -14137,7 +14206,7 @@ network_policies:
     #[tokio::test]
     async fn test_forward_private_ip_rejected_without_allowed_ips() {
         // Private IP literals should be rejected by resolve_and_reject_internal.
-        let result = resolve_and_reject_internal("10.0.0.1", 80, 0).await;
+        let result = resolve_and_reject_internal("10.0.0.1", 80).await;
         assert!(
             result.is_err(),
             "Private IP should be rejected without allowed_ips"
@@ -14208,7 +14277,7 @@ network_policies:
 
     #[tokio::test]
     async fn test_resolve_reject_internal_fails_closed_on_nul_hostname() {
-        let result = resolve_and_reject_internal("evil.com\0.safe.com", 443, 0).await;
+        let result = resolve_and_reject_internal("evil.com\0.safe.com", 443).await;
         assert!(
             result.is_err(),
             "NUL-containing hostname should fail DNS resolution (fail closed)"
