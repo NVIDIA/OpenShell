@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Setup Nix
-description: Install Nix, configure Cachix, and optionally prepare the development shell
+description: Install Determinate Nix, configure Cachix, and optionally prepare the development shell
 
 inputs:
   cachix-auth-token:
@@ -22,9 +22,9 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+    - uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
       with:
-        github_access_token: ${{ github.token }}
+        github-token: ${{ github.token }}
 
     - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
       with:
