@@ -105,11 +105,11 @@ impl<K: MockKind> NetworkMediationSource for MockSource<K> {
                 cmdline_paths: vec![],
             }),
             destination: "203.0.113.10:443".parse().unwrap(),
-            socket: NetworkSocketMetadata {
+            socket: Some(NetworkSocketMetadata {
                 socket_cookie: 7,
                 nonblocking: false,
                 process_generation: 1,
-            },
+            }),
             policy_generation: 1,
             timing: MediationTiming::default(),
             decision,
@@ -144,11 +144,11 @@ impl NetworkMediationSource for UnattributedSource {
             stream: Box::new(near),
             binary_identity: Err(ResolveError::Failed("hash unavailable".to_string())),
             destination: "203.0.113.10:443".parse().unwrap(),
-            socket: NetworkSocketMetadata {
+            socket: Some(NetworkSocketMetadata {
                 socket_cookie: 8,
                 nonblocking: false,
                 process_generation: 1,
-            },
+            }),
             policy_generation: 1,
             timing: MediationTiming::default(),
             decision,
@@ -795,7 +795,7 @@ async fn pending_network_open_carries_socket_bound_identity() {
         "00".repeat(32)
     );
     assert_eq!(conn.destination, "203.0.113.10:443".parse().unwrap());
-    assert_eq!(conn.socket.socket_cookie, 7);
+    assert_eq!(conn.socket.unwrap().socket_cookie, 7);
 }
 
 #[tokio::test]

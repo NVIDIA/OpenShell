@@ -1,0 +1,743 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Supervisor-facing lifecycle and mediated HTTP for the local V8 placement.
+use crate::{
+    guest::{Guest, GuestResult, GuestStatus, read_script},
+    launch::Launch,
+    protocol::{BACKEND, PeerMetadata, ProtocolVersion, boundary::*, control::*},
+};
+use anyhow::{Result, ensure};
+use openshell_core::jwt::{SandboxId, SessionJwtVerifier, SessionTokenProfile, SystemJwtClock};
+use openshell_isolation_interface::contract::{
+    BoundaryConfirmation, BoundaryProperties, EnforcedProperty,
+};
+use openshell_sandbox_backend::{boundary_protocol as wire, sandbox_auth::*};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::{Mutex, watch};
+use tonic::{Request, Response, Status, Streaming};
+
+type Chunks =
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<BoundaryChunk, Status>> + Send>>;
+struct State {
+    policy: Option<wire::SandboxPolicyWire>,
+    ledger: HashMap<String, (String, wire::Response)>,
+    publications: (u64, u64),
+    running: bool,
+    terminal: bool,
+}
+
+pub struct Runtime {
+    launch: Launch,
+    guest: Arc<Guest>,
+    network: crate::network::Network,
+    network_requests: Mutex<tokio::sync::mpsc::Receiver<crate::network::HttpOpen>>,
+    authenticator: SandboxProtocolAuthenticator,
+    pub registry: Arc<SandboxConnectionRegistry>,
+    opened: Mutex<HashSet<SandboxConnectionId>>,
+    state: Mutex<State>,
+    mutation: Mutex<()>,
+    output: Arc<std::sync::Mutex<Option<(crate::guest::Output, crate::guest::Output)>>>,
+    result: watch::Sender<Option<Arc<GuestResult>>>,
+    ended: watch::Sender<bool>,
+}
+
+impl Runtime {
+    pub fn new(launch: Launch) -> Result<Arc<Self>> {
+        let bytes = read_script(&launch.script)?;
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        ensure!(
+            serde_json::from_slice::<serde_json::Value>(&launch.descriptor)?["script_sha256"]
+                == digest,
+            "script binding changed"
+        );
+        ensure!(
+            launch.boundary.workload_identity.resource_digest == digest,
+            "script identity changed"
+        );
+        ensure!(
+            launch.boundary.workload_identity == crate::launch::host_identity(digest.clone())?,
+            "backend identity differs from the admitted host identity"
+        );
+        use openshell_isolation_interface::contract::{
+            OuterFenceGuarantee as G, OuterFenceGuarantees,
+        };
+        let fence = OuterFenceGuarantees::from_enforcement_evidence(
+            launch.boundary.generation.clone(),
+            [
+                G::DefaultDenyEgress,
+                G::NoUnmanagedEgressPath,
+                G::RevocationVerified,
+                G::ControllerLossFailsClosed,
+            ],
+            &crate::launch::capability_evidence(&digest),
+        )?;
+        ensure!(
+            fence == launch.boundary.outer_fence,
+            "native V8 capability evidence differs from driver fence"
+        );
+        let verifier = SessionJwtVerifier::new(
+            &launch.gateway_id,
+            SessionTokenProfile::Sandbox,
+            launch.keys.clone(),
+            Arc::new(SystemJwtClock),
+        )?;
+        let authenticator = SandboxProtocolAuthenticator::new(
+            verifier,
+            SandboxId::parse(launch.boundary.sandbox_id.clone())?,
+            openshell_core::sandbox_generation::SandboxGenerationId::parse(
+                launch.boundary.generation.clone(),
+            )?,
+            launch.epoch,
+        );
+        let registry = Arc::new(SandboxConnectionRegistry::new(
+            launch.boundary.session_id,
+            launch.rotation,
+        ));
+        let (network, network_requests) = crate::network::Network::channel();
+        Ok(Arc::new(Self {
+            launch,
+            network,
+            network_requests: Mutex::new(network_requests),
+            guest: Arc::new(Guest::new(&bytes)?),
+            authenticator,
+            registry,
+            opened: Mutex::new(HashSet::new()),
+            mutation: Mutex::new(()),
+            state: Mutex::new(State {
+                policy: None,
+                ledger: HashMap::new(),
+                publications: (0, 0),
+                running: false,
+                terminal: false,
+            }),
+            output: Arc::new(std::sync::Mutex::new(None)),
+            result: watch::channel(None).0,
+            ended: watch::channel(false).0,
+        }))
+    }
+    fn authenticate<T>(&self, request: &Request<T>) -> Result<SandboxProtocolPrincipal, Status> {
+        let id = *request
+            .extensions()
+            .get::<SandboxConnectionId>()
+            .ok_or_else(|| Status::unauthenticated("TLS connection identity missing"))?;
+        self.authenticator
+            .authenticate(id, request.metadata())
+            .map_err(|_| Status::unauthenticated("invalid sandbox launch credential"))
+    }
+    async fn route(
+        &self,
+        mut request: Request<Streaming<BoundaryChunk>>,
+    ) -> Result<(SandboxProtocolPrincipal, Streaming<BoundaryChunk>), Status> {
+        let principal = self.authenticate(&request)?;
+        if !self
+            .opened
+            .lock()
+            .await
+            .contains(&principal.connection_id())
+        {
+            return Err(Status::failed_precondition(
+                "OpenBoundary required on this connection",
+            ));
+        }
+        let first = request.get_mut().message().await?;
+        if first.and_then(|f| f.payload)
+            != Some(boundary_chunk::Payload::BoundaryId(
+                self.launch.boundary.generation.clone(),
+            ))
+        {
+            return Err(Status::permission_denied("wrong boundary handle"));
+        }
+        Ok((principal, request.into_inner()))
+    }
+    async fn result(&self) -> Result<Arc<GuestResult>, Status> {
+        let mut receiver = self.result.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow_and_update().clone() {
+                return Ok(result);
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| Status::unavailable("guest completion lost"))?;
+        }
+    }
+    fn exit(result: &GuestResult) -> wire::ExitStatusWire {
+        match result.status {
+            GuestStatus::Terminated => wire::ExitStatusWire::Signaled(15),
+            _ => wire::ExitStatusWire::Exited(result.exit_code.unwrap_or(1)),
+        }
+    }
+    pub async fn stop(&self) {
+        self.guest.terminate();
+        if self.state.lock().await.running {
+            let _ = self.result().await;
+        }
+        self.state.lock().await.terminal = true;
+        self.ended.send_replace(true);
+        self.registry.mark_terminal();
+    }
+    fn validate_policy(&self, policy: &wire::SandboxPolicyWire) -> Result<(), Status> {
+        for (selector, expected) in [
+            (
+                &policy.run_as_user,
+                self.launch.boundary.workload_identity.uid,
+            ),
+            (
+                &policy.run_as_group,
+                self.launch.boundary.workload_identity.gid,
+            ),
+        ] {
+            if selector
+                .as_ref()
+                .is_some_and(|value| value != &expected.to_string())
+            {
+                return Err(Status::permission_denied(
+                    "process identity differs from admitted host identity",
+                ));
+            }
+        }
+        Ok(())
+    }
+    async fn control(
+        self: &Arc<Self>,
+        principal: &SandboxProtocolPrincipal,
+        envelope: &wire::RequestEnvelope,
+    ) -> Result<wire::Response, Status> {
+        use wire::{Request as Q, Response as R};
+        envelope
+            .validate_payload_digest()
+            .map_err(|_| Status::invalid_argument("request digest mismatch"))?;
+        // Serialize mutations through validation, effects, and ledger commit.
+        let _mutation = if envelope.request.is_replayable_mutation() {
+            Some(self.mutation.lock().await)
+        } else {
+            None
+        };
+        let cached = {
+            let state = self.state.lock().await;
+            if let Some((digest, response)) = state.ledger.get(&envelope.request_id) {
+                if digest != &envelope.payload_digest {
+                    return Err(Status::invalid_argument(
+                        "request ID reused with different payload",
+                    ));
+                }
+                Some(response.clone())
+            } else {
+                if state.terminal
+                    && !matches!(envelope.request, Q::Wait { .. } | Q::AttachProcess { .. })
+                {
+                    return Err(Status::failed_precondition("boundary is terminal"));
+                }
+                if envelope.request.is_replayable_mutation() && state.ledger.len() >= 1024 {
+                    return Err(Status::resource_exhausted("replay ledger full"));
+                }
+                None
+            }
+        };
+        match &envelope.request {
+            Q::DiscoverPolicy => {
+                return Ok(R::ImagePolicy {
+                    yaml: None,
+                    invalid: false,
+                });
+            }
+            Q::Attach {
+                supervisor_instance_id,
+                ..
+            } => {
+                self.registry
+                    .attach(principal, *supervisor_instance_id)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            }
+            Q::Confirm => self
+                .registry
+                .require_attached(principal)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?,
+            _ => self
+                .registry
+                .require_active(principal)
+                .map_err(|e| Status::failed_precondition(e.to_string()))?,
+        }
+        if let Some(response) = cached {
+            if matches!(envelope.request, Q::Confirm) {
+                self.registry
+                    .confirm(principal)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+            }
+            return Ok(response);
+        }
+        match &envelope.request {
+            Q::Wait { process_id } | Q::Signal { process_id, .. } | Q::Terminate { process_id } => {
+                self.check_process(process_id)?
+            }
+            _ => {}
+        }
+        if matches!(envelope.request, Q::Wait { .. }) {
+            return Ok(R::Exited {
+                status: Self::exit(self.result().await?.as_ref()),
+            });
+        }
+        if let Q::Signal { signal, .. } = &envelope.request
+            && !matches!(signal, wire::SignalWire::Term)
+        {
+            return Err(Status::unimplemented("this V8 example supports TERM only"));
+        }
+        if matches!(
+            envelope.request,
+            Q::TerminateBoundary | Q::Terminate { .. } | Q::Signal { .. }
+        ) {
+            self.guest.terminate();
+            if self.state.lock().await.running {
+                let _ = self.result().await?;
+            }
+        }
+        let mut state = self.state.lock().await;
+        let response = match &envelope.request {
+            Q::Attach {
+                policy,
+                resource_claims,
+                ..
+            } => {
+                self.validate_policy(policy)?;
+                if resource_claims != &self.launch.boundary.resource_claims {
+                    return Err(Status::permission_denied("resource claims mismatch"));
+                }
+                if state
+                    .policy
+                    .as_ref()
+                    .is_some_and(|old| old != policy.as_ref())
+                {
+                    return Err(Status::failed_precondition(
+                        "policy changed during attachment",
+                    ));
+                }
+                state.policy = Some(*policy.clone());
+                R::Attached {
+                    snapshot: wire::SessionSnapshotWire {
+                        generation: self.launch.boundary.generation.clone(),
+                        processes: vec![],
+                    },
+                }
+            }
+            Q::Confirm => {
+                if state.policy.is_none() {
+                    return Err(Status::failed_precondition("attach required"));
+                }
+                self.registry
+                    .confirm(principal)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
+                let property = || EnforcedProperty::new(true, "v8-isolate-capabilities");
+                R::Confirmed {
+                    confirmation: Box::new(BoundaryConfirmation {
+                        generation: self.launch.boundary.generation.clone(),
+                        session_id: self.launch.boundary.session_id,
+                        identity: self.launch.boundary.workload_identity.clone(),
+                        resource_claims: self.launch.boundary.resource_claims.clone(),
+                        outer_fence: self.launch.boundary.outer_fence.clone(),
+                        authenticated_supervisor: true,
+                        runtime_exit_terminates_workload: true,
+                        properties: BoundaryProperties {
+                            filesystem_confinement: property(),
+                            egress_interception: property(),
+                            request_attribution: property(),
+                            privilege_floor: property(),
+                        },
+                        backend_audit: serde_json::json!({"script_sha256": self.launch.boundary.workload_identity.resource_digest, "network": "supervisor-http-host-call", "filesystem": "no-host-access"}),
+                    }),
+                }
+            }
+            Q::ProbeProviderFiles => {
+                return Err(Status::unimplemented("V8 provider files are unsupported"));
+            }
+            Q::StartAgent {
+                sandbox_id,
+                spec,
+                policy,
+                provider_env_revision,
+                provider_env,
+                provider_files,
+                ..
+            } => {
+                if sandbox_id != &self.launch.boundary.sandbox_id
+                    || state.policy.as_ref() != Some(policy)
+                {
+                    return Err(Status::permission_denied("admitted launch changed"));
+                }
+                if spec.timeout_secs != 0
+                    || spec.workdir.as_deref().is_some_and(|path| path != "/work")
+                    || spec.program != "/work/guest.js"
+                    || !spec.args.is_empty()
+                    || spec.interactive
+                    || !provider_env.is_empty()
+                    || !provider_files.is_empty()
+                {
+                    return Err(Status::unimplemented(
+                        "this example accepts only the provisioned script, without args, providers or PTY",
+                    ));
+                }
+                if state.running {
+                    return Err(Status::failed_precondition("main process already started"));
+                }
+                state.running = true;
+                state.publications = (*provider_env_revision, 1);
+                let runtime = self.clone();
+                let guest = self.guest.clone();
+                let output = self.output.clone();
+                let network = self.network.clone();
+                tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        guest.run(Some(network), |stdout, stderr| {
+                            *output.lock().unwrap() = Some((stdout, stderr));
+                        })
+                    })
+                    .await;
+                    let result = match result {
+                        Ok(Ok(result)) => result,
+                        error => GuestResult {
+                            status: GuestStatus::Failed,
+                            exit_code: None,
+                            stdout: vec![],
+                            stderr: format!("guest failed: {error:?}").into_bytes(),
+                            script_sha256: String::new(),
+                        },
+                    };
+                    println!(
+                        "Guest completed: {:?}, exit code {:?}",
+                        result.status, result.exit_code
+                    );
+                    for line in String::from_utf8_lossy(&result.stdout).lines() {
+                        println!("guest: {line}");
+                    }
+                    for line in String::from_utf8_lossy(&result.stderr).lines() {
+                        eprintln!("guest: {line}");
+                    }
+                    runtime.result.send_replace(Some(Arc::new(result)));
+                });
+                R::Started {
+                    process_id: self.process_id(),
+                    provider_env_revision: *provider_env_revision,
+                    provider_env_generation: 1,
+                }
+            }
+            Q::AttachProcess { process_id } => {
+                self.check_process(process_id)?;
+                R::ProcessAttached { terminal: false }
+            }
+            Q::UpdateProviderEnvironment {
+                revision,
+                generation,
+                provider_env,
+                provider_files,
+            } => {
+                if !provider_env.is_empty() || !provider_files.is_empty() {
+                    return Err(Status::unimplemented(
+                        "provider injection is not supported in this example",
+                    ));
+                }
+                if *generation <= state.publications.1 || *revision < state.publications.0 {
+                    return Err(Status::failed_precondition("stale publication"));
+                }
+                state.publications = (*revision, *generation);
+                R::ProviderEnvironmentUpdated {
+                    revision: *revision,
+                    generation: *generation,
+                    applied: true,
+                }
+            }
+            Q::Signal { process_id, .. } => {
+                self.check_process(process_id)?;
+                R::Signaled
+            }
+            Q::Terminate { process_id } => {
+                self.check_process(process_id)?;
+                R::Terminated
+            }
+            Q::TerminateBoundary => {
+                state.terminal = true;
+                self.ended.send_replace(true);
+                R::BoundaryTerminated
+            }
+            Q::OpenMediation => R::MediationReady,
+            _ => {
+                return Err(Status::unimplemented(
+                    "operation is not supported by this V8 example",
+                ));
+            }
+        };
+        if envelope.request.is_replayable_mutation() {
+            state.ledger.insert(
+                envelope.request_id.clone(),
+                (envelope.payload_digest.clone(), response.clone()),
+            );
+        }
+        Ok(response)
+    }
+    fn process_id(&self) -> String {
+        format!("{}:main", self.launch.boundary.generation)
+    }
+    fn check_process(&self, id: &str) -> Result<(), Status> {
+        if id == self.process_id() {
+            Ok(())
+        } else {
+            Err(Status::not_found("unknown guest process"))
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl sandbox_backend_server::SandboxBackend for Arc<Runtime> {
+    async fn describe(
+        &self,
+        request: Request<DescribeSandboxBackendRequest>,
+    ) -> Result<Response<DescribeSandboxBackendResponse>, Status> {
+        let peer = request
+            .into_inner()
+            .supervisor
+            .ok_or_else(|| Status::failed_precondition("peer metadata required"))?;
+        let capability = "openshell.sandbox.protocol".to_string();
+        if peer.protocol_version.map(|v| v.major) != Some(1)
+            || !peer.supported_capabilities.contains(&capability)
+            || peer.required_capabilities.iter().any(|c| c != &capability)
+        {
+            return Err(Status::failed_precondition(
+                "incompatible Sandbox Protocol peer",
+            ));
+        }
+        Ok(Response::new(DescribeSandboxBackendResponse {
+            backend: Some(PeerMetadata {
+                protocol_version: Some(ProtocolVersion { major: 1, minor: 0 }),
+                implementation_name: BACKEND.into(),
+                implementation_version: "0.0.0".into(),
+                supported_capabilities: vec![capability.clone()],
+                required_capabilities: vec![capability],
+            }),
+        }))
+    }
+    async fn open_boundary(
+        &self,
+        request: Request<OpenBoundaryRequest>,
+    ) -> Result<Response<OpenBoundaryResponse>, Status> {
+        let principal = self.authenticate(&request)?;
+        let q = request.into_inner();
+        let b = &self.launch.boundary;
+        if q.sandbox_id != b.sandbox_id
+            || q.session_id != b.session_id.to_string()
+            || q.generation_id != b.generation
+            || q.backend_name != BACKEND
+            || q.driver_descriptor != self.launch.descriptor
+        {
+            return Err(Status::permission_denied(
+                "immutable launch binding changed",
+            ));
+        }
+        self.opened.lock().await.insert(principal.connection_id());
+        Ok(Response::new(OpenBoundaryResponse {
+            boundary_id: b.generation.clone(),
+            outcome: 1,
+        }))
+    }
+    async fn suspend_boundary(
+        &self,
+        request: Request<SuspendBoundaryRequest>,
+    ) -> Result<Response<SuspendBoundaryResponse>, Status> {
+        self.authenticate(&request)?;
+        Err(Status::unimplemented("suspend is unsupported"))
+    }
+    async fn resume_boundary(
+        &self,
+        request: Request<ResumeBoundaryRequest>,
+    ) -> Result<Response<OpenBoundaryResponse>, Status> {
+        self.authenticate(&request)?;
+        Err(Status::unimplemented("resume is unsupported"))
+    }
+}
+
+#[tonic::async_trait]
+impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
+    type ExchangeStream = Chunks;
+    type MediateStream = Chunks;
+    async fn mediate(
+        &self,
+        request: Request<Streaming<BoundaryChunk>>,
+    ) -> Result<Response<Chunks>, Status> {
+        self.exchange(request).await
+    }
+    async fn exchange(
+        &self,
+        request: Request<Streaming<BoundaryChunk>>,
+    ) -> Result<Response<Chunks>, Status> {
+        let (principal, mut input) = self.route(request).await?;
+        let runtime = self.clone();
+        let stream = async_stream::try_stream! {
+            let mut bytes = Vec::new();
+            let envelope = loop {
+                if bytes.len() >= 4 {
+                    let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+                    if length == 0 || length > wire::MAX_CONTROL_FRAME_BYTES { Err(Status::invalid_argument("invalid frame length"))?; }
+                    if bytes.len() >= 4+length { break wire::decode_frame::<wire::RequestEnvelope>(&bytes[..4+length]).map_err(|_|Status::invalid_argument("invalid request frame"))?; }
+                }
+                let chunk = input.message().await?.ok_or_else(||Status::invalid_argument("incomplete request"))?;
+                let Some(boundary_chunk::Payload::Data(data)) = chunk.payload else { Err(Status::invalid_argument("data frame required"))?; unreachable!() };
+                if bytes.len()+data.len()>wire::MAX_CONTROL_FRAME_BYTES+4 { Err(Status::resource_exhausted("request too large"))?; }
+                bytes.extend_from_slice(&data);
+            };
+            if matches!(envelope.request, wire::Request::AcceptNetwork) {
+                envelope.validate_payload_digest().map_err(|_|Status::invalid_argument("request digest mismatch"))?;
+                runtime.registry.require_active(&principal).map_err(|e|Status::failed_precondition(e.to_string()))?;
+                let mut ended = runtime.ended.subscribe();
+                let mut pending = loop {
+                    let queued = tokio::select! {
+                        biased;
+                        _ = ended.wait_for(|value| *value) => Err(Status::unavailable("boundary closed")),
+                        _ = input.message() => Err(Status::unavailable("network accept disconnected")),
+                        pending = async { runtime.network_requests.lock().await.recv().await } => pending.ok_or_else(||Status::unavailable("network source closed")),
+                    }?;
+                    if !queued.result.is_closed() { break queued; }
+                };
+                let identity = wire::BinaryIdentityWire::Resolved {
+                    executable: wire::ExecutableIdentityWire {
+                        path: PathBuf::from("/work/guest.js"),
+                        digest: Some(runtime.launch.boundary.workload_identity.resource_digest.parse().map_err(|_|Status::internal("invalid script digest"))?),
+                    },
+                    ancestors: vec![],
+                    cmdline_paths: vec![],
+                };
+                let response = wire::Response::NetworkConnected {
+                    identity,
+                    destination: pending.destination,
+                    socket: None,
+                    policy_generation: 0,
+                    timing: wire::MediationTimingWire {
+                        notification_to_queue_us: 0,
+                        queue_wait_us: pending.queued_at.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
+                    },
+                };
+                yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(wire::encode_frame(&wire::ResponseEnvelope { request_id:envelope.request_id,response }).map_err(|_|Status::internal("encode network response"))?))};
+                let decision = tokio::select! {
+                    _ = pending.result.closed() => return,
+                    decision = crate::network::decision(&mut input) => decision,
+                }?;
+                use openshell_isolation_interface::contract::TcpOpenDecision;
+                let status = match decision {
+                    TcpOpenDecision::Denied(reason) => crate::network::denied(reason),
+                    TcpOpenDecision::RelayReady => {
+                        yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(pending.request))};
+                        tokio::select! {
+                            _ = pending.result.closed() => return,
+                            status = crate::network::http_status(&mut input) => status,
+                        }?
+                    }
+                };
+                let _ = pending.result.send(status);
+                return;
+            }
+            let response = match runtime.control(&principal,&envelope).await {
+                Ok(response) => response,
+                Err(error) => wire::Response::Error {
+                    kind: match error.code() {
+                        tonic::Code::InvalidArgument => wire::BoundaryErrorKind::Invalid,
+                        tonic::Code::Unavailable => wire::BoundaryErrorKind::Unavailable,
+                        _ => wire::BoundaryErrorKind::Denied,
+                    },
+                    message: error.message().to_string(),
+                },
+            };
+            let attached = matches!(response,wire::Response::ProcessAttached {..});
+            let mediation = matches!(response,wire::Response::MediationReady);
+            yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(wire::encode_frame(&wire::ResponseEnvelope { request_id:envelope.request_id,response }).map_err(|_|Status::internal("encode response"))?))};
+            if attached {
+                let mut offsets = [0usize, 0usize];
+                loop {
+                    let complete = runtime.result.borrow().clone();
+                    let buffers = runtime.output.lock().unwrap().as_ref().map(|(out,err)| [out.contents(), err.contents()]);
+                    let buffers = complete.as_ref().map(|r| [r.stdout.clone(),r.stderr.clone()]).or(buffers).unwrap_or_default();
+                    for (index, data) in buffers.into_iter().enumerate() {
+                        for piece in data[offsets[index]..].chunks(wire::MAX_STREAM_FRAME_BYTES) {
+                            let mut frame=vec![if index==0 {wire::STREAM_STDOUT}else{wire::STREAM_STDERR}];
+                            frame.extend_from_slice(&(piece.len() as u32).to_be_bytes()); frame.extend_from_slice(piece);
+                            yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(frame))};
+                        }
+                        offsets[index] = data.len();
+                    }
+                    if let Some(result)=complete {
+                        let bytes=serde_json::to_vec(&Runtime::exit(&result)).unwrap();
+                        let mut frame=vec![wire::STREAM_EXIT];frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());frame.extend_from_slice(&bytes);
+                        yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(frame))};
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+            if mediation { let mut ended=runtime.ended.subscribe(); while !*ended.borrow_and_update() { ended.changed().await.map_err(|_|Status::unavailable("boundary closed"))?; } }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+pub async fn serve(state_dir: PathBuf) -> Result<()> {
+    let state_dir = state_dir.canonicalize()?;
+    let socket_path = state_dir.join("backend.sock");
+    println!(
+        "V8 backend waiting for driver provisioning in {} on {}",
+        state_dir.display(),
+        socket_path.display()
+    );
+    loop {
+        let path = state_dir.join("launch.json");
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let launch: Launch = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let certs = rustls_pemfile::certs(&mut launch.certificate.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let key = rustls_pemfile::private_key(&mut launch.private_key.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("missing TLS key"))?;
+        let mut tls =
+            rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+                .with_no_client_auth()
+                .with_single_cert(certs, key)?;
+        tls.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
+        let runtime = Runtime::new(launch)?;
+        println!(
+            "V8 boundary provisioned: {}",
+            runtime.launch.boundary.sandbox_id
+        );
+        let registry = runtime.registry.clone();
+        let listener = tokio::net::UnixListener::bind(&socket_path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))?;
+        crate::launch::write_private(&state_dir.join("active"), b"ready")?;
+        let incoming = async_stream::stream! { loop {
+            let (socket,_)=match listener.accept().await { Ok(v)=>v,Err(e)=>{yield Err(e);continue} };
+            match tokio::time::timeout(Duration::from_secs(5),acceptor.accept(socket)).await {
+                Ok(Ok(stream))=>yield Ok(crate::transport::Connection {stream,id:SandboxConnectionId::new(),registry:registry.clone()}),
+                _=>continue,
+            }
+        }};
+        let shutdown = async {
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            runtime.stop().await;
+        };
+        tonic::transport::Server::builder()
+            .add_service(sandbox_backend_server::SandboxBackendServer::new(
+                runtime.clone(),
+            ))
+            .add_service(sandbox_boundary_server::SandboxBoundaryServer::new(
+                runtime.clone(),
+            ))
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await?;
+        std::fs::remove_file(&socket_path)?;
+        std::fs::remove_file(state_dir.join("active"))?;
+    }
+}

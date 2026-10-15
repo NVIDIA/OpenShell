@@ -7410,11 +7410,13 @@ process:
                     stream: Box::new(stream),
                     binary_identity: identity(),
                     destination: destination.parse().unwrap(),
-                    socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                        socket_cookie: 7,
-                        nonblocking: false,
-                        process_generation: 1,
-                    },
+                    socket: Some(
+                        openshell_isolation_interface::contract::NetworkSocketMetadata {
+                            socket_cookie: 7,
+                            nonblocking: false,
+                            process_generation: 1,
+                        },
+                    ),
                     policy_generation: engine.current_generation(),
                     timing: MediationTiming::default(),
                     decision,
@@ -7600,11 +7602,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     cmdline_paths: Vec::new(),
                 }),
                 destination,
-                socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                    socket_cookie: 7,
-                    nonblocking: false,
-                    process_generation: 1,
-                },
+                socket: Some(
+                    openshell_isolation_interface::contract::NetworkSocketMetadata {
+                        socket_cookie: 7,
+                        nonblocking: false,
+                        process_generation: 1,
+                    },
+                ),
                 policy_generation: generation,
                 timing: MediationTiming::default(),
                 decision,
@@ -8042,11 +8046,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             stream: Box::new(stream),
             binary_identity: Ok(identity.clone()),
             destination: SocketAddr::from((crate::policy_dns::POLICY_LOCAL_ADDRESS, 80)),
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8174,11 +8180,13 @@ network_policies:
                 cmdline_paths: Vec::new(),
             }),
             destination,
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8316,11 +8324,13 @@ process:
                 cmdline_paths: Vec::new(),
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8399,11 +8409,13 @@ process:
                 cmdline_paths: Vec::new(),
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,

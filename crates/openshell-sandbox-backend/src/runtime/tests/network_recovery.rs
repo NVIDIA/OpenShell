@@ -236,11 +236,11 @@ fn network_response() -> Response {
             cmdline_paths: Vec::new(),
         },
         destination: "203.0.113.1:443".parse().unwrap(),
-        socket: NetworkSocketMetadata {
+        socket: Some(NetworkSocketMetadata {
             socket_cookie: 42,
             nonblocking: true,
             process_generation: 7,
-        },
+        }),
         policy_generation: 9,
         timing: MediationTimingWire {
             notification_to_queue_us: 11,
@@ -366,7 +366,7 @@ async fn verify_connection(mut pending: PendingTcpOpen) {
         PathBuf::from("/usr/bin/curl")
     );
     assert_eq!(
-        pending.socket,
+        pending.socket.unwrap(),
         NetworkSocketMetadata {
             socket_cookie: 42,
             nonblocking: true,

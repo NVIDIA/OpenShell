@@ -256,7 +256,7 @@ alone. IDs are opaque generation-scoped strings, never local process IDs.
 | `exec_signal` | `process_id: string`, `signal: Signal` | `signaled` |
 | `resize` | `process_id: string`, `cols: u16`, `rows: u16` | `resized` |
 | `loopback_connect` | `host: IP string`, `port: u16` | `port_connected`; then raw bidirectional bytes |
-| `accept_network` | — | `network_connected`: `identity: BinaryIdentity`, `destination: socket address`, `socket: SocketMetadata`, `policy_generation: u64`, `timing: Timing`; then TCP decision/relay |
+| `accept_network` | — | `network_connected`: `identity: BinaryIdentity`, `destination: socket address`, `socket: SocketMetadata` (optional), `policy_generation: u64`, `timing: Timing`; then TCP decision/relay |
 | `open_mediation` | —; sent on `Mediate` | `mediation_ready`; then persistent DNS framing |
 
 Image policy parse/read failure returns `invalid: true` or an error; it must
@@ -323,8 +323,12 @@ snapshot. Workload launch applies all controls before its first instruction.
   `{"result":"failed","message":string}`. Identity must come from trusted
   backend observation; never substitute workload claims on resolution failure.
 - **SocketMetadata**: `socket_cookie: u64`, `nonblocking: bool`,
-  `process_generation: u64`.
-- **Timing**: `notification_to_queue_us: u64`, `queue_wait_us: u64`.
+  `process_generation: u64`. Omit `socket` for guest host calls without native
+  sockets. Supply the guest executable path and digest (module or script) as identity; do not
+  substitute the host runtime or fabricate kernel socket evidence.
+- **Timing**: `notification_to_queue_us: u64`, `queue_wait_us: u64`. Measure
+  backend-monotonic syscall or guest host-call staging; unmeasured durations are
+  zero. These are diagnostic timings, not authorization evidence.
 
 ## Process I/O, TCP relay, and DNS
 

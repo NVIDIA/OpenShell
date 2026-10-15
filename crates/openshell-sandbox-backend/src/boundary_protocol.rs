@@ -925,7 +925,9 @@ pub enum Response {
     NetworkConnected {
         identity: BinaryIdentityWire,
         destination: std::net::SocketAddr,
-        socket: openshell_isolation_interface::contract::NetworkSocketMetadata,
+        /// Native evidence is absent for guest host calls without kernel sockets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<openshell_isolation_interface::contract::NetworkSocketMetadata>,
         policy_generation: u64,
         timing: MediationTimingWire,
     },

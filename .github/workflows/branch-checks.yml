@@ -220,7 +220,7 @@ jobs:
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
-          cargo fmt --manifest-path examples/isolation-backend-wasi/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all -- --check
 
   cargo-lockfiles:
     name: Cargo lockfiles
@@ -276,7 +276,7 @@ jobs:
           cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --locked --manifest-path examples/isolation-backend-wasi/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings
 
   rust-test:
     name: Rust test (${{ matrix.system }})
@@ -314,7 +314,6 @@ jobs:
         run: |
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
-          cargo test --locked --manifest-path examples/isolation-backend-wasi/Cargo.toml
 
   rust-postgres-test:
     name: Rust PostgreSQL tests

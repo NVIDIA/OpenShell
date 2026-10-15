@@ -1349,7 +1349,7 @@ mod linux {
                         response: Response::NetworkConnected {
                             identity: BinaryIdentityWire::from(pending.identity.clone()),
                             destination: pending.destination,
-                            socket: pending.socket,
+                            socket: Some(pending.socket),
                             policy_generation: 0,
                             timing: MediationTimingWire {
                                 notification_to_queue_us: duration_micros(

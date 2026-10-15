@@ -986,8 +986,8 @@ pub enum TcpOpenDenial {
 /// timestamp is local to the supervisor and is intentionally not serialized.
 #[derive(Debug, Clone)]
 pub struct MediationTiming {
-    /// Time from receiving the sandbox syscall notification to queueing it for
-    /// the transport.
+    /// Time from receiving the sandbox syscall notification or guest host call
+    /// to queueing it for the transport. Zero when unmeasured.
     pub sandbox_notification_to_queue: Duration,
     /// Time spent waiting in the sandbox-side mediation queue.
     pub sandbox_queue_wait: Duration,
@@ -1015,10 +1015,12 @@ pub struct PendingTcpOpen {
     pub stream: BoundaryDuplexStream,
     /// Executable identity, resolved by the backend for this connection.
     pub binary_identity: Result<BinaryIdentity, ResolveError>,
-    /// Original external destination captured from the blocked syscall.
+    /// Original external destination captured by the backend before mediation.
     pub destination: SocketAddr,
-    /// Socket and process identity bound to this request.
-    pub socket: NetworkSocketMetadata,
+    /// Native socket evidence, when the backend mediates a kernel socket.
+    /// Guests without native sockets supply authoritative executable identity
+    /// above and leave this absent; never invent kernel cookies or host PIDs.
+    pub socket: Option<NetworkSocketMetadata>,
     /// Policy generation under which the request was created.
     pub policy_generation: u64,
     /// Monotonic stage timing for performance diagnostics.
