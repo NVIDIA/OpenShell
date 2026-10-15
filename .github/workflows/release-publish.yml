@@ -14,6 +14,11 @@ on:
         description: Whether the caller is publishing a pre-release
         required: true
         type: boolean
+      make-latest:
+        description: Whether this stable release should update shared latest channels
+        required: false
+        default: false
+        type: boolean
       source-sha:
         description: Source commit of the built artifacts in the calling run
         required: true
@@ -226,7 +231,7 @@ jobs:
 
       - name: Tag images with release version
         env:
-          IS_PRERELEASE: ${{ inputs.is-prerelease }}
+          MAKE_LATEST: ${{ !inputs.is-prerelease && inputs.make-latest }}
           SOURCE_TAG: ${{ inputs.source-sha }}
           VERSION: ${{ inputs.semver }}
         run: |
@@ -238,7 +243,7 @@ jobs:
               --prefer-index=false \
               -t "${REGISTRY}/${component}:${VERSION}" \
               "${REGISTRY}/${component}:${SOURCE_TAG}"
-            if [[ "${IS_PRERELEASE}" != "true" ]]; then
+            if [[ "${MAKE_LATEST}" == "true" ]]; then
               echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
               docker buildx imagetools create \
                 --prefer-index=false \
@@ -312,6 +317,7 @@ jobs:
         with:
           name: OpenShell ${{ env.RELEASE_TAG }}
           prerelease: false
+          make_latest: ${{ inputs.make-latest && 'true' || 'false' }}
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           body: |
@@ -415,7 +421,7 @@ jobs:
   publish-snap:
     name: Publish Snap
     needs: release
-    if: ${{ !inputs.is-prerelease }}
+    if: ${{ !inputs.is-prerelease && inputs.make-latest }}
     uses: ./.github/workflows/snap-publish.yml
     with:
       upload-channel: latest/stable
@@ -462,8 +468,14 @@ jobs:
       - name: Publish
         env:
           OPENSHELL_NPM_VERSION: ${{ inputs.npm-version }}
+          MAKE_LATEST: ${{ inputs.make-latest }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: mise run sdk:ts:publish
+        run: |
+          set -euo pipefail
+          if [[ "${MAKE_LATEST}" != "true" ]]; then
+            export OPENSHELL_NPM_PUBLISH_ARGS="--tag v${OPENSHELL_NPM_VERSION%.*}"
+          fi
+          mise run sdk:ts:publish
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish

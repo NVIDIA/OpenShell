@@ -125,8 +125,9 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
-`Release Tag` temporarily omits Codex Security from its `Security Scan` job.
-Other scanners and qualification gates still run. Use the standalone
+`Pre-release` temporarily omits Codex Security from its `Security Scan` job.
+`Release` uses the passing prerelease qualification result. Other scanners and
+qualification gates still run. Use the standalone
 `Codex Security Release Qualification` workflow for manual investigation.
 
 For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
@@ -167,10 +168,13 @@ During `0.x`, a minor train permits compatibility findings
 as warnings; a patch train or no active train rejects them. Compare the current
 train's version with the latest stable release; commit messages are irrelevant.
 Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
-the `release-tag-v1` qualification profile. Release and Pre-release call the reusable
-`release-qualification.yml` workflow to run the checks and collect their results.
-Release builds, qualifies, then publishes. Pre-release builds, then publishes
-and qualifies in parallel in the same run. Failed, cancelled, or skipped required suites fail
+the `release-tag-v1` qualification profile. Pre-release calls the reusable
+`release-qualification.yml` workflow after building, in parallel with publication. Release
+selects the latest passing prerelease for the requested version and branch,
+verifies its qualification evidence, creates the stable tag at its exact commit,
+then rebuilds and publishes without rerunning qualification. The promotion job
+summary and `stable-promotion-*` artifact record the candidate and evidence.
+Failed, cancelled, or skipped required suites fail
 qualification; stable publication is blocked, while published pre-release
 artifacts remain available. The Pre-release failure notification includes the
 run link. Both callers share `release-build.yml` and `release-publish.yml`.
