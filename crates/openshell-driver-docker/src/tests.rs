@@ -429,7 +429,7 @@ async fn docker_constructor_rejects_proxy_ca_bundle_without_proxy() {
     config.upstream_proxy.https_proxy = None;
 
     let Err(error) =
-        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config).await
+        DockerComputeDriver::new("127.0.0.1:17670".parse().unwrap(), "info", &config, None).await
     else {
         panic!("constructor must reject incoherent proxy CA configuration before Docker I/O");
     };

@@ -546,9 +546,9 @@ mod gateway_tls_isolation_tests {
     ) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(format!("https://{address}")).into_diagnostic()?;
         configure_gateway_tls(endpoint, pki.ca_pem.clone(), Some(server_name))?
-        .connect()
-        .await
-        .into_diagnostic()
+            .connect()
+            .await
+            .into_diagnostic()
     }
 
     #[tokio::test]
