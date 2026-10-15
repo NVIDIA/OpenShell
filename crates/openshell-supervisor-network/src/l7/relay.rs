@@ -5177,22 +5177,19 @@ network_policies:
         tokio_rustls::client::TlsStream<tokio::io::DuplexStream>,
         tokio_rustls::server::TlsStream<tokio::io::DuplexStream>,
     ) {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(vec!["api.example.test".into()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
+        let key = openshell_crypto::pki::generate_keypair().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["api.example.test".into()]).unwrap();
+        let cert = openshell_crypto::pki::self_signed(params, &key).unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![cert.der().clone()],
-                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der().unwrap()).into(),
             )
             .unwrap();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.der().clone()).unwrap();
-        let client_config = rustls::ClientConfig::builder()
+        let client_config = openshell_crypto::tls::client_builder()
             .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));

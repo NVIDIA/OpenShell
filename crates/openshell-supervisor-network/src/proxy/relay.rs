@@ -472,14 +472,13 @@ mod tests {
     #[tokio::test]
     async fn tls_http_relay_reuses_then_sends_close_notify_after_complete_response() {
         use crate::l7::tls::{CertCache, ProxyTlsState, SandboxCa, tls_terminate_client};
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let ca = SandboxCa::generate().unwrap();
         let mut roots = rustls::RootCertStore::empty();
         for cert in rustls_pemfile::certs(&mut ca.cert_pem().as_bytes()) {
             roots.add(cert.unwrap()).unwrap();
         }
         let config = Arc::new(
-            rustls::ClientConfig::builder()
+            openshell_crypto::tls::client_builder()
                 .with_root_certificates(roots)
                 .with_no_client_auth(),
         );

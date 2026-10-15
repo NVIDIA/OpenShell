@@ -85,7 +85,7 @@ use tracing::{debug, error, info, warn};
 pub(crate) static TEST_TRACING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub(crate) fn install_jsonwebtoken_crypto_provider() {
-    let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+    openshell_crypto::install_jwt_provider();
 }
 
 use compute::ComputeRuntime;
@@ -1164,7 +1164,13 @@ fn spawn_gateway_connection(
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             let certificate_sha256 =
-                                multiplex::extract_peer_certificate_sha256(&tls_stream);
+                                match multiplex::extract_peer_certificate_sha256(&tls_stream) {
+                                    Ok(fingerprint) => fingerprint,
+                                    Err(e) => {
+                                        error!(error = %e, client = %addr, "Failed to fingerprint peer certificate");
+                                        return;
+                                    }
+                                };
                             if let Err(e) = service
                                 .serve_with_verified_certificate(
                                     tls_stream,

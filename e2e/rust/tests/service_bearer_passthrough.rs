@@ -21,8 +21,8 @@ use hyper::{Request, StatusCode, header};
 use hyper_util::rt::TokioIo;
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard};
+use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-use rustls::{ClientConfig, RootCertStore};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -158,7 +158,7 @@ fn e2e_tls_connector() -> Result<TlsConnector, String> {
     let client_certificates =
         load_certificates(&mtls_dir.join("tls.crt"), "client TLS certificate")?;
     let client_key = load_private_key(&mtls_dir.join("tls.key"))?;
-    let config = ClientConfig::builder()
+    let config = openshell_crypto::tls::client_builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(client_certificates, client_key)
         .map_err(|error| format!("build e2e mTLS client configuration: {error}"))?;
