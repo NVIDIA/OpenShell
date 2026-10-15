@@ -102,7 +102,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
 use super::validation::{
-    level_matches, source_matches, validate_and_canonicalize_policy, validate_annotations,
+    level_matches, source_matches, validate_and_canonicalize_policy, validate_caller_annotations,
     validate_no_reserved_provider_policy_keys, validate_policy_safety,
     validate_static_fields_unchanged,
 };
@@ -3876,7 +3876,7 @@ async fn handle_update_config_inner(
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let replay_facts = super::mutation_replay::ordinary::Facts::from_request(&request);
     let req = request.into_inner();
-    validate_annotations(&req.annotations, "annotations")?;
+    validate_caller_annotations(&req.annotations, "annotations")?;
     let sandbox = if req.global {
         if !req.sandbox.is_empty() || req.workspace_scope.is_some() {
             return Err(Status::invalid_argument(
@@ -23952,6 +23952,49 @@ mod tests {
 
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("label key"));
+    }
+
+    #[tokio::test]
+    async fn update_config_rejects_reserved_annotations() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-reserved-annotation",
+                "reserved-annotation",
+                ProtoSandboxPolicy::default(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                sandbox: "reserved-annotation".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                policy: Some(ProtoSandboxPolicy::default()),
+                annotations: HashMap::from([(
+                    "internal.openshell.ai/auth-epoch".to_string(),
+                    "1".to_string(),
+                )]),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("internal.openshell.ai/"));
+        let stored = state
+            .store
+            .get_message_by_name::<Sandbox>("default", "reserved-annotation")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.metadata.unwrap().annotations.is_empty());
     }
 
     #[tokio::test]
