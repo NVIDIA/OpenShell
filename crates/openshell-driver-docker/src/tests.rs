@@ -2589,7 +2589,7 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
             .and_then(|config| config.binds.as_ref())
             .is_some_and(|binds| binds
                 .iter()
-                .all(|bind| !bind.contains(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)))
+                .all(|bind| !bind.contains(ADDITIONAL_CA_MOUNT_PATH)))
     );
     assert_eq!(
         create_body
@@ -2659,7 +2659,7 @@ fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
             .as_ref()
             .unwrap()
             .iter()
-            .all(|argument| argument != "--network-additional-ca-bundle")
+            .all(|argument| argument != "--additional-ca-bundle")
     );
     assert!(
         workload
@@ -2668,27 +2668,16 @@ fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
             .and_then(|host| host.mounts.as_ref())
             .unwrap()
             .iter()
-            .all(|mount| mount.target.as_deref() != Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH))
+            .all(|mount| mount.target.as_deref() != Some(ADDITIONAL_CA_MOUNT_PATH))
     );
 
     let args = docker_network_trust_supervisor_args(Some(&bundle));
-    assert!(args.windows(2).any(|arguments| {
-        arguments
-            == [
-                "--network-additional-ca-bundle",
-                NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
-            ]
-    }));
     assert!(
-        args.windows(2).any(
-            |arguments| arguments == ["--network-additional-ca-digest", "sha256:paired-digest"]
-        )
+        args.windows(2)
+            .any(|arguments| { arguments == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH] })
     );
     let mount = docker_network_trust_supervisor_mount(&bundle).unwrap();
-    assert_eq!(
-        mount.target.as_deref(),
-        Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH)
-    );
+    assert_eq!(mount.target.as_deref(), Some(ADDITIONAL_CA_MOUNT_PATH));
     assert_eq!(mount.source.as_deref(), artifact.to_str());
     assert_eq!(mount.read_only, Some(true));
 }
@@ -2708,7 +2697,7 @@ fn trust_generation_reconciliation_requires_an_explicit_none_marker() {
     };
     let mut config = runtime_config();
     let dir = TempDir::new().unwrap();
-    let artifact = dir.path().join("network-additional-ca.crt");
+    let artifact = dir.path().join("additional-ca.crt");
     fs::write(&artifact, b"expected").unwrap();
     #[cfg(unix)]
     fs::set_permissions(
@@ -2826,7 +2815,7 @@ fn user_mount_cannot_replace_network_trust_destination() {
         "mounts": [{
             "type": "bind",
             "source": source,
-            "target": NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+            "target": ADDITIONAL_CA_MOUNT_PATH
         }]
     })));
 

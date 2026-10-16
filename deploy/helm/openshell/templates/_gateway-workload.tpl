@@ -166,8 +166,8 @@ spec:
           mountPath: /var/run/secrets/openshell-peer
           readOnly: true
         {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
-        - name: network-additional-ca-source
-          mountPath: /etc/openshell-tls/network-additional-ca-source/ca.crt
+        - name: additional-ca-source
+          mountPath: /etc/openshell-tls/additional-ca-source/ca.crt
           subPath: ca.crt
           readOnly: true
         {{- end }}
@@ -268,7 +268,7 @@ spec:
               audience: openshell-gateway-peer
               expirationSeconds: 3600
     {{- if get $supervisorNetwork "additionalCaConfigMapName" }}
-    - name: network-additional-ca-source
+    - name: additional-ca-source
       configMap:
         name: {{ get $supervisorNetwork "additionalCaConfigMapName" | quote }}
         items:

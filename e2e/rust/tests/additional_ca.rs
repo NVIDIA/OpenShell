@@ -12,19 +12,20 @@ use openshell_e2e::harness::cli::{run_cli, wait_for_healthy, wait_for_sandbox_ph
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
+use sha2::Digest as _;
 use tempfile::NamedTempFile;
 
 #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 use openshell_e2e::harness::container::ContainerEngine;
 
-const NETWORK_CA_PATH: &str = "/etc/openshell-tls/network-additional-ca.crt";
+const ADDITIONAL_CA_MOUNT_PATH: &str = "/etc/openshell/tls/additional/ca-bundle.pem";
 #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 const GATEWAY_CA_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const READY_MARKER: &str = "additional-ca-e2e-ready";
 const LIFECYCLE_READY_MARKER: &str = "additional-ca-lifecycle-ready";
 const LIFECYCLE_DURABLE_MARKER: &str = "additional-ca-lifecycle-durable";
 const LIFECYCLE_DURABLE_PATH: &str = "/sandbox/additional-ca-lifecycle-marker";
-const NETWORK_CA_VOLUME: &str = "openshell-network-additional-ca";
+const ADDITIONAL_CA_VOLUME: &str = "openshell-additional-ca";
 
 struct PortForwardGuard {
     child: Child,
@@ -164,7 +165,7 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
     let mounts = mounts.as_array().ok_or("mounts must be an array")?;
     let destination_mounts = mounts
         .iter()
-        .filter(|mount| mount["Destination"] == NETWORK_CA_PATH)
+        .filter(|mount| mount["Destination"] == ADDITIONAL_CA_MOUNT_PATH)
         .collect::<Vec<_>>();
     if destination_mounts.len() != 1 || destination_mounts[0]["RW"] != false {
         return Err(format!("unexpected destination CA mounts: {mounts:#?}"));
@@ -183,40 +184,20 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
     assert_network_ca_command(command.as_array().ok_or("command must be an array")?)
 }
 
-fn network_ca_command_digest(command: &[Value]) -> Result<String, String> {
+fn assert_additional_ca_command(command: &[Value]) -> Result<(), String> {
     let bundle_pairs = command
         .windows(2)
-        .filter(|pair| pair[0] == "--network-additional-ca-bundle")
+        .filter(|pair| pair[0] == "--additional-ca-bundle")
         .collect::<Vec<_>>();
-    let digest_pairs = command
-        .windows(2)
-        .filter(|pair| pair[0] == "--network-additional-ca-digest")
-        .collect::<Vec<_>>();
-    let digest = digest_pairs
-        .first()
-        .and_then(|pair| pair[1].as_str())
-        .unwrap_or_default();
-    let valid_digest = digest.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    });
-    if bundle_pairs.len() != 1
-        || bundle_pairs[0][1] != NETWORK_CA_PATH
-        || digest_pairs.len() != 1
-        || !valid_digest
-    {
-        return Err(format!(
-            "unexpected network CA command arguments: {command:#?}"
-        ));
+    if bundle_pairs.len() != 1 || bundle_pairs[0][1] != ADDITIONAL_CA_MOUNT_PATH {
+        return Err(format!("unexpected additional CA command arguments: {command:#?}"));
     }
-    Ok(digest.to_string())
+    Ok(())
 }
 
 #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 fn assert_network_ca_command(command: &[Value]) -> Result<(), String> {
-    network_ca_command_digest(command).map(|_| ())
+    assert_additional_ca_command(command)
 }
 
 fn kubectl_json(args: &[&str]) -> Result<Value, String> {
@@ -241,7 +222,7 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
                 && pod["spec"]["volumes"].as_array().is_some_and(|volumes| {
                     volumes
                         .iter()
-                        .any(|volume| volume["name"] == NETWORK_CA_VOLUME)
+                        .any(|volume| volume["name"] == ADDITIONAL_CA_VOLUME)
                 })
         })
         .ok_or("dedicated supervisor Pod with destination CA volume not found")?;
@@ -266,14 +247,14 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         .ok_or("dedicated supervisor Pod volume mounts missing")?;
     let destination_mounts = mounts
         .iter()
-        .filter(|mount| mount["name"] == NETWORK_CA_VOLUME)
+        .filter(|mount| mount["name"] == ADDITIONAL_CA_VOLUME)
         .collect::<Vec<_>>();
     let [destination_mount] = destination_mounts.as_slice() else {
         return Err(format!(
             "expected exactly one destination CA mount in dedicated supervisor Pod: {mounts:#?}"
         ));
     };
-    if destination_mount["mountPath"] != NETWORK_CA_PATH
+    if destination_mount["mountPath"] != ADDITIONAL_CA_MOUNT_PATH
         || destination_mount["subPath"] != "ca.crt"
         || destination_mount["readOnly"] != true
     {
@@ -281,7 +262,7 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
             "dedicated supervisor destination CA mount must be a read-only ca.crt file: {destination_mount:#?}"
         ));
     }
-    let supervisor_digest = network_ca_command_digest(
+    assert_additional_ca_command(
         supervisor_container["command"]
             .as_array()
             .ok_or("dedicated supervisor command missing")?,
@@ -290,12 +271,12 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         .as_array()
         .ok_or("dedicated supervisor Pod volumes missing")?
         .iter()
-        .find(|volume| volume["name"] == NETWORK_CA_VOLUME)
+        .find(|volume| volume["name"] == ADDITIONAL_CA_VOLUME)
         .ok_or("dedicated supervisor destination CA volume missing")?;
     let managed_name = volume["configMap"]["name"]
         .as_str()
         .ok_or("managed destination CA ConfigMap name missing")?;
-    if !managed_name.starts_with("openshell-network-additional-ca-")
+    if !managed_name.starts_with("openshell-additional-ca-")
         || volume["configMap"]["items"].as_array().is_none_or(|items| {
             items != &vec![serde_json::json!({"key": "ca.crt", "path": "ca.crt"})]
         })
@@ -314,7 +295,7 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         .ok_or("workload Pod volumes missing")?;
     if workload_volumes
         .iter()
-        .any(|volume| volume["name"] == NETWORK_CA_VOLUME)
+        .any(|volume| volume["name"] == ADDITIONAL_CA_VOLUME)
     {
         return Err("destination CA ConfigMap leaked into workload Pod volumes".to_string());
     }
@@ -331,7 +312,7 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
     {
         if container["volumeMounts"].as_array().is_some_and(|mounts| {
             mounts.iter().any(|mount| {
-                mount["name"] == NETWORK_CA_VOLUME || mount["mountPath"] == NETWORK_CA_PATH
+                mount["name"] == ADDITIONAL_CA_VOLUME || mount["mountPath"] == ADDITIONAL_CA_MOUNT_PATH
             })
         }) {
             return Err(format!(
@@ -363,11 +344,14 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         return Err("managed destination CA ConfigMap ownership/data is incomplete".to_string());
     }
     let config_map_digest =
-        config_map["metadata"]["annotations"]["openshell.ai/network-additional-ca-generation"]
+        config_map["metadata"]["annotations"]["openshell.ai/additional-ca-generation"]
             .as_str()
             .ok_or("managed destination CA ConfigMap generation missing")?;
-    if supervisor_digest != config_map_digest {
-        return Err("supervisor digest does not match managed ConfigMap generation".to_string());
+    let expected_digest = format!("sha256:{:x}", sha2::Sha256::digest(
+        config_map["data"]["ca.crt"].as_str().unwrap_or_default().as_bytes(),
+    ));
+    if config_map_digest != expected_digest {
+        return Err("managed ConfigMap generation does not match its CA data".to_string());
     }
     Ok(format!("{namespace}/{managed_name}/{supervisor_name}"))
 }
@@ -413,7 +397,7 @@ fn inspect_vm_overlay() -> Result<(), String> {
         Ok(output.stdout)
     };
 
-    let staged = debugfs_read("/upper/etc/openshell-tls/network-additional-ca.crt")?;
+    let staged = debugfs_read("/upper/etc/openshell-tls/additional-ca.crt")?;
     let source = std::fs::read(&source_ca)
         .map_err(|error| format!("read additional CA source for digest comparison: {error}"))?;
     if Sha256::digest(&staged) != Sha256::digest(&source) {
@@ -425,13 +409,10 @@ fn inspect_vm_overlay() -> Result<(), String> {
     let args = String::from_utf8(debugfs_read("/upper/opt/openshell/supervisor-args")?)
         .map_err(|error| format!("VM supervisor argument marker is not UTF-8: {error}"))?;
     let lines = args.lines().collect::<Vec<_>>();
-    let staged_digest = format!("sha256:{:x}", Sha256::digest(&staged));
     if lines
         != [
-            "--network-additional-ca-bundle",
-            NETWORK_CA_PATH,
-            "--network-additional-ca-digest",
-            &staged_digest,
+            "--additional-ca-bundle",
+            ADDITIONAL_CA_MOUNT_PATH,
         ]
     {
         return Err(format!(
@@ -445,7 +426,7 @@ fn inspect_vm_overlay() -> Result<(), String> {
         .join("rootfs-console.log");
     let console = std::fs::read_to_string(&console)
         .map_err(|error| format!("read VM serial log: {error}"))?;
-    if !console.contains("supervisor arguments from driver: 4 entries") {
+    if !console.contains("supervisor arguments from driver: 2 entries") {
         return Err("VM serial log did not confirm driver-owned supervisor argv".to_string());
     }
     if console.contains("-----BEGIN CERTIFICATE-----") {
@@ -629,7 +610,7 @@ async fn assert_invalid_staged_material_fails_closed(policy_path: &str) {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        normalized_startup_error.contains("--network-additional-ca-bundle")
+        normalized_startup_error.contains("--additional-ca-bundle")
             || normalized_startup_error.contains("additional destination CA bundle")
             || normalized_startup_error.contains("invalid staged destination CA bundle")
             || normalized_startup_error
@@ -1086,7 +1067,7 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     let removed_validation_script = format!(
         r#"set -eu
 test "$(cat {LIFECYCLE_DURABLE_PATH})" = "{LIFECYCLE_DURABLE_MARKER}"
-test ! -e '{NETWORK_CA_PATH}'
+test ! -e '{ADDITIONAL_CA_MOUNT_PATH}'
 set +e
 curl --fail --silent --show-error --max-time 30 '{matching_url}' >/tmp/removed.out 2>/tmp/removed.err
 removed_status=$?

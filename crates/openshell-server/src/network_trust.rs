@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config_file::SupervisorNetworkFileSection;
 
-pub const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_cert_paths";
+pub const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_bundle";
 const ARTIFACT_DIRECTORY: &str = "network-supervisor";
 const ARTIFACT_FILE_PREFIX: &str = "additional-ca-";
 const ARTIFACT_FILE_SUFFIX: &str = ".crt";
@@ -49,14 +49,18 @@ impl NormalizedNetworkSupervisorTrust {
 /// Read and strictly normalize configured destination roots without writing a
 /// gateway state artifact.
 ///
-/// An absent or empty list preserves the legacy startup behavior and returns
-/// `None`. Once a path is configured, every PEM item in every file must be a
-/// usable X.509 certificate. No valid subset is accepted when another item is
+/// An absent path preserves the legacy startup behavior and returns `None`.
+/// Once configured, the pre-assembled PEM bundle must contain only usable
+/// X.509 certificates; no valid subset is accepted when another item is
 /// malformed or is a private key.
 pub fn normalize_from_config(
     config: &SupervisorNetworkFileSection,
 ) -> Result<Option<NormalizedNetworkSupervisorTrust>> {
-    normalize_sources(&config.additional_ca_cert_paths)
+    config
+        .additional_ca_bundle
+        .as_deref()
+        .map(normalize_source_path)
+        .transpose()
 }
 
 pub fn stage_normalized(
@@ -75,34 +79,23 @@ fn normalize_and_stage(
     source_paths: &[PathBuf],
     state_dir: &Path,
 ) -> Result<Option<NetworkSupervisorTrustBundle>> {
-    let Some(normalized) = normalize_sources(source_paths)? else {
+    let Some(source_path) = source_paths.first() else {
         return Ok(None);
     };
-    stage_normalized_in(normalized, state_dir).map(Some)
+    stage_normalized_in(normalize_source_path(source_path)?, state_dir).map(Some)
 }
 
-fn normalize_sources(source_paths: &[PathBuf]) -> Result<Option<NormalizedNetworkSupervisorTrust>> {
-    if source_paths.is_empty() {
-        return Ok(None);
+fn normalize_source_path(source_path: &Path) -> Result<NormalizedNetworkSupervisorTrust> {
+    if source_path.as_os_str().is_empty() {
+        return Err(config_error(source_path, "path must not be empty"));
     }
-
-    let mut normalized = Vec::new();
-    let mut certificate_count = 0;
-    for source_path in source_paths {
-        if source_path.as_os_str().is_empty() {
-            return Err(config_error(source_path, "path entry is empty"));
-        }
-        let source = read_source_bounded(source_path)?;
-        let (pem, count) = normalize_source(source_path, &source)?;
-        append_normalized(source_path, &mut normalized, &pem)?;
-        certificate_count += count;
-    }
-
-    Ok(Some(NormalizedNetworkSupervisorTrust {
-        digest: format!("sha256:{:x}", Sha256::digest(&normalized)),
-        normalized_pem: normalized,
+    let source = read_source_bounded(source_path)?;
+    let (normalized_pem, certificate_count) = normalize_source(source_path, &source)?;
+    Ok(NormalizedNetworkSupervisorTrust {
+        digest: format!("sha256:{:x}", Sha256::digest(&normalized_pem)),
+        normalized_pem,
         certificate_count,
-    }))
+    })
 }
 
 fn read_source_bounded(source_path: &Path) -> Result<Vec<u8>> {
@@ -153,20 +146,6 @@ fn read_source_bounded(source_path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(source)
-}
-
-fn append_normalized(source_path: &Path, destination: &mut Vec<u8>, source: &[u8]) -> Result<()> {
-    let combined_size = destination.len().saturating_add(source.len());
-    if combined_size > MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES {
-        return Err(config_error(
-            source_path,
-            format_args!(
-                "combined normalized trust bundle exceeds the maximum size of {MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES} bytes"
-            ),
-        ));
-    }
-    destination.extend_from_slice(source);
-    Ok(())
 }
 
 fn stage_normalized_in(
@@ -517,9 +496,7 @@ mod tests {
     }
 
     fn normalized_from_source(source: PathBuf) -> NormalizedNetworkSupervisorTrust {
-        normalize_sources(&[source])
-            .expect("normalize source")
-            .expect("configured source")
+        normalize_source_path(&source).expect("normalize source")
     }
 
     fn digest_for(contents: &[u8]) -> String {
@@ -1093,7 +1070,7 @@ mod tests {
     #[test]
     fn rejects_empty_path_entry() {
         let state_dir = tempdir().expect("state dir");
-        assert_rejected(Path::new(""), state_dir.path(), "path entry is empty");
+        assert_rejected(Path::new(""), state_dir.path(), "path must not be empty");
     }
 
     #[test]
@@ -1108,34 +1085,6 @@ mod tests {
         assert!(message.contains(CONFIG_FIELD));
         assert!(message.contains(&source.display().to_string()));
         assert!(!message.contains(fixture_body));
-    }
-
-    #[test]
-    fn accepts_normalized_output_exactly_at_the_bundle_limit() {
-        let source = Path::new("exact-limit.pem");
-        let mut normalized = Vec::new();
-        append_normalized(
-            source,
-            &mut normalized,
-            &vec![b'x'; MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES],
-        )
-        .expect("an exactly-at-limit normalized bundle is permitted");
-        assert_eq!(normalized.len(), MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES);
-    }
-
-    #[test]
-    fn rejects_combined_normalized_output_over_the_bundle_limit_without_staging() {
-        let source_dir = tempdir().expect("source dir");
-        let state_dir = tempdir().expect("state dir");
-        let source = source_dir.path().join("over-limit.pem");
-        let mut normalized = vec![b'x'; MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES];
-        let error = append_normalized(&source, &mut normalized, b"x")
-            .expect_err("a normalized bundle over the shared limit must be rejected");
-        let message = error.to_string();
-        assert!(message.contains(CONFIG_FIELD));
-        assert!(message.contains("combined normalized trust bundle exceeds"));
-        assert!(message.contains(&MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES.to_string()));
-        assert!(!state_dir.path().join(ARTIFACT_DIRECTORY).exists());
     }
 
     #[cfg(unix)]

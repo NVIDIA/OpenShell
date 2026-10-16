@@ -2549,7 +2549,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
                 source.display()
             ),
         )
@@ -3065,7 +3065,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
                 source.display()
             ),
         )
@@ -3112,7 +3112,7 @@ mod tests {
         std::fs::write(
             &config_path,
             format!(
-                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
                 source.display()
             ),
         )
@@ -3139,7 +3139,7 @@ mod tests {
             panic!("network trust cannot be silently discarded by a remote endpoint");
         };
 
-        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("additional_ca_bundle"));
         assert!(error.to_string().contains("unsupported remote endpoint"));
         assert!(
             !state.path().join("network-supervisor").exists(),

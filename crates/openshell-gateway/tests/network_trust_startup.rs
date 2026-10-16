@@ -12,7 +12,7 @@ use std::process::{Command, Output};
 use rcgen::generate_simple_self_signed;
 use tempfile::TempDir;
 
-const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_cert_paths";
+const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_bundle";
 
 struct GatewayFixture {
     root: TempDir,
@@ -26,7 +26,7 @@ impl GatewayFixture {
         fs::write(
             &config_path,
             format!(
-                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_cert_paths = [\"{}\"]\n",
+                "[openshell]\nversion = 2\n\n[openshell.supervisor.network]\nadditional_ca_bundle = \"{}\"\n",
                 source_path.display()
             ),
         )

@@ -647,7 +647,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   fi
   if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
     printf '[openshell.supervisor.network]\n'
-    printf 'additional_ca_cert_paths = [%s]\n\n' \
+    printf 'additional_ca_bundle = %s\n\n' \
       "$(toml_string "${ADDITIONAL_CA_DIR}/ca.crt")"
   fi
   printf '[openshell.drivers.docker]\n'

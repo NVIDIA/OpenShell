@@ -26,8 +26,7 @@ pub const MAX_NETWORK_SUPERVISOR_TRUST_BUNDLE_BYTES: usize = 1024 * 1024 - "ca.c
 /// Kubernetes stores this value in an annotation because a `sha256:<hex>`
 /// digest exceeds the 63-character label-value limit. Local container drivers
 /// may store the same protected key in a container label.
-pub const NETWORK_SUPERVISOR_TRUST_GENERATION_KEY: &str =
-    "openshell.ai/network-additional-ca-generation";
+pub const NETWORK_SUPERVISOR_TRUST_GENERATION_KEY: &str = "openshell.ai/additional-ca-generation";
 
 /// Explicit generation marker for an omitted destination-trust configuration.
 ///

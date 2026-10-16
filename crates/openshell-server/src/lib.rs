@@ -2222,7 +2222,7 @@ mod tests {
             b"-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n".to_vec(),
             1,
             "sha256:fixture",
-            "/tmp/openshell-network-additional-ca.crt".into(),
+            "/tmp/openshell-additional-ca.crt".into(),
         )
     }
 
@@ -2860,7 +2860,7 @@ mod tests {
         )
         .expect_err("destination trust must not be discarded by a remote override");
 
-        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("additional_ca_bundle"));
         assert!(error.to_string().contains("unsupported"));
         assert!(!error.to_string().contains("docker.sock"));
     }
@@ -2876,7 +2876,7 @@ mod tests {
         )
         .expect_err("destination trust must not be silently ignored by a remote driver");
 
-        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("additional_ca_bundle"));
         assert!(error.to_string().contains("kyma"));
     }
 
@@ -2898,7 +2898,7 @@ mod tests {
         )
         .expect_err("custom drivers cannot consume the shared trust contract yet");
 
-        assert!(error.to_string().contains("additional_ca_cert_paths"));
+        assert!(error.to_string().contains("additional_ca_bundle"));
         assert!(error.to_string().contains("custom"));
         assert!(error.to_string().contains("network trust propagation"));
     }

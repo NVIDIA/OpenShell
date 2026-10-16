@@ -212,14 +212,14 @@ supervisor:
 ```
 
 The chart mounts the source into the gateway and renders
-`[openshell.supervisor.network].additional_ca_cert_paths`. The gateway validates
-and normalizes certificate-only PEM at startup. The Kubernetes driver creates a
-separate managed ConfigMap in each target sandbox namespace and mounts it only
-in the dedicated supervisor Pod. That supervisor receives the expected generation
-as protected startup arguments and rejects mounted PEM whose canonical digest
-differs before network setup. The configured roots augment default destination
-trust. They do not configure the corporate proxy, OIDC, or gateway callback mTLS
-trust.
+`[openshell.supervisor.network].additional_ca_bundle`. The gateway validates
+and normalizes the one certificate-only PEM bundle at startup. The Kubernetes
+driver creates a separate managed ConfigMap in each target sandbox namespace
+and mounts it only in the dedicated supervisor Pod at
+`/etc/openshell/tls/additional/ca-bundle.pem`. That supervisor receives the
+path through `--additional-ca-bundle` and folds the bundle into system roots.
+The configured roots augment default destination trust. They do not configure
+the corporate proxy, OIDC, or gateway callback mTLS trust.
 
 Changing only the source ConfigMap does not roll or reload the gateway. Restart
 the gateway, then recreate or restart affected sandboxes to use the new roots.
@@ -230,7 +230,7 @@ restarted or recreated.
 
 The driver creates one immutable, content-addressed ConfigMap generation in
 each target namespace. Names begin with
-`openshell-network-additional-ca-` and include DNS-safe hashes of the effective
+`openshell-additional-ca-` and include DNS-safe hashes of the effective
 gateway ID and normalized bundle generation. Existing objects are accepted only
 when their ownership labels, generation annotation, immutability, and exact
 `ca.crt` data match; the driver never patches or updates them.

@@ -109,19 +109,17 @@ for sandbox egress destinations:
 
 ```toml
 [openshell.supervisor.network]
-additional_ca_cert_paths = [
-  "/etc/openshell/certs/private-root.pem",
-  "/etc/openshell/certs/private-intermediate.pem",
-]
+additional_ca_bundle = "/etc/openshell/certs/private-destination-ca.pem"
 ```
 
-The paths refer to files on the gateway host or in the gateway container. Each
-file must contain one or more PEM certificate blocks. Inline PEM, private keys,
-DER-only input, URLs, empty files, unrelated text, and mixed certificate/key
-files are unsupported. The gateway reads every file once at startup, validates
-all input, normalizes the certificates into one gateway-owned bundle, and fails
-startup with the field and source path when material is missing or unusable. It
-does not include certificate contents in diagnostics.
+The path refers to one pre-assembled PEM bundle on the gateway host or in the
+gateway container. It must contain one or more PEM certificate blocks. Inline
+PEM, private keys, DER-only input, URLs, empty files, unrelated text, mixed
+certificate/key files, symlinks, and non-regular files are unsupported. The
+gateway reads the bundle once at startup, validates and canonicalizes it into a
+gateway-owned artifact, and fails startup with the field and source path when
+material is missing or unusable. It does not include certificate contents in
+diagnostics.
 
 The normalized certificates augment the default bundled, system, or native
 roots used for sandbox destination TLS. Normal certificate-chain and hostname
@@ -139,16 +137,16 @@ This setting is separate from all other trust domains:
 - OIDC, middleware, and interceptor CA settings authenticate their own
   gateway-side connections.
 
-The in-process Docker and Podman drivers mount a gateway-owned artifact at
-`/etc/openshell-tls/network-additional-ca.crt`. The Kubernetes driver creates an
-immutable, content-addressed managed ConfigMap containing `ca.crt` in each
-target namespace and mounts it only at the combined or sidecar network-supervisor
-boundary. The VM driver writes the same path into each sandbox overlay. Every
-driver passes the protected bundle path and its gateway-issued SHA-256 digest to
-the supervisor. Before any network setup, the supervisor canonicalizes the
-mounted PEM and rejects bytes that do not match that expected generation.
-Remote and custom compute drivers reject this setting because the compute-driver
-protocol does not carry the normalized material.
+Docker and Podman bind-mount the gateway-owned artifact, Kubernetes creates an
+immutable content-addressed managed ConfigMap, and VM stages its snapshot in the
+sandbox overlay. Each mounts it at
+`/etc/openshell/tls/additional/ca-bundle.pem` and starts the supervisor with
+`--additional-ca-bundle` for that path. Drivers verify their staged artifact
+before handing it to a runtime; the SHA-256 generation is an internal staging
+and restart-reconciliation value, not a supervisor argument. The supervisor
+reads the mounted bundle and folds it into its system roots. Remote and custom
+compute drivers reject this setting because the compute-driver protocol does
+not carry the normalized material.
 
 ### Lifecycle and certificate rollover
 
@@ -181,7 +179,7 @@ Use this sequence for a non-disruptive private-CA rollover:
 
 For Helm, create an operator-owned ConfigMap with a `ca.crt` key and set
 `supervisor.network.additionalCaConfigMapName`. The chart mounts the source at
-`/etc/openshell-tls/network-additional-ca-source/ca.crt`, renders that path in
+`/etc/openshell-tls/additional-ca-source/ca.crt`, renders that path in
 the global table, and grants the Kubernetes driver ConfigMap `get` and `create`
 permissions for the selected workspace mode. These permissions cover the shared
 sandbox namespace in shared mode and are cluster-wide through the existing
@@ -320,7 +318,7 @@ provider_profile_sources = [
 # Additional private destination roots are global supervisor settings, not
 # compute-driver settings. The gateway reads certificate-only PEM at startup.
 [openshell.supervisor.network]
-additional_ca_cert_paths = ["/etc/openshell/certs/private-destination-ca.pem"]
+additional_ca_bundle = "/etc/openshell/certs/private-destination-ca.pem"
 
 # Operator-run supervisor middleware. The gRPC endpoint must be reachable from
 # both the gateway and sandbox supervisors.
@@ -1396,22 +1394,6 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
-# additional_ca_bundle points at a PEM CA bundle (on the gateway host) trusted
-# for direct, policy-inspected HTTPS egress to a destination signed by a
-# private CA — independent of proxy_ca_bundle above, this applies whether or
-# not https_proxy is set. The Podman supervisor runs as its own container,
-# separate from the workload image, so it cannot inherit a private CA baked
-# into the workload's own trust store; this setting restores that trust
-# without rebuilding the supervisor image. The gateway bind-mounts the file
-# read-only into the supervisor container and folds it into the upstream
-# trust store alongside (not instead of) the system CA bundle. The CA is also
-# added to the trust bundle inside each sandbox, so workloads trust it directly.
-# It is trusted for every destination, not only the one that needs it, so use a
-# CA you control or one with name constraints. The file must
-# exist and contain at least one certificate; the gateway validates this on
-# the gateway host when the Podman driver starts, so a bad path or a
-# certificate-free bundle fails gateway startup rather than a later sandbox.
-# additional_ca_bundle      = "/etc/openshell/tls/additional-ca.pem"
 # Project a host Workload API Unix socket into the supervisor, or use an
 # explicit container-reachable TCP endpoint, for provider token exchange.
 # provider_spiffe_workload_api_socket = "/run/spire/agent.sock"

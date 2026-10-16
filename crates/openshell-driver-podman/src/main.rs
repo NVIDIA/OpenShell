@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
             proxy_auth_allow_insecure: args.sandbox_proxy_auth_allow_insecure,
             proxy_connect_by_hostname: args.sandbox_proxy_connect_by_hostname,
             proxy_ca_bundle: args.sandbox_proxy_ca_bundle,
+            additional_ca_bundle: args.sandbox_additional_ca_bundle,
             userns: args.userns,
             uidmap: args.uidmap,
             gidmap: args.gidmap,
