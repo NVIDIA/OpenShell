@@ -117,6 +117,7 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
+| Maintenance     | `release-captain`         | Run the weekly Monday pre-flight and Tuesday stable release checklist                               |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
 ### Issue Workflow
