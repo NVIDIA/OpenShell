@@ -249,6 +249,18 @@ Suites:
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
 
+The Docker, Podman, Kubernetes, and VM runners execute CLI
+conformance before their Rust tests. Set the driver's feature variable
+(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+`OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
+`e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
+it skips them. Unset or empty values select the driver's default Rust
+features. The selector is handled by the runner; it is not a Cargo feature.
+
+```shell
+OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
+```
+
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
 defaults to the image used by the `gateway` stage in
@@ -534,18 +546,6 @@ Available task variants:
 | `e2e:kubernetes:workspace-operator` | Operator workspace mode (pre-provisioned namespaces) |
 | `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
-
-The Docker, Podman, Kubernetes, and VM runners execute CLI
-conformance before their Rust tests. Set the driver's feature variable
-(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
-`OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
-`e2e-conformance-only` to skip the Rust tests. Unset or empty values select
-the driver's default Rust features. The selector is handled by the runner;
-it is not a Cargo feature.
-
-```shell
-OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
-```
 
 Kubernetes e2e environment variables:
 
