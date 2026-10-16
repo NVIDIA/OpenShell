@@ -118,7 +118,7 @@ Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint
 
 Host mode on Docker Desktop requires host networking enabled. Bridge mode automatically uses `host.docker.internal` for a gateway on the Desktop host. On native Linux, the gateway and host services must listen on bridge-reachable addresses. Set `grpc_endpoint` for remote gateways, remapped published ports, or other custom layouts. Endpoint selection preserves TLS verification and does not change the gateway's listener. See [Docker configuration](/how-it-works/gateways/configuration#docker).
 
-Bridge mode maps the host aliases to Docker's default bridge gateway IP. Set `host_gateway_ip` when Docker Desktop or a custom daemon uses a different host address.
+OpenShell discovers Docker's host address automatically in bridge mode. Set `host_gateway_ip` only to override discovery.
 
 The sandbox must pass its Landlock and seccomp qualification in either network mode. For GPU sandboxes, configure Docker CDI before starting the gateway.
 

@@ -968,8 +968,7 @@ sandbox_label      = "docker-dev"
 # host (default) or bridge networking for the supervisor.
 # Operator-owned; sandbox driver config cannot override this choice.
 supervisor_network_mode = "host"
-# Optional host-address override. Bridge mode otherwise uses Docker's default
-# bridge gateway; Desktop and custom Docker setups may need a different IP.
+# Optional override; Docker's host address is discovered automatically.
 # host_gateway_ip = "172.29.0.254"
 # Optional override. Omit for automatic host or bridge callback selection.
 # grpc_endpoint = "https://gateway.example.com:17670"
@@ -1015,8 +1014,8 @@ Omit `grpc_endpoint` for automatic selection: host mode uses loopback; bridge
 uses `host.docker.internal` on Desktop or with a wildcard listener, otherwise
 the Linux listener's non-loopback address.
 
-If host services are unreachable or automatic host-address discovery fails,
-set `host_gateway_ip` to a host address reachable from containers.
+Docker's host address is discovered automatically for bridge mode and gateway
+endpoints using `host.docker.internal`. Set `host_gateway_ip` only to override it.
 In bridge mode, host services and the configured OTLP collector endpoint must
 be reachable from containers; native Linux loopback-only listeners are unreachable.
 Host mode on Docker Desktop requires host networking enabled.

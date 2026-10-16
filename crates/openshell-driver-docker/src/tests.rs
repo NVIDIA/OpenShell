@@ -3226,33 +3226,112 @@ fn docker_bridge_host_aliases_are_independent_of_gateway_endpoint() {
 }
 
 #[test]
-fn docker_bridge_gateway_heuristic_prefers_ipv4_and_requires_one_safe_address() {
-    let network = |gateways: &[&str]| {
-        serde_json::from_value::<bollard::models::NetworkInspect>(
-        serde_json::json!({"IPAM": {"Config": gateways.iter().map(|ip| serde_json::json!({"Gateway": ip})).collect::<Vec<_>>()}})
-    ).unwrap()
-    };
+fn docker_host_gateway_parser_prefers_one_ipv4_and_rejects_invalid_mappings() {
+    assert_eq!(parse_docker_host_gateway_hosts(b"172.29.0.254 host.openshell.internal\nfd00::1 host.openshell.internal\n172.29.0.254 host.openshell.internal # duplicate\n").unwrap(), "172.29.0.254".parse::<IpAddr>().unwrap());
     assert_eq!(
-        docker_bridge_host_gateway_ip(&network(&["172.17.0.1", "fd00::1"])).unwrap(),
-        "172.17.0.1".parse::<IpAddr>().unwrap()
-    );
-    assert_eq!(
-        docker_bridge_host_gateway_ip(&network(&["fd00::1"])).unwrap(),
+        parse_docker_host_gateway_hosts(b"fd00::1 HOST.OPENSHELL.INTERNAL\n").unwrap(),
         "fd00::1".parse::<IpAddr>().unwrap()
     );
-    for gateways in [
-        &[][..],
-        &["172.17.0.1", "172.18.0.1"][..],
-        &["bad-ip"][..],
-        &["169.254.169.254"][..],
-        &["127.0.0.1"][..],
-        &["::ffff:127.0.0.1"][..],
+    for contents in [
+        "127.0.0.1 localhost",
+        "172.17.0.1 host.docker.internal",
+        "172.17.0.1 host.openshell.internal\n172.18.0.1 host.openshell.internal",
+        "bad-ip host.openshell.internal",
+        "169.254.169.254 host.openshell.internal",
+        "127.0.0.1 host.openshell.internal",
+        "::ffff:127.0.0.1 host.openshell.internal",
+        "0.0.0.0 host.openshell.internal",
+        "224.0.0.1 host.openshell.internal",
     ] {
         assert!(
-            docker_bridge_host_gateway_ip(&network(gateways)).is_err(),
-            "{gateways:?}"
+            parse_docker_host_gateway_hosts(contents.as_bytes()).is_err(),
+            "{contents}"
         );
     }
+    assert!(parse_docker_host_gateway_hosts(&[0xff]).is_err());
+}
+
+#[test]
+fn docker_host_gateway_resolver_uses_the_trusted_image_without_network_or_privileges() {
+    let body = docker_host_gateway_resolver_body("sha256:trusted", "resolver-test");
+    assert_eq!(body.image.as_deref(), Some("sha256:trusted"));
+    assert_eq!(body.user.as_deref(), Some("65534:65534"));
+    assert_eq!(
+        body.entrypoint.unwrap(),
+        [SUPERVISOR_IMAGE_CONTROL_BINARY_PATH]
+    );
+    assert_eq!(body.cmd.unwrap(), ["--help"]);
+    let labels = body.labels.unwrap();
+    assert_eq!(
+        labels.get(LABEL_SANDBOX_NAMESPACE).map(String::as_str),
+        Some("resolver-test")
+    );
+    assert_eq!(
+        labels.get(LABEL_ISOLATION_ROLE).map(String::as_str),
+        Some(LABEL_ISOLATION_ROLE_STAGING)
+    );
+    let host = body.host_config.unwrap();
+    assert_eq!(host.network_mode.as_deref(), Some("none"));
+    assert_eq!(
+        host.extra_hosts.unwrap(),
+        ["host.openshell.internal:host-gateway"]
+    );
+    assert_eq!(host.cap_drop.unwrap(), ["ALL"]);
+    assert_eq!(host.cap_add, None);
+    assert_eq!(host.security_opt.unwrap(), ["no-new-privileges:true"]);
+    assert_eq!(host.readonly_rootfs, Some(true));
+    assert!(host.binds.is_none());
+    assert!(host.mounts.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires Docker and local supervisor/sandbox images; starts one confined resolver at a time"]
+async fn live_docker_host_gateway_resolver_reads_daemon_mapping_and_cleans_up() {
+    let docker = Docker::connect_with_local_defaults().unwrap();
+    let supervisor =
+        std::env::var("OPENSHELL_TEST_DOCKER_SUPERVISOR_IMAGE").expect("set supervisor image");
+    let sandbox = std::env::var("OPENSHELL_TEST_DOCKER_SANDBOX_IMAGE")
+        .expect("set sandbox image with no supervisor binary");
+    let temporary = TempDir::new().unwrap();
+    let namespace = format!(
+        "host-gateway-{}",
+        temporary.path().file_name().unwrap().to_str().unwrap()
+    );
+    let image_id = docker.inspect_image(&supervisor).await.unwrap().id.unwrap();
+    let ip = resolve_docker_host_gateway(&docker, &image_id, &namespace)
+        .await
+        .unwrap();
+    eprintln!("Docker daemon host-gateway resolved to {ip}");
+    if let Ok(expected) = std::env::var("OPENSHELL_TEST_DOCKER_HOST_GATEWAY_IP") {
+        assert_eq!(ip, expected.parse::<IpAddr>().unwrap());
+    }
+    let assert_clean = || async {
+        let filters = HashMap::from([(
+            "label",
+            vec![format!("{LABEL_SANDBOX_NAMESPACE}={namespace}")],
+        )]);
+        let remaining = docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::default()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            remaining.is_empty(),
+            "resolver container leaked: {remaining:?}"
+        );
+    };
+    assert_clean().await;
+    let failure_image_id = docker.inspect_image(&sandbox).await.unwrap().id.unwrap();
+    assert!(
+        resolve_docker_host_gateway(&docker, &failure_image_id, &namespace)
+            .await
+            .is_err()
+    );
+    assert_clean().await;
 }
 
 #[test]

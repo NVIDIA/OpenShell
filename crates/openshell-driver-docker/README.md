@@ -182,17 +182,20 @@ uses its sandbox-scoped bearer token to authenticate RPCs. User client
 certificates and private keys are not delivered to either container.
 
 Host mode on Docker Desktop requires host networking enabled in Settings.
-In bridge mode, the driver inspects the default `bridge` network's IPAM gateway
-at gateway startup, preferring a unique IPv4 address and otherwise a unique
-IPv6 address. Set the operator-owned `host_gateway_ip` to override this
-heuristic. Docker Desktop and custom daemon host-gateway settings can use a
-different host address and require the override. Missing or ambiguous gateway
-metadata produces an actionable configuration error.
+For bridge mode or a gateway endpoint using `host.docker.internal`, the driver
+resolves Docker's `host-gateway` once during initialization and caches it.
+A temporary container runs `--help` from the immutable supervisor image with
+no network, no capabilities, no privilege escalation, and a read-only root
+filesystem. The driver downloads Docker's generated `/etc/hosts` through the
+archive API, preferring a unique IPv4 address and otherwise a unique IPv6
+address. Resolution has a 30-second timeout; forced cleanup has a separate
+10-second timeout and runs after success or failure.
 
 The driver uses the selected address for both host aliases and the runtime
 descriptor's trust pin; workload DNS and hosts files cannot select it. Host
-mode retains its gateway-address pin unless `host_gateway_ip` is configured.
-No helper container or supervisor-specific resolution flag is required.
+mode with other gateway endpoints retains its gateway-address pin. An explicit
+operator-owned `host_gateway_ip` overrides discovery and skips the temporary
+container. No supervisor changes or per-sandbox discovery are required.
 
 When `grpc_endpoint` is omitted, bridge mode uses `host.docker.internal` on
 Desktop or for a wildcard gateway listener, and the concrete bind address for

@@ -95,6 +95,8 @@ const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
 const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
 const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
+const HOST_GATEWAY_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
+const HOST_GATEWAY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 const SANDBOX_BINARY_PATH: &str = "/.openshell/runtime/openshell-sandbox";
 const SUPERVISOR_IMAGE_CONTROL_BINARY_PATH: &str = "/openshell-supervisor";
@@ -196,7 +198,7 @@ pub struct DockerComputeConfig {
     /// Networking mode for the supervisor only. Workloads always use network=none.
     pub supervisor_network_mode: DockerSupervisorNetworkMode,
 
-    /// Override the trusted host address. Bridge mode otherwise uses the default bridge gateway.
+    /// Override the trusted host address. Bridge mode otherwise resolves Docker's host-gateway.
     pub host_gateway_ip: Option<IpAddr>,
 
     /// Image containing the trusted `openshell-sandbox` binary.
@@ -933,32 +935,26 @@ impl DockerComputeDriver {
             ))
         })?;
         let supervisor_grpc_endpoint = docker_config.grpc_endpoint.clone();
-        let host_gateway_ip = if let Some(ip) = docker_config.host_gateway_ip {
-            Some(validate_docker_host_gateway_ip(
-                ip,
-                docker_config.supervisor_network_mode,
-            )?)
-        } else if docker_config.supervisor_network_mode == DockerSupervisorNetworkMode::Bridge {
-            let network = docker
-                .inspect_network("bridge", None)
-                .await
-                .map_err(|error| {
-                    Error::config(format!(
-                        "inspect Docker bridge gateway: {error}; set host_gateway_ip explicitly"
-                    ))
-                })?;
-            let ip = docker_bridge_host_gateway_ip(&network)?;
-            info!(host_gateway_ip = %ip, "Using Docker bridge gateway for host aliases; configure host_gateway_ip if the Docker host uses a different address");
-            Some(ip)
-        } else {
-            docker_supervisor_host_address(&supervisor_grpc_endpoint)
-        };
         let supervisor_image = docker_config
             .supervisor_image
             .clone()
             .unwrap_or_else(openshell_core::config::default_supervisor_image);
         let supervisor_image_id =
             ensure_runtime_image(&docker, &supervisor_image, "supervisor").await?;
+        let host_gateway_ip = if let Some(ip) = docker_config.host_gateway_ip {
+            Some(validate_docker_host_gateway_ip(
+                ip,
+                docker_config.supervisor_network_mode,
+            )?)
+        } else if docker_config.supervisor_network_mode == DockerSupervisorNetworkMode::Bridge
+            || Url::parse(&supervisor_grpc_endpoint).is_ok_and(|endpoint| {
+                matches!(endpoint.host(), Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case(HOST_DOCKER_INTERNAL))
+            })
+        {
+            Some(resolve_docker_host_gateway(&docker, &supervisor_image_id, &docker_config.sandbox_label).await?)
+        } else {
+            docker_supervisor_host_address(&supervisor_grpc_endpoint)
+        };
         let sandbox_binary = if let Some(path) = docker_config.supervisor_bin.as_deref() {
             validate_linux_elf_binary(path).map_err(Error::config)?;
             Arc::new(tokio::fs::read(path).await.map_err(|error| {
@@ -6673,21 +6669,53 @@ fn validate_docker_host_gateway_ip(
     Ok(normalized)
 }
 
-fn docker_bridge_host_gateway_ip(network: &bollard::models::NetworkInspect) -> CoreResult<IpAddr> {
-    let addresses = network
-        .ipam
-        .as_ref()
-        .and_then(|ipam| ipam.config.as_ref())
-        .into_iter()
-        .flatten()
-        .filter_map(|config| config.gateway.as_deref())
-        .map(str::parse::<IpAddr>)
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()
-        .map_err(|error| {
-            Error::config(format!(
-                "invalid Docker bridge gateway: {error}; set host_gateway_ip explicitly"
-            ))
-        })?;
+fn docker_host_gateway_resolver_body(image: &str, namespace: &str) -> ContainerCreateBody {
+    ContainerCreateBody {
+        image: Some(image.to_string()),
+        user: Some(format!("{SUPERVISOR_UID}:{SUPERVISOR_GID}")),
+        entrypoint: Some(vec![SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string()]),
+        cmd: Some(vec!["--help".to_string()]),
+        labels: Some(HashMap::from([
+            (
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
+            ),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), namespace.to_string()),
+            (
+                LABEL_ISOLATION_ROLE.to_string(),
+                LABEL_ISOLATION_ROLE_STAGING.to_string(),
+            ),
+        ])),
+        host_config: Some(HostConfig {
+            network_mode: Some("none".to_string()),
+            extra_hosts: Some(vec![format!("{HOST_OPEN_SHELL_INTERNAL}:host-gateway")]),
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
+            readonly_rootfs: Some(true),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn parse_docker_host_gateway_hosts(contents: &[u8]) -> CoreResult<IpAddr> {
+    let hosts = std::str::from_utf8(contents).map_err(|error| {
+        Error::config(format!(
+            "Docker host-gateway hosts file is not UTF-8: {error}"
+        ))
+    })?;
+    let mut addresses = std::collections::BTreeSet::new();
+    for line in hosts.lines() {
+        let mut fields = line.split('#').next().unwrap_or("").split_whitespace();
+        let Some(address) = fields.next() else {
+            continue;
+        };
+        if fields.any(|host| host.eq_ignore_ascii_case(HOST_OPEN_SHELL_INTERNAL)) {
+            addresses.insert(address.parse::<IpAddr>().map_err(|error| {
+                Error::config(format!("invalid Docker host-gateway hosts entry: {error}"))
+            })?);
+        }
+    }
     let ipv4 = addresses
         .iter()
         .copied()
@@ -6700,10 +6728,89 @@ fn docker_bridge_host_gateway_ip(network: &bollard::models::NetworkInspect) -> C
     };
     let [ip] = candidates.as_slice() else {
         return Err(Error::config(
-            "Docker bridge does not report a unique gateway; set host_gateway_ip explicitly",
+            "Docker host-gateway resolver did not return one unique address per family",
         ));
     };
     validate_docker_host_gateway_ip(*ip, DockerSupervisorNetworkMode::Bridge)
+}
+
+/// Resolve once at driver construction; all sandbox launches reuse the cached pin.
+async fn resolve_docker_host_gateway(
+    docker: &Docker,
+    image: &str,
+    namespace: &str,
+) -> CoreResult<IpAddr> {
+    let name = format!("{}-host-gateway", temp_extract_container_name());
+    let result = tokio::time::timeout(HOST_GATEWAY_RESOLUTION_TIMEOUT, async {
+        docker
+            .create_container(
+                Some(
+                    CreateContainerOptionsBuilder::default()
+                        .name(name.as_str())
+                        .build(),
+                ),
+                docker_host_gateway_resolver_body(image, namespace),
+            )
+            .await
+            .map_err(|error| {
+                Error::config(format!("create Docker host-gateway resolver: {error}"))
+            })?;
+        docker.start_container(&name, None).await.map_err(|error| {
+            Error::config(format!("start Docker host-gateway resolver: {error}"))
+        })?;
+        let mut wait = docker.wait_container(
+            &name,
+            None::<bollard::query_parameters::WaitContainerOptions>,
+        );
+        let status = wait
+            .next()
+            .await
+            .ok_or_else(|| Error::config("Docker host-gateway resolver wait ended"))?
+            .map_err(|error| {
+                Error::config(format!("wait for Docker host-gateway resolver: {error}"))
+            })?;
+        if status.status_code != 0 {
+            return Err(Error::config(format!(
+                "Docker host-gateway resolver exited with status {}",
+                status.status_code
+            )));
+        }
+        let hosts = download_path_from_container(docker, &name, "/etc/hosts", true).await?;
+        parse_docker_host_gateway_hosts(&hosts)
+    })
+    .await
+    .map_err(|_| Error::config("Docker host-gateway resolution timed out"))
+    .and_then(std::convert::identity);
+
+    // Remove by the unique name even after a timed-out create request.
+    let cleanup = tokio::time::timeout(
+        HOST_GATEWAY_CLEANUP_TIMEOUT,
+        docker.remove_container(
+            &name,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        Error::config(format!(
+            "cleanup Docker host-gateway resolver '{name}' timed out"
+        ))
+    })
+    .and_then(|removed| match removed {
+        Ok(())
+        | Err(BollardError::DockerResponseServerError {
+            status_code: 404, ..
+        }) => Ok(()),
+        Err(error) => Err(Error::config(format!(
+            "remove Docker host-gateway resolver '{name}': {error}"
+        ))),
+    });
+    if let Err(error) = &cleanup {
+        warn!(container = %name, %error, "Failed to clean up Docker host-gateway resolver");
+    }
+    let ip = result?;
+    cleanup?;
+    Ok(ip)
 }
 
 fn docker_supervisor_networking(
