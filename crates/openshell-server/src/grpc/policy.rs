@@ -2802,7 +2802,7 @@ pub(super) async fn handle_get_sandbox_config(
             )
             .await?;
             Ok(Response::new(sandbox_config_response(
-                unadmitted_sandbox_config(&sandbox, &error),
+                unadmitted_sandbox_config(state, &sandbox, &error),
             )))
         }
         result => result,
@@ -2819,11 +2819,15 @@ pub fn is_configuration_rejection(error: &Status) -> bool {
 }
 
 /// The configuration a supervisor receives while its stored configuration is
-/// rejected: not admitted, so the supervisor fails closed until a repair.
+/// rejected: not admitted, so the supervisor applies its configured failure mode.
 /// A malformed stored candidate must not prevent a supervisor from waiting
 /// for that repair. Do not expose parser payloads or copy malformed policy
 /// history.
-pub fn unadmitted_sandbox_config(sandbox: &Sandbox, error: &Status) -> SandboxConfigSnapshot {
+pub fn unadmitted_sandbox_config(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    error: &Status,
+) -> SandboxConfigSnapshot {
     SandboxConfigSnapshot {
         configuration_admitted: false,
         configuration_error: configuration_failure_diagnostic(error).to_string(),
@@ -2833,6 +2837,11 @@ pub fn unadmitted_sandbox_config(sandbox: &Sandbox, error: &Status) -> SandboxCo
             .and_then(|status| status.configuration_admission.as_ref())
             .map_or_else(String::new, |admission| admission.instance_id.clone()),
         workspace: sandbox.object_workspace().to_string(),
+        policy_validation_failure_mode: state
+            .config
+            .policy_validation_failure_mode
+            .as_str()
+            .to_string(),
         ..Default::default()
     }
 }

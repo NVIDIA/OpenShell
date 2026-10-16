@@ -27,7 +27,7 @@ use super::{DeliveryDisposition, MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES, Supervisor
 use crate::ServerState;
 use crate::grpc::policy::{
     build_provider_environment_snapshot_from_inputs, build_sandbox_config_snapshot_from_inputs,
-    load_sandbox_config_inputs,
+    is_configuration_rejection, load_sandbox_config_inputs, unadmitted_sandbox_config,
 };
 use crate::persistence::ObjectId;
 use crate::supervisor_session::{AcceptedSession, SupervisorSessionRegistry};
@@ -88,10 +88,43 @@ pub struct ConfigSessionState {
     /// again only when it changes, so a redelivered configuration writes
     /// nothing.
     persisted_admission: Option<SandboxConfigurationAdmission>,
-    /// A policy load result whose write failed. The supervisor reports a
-    /// load only once, so it is written again with the next result. If the
-    /// session ends first, the next session's bootstrap settles it.
-    unrecorded_policy_load: Option<PolicyLoadResult>,
+    /// Preserve the last successful load across later rejected updates until
+    /// it is recorded or a newer successful load supersedes it.
+    unrecorded_policy_loads: UnrecordedPolicyLoads,
+}
+
+#[derive(Debug, Default)]
+struct UnrecordedPolicyLoads {
+    loaded: Option<PolicyLoadResult>,
+    latest: Option<PolicyLoadResult>,
+}
+
+impl UnrecordedPolicyLoads {
+    fn keep(&mut self, mut result: PolicyLoadResult) {
+        if result.loaded {
+            result.error.clear();
+            if self
+                .loaded
+                .as_ref()
+                .is_none_or(|loaded| loaded.version <= result.version)
+            {
+                self.loaded = Some(result.clone());
+            }
+        } else {
+            result.error = result.error.chars().take(1024).collect();
+        }
+        self.latest = Some(result);
+    }
+
+    fn take(&mut self) -> Vec<PolicyLoadResult> {
+        let mut results = [self.loaded.take(), self.latest.take()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        results.sort_by_key(|result| result.version);
+        results.dedup();
+        results
+    }
 }
 
 #[derive(Debug)]
@@ -132,7 +165,7 @@ impl ConfigSessionState {
             pending: None,
             acknowledged: None,
             persisted_admission: None,
-            unrecorded_policy_load: None,
+            unrecorded_policy_loads: UnrecordedPolicyLoads::default(),
         }
     }
 
@@ -361,15 +394,15 @@ impl SupervisorSessionRegistry {
         });
     }
 
-    fn take_unrecorded_policy_load(
+    fn take_unrecorded_policy_loads(
         &self,
         sandbox_id: &str,
         session_id: &str,
-    ) -> Option<PolicyLoadResult> {
+    ) -> Vec<PolicyLoadResult> {
         self.with_config_session(sandbox_id, session_id, |session| {
-            session.and_then(|session| session.unrecorded_policy_load.take())
+            session.map_or_else(Vec::new, |session| session.unrecorded_policy_loads.take())
         })
-        .flatten()
+        .unwrap_or_default()
     }
 
     fn keep_unrecorded_policy_load(
@@ -380,7 +413,7 @@ impl SupervisorSessionRegistry {
     ) {
         self.with_config_session(sandbox_id, session_id, |session| {
             if let Some(session) = session {
-                session.unrecorded_policy_load = Some(policy_load);
+                session.unrecorded_policy_loads.keep(policy_load);
             }
         });
     }
@@ -584,11 +617,11 @@ pub async fn handle_config_update_result(
     } else {
         None
     };
-    // A load whose write failed earlier goes first, so a newer one that
-    // also fails is the one kept.
+    // Retry the successful load before a later rejection so the policy still
+    // enforced cannot lose its load acknowledgement.
     let mut recorded = true;
     let policy_loads = registry
-        .take_unrecorded_policy_load(sandbox_id, session_id)
+        .take_unrecorded_policy_loads(sandbox_id, session_id)
         .into_iter()
         .chain(result.policy_load.clone())
         .chain(bootstrap_load);
@@ -790,19 +823,28 @@ async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
 ) -> Result<SupervisorConfig, Status> {
-    tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
+    let built = tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
         let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
-        let (sandbox_config, provider_environment) = tokio::join!(
-            build_sandbox_config_snapshot_from_inputs(state, &inputs),
-            build_provider_environment_snapshot_from_inputs(state, &inputs, true, true),
-        );
+        let sandbox_config = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
+        let provider_environment =
+            build_provider_environment_snapshot_from_inputs(state, &inputs, true, true).await?;
         Ok(SupervisorConfig {
-            sandbox_config: sandbox_config?,
-            provider_environment: provider_environment?,
+            sandbox_config,
+            provider_environment,
         })
     })
     .await
-    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
+    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?;
+    match built {
+        Err(error) if is_configuration_rejection(&error) => {
+            let sandbox_config = unadmitted_sandbox_config(state, sandbox, &error);
+            Ok(SupervisorConfig {
+                provider_environment: super::unresolved_provider_environment(&sandbox_config),
+                sandbox_config,
+            })
+        }
+        result => result,
+    }
 }
 
 /// The result a supervisor reports after applying `update` in full.
@@ -2340,6 +2382,126 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         assert_eq!(
             stored_sandbox(&state, sandbox_id).await.phase(),
             SandboxPhase::Ready as i32
+        );
+    }
+
+    #[test]
+    fn unrecorded_policy_loads_keep_success_and_coalesce_newer_results() {
+        let mut pending = UnrecordedPolicyLoads::default();
+        for version in 1..=100 {
+            pending.keep(PolicyLoadResult {
+                version,
+                loaded: true,
+                error: String::new(),
+            });
+        }
+        for version in 101..=200 {
+            pending.keep(PolicyLoadResult {
+                version,
+                loaded: false,
+                error: "rejected".repeat(1024),
+            });
+        }
+        let results = pending.take();
+        assert_eq!(results.len(), 2);
+        assert_eq!((results[0].version, results[0].loaded), (100, true));
+        assert_eq!((results[1].version, results[1].loaded), (200, false));
+        assert_eq!(results[1].error.len(), 1024);
+        assert!(pending.take().is_empty());
+
+        for (version, loaded) in [(201, true), (202, false), (203, true)] {
+            pending.keep(PolicyLoadResult {
+                version,
+                loaded,
+                error: String::new(),
+            });
+        }
+        assert_eq!(
+            pending.take(),
+            vec![PolicyLoadResult {
+                version: 203,
+                loaded: true,
+                error: String::new()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_rejection_preserves_unrecorded_success() {
+        use crate::policy_store::PolicyStoreExt as _;
+
+        let sandbox_id = "sb-unrecorded-success";
+        let state = push_state_with_sandbox_spec(sandbox_id).await;
+        put_sandbox_policy_revision(&state, sandbox_id).await;
+        state
+            .store
+            .put_policy_revision(
+                "policy-4",
+                sandbox_id,
+                "default",
+                4,
+                &SandboxPolicy::default().encode_to_vec(),
+                "policy-4-hash",
+            )
+            .await
+            .unwrap();
+        let (tx, mut rx) = register_apply_session_in_state(&state, sandbox_id);
+        let session = accepted_session(&state, sandbox_id, tx);
+        state
+            .store
+            .execute_for_test(FAIL_POLICY_RECORD_WRITES)
+            .await;
+        let success = deliver_and_report(
+            &state,
+            sandbox_id,
+            &mut rx,
+            &sandbox_policy_snapshot(),
+            ConfigApplyOutcome::Applied,
+        );
+        assert!(handle_config_update_result(&session, &success).await);
+        let failed_snapshot = SandboxConfigSnapshot {
+            version: 4,
+            config_revision: 8,
+            policy_hash: "policy-4-hash".into(),
+            ..sandbox_policy_snapshot()
+        };
+        let failure = deliver_and_report(
+            &state,
+            sandbox_id,
+            &mut rx,
+            &failed_snapshot,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood,
+        );
+        assert!(handle_config_update_result(&session, &failure).await);
+        state.store.execute_for_test(RESTORE_RESULT_WRITES).await;
+        let mut repeated = deliver_and_report(
+            &state,
+            sandbox_id,
+            &mut rx,
+            &failed_snapshot,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood,
+        );
+        repeated.policy_load = None;
+        assert!(handle_config_update_result(&session, &repeated).await);
+        let retained = state
+            .store
+            .get_policy_by_version(sandbox_id, 3)
+            .await
+            .unwrap()
+            .unwrap();
+        let rejected = state
+            .store
+            .get_policy_by_version(sandbox_id, 4)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.status, "loaded");
+        assert_eq!(rejected.status, "failed");
+        assert_eq!(
+            stored_sandbox(&state, sandbox_id)
+                .await
+                .current_policy_version(),
+            3
         );
     }
 }

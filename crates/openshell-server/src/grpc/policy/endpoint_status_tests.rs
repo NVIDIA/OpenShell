@@ -1848,6 +1848,68 @@ async fn gateway_client(state: Arc<ServerState>) -> OpenShellClient<tonic::trans
 }
 
 #[tokio::test]
+async fn session_resets_invalidate_evidence_when_stored_configuration_is_invalid() {
+    for disconnect in [false, true] {
+        let sandbox_id = "endpoint-invalid-configuration";
+        let (state, _) = sandbox_with_accepted_endpoint_result(sandbox_id, false).await;
+        let before = stored_sandbox(&state, sandbox_id).await;
+        assert_eq!(
+            before.status.as_ref().unwrap().endpoint_statuses[0].last_result,
+            i32::from(EndpointResult::HttpResponseReceived)
+        );
+        let mut invalid_policy = mcp_policy_with_versions(&["2025-11-25"]);
+        invalid_policy
+            .network_policies
+            .get_mut("mcp")
+            .unwrap()
+            .endpoints[0]
+            .protocol = "rest".to_string();
+        state
+            .store
+            .put_policy_revision(
+                "invalid-policy",
+                sandbox_id,
+                "default",
+                2,
+                &invalid_policy.encode_to_vec(),
+                "invalid",
+            )
+            .await
+            .unwrap();
+        let error = active_endpoint_context(&state, &before)
+            .await
+            .err()
+            .expect("stored policy fails validation");
+        assert!(crate::grpc::policy::is_configuration_rejection(&error));
+        if disconnect {
+            state
+                .supervisor_sessions
+                .remove_if_current(sandbox_id, "session-a");
+            reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
+                .await
+                .expect("disconnect invalidates evidence without decoding invalid policy");
+        } else {
+            register_session(&state, sandbox_id, "session-b");
+            reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-b")
+                .await
+                .expect("replacement invalidates evidence without decoding invalid policy");
+        }
+        let stored = stored_sandbox(&state, sandbox_id).await;
+        let endpoint = &stored.status.as_ref().unwrap().endpoint_statuses[0];
+        assert_eq!(
+            endpoint.endpoint_id,
+            before.status.as_ref().unwrap().endpoint_statuses[0].endpoint_id
+        );
+        assert_eq!(
+            endpoint.last_result,
+            i32::from(EndpointResult::NoObservedExchange)
+        );
+        assert!(endpoint.last_reported_time.is_none());
+        assert!(endpoint.last_failure.is_none());
+    }
+}
+
+#[tokio::test]
 async fn replacement_reset_timeout_invalidates_superseded_evidence() {
     let sandbox_id = "endpoint-replacement-reset-timeout";
     // Session A stays registered, so the replacement supersedes it before A's

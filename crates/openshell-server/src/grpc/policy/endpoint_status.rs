@@ -405,6 +405,19 @@ fn unknown_endpoint_reports(
         .collect()
 }
 
+async fn endpoint_reports_for_session_reset(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<Option<BTreeMap<String, EndpointStatus>>, Status> {
+    match active_endpoint_context(state, sandbox).await {
+        Ok(context) => Ok(Some(unknown_endpoint_reports(&context.endpoints))),
+        // Invalid configuration must not block its rejection bootstrap or retain
+        // evidence from an ended session.
+        Err(error) if super::is_configuration_rejection(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Reset endpoint evidence before acknowledging a newly authenticated supervisor.
 pub async fn reset_endpoint_status_for_supervisor_session(
     state: &Arc<ServerState>,
@@ -438,15 +451,18 @@ pub async fn reset_endpoint_status_for_supervisor_session(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
-    let reports = unknown_endpoint_reports(&context.endpoints);
+    let reports = endpoint_reports_for_session_reset(state, &sandbox).await?;
     let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
         .map_err(|error| Status::internal(format!("create endpoint reset timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-            reset_endpoint_statuses(sandbox, &reports, &now);
+            if let Some(reports) = &reports {
+                reset_endpoint_statuses(sandbox, reports, &now);
+            } else {
+                invalidate_endpoint_status_without_session(sandbox);
+            }
         })
         .await
         .map_err(|error| {
@@ -498,15 +514,18 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
         .await
         .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
-    let context = active_endpoint_context(state.as_ref(), &sandbox).await?;
-    let reports = unknown_endpoint_reports(&context.endpoints);
+    let reports = endpoint_reports_for_session_reset(state, &sandbox).await?;
     let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
         .map_err(|error| Status::internal(format!("create endpoint reset timestamp: {error}")))?;
     let expected_resource_version = sandbox.get_resource_version();
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-            reset_endpoint_statuses(sandbox, &reports, &now);
+            if let Some(reports) = &reports {
+                reset_endpoint_statuses(sandbox, reports, &now);
+            } else {
+                invalidate_endpoint_status_without_session(sandbox);
+            }
         })
         .await
         .map_err(|error| {

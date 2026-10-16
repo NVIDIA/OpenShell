@@ -3590,6 +3590,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_reconnect_bootstrap_quarantines_and_recovers_without_polling() {
+        use openshell_core::proto::{
+            ConfigApplyOutcome, ConfigurationAdmissionState, PolicySource,
+        };
+
+        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        let (mut ctx, config_apply_tx, _push_tx) = push_session_poll_loop(&initial);
+        let (session_tx, session_rx) = tokio::sync::watch::channel(Some("session-1".to_string()));
+        ctx.supervisor_session_id = session_rx;
+        let engine = Arc::clone(&ctx.opa_engine);
+        let (client, polls, mut reports) = scripted_policy_gateway();
+        let poll_calls = Arc::clone(&client.poll_calls);
+        polls.send(initial.clone()).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
+        expect_policy_report(&mut reports, 1).await;
+
+        session_tx.send_replace(None);
+        let mut rejected = initial.clone();
+        rejected.policy = None;
+        rejected.configuration_admitted = false;
+        rejected.configuration_error = "Stored policy structure or safety validation failed".into();
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+        session_tx.send_replace(Some("session-2".to_string()));
+        let result = deliver_update(
+            &config_apply_tx,
+            config_update("rejected-bootstrap", &rejected),
+        )
+        .await;
+        assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::FailedClosed));
+        assert_eq!(
+            result.admission.unwrap().state,
+            i32::from(ConfigurationAdmissionState::Rejected)
+        );
+        assert!(engine.fail_closed_reason().is_some());
+
+        let mut repaired = initial;
+        repaired.version = 3;
+        repaired.config_revision = 300;
+        let result = deliver_update(&config_apply_tx, config_update("repair", &repaired)).await;
+        assert_eq!(result.outcome, i32::from(ConfigApplyOutcome::Applied));
+        assert!(engine.fail_closed_reason().is_none());
+        assert_eq!(poll_calls.load(Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn runtime_polls_again_when_the_session_stops_pushing() {
         let initial = settings_poll_result(
             Some(proto_policy_fixture()),

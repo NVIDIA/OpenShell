@@ -444,7 +444,7 @@ async fn build_sandbox_config(
         Ok((inputs, snapshot)) => Ok(Some(BuiltSandboxConfig::Built(Box::new(inputs), snapshot))),
         Err(error) if is_configuration_rejection(&error) => {
             Ok(Some(BuiltSandboxConfig::Rejected {
-                sandbox_config: unadmitted_sandbox_config(&sandbox, &error),
+                sandbox_config: unadmitted_sandbox_config(state, &sandbox, &error),
                 providers: sandbox
                     .spec
                     .as_ref()
@@ -1200,6 +1200,94 @@ mod tests {
             panic!("expected a configuration update");
         };
         update.sandbox_config.expect("sandbox configuration")
+    }
+
+    #[tokio::test]
+    async fn invalid_configuration_bootstrap_is_delivered_and_repaired_on_the_same_stream() {
+        use openshell_core::proto::{ConfigApplyOutcome, SupervisorMessage, supervisor_message};
+
+        for mode in [
+            openshell_core::PolicyValidationFailureMode::FailClosed,
+            openshell_core::PolicyValidationFailureMode::RetainLastValid,
+        ] {
+            for reconnect in [false, true] {
+                let mut state = push_state().await;
+                Arc::get_mut(&mut state)
+                    .unwrap()
+                    .config
+                    .policy_validation_failure_mode = mode;
+                put_sandbox(&state, "sandbox", &[]).await;
+                if reconnect {
+                    change_policy(&state, "sandbox", 1).await;
+                    let (_old, _) = accepted_session(&state, "sandbox").await;
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let sandbox = state
+                                .store
+                                .get_message::<Sandbox>("sandbox")
+                                .await
+                                .unwrap()
+                                .unwrap();
+                            if sandbox.current_policy_version() == 1 {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("initial policy acknowledgement is persisted");
+                    state.supervisor_sessions.disconnect("sandbox");
+                }
+                let invalid_version = if reconnect { 2 } else { 1 };
+                store_invalid_policy(&state, "sandbox", invalid_version).await;
+                let connected = if reconnect {
+                    reconnect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply).await
+                } else {
+                    connect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply).await
+                };
+                let mut harness = connected
+                    .expect("invalid configuration must not prevent explicit bootstrap rejection");
+                let message = next_update(&mut harness, Duration::from_secs(5))
+                    .await
+                    .expect("accepted session");
+                let Some(gateway_message::Payload::SessionAccepted(accepted)) = message.payload
+                else {
+                    panic!("expected SessionAccepted");
+                };
+                let bootstrap = accepted.bootstrap.expect("rejected bootstrap");
+                let snapshot = bootstrap.sandbox_config.as_ref().unwrap();
+                assert!(!snapshot.configuration_admitted);
+                assert_eq!(snapshot.policy_validation_failure_mode, mode.as_str());
+                assert!(snapshot.policy.is_none());
+                assert!(!snapshot.configuration_error.is_empty());
+                assert_eq!(
+                    bootstrap.provider_environment.as_ref().unwrap(),
+                    &unresolved_provider_environment(snapshot)
+                );
+                let mut rejected = session::applied_result(&bootstrap);
+                rejected.outcome = ConfigApplyOutcome::FailedClosed.into();
+                rejected.policy_load = None;
+                harness
+                    .outbound
+                    .send(SupervisorMessage {
+                        payload: Some(supervisor_message::Payload::ConfigUpdateResult(rejected)),
+                    })
+                    .await
+                    .unwrap();
+
+                let repaired_version = invalid_version + 1;
+                change_policy(&state, "sandbox", repaired_version).await;
+                publish_sandbox(&state, "sandbox");
+                let repaired = sent_config(
+                    &next_update(&mut harness, Duration::from_secs(5))
+                        .await
+                        .expect("repaired live update"),
+                );
+                let snapshot = repaired.sandbox_config.as_ref().unwrap();
+                assert!(snapshot.configuration_admitted);
+                assert_eq!(i64::from(snapshot.version), repaired_version);
+            }
+        }
     }
 
     #[tokio::test]
