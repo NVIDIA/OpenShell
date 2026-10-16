@@ -531,7 +531,7 @@ pub async fn spawn(
     gateway_name: &str,
     vm_config: &VmComputeConfig,
     otlp_config: Option<&OtlpConfig>,
-    network_additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
+    additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     vm_config.validate_configuration()?;
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
@@ -581,7 +581,7 @@ pub async fn spawn(
         command.arg("--guest-tls-ca").arg(tls.ca);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
-    append_vm_network_trust_args(&mut command, network_additional_ca_bundle);
+    append_vm_network_trust_args(&mut command, additional_ca_bundle);
     if vm_config.enable_bind_mounts {
         command.arg("--enable-bind-mounts");
     }
@@ -650,13 +650,11 @@ fn append_vm_network_trust_args(
         // boundary. The child reads and verifies the bounded artifact once,
         // then retains its own immutable snapshot for sandbox launches.
         command
-            .arg("--network-additional-ca-bundle")
+            .arg("--additional-ca-bundle")
             .arg(bundle.artifact_path());
+        command.arg("--additional-ca-digest").arg(bundle.digest());
         command
-            .arg("--network-additional-ca-digest")
-            .arg(bundle.digest());
-        command
-            .arg("--network-additional-ca-certificate-count")
+            .arg("--additional-ca-certificate-count")
             .arg(bundle.certificate_count().to_string());
     }
 }
@@ -717,7 +715,7 @@ pub async fn spawn(
     _gateway_name: &str,
     _vm_config: &VmComputeConfig,
     _otlp_config: Option<&OtlpConfig>,
-    _network_additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
+    _additional_ca_bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Result<AcquiredRemoteDriverEndpoint> {
     Err(Error::config(
         "the vm compute driver requires unix domain socket support",
@@ -987,11 +985,11 @@ mod tests {
         assert_eq!(
             args,
             [
-                "--network-additional-ca-bundle",
+                "--additional-ca-bundle",
                 "/var/lib/openshell/network/additional-ca.crt",
-                "--network-additional-ca-digest",
+                "--additional-ca-digest",
                 "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                "--network-additional-ca-certificate-count",
+                "--additional-ca-certificate-count",
                 "2",
             ]
         );

@@ -130,10 +130,9 @@ const ANNOTATION_SANDBOX_RUNTIME_CONTROL_POLICY_GENERATION: &str =
 /// Full gateway-normalized destination-trust digest recorded on each immutable
 /// `ConfigMap` generation. The digest is intentionally not truncated here even
 /// though the object name uses stable, DNS-safe hash prefixes.
-const ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION: &str =
-    "openshell.ai/network-additional-ca-generation";
-const NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX: &str = "openshell-network-additional-ca-";
-const NETWORK_ADDITIONAL_CA_DATA_KEY: &str = "ca.crt";
+const ANNOTATION_ADDITIONAL_CA_GENERATION: &str = "openshell.ai/additional-ca-generation";
+const ADDITIONAL_CA_CONFIG_MAP_PREFIX: &str = "openshell-additional-ca-";
+const ADDITIONAL_CA_DATA_KEY: &str = "ca.crt";
 
 /// A validated immutable `ConfigMap` generation selected for a supervisor Pod.
 /// This contains only an object name and non-secret digest; PEM bytes remain in
@@ -151,9 +150,9 @@ fn network_additional_ca_config_map_name(gateway_id: &str, digest: &str) -> Stri
     let gateway_hash = format!("{:x}", Sha256::digest(gateway_id.as_bytes()));
     let digest_hash = format!("{:x}", Sha256::digest(digest.as_bytes()));
     format!(
-        "{NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX}{}-{}",
+        "{ADDITIONAL_CA_CONFIG_MAP_PREFIX}{}-{}",
         &gateway_hash[..12],
-        &digest_hash[..18],
+        &digest_hash[..26],
     )
 }
 
@@ -180,7 +179,7 @@ fn network_additional_ca_config_map(
                 (LABEL_GATEWAY_ID.to_string(), gateway_id.to_string()),
             ])),
             annotations: Some(BTreeMap::from([(
-                ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION.to_string(),
+                ANNOTATION_ADDITIONAL_CA_GENERATION.to_string(),
                 bundle.digest().to_string(),
             )])),
             // Generations are intentionally retained across Pod and Sandbox
@@ -191,7 +190,7 @@ fn network_additional_ca_config_map(
         },
         immutable: Some(true),
         data: Some(BTreeMap::from([(
-            NETWORK_ADDITIONAL_CA_DATA_KEY.to_string(),
+            ADDITIONAL_CA_DATA_KEY.to_string(),
             pem.to_string(),
         )])),
         binary_data: None,
@@ -218,12 +217,12 @@ fn validate_network_additional_ca_config_map(
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION));
+        .and_then(|annotations| annotations.get(ANNOTATION_ADDITIONAL_CA_GENERATION));
     let actual_digest = existing
         .metadata
         .annotations
         .as_ref()
-        .and_then(|annotations| annotations.get(ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION));
+        .and_then(|annotations| annotations.get(ANNOTATION_ADDITIONAL_CA_GENERATION));
     if actual_digest != expected_digest {
         return Err(KubernetesDriverError::Precondition(format!(
             "network additional CA ConfigMap {name} has an unexpected trust generation"
@@ -9201,9 +9200,7 @@ mod tests {
         assert!(steps.lock().unwrap().is_empty());
     }
 
-    use crate::sandbox_runtime::{
-        NETWORK_ADDITIONAL_CA_BUNDLE_PATH, NETWORK_ADDITIONAL_CA_VOLUME_NAME,
-    };
+    use crate::sandbox_runtime::{ADDITIONAL_CA_MOUNT_PATH, ADDITIONAL_CA_VOLUME_NAME};
     use openshell_core::progress::{
         PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
         PROGRESS_COMPLETE_STEP_KEY,
@@ -9336,7 +9333,7 @@ mod tests {
             .expect("normalized PEM must be valid UTF-8");
         let name = expected.metadata.name.as_deref().expect("ConfigMap name");
         assert_eq!(name.len(), 63);
-        assert!(name.starts_with(NETWORK_ADDITIONAL_CA_CONFIG_MAP_PREFIX));
+        assert!(name.starts_with(ADDITIONAL_CA_CONFIG_MAP_PREFIX));
         assert!(
             name.bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -9354,15 +9351,17 @@ mod tests {
             ]))
         );
         assert_eq!(
-            expected.metadata.annotations.as_ref().and_then(
-                |annotations| annotations.get(ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION)
-            ),
+            expected
+                .metadata
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.get(ANNOTATION_ADDITIONAL_CA_GENERATION)),
             Some(&digest.to_string())
         );
         assert_eq!(
             expected.data.as_ref(),
             Some(&BTreeMap::from([(
-                NETWORK_ADDITIONAL_CA_DATA_KEY.to_string(),
+                ADDITIONAL_CA_DATA_KEY.to_string(),
                 String::from_utf8(bundle.normalized_pem().to_vec()).unwrap(),
             )]))
         );
@@ -9391,7 +9390,7 @@ mod tests {
 
         let mut replaced = expected.clone();
         replaced.data = Some(BTreeMap::from([(
-            NETWORK_ADDITIONAL_CA_DATA_KEY.to_string(),
+            ADDITIONAL_CA_DATA_KEY.to_string(),
             "not-a-certificate\n".to_string(),
         )]));
         assert!(matches!(
@@ -9437,7 +9436,7 @@ mod tests {
 
         let mut stale_digest = expected.clone();
         stale_digest.metadata.annotations.as_mut().unwrap().insert(
-            ANNOTATION_NETWORK_ADDITIONAL_CA_GENERATION.to_string(),
+            ANNOTATION_ADDITIONAL_CA_GENERATION.to_string(),
             "sha256:stale".to_string(),
         );
         assert!(matches!(
@@ -11781,7 +11780,7 @@ mod tests {
         assert!(
             !volumes
                 .iter()
-                .any(|volume| volume["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME),
+                .any(|volume| volume["name"] == ADDITIONAL_CA_VOLUME_NAME),
             "destination trust is exclusive to the separate supervisor Pod"
         );
         for container in pod_template["spec"]["containers"]
@@ -11798,8 +11797,8 @@ mod tests {
             assert!(
                 !container["volumeMounts"].as_array().is_some_and(|mounts| {
                     mounts.iter().any(|mount| {
-                        mount["name"] == NETWORK_ADDITIONAL_CA_VOLUME_NAME
-                            || mount["mountPath"] == NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+                        mount["name"] == ADDITIONAL_CA_VOLUME_NAME
+                            || mount["mountPath"] == ADDITIONAL_CA_MOUNT_PATH
                     })
                 }),
                 "destination trust leaked into a workload or init container: {container:#?}"

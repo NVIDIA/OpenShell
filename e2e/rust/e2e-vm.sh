@@ -312,7 +312,7 @@ EOF
 if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
   cat >>"${GATEWAY_CONFIG}" <<EOF
 [openshell.supervisor.network]
-additional_ca_cert_paths = ["${ADDITIONAL_CA_DIR}/ca.crt"]
+additional_ca_bundle = "${ADDITIONAL_CA_DIR}/ca.crt"
 
 EOF
 fi

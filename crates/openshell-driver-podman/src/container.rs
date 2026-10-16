@@ -72,8 +72,7 @@ const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
-const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
-    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
+const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
@@ -622,12 +621,10 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
 /// The source path stays out of argv; the digest pairs the mounted artifact
 /// with the immutable generation recorded on the workload label.
 fn network_trust_cli_args(network_trust: Option<&NetworkSupervisorTrustBundle>) -> Vec<String> {
-    network_trust.map_or_else(Vec::new, |bundle| {
+    network_trust.map_or_else(Vec::new, |_bundle| {
         vec![
-            "--network-additional-ca-bundle".to_string(),
-            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
-            "--network-additional-ca-digest".to_string(),
-            bundle.digest().to_string(),
+            "--additional-ca-bundle".to_string(),
+            ADDITIONAL_CA_MOUNT_PATH.to_string(),
         ]
     })
 }
@@ -655,7 +652,7 @@ fn network_trust_mount(bundle: &NetworkSupervisorTrustBundle) -> Result<Mount, C
     Ok(Mount {
         kind: "bind".into(),
         source: source.to_string(),
-        destination: NETWORK_ADDITIONAL_CA_BUNDLE_PATH.into(),
+        destination: ADDITIONAL_CA_MOUNT_PATH.into(),
         options,
     })
 }
@@ -1823,7 +1820,7 @@ fn trusted_mount(destination: &str) -> bool {
         destination,
         TLS_CA_MOUNT_PATH
             | PROXY_CA_MOUNT_PATH
-            | NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+            | ADDITIONAL_CA_MOUNT_PATH
             | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
     ) || destination == openshell_core::container_paths::NETNS_MOUNT_ROOT
 }
@@ -1955,8 +1952,7 @@ mod tests {
 
     #[test]
     fn additional_destination_trust_is_delivered_only_to_supervisor_with_digest() {
-        let artifact =
-            crate::test_utils::unique_socket_path("network-additional-ca").with_extension("crt");
+        let artifact = crate::test_utils::unique_socket_path("additional-ca").with_extension("crt");
         let pem = b"normalized additional CA fixture";
         std::fs::write(&artifact, pem).unwrap();
         #[cfg(unix)]
@@ -2007,29 +2003,25 @@ mod tests {
                 .map(String::as_str),
             Some("sha256:paired-digest")
         );
-        assert!(specs.workload.command.iter().all(|argument| {
-            argument != "--network-additional-ca-bundle"
-                && argument != "--network-additional-ca-digest"
-        }));
+        assert!(
+            specs
+                .workload
+                .command
+                .iter()
+                .all(|argument| argument != "--additional-ca-bundle")
+        );
         assert!(
             specs
                 .workload
                 .mounts
                 .iter()
-                .all(|mount| { mount.destination != NETWORK_ADDITIONAL_CA_BUNDLE_PATH })
+                .all(|mount| { mount.destination != ADDITIONAL_CA_MOUNT_PATH })
         );
         assert!(specs.supervisor.command.windows(2).any(|arguments| {
-            arguments
-                == [
-                    "--network-additional-ca-bundle",
-                    NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
-                ]
-        }));
-        assert!(specs.supervisor.command.windows(2).any(|arguments| {
-            arguments == ["--network-additional-ca-digest", "sha256:paired-digest"]
+            arguments == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH]
         }));
         assert!(specs.supervisor.mounts.iter().any(|mount| {
-            mount.destination == NETWORK_ADDITIONAL_CA_BUNDLE_PATH
+            mount.destination == ADDITIONAL_CA_MOUNT_PATH
                 && mount.source == artifact.to_string_lossy()
                 && mount.options.iter().any(|option| option == "ro")
         }));
@@ -2038,8 +2030,8 @@ mod tests {
 
     #[test]
     fn tampered_destination_trust_artifact_fails_closed_without_pem_contents() {
-        let artifact = crate::test_utils::unique_socket_path("tampered-network-additional-ca")
-            .with_extension("crt");
+        let artifact =
+            crate::test_utils::unique_socket_path("tampered-additional-ca").with_extension("crt");
         std::fs::write(&artifact, b"expected").unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(
@@ -3129,13 +3121,13 @@ mod tests {
         assert!(
             !mounts
                 .iter()
-                .any(|m| { m["destination"].as_str() == Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH) }),
+                .any(|m| { m["destination"].as_str() == Some(ADDITIONAL_CA_MOUNT_PATH) }),
             "no destination CA mount without global config"
         );
         assert!(
             !spec_command(&spec)
                 .iter()
-                .any(|arg| arg == "--network-additional-ca-bundle"),
+                .any(|arg| arg == "--additional-ca-bundle"),
             "no destination CA argument without global config"
         );
     }
@@ -3821,10 +3813,7 @@ mod tests {
     fn driver_config_rejects_reserved_mount_targets() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
-        for target in [
-            "/etc/openshell/tls/client",
-            NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
-        ] {
+        for target in ["/etc/openshell/tls/client", ADDITIONAL_CA_MOUNT_PATH] {
             let mut sandbox = test_sandbox("test-id", "test-name");
             sandbox.spec = Some(DriverSandboxSpec {
                 template: Some(DriverSandboxTemplate {

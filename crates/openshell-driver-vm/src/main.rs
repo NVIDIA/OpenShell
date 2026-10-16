@@ -145,18 +145,18 @@ struct Args {
     /// Gateway-owned normalized destination trust artifact. This hidden option
     /// is supplied only by the in-process gateway VM factory.
     #[arg(long, hide = true)]
-    network_additional_ca_bundle: Option<PathBuf>,
+    additional_ca_bundle: Option<PathBuf>,
 
     /// Expected SHA-256 generation of the gateway-owned destination trust
     /// artifact. Supplied with the path so the child can authenticate its
     /// one-time startup read without receiving CA bytes on argv or in env.
     #[arg(long, hide = true)]
-    network_additional_ca_digest: Option<String>,
+    additional_ca_digest: Option<String>,
 
     /// Expected certificate count in the gateway-normalized destination trust
     /// artifact.
     #[arg(long, hide = true)]
-    network_additional_ca_certificate_count: Option<usize>,
+    additional_ca_certificate_count: Option<usize>,
 
     /// Corporate forward proxy for supervisor TLS egress.
     #[arg(long, env = "OPENSHELL_VM_UPSTREAM_PROXY")]
@@ -354,10 +354,10 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
-        network_additional_ca_bundle: args.network_additional_ca_bundle.clone(),
-        network_additional_ca_digest: args.network_additional_ca_digest.clone(),
-        network_additional_ca_certificate_count: args.network_additional_ca_certificate_count,
-        network_additional_ca_snapshot: None,
+        additional_ca_bundle: args.additional_ca_bundle.clone(),
+        additional_ca_digest: args.additional_ca_digest.clone(),
+        additional_ca_certificate_count: args.additional_ca_certificate_count,
+        additional_ca_snapshot: None,
         upstream_proxy: openshell_core::UpstreamProxyConfig {
             https_proxy: args.upstream_proxy.clone(),
             no_proxy: args.upstream_no_proxy.clone(),
@@ -851,43 +851,37 @@ mod tests {
     fn internal_network_trust_options_have_no_environment_aliases() {
         let args = Args::parse_from([
             "openshell-driver-vm",
-            "--network-additional-ca-bundle",
+            "--additional-ca-bundle",
             "/var/lib/openshell/network/additional-ca.crt",
-            "--network-additional-ca-digest",
+            "--additional-ca-digest",
             "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-            "--network-additional-ca-certificate-count",
+            "--additional-ca-certificate-count",
             "2",
         ]);
         assert_eq!(
-            args.network_additional_ca_bundle.as_deref(),
+            args.additional_ca_bundle.as_deref(),
             Some(PathBuf::from("/var/lib/openshell/network/additional-ca.crt").as_path())
         );
         assert_eq!(
-            args.network_additional_ca_digest.as_deref(),
+            args.additional_ca_digest.as_deref(),
             Some("sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         );
-        assert_eq!(args.network_additional_ca_certificate_count, Some(2));
+        assert_eq!(args.additional_ca_certificate_count, Some(2));
 
         temp_env::with_vars(
             [
                 (
-                    "OPENSHELL_VM_NETWORK_ADDITIONAL_CA_BUNDLE",
+                    "OPENSHELL_VM_ADDITIONAL_CA_BUNDLE",
                     Some("/tmp/untrusted.crt"),
                 ),
-                (
-                    "OPENSHELL_VM_NETWORK_ADDITIONAL_CA_DIGEST",
-                    Some("sha256:bad"),
-                ),
-                (
-                    "OPENSHELL_VM_NETWORK_ADDITIONAL_CA_CERTIFICATE_COUNT",
-                    Some("999"),
-                ),
+                ("OPENSHELL_VM_ADDITIONAL_CA_DIGEST", Some("sha256:bad")),
+                ("OPENSHELL_VM_ADDITIONAL_CA_CERTIFICATE_COUNT", Some("999")),
             ],
             || {
                 let args = Args::parse_from(["openshell-driver-vm"]);
-                assert!(args.network_additional_ca_bundle.is_none());
-                assert!(args.network_additional_ca_digest.is_none());
-                assert!(args.network_additional_ca_certificate_count.is_none());
+                assert!(args.additional_ca_bundle.is_none());
+                assert!(args.additional_ca_digest.is_none());
+                assert!(args.additional_ca_certificate_count.is_none());
             },
         );
     }
