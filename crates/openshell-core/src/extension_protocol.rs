@@ -131,6 +131,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
         supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
+        supported_capabilities.push(COMPUTE_UPDATE_SANDBOX_IMAGE.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {
@@ -401,6 +402,23 @@ fn valid_capability(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compute_gateway_advertises_both_optional_extensions() {
+        let gateway = gateway_metadata(ExtensionFamily::Compute);
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_ISOLATION_BACKEND)
+        );
+        assert!(
+            gateway
+                .supported_capabilities
+                .iter()
+                .any(|c| c == COMPUTE_UPDATE_SANDBOX_IMAGE)
+        );
+    }
 
     fn compatible() -> (PeerMetadata, PeerMetadata) {
         let gateway = gateway_metadata(ExtensionFamily::Compute);

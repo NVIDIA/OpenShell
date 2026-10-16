@@ -310,10 +310,16 @@ mod tests {
                 name: "image-sandbox".into(),
                 workspace: "default".into(),
                 labels: HashMap::from([("app".into(), "retained".into())]),
-                annotations: HashMap::from([(
-                    COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
-                    "stable-runtime".into(),
-                )]),
+                annotations: HashMap::from([
+                    (
+                        COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+                        "stable-runtime".into(),
+                    ),
+                    (
+                        crate::compute::ISOLATION_BACKEND_ANNOTATION.into(),
+                        openshell_core::isolation_registration::BUILTIN_BACKEND_NAME.into(),
+                    ),
+                ]),
                 ..Default::default()
             }),
             spec: Some(SandboxSpec {
@@ -353,7 +359,19 @@ mod tests {
 
     #[tokio::test]
     async fn image_update_preserves_identity_and_every_other_spec_field() {
-        let (runtime, driver, original) = fixture(true).await;
+        let (runtime, driver, mut original) = fixture(true).await;
+        // Image edits must preserve the upstream backend pin and launch identity,
+        // including generation/session and authorization epoch annotations.
+        crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+            .unwrap()
+            .write(&mut original.metadata.as_mut().unwrap().annotations);
+        runtime.store.put_message(&original).await.unwrap();
+        let original = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
         let updated = runtime
             .update_sandbox_image(
                 original.object_id(),
