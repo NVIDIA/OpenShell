@@ -33,5 +33,5 @@ pub(crate) use openshell_driver_vm::allocation_tracking as test_alloc;
 #[global_allocator]
 static TEST_ALLOCATOR: openshell_driver_vm::allocation_tracking::CountingAllocator =
     openshell_driver_vm::allocation_tracking::CountingAllocator;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod test_support;

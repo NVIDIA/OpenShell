@@ -60,11 +60,6 @@ path = "tests/vm_overlay.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
-name = "custom_image"
-path = "tests/custom_image.rs"
-required-features = ["e2e-docker"]
-
-[[test]]
 name = "service_bearer_passthrough"
 path = "tests/service_bearer_passthrough.rs"
 required-features = ["e2e-docker"]
@@ -162,6 +157,11 @@ required-features = ["e2e-kubernetes-ha"]
 [[test]]
 name = "kubernetes_corporate_proxy"
 path = "tests/kubernetes_corporate_proxy.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
+name = "kubernetes_runtime_reconcile"
+path = "tests/kubernetes_runtime_reconcile.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]

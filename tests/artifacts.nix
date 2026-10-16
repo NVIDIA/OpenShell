@@ -12,6 +12,9 @@ let
   gnuToolchain = toolchains.${if isAarch64 then "aarch64-gnu" else "x86_64-gnu"};
   muslToolchain = toolchains.${if isAarch64 then "aarch64-musl" else "x86_64-musl"};
   dockerArch = if isAarch64 then "arm64" else "amd64";
+  linuxVmRuntime = pkgs.callPackage ../nix/pkgs/vm-runtime.nix {
+    stdenv = gnuToolchain.stdenv;
+  };
   toolchainEnv = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (
     builtins.attrValues toolchains
   );
@@ -79,7 +82,7 @@ let
       '';
     };
 
-  conformanceCliArchive = mkTestArchive {
+  conformanceTestArchive = mkTestArchive {
     name = "openshell-conformance";
     workspacePath = "tests/suites/conformance";
     manifestPath = "tests/suites/conformance/Cargo.toml";
@@ -95,33 +98,38 @@ let
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/provider-refresh-keycloak-tests.tar";
   };
+  ociImageArchive = mkTestArchive {
+    name = "oci-image";
+    workspacePath = "tests/suites/features";
+    manifestPath = "tests/suites/features/Cargo.toml";
+    package = "openshell-test-feature-oci-image";
+    target = muslToolchain.target;
+    output = "artifacts/test-archives/${muslToolchain.target}/oci-image-tests.tar";
+  };
 
-  # Follow-up: migrate these wrapper-coupled tests once tmachine provides their
-  # managed-gateway controls, SPIFFE fixtures, caller driver-config setting,
-  # guest tools, and matching workload-image identity behavior. The corporate
-  # proxy and gateway-start binaries currently self-skip without wrapper-owned
-  # gateway metadata, so exclude them rather than report false passes.
+  # Follow-up: binaries that do not yet run in the rootless tmachine guest. Each
+  # entry says what it needs. Entries marked "wrapper lane" still run in the
+  # wrapper-based Podman lane (`mise run e2e:podman:ci`), so they are covered
+  # there until tmachine provides what they need.
   podmanE2eFollowUpBinaries = [
-    "credential_gating"
+    # Needs the caller driver-config settings (`allow_driver_config`,
+    # `enable_bind_mounts`), which the tmachine gateway does not enable. Wrapper
+    # lane.
     "driver_config_volume"
-    "forward_proxy_graphql_l7"
-    "forward_proxy_jsonrpc_l7"
-    "forward_proxy_l7_bypass"
-    "host_gateway_alias"
-    "landlock"
+    # The next three self-skip without wrapper-owned gateway metadata (restart
+    # and configuration control), so exclude them rather than report false
+    # passes. Wrapper lane.
     "local_driver_token_restart"
-    # Standalone tmachine runs can time out while opening the localhost relay.
-    # Follow up on making the relay setup deterministic before restoring it.
-    "no_proxy"
     "podman_corporate_proxy"
     "podman_gateway_start"
-    "podman_oci_identity"
+    # Its move to conformance is deferred until the isolation work in #4120; see
+    # #4246.
     "provider_auto_create"
-    # The provider-refresh feature suite covers revoked Keycloak grants. This
-    # binary instead covers stable workload handles across repeated rotations
-    # and explicit refresh reconfiguration in a long-running sandbox.
-    "provider_refresh_handles"
+    # Needs the SPIFFE fixtures that the wrapper sets up. Wrapper lane.
     "provider_token_exchange"
+    # One test times out reaching support-container IPs from the sandbox in the
+    # rootless guest; the other tests in the binary pass. Nextest archive
+    # filters cannot select individual tests, so keep the complete binary here.
     "proxy_egress_pipeline"
     # Conformance covers stop/start workspace preservation and deletion while
     # stopped. The remaining canonical-main, TTY, attachment replay, and
@@ -130,7 +138,6 @@ let
     "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
-    "websocket_conformance"
     "workspace_lifecycle"
   ];
   podmanE2eArchiveFilter =
@@ -196,8 +203,9 @@ let
 in
 rec {
   inherit
-    conformanceCliArchive
+    conformanceTestArchive
     providerRefreshKeycloakArchive
+    ociImageArchive
     podmanDriverArchive
     podmanE2eArchive
     podmanE2eCiTests
@@ -217,7 +225,8 @@ rec {
 
       cargo build --target ${muslToolchain.target} \
         -p openshell-cli \
-        -p openshell-sandbox
+        -p openshell-sandbox \
+        -p openshell-prover-cli
 
       cargo build --target ${gnuToolchain.target} \
         -p openshell-gateway \
@@ -238,20 +247,71 @@ rec {
       install -D -m 0755 \
         target/${gnuToolchain.target}/debug/openshell-supervisor \
         artifacts/binaries/${gnuToolchain.target}/openshell-supervisor
+
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell-prover \
+        artifacts/binaries/${muslToolchain.target}/openshell-prover
+    '';
+  };
+
+  vmDriver = pkgs.writeShellApplication {
+    name = "build-artifacts-vm-driver";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.git
+      pkgs.zstd
+      rustToolchain
+    ];
+    runtimeEnv = toolchainEnv;
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      cargo build --target ${muslToolchain.target} \
+        -p openshell-driver-vm --no-default-features --bin openshell-vm-init
+
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell-vm-init \
+        artifacts/binaries/${muslToolchain.target}/openshell-vm-init
+
+      compressed_dir=$(mktemp -d -p /tmp openshell-vm-runtime.XXXXXX)
+      cleanup() {
+        status=$?
+        trap - EXIT
+        rm -rf -- "$compressed_dir"
+        exit "$status"
+      }
+      trap cleanup EXIT
+      cp ${linuxVmRuntime}/compressed/*.zst "$compressed_dir/"
+      zstd -19 -T1 artifacts/binaries/${muslToolchain.target}/openshell-sandbox \
+        -o "$compressed_dir/openshell-sandbox.zst"
+      zstd -19 -T1 artifacts/binaries/${gnuToolchain.target}/openshell-supervisor \
+        -o "$compressed_dir/openshell-supervisor.zst"
+      zstd -19 -T1 artifacts/binaries/${muslToolchain.target}/openshell-vm-init \
+        -o "$compressed_dir/openshell-vm-init.zst"
+      OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$compressed_dir" \
+        cargo build --target ${gnuToolchain.target} \
+          -p openshell-driver-vm --bin openshell-driver-vm
+
+      install -D -m 0755 \
+        target/${gnuToolchain.target}/debug/openshell-driver-vm \
+        artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm
     '';
   };
 
   testArchives = pkgs.writeShellApplication {
     name = "build-artifacts-test-archives";
     runtimeInputs = [
-      conformanceCliArchive
+      conformanceTestArchive
       providerRefreshKeycloakArchive
+      ociImageArchive
       podmanDriverArchive
       podmanE2eArchive
     ];
     text = ''
       build-openshell-conformance-test-archive
       build-provider-refresh-keycloak-test-archive
+      build-oci-image-test-archive
       build-podman-driver-test-archive
       build-podman-e2e-test-archive
     '';
@@ -345,6 +405,32 @@ rec {
     '';
   };
 
+  deb = pkgs.writeShellApplication {
+    name = "build-artifacts-deb";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.dpkg
+      pkgs.git
+      pkgs.gzip
+    ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      package_version="''${OPENSHELL_DEB_VERSION:-0.0.0-local}"
+      OPENSHELL_CLI_BINARY="$root/artifacts/binaries/${muslToolchain.target}/openshell" \
+        OPENSHELL_GATEWAY_BINARY="$root/artifacts/binaries/${gnuToolchain.target}/openshell-gateway" \
+        OPENSHELL_PROVER_BINARY="$root/artifacts/binaries/${muslToolchain.target}/openshell-prover" \
+        OPENSHELL_DRIVER_VM_BINARY="$root/artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm" \
+        OPENSHELL_DEB_VERSION="$package_version" \
+        OPENSHELL_DEB_ARCH=${dockerArch} \
+        OPENSHELL_OUTPUT_DIR="$root/artifacts/packages" \
+        tasks/scripts/package-deb.sh
+      install -m 0644 "artifacts/packages/openshell_''${package_version}_${dockerArch}.deb" \
+        artifacts/packages/openshell.deb
+    '';
+  };
+
   helm = pkgs.writeShellApplication {
     name = "build-artifacts-helm";
     runtimeInputs = [
@@ -364,12 +450,16 @@ rec {
     name = "build-artifacts";
     runtimeInputs = [
       binaries
+      vmDriver
+      deb
       testArchives
       images
       helm
     ];
     text = ''
       build-artifacts-binaries
+      build-artifacts-vm-driver
+      build-artifacts-deb
       build-artifacts-test-archives
       build-artifacts-images
       build-artifacts-helm

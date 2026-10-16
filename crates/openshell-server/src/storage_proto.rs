@@ -136,6 +136,9 @@ mod tests {
     // Driver-operation ownership adds pending and a retained operation ID to
     // SandboxProvisioning in both closures. Old rows decode false and empty;
     // decoding or deadline updates cannot claim an existing attempt.
+    // Stable placeholders add a stored credential flag whose absent value is
+    // false. Capability negotiation and delivered key lists are public-only;
+    // the set of shared message and enum types remains unchanged.
     // SessionRedirect and SupervisorHello.redirected are supervisor control
     // traffic and are never stored.
     // Token-grant owner fields add gateway-derived metadata to endpoints and
@@ -143,12 +146,23 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
+    // ListProvidersRequest field 4 adds a public-only label selector. Older
+    // requests decode an empty selector; durable schemas remain unchanged.
+    // Endpoint failure causes add EndpointFailure and EndpointFailureDomain to
+    // both closures through EndpointStatus.last_failure. Stored statuses decode
+    // without a cause, and the next accepted report or reset replaces them.
+    // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
+    // closures and TokenGrantStatus to public reports. Older rows have no grant
+    // record; absent report extensions retain compatibility without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "f986011b0ced61066dd0787dd86ca50f44c621ce51abc885eef2835160a71109";
+        "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
     const DURABLE_SCHEMA_SHA256: &str =
-        "96269474903e077df4d4861db0dd1004b8a7205604ffadcdaff98d0124f18147";
+        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "761dea31a521b0650840fe2a823ad6e36a265ed323ba4506889781d630df0ee3";
+        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+    // Encoded with the schema that omitted stable_placeholder. Keep these
+    // bytes fixed so the current encoder cannot hide a compatibility change.
+    const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
     // A persisted Sandbox without endpoint status retains its lifecycle fields;
     // the absent repeated field decodes empty and needs no database rewrite.
     const SANDBOX_WITHOUT_ENDPOINT_STATUS: &str = "0a1e0a0a73616e64626f782d6964120773616e64626f783a0764656661756c741a2b0a0773616e64626f782a0d0a05526561647912045472756530023807420d73757065727669736f722d6964";
@@ -613,9 +627,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (311, 27),
-                (93, 21),
-                (81, 21),
+                (314, 28),
+                (95, 22),
+                (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256
@@ -684,6 +698,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_stored_profile_preserves_revision_scoped_credentials() {
+        let bytes = legacy_bytes(LEGACY_STATIC_PROFILE);
+        let stored = StoredProviderProfile::decode(bytes.as_slice())
+            .expect("legacy static profile must decode");
+        assert_eq!(stored.encode_to_vec(), bytes);
+        let profile = stored.profile.expect("profile");
+        assert_eq!(profile.id, "legacy-static");
+        assert_eq!(profile.credentials.len(), 1);
+        let credential = &profile.credentials[0];
+        assert_eq!(credential.name, "api_key");
+        assert_eq!(credential.env_vars, ["SYNTHETIC_API_KEY"]);
+        assert!(credential.required);
+        assert_eq!(credential.auth_style, "bearer");
+        assert!(!credential.stable_placeholder);
+    }
+
+    #[test]
     fn sandbox_payload_without_endpoint_status_decodes() {
         use openshell_core::proto::{Sandbox, SandboxPhase};
 
@@ -699,6 +730,7 @@ mod tests {
         assert_eq!(status.main_process_instance_id, "supervisor-id");
         assert_eq!(status.exit_code, None);
         assert_eq!(status.restart_count, 0);
+        assert!(status.last_token_grant_failure.is_none());
         assert!(status.next_restart_time.is_none());
         assert!(status.main_process_started_time.is_none());
         assert_eq!(status.conditions.len(), 1);

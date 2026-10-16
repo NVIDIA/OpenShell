@@ -57,6 +57,24 @@ pub fn openshell_state_dir() -> Result<PathBuf> {
     Ok(xdg_state_dir()?.join("openshell"))
 }
 
+/// Platform default for gateway audit files. Sink configuration and writing
+/// remain portable; only the directory convention depends on the host.
+pub fn gateway_audit_log_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(directory) = std::env::var_os("ProgramData") {
+            return PathBuf::from(directory).join("OpenShell").join("logs");
+        }
+        std::env::temp_dir().join("openshell").join("logs")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        openshell_state_dir()
+            .unwrap_or_else(|_| std::env::temp_dir().join("openshell"))
+            .join("logs")
+    }
+}
+
 /// Resolve the XDG data base directory.
 ///
 /// Returns `$XDG_DATA_HOME` if set, otherwise `$HOME/.local/share`.

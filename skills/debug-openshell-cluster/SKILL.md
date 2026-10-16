@@ -72,7 +72,7 @@ Common findings:
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
 - TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
-- Fresh Snap installations use `openshell.user-gateway`; upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published Snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local Snap gateway is expected to run.
+- Fresh snap installations use `openshell.user-gateway`; upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local snap gateway is expected to run.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
 - Operator credential retrieval requires direct gateway mTLS, `[openshell.gateway.mtls_auth] operator_enabled = true`, and a verified certificate with exact `OU=operator`. OIDC admin roles and forwarded certificate headers do not grant access. Do not combine the operator certificate with an `Authorization` header. Enabling this role grants gateway-wide administration; never repair a denial by issuing operator certificates to ordinary users. See the published gateway authentication and provider references.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
@@ -110,6 +110,11 @@ and the generation copies (`openshell.ai/component=image-pull`) in the workspace
 namespace. Legacy workloads without
 admission provenance need recreation. Do not
 automatically label control-plane resources or disable enforcement as a repair.
+
+For Kubernetes mount-path conflicts, move caller PVC mounts away from
+`/.openshell` and `/run` to a data path such as `/data` or below `/sandbox`.
+These driver-managed paths remain reserved even for approved resources and
+`sub_path` mounts; changing approval labels does not resolve a path conflict.
 
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
@@ -307,7 +312,7 @@ Common findings:
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
 - SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
-- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
+- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. For token grant failures on any HTTP protocol, including failures before endpoint selection, inspect `last_token_grant_failure` in JSON output. It contains the bounded destination and cause, survives unrelated successful traffic, and clears on matching grant success or a policy, provider, or supervisor reset. If several paths share a host and port, other failures before the path is known, such as TLS failures, remain only in logs. A `CredentialUnavailable` result from a failed dynamic token grant also carries `last_failure` with a closed-set `code`, `stage`, `recovery_action`, the provider and credential names, and the `request_id` that the workload received in its `x-openshell-request-id` response header. Search `openshell logs <name>` for that ID: the supervisor's `Token grant failed` line carries the code and stage for every endpoint, and the gateway's `dynamic token grant failed` line appears when the gateway hop failed. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
   can mean the supervisor's selected network mode cannot reach the gateway.
   Check the gateway's `Selected Docker supervisor networking` log. The default
@@ -409,6 +414,17 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
+- Gateway fails to start with an `additional_ca_bundle` error: the Podman
+  driver validates the setting at startup. The file must exist on the gateway
+  host, be non-empty, and contain at least one PEM certificate.
+- Inspected HTTPS to a private-CA destination fails (for example
+  `curl: (52) Empty reply from server`), or the supervisor exits at startup,
+  with `additional_ca_bundle` set: the supervisor container needs the CA, not
+  just the workload. Check
+  `podman inspect <sandbox>-supervisor --format '{{json .Mounts}}'` for a
+  read-only bind of the bundle at `/etc/openshell/tls/additional/ca-bundle.pem`,
+  and `--format '{{json .Config.Cmd}}'` for `--additional-ca-bundle` with that
+  path. The `sandbox` role container must not have the mount.
 - On Linux, verify that the host-networked Podman supervisor can reach the
   gateway's primary loopback endpoint. On macOS, verify Podman Machine's
   host-loopback forwarding or configure an explicit `grpc_endpoint`.
@@ -503,17 +519,156 @@ kubectl -n <namespace> get deployment,service,pod -l app.kubernetes.io/name=<pos
 kubectl -n <namespace> logs deployment/<postgres-workload> --tail=200
 ```
 
-Multi-replica gateways serialize cross-object sandbox and provider mutations
-with a PostgreSQL advisory lock. If those RPCs stall while ordinary reads and
-health checks remain responsive, inspect long-running database sessions and
-advisory-lock waiters. Do not print the database URI or Secret contents into
-logs:
+Gateways that use an external PostgreSQL database guard cross-object
+mutations with PostgreSQL advisory locks at three levels: one global key, one
+key per workspace, and one key per sandbox, each taken shared or exclusive.
+Sandbox operations on different sandboxes do not wait on each other's locks;
+provider and workspace-profile changes block guarded sandbox mutations in
+their workspace; gateway-global policy and settings changes block every
+guarded mutation. Guarded sandbox mutations are sandbox create, provider
+attach and detach, sandbox-scoped policy and settings changes, and supervisor
+configuration, policy status, and endpoint status reports. Lifecycle paths
+(start, stop, delete, restart, supervisor connection and process-exit state,
+driver-watch updates, and reconcile) take only a process-local shared global
+and exclusive sandbox lock, with no time limit and no mutation advisory lock
+(start, restart, and delete also take the SSH identity key below), so only
+a global change on the same replica blocks them directly. Provider,
+workspace-profile, and other replicas' global changes delay them only while
+another operation on the same sandbox waits behind the change, holding that
+sandbox's key. Provisioning-deadline expiry also takes
+its workspace key locally, so provider and workspace-profile changes on the
+same replica can delay it. Each
+replica takes its advisory locks on a dedicated lock pool of PostgreSQL
+connections, one per guard, 4 by default (gateway config
+`database_lock_max_connections`), so at most that many guarded
+operations per replica hold or wait for PostgreSQL locks at once.
+`openshell_server_mutation_lock_connections_in_use` shows how many are checked
+out, against `openshell_server_mutation_lock_connections_capacity`. Its data
+pool (`database_max_connections`, 10 by default) is separate. Helm deployments
+set both keys under `gatewayConfig.openshell.gateway`.
+The gateway logs both sizes at startup in
+`sizing Postgres connection pools`. A request cancelled during its lock wait
+frees its slot while its backend keeps waiting, with any keys it took, until
+the 10-second deadline, so `pg_locks` can briefly show more lock sessions from
+one pod. A guard that waits on a PostgreSQL lock
+keeps its connection while it waits, so contention on one key can fill the
+pool and make unrelated guarded operations on that replica queue for a
+connection, within the same 10-second limit.
+
+A lock wait longer than 10 seconds returns `UNAVAILABLE` with reason
+`MUTATION_LOCK_TIMEOUT` and the message "... timed out waiting for a
+concurrent mutation; retry the request", logs
+`mutation lock acquisition timed out` with `scope`, `waited_ms`, and `detail`
+fields, and increments `openshell_server_mutation_lock_timeouts_total`. The
+`detail` field says where the wait stopped:
+
+- `waiting for a local mutation lock`: another operation on the same replica
+  holds a conflicting key.
+- `waiting for a mutation lock connection`: every lock-pool connection of that
+  replica was in use, by waiters or by holders slowed by a compute driver,
+  credential backend, middleware, or provider profile source call, or a local
+  wait left less than a second to open one. `pg_locks` shows no row for the
+  timed-out operation. Look for the pod's granted or waiting advisory-lock
+  rows by `client_addr`, and find the holder they wait on.
+- `waiting for a PostgreSQL advisory lock`, or PostgreSQL's own
+  `canceling statement due to lock timeout`: a conflicting key is held on
+  another connection, usually by another replica or by an older gateway during
+  an upgrade. `pg_locks` shows the holder and the waiters.
+
+A starting gateway resets stale endpoint status one sandbox at a time before it
+binds its listeners. It retries lock timeouts there for the first 30 seconds of
+that scan, then logs
+`tool server endpoint-status startup reconciliation gave up on a sandbox` with
+the `sandbox_id` and exits with
+`tool server endpoint-status startup reconciliation failed`. A pod that
+restarts with that error during a rollout or scale-out is waiting behind a
+long holder: find it as above. Those startup timeouts appear in the gateway log
+only, because the metrics endpoint starts after the scan.
+
+A lock connection that PostgreSQL does not open, although at least a second of
+the 10-second limit remained, is not a lock timeout. The request fails with
+`INTERNAL` and "could not open a mutation lock connection", and the gateway
+logs `mutation lock acquisition failed` and increments
+`openshell_server_mutation_lock_errors_total` instead of the timeout counter.
+A lock statement that fails for another reason, such as a PostgreSQL restart,
+is counted the same way. PostgreSQL refused the connection, ran out of
+connection slots, was starting up, or did not answer. Check the PostgreSQL logs for "too many
+clients already", "remaining connection slots are reserved", or "the database
+system is starting up", and compare
+`SELECT count(*) FROM pg_stat_activity` with `SHOW max_connections`. Each
+replica opens up to its data plus lock pool sizes, 14 with the defaults.
+
+A gateway log line `timed out returning PostgreSQL mutation lock connection;
+discarded connection` means returning a lock session stalled for 5 seconds and
+the gateway dropped it; that slot stays busy for up to those 5 seconds. The
+warning does not identify the PostgreSQL backend. Healthy guards also hold
+idle advisory-lock sessions while validation and writes use separate data
+connections. Neither an idle duration nor a matching `client_addr` proves
+that a holder is orphaned, even when it blocks a timed-out request.
+
+Guarded work has no time limit of its own. A holder slowed by a compute
+driver, credential backend, middleware, or provider profile source call keeps
+its locks until that call returns, and conflicting acquisitions on every
+replica time out after 10 seconds. When it releases a lock held longer than
+10 seconds, its gateway logs
+`mutation lock held longer than the lock wait timeout` with `scope` and
+`held_ms`, and `openshell_server_mutation_lock_hold_seconds` records every
+hold by scope. Neither reports a hold that is still in progress. Before treating a long-held
+advisory lock as orphaned, check the gateway pod at its `client_addr` for
+these warnings and for slow dependency calls. A pod that logs them is still
+running slow guarded work, so fix that dependency or stop the pod instead of
+terminating its lock sessions:
+
+```bash
+kubectl -n openshell logs <gateway-pod> --since=1h \
+  | grep 'mutation lock held longer than the lock wait timeout'
+```
+
+Before using `SELECT pg_terminate_backend(<pid>)`, conclusively map that
+backend to its owning gateway process and confirm that process has stopped
+or can no longer write. If the owner is still running, stop it first and
+verify its exit; terminating or failing readiness alone is insufficient. Killing
+its lock session while it can still write removes exclusion from an active
+mutation. Recheck the backend PID and `backend_start` before terminating the
+confirmed orphan: pod IPs and PIDs can be reused, and a database proxy can
+hide several gateways behind one `client_addr`. If ownership cannot be
+established, investigate connectivity instead of choosing a backend by IP or
+idle state. Setting PostgreSQL
+`tcp_keepalives_idle`, `tcp_keepalives_interval`, and `tcp_keepalives_count`
+(for example 60, 10, and 6) bounds how long such sessions survive.
+
+If mutations stall or time out while reads and health checks work, inspect
+advisory-lock holders and waiters. Do not print the database URI or Secret
+contents into logs:
 
 ```sql
-SELECT pid, granted, waitstart
-FROM pg_locks
-WHERE locktype = 'advisory';
+SELECT l.pid, l.mode, l.granted, l.waitstart, l.classid, l.objid,
+       a.client_addr, a.backend_start, a.state,
+       now() - a.state_change AS in_state_for
+FROM pg_locks l
+JOIN pg_stat_activity a USING (pid)
+WHERE l.locktype = 'advisory'
+ORDER BY l.granted, l.waitstart;
 ```
+
+Gateways hold these locks at session level outside any transaction, so a
+holder (`granted = t`) usually shows `state = idle`. It still holds the lock,
+and `in_state_for` approximates how long. `client_addr` is the holding
+gateway pod's IP, or the pooler's IP when a connection pooler sits in between.
+
+The global key appears as `classid = 1330660686` and `objid = 1397247052`
+(key `0x4F50454E53484C4C`). Older gateways during a rolling upgrade take that
+key exclusively for every guarded mutation, so mutations can queue behind
+them until the rollout finishes.
+
+SSH host identity provisioning and cleanup, in sandbox create, start,
+restart, and delete, take one more fleet-wide key, `classid = 1330860872` and
+`objid = 1213158228` (key `0x4F535348484F5354`), on a data connection instead
+of the lock pool, with a 10-second PostgreSQL `lock_timeout`. Sandbox create
+holds its mutation guard while it waits for that key. A wait that runs out
+returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
+`openshell_server_mutation_lock_timeouts_total` nor
+`openshell_server_mutation_lock_errors_total` counts it.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
@@ -560,7 +715,7 @@ for pod in $(kubectl -n openshell get pod \
     -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
   echo "${pod}"
   kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
-    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total|mutation_lock_(timeouts_total|errors_total|connections))'
 done
 kubectl -n openshell get hpa
 kubectl -n openshell describe hpa openshell
@@ -582,7 +737,7 @@ kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
 pf_pid=$!
 sleep 2
 curl -s http://localhost:9090/metrics \
-  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total)'
+  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total|mutation_lock_(timeouts_total|errors_total|connections))'
 kill "${pf_pid}"
 ```
 
@@ -724,7 +879,7 @@ kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o jsonpath="{.spec.template.sp
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
-The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
+The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
 For vulnerability reports, record the running image digest and scan that exact
 artifact. The gateway includes a pinned Distroless base; the supervisor includes
@@ -1029,18 +1184,23 @@ credential failures.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
+| Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable or non-gRPC endpoint, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, shipper falling behind retention, or a schema mismatch | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, `schema_version`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
 | CPU-only VM startup reports that read-only `/proc` cannot be removed | Older supervisors can infer GPU requirements from host devices | Check gateway, VM driver, and bundled supervisor versions; use matching updated artifacts. CPU-only VMs do not require read-write `/proc`. |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
-| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
+| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>`; if the gateway PVC is unbound because the cluster has no default `StorageClass`, set `server.dataStorageClass` to a valid one, and size the claim with `server.dataStorageSize` |
+| `helm upgrade` fails on a forbidden update to the gateway StatefulSet after changing `server.dataStorageSize` or `server.dataStorageClass` | `volumeClaimTemplates` is immutable on an existing StatefulSet | `kubectl -n openshell delete statefulset openshell --cascade=orphan`, then re-upgrade; the orphaned PVC keeps its original size and class, so grow it with in-place PVC expansion or copy the data to a new claim |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
+| Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
 | `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
 | HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
 | One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
+| Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
@@ -1085,7 +1245,7 @@ When handing results back to the user, include:
 
 ## Package Configuration Preflight
 
-For a Debian, Ubuntu, or Snap gateway that stops before certificate generation or
+For a Debian, Ubuntu, or snap gateway that stops before certificate generation or
 daemon startup, validate the selected configuration without starting the service:
 
 ```shell

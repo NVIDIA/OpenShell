@@ -70,7 +70,8 @@ cargo test -p openshell-server --features test-support,prebuilt-z3
 cargo clippy -p openshell-server --all-targets --features test-support,prebuilt-z3 -- -D warnings
 ```
 
-The ignored `refresh_locks_coordinate_independent_replica_sessions` test requires
+The ignored `postgres_refresh_locks_coordinate_independent_replica_sessions` test
+runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.

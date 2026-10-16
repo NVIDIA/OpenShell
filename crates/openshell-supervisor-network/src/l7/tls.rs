@@ -585,9 +585,78 @@ mod tests {
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }
 
+    /// Reproduces issue #3781 end to end with a real TLS handshake: an
+    /// upstream client trying to reach a destination signed by an
+    /// operator-owned private CA fails when that CA is unknown, and succeeds
+    /// once it is appended to the bundle passed to
+    /// `build_upstream_client_config` — the same mechanism the Podman driver
+    /// fix (`additional_ca_bundle`) feeds into. No fakes: a real rustls
+    /// `TlsAcceptor`/`TlsConnector` pair over a real loopback TCP connection.
+    #[tokio::test]
+    async fn additional_ca_enables_trust_of_privately_signed_upstream() {
+        let hostname = "private.example";
+
+        // A CA the system bundle has never heard of, standing in for the
+        // operator-owned private CA from #3781.
+        let private_ca = SandboxCa::generate().unwrap();
+        let private_ca_pem = private_ca.cert_pem().to_string();
+        let cert_cache = CertCache::new(private_ca);
+        let leaf = cert_cache.get_or_generate(hostname).unwrap();
+
+        let server_config = Arc::new(
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
+                .unwrap(),
+        );
+        let acceptor = TlsAcceptor::from(server_config);
+
+        // --- Without the private CA: must fail. This is the literal bug in
+        // #3781 — "Upstream TLS establishment failed" against a
+        // policy-allowed, private-CA-signed destination. ---
+        let addr = serve_one(acceptor.clone()).await;
+        let client_without = build_upstream_client_config("").unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = tls_connect_upstream(tcp, hostname, &client_without).await;
+        assert!(
+            result.is_err(),
+            "connection to a privately-signed destination must fail when the \
+             private CA is not trusted, reproducing #3781"
+        );
+
+        // --- With the private CA appended to the bundle: must succeed. This
+        // is what additional_ca_bundle plumbs through in the Podman driver
+        // fix. ---
+        let addr = serve_one(acceptor).await;
+        let client_with = build_upstream_client_config(&private_ca_pem).unwrap();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = tls_connect_upstream(tcp, hostname, &client_with).await;
+        assert!(
+            result.is_ok(),
+            "connection must succeed once the private CA is trusted: {:?}",
+            result.err()
+        );
+    }
+
     /// Helper: generate a self-signed CA and return its PEM string.
     fn generate_ca_pem() -> String {
         SandboxCa::generate().unwrap().ca_cert_pem
+    }
+
+    /// Accept exactly one TLS connection on a fresh loopback listener and
+    /// return its address. Used by `additional_ca_enables_trust_of_...` to
+    /// give each connection attempt its own listener.
+    async fn serve_one(acceptor: TlsAcceptor) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            // Don't unwrap: when the client (correctly) rejects an untrusted
+            // certificate, the server observes a failed handshake too. Only
+            // the client's outcome matters here.
+            let _ = acceptor.accept(stream).await;
+        });
+        addr
     }
 
     #[test]

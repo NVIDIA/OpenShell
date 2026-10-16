@@ -4307,17 +4307,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "openshell-conformance-cli"
-version = "0.0.0"
-dependencies = [
- "clap",
- "openshell-conformance",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -4347,12 +4336,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tonic-types",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "zeroize",
@@ -4423,6 +4414,8 @@ dependencies = [
  "futures",
  "http 1.4.0",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "k8s-openapi",
  "kube",
  "kube-runtime",
@@ -4516,6 +4509,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
+ "rcgen",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4701,9 +4695,12 @@ version = "0.0.0"
 dependencies = [
  "futures",
  "http 1.4.0",
+ "metrics",
+ "openshell-ocsf",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tonic",
@@ -4719,6 +4716,8 @@ version = "0.0.0"
 dependencies = [
  "openshell-otel",
  "opentelemetry-proto",
+ "rcgen",
+ "tempfile",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -4939,6 +4938,7 @@ dependencies = [
  "openshell-gateway-interceptors",
  "openshell-ocsf",
  "openshell-otel",
+ "openshell-otel-test-support",
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
@@ -4977,6 +4977,7 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-prost-build",
+ "tonic-reflection",
  "tower",
  "tower-http",
  "tracing",
@@ -5028,6 +5029,7 @@ dependencies = [
  "socket2",
  "temp-env",
  "tempfile",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.26.2",
  "tonic",
@@ -5141,7 +5143,6 @@ dependencies = [
  "hex",
  "libc",
  "miette",
- "nix 0.29.0",
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
@@ -6757,9 +6758,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -8216,6 +8217,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "flate2",
  "h2",
  "http 1.4.0",
  "http-body 1.0.1",
@@ -8274,6 +8276,20 @@ dependencies = [
  "syn 2.0.117",
  "tempfile",
  "tonic-build",
+]
+
+[[package]]
+name = "tonic-reflection"
+version = "0.14.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acccd136a4bf19810a1fde9c74edc6129b42a66b44d0c1c8aaa67aeb49a146a7"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

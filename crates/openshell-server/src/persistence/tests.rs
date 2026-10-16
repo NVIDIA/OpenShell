@@ -233,7 +233,7 @@ fn embedded_migrators_include_pagination_indexes() {
 #[tokio::test]
 async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
     for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
-        let store = super::sqlite::SqliteStore::connect(url)
+        let store = super::sqlite::SqliteStore::connect(url, None)
             .await
             .expect("connect to in-memory SQLite");
         store.migrate().await.expect("migrate in-memory SQLite");
@@ -279,6 +279,76 @@ async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
                 .is_some(),
             "database URL: {url}"
         );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_pool_ceiling_defaults_and_honours_an_override() {
+    use super::sqlite::{DEFAULT_MAX_CONNECTIONS, SqliteStore};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let unset = SqliteStore::connect(&url, None)
+        .await
+        .expect("connect to sqlite");
+    assert_eq!(unset.max_connections_for_test(), DEFAULT_MAX_CONNECTIONS);
+
+    let raised = SqliteStore::connect(&url, Some(32))
+        .await
+        .expect("connect to sqlite");
+    assert_eq!(raised.max_connections_for_test(), 32);
+}
+
+/// An in-memory database lives inside its single connection: a second one
+/// would open a different, empty database, so the ceiling cannot be raised.
+#[tokio::test]
+async fn in_memory_sqlite_pins_the_pool_to_one_connection() {
+    use super::sqlite::SqliteStore;
+
+    let store = SqliteStore::connect("sqlite::memory:", Some(32))
+        .await
+        .expect("connect to in-memory sqlite");
+    assert_eq!(store.max_connections_for_test(), 1);
+}
+
+/// The SSH identity lock keeps one data connection while it queries the
+/// pool, so a single-connection `PostgreSQL` pool is refused at startup. The
+/// check runs before any connection opens, so nothing listens on the URL.
+#[tokio::test]
+async fn postgres_rejects_a_single_connection_data_pool_before_connecting() {
+    for url in [
+        "postgres://openshell@127.0.0.1:1/openshell",
+        "postgresql://openshell@127.0.0.1:1/openshell",
+    ] {
+        let error = Store::connect_with_pool_sizes(url, Some(1), None)
+            .await
+            .expect_err("a PostgreSQL data pool of one must be rejected");
+        match error {
+            openshell_core::Error::Config { message } => assert!(
+                message.contains("database_max_connections") && message.contains("at least 2"),
+                "the error names the setting and its minimum, got {message:?}"
+            ),
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+}
+
+/// `SQLite` takes the SSH identity lock without a pool connection, so one
+/// connection is enough there, on disk and in memory.
+#[tokio::test]
+async fn sqlite_accepts_a_single_connection_data_pool() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let on_disk = format!(
+        "sqlite:{}?mode=rwc",
+        tmp.path().join("openshell.db").display()
+    );
+    for url in [on_disk.as_str(), "sqlite::memory:"] {
+        let store = Store::connect_with_pool_sizes(url, Some(1), None)
+            .await
+            .expect("a single-connection SQLite pool connects and migrates");
+        store.ping().await.expect("the store answers");
     }
 }
 
@@ -2198,6 +2268,83 @@ async fn cas_concurrent_updates_one_succeeds() {
     // Final version should be 2
     let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
     assert_eq!(record.resource_version, 2);
+}
+
+/// Write `payload` to the shared `sandbox-1` row under `condition`.
+async fn put_sandbox_1(
+    store: &Store,
+    payload: &str,
+    condition: super::WriteCondition,
+) -> Result<super::WriteResult, PersistenceError> {
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            "default",
+            payload.as_bytes(),
+            None,
+            condition,
+        )
+        .await
+}
+
+/// Each write must report the version it produced, even while other writers
+/// race on the same row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_writes_return_their_own_resource_version() {
+    use super::WriteCondition;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    const WRITERS: u64 = 8;
+    const WRITES: u64 = 25;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = on_disk_store_url(&tmp.path().join("openshell.db"));
+    let store = Arc::new(Store::connect(&url).await.expect("connect to sqlite"));
+    put_sandbox_1(&store, "initial", WriteCondition::MustCreate)
+        .await
+        .unwrap();
+
+    let writers = (0..WRITERS).map(|writer| {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut versions = Vec::new();
+            for write in 0..WRITES {
+                let payload = format!("{writer}-{write}");
+                let unconditional = put_sandbox_1(&store, &payload, WriteCondition::Unconditional)
+                    .await
+                    .unwrap();
+                versions.push(unconditional.resource_version);
+
+                // Retry the version-checked update until it wins a race.
+                loop {
+                    let current = store.get("sandbox", "id-1").await.unwrap().unwrap();
+                    let condition = WriteCondition::MatchResourceVersion(current.resource_version);
+                    match put_sandbox_1(&store, &payload, condition).await {
+                        Ok(result) => {
+                            versions.push(result.resource_version);
+                            break;
+                        }
+                        Err(PersistenceError::Conflict { .. }) => {}
+                        Err(err) => panic!("unexpected error: {err}"),
+                    }
+                }
+            }
+            versions
+        })
+    });
+
+    let mut seen = BTreeSet::new();
+    for handle in futures::future::join_all(writers).await {
+        for version in handle.unwrap() {
+            assert!(seen.insert(version), "version {version} returned twice");
+        }
+    }
+
+    let total = WRITERS * WRITES * 2;
+    assert_eq!(seen, (2..=total + 1).collect::<BTreeSet<_>>());
 }
 
 #[tokio::test]

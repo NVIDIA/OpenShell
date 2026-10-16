@@ -228,9 +228,11 @@ An upstream that the proxy cannot reach returns `502 Bad Gateway`:
 }
 ```
 
-The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `middleware_failed`, `ssrf_denied`, `upstream_unreachable`, `unsupported_l7_protocol`). The `detail` field is a human-readable explanation suitable for display in an agent transcript. The optional `reason` field, when present, provides the specific denial cause from the policy engine (for example, which binary was not allowed or which rule was missing).
+The `error` field is a short machine-readable code (`policy_denied`, `middleware_denied`, `middleware_failed`, `ssrf_denied`, `upstream_unreachable`, `unsupported_l7_protocol`, `token_grant_failed`). The `detail` field is a human-readable explanation suitable for display in an agent transcript. The optional `reason` field, when present, provides the specific denial cause from the policy engine (for example, which binary was not allowed or which rule was missing).
 
 For L7 REST policy denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When the policy advisor is enabled, the body also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry. A middleware denial instead identifies the policy-local config in `middleware` and can include a validated `reason_code`. A fail-closed runtime failure uses `middleware_failed` with platform-owned text. Both middleware responses omit `rule_missing`, `next_steps`, and `agent_guidance` because no policy rule is missing.
+
+A failed [dynamic token grant](/how-it-works/providers/profiles#token-grant-failures) returns `502 Bad Gateway` with an `x-openshell-request-id` header. The forward proxy body is `{"error":"token_grant_failed","detail":"dynamic token grant failed"}`; L7 relays send an empty body. Neither states the cause, so give the request ID to someone who can read the sandbox.
 
 ## Filesystem Sandbox Logs
 
@@ -261,9 +263,12 @@ The supervisor writes logs to `/var/log/` in its own filesystem, separate from t
 | File | Format | Rotation |
 |---|---|---|
 | `openshell.YYYY-MM-DD.log` | Shorthand + standard tracing | Daily |
-| `openshell-ocsf.YYYY-MM-DD.log` | OCSF JSONL when enabled | Daily |
+| `openshell-ocsf.YYYY-MM-DD.jsonl` | OCSF JSONL when enabled | Daily |
 
-Each supervisor file appender is configured with a three-file limit. The shorthand appender's filename prefix also matches JSONL files, so its cleanup can delete JSONL history on filesystems that expose file creation timestamps. Do not rely on independent three-file retention for each format.
+Each format rotates daily with an independent three-file limit.
+
+Configure supervisor OCSF collectors to match `openshell-ocsf.*.jsonl`.
+Shorthand filenames and Windows MXC gateway filenames are unchanged.
 
 File output requires a writable `/var/log` and uses non-blocking writers that can drop events under pressure. If file logging cannot start, the supervisor falls back to stderr-only output. Enabling `ocsf_json_enabled` adds full `OCSF-JSON` records to stderr even without a file sink; see [OCSF JSON collection](/observability/ocsf-json-export#output-location).
 
@@ -271,6 +276,7 @@ Docker and Podman use tmpfs for this directory; Kubernetes uses an `emptyDir` in
 
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) for every signal OpenShell produces and how to enable it.
 - [Access logs](/observability/accessing-logs) through the CLI, TUI, or supervisor resources.
 - [Enable OCSF JSON export](/observability/ocsf-json-export) for SIEM integration and compliance.
 - Learn about [network policies](/how-it-works/policies/overview) that generate these events.

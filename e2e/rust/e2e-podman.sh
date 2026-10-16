@@ -41,6 +41,7 @@ PODMAN_CI_TESTS=(
   podman_host_gateway
   podman_oci_identity
   provider_token_exchange
+  upload_backpressure
 )
 
 if [ -n "${E2E_TEST}" ] && [ -n "${E2E_TEST_SET}" ]; then

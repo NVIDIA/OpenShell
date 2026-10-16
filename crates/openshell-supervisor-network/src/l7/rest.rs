@@ -21,6 +21,7 @@ use http_response::{
 };
 
 use crate::l7::EndpointObserver;
+use crate::l7::http::{parse_chunk_size_line, validate_chunk_trailer_line};
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
 use aws_sigv4::http_request::SignableBody;
@@ -1135,16 +1136,12 @@ where
                             .into_diagnostic()?;
 
                         let overflow = &req.raw_header[header_end..];
-                        if !overflow.is_empty() {
-                            if let Some(guard) = options.generation_guard {
-                                guard.ensure_current()?;
-                            }
-                            upstream.write_all(overflow).await.into_diagnostic()?;
-                        }
-                        let overflow_len = overflow.len() as u64;
-
                         match req.body_length {
                             BodyLength::ContentLength(len) => {
+                                if !overflow.is_empty() {
+                                    write_body_bytes(upstream, overflow, options).await?;
+                                }
+                                let overflow_len = overflow.len() as u64;
                                 let remaining = len.saturating_sub(overflow_len);
                                 if remaining > 0 {
                                     relay_fixed(
@@ -1157,15 +1154,14 @@ where
                                 }
                             }
                             BodyLength::Chunked => {
-                                relay_chunked(
-                                    client,
-                                    upstream,
-                                    &req.raw_header[header_end..],
-                                    options.generation_guard,
-                                )
-                                .await?;
+                                relay_chunked(client, upstream, overflow, options.generation_guard)
+                                    .await?;
                             }
-                            BodyLength::None => {}
+                            BodyLength::None => {
+                                if !overflow.is_empty() {
+                                    write_body_bytes(upstream, overflow, options).await?;
+                                }
+                            }
                         }
                     }
 
@@ -1241,31 +1237,25 @@ where
             .into_diagnostic()?;
 
         let overflow = &req.raw_header[header_end..];
-        if !overflow.is_empty() {
-            if let Some(guard) = options.generation_guard {
-                guard.ensure_current()?;
-            }
-            upstream.write_all(overflow).await.into_diagnostic()?;
-        }
-        let overflow_len = overflow.len() as u64;
-
         match req.body_length {
             BodyLength::ContentLength(len) => {
+                if !overflow.is_empty() {
+                    write_body_bytes(upstream, overflow, options).await?;
+                }
+                let overflow_len = overflow.len() as u64;
                 let remaining = len.saturating_sub(overflow_len);
                 if remaining > 0 {
                     relay_fixed(client, upstream, remaining, options.generation_guard).await?;
                 }
             }
             BodyLength::Chunked => {
-                relay_chunked(
-                    client,
-                    upstream,
-                    &req.raw_header[header_end..],
-                    options.generation_guard,
-                )
-                .await?;
+                relay_chunked(client, upstream, overflow, options.generation_guard).await?;
             }
-            BodyLength::None => {}
+            BodyLength::None => {
+                if !overflow.is_empty() {
+                    write_body_bytes(upstream, overflow, options).await?;
+                }
+            }
         }
     }
     upstream.flush().await.into_diagnostic()?;
@@ -1467,15 +1457,7 @@ where
         let size_line = read_chunked_line(client, already_read, &mut read_state, generation_guard)
             .await
             .map_err(CollectChunkedError::into_report)?;
-        let size_line = std::str::from_utf8(&size_line)
-            .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
-        let size_token = size_line
-            .split(';')
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
-        let chunk_size = usize::from_str_radix(size_token, 16)
-            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+        let chunk_size = parse_chunk_size_line(&size_line)?;
 
         if chunk_size == 0 {
             write_guarded_chunk(upstream, &scanner.finish()?, options).await?;
@@ -1485,6 +1467,7 @@ where
                     read_chunked_line(client, already_read, &mut read_state, generation_guard)
                         .await
                         .map_err(CollectChunkedError::into_report)?;
+                validate_chunk_trailer_line(&trailer)?;
                 if contains_reserved_credential_marker_bytes(&trailer) {
                     return Err(BodyCredentialError::Trailer.into());
                 }
@@ -1714,15 +1697,7 @@ fn chunked_body_is_fully_buffered(bytes: &[u8]) -> bool {
             return false;
         };
         let line_end = pos + line_end;
-        let Ok(size_line) = std::str::from_utf8(&bytes[pos..line_end]) else {
-            return false;
-        };
-        let size_token = size_line
-            .split(';')
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
-        let Ok(chunk_size) = usize::from_str_radix(size_token, 16) else {
+        let Ok(chunk_size) = parse_chunk_size_line(&bytes[pos..line_end]) else {
             return false;
         };
         pos = line_end + 2;
@@ -2059,17 +2034,7 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
             .map_err(|error| {
                 error.context(|e| miette!("Chunked body ended before chunk-size line: {e}"))
             })?;
-        let size_line = std::str::from_utf8(&size_line).map_err(|_| {
-            CollectChunkedError::Failed(miette!("Invalid UTF-8 in chunk-size line"))
-        })?;
-        let size_token = size_line
-            .split(';')
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
-        let chunk_size = usize::from_str_radix(size_token, 16).map_err(|_| {
-            CollectChunkedError::Failed(miette!("Invalid chunk size token: {size_token:?}"))
-        })?;
+        let chunk_size = parse_chunk_size_line(&size_line).map_err(CollectChunkedError::Failed)?;
 
         if chunk_size == 0 {
             let trailer_line =
@@ -2080,6 +2045,7 @@ async fn collect_chunked_body<C: AsyncRead + Unpin>(
                             miette!("Chunked body ended before trailer terminator: {e}")
                         })
                     })?;
+            validate_chunk_trailer_line(&trailer_line).map_err(CollectChunkedError::Failed)?;
             if trailer_line.is_empty() {
                 return Ok(body);
             }
@@ -3252,13 +3218,13 @@ where
 /// boundaries so we can stop exactly at the end of the current message body.
 /// Handles chunk extensions and trailers per RFC 7230.
 ///
-/// `already_forwarded` are overflow bytes that were already written to the
-/// writer during header parsing. The parser consumes them before reading more
-/// bytes so it can detect boundaries without forwarding them twice.
+/// `already_read` are overflow bytes buffered while parsing the headers. They
+/// are validated here before being written so ambiguous framing cannot reach
+/// the peer.
 async fn relay_chunked<R, W>(
     reader: &mut R,
     writer: &mut W,
-    already_forwarded: &[u8],
+    already_read: &[u8],
     generation_guard: Option<&PolicyGenerationGuard>,
 ) -> Result<()>
 where
@@ -3266,7 +3232,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let started_at = std::time::Instant::now();
-    let mut input = ChunkedRelayInput::new(already_forwarded);
+    let mut input = ChunkedRelayInput::new(already_read);
     let mut chunk_count = 0usize;
     let mut chunk_payload_bytes = 0usize;
 
@@ -3278,17 +3244,7 @@ where
                 "Chunk-size line exceeds limit",
             )
             .await?;
-        let size_line = std::str::from_utf8(&size_line)
-            .into_diagnostic()
-            .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
-        let size_token = size_line
-            .split(';')
-            .next()
-            .map(str::trim)
-            .unwrap_or_default();
-        let chunk_size = usize::from_str_radix(size_token, 16)
-            .into_diagnostic()
-            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+        let chunk_size = parse_chunk_size_line(&size_line)?;
 
         if chunk_size == 0 {
             let mut trailer_count = 0usize;
@@ -3301,6 +3257,7 @@ where
                         "Chunk trailer line exceeds limit",
                     )
                     .await?;
+                validate_chunk_trailer_line(&trailer_line)?;
                 trailer_bytes = trailer_bytes
                     .checked_add(trailer_line.len() + 2)
                     .ok_or_else(|| miette!("Chunk trailer size overflow"))?;
@@ -3357,16 +3314,16 @@ where
 }
 
 struct ChunkedRelayInput<'a> {
-    already_forwarded: &'a [u8],
-    already_forwarded_pos: usize,
+    already_read: &'a [u8],
+    already_read_pos: usize,
     pending: Vec<u8>,
 }
 
 impl<'a> ChunkedRelayInput<'a> {
-    fn new(already_forwarded: &'a [u8]) -> Self {
+    fn new(already_read: &'a [u8]) -> Self {
         Self {
-            already_forwarded,
-            already_forwarded_pos: 0,
+            already_read,
+            already_read_pos: 0,
             pending: Vec::with_capacity(RELAY_BUF_SIZE),
         }
     }
@@ -3409,19 +3366,21 @@ impl<'a> ChunkedRelayInput<'a> {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        if self.already_forwarded_pos < self.already_forwarded.len() {
-            let available = self.already_forwarded.len() - self.already_forwarded_pos;
-            let consumed = available.min(remaining);
-            self.already_forwarded_pos += consumed;
-            remaining -= consumed;
-        }
-
         while remaining > 0 {
             if self.pending.len() >= RELAY_BUF_SIZE {
                 self.flush_pending(writer, generation_guard).await?;
             }
             let available = RELAY_BUF_SIZE - self.pending.len();
             let to_read = remaining.min(available);
+            if self.already_read_pos < self.already_read.len() {
+                let buffered = to_read.min(self.already_read.len() - self.already_read_pos);
+                let end = self.already_read_pos + buffered;
+                self.pending
+                    .extend_from_slice(&self.already_read[self.already_read_pos..end]);
+                self.already_read_pos = end;
+                remaining -= buffered;
+                continue;
+            }
             let start = self.pending.len();
             self.pending.resize(start + to_read, 0);
             let read = reader
@@ -3445,9 +3404,10 @@ impl<'a> ChunkedRelayInput<'a> {
     where
         R: AsyncRead + Unpin,
     {
-        if self.already_forwarded_pos < self.already_forwarded.len() {
-            let byte = self.already_forwarded[self.already_forwarded_pos];
-            self.already_forwarded_pos += 1;
+        if self.already_read_pos < self.already_read.len() {
+            let byte = self.already_read[self.already_read_pos];
+            self.already_read_pos += 1;
+            self.pending.push(byte);
             return Ok(byte);
         }
         let byte = match reader.read_u8().await {
@@ -4205,6 +4165,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn relay_chunked_rejects_ambiguous_framing_before_forwarding() {
+        for wire in [
+            b"0\n\r\n\r\n".as_slice(),
+            b"+0\r\n\r\n",
+            b" 0\r\n\r\n",
+            b"0 \r\n\r\n",
+            b"0\rX\r\n\r\n",
+            b"0\r\nMalformed-Trailer\r\n\r\n",
+            b"4\r\nAAAA\r\n0\r\nA: b\n\r\nGET /hidden HTTP/1.1\r\nHost: hidden.example\r\n\r\n",
+        ] {
+            for buffered in [false, true] {
+                let input = if buffered { Vec::new() } else { wire.to_vec() };
+                let already_read = if buffered { wire } else { &[] };
+                let mut reader = CountingReader::new(input);
+                let mut writer = CountingWriter::default();
+
+                let error = relay_chunked(&mut reader, &mut writer, already_read, None)
+                    .await
+                    .expect_err("ambiguous chunked framing must fail closed");
+
+                assert!(
+                    error.to_string().contains("chunk"),
+                    "unexpected error: {error}"
+                );
+                assert!(
+                    !writer
+                        .bytes
+                        .windows(b"GET /hidden".len())
+                        .any(|window| window == b"GET /hidden"),
+                    "the hidden request reached the peer (buffered={buffered})"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_relay_does_not_forward_smuggled_request_from_buffered_body() {
+        let mut raw_header =
+            b"POST /allowed HTTP/1.1\r\nHost: allowed.example\r\nTransfer-Encoding: chunked\r\n\r\n"
+                .to_vec();
+        raw_header.extend_from_slice(
+            b"4\r\nAAAA\r\n0\r\nA: b\n\r\nGET /hidden HTTP/1.1\r\nHost: hidden.example\r\n\r\n",
+        );
+        let request = L7Request {
+            action: "POST".into(),
+            target: "/allowed".into(),
+            query_params: HashMap::new(),
+            raw_header,
+            body_length: BodyLength::Chunked,
+        };
+        let (app, mut proxy_client) = tokio::io::duplex(4096);
+        drop(app);
+        let (mut proxy_upstream, mut upstream) = tokio::io::duplex(4096);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            relay_http_request_with_options_guarded(
+                &request,
+                &mut proxy_client,
+                &mut proxy_upstream,
+                RelayRequestOptions::default(),
+            ),
+        )
+        .await
+        .expect("ambiguous framing must be rejected before waiting for a response");
+        assert!(result.is_err());
+
+        drop(proxy_upstream);
+        let mut forwarded = Vec::new();
+        upstream.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            !forwarded
+                .windows(b"GET /hidden".len())
+                .any(|window| window == b"GET /hidden"),
+            "hidden request reached upstream: {}",
+            String::from_utf8_lossy(&forwarded)
+        );
+    }
+
     fn write_header(name: &str, value: &str, on_existing: ExistingHeaderAction) -> HeaderMutation {
         HeaderMutation {
             operation: Some(header_mutation::Operation::Write(
@@ -4935,8 +4975,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_chunked_with_forwarded_prefix_and_trailers_preserves_pipeline_boundary() {
-        let already_forwarded = b"3\r\na";
+    async fn relay_chunked_with_buffered_prefix_and_trailers_preserves_pipeline_boundary() {
+        let already_read = b"3\r\na";
         let body_remainder = b"bc\r\n0\r\nX-Checksum: abc123\r\n\r\n";
         let pipelined_request =
             b"DELETE /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n";
@@ -4947,16 +4987,10 @@ mod tests {
         client_writer.write_all(&later_read).await.unwrap();
         let mut relay_reader = tokio::io::BufReader::with_capacity(4096, relay_reader);
         let (mut relay_writer, mut upstream_reader) = tokio::io::duplex(4096);
-        relay_writer.write_all(already_forwarded).await.unwrap();
 
-        relay_chunked(
-            &mut relay_reader,
-            &mut relay_writer,
-            already_forwarded,
-            None,
-        )
-        .await
-        .expect("chunked body with trailers should relay");
+        relay_chunked(&mut relay_reader, &mut relay_writer, already_read, None)
+            .await
+            .expect("chunked body with trailers should relay");
 
         let mut remaining = vec![0; pipelined_request.len()];
         relay_reader.read_exact(&mut remaining).await.unwrap();
@@ -4965,7 +4999,7 @@ mod tests {
         drop(relay_writer);
         let mut forwarded = Vec::new();
         upstream_reader.read_to_end(&mut forwarded).await.unwrap();
-        let mut expected = already_forwarded.to_vec();
+        let mut expected = already_read.to_vec();
         expected.extend_from_slice(body_remainder);
         assert_eq!(forwarded, expected);
     }
@@ -5585,7 +5619,7 @@ mod tests {
                 .expect_err("invalid chunk framing must surface as an error");
 
         assert!(
-            err.to_string().contains("Invalid chunk size token"),
+            err.to_string().contains("chunk size token"),
             "unexpected error: {err}"
         );
         assert!(
@@ -6938,6 +6972,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn response_middleware_headers_only_does_not_forward_ambiguous_chunked_overflow() {
+        let (outcome, delivered) = run_response_middleware_relay(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nAAAA\r\n0\r\nA: b\n\r\nHTTP/1.1 204 No Content\r\n\r\n",
+            "GET",
+            ResponseRelayScript::HeadersOnly,
+        )
+        .await;
+
+        assert!(outcome.is_err());
+        assert!(
+            !delivered
+                .windows(b"HTTP/1.1 204 No Content".len())
+                .any(|window| window == b"HTTP/1.1 204 No Content")
+        );
+    }
+
+    #[tokio::test]
     async fn response_middleware_whole_body_delays_commit_and_sets_length() {
         let (outcome, delivered) = run_response_middleware_relay(
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: stale\r\n\r\nhello",
@@ -7328,6 +7379,8 @@ mod tests {
         for response in [
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nBad Name: value\r\n\r\n".as_slice(),
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nContent-Length: 7\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\n\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nA: b\n\r\nHTTP/1.1 204 No Content\r\n\r\n".as_slice(),
         ] {
             let (outcome, delivered) = run_response_middleware_relay(
                 response,
@@ -8118,6 +8171,35 @@ mod tests {
         assert!(
             received_str.contains("x-checksum: abc123"),
             "trailers should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_does_not_forward_ambiguous_chunked_overflow() {
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nAAAA\r\n0\r\nA: b\n\r\nHTTP/1.1 204 No Content\r\n\r\n";
+        let mut upstream = response.as_slice();
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        let error = relay_response(
+            "GET",
+            &mut upstream,
+            &mut client_write,
+            RelayResponseOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("ambiguous response framing must fail closed");
+        assert!(error.to_string().contains("chunk trailer"), "{error}");
+
+        client_write.shutdown().await.unwrap();
+        let mut delivered = Vec::new();
+        client_read.read_to_end(&mut delivered).await.unwrap();
+        assert!(
+            !delivered
+                .windows(b"HTTP/1.1 204 No Content".len())
+                .any(|window| window == b"HTTP/1.1 204 No Content"),
+            "hidden response reached the client: {}",
+            String::from_utf8_lossy(&delivered)
         );
     }
 
@@ -10002,6 +10084,28 @@ mod tests {
         let mut forwarded = Vec::new();
         upstream_reader.read_to_end(&mut forwarded).await.unwrap();
         assert!(!String::from_utf8_lossy(&forwarded).contains("env%3AKEY"));
+    }
+
+    #[tokio::test]
+    async fn guarded_chunked_body_rejects_bare_lf_trailer() {
+        let wire =
+            b"4\r\nAAAA\r\n0\r\nA: b\n\r\nGET /hidden HTTP/1.1\r\nHost: hidden.example\r\n\r\n";
+        let mut output = Vec::new();
+        let error = relay_chunked_with_marker_guard(
+            &mut tokio::io::empty(),
+            &mut output,
+            wire,
+            RelayRequestOptions::default(),
+        )
+        .await
+        .expect_err("ambiguous trailer framing must fail closed");
+
+        assert!(error.to_string().contains("chunk trailer"), "{error}");
+        assert!(
+            !output
+                .windows(b"GET /hidden".len())
+                .any(|window| window == b"GET /hidden")
+        );
     }
 
     #[tokio::test]

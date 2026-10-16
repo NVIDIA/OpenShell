@@ -157,6 +157,14 @@
             type = "app";
             program = "${artifacts.binaries}/bin/build-artifacts-binaries";
           };
+          build-artifacts-vm-driver = {
+            type = "app";
+            program = "${artifacts.vmDriver}/bin/build-artifacts-vm-driver";
+          };
+          build-artifacts-deb = {
+            type = "app";
+            program = "${artifacts.deb}/bin/build-artifacts-deb";
+          };
           build-artifacts-test-archives = {
             type = "app";
             program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";

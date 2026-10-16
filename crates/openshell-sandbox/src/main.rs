@@ -24,7 +24,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
@@ -154,6 +154,10 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     // broker is intentionally nondumpable, so that fallback is inaccessible
     // even though /proc/<dumpable-child>/mem remains available to mediation.
     let task_memory_copy = true;
+    // Check the ABI first: on an older kernel the allow/deny probe would fail
+    // with an opaque ruleset error instead of naming the ABI it needs.
+    let landlock_abi =
+        openshell_sandbox::sandbox::linux::require_landlock_abi().wrap_err("Landlock ABI probe")?;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
     let notification = openshell_sandbox::linux::seccomp_notify::probe_notification_api()
         .into_diagnostic()
@@ -163,14 +167,6 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
         .into_diagnostic()
         .wrap_err("socket loopback confinement probe")?;
     probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
-    let landlock_abi = openshell_sandbox::linux::landlock::abi_version()
-        .into_diagnostic()
-        .wrap_err("Landlock ABI probe")?;
-    if landlock_abi < 3 {
-        return Err(miette::miette!(
-            "sandbox self-protection requires Landlock ABI v3 or newer (including truncation), found v{landlock_abi}"
-        ));
-    }
 
     let groups = nix::unistd::getgroups()
         .into_diagnostic()?
@@ -1539,7 +1535,7 @@ fn run_kubernetes_bootstrap() -> Result<()> {
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::PermissionsExt as _;
@@ -1596,7 +1592,7 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn copy_projected_secret_file(
     source_root: &Path,
     name: &str,
@@ -1614,7 +1610,7 @@ fn copy_projected_secret_file(
     copy_regular_file(&canonical_source, destination, mode)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
@@ -1651,10 +1647,12 @@ fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()>
 
 /// Seed the persistent workspace from the agent image as the final workload
 /// identity. This replaces the former root shell/tar init container.
+#[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace() -> Result<()> {
     seed_kubernetes_workspace_at(Path::new("/sandbox"), Path::new("/mnt/openshell-workspace"))
 }
 
+#[cfg(target_os = "linux")]
 fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
@@ -1707,6 +1705,7 @@ fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::Write as _;
@@ -1749,6 +1748,13 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
         .sync_all()
         .into_diagnostic()?;
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn seed_kubernetes_workspace() -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace seeding is supported only on Linux"
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1817,7 +1823,7 @@ fn main() -> Result<()> {
     run_boundary(&args.bootstrap, &args.log_level)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

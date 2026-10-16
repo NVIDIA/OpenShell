@@ -1,27 +1,30 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenTelemetry tracing integration for the gateway.
+//! OpenTelemetry export for the gateway.
 //!
 //! Converts selected Rust `tracing` spans into OpenTelemetry traces and
-//! exports them over OTLP/gRPC when configured.
+//! gateway OCSF events into log records, and exports each over OTLP/gRPC when
+//! configured.
 //!
 //! # Configuration split
 //!
-//! `[openshell.gateway.otlp]` decides **whether and where** to export: the
-//! table's presence is the on-switch, its `endpoint` the destination.
-//! `OTEL_EXPORTER_OTLP_ENDPOINT` is deliberately not read, so enablement has
-//! one source.
+//! `[openshell.gateway.otlp]` decides **whether and where** to export each
+//! signal: a shared `endpoint` enables traces, `[otlp.traces]` overrides
+//! their endpoint, and `[otlp.ocsf]` with `enabled = true` exports OCSF
+//! records, optionally to their own endpoint. `OTEL_EXPORTER_OTLP_*ENDPOINT` is deliberately not
+//! read, so enablement has one source.
 //!
 //! **How** to export — sampling, batching, span limits, transport headers —
 //! is the SDK's `OTEL_*` environment surface, read as the provider is built
 //! and mirrored nowhere here. `docs/how-it-works/gateways/configuration.mdx` documents
 //! the variables operators are likely to want.
 //!
-//! Only traces are exported. Logs and metrics have their own surfaces (OCSF
-//! JSONL and the Prometheus `/metrics` endpoint).
+//! Diagnostic logs and metrics are not exported over OTLP. They have their own
+//! surfaces (the gateway log stream and the Prometheus `/metrics` endpoint).
 
-use openshell_otel::{OtlpTraceConfig, ServiceName};
+use openshell_core::jwt::SecretOtlpHeaders;
+use openshell_otel::{OcsfOtlp, OtlpExportConfig, OtlpTarget, ServiceName};
 pub use openshell_otel::{SetupError, TraceContextInterceptor, mark_error};
 #[cfg(test)]
 use opentelemetry_sdk::Resource;
@@ -62,10 +65,11 @@ impl<'a> GatewayResourceAttributes<'a> {
     }
 }
 
-fn trace_config<'cfg>(
+fn export_config<'cfg>(
     cfg: &'cfg OtlpConfig,
+    endpoint: &'cfg str,
     gateway: GatewayResourceAttributes<'_>,
-) -> OtlpTraceConfig<'cfg> {
+) -> OtlpExportConfig<'cfg> {
     let service_name = cfg
         .service_name
         .as_deref()
@@ -76,8 +80,8 @@ fn trace_config<'cfg>(
             ServiceName::Fixed,
         );
 
-    OtlpTraceConfig {
-        endpoint: &cfg.endpoint,
+    OtlpExportConfig {
+        endpoint,
         service_name,
         service_version: Some(openshell_core::VERSION),
         resource_attributes: openshell_otel::gateway_resource_attributes(
@@ -89,7 +93,7 @@ fn trace_config<'cfg>(
 
 #[cfg(test)]
 fn build_resource(cfg: &OtlpConfig, gateway: GatewayResourceAttributes<'_>) -> Resource {
-    openshell_otel::resource_for(&trace_config(cfg, gateway))
+    openshell_otel::resource_for(&export_config(cfg, "", gateway))
 }
 
 /// Build a tracer provider exporting over OTLP/gRPC to the configured endpoint.
@@ -105,22 +109,127 @@ fn build_provider(
     cfg: &OtlpConfig,
     gateway: GatewayResourceAttributes<'_>,
 ) -> Result<SdkTracerProvider, SetupError> {
-    openshell_otel::build_provider(&trace_config(cfg, gateway))
+    let endpoint = cfg.traces_endpoint().expect("trace export is configured");
+    openshell_otel::build_provider(&export_config(cfg, endpoint, gateway))
 }
 
-/// Resolve the tracer provider for a gateway config file's optional
-/// `[openshell.gateway.otlp]` table.
-///
-/// `None` means export is off — not configured, or configured and unusable.
-/// Telemetry is diagnostic, so a broken exporter never stops the gateway.
-///
-/// The error is returned rather than logged because the provider is built
-/// before the subscriber it attaches to, so logging here would go nowhere.
-pub fn provider_for(
-    cfg: Option<&OtlpConfig>,
-    gateway: GatewayResourceAttributes<'_>,
-) -> (Option<SdkTracerProvider>, Option<SetupError>) {
-    openshell_otel::provider_for(cfg.map(|cfg| trace_config(cfg, gateway)))
+/// OTLP export configured by `[openshell.gateway.otlp]`: gateway spans and
+/// OCSF log records, each sent to its own configured collector.
+pub struct OtlpExport {
+    traces: Option<Signal<SdkTracerProvider>>,
+    ocsf: Option<Signal<OcsfOtlp>>,
+}
+
+/// One signal's exporter and the endpoint it sends to.
+struct Signal<E> {
+    endpoint: String,
+    exporter: E,
+}
+
+impl OtlpExport {
+    /// Start export for the optional `[openshell.gateway.otlp]` table.
+    ///
+    /// `None` means export is off — not configured, or configured and unusable.
+    /// Telemetry is diagnostic, so a broken exporter never stops the gateway.
+    ///
+    /// The error is returned rather than logged because export starts before
+    /// the subscriber it attaches to, so logging here would go nowhere.
+    pub fn start(
+        cfg: Option<&OtlpConfig>,
+        gateway: GatewayResourceAttributes<'_>,
+    ) -> (Option<Self>, Option<SetupError>) {
+        match cfg.map(|cfg| Self::try_start(cfg, gateway)) {
+            None => (None, None),
+            Some(Ok(export)) => (Some(export), None),
+            Some(Err(error)) => (None, Some(error)),
+        }
+    }
+
+    fn try_start(
+        cfg: &OtlpConfig,
+        gateway: GatewayResourceAttributes<'_>,
+    ) -> Result<Self, SetupError> {
+        let target = |endpoint| OtlpTarget::new(&export_config(cfg, endpoint, gateway));
+        let traces = cfg
+            .traces
+            .as_ref()
+            .map(|traces| {
+                let target = target(&traces.endpoint)?;
+                Ok::<_, SetupError>(Signal {
+                    endpoint: target.endpoint().to_string(),
+                    exporter: target.tracer_provider()?,
+                })
+            })
+            .transpose()?;
+        let ocsf = cfg
+            .ocsf
+            .as_ref()
+            .map(|ocsf| {
+                let target = target(&ocsf.endpoint)?;
+                Ok::<_, SetupError>(Signal {
+                    endpoint: target.endpoint().to_string(),
+                    exporter: OcsfOtlp::start(
+                        target.log_exporter()?,
+                        target.resource().clone(),
+                        ocsf.schema_version,
+                    ),
+                })
+            })
+            .transpose()?;
+        Ok(Self { traces, ocsf })
+    }
+
+    /// The collector receiving traces, when trace export is enabled.
+    pub fn traces_endpoint(&self) -> Option<&str> {
+        self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+    }
+
+    /// The trace provider, when trace export is enabled.
+    pub fn tracer_provider(&self) -> Option<&SdkTracerProvider> {
+        self.traces.as_ref().map(|traces| &traces.exporter)
+    }
+
+    /// The collector receiving OCSF log records, when OCSF export is enabled.
+    pub fn ocsf_endpoint(&self) -> Option<&str> {
+        self.ocsf.as_ref().map(|ocsf| ocsf.endpoint.as_str())
+    }
+
+    /// OCSF log export, when `[otlp.ocsf]` is configured.
+    pub fn ocsf(&self) -> Option<&OcsfOtlp> {
+        self.ocsf.as_ref().map(|ocsf| &ocsf.exporter)
+    }
+
+    /// Flush buffered spans, then export queued OCSF records within their
+    /// shutdown budget.
+    pub async fn shutdown(self) {
+        if let Some(traces) = self.traces
+            && let Err(err) = traces.exporter.shutdown()
+        {
+            tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
+        }
+        if let Some(ocsf) = self.ocsf {
+            ocsf.exporter.shutdown().await;
+        }
+    }
+}
+
+/// Collector headers for supervisors to send with their OCSF exports: the
+/// headers the gateway's own OCSF exporter reads from its environment, with the
+/// same precedence. Supervisors receive them in their launch bundle because
+/// they do not inherit the gateway's environment.
+pub fn supervisor_ocsf_headers(otlp: Option<&OtlpConfig>) -> Option<SecretOtlpHeaders> {
+    ocsf_headers_from(otlp, |name| std::env::var(name).ok())
+}
+
+fn ocsf_headers_from(
+    otlp: Option<&OtlpConfig>,
+    var: impl Fn(&str) -> Option<String>,
+) -> Option<SecretOtlpHeaders> {
+    otlp?.ocsf.as_ref()?;
+    var("OTEL_EXPORTER_OTLP_LOGS_HEADERS")
+        .or_else(|| var("OTEL_EXPORTER_OTLP_HEADERS"))
+        .filter(|headers| !headers.trim().is_empty())
+        .map(SecretOtlpHeaders::new)
 }
 
 /// Build the `tracing` layer that forwards spans to `provider`.
@@ -451,17 +560,168 @@ pub mod test_exporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_file::{OcsfOtlpConfig, OtlpTracesConfig};
     use crate::test_environment::Environment;
 
     fn config() -> OtlpConfig {
+        with_traces_endpoint("http://127.0.0.1:4317")
+    }
+
+    fn with_traces_endpoint(endpoint: &str) -> OtlpConfig {
         OtlpConfig {
-            endpoint: "http://127.0.0.1:4317".into(),
             service_name: None,
+            traces: Some(OtlpTracesConfig {
+                endpoint: endpoint.into(),
+            }),
+            ocsf: None,
+        }
+    }
+
+    fn ocsf_config(endpoint: &str) -> OcsfOtlpConfig {
+        OcsfOtlpConfig {
+            endpoint: endpoint.into(),
+            schema_version: None,
         }
     }
 
     fn build_test_resource(cfg: &OtlpConfig) -> Resource {
         build_resource(cfg, GatewayResourceAttributes::default())
+    }
+
+    #[test]
+    fn supervisors_receive_the_gateway_ocsf_headers() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_string())
+            }
+        };
+        let headers = |otlp: &OtlpConfig, vars| {
+            ocsf_headers_from(Some(otlp), env(vars)).map(|h| h.expose_secret().to_string())
+        };
+        let mut otlp = config();
+        let both: &[(&str, &str)] = &[
+            ("OTEL_EXPORTER_OTLP_LOGS_HEADERS", "authorization=logs"),
+            ("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all"),
+        ];
+        assert_eq!(headers(&otlp, both), None, "OCSF export is not enabled");
+
+        otlp.ocsf = Some(ocsf_config("http://127.0.0.1:4317"));
+        assert_eq!(headers(&otlp, both).as_deref(), Some("authorization=logs"));
+        assert_eq!(
+            headers(
+                &otlp,
+                &[("OTEL_EXPORTER_OTLP_HEADERS", "authorization=all")]
+            )
+            .as_deref(),
+            Some("authorization=all")
+        );
+        assert_eq!(
+            headers(&otlp, &[("OTEL_EXPORTER_OTLP_LOGS_HEADERS", " ")]),
+            None
+        );
+        assert_eq!(headers(&otlp, &[]), None);
+        assert!(ocsf_headers_from(None, env(both)).is_none());
+    }
+
+    #[tokio::test]
+    async fn each_signal_exports_only_when_configured() {
+        let (export, error) =
+            OtlpExport::start(Some(&config()), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("trace export");
+        assert_eq!(export.traces_endpoint(), Some("http://127.0.0.1:4317"));
+        assert!(export.ocsf().is_none());
+        export.shutdown().await;
+
+        let mut cfg = config();
+        cfg.ocsf = Some(ocsf_config("http://siem:4317"));
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("trace and OCSF log export");
+        assert_eq!(export.traces_endpoint(), Some("http://127.0.0.1:4317"));
+        assert_eq!(export.ocsf_endpoint(), Some("http://siem:4317"));
+        assert!(export.ocsf().is_some());
+        export.shutdown().await;
+
+        cfg.traces = None;
+        let (export, error) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OCSF log export");
+        assert!(export.tracer_provider().is_none());
+        assert!(export.ocsf().is_some());
+        export.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn ocsf_records_reach_an_otlp_collector_over_grpc() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, ocsf_emit};
+        use tracing_subscriber::prelude::*;
+
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let mut cfg = config();
+        cfg.traces = None;
+        cfg.ocsf = Some(ocsf_config(collector.endpoint()));
+        let (export, error) = OtlpExport::start(
+            Some(&cfg),
+            GatewayResourceAttributes::new(Some("test-gateway"), Some("docker")),
+        );
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        let export = export.expect("OTLP export");
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .severity(SeverityId::Medium)
+                .message("policy approved")
+                .build();
+        let expected = serde_json::to_value(&event).unwrap();
+        let subscriber =
+            tracing_subscriber::registry().with(export.ocsf().expect("OCSF log export").layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        export.shutdown().await;
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.gateway_names, ["test-gateway"]);
+        assert_eq!(received.log_bodies.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&received.log_bodies[0]).unwrap(),
+            expected
+        );
+    }
+
+    /// Supervisors authenticate to the collector with the headers from their
+    /// launch bundle.
+    #[tokio::test]
+    async fn ocsf_export_sends_explicit_collector_headers() {
+        use openshell_ocsf::{ConfigStateChangeBuilder, ocsf_emit};
+        use tracing_subscriber::prelude::*;
+
+        let collector = openshell_otel_test_support::OtlpTestServer::start().await;
+        let target = OtlpTarget::new(&OtlpExportConfig {
+            endpoint: collector.endpoint(),
+            service_name: ServiceName::Fixed("openshell-supervisor"),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        })
+        .unwrap();
+        let export = OcsfOtlp::start(
+            target
+                .log_exporter_with_headers(Some("authorization=Bearer%20collector-token"))
+                .unwrap(),
+            target.resource().clone(),
+            None,
+        );
+        let event =
+            ConfigStateChangeBuilder::new(&crate::gateway_ocsf::context("sandbox-1", "sandbox"))
+                .message("policy approved")
+                .build();
+        let subscriber = tracing_subscriber::registry().with(export.layer());
+        tracing::subscriber::with_default(subscriber, || ocsf_emit!(event));
+        export.shutdown().await;
+        let received = collector.shutdown().await;
+
+        assert_eq!(received.log_bodies.len(), 1);
+        assert_eq!(received.log_authorizations, ["Bearer collector-token"]);
     }
 
     #[test]
@@ -571,8 +831,7 @@ mod tests {
 
     #[test]
     fn provider_rejects_a_malformed_endpoint() {
-        let mut cfg = config();
-        cfg.endpoint = "definitely not a url".into();
+        let cfg = with_traces_endpoint("definitely not a url");
         let err = build_provider(&cfg, GatewayResourceAttributes::default())
             .expect_err("malformed endpoint");
         assert!(
@@ -583,8 +842,7 @@ mod tests {
 
     #[test]
     fn provider_rejects_an_empty_endpoint() {
-        let mut cfg = config();
-        cfg.endpoint = "   ".into();
+        let cfg = with_traces_endpoint("   ");
         assert!(
             build_provider(&cfg, GatewayResourceAttributes::default()).is_err(),
             "empty endpoint is rejected"
@@ -606,8 +864,8 @@ mod tests {
     /// error for the caller to log — see the misconfigured-endpoint test.
     #[tokio::test]
     async fn absent_otlp_table_disables_export() {
-        let (provider, err) = provider_for(None, GatewayResourceAttributes::default());
-        assert!(provider.is_none(), "export is off");
+        let (export, err) = OtlpExport::start(None, GatewayResourceAttributes::default());
+        assert!(export.is_none(), "export is off");
         assert!(
             err.is_none(),
             "an absent table is a choice, not an error to report"
@@ -616,9 +874,10 @@ mod tests {
 
     #[tokio::test]
     async fn present_otlp_table_enables_export() {
-        let (provider, err) = provider_for(Some(&config()), GatewayResourceAttributes::default());
+        let (export, err) =
+            OtlpExport::start(Some(&config()), GatewayResourceAttributes::default());
         assert!(err.is_none());
-        provider.expect("provider is present").shutdown().ok();
+        export.expect("export is on").shutdown().await;
     }
 
     /// Telemetry must never be able to take the gateway down. A bad endpoint
@@ -626,15 +885,16 @@ mod tests {
     /// gateway from starting.
     #[tokio::test]
     async fn misconfigured_endpoint_disables_export_without_failing_startup() {
-        let mut cfg = config();
-        cfg.endpoint = "definitely not a url".into();
-
-        let (provider, err) = provider_for(Some(&cfg), GatewayResourceAttributes::default());
-        assert!(
-            provider.is_none(),
-            "a bad endpoint degrades to no export rather than failing startup"
-        );
-        assert!(err.is_some(), "the failure is reportable, not swallowed");
+        let mut bad_ocsf = config();
+        bad_ocsf.ocsf = Some(ocsf_config("definitely not a url"));
+        for cfg in [with_traces_endpoint("definitely not a url"), bad_ocsf] {
+            let (export, err) = OtlpExport::start(Some(&cfg), GatewayResourceAttributes::default());
+            assert!(
+                export.is_none(),
+                "a bad endpoint degrades to no export rather than failing startup"
+            );
+            assert!(err.is_some(), "the failure is reportable, not swallowed");
+        }
     }
 
     #[tokio::test]

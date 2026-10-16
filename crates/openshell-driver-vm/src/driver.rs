@@ -6,6 +6,10 @@
 #[path = "preparation.rs"]
 mod preparation;
 
+#[cfg(test)]
+#[path = "registry_cache_tests.rs"]
+mod registry_cache_tests;
+
 use crate::gpu::{GpuInventory, allocate_vsock_cid};
 
 use crate::isolation::VmBoundarySpec;
@@ -200,8 +204,9 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v5";
-const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
+// Older registry cache entries were not bound to the downloaded manifest.
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v6";
+const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v4";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
@@ -258,6 +263,12 @@ pub struct VmDriverConfig {
     /// supplies its own export endpoint; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    /// Gateway name passed to supervisors for their telemetry.
+    pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
@@ -312,6 +323,8 @@ impl std::fmt::Debug for VmDriverConfig {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
+            .field("supervisor_ocsf_export", &self.supervisor_ocsf_export)
+            .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
@@ -376,6 +389,8 @@ impl Default for VmDriverConfig {
         Self {
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
                 openshell_core::resource_admission::ResourceAdmissionConfig::default(),
@@ -982,6 +997,12 @@ impl VmDriver {
             command
                 .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
                 .envs(openshell_otel::current_trace_context_environment());
+        }
+        if let Some(export) = &self.config.supervisor_ocsf_export {
+            command.envs(export.environment());
+        }
+        if let Some(name) = &self.config.supervisor_gateway_name {
+            command.env(openshell_core::sandbox_env::GATEWAY_NAME, name);
         }
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
@@ -3191,10 +3212,27 @@ impl VmDriver {
             return span_status.finish(result);
         }
 
+        span_status.finish(
+            self.ensure_cached_registry_rootfs_image(
+                sandbox_id,
+                image_ref,
+                &registry_client(),
+                &registry_auth(image_ref)?,
+            )
+            .await,
+        )
+    }
+
+    async fn ensure_cached_registry_rootfs_image(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        client: &OciClient,
+        auth: &RegistryAuth,
+    ) -> Result<String, Status> {
+        let span_status = openshell_otel::ErrorStatusGuard::current();
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
         let reference = parse_registry_reference(image_ref)?;
-        let client = registry_client();
-        let auth = registry_auth(image_ref)?;
         info!(image_ref = %image_ref, "vm driver: authenticating with registry");
         self.publish_vm_progress(
             sandbox_id,
@@ -3206,7 +3244,7 @@ impl VmDriver {
             ]),
         );
         retry_registry_request("authenticate with registry", || {
-            client.auth(&reference, &auth, RegistryOperation::Pull)
+            client.auth(&reference, auth, RegistryOperation::Pull)
         })
         .await
         .map_err(|err| {
@@ -3224,15 +3262,13 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = retry_registry_request("fetch manifest digest", || {
-            client.fetch_manifest_digest(&reference, &auth)
-        })
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to resolve vm sandbox image '{image_ref}': {err}"
-            ))
-        })?;
+        let (reference, source_image_identity) = pin_registry_reference(client, &reference, auth)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to resolve vm sandbox image '{image_ref}': {err}"
+                ))
+            })?;
         info!(
             image_ref = %image_ref,
             image_identity = %source_image_identity,
@@ -3327,9 +3363,9 @@ impl VmDriver {
 
         self.build_cached_registry_image_rootfs_image(
             sandbox_id,
-            &client,
+            client,
             &reference,
-            &auth,
+            auth,
             image_ref,
             &image_identity,
         )
@@ -3514,8 +3550,14 @@ impl VmDriver {
                 .await;
         }
 
-        self.ensure_prepared_registry_image_disk(sandbox_id, image_ref, bootstrap_root_disk)
-            .await
+        self.ensure_prepared_registry_image_disk(
+            sandbox_id,
+            image_ref,
+            bootstrap_root_disk,
+            &registry_client(),
+            &registry_auth(image_ref)?,
+        )
+        .await
     }
 
     async fn ensure_prepared_local_image_disk(
@@ -3738,10 +3780,10 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
         bootstrap_root_disk: &Path,
+        client: &OciClient,
+        auth: &RegistryAuth,
     ) -> Result<PreparedImageDisk, Status> {
         let reference = parse_registry_reference(image_ref)?;
-        let client = registry_client();
-        let auth = registry_auth(image_ref)?;
 
         self.publish_vm_progress(
             sandbox_id,
@@ -3753,7 +3795,7 @@ impl VmDriver {
             ]),
         );
         retry_registry_request("authenticate with registry", || {
-            client.auth(&reference, &auth, RegistryOperation::Pull)
+            client.auth(&reference, auth, RegistryOperation::Pull)
         })
         .await
         .map_err(|err| {
@@ -3771,15 +3813,13 @@ impl VmDriver {
                 ("image_source".to_string(), "registry".to_string()),
             ]),
         );
-        let source_image_identity = retry_registry_request("fetch manifest digest", || {
-            client.fetch_manifest_digest(&reference, &auth)
-        })
-        .await
-        .map_err(|err| {
-            Status::failed_precondition(format!(
-                "failed to resolve vm sandbox image '{image_ref}': {err}"
-            ))
-        })?;
+        let (reference, source_image_identity) = pin_registry_reference(client, &reference, auth)
+            .await
+            .map_err(|err| {
+                Status::failed_precondition(format!(
+                    "failed to resolve vm sandbox image '{image_ref}': {err}"
+                ))
+            })?;
         let cache_identity = prepared_image_cache_identity(&source_image_identity, &self.config);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
@@ -3806,7 +3846,7 @@ impl VmDriver {
         let layout_dir = staging_dir.join(GUEST_IMAGE_OCI_LAYOUT_DIR);
 
         let (manifest, _) = retry_registry_request("pull image manifest", || {
-            client.pull_image_manifest(&reference, &auth)
+            client.pull_image_manifest(&reference, auth)
         })
         .await
         .map_err(|err| {
@@ -3819,7 +3859,7 @@ impl VmDriver {
             .map_err(|err| Status::internal(format!("create guest OCI layout failed: {err}")))?;
 
         download_registry_descriptor_blob_file(
-            &client,
+            client,
             &reference,
             image_ref,
             &layout_dir,
@@ -5194,6 +5234,28 @@ fn registry_client() -> OciClient {
     })
 }
 
+async fn pin_registry_reference(
+    client: &OciClient,
+    reference: &Reference,
+    auth: &RegistryAuth,
+) -> Result<(Reference, String), OciDistributionError> {
+    // Preserve caller pins, including their digest algorithm. A HEAD response
+    // is only a resolution hint for tags, never proof of the image's contents.
+    let digest = match reference.digest() {
+        Some(digest) => digest.to_string(),
+        None => {
+            retry_registry_request("fetch manifest digest", || {
+                client.fetch_manifest_digest(reference, auth)
+            })
+            .await?
+        }
+    };
+    // oci-client verifies GET bytes against this pin. For an index it verifies
+    // the index first, then the selected platform manifest against its entry.
+    // All retries must use this same reference before publishing to the cache.
+    Ok((reference.clone_with_digest(digest.clone()), digest))
+}
+
 async fn retry_registry_request<T, F, Fut>(
     operation: &str,
     request: F,
@@ -6457,6 +6519,9 @@ fn write_oci_layout_for_manifest(
 }
 
 fn bootstrap_image_cache_identity(image_identity: &str) -> String {
+    // Bound new cache/staging filenames even for long source digests such as
+    // SHA-512. Persisted identities still use the unchanged path lookup.
+    let image_identity = compute_bytes_sha256_hex(image_identity.as_bytes());
     format!(
         "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:guest-{}:{image_identity}",
         openshell_core::VERSION,
@@ -6472,6 +6537,7 @@ fn configured_sandbox_identity(config: &VmDriverConfig) -> Option<(u32, u32)> {
 }
 
 fn prepared_image_cache_identity(image_identity: &str, config: &VmDriverConfig) -> String {
+    let image_identity = compute_bytes_sha256_hex(image_identity.as_bytes());
     let identity = configured_sandbox_identity(config).map_or_else(
         || "image-account".to_string(),
         |(uid, gid)| format!("configured-{uid}-{gid}"),
@@ -7151,8 +7217,13 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
 }
 
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
-    process.supervisor_liveness.take();
+    // Liveness EOF makes the supervisor exit at once, skipping workload
+    // teardown and its OCSF export flush, so close it only after SIGTERM has
+    // had its chance. Each process keeps its five-second budget, so a stop
+    // still completes within ten seconds; a slow workload stop can leave the
+    // supervisor too little time to flush.
     let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
+    process.supervisor_liveness.take();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
 
     match (supervisor_error, vm_error) {
@@ -10040,6 +10111,7 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -11485,11 +11557,12 @@ mod tests {
     #[test]
     fn prepared_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
         let image = "sha256:local-image";
+        let image_hash = compute_bytes_sha256_hex(image.as_bytes());
         let image_account = prepared_image_cache_identity(image, &VmDriverConfig::default());
         assert_eq!(
             image_account,
             format!(
-                "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:image-account:{image}",
+                "sandbox-prepared-rootfs-ext4-umoci-v4:openshell-{}:image-account:{image_hash}",
                 openshell_core::VERSION
             )
         );
@@ -11531,10 +11604,10 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version_and_guest_runtime() {
         let identity = bootstrap_image_cache_identity("sha256:bootstrap-image");
         assert!(identity.starts_with(&format!(
-            "sandbox-bootstrap-rootfs-ext4-v5:openshell-{}:guest-",
+            "sandbox-bootstrap-rootfs-ext4-v6:openshell-{}:guest-",
             openshell_core::VERSION
         )));
-        assert!(identity.ends_with(":sha256:bootstrap-image"));
+        assert!(identity.ends_with(&compute_bytes_sha256_hex(b"sha256:bootstrap-image")));
         assert!(identity.contains(&sandbox_guest_runtime_identity()));
     }
 
@@ -11667,6 +11740,59 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// A stand-in supervisor that drains for a second on SIGTERM and then
+    /// writes `marker`, unless liveness reached EOF while it drained, which
+    /// would have made the real supervisor exit at once.
+    #[cfg(unix)]
+    fn spawn_draining_supervisor(marker: &Path) -> (Child, fs::File) {
+        let (liveness_read, liveness_write) = nix::unistd::pipe().unwrap();
+        // As in production, so the child does not inherit the write end.
+        nix::fcntl::fcntl(
+            liveness_write.as_raw_fd(),
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .unwrap();
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(
+                r#"(cat >/dev/null; touch "$0.eof") <&0 &
+trap 'sleep 1; [ -e "$0.eof" ] || echo drained > "$0"; exit 0' TERM
+wait $!
+exit 1"#,
+            )
+            .arg(marker)
+            .stdin(Stdio::from(liveness_read))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        // Let the shell install its trap before the test signals it.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(child.try_wait().unwrap().is_none());
+        (child, fs::File::from(liveness_write))
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_sandbox_lets_the_supervisor_drain_before_closing_liveness() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("drained");
+        let (supervisor, liveness) = spawn_draining_supervisor(&marker);
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(liveness),
+            deleting: true,
+        };
+
+        terminate_sandbox_processes(&mut process).await.unwrap();
+
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "drained\n");
+        assert!(process.supervisor_liveness.is_none());
+        let _ = fs::remove_dir_all(dir);
     }
 
     async fn insert_test_record(

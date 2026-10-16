@@ -64,6 +64,7 @@ fn test_launch_authentication() -> Vec<u8> {
             sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
             sandbox_expires_at: i64::MAX,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         },
         gateway_id: "gateway-test".to_string(),
         verification_keys: vec![SessionVerificationKey {
@@ -216,6 +217,8 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         supervisor_endpoint_explicit: true,
         bridge_default_endpoint: Some("https://host.docker.internal:8443".to_string()),
         host_gateway_ip: None,
+        supervisor_ocsf_export: None,
+        supervisor_gateway_name: None,
         ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
         guest_tls: Some(DockerGuestTlsPaths {
             ca: PathBuf::from("/tmp/ca.crt"),
@@ -1396,17 +1399,37 @@ fn docker_child_environment_strips_supervisor_control_keys() {
 }
 
 #[test]
-fn supervisor_tracing_environment_requires_an_endpoint() {
+fn supervisor_otlp_environment_carries_only_configured_signals() {
+    use openshell_core::sandbox_env::{
+        GATEWAY_NAME, OTLP_ENDPOINT, OTLP_OCSF_ENDPOINT, OTLP_OCSF_SCHEMA_VERSION, OcsfOtlpExport,
+    };
+
     let mut config = runtime_config();
-    assert!(supervisor_tracing_environment(&config).is_empty());
+    assert!(supervisor_otlp_environment(&config).is_empty());
 
     config.supervisor_otlp_endpoint = Some("http://127.0.0.1:4317".to_string());
     assert_eq!(
-        supervisor_tracing_environment(&config),
-        [format!(
-            "{}=http://127.0.0.1:4317",
-            openshell_core::sandbox_env::OTLP_ENDPOINT
-        )]
+        supervisor_otlp_environment(&config),
+        [format!("{OTLP_ENDPOINT}=http://127.0.0.1:4317")]
+    );
+
+    config.supervisor_otlp_endpoint = None;
+    config.supervisor_ocsf_export = Some(OcsfOtlpExport {
+        endpoint: "http://siem:4317".to_string(),
+        schema_version: Some("1.3".to_string()),
+    });
+    assert_eq!(
+        supervisor_otlp_environment(&config),
+        [
+            format!("{OTLP_OCSF_ENDPOINT}=http://siem:4317"),
+            format!("{OTLP_OCSF_SCHEMA_VERSION}=1.3"),
+        ]
+    );
+
+    config.supervisor_gateway_name = Some("prod-west".to_string());
+    assert_eq!(
+        supervisor_otlp_environment(&config).last(),
+        Some(&format!("{GATEWAY_NAME}=prod-west"))
     );
 }
 
@@ -4058,6 +4081,71 @@ fn docker_oom_kill_stays_terminal_despite_137() {
     };
     apply_docker_exit_classification(&mut sandbox, &state);
     assert_eq!(ready_reason(&sandbox), CONDITION_EXITED);
+}
+
+#[test]
+fn supervisor_workspace_validation_exit_is_reported_explicitly() {
+    let status = workspace_validation_status();
+    assert_eq!(status.message(), WORKSPACE_VALIDATION_FAILED_MESSAGE);
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(
+        supervisor_start_failure_reason(
+            &Status::failed_precondition("provider SPIFFE socket has no parent directory"),
+            "ControlSupervisorStartFailed"
+        ),
+        "ControlSupervisorStartFailed"
+    );
+    assert_eq!(
+        supervisor_exit_reason(i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED)),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
+    assert_eq!(supervisor_exit_reason(1), "ControlSupervisorExited");
+
+    let (reason, message) =
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: i64::from(SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED),
+            error: "image workspace validation failed".into(),
+        })));
+    assert_eq!(reason, CONDITION_WORKSPACE_VALIDATION_FAILED);
+    assert!(message.contains("status 78"));
+    assert_eq!(
+        docker_supervisor_wait_failure(Some(Err(BollardError::DockerContainerWaitError {
+            code: 1,
+            error: String::new(),
+        })))
+        .0,
+        "ControlSupervisorExited"
+    );
+}
+
+#[tokio::test]
+async fn workspace_failure_survives_supervisor_cleanup_before_readiness_inspection() {
+    let failures = Arc::new(Mutex::new(HashMap::from([(
+        "sandbox-1".to_string(),
+        DockerRuntimeFailure {
+            reason: CONDITION_WORKSPACE_VALIDATION_FAILED,
+            message: "Docker supervisor container exited with status 78".into(),
+        },
+    )])));
+    // There is no Docker daemon at this address: a monitor that has removed
+    // the supervisor must not need another inspection to retain the reason.
+    let docker = Docker::connect_with_http("127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION).unwrap();
+    let status = wait_for_docker_supervisor_ready(
+        &docker,
+        "removed-supervisor",
+        "workload-container-1",
+        "sandbox-1",
+        &failures,
+    )
+    .await
+    .expect_err("the recorded workspace failure takes precedence over inspection");
+    assert_eq!(
+        supervisor_start_failure_reason(&status, "ControlSupervisorStartFailed"),
+        CONDITION_WORKSPACE_VALIDATION_FAILED
+    );
 }
 
 #[test]
