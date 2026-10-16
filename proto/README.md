@@ -88,8 +88,10 @@ identifies the service being exposed.
 
 ## Isolation backend protocol
 
-[`sandbox_backend.proto`](sandbox_backend.proto) and
-[`sandbox_protocol.proto`](sandbox_protocol.proto) are supervisor-to-backend
-contracts, not gateway RPCs. Backend authors can generate bindings independently
-and implement [Sandbox Protocol 1.0](sandbox_protocol/v1/README.md). Its negotiated
-version covers the gRPC services, JSON messages, framing, and lifecycle semantics.
+[`isolation_backend.proto`](isolation_backend.proto) defines backend discovery,
+boundary binding, and optional suspend/resume RPCs.
+[`sandbox_protocol.proto`](sandbox_protocol.proto) defines typed workload
+control, process I/O, and network mediation over the bound boundary. Both are
+supervisor-to-backend contracts, not gateway RPCs. Backend authors can generate bindings independently
+from these definitions. The negotiated Sandbox Protocol version covers the gRPC
+services, typed messages, streaming, and lifecycle semantics.

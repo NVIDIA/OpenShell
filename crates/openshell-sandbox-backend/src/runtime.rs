@@ -14,7 +14,9 @@ use crate::backend_proto::{
     DescribeSandboxBackendRequest, OpenBoundaryRequest, open_boundary_response::LaunchOutcome,
     sandbox_backend_client::SandboxBackendClient,
 };
-use crate::isolation_protocol::{boundary_chunk, chunk_data, data_chunk};
+use crate::isolation_protocol::boundary_chunk;
+#[cfg(test)]
+use crate::isolation_protocol::{chunk_data, data_chunk};
 use crate::proto::{BoundaryChunk, sandbox_boundary_client::SandboxBoundaryClient};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
@@ -700,7 +702,7 @@ async fn pump_process_responses(
                 }
             }
             Ok(Some((STREAM_EXIT, payload))) => {
-                break serde_json::from_slice::<ExitStatusWire>(&payload)
+                break crate::protobuf::decode::<ExitStatusWire>(&payload)
                     .map_or(BoundaryExitStatus::Exited(74), Into::into);
             }
             Ok(None | Some(_)) | Err(_) => break BoundaryExitStatus::Exited(74),
@@ -1032,7 +1034,7 @@ async fn complete_network_open(
     let decision = completion
         .await
         .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
-    let Ok(payload) = serde_json::to_vec(&decision) else {
+    let Ok(payload) = crate::protobuf::encode(&decision) else {
         return;
     };
     if write_stream_frame(
@@ -1126,7 +1128,7 @@ async fn dispatch_client_mediation_frame(
 ) -> std::io::Result<()> {
     match frame.kind {
         MediationFrameKind::DnsQuery => {
-            let query: DnsQueryWire = mediation::decode_json(&frame.payload)?;
+            let query: DnsQueryWire = mediation::decode_message(&frame.payload)?;
             let (response, completion) =
                 tokio::sync::oneshot::channel::<Result<Vec<u8>, BackendError>>();
             let outbound = outbound.clone();
@@ -1138,7 +1140,7 @@ async fn dispatch_client_mediation_frame(
                         "supervisor dropped the mediated DNS query".to_string(),
                     ),
                 };
-                if let Ok(payload) = mediation::encode_json(&response) {
+                if let Ok(payload) = mediation::encode_message(&response) {
                     let _ = outbound
                         .send(OutboundMediationFrame {
                             kind: MediationFrameKind::DnsResponse,
@@ -2249,8 +2251,8 @@ async fn open_grpc_client_stream_with_authorization(
         .map_err(|_| BackendError::Unavailable("queue boundary binding frame".to_string()))?;
     tokio::spawn(pump_to_grpc(reader, outbound));
     let mut client = SandboxBoundaryClient::new(channel)
-        .max_decoding_message_size(64 * 1024)
-        .max_encoding_message_size(64 * 1024);
+        .max_decoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES);
     let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
     request
         .metadata_mut()
@@ -2265,7 +2267,11 @@ async fn open_grpc_client_stream_with_authorization(
         }
         _ => BackendError::Unavailable(format!("open boundary gRPC stream: {error}")),
     })?;
-    tokio::spawn(pump_from_grpc(response.into_inner(), writer));
+    tokio::spawn(pump_from_grpc(
+        response.into_inner(),
+        writer,
+        crate::stream_adapter::Mode::Response,
+    ));
     Ok(Box::new(application))
 }
 
@@ -2273,36 +2279,34 @@ async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<Bounda
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut mode = crate::stream_adapter::Mode::Request;
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(read) => read,
+        match crate::stream_adapter::send(&mut reader, &mut mode).await {
+            Ok(Some(chunk)) => {
+                if sender.send(chunk).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => return,
             Err(error) => {
-                tracing::debug!(%error, "boundary gRPC request reader ended");
+                tracing::debug!(%error,"boundary request adapter ended");
                 return;
             }
-        };
-        if read == 0 {
-            return;
-        }
-        if sender
-            .send(data_chunk(buffer[..read].to_vec()))
-            .await
-            .is_err()
-        {
-            return;
         }
     }
 }
 
-async fn pump_from_grpc<W>(mut stream: tonic::Streaming<BoundaryChunk>, mut writer: W)
-where
+async fn pump_from_grpc<W>(
+    mut stream: tonic::Streaming<BoundaryChunk>,
+    mut writer: W,
+    mut mode: crate::stream_adapter::Mode,
+) where
     W: tokio::io::AsyncWrite + Unpin,
 {
     loop {
         match stream.message().await {
             Ok(Some(chunk)) => {
-                let Ok(data) = chunk_data(chunk) else {
+                let Ok(data) = crate::stream_adapter::receive(&mut mode, chunk) else {
                     let _ = writer.shutdown().await;
                     return;
                 };
@@ -2785,7 +2789,7 @@ mod tests {
                 } else {
                     b"complete response".to_vec()
                 };
-                let _ = outbound.send(Ok(data_chunk(response))).await;
+                let _ = outbound.send(Ok(test_response_chunk(response))).await;
             });
             Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
                 outbound_rx,
@@ -2809,6 +2813,11 @@ mod tests {
             }
             self.exchange(request).await
         }
+    }
+
+    fn test_response_chunk(bytes: Vec<u8>) -> BoundaryChunk {
+        let response: ResponseEnvelope = decode_frame(&bytes).unwrap();
+        crate::isolation_protocol::response_chunk(&response).unwrap()
     }
 
     fn complete_control_frame(frame: &[u8]) -> bool {
@@ -3098,11 +3107,19 @@ mod tests {
         )
         .await
         .unwrap();
-        stream.write_all(b"finite request").await.unwrap();
+        let request = RequestEnvelope::new(Request::DiscoverPolicy).unwrap();
+        stream
+            .write_all(&encode_frame(&request).unwrap())
+            .await
+            .unwrap();
         stream.shutdown().await.unwrap();
-        let mut response = [0_u8; 17];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"complete response");
+        let response: ResponseEnvelope = crate::boundary_protocol::read_frame_async(&mut stream)
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.response,
+            Response::ImagePolicy { invalid: false, .. }
+        ));
         drop(stream);
         server.abort();
     }
@@ -3129,7 +3146,7 @@ mod tests {
                 &mut server_stream,
                 MediationFrameKind::DnsQuery,
                 42,
-                &mediation::encode_json(&query).unwrap(),
+                &mediation::encode_message(&query).unwrap(),
             )
             .await
             .unwrap();
@@ -3140,7 +3157,7 @@ mod tests {
             assert_eq!(reply.kind, MediationFrameKind::DnsResponse);
             assert_eq!(reply.stream_id, 42);
             assert_eq!(
-                mediation::decode_json::<DnsQueryResultWire>(&reply.payload).unwrap(),
+                mediation::decode_message::<DnsQueryResultWire>(&reply.payload).unwrap(),
                 DnsQueryResultWire::Response(vec![4, 5, 6])
             );
         });
@@ -3735,7 +3752,7 @@ mod tests {
         write_stream_frame(&mut peer, STREAM_STDOUT, b"hello")
             .await
             .unwrap();
-        let status = serde_json::to_vec(&ExitStatusWire::Exited(74)).unwrap();
+        let status = crate::protobuf::encode(&ExitStatusWire::Exited(74)).unwrap();
         write_stream_frame(&mut peer, STREAM_EXIT, &status)
             .await
             .unwrap();

@@ -5,9 +5,9 @@
 //!
 //! Drivers choose and provision the transport, but they do not redefine the
 //! process lifecycle, streaming, identity, or authentication messages.  The
-//! supervisor and sandbox exchange these length-delimited JSON frames inside
-//! gRPC streams on one mutually authenticated connection. The driver chooses
-//! the underlying private Unix socket, TCP connection, or virtio-vsock stream.
+//! supervisor and sandbox exchange typed protobuf messages over gRPC. The
+//! length-delimited helpers below adapt only private, in-process Rust streams.
+//! The driver chooses the underlying private Unix socket, TCP connection, or virtio-vsock stream.
 
 use std::fmt;
 use std::io;
@@ -29,7 +29,6 @@ use openshell_isolation_interface::contract::{
     OuterFenceGuarantees, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -608,7 +607,7 @@ pub async fn read_stream_frame(
 pub struct RequestEnvelope {
     /// Cryptographically random idempotency key scoped to one sandbox generation.
     pub request_id: String,
-    /// SHA-256 of the canonically serialized request payload.
+    /// Local replay fingerprint of decoded protobuf fields; never transmitted.
     pub payload_digest: String,
     /// Absolute exec admission deadline, preserved across retries and bound to
     /// the payload digest. Other request kinds do not expire through this field.
@@ -657,19 +656,19 @@ pub fn unix_time_millis() -> Result<u64, FrameError> {
     u64::try_from(elapsed.as_millis()).map_err(|error| FrameError::Io(io::Error::other(error)))
 }
 
-fn request_envelope_digest(
+pub(crate) fn request_envelope_digest(
     request: &Request,
     exec_expires_at_unix_ms: Option<u64>,
 ) -> Result<String, FrameError> {
-    // Sort every object explicitly: dependency features may make Value retain
-    // insertion order. Provider environments must hash identically after
-    // deserialization and across independently serialized retries.
-    let mut normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
-    if let Some(expires_at) = exec_expires_at_unix_ms {
-        normalized["exec_expires_at_unix_ms"] = expires_at.into();
-    }
-    normalized.sort_all_objects();
-    let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
+    // Stable local replay fingerprint of decoded protobuf fields. Maps use
+    // BTreeMap in generated messages; neither clients nor the wire carry this.
+    let envelope = RequestEnvelope {
+        request_id: String::new(),
+        payload_digest: String::new(),
+        exec_expires_at_unix_ms,
+        request: request.clone(),
+    };
+    let payload = crate::protobuf::encode(&envelope)?;
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
 }
@@ -1350,8 +1349,11 @@ impl From<BoundaryExitStatus> for ExitStatusWire {
     }
 }
 
-pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
-    let payload = serde_json::to_vec(message).map_err(FrameError::Serialize)?;
+pub fn encode_frame<T: crate::protobuf::WireMessage>(message: &T) -> Result<Vec<u8>, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
+    let payload = crate::protobuf::encode(message)?;
     if payload.len() > MAX_CONTROL_FRAME_BYTES {
         return Err(FrameError::TooLarge(payload.len()));
     }
@@ -1362,7 +1364,10 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> {
+pub fn decode_frame<T: crate::protobuf::WireMessage>(frame: &[u8]) -> Result<T, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let header: [u8; 4] = frame
         .get(..4)
         .ok_or(FrameError::Truncated)?
@@ -1379,10 +1384,13 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> 
             actual: payload.len(),
         });
     }
-    serde_json::from_slice(payload).map_err(FrameError::Deserialize)
+    crate::protobuf::decode(payload)
 }
 
-pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, FrameError> {
+pub fn read_frame<T: crate::protobuf::WireMessage>(reader: &mut impl Read) -> Result<T, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let mut header = [0_u8; 4];
     reader.read_exact(&mut header)?;
     let declared = u32::from_be_bytes(header) as usize;
@@ -1399,7 +1407,8 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, Fram
 pub async fn read_frame_async<R, T>(reader: &mut R) -> Result<T, FrameError>
 where
     R: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: crate::protobuf::WireMessage,
+    T::Proto: prost::Message + Default,
 {
     use tokio::io::AsyncReadExt as _;
 
@@ -1416,7 +1425,13 @@ where
     decode_frame(&frame)
 }
 
-pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<(), FrameError> {
+pub fn write_frame<T: crate::protobuf::WireMessage>(
+    writer: &mut impl Write,
+    message: &T,
+) -> Result<(), FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let frame = encode_frame(message)?;
     writer.write_all(&frame)?;
     writer.flush()?;
@@ -1425,16 +1440,14 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("invalid protobuf message: {0}")]
+    Protobuf(String),
     #[error("control frame is truncated")]
     Truncated,
     #[error("control frame is too large: {0} bytes")]
     TooLarge(usize),
     #[error("control frame declared {declared} bytes but contained {actual}")]
     LengthMismatch { declared: usize, actual: usize },
-    #[error("serialize control frame: {0}")]
-    Serialize(serde_json::Error),
-    #[error("deserialize control frame: {0}")]
-    Deserialize(serde_json::Error),
     #[error("control request payload digest does not match its envelope")]
     PayloadDigestMismatch,
     #[error("read or write control frame: {0}")]
@@ -1680,15 +1693,9 @@ mod tests {
             revision: 2,
             provider_env,
         };
-        // Pin the canonical bytes, including the nested environment object.
-        // Two randomized HashMaps can otherwise happen to iterate identically
-        // and conceal a serializer that preserves insertion order.
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"provider_files":{},"revision":2}"#
-            )
-        );
+        // The fingerprint is local: independently ordered protobuf maps must
+        // compare equally, while changed decoded fields must not replay.
+        let expected = request_envelope_digest(&build(first.clone()), None).unwrap();
         for provider_env in [first, second] {
             let request = build(provider_env);
             assert_eq!(

@@ -194,17 +194,21 @@ impl NetworkPeer {
             response,
         })
         .unwrap();
-        outbound.send(Ok(data_chunk(bytes))).await.unwrap();
+        outbound.send(Ok(test_response_chunk(bytes))).await.unwrap();
         if connected {
             let state = self.state.clone();
             tokio::spawn(async move {
                 let (mut reader, writer) = tokio::io::duplex(4096);
-                let pump = tokio::spawn(pump_from_grpc(inbound, writer));
+                let pump = tokio::spawn(pump_from_grpc(
+                    inbound,
+                    writer,
+                    crate::stream_adapter::Mode::Decision,
+                ));
                 let result = tokio::time::timeout(Duration::from_secs(3), async {
                     let (channel, payload) = read_stream_frame(&mut reader).await.unwrap().unwrap();
                     assert_eq!(channel, STREAM_NETWORK_DECISION);
                     assert_eq!(
-                        serde_json::from_slice::<TcpOpenDecision>(&payload).unwrap(),
+                        crate::protobuf::decode::<TcpOpenDecision>(&payload).unwrap(),
                         TcpOpenDecision::RelayReady
                     );
                     state.decisions.fetch_add(1, Ordering::AcqRel);

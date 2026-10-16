@@ -37,42 +37,35 @@ pub fn metadata() -> PeerMetadata {
     }
 }
 
-/// Read one length-prefixed control request across arbitrary gRPC fragments.
+// This example generates its own bindings. Bridge local Rust convenience types
+// through protobuf encoding so it also exercises the independently generated API.
+fn convert<T: prost::Message, U: prost::Message + Default>(value: T) -> Result<U, tonic::Status> {
+    U::decode(value.encode_to_vec().as_slice())
+        .map_err(|_| tonic::Status::invalid_argument("invalid protocol message"))
+}
+
 pub async fn read_request(
     input: &mut tonic::Streaming<boundary::BoundaryChunk>,
 ) -> Result<openshell_sandbox_backend::boundary_protocol::RequestEnvelope, tonic::Status> {
-    use boundary::boundary_chunk::Payload;
-    use openshell_sandbox_backend::boundary_protocol as wire;
-    use tonic::Status;
-    let mut bytes = Vec::new();
-    loop {
-        if bytes.len() >= 4 {
-            let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-            if length == 0 || length > wire::MAX_CONTROL_FRAME_BYTES {
-                return Err(Status::invalid_argument("invalid frame length"));
-            }
-            if bytes.len() >= 4 + length {
-                return wire::decode_frame(&bytes[..4 + length])
-                    .map_err(|_| Status::invalid_argument("invalid request frame"));
-            }
-        }
-        let chunk = input
-            .message()
-            .await?
-            .ok_or_else(|| Status::invalid_argument("incomplete request"))?;
-        let Some(Payload::Data(data)) = chunk.payload else {
-            return Err(Status::invalid_argument("data frame required"));
-        };
-        if bytes.len() + data.len() > wire::MAX_CONTROL_FRAME_BYTES + 4 {
-            return Err(Status::resource_exhausted("request too large"));
-        }
-        bytes.extend_from_slice(&data);
+    use openshell_sandbox_backend::{boundary_protocol as wire, protobuf::WireMessage};
+    use prost::Message;
+    let chunk = input
+        .message()
+        .await?
+        .ok_or_else(|| tonic::Status::invalid_argument("request required"))?;
+    if chunk.encoded_len() > openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES {
+        return Err(tonic::Status::resource_exhausted("request too large"));
     }
+    let Some(boundary::boundary_chunk::Payload::Request(request)) = chunk.payload else {
+        return Err(tonic::Status::invalid_argument("typed request required"));
+    };
+    wire::RequestEnvelope::from_proto(convert(request)?)
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
 }
 
 pub fn data(bytes: Vec<u8>) -> boundary::BoundaryChunk {
     boundary::BoundaryChunk {
-        payload: Some(boundary::boundary_chunk::Payload::Data(bytes)),
+        payload: Some(boundary::boundary_chunk::Payload::RelayData(bytes)),
     }
 }
 
@@ -80,18 +73,51 @@ pub fn response(
     request_id: String,
     response: openshell_sandbox_backend::boundary_protocol::Response,
 ) -> Result<boundary::BoundaryChunk, tonic::Status> {
-    use openshell_sandbox_backend::boundary_protocol as wire;
-    wire::encode_frame(&wire::ResponseEnvelope {
+    use openshell_sandbox_backend::{boundary_protocol as wire, protobuf::WireMessage};
+    let value = wire::ResponseEnvelope {
         request_id,
         response,
+    }
+    .to_proto()
+    .map_err(|error| tonic::Status::internal(error.to_string()))?;
+    Ok(boundary::BoundaryChunk {
+        payload: Some(boundary::boundary_chunk::Payload::Response(convert(value)?)),
     })
-    .map(data)
-    .map_err(|_| tonic::Status::internal("encode response"))
 }
 
-pub fn stream_frame(channel: u8, payload: &[u8]) -> boundary::BoundaryChunk {
-    let mut bytes = vec![channel];
-    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    bytes.extend_from_slice(payload);
-    data(bytes)
+pub fn stream_frame(channel: u8, payload: &[u8]) -> Result<boundary::BoundaryChunk, tonic::Status> {
+    use boundary::boundary_chunk::Payload;
+    use openshell_sandbox_backend::{
+        boundary_protocol as wire,
+        protobuf::{self, WireMessage},
+    };
+    if payload.len() > wire::MAX_STREAM_FRAME_BYTES {
+        return Err(tonic::Status::resource_exhausted("output frame too large"));
+    }
+    let payload = match channel {
+        wire::STREAM_STDOUT => Payload::Stdout(payload.to_vec()),
+        wire::STREAM_STDERR => Payload::Stderr(payload.to_vec()),
+        wire::STREAM_EXIT => {
+            let value = protobuf::decode::<wire::ExitStatusWire>(payload)
+                .and_then(|v| v.to_proto())
+                .map_err(|error| tonic::Status::internal(error.to_string()))?;
+            Payload::Exit(convert(value)?)
+        }
+        _ => {
+            return Err(tonic::Status::invalid_argument(
+                "unsupported output channel",
+            ));
+        }
+    };
+    Ok(boundary::BoundaryChunk {
+        payload: Some(payload),
+    })
+}
+
+pub fn network_decision(
+    value: boundary::TcpOpenDecision,
+) -> Result<openshell_isolation_interface::contract::TcpOpenDecision, tonic::Status> {
+    use openshell_sandbox_backend::protobuf::WireMessage;
+    openshell_isolation_interface::contract::TcpOpenDecision::from_proto(convert(value)?)
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
 }

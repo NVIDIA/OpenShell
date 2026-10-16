@@ -73,6 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Configure tonic/prost protobuf code generation.
     tonic_prost_build::configure()
+        .btree_map(".openshell.sandbox.protocol.v1")
         .build_server(true)
         .build_client(true)
         .include_file("openshell.rs")

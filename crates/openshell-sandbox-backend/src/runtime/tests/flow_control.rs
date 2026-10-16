@@ -29,7 +29,19 @@ impl SandboxBoundary for StallingPeer {
         } else {
             tokio::spawn(async move {
                 if let Ok(Some(chunk)) = inbound.message().await {
-                    let _ = outbound.send(Ok(chunk)).await;
+                    let request = chunk_data(chunk).unwrap();
+                    let request: RequestEnvelope = decode_frame(&request).unwrap();
+                    let response = ResponseEnvelope {
+                        request_id: request.request_id,
+                        response: Response::Exited {
+                            status: ExitStatusWire::Exited(23),
+                        },
+                    };
+                    let _ = outbound
+                        .send(Ok(
+                            crate::isolation_protocol::response_chunk(&response).unwrap()
+                        ))
+                        .await;
                 }
             });
         }
@@ -135,14 +147,27 @@ async fn stalled_relays_cannot_starve_other_streams() {
         )
         .await
         .unwrap();
-        stream.write_all(b"ping").await.unwrap();
-        let mut pong = [0_u8; 4];
-        stream.read_exact(&mut pong).await.unwrap();
-        pong
+        let request = RequestEnvelope::new(Request::Wait {
+            process_id: "main".into(),
+        })
+        .unwrap();
+        stream
+            .write_all(&encode_frame(&request).unwrap())
+            .await
+            .unwrap();
+        crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
+            .await
+            .unwrap()
+            .response
     };
     let pong = tokio::time::timeout(Duration::from_secs(3), exchange)
         .await
         .expect("stalled relay streams must not exhaust connection-level credit");
-    assert_eq!(&pong, b"ping");
+    assert!(matches!(
+        pong,
+        Response::Exited {
+            status: ExitStatusWire::Exited(23)
+        }
+    ));
     drop(stalled);
 }

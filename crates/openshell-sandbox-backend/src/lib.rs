@@ -15,8 +15,10 @@ pub mod boundary_protocol;
 pub mod delegated;
 pub mod isolation_protocol;
 pub mod mediation;
+pub mod protobuf;
 mod runtime;
 pub mod sandbox_auth;
+pub mod stream_adapter;
 
 pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
 pub use runtime::{BoundaryTransportConnector, DelegatedRuntimeBackend, OpenShellRuntimeBackend};

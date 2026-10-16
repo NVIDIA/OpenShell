@@ -8,7 +8,6 @@ use std::{
 };
 
 use openshell_isolation_interface::contract::{TcpOpenDecision, TcpOpenDenial};
-use openshell_sandbox_backend::boundary_protocol as wire;
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::{Status, Streaming};
 
@@ -106,31 +105,23 @@ fn parse_request(url: &str) -> Option<(SocketAddr, Vec<u8>)> {
 
 async fn data(input: &mut Streaming<BoundaryChunk>) -> Result<Vec<u8>, Status> {
     match input.message().await?.and_then(|chunk| chunk.payload) {
-        Some(boundary_chunk::Payload::Data(bytes)) if !bytes.is_empty() => Ok(bytes),
+        Some(boundary_chunk::Payload::RelayData(bytes))
+            if !bytes.is_empty()
+                && bytes.len()
+                    <= openshell_sandbox_backend::boundary_protocol::MAX_STREAM_FRAME_BYTES =>
+        {
+            Ok(bytes)
+        }
         _ => Err(Status::unavailable("network stream closed or invalid")),
     }
 }
 
 pub async fn decision(input: &mut Streaming<BoundaryChunk>) -> Result<TcpOpenDecision, Status> {
-    let mut bytes = Vec::new();
-    loop {
-        bytes.extend_from_slice(&data(input).await?);
-        if bytes.len() > wire::MAX_STREAM_FRAME_BYTES + 5 {
-            return Err(Status::invalid_argument("network decision too large"));
+    match input.message().await?.and_then(|chunk| chunk.payload) {
+        Some(boundary_chunk::Payload::NetworkDecision(value)) => {
+            crate::protocol::network_decision(value)
         }
-        if bytes.len() >= 5 {
-            let length = u32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize;
-            if bytes[0] != wire::STREAM_NETWORK_DECISION || length > wire::MAX_STREAM_FRAME_BYTES {
-                return Err(Status::invalid_argument("invalid network decision frame"));
-            }
-            if bytes.len() == length + 5 {
-                return serde_json::from_slice(&bytes[5..])
-                    .map_err(|_| Status::invalid_argument("invalid network decision"));
-            }
-            if bytes.len() > length + 5 {
-                return Err(Status::invalid_argument("data before network decision"));
-            }
-        }
+        _ => Err(Status::invalid_argument("network decision required")),
     }
 }
 

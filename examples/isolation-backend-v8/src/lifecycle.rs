@@ -500,14 +500,14 @@ impl Runtime {
                     let pending = data.get(offsets[index]..)
                         .ok_or_else(|| Status::internal("guest output was truncated"))?;
                     for piece in pending.chunks(wire::MAX_STREAM_FRAME_BYTES) {
-                        yield protocol::stream_frame(channel, piece);
+                        yield protocol::stream_frame(channel, piece)?;
                     }
                     offsets[index] = data.len();
                 }
                 if let Some(result) = complete {
-                    let bytes = serde_json::to_vec(&Runtime::exit(&result))
+                    let bytes = openshell_sandbox_backend::protobuf::encode(&Runtime::exit(&result))
                         .map_err(|_| Status::internal("encode exit status"))?;
-                    yield protocol::stream_frame(wire::STREAM_EXIT, &bytes);
+                    yield protocol::stream_frame(wire::STREAM_EXIT, &bytes)?;
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -741,12 +741,20 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
             runtime.stop().await;
         };
         tonic::transport::Server::builder()
-            .add_service(sandbox_backend_server::SandboxBackendServer::new(
-                runtime.clone(),
-            ))
-            .add_service(sandbox_boundary_server::SandboxBoundaryServer::new(
-                runtime.clone(),
-            ))
+            .add_service(
+                sandbox_backend_server::SandboxBackendServer::new(runtime.clone())
+                    .max_decoding_message_size(64 * 1024)
+                    .max_encoding_message_size(64 * 1024),
+            )
+            .add_service(
+                sandbox_boundary_server::SandboxBoundaryServer::new(runtime.clone())
+                    .max_decoding_message_size(
+                        openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
+                    )
+                    .max_encoding_message_size(
+                        openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
+                    ),
+            )
             .serve_with_incoming_shutdown(incoming, shutdown)
             .await?;
         std::fs::remove_file(&socket_path)?;

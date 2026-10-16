@@ -16,6 +16,7 @@ openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 async-trait = "0.1"
 hyper-util = { workspace = true }
 prost = { workspace = true }
+prost-types = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }

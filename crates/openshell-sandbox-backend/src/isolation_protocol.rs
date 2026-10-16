@@ -68,7 +68,7 @@ pub fn validate_open(
 #[must_use]
 pub fn data_chunk(data: Vec<u8>) -> BoundaryChunk {
     BoundaryChunk {
-        payload: Some(Payload::Data(data)),
+        payload: Some(Payload::RelayData(data)),
     }
 }
 
@@ -79,12 +79,40 @@ pub fn boundary_chunk(boundary_id: &str) -> BoundaryChunk {
     }
 }
 
-/// After binding, only data frames are legal in either stream direction.
+/// Adapt a single typed frame for callers inspecting a local response.
 pub fn chunk_data(chunk: BoundaryChunk) -> Result<Vec<u8>, tonic::Status> {
-    match chunk.payload {
-        Some(Payload::Data(data)) => Ok(data),
-        _ => Err(tonic::Status::invalid_argument(
-            "only data frames are allowed after boundary binding",
-        )),
-    }
+    let mut mode = match chunk.payload.as_ref() {
+        Some(Payload::Request(_)) => crate::stream_adapter::Mode::Request,
+        Some(Payload::Response(_)) => crate::stream_adapter::Mode::Response,
+        Some(Payload::Stdin(_) | Payload::StdinClosed(_)) => crate::stream_adapter::Mode::Input,
+        Some(Payload::Stdout(_) | Payload::Stderr(_) | Payload::Exit(_)) => {
+            crate::stream_adapter::Mode::Output
+        }
+        Some(Payload::NetworkDecision(_)) => crate::stream_adapter::Mode::Decision,
+        Some(Payload::DnsQuery(_)) => crate::stream_adapter::Mode::DnsQueries,
+        Some(Payload::DnsResponse(_)) => crate::stream_adapter::Mode::DnsResponses,
+        _ => crate::stream_adapter::Mode::Relay,
+    };
+    crate::stream_adapter::receive(&mut mode, chunk)
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
+}
+
+/// A typed control request after the stream's boundary-binding frame.
+pub fn request_chunk(
+    request: &crate::boundary_protocol::RequestEnvelope,
+) -> Result<BoundaryChunk, crate::boundary_protocol::FrameError> {
+    use crate::protobuf::WireMessage;
+    Ok(BoundaryChunk {
+        payload: Some(Payload::Request(request.to_proto()?)),
+    })
+}
+
+/// A typed control response, preserving the request's correlation ID.
+pub fn response_chunk(
+    response: &crate::boundary_protocol::ResponseEnvelope,
+) -> Result<BoundaryChunk, crate::boundary_protocol::FrameError> {
+    use crate::protobuf::WireMessage;
+    Ok(BoundaryChunk {
+        payload: Some(Payload::Response(response.to_proto()?)),
+    })
 }

@@ -45,6 +45,7 @@ mod linux {
         open_boundary_response::LaunchOutcome,
         sandbox_backend_server::{SandboxBackend, SandboxBackendServer},
     };
+    #[cfg(test)]
     use openshell_sandbox_backend::isolation_protocol::{chunk_data, data_chunk};
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
@@ -619,8 +620,12 @@ mod linux {
             )
             .add_service(
                 SandboxBoundaryServer::new(service)
-                    .max_decoding_message_size(64 * 1024)
-                    .max_encoding_message_size(64 * 1024),
+                    .max_decoding_message_size(
+                        openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
+                    )
+                    .max_encoding_message_size(
+                        openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
+                    ),
             )
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown.changed().await;
@@ -939,10 +944,11 @@ mod linux {
             tokio::select! {
             _ = inbound_closed.changed() => {},
             () = async {
+            let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Request;
             loop {
                 match inbound.message().await {
                     Ok(Some(chunk)) => {
-                        let data = match chunk_data(chunk) {
+                        let data = match openshell_sandbox_backend::stream_adapter::receive(&mut mode,chunk).map_err(|error|tonic::Status::invalid_argument(error.to_string())) {
                             Ok(data) => data,
                             Err(error) => {
                                 if let Some(outbound) = invalid_frames.upgrade() {
@@ -974,24 +980,12 @@ mod linux {
             tokio::select! {
             _ = outbound_closed.changed() => {},
             () = async {
-            let mut buffer = vec![0_u8; 16 * 1024];
+            let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Response;
             loop {
-                let read = match reader.read(&mut buffer).await {
-                    Ok(read) => read,
-                    Err(error) => {
-                        tracing::debug!(%error, "Boundary gRPC response reader ended");
-                        return;
-                    }
-                };
-                if read == 0 {
-                    return;
-                }
-                if outbound
-                    .send(Ok(data_chunk(buffer[..read].to_vec())))
-                    .await
-                    .is_err()
-                {
-                    return;
+                match openshell_sandbox_backend::stream_adapter::send(&mut reader,&mut mode).await {
+                    Ok(Some(chunk)) => if outbound.send(Ok(chunk)).await.is_err() { return; },
+                    Ok(None) => return,
+                    Err(error) => { let _=outbound.send(Err(tonic::Status::invalid_argument(error.to_string()))).await;return; }
                 }
             }
             } => {},
@@ -1159,7 +1153,7 @@ mod linux {
                 queue_wait_us: duration_micros(pending.queued_at.elapsed()),
             },
         };
-        let Ok(payload) = mediation::encode_json(&query) else {
+        let Ok(payload) = mediation::encode_message(&query) else {
             routes.lock().await.remove(&stream_id);
             return;
         };
@@ -1180,7 +1174,7 @@ mod linux {
                 kind: MediationFrameKind::DnsResponse,
                 payload,
                 ..
-            }) => mediation::decode_json::<DnsQueryResultWire>(&payload)
+            }) => mediation::decode_message::<DnsQueryResultWire>(&payload)
                 .map_err(io::Error::other)
                 .and_then(|response| match response {
                     DnsQueryResultWire::Response(response) => Ok(response),
@@ -1375,7 +1369,7 @@ mod linux {
                             "unexpected network-open decision channel {channel}"
                         ));
                     }
-                    let decision = serde_json::from_slice(&payload)
+                    let decision = openshell_sandbox_backend::protobuf::decode(&payload)
                         .map_err(|error| format!("decode network-open decision: {error}"))?;
                     let Some(target) = pending
                         .complete(decision)
@@ -3274,8 +3268,9 @@ mod linux {
                 Ok(MainOutput::Stdout(payload)) => (STREAM_STDOUT, payload.to_vec()),
                 Ok(MainOutput::Stderr(payload)) => (STREAM_STDERR, payload.to_vec()),
                 Ok(MainOutput::Exit(code)) => {
-                    let status = serde_json::to_vec(&attachment.exit_status(code))
-                        .map_err(|error| format!("encode main process exit: {error}"))?;
+                    let status =
+                        openshell_sandbox_backend::protobuf::encode(&attachment.exit_status(code))
+                            .map_err(|error| format!("encode main process exit: {error}"))?;
                     break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
                         .await
                         .map_err(|error| format!("write main process exit: {error}"));
@@ -3290,8 +3285,10 @@ mod linux {
                         let _ =
                             write_stream_frame(&mut *writer.lock().await, STREAM_STDERR, message)
                                 .await;
-                        let status = serde_json::to_vec(&ExitStatusWire::Exited(74))
-                            .map_err(|error| format!("encode exec output failure: {error}"))?;
+                        let status = openshell_sandbox_backend::protobuf::encode(
+                            &ExitStatusWire::Exited(74),
+                        )
+                        .map_err(|error| format!("encode exec output failure: {error}"))?;
                         break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
                             .await
                             .map_err(|error| format!("write exec output failure: {error}"));
@@ -4656,7 +4653,9 @@ mod linux {
                 .unwrap();
             let request = RequestEnvelope::new(Request::OpenMediation).unwrap();
             sender
-                .send(data_chunk(encode_frame(&request).unwrap()))
+                .send(
+                    openshell_sandbox_backend::isolation_protocol::request_chunk(&request).unwrap(),
+                )
                 .await
                 .unwrap();
             let mut response = SandboxBoundaryClient::new(channel)
@@ -5561,7 +5560,8 @@ mod linux {
             let handle = test_open_boundary(channel.clone(), opening, &token).await;
             let request_stream = tokio_stream::iter([
                 openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle),
-                data_chunk(encode_frame(&request).expect("encode logical request")),
+                openshell_sandbox_backend::isolation_protocol::request_chunk(&request)
+                    .expect("typed logical request"),
             ]);
             let mut body = SandboxBoundaryClient::new(channel)
                 .exchange(bearer_request(request_stream, &token))

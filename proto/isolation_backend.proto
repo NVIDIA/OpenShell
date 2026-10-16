@@ -27,8 +27,8 @@ service SandboxBackend {
 
   // Bind a driver-provisioned resource to one fresh sandbox launch. The
   // caller credential must match sandbox_id and generation_id. This call must
-  // not run untrusted workload code. The subsequent Sandbox Protocol attach,
-  // confirm, and start sequence remains mandatory. A resource that already is
+  // not run untrusted workload code. The subsequent Sandbox Protocol Attach,
+  // Confirm, and StartAgent sequence remains mandatory. A resource that already is
   // the boundary may only validate and reserve its binding, then return a handle.
   // Reopening the same session and generation returns the same result. The
   // descriptor must bind to the same provisioned resource; a different resource

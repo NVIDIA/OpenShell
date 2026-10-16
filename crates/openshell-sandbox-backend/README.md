@@ -21,9 +21,11 @@ returns `UNIMPLEMENTED` for those optional RPCs.
 
 `SandboxBoundary.Exchange` and `.Mediate` begin with the handle from
 `OpenBoundary`. The server authenticates the stream's bearer, checks the handle
-against its provisioned sandbox and generation, then accepts data fragments.
-Missing bindings, repeated bindings, and frames without a payload are rejected.
-The fragments retain the existing versioned Sandbox Protocol framing.
+against its provisioned sandbox and generation, then accepts typed protobuf
+requests, responses, process I/O, network decisions, relay data, and DNS messages.
+Missing bindings, repeated bindings, and frames that do not match the operation
+or direction are rejected. There is no nested JSON or length/channel framing on
+the wire. Private in-process adapters retain the Rust byte-stream interfaces.
 
 Opening a boundary only validates and reserves a route. It neither attaches a
 supervisor nor runs workload code. Policy discovery is followed by the existing
@@ -43,13 +45,18 @@ generation, resource claims, and outer-fence evidence. Native evidence is
 validated by the registered backend; Linux evidence validation remains in the
 built-in adapter.
 
-The language-neutral contract and generation instructions are in [Sandbox Protocol 1.0](../../proto/sandbox_protocol/v1/README.md).
+The public gRPC contracts are in
+[`isolation_backend.proto`](../../proto/isolation_backend.proto) and
+[`sandbox_protocol.proto`](../../proto/sandbox_protocol.proto).
 
 ## Exec recovery
 
-An exec envelope carries a UUID request ID and an absolute expiration time in
-Unix milliseconds, set to 30 seconds after creation. The payload digest includes
-the expiration time, and transport recovery preserves the entire envelope.
+An exec envelope carries a UUID request ID and a protobuf timestamp set to
+30 seconds after creation. Transport recovery preserves the entire request,
+including that deadline. Repeated mutations with the same ID and equivalent
+decoded fields replay the original result; conflicting reuse is rejected.
+Map entry order is immaterial. The receiver computes its local replay
+fingerprint; clients do not transmit a digest.
 The supervisor and sandbox need synchronized wall clocks.
 
 The sandbox checks expiration before starting or reattaching an exec. It keeps
