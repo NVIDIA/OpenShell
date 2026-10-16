@@ -8,7 +8,7 @@ use std::net::IpAddr;
 
 use openshell_core::SandboxSessionId;
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,7 @@ pub struct DelegatedLaunch {
     #[serde(default)]
     pub host_gateway_ip: Option<IpAddr>,
     pub resource_claims: BTreeMap<String, String>,
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
 }
 
 impl DelegatedLaunch {
@@ -49,7 +49,7 @@ impl DelegatedLaunch {
             tls: self.tls,
             host_gateway_ip: self.host_gateway_ip,
             resource_claims: self.resource_claims,
-            outer_fence: self.outer_fence,
+            provisioning_evidence: self.provisioning_evidence,
         };
         crate::runtime::validate_runtime_coordinates(&descriptor)?;
         Ok(descriptor)

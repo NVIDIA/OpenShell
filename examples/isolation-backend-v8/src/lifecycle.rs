@@ -9,9 +9,7 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use openshell_core::jwt::{SandboxId, SessionJwtVerifier, SessionTokenProfile, SystemJwtClock};
-use openshell_isolation_interface::contract::{
-    BoundaryConfirmation, BoundaryProperties, EnforcedProperty,
-};
+use openshell_isolation_interface::contract::BoundaryConfirmation;
 use openshell_sandbox_backend::{boundary_protocol as wire, sandbox_auth::*};
 use sha2::{Digest, Sha256};
 use std::{
@@ -65,21 +63,13 @@ impl Runtime {
             launch.boundary.workload_identity == crate::launch::host_identity(digest.clone())?,
             "backend identity differs from the admitted host identity"
         );
-        use openshell_isolation_interface::contract::{
-            OuterFenceGuarantee as G, OuterFenceGuarantees,
-        };
-        let fence = OuterFenceGuarantees::from_enforcement_evidence(
+        use openshell_isolation_interface::contract::ProvisioningEvidence;
+        let fence = ProvisioningEvidence::from_enforcement_evidence(
             launch.boundary.generation.clone(),
-            [
-                G::DefaultDenyEgress,
-                G::NoUnmanagedEgressPath,
-                G::RevocationVerified,
-                G::ControllerLossFailsClosed,
-            ],
             &crate::launch::capability_evidence(&digest),
         )?;
         ensure!(
-            fence == launch.boundary.outer_fence,
+            fence == launch.boundary.provisioning_evidence,
             "native V8 capability evidence differs from driver fence"
         );
         let verifier = SessionJwtVerifier::new(
@@ -333,22 +323,17 @@ impl Runtime {
                 self.registry
                     .confirm(principal)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
-                let property = || EnforcedProperty::new(true, "v8-isolate-capabilities");
                 R::Confirmed {
                     confirmation: Box::new(BoundaryConfirmation {
                         generation: self.launch.boundary.generation.clone(),
                         session_id: self.launch.boundary.session_id,
                         identity: self.launch.boundary.workload_identity.clone(),
                         resource_claims: self.launch.boundary.resource_claims.clone(),
-                        outer_fence: self.launch.boundary.outer_fence.clone(),
-                        authenticated_supervisor: true,
-                        runtime_exit_terminates_workload: true,
-                        properties: BoundaryProperties {
-                            filesystem_confinement: property(),
-                            egress_interception: property(),
-                            request_attribution: property(),
-                            privilege_floor: property(),
-                        },
+                        provisioning_evidence_digest: self
+                            .launch
+                            .boundary
+                            .provisioning_evidence
+                            .evidence_digest,
                         backend_audit: serde_json::json!({"script_sha256": self.launch.boundary.workload_identity.resource_digest, "network": "supervisor-http-host-call", "filesystem": "no-host-access"}),
                     }),
                 }

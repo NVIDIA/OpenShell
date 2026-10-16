@@ -161,8 +161,9 @@ impl OpenShellRuntimeBackend {
 }
 
 /// Shared Sandbox Protocol adapter for a trusted, endpoint-registered backend.
+///
 /// The remote backend validates its native evidence; this adapter validates the
-/// common guarantees and immutable launch binding.
+/// admitted workload identity and immutable launch binding.
 pub struct DelegatedRuntimeBackend(OpenShellRuntimeBackend);
 
 impl DelegatedRuntimeBackend {
@@ -252,7 +253,7 @@ impl OpenShellRuntimeBackend {
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
-        let outer_fence = runtime_descriptor.outer_fence.clone();
+        let provisioning_evidence = runtime_descriptor.provisioning_evidence.clone();
         let mut client = BoundaryClient::with_backend(
             runtime_descriptor,
             self.sandbox_bearer.clone(),
@@ -293,7 +294,7 @@ impl OpenShellRuntimeBackend {
             generation,
             session_id,
             resource_claims,
-            outer_fence,
+            provisioning_evidence,
         }))
     }
 }
@@ -345,7 +346,7 @@ pub fn validate_runtime_coordinates(
     }
     validate_resource_claims(&runtime_descriptor.resource_claims)?;
     runtime_descriptor
-        .outer_fence
+        .provisioning_evidence
         .validate(&runtime_descriptor.generation)?;
     runtime_descriptor
         .transport
@@ -405,7 +406,7 @@ pub struct BoundBoundary {
     generation: String,
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
-    outer_fence: openshell_isolation_interface::contract::OuterFenceGuarantees,
+    provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence,
 }
 
 impl BoundBoundary {
@@ -425,21 +426,16 @@ impl BoundBoundary {
         if confirmation.generation != self.generation
             || confirmation.session_id != self.session_id
             || confirmation.resource_claims != self.resource_claims
-            || confirmation.outer_fence != self.outer_fence
+            || confirmation.provisioning_evidence_digest
+                != self.provisioning_evidence.evidence_digest
         {
             return Err(BackendError::Confirm(
-                "sandbox confirmation generation, session, resource claims, or outer fence do not match runtime descriptor"
+                "sandbox confirmation generation, session, resource claims, or provisioning evidence do not match runtime descriptor"
                     .to_string(),
             ));
         }
         if let Some(validator) = &self.audit_validator {
-            let properties = validator.validate(&confirmation.backend_audit)?;
-            if confirmation.properties != properties {
-                return Err(BackendError::Confirm(
-                    "sandbox confirmation properties do not match validated audit evidence"
-                        .to_string(),
-                ));
-            }
+            validator.validate(&confirmation.backend_audit)?;
         }
         let client = self.client.clone();
         let confirmed = ConfirmedBoundary::try_new(
@@ -2655,17 +2651,10 @@ mod tests {
         }
     }
 
-    fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
-        use openshell_isolation_interface::contract::OuterFenceGuarantee;
-
-        openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+    fn test_provisioning_evidence() -> openshell_isolation_interface::contract::ProvisioningEvidence
+    {
+        openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
             "test-generation",
-            [
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::NoUnmanagedEgressPath,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ],
             b"test-vm-fence",
         )
         .unwrap()
@@ -3260,7 +3249,7 @@ mod tests {
             tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         }
     }
 
@@ -3395,11 +3384,8 @@ mod tests {
         BoundaryConfirmation {
             generation: "test-generation".to_string(),
             identity: sandbox().identity,
-            properties: audit.properties(),
-            authenticated_supervisor: true,
             session_id: test_session_id(),
-            outer_fence: test_outer_fence(),
-            runtime_exit_terminates_workload: true,
+            provisioning_evidence_digest: test_provisioning_evidence().evidence_digest,
             resource_claims: std::collections::BTreeMap::new(),
             backend_audit: serde_json::to_value(audit).expect("serialize audit evidence"),
         }
@@ -3424,7 +3410,7 @@ mod tests {
         });
 
         let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
-        let outer_fence = descriptor.outer_fence.clone();
+        let provisioning_evidence = descriptor.provisioning_evidence.clone();
         let context = sandbox();
         let client = Arc::new(BoundaryClient::new(
             descriptor,
@@ -3452,7 +3438,7 @@ mod tests {
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence,
+            provisioning_evidence,
         };
 
         assert!(matches!(
@@ -3478,32 +3464,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_confirm_rejects_property_projection_mismatch_before_monitoring() {
-        let mut confirmation = test_confirmation();
-        confirmation.properties.egress_interception.mechanism = "untrusted projection".to_string();
-
-        assert_remote_confirmation_rejected(confirmation).await;
-    }
-
-    #[tokio::test]
-    async fn remote_confirm_rejects_outer_fence_generation_mismatch_before_monitoring() {
-        let mut confirmation = test_confirmation();
-        confirmation.outer_fence.generation = "other-generation".to_string();
-
-        assert_remote_confirmation_rejected(confirmation).await;
-    }
-
-    #[tokio::test]
-    async fn remote_confirm_rejects_outer_fence_digest_mismatch_before_monitoring() {
+    async fn remote_confirm_rejects_provisioning_evidence_mismatch_before_monitoring() {
         let mut confirmation = test_confirmation();
         let different_fence =
-            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+            openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
                 "test-generation",
-                confirmation.outer_fence.established.iter().copied(),
                 b"different evidence",
             )
             .expect("construct different test evidence");
-        confirmation.outer_fence.evidence_digest = different_fence.evidence_digest;
+        confirmation.provisioning_evidence_digest = different_fence.evidence_digest;
 
         assert_remote_confirmation_rejected(confirmation).await;
     }
@@ -3522,7 +3491,7 @@ mod tests {
             tls: certificate.client_tls.clone(),
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
@@ -3542,7 +3511,7 @@ mod tests {
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -3564,7 +3533,7 @@ mod tests {
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -3586,7 +3555,7 @@ mod tests {
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox())
             .expect("TCP runtime descriptor should be valid");
@@ -3895,7 +3864,7 @@ mod tests {
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
             },
             test_bearer(&"a".repeat(32)),
         ));
@@ -4089,7 +4058,7 @@ mod tests {
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
             },
             test_bearer(&"a".repeat(32)),
         );

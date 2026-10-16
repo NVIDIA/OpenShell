@@ -25,8 +25,7 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
-    OuterFenceGuarantees, ResolveError, ShellSpec,
+    BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
 use serde::{Deserialize, Serialize};
@@ -159,42 +158,6 @@ impl NativeLinuxSandboxAuditEvidence {
             Err(BackendError::Confirm(
                 "native Linux sandbox audit evidence is incomplete".to_string(),
             ))
-        }
-    }
-
-    /// Project backend measurements into the common property contract.
-    #[must_use]
-    pub fn properties(&self) -> BoundaryProperties {
-        BoundaryProperties {
-            filesystem_confinement: EnforcedProperty::new(
-                self.landlock_abi >= 3 && self.landlock_allow_deny,
-                format!("landlock-v{}", self.landlock_abi),
-            ),
-            egress_interception: EnforcedProperty::new(
-                self.seccomp.new_listener
-                    && self.seccomp.notification_round_trip
-                    && self.seccomp.addfd_send
-                    && self.udp_dns_round_trip
-                    && self.tcp_dns_round_trip
-                    && self.tcp_allow_round_trip
-                    && self.tcp_deny_round_trip
-                    && self.socket_loopback_confinement,
-                "seccomp-notify",
-            ),
-            request_attribution: EnforcedProperty::new(
-                self.seccomp.id_validation
-                    && self.seccomp.proc_fd_identity
-                    && self.seccomp.task_memory_read,
-                "seccomp-notify-procfs",
-            ),
-            privilege_floor: EnforcedProperty::new(
-                self.capabilities.is_empty()
-                    && self.no_new_privileges
-                    && !self.sandbox_dumpable
-                    && self.child_dumpable
-                    && self.core_limit_zero,
-                "linux-capability-free",
-            ),
         }
     }
 }
@@ -426,7 +389,7 @@ pub struct SandboxRuntimeDescriptor {
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Backend-neutral projection of the validated outer network fence.
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -440,7 +403,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
-            .field("outer_fence", &self.outer_fence)
+            .field("provisioning_evidence", &self.provisioning_evidence)
             .finish()
     }
 }
@@ -494,7 +457,7 @@ pub struct BoundaryConfig {
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Backend-neutral projection of the validated outer network fence.
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
@@ -522,7 +485,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
-            .field("outer_fence", &self.outer_fence)
+            .field("provisioning_evidence", &self.provisioning_evidence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -1494,23 +1457,10 @@ mod tests {
     }
 
     #[test]
-    fn native_linux_audit_evidence_projects_backend_neutral_properties() {
-        let audit = complete_audit_evidence();
-        audit.validate().unwrap();
-        let properties = audit.properties();
-        assert!(properties.filesystem_confinement.enforced);
-        assert_eq!(properties.filesystem_confinement.mechanism, "landlock-v6");
-        assert!(properties.egress_interception.enforced);
-        assert!(properties.request_attribution.enforced);
-        assert!(properties.privilege_floor.enforced);
-    }
-
-    #[test]
     fn native_linux_audit_evidence_rejects_mechanism_failure() {
         let mut audit = complete_audit_evidence();
         audit.seccomp.addfd_send = false;
         assert!(audit.validate().is_err());
-        assert!(!audit.properties().egress_interception.enforced);
     }
 
     #[test]
@@ -1518,7 +1468,6 @@ mod tests {
         let mut audit = complete_audit_evidence();
         audit.socket_loopback_confinement = false;
         assert!(audit.validate().is_err());
-        assert!(!audit.properties().egress_interception.enforced);
     }
 
     #[test]

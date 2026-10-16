@@ -9,10 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionRotation};
 use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
 use openshell_core::sandbox_generation::SandboxGenerationId;
-use openshell_isolation_interface::contract::{
-    BoundaryConfirmation, BoundaryProperties, EnforcedProperty, OuterFenceGuarantee,
-    OuterFenceGuarantees,
-};
+use openshell_isolation_interface::contract::{BoundaryConfirmation, ProvisioningEvidence};
 #[cfg(unix)]
 use openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs;
 
@@ -61,14 +58,8 @@ fn registered_backend_selects_operator_endpoint_and_preserves_opaque_payload() {
         },
         host_gateway_ip: None,
         resource_claims: BTreeMap::new(),
-        outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
+        provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
             "generation-1",
-            [
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::NoUnmanagedEgressPath,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ],
             b"driver-fence",
         )
         .unwrap(),
@@ -80,7 +71,7 @@ fn registered_backend_selects_operator_endpoint_and_preserves_opaque_payload() {
         match field {
             "name" => invalid.backend_name = "other".into(),
             "tls" => invalid.tls.trust_anchor_pem.clear(),
-            "fence" => invalid.outer_fence.generation = "other".into(),
+            "fence" => invalid.provisioning_evidence.generation = "other".into(),
             "identity" => invalid.workload_identity.uid = 0,
             _ => unreachable!(),
         }
@@ -311,32 +302,22 @@ impl PreparedBackend for TestLaunch {
                     }
                     Request::Confirm => {
                         observed.record("confirm");
-                        let property = EnforcedProperty::new(true, "rpc-test");
+                        if observed.deny_confirmation.load(Ordering::SeqCst) {
+                            return Err(BackendError::Unsupported(
+                                "policy cannot be enforced".into(),
+                            ));
+                        }
                         Response::Confirmed {
                             confirmation: Box::new(BoundaryConfirmation {
                                 generation: generation.clone(),
                                 identity: identity(),
-                                properties: BoundaryProperties {
-                                    filesystem_confinement: property.clone(),
-                                    egress_interception: property.clone(),
-                                    request_attribution: property.clone(),
-                                    privilege_floor: property,
-                                },
-                                authenticated_supervisor: !observed
-                                    .deny_confirmation
-                                    .load(Ordering::SeqCst),
                                 session_id,
-                                outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
-                                    &generation,
-                                    [
-                                        OuterFenceGuarantee::DefaultDenyEgress,
-                                        OuterFenceGuarantee::NoUnmanagedEgressPath,
-                                        OuterFenceGuarantee::RevocationVerified,
-                                        OuterFenceGuarantee::ControllerLossFailsClosed,
-                                    ],
-                                    b"in-process-enforcement-evidence",
-                                )?,
-                                runtime_exit_terminates_workload: true,
+                                provisioning_evidence_digest:
+                                    ProvisioningEvidence::from_enforcement_evidence(
+                                        &generation,
+                                        b"in-process-enforcement-evidence",
+                                    )?
+                                    .evidence_digest,
                                 resource_claims: BTreeMap::new(),
                                 backend_audit: serde_json::json!({"rpc_test":true}),
                             }),
@@ -586,9 +567,8 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
         },
         host_gateway_ip: None,
         resource_claims: BTreeMap::new(),
-        outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
+        provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
             "generation-1",
-            [],
             b"test-evidence",
         )
         .unwrap(),

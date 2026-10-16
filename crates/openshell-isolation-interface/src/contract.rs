@@ -7,7 +7,7 @@
 //! `proto/sandbox_protocol.proto`. This module contains data and validation,
 //! not a second trait-based backend interface.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -219,54 +219,28 @@ use crate::AgentSpec;
 // Lifecycle states
 // ============================================================================
 
-/// Backend-neutral guarantees established by the component that owns the outer
-/// network fence.
+/// Commitment to provisioning facts validated by the trusted compute driver.
 ///
-/// The enforcement owner may be a compute driver or a delegated isolation
-/// backend. It owns its native evidence schema and the code that validates it.
-/// After validation, it projects that evidence into these guarantees and
-/// supplies a digest that binds the original evidence to this generation. The
-/// common runtime only validates and compares this projection; it never
-/// interprets backend- or runtime-specific fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OuterFenceGuarantee {
-    /// No workload packet can leave without an explicit mediated decision.
-    DefaultDenyEgress,
-    /// The enforcement owner found no network path outside the mediated boundary.
-    NoUnmanagedEgressPath,
-    /// Previously granted access can be revoked by the enforcement owner.
-    RevocationVerified,
-    /// Loss of the fence's controller does not open network access.
-    ControllerLossFailsClosed,
-}
-
+/// The driver validates its native placement and enforcement requirements before
+/// constructing this binding. The digest includes the runtime generation, so
+/// confirmation cannot reuse evidence from another launch. It is a binding,
+/// not independent proof that the backend enforces policy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OuterFenceGuarantees {
-    /// Sandbox generation for which the evidence was collected.
+pub struct ProvisioningEvidence {
     pub generation: String,
-    /// Complete set of normalized guarantees established by the enforcement owner.
-    pub established: BTreeSet<OuterFenceGuarantee>,
-    /// Commitment to the enforcement owner's native evidence.
     pub evidence_digest: Sha256Digest,
 }
 
-impl OuterFenceGuarantees {
-    /// Bind guarantees explicitly established by validated enforcement evidence.
-    ///
-    /// This constructor deliberately does not infer guarantees from the mere
-    /// presence of evidence. The enforcement owner must inspect its native
-    /// state and project each established guarantee before calling this
-    /// function.
+impl ProvisioningEvidence {
+    /// Bind already-validated native provisioning evidence to one generation.
     pub fn from_enforcement_evidence(
         generation: impl Into<String>,
-        established: impl IntoIterator<Item = OuterFenceGuarantee>,
         native_evidence: &[u8],
     ) -> Result<Self, BackendError> {
         let generation = generation.into();
         if generation.is_empty() || native_evidence.is_empty() {
             return Err(BackendError::Descriptor(
-                "outer fence generation and native evidence are required".to_string(),
+                "provisioning generation and native evidence are required".to_string(),
             ));
         }
         let mut binding = Vec::with_capacity(8 + generation.len() + native_evidence.len());
@@ -275,113 +249,43 @@ impl OuterFenceGuarantees {
         binding.extend_from_slice(native_evidence);
         Ok(Self {
             generation,
-            established: established.into_iter().collect(),
             evidence_digest: Sha256Digest::compute(&binding),
         })
     }
 
-    /// Validate the common guarantees against the admitted generation.
+    /// Reject evidence bound to a different launch.
     pub fn validate(&self, expected_generation: &str) -> Result<(), BackendError> {
-        let required = BTreeSet::from([
-            OuterFenceGuarantee::DefaultDenyEgress,
-            OuterFenceGuarantee::NoUnmanagedEgressPath,
-            OuterFenceGuarantee::RevocationVerified,
-            OuterFenceGuarantee::ControllerLossFailsClosed,
-        ]);
-        let complete = !self.generation.is_empty()
-            && self.generation == expected_generation
-            && self.established == required;
-        if complete {
+        if !self.generation.is_empty() && self.generation == expected_generation {
             Ok(())
         } else {
             Err(BackendError::Confirm(
-                "outer fence guarantees are incomplete or bound to another generation".to_string(),
+                "provisioning evidence belongs to another generation".to_string(),
             ))
         }
     }
 }
 
-/// A backend-neutral security property established before agent launch.
+/// Successful policy-enforcement confirmation for one admitted launch.
 ///
-/// `mechanism` is diagnostic and audit metadata. It never authorizes launch;
-/// the registered backend is responsible for validating its mechanism-specific
-/// evidence before setting `enforced`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnforcedProperty {
-    pub enforced: bool,
-    pub mechanism: String,
-}
-
-impl EnforcedProperty {
-    #[must_use]
-    pub fn new(enforced: bool, mechanism: impl Into<String>) -> Self {
-        Self {
-            enforced,
-            mechanism: mechanism.into(),
-        }
-    }
-
-    fn validate(&self, name: &str) -> Result<(), BackendError> {
-        if self.enforced && !self.mechanism.trim().is_empty() {
-            Ok(())
-        } else {
-            Err(BackendError::Confirm(format!(
-                "{name} is not enforced or has no declared mechanism"
-            )))
-        }
-    }
-}
-
-/// Security properties every isolation backend establishes before launch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BoundaryProperties {
-    pub filesystem_confinement: EnforcedProperty,
-    pub egress_interception: EnforcedProperty,
-    pub request_attribution: EnforcedProperty,
-    pub privilege_floor: EnforcedProperty,
-}
-
-impl BoundaryProperties {
-    fn validate(&self) -> Result<(), BackendError> {
-        self.filesystem_confinement
-            .validate("filesystem confinement")?;
-        self.egress_interception.validate("egress interception")?;
-        self.request_attribution.validate("request attribution")?;
-        self.privilege_floor.validate("privilege floor")
-    }
-}
-
-/// Per-boundary confirmation produced before agent launch.
-///
-/// Common validation binds the confirmation to the admitted workload and
-/// checks backend-neutral properties. `backend_audit` remains opaque to this
-/// crate; the registered backend owns its schema and validates it before
-/// constructing [`ConfirmedBoundary`].
+/// The backend rejects unsupported policy before confirming. Mechanisms are
+/// backend-specific; the common client checks identity and launch binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryConfirmation {
     pub generation: String,
     pub identity: ResolvedWorkloadIdentity,
-    pub properties: BoundaryProperties,
-    pub authenticated_supervisor: bool,
     pub session_id: SandboxSessionId,
-    pub outer_fence: OuterFenceGuarantees,
-    /// The backend-owned containment primitive terminates the workload when its
-    /// Sandbox Runtime exits.
-    pub runtime_exit_terminates_workload: bool,
     pub resource_claims: BTreeMap<String, String>,
+    pub provisioning_evidence_digest: Sha256Digest,
+    /// Optional backend-owned audit data; native clients may validate its schema.
+    #[serde(default)]
     pub backend_audit: serde_json::Value,
 }
 
 impl BoundaryConfirmation {
-    /// Validate common security properties and immutable launch binding.
+    /// Validate the admitted workload identity. The RPC client checks the
+    /// session, generation, resource claims, and provisioning evidence binding.
     pub fn validate(&self, expected: &ResolvedWorkloadIdentity) -> Result<(), BackendError> {
-        self.outer_fence.validate(&self.generation)?;
-        self.properties.validate()?;
-        let complete = &self.identity == expected
-            && self.authenticated_supervisor
-            && self.runtime_exit_terminates_workload
-            && !self.generation.is_empty();
-        if complete {
+        if &self.identity == expected && !self.generation.is_empty() {
             Ok(())
         } else {
             Err(BackendError::Confirm(

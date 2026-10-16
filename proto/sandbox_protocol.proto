@@ -106,6 +106,12 @@ message Attach {
   SandboxPolicy policy = 2;
   map<string, string> resource_claims = 3;
 }
+// Success asserts that the backend can enforce the attached policy and trusted
+// workload identity. Unsupported requirements fail before StartAgent. No
+// untrusted instruction may execute until StartAgent installs all launch-time
+// controls. Supervisor or transport loss must never relax enforcement or open
+// an unmediated egress path; supervisor-dependent operations fail closed.
+// A backend may terminate, pause, or keep a disconnected workload contained.
 message Confirm {}
 message ProbeProviderFiles {}
 message StartAgent {
@@ -293,41 +299,20 @@ message ResolvedWorkloadIdentity {
   string source = 4;
   string resource_digest = 5;
 }
-message EnforcedProperty {
-  bool enforced = 1;
-  string mechanism = 2;
-}
-message BoundaryProperties {
-  // Every property is required and must be enforced before confirmation.
-  EnforcedProperty filesystem_confinement = 1;
-  EnforcedProperty egress_interception = 2;
-  EnforcedProperty request_attribution = 3;
-  EnforcedProperty privilege_floor = 4;
-}
-message OuterFenceGuarantees {
-  string generation = 1;
-  repeated OuterFenceGuarantee established = 2;
-  string evidence_digest = 3;
-}
-enum OuterFenceGuarantee {
-  OUTER_FENCE_GUARANTEE_UNSPECIFIED = 0;
-  OUTER_FENCE_GUARANTEE_DEFAULT_DENY_EGRESS = 1;
-  OUTER_FENCE_GUARANTEE_NO_UNMANAGED_EGRESS_PATH = 2;
-  OUTER_FENCE_GUARANTEE_REVOCATION_VERIFIED = 3;
-  OUTER_FENCE_GUARANTEE_CONTROLLER_LOSS_FAILS_CLOSED = 4;
-}
+// Successful confirmation binds policy enforcement to the admitted launch.
+// Enforcement mechanisms are backend-specific, not a portable flag checklist.
 message BoundaryConfirmation {
   string generation = 1;
   ResolvedWorkloadIdentity identity = 2;
-  BoundaryProperties properties = 3;
-  bool authenticated_supervisor = 4;
   string session_id = 5;
-  OuterFenceGuarantees outer_fence = 6;
-  bool runtime_exit_terminates_workload = 7;
   map<string, string> resource_claims = 8;
-  // Opaque backend-owned audit document. The selected backend validates its
-  // schema; common properties above are typed and checked by the supervisor.
+  // Optional opaque backend-owned audit document. Native clients may validate
+  // its schema; external backends need not provide Linux mechanism evidence.
   bytes backend_audit = 9;
+  // Required SHA-256 commitment to the driver's validated provisioning evidence
+  // and this generation. Must match trusted launch metadata. A matching digest
+  // binds provisioning; it is not independent proof of policy enforcement.
+  string provisioning_evidence_digest = 10;
 }
 message SessionSnapshot {
   string generation = 1;

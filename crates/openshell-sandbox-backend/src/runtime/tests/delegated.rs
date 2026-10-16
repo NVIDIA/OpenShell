@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_isolation_interface::contract::{BackendDescriptor, EnforcedProperty};
+use openshell_isolation_interface::contract::BackendDescriptor;
 
 const EXTERNAL_NAME: &str = "external-test";
 const OPAQUE_PAYLOAD: &[u8] = b"external-driver-v1\0\xffresource";
@@ -80,14 +80,7 @@ async fn external_backend(
 
 fn external_confirmation() -> BoundaryConfirmation {
     let mut confirmation = test_confirmation();
-    confirmation.backend_audit = serde_json::json!({"external_boundary": "verified-actor"});
-    let property = EnforcedProperty::new(true, "external-actor-isolation");
-    confirmation.properties = openshell_isolation_interface::contract::BoundaryProperties {
-        filesystem_confinement: property.clone(),
-        egress_interception: property.clone(),
-        request_attribution: property.clone(),
-        privilege_floor: property,
-    };
+    confirmation.backend_audit = serde_json::Value::Null;
     confirmation
 }
 
@@ -103,10 +96,7 @@ async fn attach_external(backend: DelegatedRuntimeBackend) -> Box<BoundBoundary>
 async fn external_protocol_backend_runs_without_native_linux_audit() {
     let (backend, server) = external_backend(external_confirmation()).await;
     let confirmed = attach_external(backend).await.confirm().await.unwrap();
-    assert_eq!(
-        confirmed.confirmation().backend_audit["external_boundary"],
-        "verified-actor"
-    );
+    assert!(confirmed.confirmation().backend_audit.is_null());
     let running = confirmed.into_boundary().start_agent().await.unwrap();
     assert_eq!(
         running.agent().wait().await.unwrap(),
@@ -118,41 +108,27 @@ async fn external_protocol_backend_runs_without_native_linux_audit() {
 }
 
 #[tokio::test]
-async fn external_confirmation_still_requires_common_guarantees_and_launch_binding() {
+async fn external_confirmation_requires_admitted_launch_binding() {
     for field in [
         "generation",
         "session",
         "identity",
-        "fence",
-        "fence_digest",
+        "provisioning_evidence_digest",
         "claims",
-        "properties",
-        "mechanism",
-        "containment",
-        "authentication",
     ] {
         let mut confirmation = external_confirmation();
         match field {
             "generation" => confirmation.generation = "other-generation".into(),
             "session" => confirmation.session_id = openshell_core::SandboxSessionId::new(),
             "identity" => confirmation.identity.uid += 1,
-            "fence" => confirmation.outer_fence.generation = "other-generation".into(),
-            "fence_digest" => {
-                confirmation.outer_fence.evidence_digest = "f".repeat(64).parse().unwrap();
+            "provisioning_evidence_digest" => {
+                confirmation.provisioning_evidence_digest = "f".repeat(64).parse().unwrap();
             }
             "claims" => {
                 confirmation
                     .resource_claims
                     .insert("unexpected".into(), "claim".into());
             }
-            "properties" => confirmation.properties.egress_interception.enforced = false,
-            "mechanism" => confirmation
-                .properties
-                .egress_interception
-                .mechanism
-                .clear(),
-            "containment" => confirmation.runtime_exit_terminates_workload = false,
-            "authentication" => confirmation.authenticated_supervisor = false,
             _ => unreachable!(),
         }
         let (backend, server) = external_backend(confirmation).await;

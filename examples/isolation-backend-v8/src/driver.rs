@@ -13,7 +13,7 @@ use openshell_core::{
     jwt::SandboxLaunchAuthentication,
     proto::compute::v1::*,
 };
-use openshell_isolation_interface::contract::{OuterFenceGuarantee, OuterFenceGuarantees};
+use openshell_isolation_interface::contract::ProvisioningEvidence;
 use openshell_sandbox_backend::{
     boundary_protocol::{SandboxTlsClientConfig, generate_sandbox_tls_material},
     delegated::DelegatedLaunch,
@@ -125,7 +125,11 @@ impl Driver {
             }),
             fence_evidence: Some(DriverFenceEvidence {
                 generation: entry.boundary.generation.clone(),
-                evidence_digest: entry.boundary.outer_fence.evidence_digest.to_string(),
+                evidence_digest: entry
+                    .boundary
+                    .provisioning_evidence
+                    .evidence_digest
+                    .to_string(),
                 resource_claims: Default::default(),
             }),
             ..Default::default()
@@ -167,14 +171,8 @@ impl Driver {
             serde_json::to_vec(&serde_json::json!({"script_sha256":digest})).map_err(internal)?;
         let identity = crate::launch::host_identity(digest).map_err(internal)?;
         let evidence = crate::launch::capability_evidence(&identity.resource_digest);
-        let fence = OuterFenceGuarantees::from_enforcement_evidence(
+        let fence = ProvisioningEvidence::from_enforcement_evidence(
             auth.supervisor.runtime_generation.to_string(),
-            [
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::NoUnmanagedEgressPath,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ],
             &evidence,
         )
         .map_err(internal)?;
@@ -191,7 +189,7 @@ impl Driver {
             },
             host_gateway_ip: None,
             resource_claims: BTreeMap::new(),
-            outer_fence: fence,
+            provisioning_evidence: fence,
         };
         let launch = Launch {
             boundary: boundary.clone(),

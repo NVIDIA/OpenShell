@@ -3,14 +3,14 @@
 
 //! Backend-selected interpretation of opaque boundary confirmation evidence.
 
-use openshell_isolation_interface::contract::{BackendError, BoundaryProperties};
+use openshell_isolation_interface::contract::BackendError;
 
-/// Validate measured evidence and derive the properties it actually supports.
+/// Validate native measurements required by the selected backend.
 /// Implementations must reject incomplete evidence and unsupported formats.
 pub trait BoundaryAuditValidator: std::fmt::Debug + Send + Sync {
     /// # Errors
-    /// Returns an error when evidence cannot establish the boundary guarantees.
-    fn validate(&self, evidence: &serde_json::Value) -> Result<BoundaryProperties, BackendError>;
+    /// Returns an error when native enforcement measurements are incomplete.
+    fn validate(&self, evidence: &serde_json::Value) -> Result<(), BackendError>;
 }
 
 /// Default evidence interpreter for the Linux `OpenShell` sandbox.
@@ -18,13 +18,12 @@ pub trait BoundaryAuditValidator: std::fmt::Debug + Send + Sync {
 pub struct LinuxBoundaryAuditValidator;
 
 impl BoundaryAuditValidator for LinuxBoundaryAuditValidator {
-    fn validate(&self, evidence: &serde_json::Value) -> Result<BoundaryProperties, BackendError> {
+    fn validate(&self, evidence: &serde_json::Value) -> Result<(), BackendError> {
         let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
             serde_json::from_value(evidence.clone()).map_err(|error| {
                 BackendError::Confirm(format!("decode Linux sandbox audit evidence: {error}"))
             })?;
-        audit.validate()?;
-        Ok(audit.properties())
+        audit.validate()
     }
 }
 
@@ -52,10 +51,7 @@ mod tests {
                 "tcp_allow_round_trip": true, "tcp_deny_round_trip": true,
                 "socket_loopback_confinement": true
         });
-        let properties = LinuxBoundaryAuditValidator.validate(&evidence).unwrap();
-        let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
-            serde_json::from_value(evidence.clone()).unwrap();
-        assert_eq!(properties, audit.properties());
+        LinuxBoundaryAuditValidator.validate(&evidence).unwrap();
         let mut incomplete = evidence;
         incomplete["no_new_privileges"] = false.into();
         assert!(LinuxBoundaryAuditValidator.validate(&incomplete).is_err());

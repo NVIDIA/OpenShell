@@ -16,9 +16,9 @@ use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionBearerTokenSlot};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::{
     BackendError, BackendErrorKind, BoundaryDuplexStream, BoundaryExitStatus, BoundaryInput,
-    BoundaryOutput, BoundarySignal, ExecSpec, LoopbackTarget, OuterFenceGuarantee,
-    OuterFenceGuarantees, PendingDnsQuery, PendingTcpOpen, ProviderEnvironmentInstallation,
-    ResolvedWorkloadIdentity, SandboxContext, TcpOpenDecision,
+    BoundaryOutput, BoundarySignal, ExecSpec, LoopbackTarget, PendingDnsQuery, PendingTcpOpen,
+    ProviderEnvironmentInstallation, ProvisioningEvidence, ResolvedWorkloadIdentity,
+    SandboxContext, TcpOpenDecision,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -712,7 +712,8 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
         },
         host_gateway_ip: None,
         resource_claims: std::collections::BTreeMap::default(),
-        outer_fence: OuterFenceGuarantees::from_enforcement_evidence("test", [], b"test").unwrap(),
+        provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence("test", b"test")
+            .unwrap(),
     };
     let bearer = SessionBearerTokenSlot::new(
         SecretJwt::parse("a".repeat(32)).unwrap(),
@@ -854,14 +855,8 @@ pub fn backend(
     descriptor.session_id = sandbox.session_id;
     descriptor.generation.clone_from(&generation);
     descriptor.workload_identity = sandbox.identity;
-    descriptor.outer_fence = OuterFenceGuarantees::from_enforcement_evidence(
+    descriptor.provisioning_evidence = ProvisioningEvidence::from_enforcement_evidence(
         generation,
-        [
-            OuterFenceGuarantee::DefaultDenyEgress,
-            OuterFenceGuarantee::NoUnmanagedEgressPath,
-            OuterFenceGuarantee::RevocationVerified,
-            OuterFenceGuarantee::ControllerLossFailsClosed,
-        ],
         b"in-process-enforcement-evidence",
     )
     .unwrap();

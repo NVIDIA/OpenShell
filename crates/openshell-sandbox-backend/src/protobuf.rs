@@ -62,7 +62,6 @@ enumeration!(w::LandlockCompatibilityWire, p::LandlockCompatibility, {BestEffort
 enumeration!(w::RuntimeHelperWire, p::RuntimeHelper, { Sftp });
 enumeration!(w::ProcessKindWire, p::ProcessKind, {Main, Exec});
 enumeration!(w::BoundaryErrorKind, p::BoundaryErrorKind, {Invalid, Denied, Unavailable, Terminated, Process, Unsupported});
-enumeration!(c::OuterFenceGuarantee, p::OuterFenceGuarantee, {DefaultDenyEgress, NoUnmanagedEgressPath, RevocationVerified, ControllerLossFailsClosed});
 enumeration!(c::TcpOpenDenial, p::TcpOpenDenial, {PolicyDenied, IdentityUnavailable, InvalidDestination, ResourceExhausted, MediationUnavailable});
 enumeration!(c::DnsTransport, p::DnsTransport, {Udp, Tcp});
 fn enum_value<E: TryFrom<i32>>(value: i32) -> Result<E, FrameError> {
@@ -320,12 +319,6 @@ impl WireMessage for c::TcpOpenDecision {
 impl WireMessage for c::BoundaryConfirmation {
     type Proto = p::BoundaryConfirmation;
     fn to_proto(&self) -> Result<Self::Proto, FrameError> {
-        let prop = |v: &c::EnforcedProperty| {
-            Some(p::EnforcedProperty {
-                enforced: v.enforced,
-                mechanism: v.mechanism.clone(),
-            })
-        };
         Ok(p::BoundaryConfirmation {
             generation: self.generation.clone(),
             identity: Some(p::ResolvedWorkloadIdentity {
@@ -335,40 +328,18 @@ impl WireMessage for c::BoundaryConfirmation {
                 source: self.identity.source.clone(),
                 resource_digest: self.identity.resource_digest.clone(),
             }),
-            properties: Some(p::BoundaryProperties {
-                filesystem_confinement: prop(&self.properties.filesystem_confinement),
-                egress_interception: prop(&self.properties.egress_interception),
-                request_attribution: prop(&self.properties.request_attribution),
-                privilege_floor: prop(&self.properties.privilege_floor),
-            }),
-            authenticated_supervisor: self.authenticated_supervisor,
             session_id: self.session_id.to_string(),
-            outer_fence: Some(p::OuterFenceGuarantees {
-                generation: self.outer_fence.generation.clone(),
-                established: self
-                    .outer_fence
-                    .established
-                    .iter()
-                    .map(|v| v.to_proto().map(|v| v as i32))
-                    .collect::<Result<_, _>>()?,
-                evidence_digest: self.outer_fence.evidence_digest.to_string(),
-            }),
-            runtime_exit_terminates_workload: self.runtime_exit_terminates_workload,
             resource_claims: self.resource_claims.clone(),
-            backend_audit: serde_json::to_vec(&self.backend_audit).map_err(invalid)?,
+            provisioning_evidence_digest: self.provisioning_evidence_digest.to_string(),
+            backend_audit: if self.backend_audit.is_null() {
+                Vec::new()
+            } else {
+                serde_json::to_vec(&self.backend_audit).map_err(invalid)?
+            },
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
         let identity = required(v.identity)?;
-        let properties = required(v.properties)?;
-        let fence = required(v.outer_fence)?;
-        let prop = |v: Option<p::EnforcedProperty>| -> Result<_, FrameError> {
-            let v = required(v)?;
-            Ok(c::EnforcedProperty {
-                enforced: v.enforced,
-                mechanism: v.mechanism,
-            })
-        };
         Ok(Self {
             generation: v.generation,
             identity: c::ResolvedWorkloadIdentity::new(
@@ -379,26 +350,14 @@ impl WireMessage for c::BoundaryConfirmation {
                 identity.resource_digest,
             )
             .map_err(invalid)?,
-            properties: c::BoundaryProperties {
-                filesystem_confinement: prop(properties.filesystem_confinement)?,
-                egress_interception: prop(properties.egress_interception)?,
-                request_attribution: prop(properties.request_attribution)?,
-                privilege_floor: prop(properties.privilege_floor)?,
-            },
-            authenticated_supervisor: v.authenticated_supervisor,
             session_id: parse(&v.session_id)?,
-            outer_fence: c::OuterFenceGuarantees {
-                generation: fence.generation,
-                established: fence
-                    .established
-                    .into_iter()
-                    .map(|v| c::OuterFenceGuarantee::from_proto(enum_value(v)?))
-                    .collect::<Result<_, _>>()?,
-                evidence_digest: parse(&fence.evidence_digest)?,
-            },
-            runtime_exit_terminates_workload: v.runtime_exit_terminates_workload,
             resource_claims: v.resource_claims,
-            backend_audit: serde_json::from_slice(&v.backend_audit).map_err(invalid)?,
+            provisioning_evidence_digest: parse(&v.provisioning_evidence_digest)?,
+            backend_audit: if v.backend_audit.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&v.backend_audit).map_err(invalid)?
+            },
         })
     }
 }

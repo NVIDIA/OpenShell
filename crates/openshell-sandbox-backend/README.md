@@ -48,7 +48,7 @@ startup instead of using a fallback path.
 operator-registered backend. Trusted endpoint registration and `DelegatedLaunch`
 metadata are separate from the driver's opaque descriptor, which crosses
 `OpenBoundary` unchanged. Common confirmation checks bind identity, session,
-generation, resource claims, and outer-fence evidence. Native evidence is
+generation, resource claims, and the driver's provisioning evidence digest. Native evidence is
 validated by the registered backend; Linux evidence validation remains in the
 built-in adapter.
 
@@ -88,9 +88,11 @@ Sandbox Protocol.
 
 Backend implementations may inject a `BoundaryAuditValidator` to interpret
 their opaque confirmation evidence. The default Linux validator rejects
-incomplete or foreign evidence. Confirmation compares the asserted properties
-with the properties derived by the selected validator; validator injection does
-not bypass generation, session, resource, identity, or outer-fence checks.
+incomplete or foreign evidence. Successful confirmation asserts that the backend
+can enforce the admitted policy; unsupported requirements fail before workload
+start. Validator injection does not bypass generation, session, resource,
+identity, or provisioning evidence checks. External backends may omit audit data;
+they do not need to reproduce Linux mechanism measurements.
 
 Concrete platform validators belong to the implementing backend, not this
 shared transport library.

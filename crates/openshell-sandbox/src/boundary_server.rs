@@ -310,7 +310,7 @@ mod linux {
         }
         validate_resource_claims(&config.resource_claims).map_err(|error| error.to_string())?;
         config
-            .outer_fence
+            .provisioning_evidence
             .validate(&config.generation)
             .map_err(|error| error.to_string())?;
         for (claim, path) in &config.resource_claim_files {
@@ -2590,17 +2590,13 @@ mod linux {
             // backend validates it before constructing a ConfirmedBoundary.
             // Keeping that decision at the verifier also lets lifecycle tests
             // exercise the protocol without claiming host-kernel enforcement.
-            let properties = audit.properties();
             let backend_audit = serde_json::to_value(audit)
                 .map_err(|error| format!("encode OpenShell sandbox audit evidence: {error}"))?;
             Ok(BoundaryConfirmation {
                 generation: self.config.generation.clone(),
                 identity: self.config.workload_identity.clone(),
-                properties,
-                authenticated_supervisor: true,
                 session_id: self.config.session_id,
-                outer_fence: self.config.outer_fence.clone(),
-                runtime_exit_terminates_workload: true,
+                provisioning_evidence_digest: self.config.provisioning_evidence.evidence_digest,
                 resource_claims: self.config.resource_claims.clone(),
                 backend_audit,
             })
@@ -4079,7 +4075,7 @@ mod linux {
                     },
                     host_gateway_ip: None,
                     resource_claims: config.resource_claims.clone(),
-                    outer_fence: config.outer_fence.clone(),
+                    provisioning_evidence: config.provisioning_evidence.clone(),
                 };
             OpenBoundaryRequest {
                 sandbox_id: config.boundary_id.clone(),
@@ -4182,7 +4178,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
             let debug = format!("{config:?}");
@@ -4296,7 +4292,7 @@ mod linux {
                 )]),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
             assert!(allows_runtime_supplementary_groups(&config));
@@ -4367,7 +4363,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -4809,17 +4805,10 @@ mod linux {
             .unwrap()
         }
 
-        fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
-            use openshell_isolation_interface::contract::OuterFenceGuarantee;
-
-            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+        fn test_provisioning_evidence()
+        -> openshell_isolation_interface::contract::ProvisioningEvidence {
+            openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
                 "generation-1",
-                [
-                    OuterFenceGuarantee::DefaultDenyEgress,
-                    OuterFenceGuarantee::NoUnmanagedEgressPath,
-                    OuterFenceGuarantee::RevocationVerified,
-                    OuterFenceGuarantee::ControllerLossFailsClosed,
-                ],
                 b"test-vm-fence",
             )
             .unwrap()
@@ -4968,7 +4957,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -5190,7 +5179,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
             for address in [
@@ -5237,7 +5226,7 @@ mod linux {
                     pod_uid_path,
                 )]),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -5522,7 +5511,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -5829,7 +5818,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
@@ -6164,7 +6153,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
