@@ -2484,6 +2484,10 @@ enum WorkspaceCommands {
         /// Labels to attach to the workspace (KEY=VALUE).
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Fetch a workspace by name.
@@ -2492,6 +2496,10 @@ enum WorkspaceCommands {
         /// Workspace name.
         #[arg(add = ArgValueCompleter::new(completers::complete_workspace_names))]
         name: String,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// List workspaces.
@@ -3830,11 +3838,15 @@ async fn run_async() -> Result<()> {
             apply_auth(&mut tls, &ctx.name)?;
 
             match command {
-                WorkspaceCommands::Create { name, labels } => {
-                    run::workspace_create(endpoint, &name, &labels, &tls).await?;
+                WorkspaceCommands::Create {
+                    name,
+                    labels,
+                    output,
+                } => {
+                    run::workspace_create(endpoint, &name, &labels, output.as_str(), &tls).await?;
                 }
-                WorkspaceCommands::Get { name } => {
-                    run::workspace_get(endpoint, &name, &tls).await?;
+                WorkspaceCommands::Get { name, output } => {
+                    run::workspace_get(endpoint, &name, output.as_str(), &tls).await?;
                 }
                 WorkspaceCommands::List {
                     page_size,
@@ -6637,6 +6649,35 @@ mod tests {
                 assert!(all_workspaces);
             }
             other => panic!("expected SandboxTemplateCommands::List, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_create_and_get_accept_output_format() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "workspace",
+            "create",
+            "--name",
+            "team-ml",
+            "--output",
+            "json",
+        ])
+        .expect("workspace create --output should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Create { output, .. }),
+            }) => assert_eq!(output.as_str(), "json"),
+            other => panic!("expected workspace create, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "workspace", "get", "team-ml", "-o", "yaml"])
+            .expect("workspace get -o should parse");
+        match cli.command {
+            Some(Commands::Workspace {
+                command: Some(WorkspaceCommands::Get { output, .. }),
+            }) => assert_eq!(output.as_str(), "yaml"),
+            other => panic!("expected workspace get, got {other:?}"),
         }
     }
 
