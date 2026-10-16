@@ -641,7 +641,7 @@ impl Drop for Connector {
     }
 }
 #[async_trait]
-impl crate::BoundaryTransportConnector for Connector {
+impl super::BoundaryTransportConnector for Connector {
     async fn connect(
         &self,
         _: &w::SandboxRuntimeDescriptor,

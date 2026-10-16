@@ -44,8 +44,8 @@ startup instead of using a fallback path.
 
 ## Endpoint-registered backends
 
-`DelegatedRuntimeBackend` uses the same client and lifecycle handles for an
-operator-registered backend. Trusted endpoint registration and `DelegatedLaunch`
+`OpenShellRuntimeBackend::registered` constructs the same client and lifecycle
+handles for an operator-registered backend. Trusted endpoint registration and `DelegatedLaunch`
 metadata are separate from the driver's opaque descriptor, which crosses
 `OpenBoundary` unchanged. Common confirmation checks bind identity, session,
 generation, resource claims, and the driver's provisioning evidence digest. Native evidence is
@@ -86,21 +86,15 @@ and sandbox runtime together when deploying this protocol change.
 `OpenShellRuntimeBackend` implements the authenticated host side of the shared
 Sandbox Protocol.
 
-Backend implementations may inject a `BoundaryAuditValidator` to interpret
-their opaque confirmation evidence. The default Linux validator rejects
-incomplete or foreign evidence. Successful confirmation asserts that the backend
-can enforce the admitted policy; unsupported requirements fail before workload
-start. Validator injection does not bypass generation, session, resource,
-identity, or provisioning evidence checks. External backends may omit audit data;
-they do not need to reproduce Linux mechanism measurements.
-
-Concrete platform validators belong to the implementing backend, not this
-shared transport library.
+For the built-in Linux backend, the client validates native audit evidence and
+rejects incomplete or foreign measurements. External backends validate their own
+mechanisms and may omit audit data; they do not need to reproduce Linux
+measurements. Successful confirmation asserts that the backend can enforce the
+admitted policy; unsupported requirements fail before workload start. Both paths
+retain generation, session, resource, identity, and provisioning evidence checks.
 
 ## Boundary transport establishment
 
-Backends may supply a `BoundaryTransportConnector` for raw stream establishment.
-The shared client retains TLS peer verification, session bearer authentication,
-generation checks, and reconnection handling. The connector is reused for policy
-discovery and attachment; it does not define platform launch configuration or
-replace the RPC contracts.
+The client connects to the configured Unix socket, TCP, or vsock endpoint. It
+owns TLS peer verification, session bearer authentication, generation checks,
+and reconnection handling for policy discovery and attachment.

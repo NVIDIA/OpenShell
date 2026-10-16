@@ -69,10 +69,10 @@ fn begin_recovery_window(
     *deadline.get_or_insert(failure_time + CONNECT_RETRY_TIMEOUT)
 }
 
-/// Backend-owned raw transport establishment; shared code still authenticates
+/// Internal raw transport establishment; shared code still authenticates
 /// the resulting stream with generation-pinned TLS and Sandbox Protocol JWTs.
 #[async_trait]
-pub trait BoundaryTransportConnector: std::fmt::Debug + Send + Sync {
+trait BoundaryTransportConnector: std::fmt::Debug + Send + Sync {
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
@@ -83,7 +83,6 @@ pub trait BoundaryTransportConnector: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
     connector: Option<Arc<dyn BoundaryTransportConnector>>,
-    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
@@ -112,17 +111,9 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Result<(Option<String>, bool), BackendError> {
-        Self::discover_policy_with_connector(descriptor, bearer, None).await
-    }
-
-    pub async fn discover_policy_with_connector(
-        descriptor: SandboxRuntimeDescriptor,
-        bearer: openshell_core::jwt::SessionBearerTokenSlot,
-        connector: Option<Arc<dyn BoundaryTransportConnector>>,
-    ) -> Result<(Option<String>, bool), BackendError> {
-        let mut client = BoundaryClient::new(descriptor, bearer);
-        client.connector = connector;
-        client.discover_policy().await
+        BoundaryClient::new(descriptor, bearer)
+            .discover_policy()
+            .await
     }
 
     pub fn new(
@@ -132,7 +123,6 @@ impl OpenShellRuntimeBackend {
     ) -> Self {
         Self {
             connector: None,
-            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
@@ -140,38 +130,8 @@ impl OpenShellRuntimeBackend {
         }
     }
 
-    #[must_use]
-    pub fn with_transport_connector(
-        mut self,
-        connector: Arc<dyn BoundaryTransportConnector>,
-    ) -> Self {
-        self.connector = Some(connector);
-        self
-    }
-
-    /// Select the backend implementation that validates opaque audit evidence.
-    #[must_use]
-    pub fn with_audit_validator(
-        mut self,
-        validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
-    ) -> Self {
-        self.audit_validator = validator;
-        self
-    }
-}
-
-/// Shared Sandbox Protocol adapter for a trusted, endpoint-registered backend.
-///
-/// The remote backend validates its native evidence; this adapter validates the
-/// admitted workload identity and immutable launch binding.
-pub struct DelegatedRuntimeBackend(OpenShellRuntimeBackend);
-
-impl DelegatedRuntimeBackend {
-    pub fn into_client(self) -> OpenShellRuntimeBackend {
-        self.0
-    }
-
-    pub fn new(
+    /// Construct the same RPC client for an operator-registered backend.
+    pub fn registered(
         backend_name: String,
         descriptor: SandboxRuntimeDescriptor,
         driver_descriptor: Vec<u8>,
@@ -181,17 +141,17 @@ impl DelegatedRuntimeBackend {
     ) -> Result<Self, BackendError> {
         crate::delegated::validate_backend_name(&backend_name)?;
         validate_runtime_coordinates(&descriptor)?;
-        let mut backend =
-            OpenShellRuntimeBackend::new(ca_file_paths, provider_credentials, sandbox_bearer);
+        let mut backend = Self::new(ca_file_paths, provider_credentials, sandbox_bearer);
         backend.delegated = Some(DelegatedRuntime {
             backend_name,
             descriptor,
             driver_descriptor,
         });
-        Ok(Self(backend))
+        Ok(backend)
     }
 
-    pub async fn discover_policy(
+    /// Discover policy using the registered endpoint and opaque driver payload.
+    pub async fn discover_registered_policy(
         backend_name: String,
         descriptor: SandboxRuntimeDescriptor,
         driver_descriptor: Vec<u8>,
@@ -203,23 +163,7 @@ impl DelegatedRuntimeBackend {
             BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
         client.discover_policy().await
     }
-}
 
-impl DelegatedRuntimeBackend {
-    pub fn backend_name(&self) -> &str {
-        self.0.backend_name()
-    }
-
-    pub async fn attach(
-        &self,
-        descriptor: BackendDescriptor,
-        sandbox: SandboxContext,
-    ) -> Result<Box<BoundBoundary>, BackendError> {
-        self.0.attach(descriptor, sandbox).await
-    }
-}
-
-impl OpenShellRuntimeBackend {
     pub fn backend_name(&self) -> &str {
         self.delegated
             .as_ref()
@@ -278,10 +222,6 @@ impl OpenShellRuntimeBackend {
             ));
         }
         Ok(Box::new(BoundBoundary {
-            audit_validator: self
-                .delegated
-                .is_none()
-                .then(|| self.audit_validator.clone()),
             client: client.clone(),
             agent: sandbox.agent,
             policy: sandbox.policy,
@@ -393,7 +333,6 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
 }
 
 pub struct BoundBoundary {
-    audit_validator: Option<Arc<dyn crate::audit::BoundaryAuditValidator>>,
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
     policy: openshell_core::policy::SandboxPolicy,
@@ -434,8 +373,8 @@ impl BoundBoundary {
                     .to_string(),
             ));
         }
-        if let Some(validator) = &self.audit_validator {
-            validator.validate(&confirmation.backend_audit)?;
+        if self.client.backend_name == crate::BACKEND_NAME {
+            crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
         }
         let client = self.client.clone();
         let confirmed = ConfirmedBoundary::try_new(
@@ -3417,7 +3356,6 @@ mod tests {
             test_bearer(&expected_token),
         ));
         let bound = BoundBoundary {
-            audit_validator: Some(Arc::new(crate::audit::LinuxBoundaryAuditValidator)),
             client: client.clone(),
             agent: context.agent,
             policy: context.policy,

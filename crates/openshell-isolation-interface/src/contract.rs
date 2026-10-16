@@ -32,8 +32,6 @@ pub use openshell_core::policy::SandboxPolicy;
 pub enum BackendError {
     /// Descriptor missing, malformed, unsupported, or mismatched against admission.
     Descriptor(String),
-    /// No backend registered for the resolved `backend_name`.
-    NotRegistered(String),
     /// Authenticated attachment rejection (incompatible or already-bound resource).
     Denied(String),
     /// Boundary temporarily unavailable.
@@ -76,7 +74,7 @@ impl BackendError {
     #[must_use]
     pub fn kind(&self) -> BackendErrorKind {
         match self {
-            Self::Descriptor(_) | Self::NotRegistered(_) => BackendErrorKind::Invalid,
+            Self::Descriptor(_) => BackendErrorKind::Invalid,
             Self::Denied(_) => BackendErrorKind::Denied,
             Self::Unavailable(_) => BackendErrorKind::Unavailable,
             Self::Unsupported(_) => BackendErrorKind::Unsupported,
@@ -90,7 +88,6 @@ impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Descriptor(m) => write!(f, "descriptor error: {m}"),
-            Self::NotRegistered(m) => write!(f, "backend not registered: {m}"),
             Self::Denied(m) => write!(f, "attachment denied: {m}"),
             Self::Unavailable(m) => write!(f, "boundary unavailable: {m}"),
             Self::Unsupported(m) => write!(f, "operation unsupported: {m}"),

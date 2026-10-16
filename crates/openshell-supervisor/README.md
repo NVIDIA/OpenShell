@@ -16,7 +16,7 @@ The client receives the supervisor's live provider state, bearer-token slot, and
 
 `backend_setup`, `SandboxRunConfig`, and `run_sandbox_with_backend` are public so the supervisor binary can select a registered backend. External backends should implement the `IsolationBackend` and `SandboxProtocol` services rather than link this crate.
 
-The private startup result separates the backend transport payload from optional
+The startup result separates the backend transport payload from optional
 authenticated CONNECT listener settings. Shared networking starts the listener
 only after boundary attachment and confirmation; the supervisor owns policy
 evaluation, live credentials, and listener lifetime. These settings do not add

@@ -40,7 +40,7 @@ pub struct BackendServices {
     pub sandbox_bearer: SessionBearerTokenSlot,
 }
 
-/// Private startup result; native payload decoding never reaches shared runtime
+/// Startup result; native payload decoding never reaches shared runtime
 /// descriptors or the public isolation interface.
 pub struct BuiltBackend {
     pub backend: Arc<openshell_sandbox_backend::OpenShellRuntimeBackend>,

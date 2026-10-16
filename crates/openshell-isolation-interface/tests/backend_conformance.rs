@@ -105,10 +105,6 @@ fn error_kinds_map_to_supervisor_status_classes() {
         BackendErrorKind::Invalid
     );
     assert_eq!(
-        BackendError::NotRegistered("x".into()).kind(),
-        BackendErrorKind::Invalid
-    );
-    assert_eq!(
         BackendError::Denied("x".into()).kind(),
         BackendErrorKind::Denied
     );

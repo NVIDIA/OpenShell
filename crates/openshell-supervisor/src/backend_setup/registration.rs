@@ -4,7 +4,7 @@
 //! Operator-owned endpoint registration; launch payloads never select a route.
 
 pub use openshell_core::isolation_registration::BackendRegistration;
-use openshell_sandbox_backend::DelegatedRuntimeBackend;
+use openshell_sandbox_backend::OpenShellRuntimeBackend;
 use openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor;
 use openshell_sandbox_backend::delegated::DelegatedLaunch;
 use serde::Deserialize;
@@ -100,7 +100,7 @@ impl PreparedBackend for RegisteredLaunch {
         &self,
         bearer: SessionBearerTokenSlot,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
-        DelegatedRuntimeBackend::discover_policy(
+        OpenShellRuntimeBackend::discover_registered_policy(
             self.name.clone(),
             self.descriptor.clone(),
             self.payload.clone(),
@@ -114,17 +114,14 @@ impl PreparedBackend for RegisteredLaunch {
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
         let payload = self.payload.clone();
-        let backend = Arc::new(
-            DelegatedRuntimeBackend::new(
-                self.name,
-                self.descriptor,
-                self.payload,
-                services.ca_file_paths,
-                services.provider_credentials,
-                services.sandbox_bearer,
-            )?
-            .into_client(),
-        );
+        let backend = Arc::new(OpenShellRuntimeBackend::registered(
+            self.name,
+            self.descriptor,
+            self.payload,
+            services.ca_file_paths,
+            services.provider_credentials,
+            services.sandbox_bearer,
+        )?);
         Ok(BuiltBackend {
             backend,
             payload,

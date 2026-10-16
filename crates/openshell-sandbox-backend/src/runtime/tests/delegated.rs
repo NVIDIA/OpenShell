@@ -9,7 +9,7 @@ const OPAQUE_PAYLOAD: &[u8] = b"external-driver-v1\0\xffresource";
 
 async fn external_backend(
     confirmation: BoundaryConfirmation,
-) -> (DelegatedRuntimeBackend, tokio::task::JoinHandle<()>) {
+) -> (OpenShellRuntimeBackend, tokio::task::JoinHandle<()>) {
     let certificate = test_certificate();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -53,7 +53,7 @@ async fn external_backend(
     let descriptor = tls_runtime_descriptor(address, client_tls);
     let bearer = test_bearer(&"a".repeat(32));
     assert_eq!(
-        DelegatedRuntimeBackend::discover_policy(
+        OpenShellRuntimeBackend::discover_registered_policy(
             EXTERNAL_NAME.into(),
             descriptor.clone(),
             OPAQUE_PAYLOAD.to_vec(),
@@ -63,7 +63,7 @@ async fn external_backend(
         .unwrap(),
         (None, false)
     );
-    let backend = DelegatedRuntimeBackend::new(
+    let backend = OpenShellRuntimeBackend::registered(
         EXTERNAL_NAME.into(),
         descriptor,
         OPAQUE_PAYLOAD.to_vec(),
@@ -84,7 +84,7 @@ fn external_confirmation() -> BoundaryConfirmation {
     confirmation
 }
 
-async fn attach_external(backend: DelegatedRuntimeBackend) -> Box<BoundBoundary> {
+async fn attach_external(backend: OpenShellRuntimeBackend) -> Box<BoundBoundary> {
     let descriptor = BackendDescriptor {
         backend_name: EXTERNAL_NAME.into(),
         payload: OPAQUE_PAYLOAD.to_vec(),
@@ -148,7 +148,7 @@ async fn delegated_backend_rejects_reserved_name_and_changed_payload_before_io()
     let certificate = test_certificate();
     let descriptor = tls_runtime_descriptor("127.0.0.1:1".parse().unwrap(), certificate.client_tls);
     assert!(matches!(
-        DelegatedRuntimeBackend::new(
+        OpenShellRuntimeBackend::registered(
             crate::BACKEND_NAME.into(),
             descriptor.clone(),
             OPAQUE_PAYLOAD.to_vec(),
@@ -162,7 +162,7 @@ async fn delegated_backend_rejects_reserved_name_and_changed_payload_before_io()
         Err(BackendError::Descriptor(_))
     ));
     assert!(matches!(
-        DelegatedRuntimeBackend::discover_policy(
+        OpenShellRuntimeBackend::discover_registered_policy(
             crate::BACKEND_NAME.into(),
             descriptor,
             OPAQUE_PAYLOAD.to_vec(),

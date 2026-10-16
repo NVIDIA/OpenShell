@@ -21,6 +21,13 @@ Today the supervisor both builds the workload's isolation boundary and applies i
 
 The compute driver orchestrates the workload, supervisor, sandbox runtime, protected channel, and outer network fence. The supervisor is the trusted bridge between the gateway and the workload: it maintains the gateway connection, handles authorized requests, and drives the backend. The backend establishes the isolation controls, manages workload processes, and routes egress to network mediation. The same lifecycle supports different compute drivers and backend implementations without driver-specific supervisor paths.
 
+The implementation expresses this contract through
+[`isolation_backend.proto`](../../proto/isolation_backend.proto) and
+[`sandbox_protocol.proto`](../../proto/sandbox_protocol.proto). The Rust
+signatures below illustrate the lifecycle model; they are not backend extension
+traits. The supervisor uses concrete RPC clients, and backends implement the
+generated services. Wire negotiation and message definitions live in the protos.
+
 ## Motivation
 
 Boundary construction is embedded in the supervisor, so moving it anywhere else means changing the supervisor. That placement creates three problems:
@@ -80,7 +87,7 @@ flowchart TB
     Mediator -->|"allowed egress"| Egress["Egress"]
 ```
 
-The initial implementation is `OpenShellRuntimeBackend`: a supervisor-side client that delegates operations over the authenticated OpenShell Sandbox Protocol to `openshell-sandbox` beside the workload. A future runtime-native backend could implement the same interface without using that protocol or binary.
+The initial implementation is `OpenShellRuntimeBackend`: a supervisor-side client that delegates operations over the authenticated OpenShell Sandbox Protocol to `openshell-sandbox` beside the workload. Other backends implement the same RPC services using their own isolation mechanisms; they do not need the `openshell-sandbox` binary.
 
 A boundary is active from successful `attach` until normal backend cleanup releases the binding or the compute driver's trusted cleanup path invalidates it. A backend may coordinate multiple trusted helper or interception processes for that boundary. The backend owns the active-boundary binding; the compute driver owns the sandbox instance and infrastructure lifecycle.
 
@@ -403,9 +410,12 @@ This is natural for drivers such as MXC, and the same component may implement bo
 
 ### Start with a remote backend service
 
-The contract could be expressed as a gRPC service or plugin ABI rather than an in-process Rust contract. [RFC 0001](../0001-core-architecture/README.md) chose gRPC for its gateway-facing drivers, so the question applies here.
-
-The callers differ. A gateway driver is a control-plane peer with its own release cycle, while the Isolation Backend is driven by the supervisor that operates the boundary, and a co-located implementation needs no transport at all. Starting in-process serves that case directly and lets delegated implementations carry their own transport behind the same interface. A transport-bearing surface is not precluded: it is versioned contract surface, added when a concrete delegated backend requires it.
+The original proposal started with an in-process Rust contract and allowed a
+versioned transport when a delegated backend required it. The implementation
+now uses gRPC for both the in-tree Linux runtime and external backends, retaining
+the lifecycle semantics described here. As in
+[RFC 0001](../0001-core-architecture/README.md), protobuf services let external
+implementations generate their own bindings without linking supervisor code.
 
 ### Standardize placement and capabilities
 

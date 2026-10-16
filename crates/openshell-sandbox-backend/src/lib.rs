@@ -10,7 +10,7 @@
 //! they are not backend implementation traits. The workload-side
 //! `openshell-sandbox` runtime implements the generated server services.
 
-pub mod audit;
+mod audit;
 pub mod boundary_protocol;
 pub mod delegated;
 pub mod isolation_protocol;
@@ -23,9 +23,8 @@ pub mod stream_adapter;
 pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
 pub use runtime::{
     BoundBoundary, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal,
-    BoundaryTransportConnector, ConfirmedBoundary, DelegatedRuntimeBackend, ExecSession,
-    NetworkMediationSource, OpenShellRuntimeBackend, ProcessAttachment, ReadyBoundary,
-    RunningBoundary,
+    ConfirmedBoundary, ExecSession, NetworkMediationSource, OpenShellRuntimeBackend,
+    ProcessAttachment, ReadyBoundary, RunningBoundary,
 };
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
