@@ -69,7 +69,7 @@ The local gateway auto-detects an available runtime. To pin one, set `compute_dr
 
 | Runtime | Requirements |
 |---|---|
-| Docker | Docker Desktop or Docker Engine 28.0 or later. |
+| Docker | Docker Desktop with host networking enabled and Enhanced Container Isolation disabled, or Docker Engine 28.0 or later. Run `openshell doctor check` to verify prerequisites. |
 | Podman | Linux with Podman 5.x, cgroups v2, and an active Podman user socket. |
 | MicroVM | Host virtualization: Hypervisor.framework on macOS or KVM on Linux. |
 
