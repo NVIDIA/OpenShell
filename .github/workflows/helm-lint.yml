@@ -3,13 +3,36 @@
 
 name: Helm Lint
 
+run-name: >-
+  ${{ inputs.merge_group_sha != ''
+      && format('Helm Lint / merge group / PR #{0} / {1} / head {2} / approval {3}', inputs.pr_number, inputs.merge_group_sha, inputs.head_sha, inputs.approval_comment_id)
+      || inputs.pr_number != ''
+      && format('Helm Lint / PR #{0} / {1} / approval {2}', inputs.pr_number, inputs.head_sha, inputs.approval_comment_id)
+      || 'Helm Lint' }}
+
 on:
-  merge_group:
-    types: [checks_requested]
-  push:
-    branches:
-      - "pull-request/[0-9]+"
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number supplied by the trusted PR dispatcher
+        required: false
+        type: string
+        default: ""
+      head_sha:
+        description: Exact approved pull request head SHA
+        required: false
+        type: string
+        default: ""
+      approval_comment_id:
+        description: Exact-SHA maintainer approval comment
+        required: false
+        type: string
+        default: ""
+      merge_group_sha:
+        description: Exact synthetic merge queue SHA from the trusted dispatcher
+        required: false
+        type: string
+        default: ""
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -18,24 +41,35 @@ permissions:
   contents: read
   packages: read
 
+cache-mode: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.merge_group_sha || inputs.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
   pr_metadata:
-    name: Resolve PR metadata
+    name: Authorize PR revision
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: read
       pull-requests: read
     outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
+      should_run: ${{ steps.authorize.outcome == 'success' }}
+      base_sha: ${{ steps.authorize.outputs.base-sha }}
+      merge_base_sha: ${{ steps.authorize.outputs.merge-base-sha }}
+      checkout_repository: ${{ steps.authorize.outputs.checkout-repository }}
+      head_sha: ${{ steps.authorize.outputs.head-sha }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - id: gate
-        uses: ./.github/actions/pr-gate
+      - id: authorize
+        uses: $/.github/actions/authorize-pr-ci
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ inputs.pr_number }}
+          head-sha: ${{ inputs.head_sha }}
+          approval-comment-id: ${{ inputs.approval_comment_id }}
+          merge-group-sha: ${{ inputs.merge_group_sha }}
 
   helm_changes:
     name: Detect Helm changes
@@ -49,25 +83,32 @@ jobs:
       should_run: ${{ steps.default.outputs.should_run || steps.changes.outputs.any_changed }}
     steps:
       - id: default
-        if: github.event_name != 'push'
+        if: inputs.pr_number == ''
         shell: bash
         run: echo "should_run=true" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'push'
-
-      - id: merge-base
-        if: github.event_name == 'push'
-        uses: ./.github/actions/pr-merge-base
+        if: inputs.pr_number != ''
         with:
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
+
+      - name: Fetch merge base
+        if: inputs.pr_number != ''
+        env:
+          BASE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          BASE_SHA: ${{ needs.pr_metadata.outputs.merge_base_sha }}
+        run: git fetch --no-tags --depth=1 "$BASE_REPOSITORY_URL" "$BASE_SHA"
 
       - id: changes
-        if: github.event_name == 'push'
+        if: inputs.pr_number != ''
         uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
         with:
-          base_sha: ${{ steps.merge-base.outputs.base_sha }}
-          skip_initial_fetch: ${{ steps.merge-base.outputs.base_sha != '' }}
+          base_sha: ${{ needs.pr_metadata.outputs.merge_base_sha }}
+          sha: ${{ needs.pr_metadata.outputs.head_sha }}
+          skip_initial_fetch: true
           files: |
             deploy/helm/**
             mise.toml
@@ -87,6 +128,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Install tools
         run: mise install --locked

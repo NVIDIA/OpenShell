@@ -1,0 +1,286 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Authorize PR CI revision
+description: Revalidate an exact maintainer-approved pull request revision before running candidate code
+
+inputs:
+  github-token:
+    description: Read-only token used for pull request and collaborator metadata
+    required: true
+  pr-number:
+    description: Pull request number from the trusted dispatcher
+    required: false
+    default: ""
+  head-sha:
+    description: Exact pull request head SHA from the trusted dispatcher
+    required: false
+    default: ""
+  approval-comment-id:
+    description: Exact-SHA approval comment from the trusted dispatcher
+    required: false
+    default: ""
+  merge-group-sha:
+    description: Exact synthetic merge queue SHA resolved by the trusted dispatcher
+    required: false
+    default: ""
+  trusted-ref:
+    description: Exact repository branch allowed for an explicitly trusted non-PR run
+    required: false
+    default: ""
+
+outputs:
+  base-sha:
+    description: Current target branch base SHA or trusted event base SHA
+    value: ${{ steps.authorize.outputs.base-sha }}
+  merge-base-sha:
+    description: Immutable merge base between the target branch and pull request head
+    value: ${{ steps.authorize.outputs.merge-base-sha }}
+  checkout-repository:
+    description: Repository containing the exact candidate SHA
+    value: ${{ steps.authorize.outputs.checkout-repository }}
+  head-sha:
+    description: Exact authorized candidate SHA
+    value: ${{ steps.authorize.outputs.head-sha }}
+  pr-number:
+    description: Authorized pull request number, or zero for a trusted non-PR event
+    value: ${{ steps.authorize.outputs.pr-number }}
+
+runs:
+  using: composite
+  steps:
+    - id: authorize
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      env:
+        APPROVAL_COMMENT_ID: ${{ inputs.approval-comment-id }}
+        GH_REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        MERGE_GROUP_SHA: ${{ inputs.merge-group-sha }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        TRUSTED_REF: ${{ inputs.trusted-ref }}
+        WORKFLOW_EVENT: ${{ github.event_name }}
+        WORKFLOW_REF: ${{ github.ref }}
+        WORKFLOW_SHA: ${{ github.sha }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const repoName = process.env.GH_REPO;
+          const prNumberText = process.env.PR_NUMBER;
+          const requestedSha = process.env.HEAD_SHA;
+          const mergeGroupSha = process.env.MERGE_GROUP_SHA;
+          const commentIdText = process.env.APPROVAL_COMMENT_ID;
+          const trustedRef = process.env.TRUSTED_REF;
+          const shaPattern = /^[0-9a-f]{40}$/;
+
+          if (!prNumberText && trustedRef) {
+            const eventName = process.env.WORKFLOW_EVENT;
+            const workflowRef = process.env.WORKFLOW_REF;
+            const workflowSha = process.env.WORKFLOW_SHA;
+            const trustedWindowsRun = trustedRef === 'refs/heads/windows'
+              && workflowRef === trustedRef
+              && ['push', 'workflow_dispatch'].includes(eventName)
+              && shaPattern.test(workflowSha);
+            if (!trustedWindowsRun || requestedSha || commentIdText || mergeGroupSha) {
+              core.setFailed('Trusted branch authorization does not match this workflow run.');
+              return;
+            }
+            core.setOutput('base-sha', '');
+            core.setOutput('merge-base-sha', '');
+            core.setOutput('checkout-repository', repoName);
+            core.setOutput('head-sha', workflowSha);
+            core.setOutput('pr-number', '0');
+            return;
+          }
+
+          if (!/^[1-9][0-9]*$/.test(prNumberText)
+              || !shaPattern.test(requestedSha)
+              || (mergeGroupSha && !shaPattern.test(mergeGroupSha))
+              || !/^[1-9][0-9]*$/.test(commentIdText)) {
+            core.setFailed('PR CI dispatch inputs are malformed.');
+            return;
+          }
+
+          const pullNumber = Number(prNumberText);
+          const commentId = Number(commentIdText);
+          const { data: pull } = await github.rest.pulls.get({
+            ...context.repo,
+            pull_number: pullNumber,
+          });
+          if (pull.state !== 'open' || pull.draft
+              || pull.base.repo.full_name !== repoName
+              || pull.base.ref !== context.payload.repository.default_branch
+              || pull.head.sha !== requestedSha
+              || !pull.head.repo?.full_name) {
+            core.setFailed('The dispatched pull request revision is no longer eligible to run.');
+            return;
+          }
+
+          const splitRepository = (fullName) => {
+            const parts = String(fullName || '').split('/');
+            if (parts.length !== 2
+                || parts.some((part) => !/^[A-Za-z0-9_.-]+$/.test(part))) {
+              throw new Error(`Invalid repository name: ${fullName}`);
+            }
+            return { owner: parts[0], repo: parts[1] };
+          };
+
+          const workflowTreeIdentity = async (repositoryName, commitSha) => {
+            if (!shaPattern.test(commitSha)) {
+              throw new Error(`Invalid commit SHA for ${repositoryName}.`);
+            }
+            const repository = splitRepository(repositoryName);
+            const { data: commit } = await github.rest.git.getCommit({
+              ...repository,
+              commit_sha: commitSha,
+            });
+            if (commit.sha !== commitSha || !shaPattern.test(commit.tree?.sha || '')) {
+              throw new Error(`Could not bind ${repositoryName} to commit ${commitSha}.`);
+            }
+
+            let treeSha = commit.tree.sha;
+            for (const component of ['.github', 'workflows']) {
+              const { data: tree } = await github.rest.git.getTree({
+                ...repository,
+                tree_sha: treeSha,
+              });
+              if (tree.truncated) {
+                throw new Error(`Truncated Git tree while resolving ${repositoryName}.`);
+              }
+              const matches = tree.tree.filter((entry) => entry.path === component);
+              if (matches.length !== 1
+                  || matches[0].type !== 'tree'
+                  || matches[0].mode !== '040000'
+                  || !shaPattern.test(matches[0].sha || '')) {
+                throw new Error(
+                  `Could not resolve an exact .github/workflows tree in ${repositoryName}.`,
+                );
+              }
+              treeSha = matches[0].sha;
+            }
+            return `tree:040000:${treeSha}`;
+          };
+
+          const comparison = await github.rest.repos.compareCommitsWithBasehead({
+            ...context.repo,
+            basehead: `${pull.base.sha}...${requestedSha}`,
+          });
+          const mergeBaseSha = comparison.data.merge_base_commit?.sha;
+          if (comparison.data.base_commit?.sha !== pull.base.sha
+              || !shaPattern.test(mergeBaseSha || '')) {
+            core.setFailed('GitHub did not return the expected immutable comparison range.');
+            return;
+          }
+
+          if (pull.head.repo.full_name !== repoName) {
+            const [baseWorkflowTree, headWorkflowTree] = await Promise.all([
+              workflowTreeIdentity(repoName, mergeBaseSha),
+              workflowTreeIdentity(pull.head.repo.full_name, requestedSha),
+            ]);
+            if (baseWorkflowTree !== headWorkflowTree) {
+              core.setFailed(
+                'Fork pull requests cannot modify GitHub workflow definitions.',
+              );
+              return;
+            }
+          }
+
+          const { data: comment } = await github.rest.issues.getComment({
+            ...context.repo,
+            comment_id: commentId,
+          });
+          const expectedIssueUrl = `${context.apiUrl}/repos/${repoName}/issues/${pullNumber}`;
+          if (comment.issue_url !== expectedIssueUrl
+              || String(comment.body || '').trim() !== `/ok to test ${requestedSha}`
+              || !comment.user?.login) {
+            core.setFailed('The dispatch is not tied to an exact-SHA approval comment.');
+            return;
+          }
+
+          const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+            ...context.repo,
+            username: comment.user.login,
+          });
+          if (!['admin', 'maintain', 'write'].includes(permission.permission)) {
+            core.setFailed('The approving commenter no longer has Write permission.');
+            return;
+          }
+
+          if (mergeGroupSha) {
+            const data = await github.graphql(
+              `query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    isInMergeQueue
+                    mergeQueueEntry {
+                      id
+                      state
+                      baseCommit { oid }
+                      headCommit { oid }
+                      pullRequest {
+                        number
+                        state
+                        isDraft
+                        headRefOid
+                        baseRefName
+                        repository { nameWithOwner }
+                      }
+                    }
+                  }
+                }
+              }`,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: pullNumber,
+              },
+            );
+            const queuedPull = data.repository?.pullRequest;
+            const entry = queuedPull?.mergeQueueEntry;
+            const baseSha = entry?.baseCommit?.oid;
+            const queuedHead = entry?.headCommit?.oid;
+            const entryPull = entry?.pullRequest;
+            if (!queuedPull?.isInMergeQueue
+                || !entry
+                || !shaPattern.test(baseSha || '')
+                || queuedHead !== mergeGroupSha
+                || entryPull?.number !== pullNumber
+                || entryPull.state !== 'OPEN'
+                || entryPull.isDraft
+                || entryPull.headRefOid !== requestedSha
+                || entryPull.baseRefName !== pull.base.ref
+                || entryPull.repository?.nameWithOwner !== repoName) {
+              core.setFailed('The synthetic commit is not the current merge queue entry.');
+              return;
+            }
+
+            const queueRef = `heads/gh-readonly-queue/${pull.base.ref}`
+              + `/pr-${pullNumber}-${baseSha}`;
+            let queueRefData;
+            try {
+              ({ data: queueRefData } = await github.rest.git.getRef({
+                ...context.repo,
+                ref: queueRef,
+              }));
+            } catch (error) {
+              core.setFailed(`Could not resolve the current merge queue ref: ${error.message}`);
+              return;
+            }
+            if (queueRefData.object?.type !== 'commit'
+                || queueRefData.object.sha !== mergeGroupSha) {
+              core.setFailed('The current merge queue ref does not match the dispatched SHA.');
+              return;
+            }
+
+            core.setOutput('base-sha', baseSha);
+            core.setOutput('merge-base-sha', baseSha);
+            core.setOutput('checkout-repository', repoName);
+            core.setOutput('head-sha', mergeGroupSha);
+            core.setOutput('pr-number', '0');
+            return;
+          }
+
+          core.setOutput('base-sha', pull.base.sha);
+          core.setOutput('merge-base-sha', mergeBaseSha);
+          core.setOutput('checkout-repository', pull.head.repo.full_name);
+          core.setOutput('head-sha', requestedSha);
+          core.setOutput('pr-number', prNumberText);

@@ -60,10 +60,10 @@ on:
     types: [completed]
 ```
 
-- **Automatic.** Every successful `Release Dev` run (on `main` or a manual dispatch of Release Dev) fires the canary. Each job gates on `github.event.workflow_run.conclusion == 'success'` so a failed Release Dev does not run the canary.
+- **Automatic.** A successful `Release Dev` push on `main`, or a successful manual `Release Dev` dispatch by a user who still has Write permission, fires the canary. The authorization job reloads the triggering run and trusted workflow through the API, verifies the workflow ID and path, repository, event, revision, and actor, then passes the exact candidate SHA to every canary job. Runs created from pull request workflow definitions fail closed.
 - **Manual.** `workflow_dispatch` lets you run the canary on demand against any branch's workflow definition.
 
-When dispatched manually, `github.event.workflow_run.head_sha` is empty and the workflow falls back to `github.sha` (the branch tip) for the `install.sh` URL.
+When the canary itself is dispatched manually, the authorization job uses `github.sha` (the selected branch tip) for the `install.sh` URL.
 
 ## Manual dispatch
 

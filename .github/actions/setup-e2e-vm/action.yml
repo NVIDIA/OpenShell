@@ -55,7 +55,7 @@ runs:
         command -v mkfs.ext4
         command -v debugfs
 
-    - uses: ./.github/actions/setup-mise
+    - uses: $/.github/actions/setup-mise
       with:
         version: ${{ inputs.mise-version }}
 

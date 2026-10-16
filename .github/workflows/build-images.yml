@@ -10,14 +10,20 @@ on:
         required: false
         type: string
         default: ""
+      checkout-repository:
+        description: Repository containing the candidate revision
+        required: false
+        type: string
+        default: ""
       image-tag:
         required: false
         type: string
         default: ""
-
-permissions:
-  contents: read
-  packages: write
+      push-images:
+        description: "Push images to GHCR instead of exporting artifacts only"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   gateway:
@@ -30,16 +36,18 @@ jobs:
     steps: &build_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ inputs.checkout-repository || github.repository }}
           ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
 
-      - uses: ./.github/actions/build-docker-image
+      - uses: $/.github/actions/build-docker-image
         with:
           component: ${{ env.COMPONENT }}
           binary: ${{ env.BINARY }}
           target-suffix: ${{ env.TARGET_SUFFIX }}
           image-tag: ${{ inputs.image-tag || github.sha }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ inputs.push-images && secrets.GITHUB_TOKEN || '' }}
+          push-image: ${{ inputs.push-images }}
 
   sandbox:
     env:

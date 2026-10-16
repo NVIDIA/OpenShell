@@ -10,6 +10,11 @@ on:
         description: Source revision of the prepared candidate artifacts
         required: true
         type: string
+      checkout-repository:
+        description: Repository containing source-sha
+        required: false
+        type: string
+        default: ""
       integration-inputs-artifact-id:
         description: Immutable ID of the prepared integration inputs artifact
         required: true
@@ -37,7 +42,7 @@ permissions:
   packages: read
 
 concurrency:
-  group: ${{ github.workflow }}-integration-${{ inputs.category }}-${{ github.ref }}
+  group: ${{ github.workflow }}-integration-${{ inputs.category }}-${{ inputs.source-sha }}
   cancel-in-progress: true
 
 jobs:
@@ -54,6 +59,7 @@ jobs:
         with:
           ref: ${{ inputs['source-sha'] }}
           persist-credentials: false
+          repository: ${{ inputs.checkout-repository || github.repository }}
 
       - name: Enable KVM access
         run: |
@@ -66,7 +72,7 @@ jobs:
           exec 3<>/dev/kvm
           exec 3>&-
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
 
       - name: Cache tmachine disks
         if: matrix.environment != 'ubuntu-k3s'

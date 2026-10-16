@@ -251,16 +251,18 @@ Created PR [#123](https://github.com/OWNER/REPO/pull/123)
 
 ### Monitor Workflow Run (Optional)
 
-If the user asks to wait for a green CI before posting the RFR, use this snippet to monitor the workflow run:
+If the user asks to wait for green CI before posting the RFR, monitor the PR
+checks directly:
 
 ```bash
-# Watch the latest workflow run for the current branch
-gh run watch
+gh pr checks <pr-number> --watch --interval 30
 ```
 
-Or poll manually:
+The trusted PR workflows run from the default branch, so do not select runs by
+the PR head branch. To inspect a pending or failed required gate, retrieve its
+target URL and open the exact run ID from that URL:
 
 ```bash
-RUN_ID=$(gh run list --branch "$(git branch --show-current)" --limit 1 --json databaseId --jq '.[0].databaseId')
-gh run watch "$RUN_ID"
+gh pr checks <pr-number> --json name,state,link
+gh run view <run-id>
 ```

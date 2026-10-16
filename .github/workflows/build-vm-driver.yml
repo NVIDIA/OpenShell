@@ -17,9 +17,14 @@ on:
         required: false
         type: string
         default: ""
+      checkout-repository:
+        description: Repository containing checkout-ref
+        required: false
+        type: string
+        default: ""
     secrets:
       CACHIX_AUTH_TOKEN:
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -49,9 +54,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          repository: ${{ inputs.checkout-repository || github.repository }}
           ref: ${{ inputs['checkout-ref'] || github.sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -101,7 +107,7 @@ jobs:
           zstd -19 -T1 vm-init/openshell-vm-init -o "$compressed_dir/openshell-vm-init.zst"
 
       - name: Build openshell-driver-vm
-        uses: ./.github/actions/build-rust-binary
+        uses: $/.github/actions/build-rust-binary
         env:
           OPENSHELL_VM_RUNTIME_COMPRESSED_DIR: ${{ runner.temp }}/vm-runtime-compressed
         with:

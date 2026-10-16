@@ -9,6 +9,11 @@ on:
       checkout-ref:
         required: true
         type: string
+      checkout-repository:
+        description: Repository containing checkout-ref
+        required: false
+        type: string
+        default: ""
       rpm-version:
         required: false
         type: string
@@ -46,9 +51,10 @@ jobs:
             cli_target: aarch64-unknown-linux-musl
             gateway_target: aarch64-unknown-linux-gnu
             prover_target: aarch64-unknown-linux-musl
-    uses: ./.github/workflows/build-rpm.yml
+    uses: $/.github/workflows/build-rpm.yml
     with:
       checkout-ref: ${{ inputs.checkout-ref }}
+      checkout-repository: ${{ inputs.checkout-repository }}
       arch: ${{ matrix.arch }}
       runner: ${{ matrix.runner }}
       cli-target: ${{ matrix.cli_target }}

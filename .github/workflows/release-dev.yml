@@ -100,6 +100,7 @@ jobs:
     uses: ./.github/workflows/build-images.yml
     with:
       checkout-ref: ${{ github.sha }}
+      push-images: true
 
   prepare-integration:
     needs: [build-binaries, build-deb, build-images, build-rpm]

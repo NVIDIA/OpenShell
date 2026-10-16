@@ -1,71 +1,104 @@
 name: Branch E2E Checks
 
+run-name: >-
+  ${{ inputs.pr_number != ''
+      && format('Branch E2E Checks / PR #{0} / {1} / approval {2} / core {3} / gpu {4} / kubernetes {5}', inputs.pr_number, inputs.head_sha, inputs.approval_comment_id, inputs.run_core_e2e, inputs.run_gpu_e2e, inputs.run_kubernetes_e2e)
+      || 'Branch E2E Checks' }}
+
 on:
-  push:
-    branches:
-      - "pull-request/[0-9]+"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number supplied by the trusted PR dispatcher
+        required: false
+        type: string
+        default: ""
+      head_sha:
+        description: Exact approved pull request head SHA
+        required: false
+        type: string
+        default: ""
+      approval_comment_id:
+        description: Exact-SHA maintainer approval comment
+        required: false
+        type: string
+        default: ""
+      run_core_e2e:
+        description: Run the core and integration E2E suites
+        required: false
+        type: boolean
+        default: true
+      run_gpu_e2e:
+        description: Run the GPU E2E suite
+        required: false
+        type: boolean
+        default: true
+      run_kubernetes_e2e:
+        description: Run the optional Kubernetes E2E suites
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
+cache-mode: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
   pr_metadata:
-    name: Resolve PR metadata
+    name: Authorize PR revision
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: read
       pull-requests: read
     outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      run_integration: ${{ steps.labels.outputs.run_core_e2e }}
-      run_core_e2e: ${{ steps.labels.outputs.run_core_e2e }}
-      run_gpu_e2e: ${{ steps.labels.outputs.run_gpu_e2e }}
-      run_kubernetes_ha_e2e: ${{ steps.labels.outputs.run_kubernetes_ha_e2e }}
-      run_kubernetes_credential_drivers_e2e: ${{ steps.labels.outputs.run_kubernetes_credential_drivers_e2e }}
-      run_any_e2e: ${{ steps.labels.outputs.run_any_e2e }}
+      should_run: ${{ steps.authorize.outcome == 'success' && steps.context.outcome == 'success' }}
+      run_integration: ${{ steps.context.outputs.run_core_e2e }}
+      run_core_e2e: ${{ steps.context.outputs.run_core_e2e }}
+      run_gpu_e2e: ${{ steps.context.outputs.run_gpu_e2e }}
+      run_kubernetes_ha_e2e: ${{ steps.context.outputs.run_kubernetes_e2e }}
+      run_kubernetes_credential_drivers_e2e: ${{ steps.context.outputs.run_kubernetes_e2e }}
+      run_any_e2e: ${{ steps.context.outputs.run_any_e2e }}
+      base_sha: ${{ steps.authorize.outputs.base-sha }}
+      checkout_repository: ${{ steps.authorize.outputs.checkout-repository }}
+      head_sha: ${{ steps.authorize.outputs.head-sha }}
+      checkout_ref: ${{ steps.authorize.outputs.head-sha }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: authorize
+        uses: $/.github/actions/authorize-pr-ci
         with:
-          persist-credentials: false
-      - id: gate
-        uses: ./.github/actions/pr-gate
-      - id: labels
-        if: steps.gate.outputs.should_run == 'true'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ inputs.pr_number }}
+          head-sha: ${{ inputs.head_sha }}
+          approval-comment-id: ${{ inputs.approval_comment_id }}
+
+      - id: context
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          LABELS_JSON: ${{ steps.gate.outputs.labels_json }}
+          RUN_CORE_E2E: ${{ inputs.run_core_e2e }}
+          RUN_GPU_E2E: ${{ inputs.run_gpu_e2e }}
+          RUN_KUBERNETES_E2E: ${{ inputs.run_kubernetes_e2e }}
         shell: bash
         run: |
           set -euo pipefail
-          case "$EVENT_NAME" in
-            push)
-              run_core_e2e="$(jq -r 'index("test:e2e") != null' <<< "$LABELS_JSON")"
-              run_gpu_e2e="$(jq -r 'index("test:e2e-gpu") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
-              run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
-              ;;
-            *)
-              run_core_e2e=true
-              run_gpu_e2e=true
-              run_kubernetes_ha_e2e=false
-              run_kubernetes_credential_drivers_e2e=false
-              ;;
-          esac
-          if [ "$run_core_e2e" = "true" ] || [ "$run_gpu_e2e" = "true" ] || [ "$run_kubernetes_ha_e2e" = "true" ] || [ "$run_kubernetes_credential_drivers_e2e" = "true" ]; then
+          for value in "$RUN_CORE_E2E" "$RUN_GPU_E2E" "$RUN_KUBERNETES_E2E"; do
+            [ "$value" = true ] || [ "$value" = false ] || {
+              echo "Invalid E2E selection" >&2
+              exit 1
+            }
+          done
+          if [ "$RUN_CORE_E2E" = true ] || [ "$RUN_GPU_E2E" = true ] || [ "$RUN_KUBERNETES_E2E" = true ]; then
             run_any_e2e=true
           else
             run_any_e2e=false
           fi
-
           {
-            echo "run_core_e2e=$run_core_e2e"
-            echo "run_gpu_e2e=$run_gpu_e2e"
-            echo "run_kubernetes_ha_e2e=$run_kubernetes_ha_e2e"
-            echo "run_kubernetes_credential_drivers_e2e=$run_kubernetes_credential_drivers_e2e"
+            echo "run_core_e2e=$RUN_CORE_E2E"
+            echo "run_gpu_e2e=$RUN_GPU_E2E"
+            echo "run_kubernetes_e2e=$RUN_KUBERNETES_E2E"
             echo "run_any_e2e=$run_any_e2e"
           } >> "$GITHUB_OUTPUT"
 
@@ -86,6 +119,17 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+
+      - name: Fetch version tags from the target repository
+        env:
+          BASE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+          git for-each-ref --format='delete %(refname)' refs/tags | git update-ref --stdin
+          git fetch --force --no-recurse-submodules "$BASE_REPOSITORY_URL" \
+            '+refs/tags/*:refs/tags/*'
 
       - name: Compute version
         id: version
@@ -102,14 +146,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   build-binaries:
-    needs: version
+    needs: [pr_metadata, version]
     permissions:
       contents: read
-    uses: ./.github/workflows/build-binaries.yml
+    uses: $/.github/workflows/build-binaries.yml
     with:
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-gateway-plain:
     name: openshell-gateway driver-free (${{ matrix.triple }})
@@ -130,12 +174,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: ./.github/actions/setup-nix
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: ./.github/actions/build-rust-binary
+      - uses: $/.github/actions/build-rust-binary
         with:
           package: openshell-gateway
           binary: openshell-gateway
@@ -171,12 +215,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.sha }}
-      - uses: ./.github/actions/setup-nix
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
-      - uses: ./.github/actions/build-rust-binary
+      - uses: $/.github/actions/build-rust-binary
         with:
           package: ${{ matrix.package }}
           binary: ${{ matrix.binary }}
@@ -188,19 +232,24 @@ jobs:
     if: needs.pr_metadata.outputs.run_core_e2e == 'true'
     permissions:
       contents: read
-    uses: ./.github/workflows/build-vm-driver.yml
+    uses: $/.github/workflows/build-vm-driver.yml
     with:
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-images:
     needs: [pr_metadata, build-binaries]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
-      packages: write
-    uses: ./.github/workflows/build-images.yml
+      actions: read
+    uses: $/.github/workflows/build-images.yml
+    with:
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      push-images: false
 
   build-deb:
     name: Build Debian packages
@@ -209,9 +258,10 @@ jobs:
     permissions:
       contents: read
       packages: read
-    uses: ./.github/workflows/deb-package.yml
+    uses: $/.github/workflows/deb-package.yml
     with:
-      checkout-ref: ${{ github.sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       deb-version: ${{ needs.version.outputs.deb_version }}
 
   build-rpm:
@@ -221,9 +271,10 @@ jobs:
     permissions:
       actions: read
       contents: read
-    uses: ./.github/workflows/rpm-package.yml
+    uses: $/.github/workflows/rpm-package.yml
     with:
-      checkout-ref: ${{ github.sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       rpm-version: ${{ needs.version.outputs.rpm_version }}
       rpm-release: ${{ needs.version.outputs.rpm_release }}
       cargo-version: ${{ needs.version.outputs.cargo }}
@@ -235,22 +286,26 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/prepare-integration-inputs.yml
+    uses: $/.github/workflows/prepare-integration-inputs.yml
     with:
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      source-sha: ${{ needs.pr_metadata.outputs.head_sha }}
+      use-image-artifacts: true
       deb-artifact-name: deb-linux-amd64
       rpm-artifact-name: rpm-linux-x86_64
 
   # Run driver-independent conformance tests.
   conformance-integration:
-    needs: prepare-integration
+    needs: [pr_metadata, prepare-integration]
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: $/.github/workflows/integration-runner.yml
     with:
       category: conformance
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
@@ -263,15 +318,16 @@ jobs:
 
   # Run feature-specific integration tests:
   feature-specific-integration:
-    needs: prepare-integration
+    needs: [pr_metadata, prepare-integration]
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: $/.github/workflows/integration-runner.yml
     with:
       category: feature-specific
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
@@ -286,15 +342,16 @@ jobs:
   # These suites require the binary installer's CLI path, local HTTP gateway,
   # and system service configuration for their Podman user-namespace fixtures.
   driver-specific-integration:
-    needs: prepare-integration
+    needs: [pr_metadata, prepare-integration]
     permissions:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/integration-runner.yml
+    uses: $/.github/workflows/integration-runner.yml
     with:
       category: driver-specific
       source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
       test-matrix: >-
         [
@@ -310,9 +367,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-docker-test.yml
+    uses: $/.github/workflows/e2e-docker-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       runner: linux-arm64-cpu8
 
   podman-e2e:
@@ -322,9 +382,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
+    uses: $/.github/workflows/e2e-podman-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       suite-matrix: >-
         [{"suite":"ci","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:ci"}]
 
@@ -335,7 +398,10 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-vm-test.yml
+    uses: $/.github/workflows/e2e-vm-test.yml
+    with:
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
 
   docker-external-driver-e2e:
     needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
@@ -344,9 +410,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-docker-test.yml
+    uses: $/.github/workflows/e2e-docker-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       runner: linux-arm64-cpu8
       gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
       external-driver-binary: openshell-driver-docker
@@ -360,9 +429,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-podman-test.yml
+    uses: $/.github/workflows/e2e-podman-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       external-driver-binary: openshell-driver-podman
       suite-matrix: >-
@@ -375,8 +447,10 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-vm-test.yml
+    uses: $/.github/workflows/e2e-vm-test.yml
     with:
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       suite-name: external-driver
       e2e-task: e2e:vm:external-driver
@@ -388,9 +462,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-gpu-test.yaml
+    uses: $/.github/workflows/e2e-gpu-test.yaml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
 
   kubernetes-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -407,9 +484,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: $/.github/workflows/e2e-kubernetes-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
 
@@ -420,9 +500,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: $/.github/workflows/e2e-kubernetes-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
 
@@ -433,9 +516,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: $/.github/workflows/e2e-kubernetes-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       job-name: Kubernetes E2E (external compute driver)
       e2e-task: e2e:kubernetes:external-driver
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
@@ -449,9 +535,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: $/.github/workflows/e2e-kubernetes-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
 
@@ -462,9 +551,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: $/.github/workflows/e2e-kubernetes-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       job-name: Kubernetes HA E2E (Rust smoke)
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
       external-postgres-secret: openshell-ha-pg
@@ -479,9 +571,12 @@ jobs:
       actions: read
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    uses: $/.github/workflows/e2e-kubernetes-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ needs.pr_metadata.outputs.head_sha }}
+      checkout-ref: ${{ needs.pr_metadata.outputs.checkout_ref }}
+      checkout-repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+      use-image-artifacts: true
       job-name: Kubernetes Credential Drivers E2E
       e2e-task: e2e:kubernetes:credential-drivers
 
@@ -505,10 +600,7 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/check-job-results
+      - uses: $/.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
 
@@ -518,10 +610,7 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_gpu_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/check-job-results
+      - uses: $/.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
 
@@ -531,10 +620,7 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_ha_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/check-job-results
+      - uses: $/.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}
 
@@ -544,9 +630,6 @@ jobs:
     if: always() && needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_kubernetes_credential_drivers_e2e == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/check-job-results
+      - uses: $/.github/actions/check-job-results
         with:
           results: ${{ toJSON(needs) }}

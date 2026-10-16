@@ -1,0 +1,938 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: PR CI Dispatch
+
+# Do not add a merge_group trigger. GitHub loads that workflow definition from
+# the synthetic candidate revision. Queue reconciliation must stay on events
+# whose workflow comes from the default branch.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, labeled, unlabeled, ready_for_review, reopened, enqueued, dequeued]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      (github.event_name == 'schedule'
+        || github.event_name == 'push'
+        || github.event_name == 'workflow_dispatch'
+        || github.event.action == 'enqueued'
+        || github.event.action == 'dequeued')
+      && 'merge-queue'
+      || (github.event_name == 'issue_comment'
+        && startsWith(github.event.comment.body, '/ok to test ')
+        && (github.event.comment.author_association == 'OWNER'
+          || github.event.comment.author_association == 'MEMBER'
+          || github.event.comment.author_association == 'COLLABORATOR')
+        && format('pr-{0}', github.event.issue.number))
+      || (github.event_name == 'pull_request_target'
+        && format('pr-{0}', github.event.pull_request.number))
+      || format('ignored-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name != 'issue_comment' }}
+
+jobs:
+  route:
+    name: Bind status serialization to the current revision
+    if: >-
+      github.repository_owner == 'NVIDIA' &&
+      (github.event_name != 'issue_comment' ||
+        (github.event.issue.pull_request != null &&
+          startsWith(github.event.comment.body, '/ok to test ') &&
+          (github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR')))
+    permissions:
+      pull-requests: read
+    outputs:
+      head-sha: ${{ steps.route.outputs.head-sha }}
+      lock-key: ${{ steps.route.outputs.lock-key }}
+      pull-number: ${{ steps.route.outputs.pull-number }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - id: route
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const queueEvent = context.eventName === 'schedule'
+              || context.eventName === 'push'
+              || context.eventName === 'workflow_dispatch'
+              || (context.eventName === 'pull_request_target'
+                && ['enqueued', 'dequeued'].includes(context.payload.action));
+            if (queueEvent) {
+              core.setOutput('lock-key', 'merge-queue');
+              return;
+            }
+
+            const pullNumber = context.eventName === 'issue_comment'
+              ? context.payload.issue.number
+              : context.payload.pull_request.number;
+            const { data: pull } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: pullNumber,
+            });
+            if (pull.number !== pullNumber || !/^[0-9a-f]{40}$/.test(pull.head?.sha || '')) {
+              throw new Error(`Could not bind PR #${pullNumber} to an immutable head revision.`);
+            }
+            core.setOutput('head-sha', pull.head.sha);
+            core.setOutput('lock-key', `sha-${pull.head.sha}`);
+            core.setOutput('pull-number', String(pullNumber));
+
+  dispatch:
+    name: Dispatch approved PR checks
+    needs: route
+    if: >-
+      github.repository_owner == 'NVIDIA' &&
+      (github.event_name != 'issue_comment' ||
+        (github.event.issue.pull_request != null &&
+          startsWith(github.event.comment.body, '/ok to test ') &&
+          (github.event.comment.author_association == 'OWNER' ||
+            github.event.comment.author_association == 'MEMBER' ||
+            github.event.comment.author_association == 'COLLABORATOR')))
+    permissions:
+      actions: write
+      contents: read
+      issues: read
+      pull-requests: read
+      statuses: write
+    concurrency:
+      group: pr-ci-status-${{ needs.route.outputs.lock-key }}
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify exact-SHA approval and dispatch trusted workflows
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ROUTED_HEAD_SHA: ${{ needs.route.outputs.head-sha }}
+          ROUTED_PULL_NUMBER: ${{ needs.route.outputs.pull-number }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const shaPattern = /^[0-9a-f]{40}$/;
+            const expectedRepository = `${context.repo.owner}/${context.repo.repo}`;
+            const defaultBranch = context.payload.repository.default_branch;
+            const normalizeWorkflowPath = (value) => String(value || '').split('@', 1)[0];
+            const maintainerAssociations = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            const permissionCache = new Map();
+            const statusCache = new Map();
+            const sleep = (milliseconds) => new Promise(
+              (resolve) => setTimeout(resolve, milliseconds),
+            );
+
+            const postStatus = async (sha, statusContext, state, description, targetUrl) => {
+              let statuses = statusCache.get(sha);
+              if (!statuses) {
+                const current = await github.paginate(
+                  github.rest.repos.listCommitStatusesForRef,
+                  { ...context.repo, ref: sha, per_page: 100 },
+                );
+                statuses = new Map();
+                for (const status of current) {
+                  if (!statuses.has(status.context)) statuses.set(status.context, status);
+                }
+                statusCache.set(sha, statuses);
+              }
+              const normalizedDescription = description.slice(0, 140);
+              const current = statuses.get(statusContext);
+              if (current?.state === state
+                  && current.description === normalizedDescription
+                  && String(current.target_url || '') === String(targetUrl || '')) {
+                core.info(`${statusContext} is already ${state} for ${sha}.`);
+                return;
+              }
+              const { data: created } = await github.rest.repos.createCommitStatus({
+                ...context.repo,
+                sha,
+                state,
+                context: statusContext,
+                description: normalizedDescription,
+                target_url: targetUrl,
+              });
+              statuses.set(statusContext, created);
+            };
+
+            const hasWritePermission = async (login, authorAssociation) => {
+              if (!login || !maintainerAssociations.has(authorAssociation)) return false;
+              if (permissionCache.has(login)) return permissionCache.get(login);
+              let allowed = false;
+              try {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  ...context.repo,
+                  username: login,
+                });
+                allowed = ['admin', 'maintain', 'write'].includes(data.permission);
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                core.info(`Ignoring approval from former collaborator ${login}.`);
+              }
+              permissionCache.set(login, allowed);
+              return allowed;
+            };
+
+            const dispatch = async (workflow_id, inputs) => {
+              const response = await github.request(
+                'POST /repos/{owner}/{repo}/actions/workflows/{workflow_id}/dispatches',
+                {
+                  ...context.repo,
+                  workflow_id,
+                  ref: defaultBranch,
+                  inputs,
+                  headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+                },
+              );
+              const runUrl = response.data?.html_url;
+              if (!response.data?.workflow_run_id || !runUrl) {
+                throw new Error(`GitHub did not return the run created for ${workflow_id}.`);
+              }
+              core.info(`Dispatched ${workflow_id} as run ${response.data.workflow_run_id}.`);
+              return runUrl;
+            };
+
+            const latestStatuses = async (sha) => {
+              const statuses = await github.paginate(
+                github.rest.repos.listCommitStatusesForRef,
+                { ...context.repo, ref: sha, per_page: 100 },
+              );
+              const latest = new Map();
+              for (const status of statuses) {
+                if (!latest.has(status.context)) latest.set(status.context, status);
+              }
+              return latest;
+            };
+
+            const trustedRunMatches = (run, workflow, title) =>
+              run.name === workflow.name
+              && normalizeWorkflowPath(run.path) === workflow.path
+              && run.event === 'workflow_dispatch'
+              && run.head_branch === defaultBranch
+              && run.head_repository?.full_name === expectedRepository
+              && run.display_title === title;
+
+            const trustedRunStillOwnsStatus = async (status, workflow, title) => {
+              let target;
+              try {
+                target = new URL(status?.target_url || '');
+              } catch {
+                return false;
+              }
+              const path = target.pathname.split('/').filter(Boolean);
+              if (target.origin !== new URL(context.serverUrl).origin
+                  || path.length !== 5
+                  || path[0] !== context.repo.owner
+                  || path[1] !== context.repo.repo
+                  || path[2] !== 'actions'
+                  || path[3] !== 'runs'
+                  || !/^[1-9][0-9]*$/.test(path[4])) {
+                return false;
+              }
+              try {
+                const { data: run } = await github.rest.actions.getWorkflowRun({
+                  ...context.repo,
+                  run_id: Number(path[4]),
+                });
+                const matches = trustedRunMatches(run, workflow, title);
+                return matches && !(status.state === 'pending' && run.status === 'completed');
+              } catch (error) {
+                core.info(`Ignoring stale status target ${status.target_url}: ${error.message}`);
+                return false;
+              }
+            };
+
+            const trustedWorkflowRunExists = async (workflow, title) => {
+              const { data } = await github.rest.actions.listWorkflowRuns({
+                ...context.repo,
+                workflow_id: workflow.id,
+                branch: defaultBranch,
+                event: 'workflow_dispatch',
+                per_page: 100,
+              });
+              return data.workflow_runs.some(
+                (run) => trustedRunMatches(run, workflow, title),
+              );
+            };
+
+            const splitRepository = (fullName) => {
+              const parts = String(fullName || '').split('/');
+              if (parts.length !== 2
+                  || parts.some((part) => !/^[A-Za-z0-9_.-]+$/.test(part))) {
+                throw new Error(`Invalid repository name: ${fullName}`);
+              }
+              return { owner: parts[0], repo: parts[1] };
+            };
+
+            const workflowTreeIdentity = async (repositoryName, commitSha) => {
+              if (!shaPattern.test(commitSha)) {
+                throw new Error(`Invalid commit SHA for ${repositoryName}.`);
+              }
+              const repository = splitRepository(repositoryName);
+              const { data: commit } = await github.rest.git.getCommit({
+                ...repository,
+                commit_sha: commitSha,
+              });
+              if (commit.sha !== commitSha || !shaPattern.test(commit.tree?.sha || '')) {
+                throw new Error(`Could not bind ${repositoryName} to commit ${commitSha}.`);
+              }
+
+              let treeSha = commit.tree.sha;
+              for (const component of ['.github', 'workflows']) {
+                const { data: tree } = await github.rest.git.getTree({
+                  ...repository,
+                  tree_sha: treeSha,
+                });
+                if (tree.truncated) {
+                  throw new Error(`Truncated Git tree while resolving ${repositoryName}.`);
+                }
+                const matches = tree.tree.filter((entry) => entry.path === component);
+                if (matches.length !== 1
+                    || matches[0].type !== 'tree'
+                    || matches[0].mode !== '040000'
+                    || !shaPattern.test(matches[0].sha || '')) {
+                  throw new Error(
+                    `Could not resolve an exact .github/workflows tree in ${repositoryName}.`,
+                  );
+                }
+                treeSha = matches[0].sha;
+              }
+              return `tree:040000:${treeSha}`;
+            };
+
+            const forkChangesWorkflows = async (pull) => {
+              const headRepository = pull.head?.repo?.full_name;
+              const baseSha = pull.base?.sha;
+              const headSha = pull.head?.sha;
+              if (!headRepository || !shaPattern.test(baseSha || '')
+                  || !shaPattern.test(headSha || '')) {
+                throw new Error(`PR #${pull.number} has incomplete immutable revisions.`);
+              }
+              if (headRepository === expectedRepository) return false;
+
+              const comparison = await github.rest.repos.compareCommitsWithBasehead({
+                ...context.repo,
+                basehead: `${baseSha}...${headSha}`,
+              });
+              const mergeBaseSha = comparison.data.merge_base_commit?.sha;
+              if (comparison.data.base_commit?.sha !== baseSha
+                  || !shaPattern.test(mergeBaseSha || '')) {
+                throw new Error(`Could not resolve an immutable comparison for PR #${pull.number}.`);
+              }
+              const [baseWorkflowTree, headWorkflowTree] = await Promise.all([
+                workflowTreeIdentity(expectedRepository, mergeBaseSha),
+                workflowTreeIdentity(headRepository, headSha),
+              ]);
+              return baseWorkflowTree !== headWorkflowTree;
+            };
+
+            const loadMergeQueueEntries = async () => {
+              const entries = [];
+              let cursor = null;
+              do {
+                const data = await github.graphql(
+                  `query($owner: String!, $repo: String!, $branch: String!, $cursor: String) {
+                    repository(owner: $owner, name: $repo) {
+                      mergeQueue(branch: $branch) {
+                        entries(first: 100, after: $cursor) {
+                          nodes {
+                            id
+                            state
+                            baseCommit { oid }
+                            headCommit { oid }
+                            pullRequest {
+                              number
+                              state
+                              isDraft
+                              headRefOid
+                              baseRefName
+                              repository { nameWithOwner }
+                            }
+                          }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }`,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    branch: defaultBranch,
+                    cursor,
+                  },
+                );
+                const connection = data.repository?.mergeQueue?.entries;
+                if (!connection) return [];
+                entries.push(...connection.nodes);
+                cursor = connection.pageInfo.hasNextPage
+                  ? connection.pageInfo.endCursor
+                  : null;
+              } while (cursor);
+              return entries;
+            };
+
+            const mergeQueueEvent = context.eventName === 'schedule'
+              || context.eventName === 'push'
+              || context.eventName === 'workflow_dispatch'
+              || (context.eventName === 'pull_request_target'
+                && ['enqueued', 'dequeued'].includes(context.payload.action));
+            if (mergeQueueEvent) {
+              const workflowDetails = new Map([
+                ['OpenShell / Branch Checks', {
+                  id: 'branch-checks.yml',
+                  name: 'Branch Checks',
+                  path: '.github/workflows/branch-checks.yml',
+                }],
+                ['OpenShell / Helm Lint', {
+                  id: 'helm-lint.yml',
+                  name: 'Helm Lint',
+                  path: '.github/workflows/helm-lint.yml',
+                }],
+              ]);
+              const runTitle = (name, pullNumber, groupSha, pullHead, approvalId) =>
+                `${name} / merge group / PR #${pullNumber} / ${groupSha} / `
+                + `head ${pullHead} / approval ${approvalId}`;
+
+              let queueEntries = [];
+              for (let attempt = 1; attempt <= 6; attempt += 1) {
+                queueEntries = await loadMergeQueueEntries();
+                const enqueuedPullNumber = context.payload.pull_request?.number;
+                const enqueuedEntryReady = context.payload.action !== 'enqueued'
+                  || queueEntries.some(
+                    (entry) => entry.pullRequest?.number === enqueuedPullNumber
+                      && entry.baseCommit?.oid
+                      && entry.headCommit?.oid,
+                  );
+                if (enqueuedEntryReady || attempt === 6) break;
+                core.info(`Waiting for merge queue entry for PR #${enqueuedPullNumber}.`);
+                await sleep(5000);
+              }
+
+              for (const entry of queueEntries) {
+                const pull = entry.pullRequest;
+                const baseSha = entry.baseCommit?.oid;
+                const groupSha = entry.headCommit?.oid;
+                const eligible = pull?.state === 'OPEN'
+                  && !pull.isDraft
+                  && pull.repository?.nameWithOwner === expectedRepository
+                  && pull.baseRefName === defaultBranch
+                  && Number.isSafeInteger(pull.number)
+                  && shaPattern.test(pull.headRefOid || '')
+                  && shaPattern.test(baseSha || '')
+                  && shaPattern.test(groupSha || '');
+                if (!eligible) {
+                  core.warning(`Skipping incomplete merge queue entry ${entry.id || '(unknown)'}.`);
+                  continue;
+                }
+
+                const queueRef = `heads/gh-readonly-queue/${defaultBranch}`
+                  + `/pr-${pull.number}-${baseSha}`;
+                let queueRefData;
+                try {
+                  ({ data: queueRefData } = await github.rest.git.getRef({
+                    ...context.repo,
+                    ref: queueRef,
+                  }));
+                } catch (error) {
+                  core.info(`Merge queue ref ${queueRef} is not ready: ${error.message}`);
+                  continue;
+                }
+                if (queueRefData.object?.type !== 'commit'
+                    || queueRefData.object.sha !== groupSha) {
+                  core.warning(`Merge queue ref ${queueRef} does not match ${groupSha}.`);
+                  continue;
+                }
+
+                let livePull;
+                let workflowPolicyViolation = false;
+                try {
+                  ({ data: livePull } = await github.rest.pulls.get({
+                    ...context.repo,
+                    pull_number: pull.number,
+                  }));
+                  const livePullMatches = livePull.state === 'open'
+                    && !livePull.draft
+                    && livePull.base.repo.full_name === expectedRepository
+                    && livePull.base.ref === defaultBranch
+                    && livePull.head.sha === pull.headRefOid;
+                  if (!livePullMatches) {
+                    core.warning(`Skipping stale merge queue entry for PR #${pull.number}.`);
+                    continue;
+                  }
+                  workflowPolicyViolation = await forkChangesWorkflows(livePull);
+                } catch (error) {
+                  core.warning(`Could not verify workflow policy for PR #${pull.number}: ${error.message}`);
+                  workflowPolicyViolation = true;
+                }
+
+                if (workflowPolicyViolation) {
+                  const queueUrl = `${context.serverUrl}/${context.repo.owner}`
+                    + `/${context.repo.repo}/queue/${defaultBranch}`;
+                  for (const statusContext of [
+                    'OpenShell / Branch Checks',
+                    'OpenShell / Helm Lint',
+                    'OpenShell / E2E',
+                    'OpenShell / GPU E2E',
+                  ]) {
+                    await postStatus(
+                      groupSha,
+                      statusContext,
+                      'failure',
+                      'Fork pull requests cannot modify GitHub workflows',
+                      queueUrl,
+                    );
+                  }
+                  continue;
+                }
+
+                const command = `/ok to test ${pull.headRefOid}`;
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...context.repo,
+                  issue_number: pull.number,
+                  per_page: 100,
+                });
+                let approvalCommentId = 0;
+                for (const comment of comments.reverse()) {
+                  if (comment.body.trim() !== command) continue;
+                  if (await hasWritePermission(
+                    comment.user?.login,
+                    comment.author_association,
+                  )) {
+                    approvalCommentId = comment.id;
+                    break;
+                  }
+                }
+
+                const queueUrl = `${context.serverUrl}/${context.repo.owner}`
+                  + `/${context.repo.repo}/queue/${defaultBranch}`;
+                await postStatus(
+                  groupSha,
+                  'OpenShell / E2E',
+                  'success',
+                  'Not applicable to merge queue revisions',
+                  queueUrl,
+                );
+                await postStatus(
+                  groupSha,
+                  'OpenShell / GPU E2E',
+                  'success',
+                  'Not applicable to merge queue revisions',
+                  queueUrl,
+                );
+
+                if (!approvalCommentId) {
+                  await postStatus(
+                    groupSha,
+                    'OpenShell / Branch Checks',
+                    'failure',
+                    `Missing ${command}`,
+                    queueUrl,
+                  );
+                  await postStatus(
+                    groupSha,
+                    'OpenShell / Helm Lint',
+                    'failure',
+                    `Missing ${command}`,
+                    queueUrl,
+                  );
+                  continue;
+                }
+
+                const inputs = {
+                  pr_number: String(pull.number),
+                  head_sha: pull.headRefOid,
+                  approval_comment_id: String(approvalCommentId),
+                  merge_group_sha: groupSha,
+                };
+                const statuses = await latestStatuses(groupSha);
+                for (const [statusContext, workflow] of workflowDetails) {
+                  const title = runTitle(
+                    workflow.name,
+                    pull.number,
+                    groupSha,
+                    pull.headRefOid,
+                    approvalCommentId,
+                  );
+                  if (await trustedRunStillOwnsStatus(
+                    statuses.get(statusContext),
+                    workflow,
+                    title,
+                  )) {
+                    core.info(`${statusContext} already points to the trusted run for ${groupSha}.`);
+                    continue;
+                  }
+                  const runUrl = await dispatch(workflow.id, inputs);
+                  await postStatus(
+                    groupSha,
+                    statusContext,
+                    'pending',
+                    `${workflow.name} dispatched for merge queue revision`,
+                    runUrl,
+                  );
+                }
+              }
+              return;
+            }
+
+            const eventPullNumber = context.eventName === 'issue_comment'
+              ? context.payload.issue.number
+              : context.payload.pull_request.number;
+            const { data: eventPull } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: eventPullNumber,
+            });
+
+            if (String(eventPullNumber) !== process.env.ROUTED_PULL_NUMBER
+                || eventPull.head.sha !== process.env.ROUTED_HEAD_SHA) {
+              core.notice(`PR #${eventPullNumber} changed after status serialization was bound.`);
+              return;
+            }
+
+            if (eventPull.state !== 'open' || eventPull.draft) {
+              core.notice(
+                `Skipping PR #${eventPullNumber}: state=${eventPull.state}, draft=${eventPull.draft}.`,
+              );
+              return;
+            }
+            if (eventPull.base.repo.full_name !== expectedRepository
+                || eventPull.base.ref !== defaultBranch) {
+              core.notice(
+                `Skipping PR #${eventPullNumber}: it does not target `
+                + `${expectedRepository}:${defaultBranch}.`,
+              );
+              return;
+            }
+
+            const eventLabels = new Set(
+              (eventPull.labels || []).map((label) => label.name),
+            );
+            const blockRequiredTests = async (labels, description) => {
+              const currentStatuses = await latestStatuses(eventPull.head.sha);
+              for (const [label, statusContext] of [
+                ['test:e2e', 'OpenShell / E2E'],
+                ['test:e2e-gpu', 'OpenShell / GPU E2E'],
+              ]) {
+                if (!labels.has(label)) continue;
+                if (currentStatuses.get(statusContext)?.state === 'pending') {
+                  core.info(`Preserving the current pending ${statusContext} pointer.`);
+                  continue;
+                }
+                await postStatus(
+                  eventPull.head.sha,
+                  statusContext,
+                  'pending',
+                  description,
+                  eventPull.html_url,
+                );
+              }
+            };
+
+            let matchingPulls = [];
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              try {
+                const openPulls = await github.paginate(
+                  github.rest.pulls.list,
+                  {
+                    ...context.repo,
+                    state: 'open',
+                    base: defaultBranch,
+                    per_page: 100,
+                  },
+                );
+                matchingPulls = openPulls
+                  .filter((candidate) =>
+                    candidate.state === 'open'
+                    && !candidate.draft
+                    && candidate.base?.repo?.full_name === expectedRepository
+                    && candidate.base?.ref === defaultBranch
+                    && candidate.head?.sha === eventPull.head.sha
+                    && candidate.head?.repo?.full_name)
+                  .map((candidate) =>
+                    candidate.number === eventPullNumber ? eventPull : candidate)
+                  .sort((left, right) => left.number - right.number);
+                if (matchingPulls.some((candidate) => candidate.number === eventPullNumber)) {
+                  break;
+                }
+              } catch (error) {
+                if (attempt === 3) {
+                  await blockRequiredTests(
+                    eventLabels,
+                    'Waiting to resolve current PR requirements',
+                  );
+                  core.setFailed(`Could not resolve pull requests for this SHA: ${error.message}`);
+                  return;
+                }
+              }
+              if (attempt < 3) await sleep(2000);
+            }
+            if (!matchingPulls.some((candidate) => candidate.number === eventPullNumber)) {
+              await blockRequiredTests(
+                eventLabels,
+                'Waiting to bind this PR to its candidate SHA',
+              );
+              core.setFailed(`Could not bind PR #${eventPullNumber} to its candidate SHA.`);
+              return;
+            }
+
+            // Commit statuses are shared by every PR with the same head SHA. Apply
+            // the union of their requested tests so one PR cannot publish an N/A
+            // status for a test required by another PR.
+            const labels = new Set(matchingPulls.flatMap(
+              (candidate) => (candidate.labels || []).map((label) => label.name),
+            ));
+            const command = `/ok to test ${eventPull.head.sha}`;
+            let pull = matchingPulls[0];
+            let approvalCommentId = 0;
+            try {
+              for (const candidate of matchingPulls) {
+                const comments = await github.paginate(github.rest.issues.listComments, {
+                  ...context.repo,
+                  issue_number: candidate.number,
+                  per_page: 100,
+                });
+                for (let index = comments.length - 1; index >= 0; index -= 1) {
+                  const comment = comments[index];
+                  const expectedIssueUrl = `${context.apiUrl}/repos/${expectedRepository}`
+                    + `/issues/${candidate.number}`;
+                  if (comment.issue_url === expectedIssueUrl
+                    && String(comment.body || '').trim() === command
+                    && await hasWritePermission(
+                      comment.user?.login,
+                      comment.author_association,
+                    )) {
+                    pull = candidate;
+                    approvalCommentId = comment.id;
+                    break;
+                  }
+                }
+                if (approvalCommentId) break;
+              }
+            } catch (error) {
+              await blockRequiredTests(
+                labels,
+                'Waiting to resolve exact-SHA approval',
+              );
+              core.setFailed(`Could not resolve exact-SHA approval: ${error.message}`);
+              return;
+            }
+            const approved = approvalCommentId !== 0;
+            const pullNumber = pull.number;
+
+            const runCoreE2e = labels.has('test:e2e');
+            const runGpuE2e = labels.has('test:e2e-gpu');
+            const runKubernetesE2e = labels.has('test:e2e-kubernetes');
+            const e2eLabels = new Set([
+              'test:e2e',
+              'test:e2e-gpu',
+              'test:e2e-kubernetes',
+            ]);
+            const testLabels = new Set([
+              ...e2eLabels,
+              'test:windows',
+            ]);
+            const changedLabel = context.payload.label?.name;
+
+            const postPullStatus = async (statusContext, state, description, targetUrl) =>
+              postStatus(pull.head.sha, statusContext, state, description, targetUrl);
+
+            let workflowPolicyViolation = false;
+            try {
+              workflowPolicyViolation = await forkChangesWorkflows(pull);
+            } catch (error) {
+              core.warning(`Could not verify workflow policy for PR #${pullNumber}: ${error.message}`);
+              workflowPolicyViolation = true;
+            }
+            if (workflowPolicyViolation) {
+              for (const statusContext of [
+                'OpenShell / Branch Checks',
+                'OpenShell / Helm Lint',
+                'OpenShell / E2E',
+                'OpenShell / GPU E2E',
+              ]) {
+                await postPullStatus(
+                  statusContext,
+                  'failure',
+                  'Fork pull requests cannot modify GitHub workflows',
+                  pull.html_url,
+                );
+              }
+              return;
+            }
+
+            if (context.eventName === 'pull_request_target' && changedLabel) {
+              if (!testLabels.has(changedLabel)) {
+                core.notice(`Ignoring unrelated label ${changedLabel}.`);
+              }
+            }
+            if (!runCoreE2e) {
+              await postPullStatus(
+                'OpenShell / E2E',
+                'success',
+                'test:e2e not applied',
+                pull.html_url,
+              );
+            }
+            if (!runGpuE2e) {
+              await postPullStatus(
+                'OpenShell / GPU E2E',
+                'success',
+                'test:e2e-gpu not applied',
+                pull.html_url,
+              );
+            }
+
+            if (!approved) {
+              await postPullStatus(
+                'OpenShell / Branch Checks',
+                'pending',
+                `Waiting for ${command}`,
+                pull.html_url,
+              );
+              await postPullStatus(
+                'OpenShell / Helm Lint',
+                'pending',
+                `Waiting for ${command}`,
+                pull.html_url,
+              );
+              if (runCoreE2e) {
+                await postPullStatus(
+                  'OpenShell / E2E',
+                  'pending',
+                  `Waiting for ${command}`,
+                  pull.html_url,
+                );
+              }
+              if (runGpuE2e) {
+                await postPullStatus(
+                  'OpenShell / GPU E2E',
+                  'pending',
+                  `Waiting for ${command}`,
+                  pull.html_url,
+                );
+              }
+              core.notice(`Candidate SHA ${pull.head.sha} has no Write+ approval.`);
+              return;
+            }
+
+            const commonInputs = {
+              pr_number: String(pullNumber),
+              head_sha: pull.head.sha,
+              approval_comment_id: String(approvalCommentId),
+            };
+
+            const pullWorkflows = {
+              branch: {
+                id: 'branch-checks.yml',
+                name: 'Branch Checks',
+                path: '.github/workflows/branch-checks.yml',
+              },
+              e2e: {
+                id: 'branch-e2e.yml',
+                name: 'Branch E2E Checks',
+                path: '.github/workflows/branch-e2e.yml',
+              },
+              helm: {
+                id: 'helm-lint.yml',
+                name: 'Helm Lint',
+                path: '.github/workflows/helm-lint.yml',
+              },
+              windows: {
+                id: 'windows-msvc.yml',
+                name: 'Windows MSVC',
+                path: '.github/workflows/windows-msvc.yml',
+              },
+            };
+            const pullRunTitle = (workflow) =>
+              `${workflow.name} / PR #${pullNumber} / ${pull.head.sha} / `
+              + `approval ${approvalCommentId}`;
+            const statuses = await latestStatuses(pull.head.sha);
+
+            const isLabelEvent = context.eventName === 'pull_request_target'
+              && context.payload.action === 'labeled';
+            const standardWorkflows = new Map([
+              ['OpenShell / Branch Checks', pullWorkflows.branch],
+              ['OpenShell / Helm Lint', pullWorkflows.helm],
+            ]);
+            for (const [statusContext, workflow] of standardWorkflows) {
+              const title = pullRunTitle(workflow);
+              if (await trustedRunStillOwnsStatus(
+                statuses.get(statusContext),
+                workflow,
+                title,
+              )) {
+                core.info(`${statusContext} already points to the trusted run for this PR head.`);
+                continue;
+              }
+              const runUrl = await dispatch(workflow.id, commonInputs);
+              await postPullStatus(
+                statusContext,
+                'pending',
+                `${workflow.name} dispatched for approved SHA`,
+                runUrl,
+              );
+            }
+
+            if (runCoreE2e || runGpuE2e || runKubernetesE2e) {
+              const e2eTitle = `${pullRunTitle(pullWorkflows.e2e)}`
+                + ` / core ${runCoreE2e} / gpu ${runGpuE2e}`
+                + ` / kubernetes ${runKubernetesE2e}`;
+              const e2eContexts = [];
+              if (runCoreE2e) e2eContexts.push('OpenShell / E2E');
+              if (runGpuE2e) e2eContexts.push('OpenShell / GPU E2E');
+              const e2eRunExists = e2eContexts.length > 0
+                ? (await Promise.all(e2eContexts.map(
+                  (statusContext) => trustedRunStillOwnsStatus(
+                    statuses.get(statusContext),
+                    pullWorkflows.e2e,
+                    e2eTitle,
+                  ),
+                ))).every(Boolean)
+                : await trustedWorkflowRunExists(pullWorkflows.e2e, e2eTitle);
+              if (e2eRunExists) {
+                core.info('Branch E2E already has a trusted run for this PR head.');
+              } else {
+                const e2eUrl = await dispatch('branch-e2e.yml', {
+                  ...commonInputs,
+                  run_core_e2e: String(runCoreE2e),
+                  run_gpu_e2e: String(runGpuE2e),
+                  run_kubernetes_e2e: String(runKubernetesE2e),
+                });
+                if (runCoreE2e) {
+                  await postPullStatus(
+                    'OpenShell / E2E',
+                    'pending',
+                    'Branch E2E dispatched for approved SHA',
+                    e2eUrl,
+                  );
+                }
+                if (runGpuE2e) {
+                  await postPullStatus(
+                    'OpenShell / GPU E2E',
+                    'pending',
+                    'GPU E2E dispatched for approved SHA',
+                    e2eUrl,
+                  );
+                }
+              }
+            }
+
+            if (labels.has('test:windows')) {
+              const windowsTitle = pullRunTitle(pullWorkflows.windows);
+              const forceWindows = isLabelEvent && changedLabel === 'test:windows';
+              if (forceWindows || !await trustedWorkflowRunExists(
+                pullWorkflows.windows,
+                windowsTitle,
+              )) {
+                await dispatch('windows-msvc.yml', commonInputs);
+              } else {
+                core.info('Windows MSVC already has a trusted run for this PR head.');
+              }
+            }

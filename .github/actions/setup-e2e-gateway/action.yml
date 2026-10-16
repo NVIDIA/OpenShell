@@ -7,6 +7,11 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  binary:
+    description: Path to the prebuilt OpenShell gateway
+    value: ${{ steps.configure.outputs.binary }}
+
 runs:
   using: composite
   steps:
@@ -16,10 +21,11 @@ runs:
         name: ${{ inputs.artifact-name || (runner.arch == 'X64' && 'openshell-gateway-x86_64-unknown-linux-gnu' || 'openshell-gateway-aarch64-unknown-linux-gnu') }}
         path: .e2e/prebuilt-gateway
 
-    - name: Configure prebuilt gateway
+    - id: configure
+      name: Configure prebuilt gateway
       shell: bash
       run: |
         gateway="$GITHUB_WORKSPACE/.e2e/prebuilt-gateway/openshell-gateway"
         chmod +x "$gateway"
         "$gateway" --version
-        echo "OPENSHELL_GATEWAY_BIN=$gateway" >> "$GITHUB_ENV"
+        echo "binary=$gateway" >> "$GITHUB_OUTPUT"

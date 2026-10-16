@@ -19,9 +19,105 @@ env:
   OPENSHELL_TELEMETRY_ENABLED: "false"
 
 jobs:
+  authorize:
+    name: Authorize release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      candidate_sha: ${{ steps.authorize.outputs.candidate-sha }}
+    steps:
+      - id: authorize
+        name: Verify the triggering Release Dev run
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          script: |
+            const shaPattern = /^[0-9a-f]{40}$/;
+            if (context.eventName === 'workflow_dispatch') {
+              if (!shaPattern.test(context.sha)) {
+                core.setFailed('The manually dispatched revision is not an exact commit SHA.');
+                return;
+              }
+              core.setOutput('candidate-sha', context.sha);
+              return;
+            }
+
+            const runId = Number(context.payload.workflow_run?.id);
+            if (!Number.isSafeInteger(runId) || runId <= 0) {
+              core.setFailed('The workflow_run payload has no valid run ID.');
+              return;
+            }
+            const [{ data: run }, { data: trustedWorkflow }] = await Promise.all([
+              github.rest.actions.getWorkflowRun({ ...context.repo, run_id: runId }),
+              github.rest.actions.getWorkflow({
+                ...context.repo,
+                workflow_id: 'release-dev.yml',
+              }),
+            ]);
+            const expectedRepository = `${context.repo.owner}/${context.repo.repo}`;
+            const defaultBranch = context.payload.repository.default_branch;
+            const workflowPath = String(run.path || '').split('@', 1)[0];
+            const trustedPush = run.event === 'push' && run.head_branch === defaultBranch;
+            const trustedManual = run.event === 'workflow_dispatch' && run.actor?.login;
+            if (run.id !== runId
+                || run.workflow_id !== trustedWorkflow.id
+                || run.name !== 'Release Dev'
+                || workflowPath !== '.github/workflows/release-dev.yml'
+                || run.status !== 'completed'
+                || run.conclusion !== 'success'
+                || run.repository?.full_name !== expectedRepository
+                || run.head_repository?.full_name !== expectedRepository
+                || (!trustedPush && !trustedManual)
+                || !shaPattern.test(run.head_sha || '')) {
+              core.setFailed('The triggering run is not a trusted Release Dev run.');
+              return;
+            }
+
+            const { data: commit } = await github.rest.git.getCommit({
+              ...context.repo,
+              commit_sha: run.head_sha,
+            });
+            if (commit.sha !== run.head_sha) {
+              core.setFailed('The triggering revision is not in this repository.');
+              return;
+            }
+
+            if (trustedManual) {
+              const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo,
+                username: run.actor.login,
+              });
+              if (!['admin', 'maintain', 'write'].includes(permission.permission)) {
+                core.setFailed('The Release Dev dispatcher no longer has Write permission.');
+                return;
+              }
+              core.setOutput('candidate-sha', run.head_sha);
+              return;
+            }
+
+            const { data: defaultRef } = await github.rest.git.getRef({
+              ...context.repo,
+              ref: `heads/${defaultBranch}`,
+            });
+            if (defaultRef.object?.type !== 'commit'
+                || !shaPattern.test(defaultRef.object.sha || '')) {
+              core.setFailed('The default branch does not resolve to an exact commit.');
+              return;
+            }
+            const comparison = await github.rest.repos.compareCommitsWithBasehead({
+              ...context.repo,
+              basehead: `${run.head_sha}...${defaultRef.object.sha}`,
+            });
+            if (comparison.data.base_commit?.sha !== run.head_sha
+                || comparison.data.merge_base_commit?.sha !== run.head_sha) {
+              core.setFailed('The triggering revision is no longer on the default branch.');
+              return;
+            }
+            core.setOutput('candidate-sha', run.head_sha);
+
   macos:
     name: macOS Homebrew
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: authorize
+    if: needs.authorize.outputs.candidate_sha != ''
     runs-on: macos-latest-xlarge
     timeout-minutes: 20
     steps:
@@ -33,7 +129,7 @@ jobs:
       - name: Install and check gateway status
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ needs.authorize.outputs.candidate_sha }}/install.sh | sh
           openshell --version
           openshell status
 
@@ -55,7 +151,8 @@ jobs:
 
   ubuntu-deb:
     name: Ubuntu DEB
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: authorize
+    if: needs.authorize.outputs.candidate_sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -84,7 +181,7 @@ jobs:
       - name: Install and check status
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ needs.authorize.outputs.candidate_sha }}/install.sh | sh
           openshell status
           sandbox="rc-${GITHUB_RUN_ID}"
           openshell sandbox create --name "$sandbox" --detach
@@ -93,7 +190,8 @@ jobs:
 
   fedora:
     name: Fedora RPM
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: authorize
+    if: needs.authorize.outputs.candidate_sha != ''
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
     env:
@@ -172,7 +270,7 @@ jobs:
             OPENSHELL_VERSION="$OPENSHELL_VERSION" \
             OPENSHELL_TELEMETRY_ENABLED="$OPENSHELL_TELEMETRY_ENABLED" \
             CANARY_SANDBOX="rc-${GITHUB_RUN_ID}" \
-            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
+            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ needs.authorize.outputs.candidate_sha }}/install.sh" \
             bash -s <<'EOF'
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
@@ -193,7 +291,8 @@ jobs:
 
   ubuntu-snap-system-docker:
     name: Ubuntu snap with system Docker
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: authorize
+    if: needs.authorize.outputs.candidate_sha != ''
     runs-on: ubuntu-latest
     env:
       OPENSHELL_INSTALL_METHOD: snap
@@ -223,7 +322,7 @@ jobs:
           set -euo pipefail
           systemctl --user set-environment \
             "OPENSHELL_TELEMETRY_ENABLED=${OPENSHELL_TELEMETRY_ENABLED}"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh |
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ needs.authorize.outputs.candidate_sha }}/install.sh |
             DOCKER_HOST=unix:///tmp/nonexistent-docker.sock DOCKER_CONTEXT=nonexistent sh
           sudo snap list openshell
           if sudo snap list docker >/dev/null 2>&1; then
@@ -295,7 +394,8 @@ jobs:
 
   ubuntu-snap-docker-preflight:
     name: Ubuntu snap Docker preflight
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: authorize
+    if: needs.authorize.outputs.candidate_sha != ''
     runs-on: ubuntu-latest
     env:
       OPENSHELL_INSTALL_METHOD: snap
@@ -321,7 +421,7 @@ jobs:
       - name: Verify installer rejects missing Docker
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh -o install.sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ needs.authorize.outputs.candidate_sha }}/install.sh -o install.sh
           if OPENSHELL_VERSION=dev sh install.sh >install.log 2>&1; then
             echo "install.sh unexpectedly succeeded without Docker" >&2
             cat install.log >&2
@@ -357,7 +457,8 @@ jobs:
 
   kubernetes:
     name: Kubernetes Helm (kind)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs: authorize
+    if: needs.authorize.outputs.candidate_sha != ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -439,7 +540,7 @@ jobs:
           set -euo pipefail
           mkdir -p "${HOME}/.config/openshell"
           printf 'OPENSHELL_COMPUTE_DRIVER=docker\n' > "${HOME}/.config/openshell/gateway.env"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ needs.authorize.outputs.candidate_sha }}/install.sh | sh
 
       - name: Register kind gateway and check status
         run: |

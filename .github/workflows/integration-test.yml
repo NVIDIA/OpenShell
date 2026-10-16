@@ -8,14 +8,22 @@ on:
     inputs:
       artifact-run-id:
         description: Workflow run containing the candidate artifacts
-        required: false
+        required: true
         type: string
-        default: ""
       source-sha:
-        description: Candidate source revision; defaults to the artifact run head SHA
+        description: Exact candidate commit SHA used to build the artifacts
+        required: true
+        type: string
+      checkout-repository:
+        description: Repository containing source-sha; defaults to this repository
         required: false
         type: string
         default: ""
+      use-image-artifacts:
+        description: Load PR images from artifact-run-id; disable only for images published by Release Dev, Release, or Pre-release
+        required: true
+        type: boolean
+        default: true
       category:
         description: Integration-test category, used for the job name and concurrency key
         required: true
@@ -39,12 +47,16 @@ permissions:
   contents: read
   packages: read
 
+cache-mode: read
+
 jobs:
   prepare:
     uses: ./.github/workflows/prepare-integration-inputs.yml
     with:
       artifact-run-id: ${{ inputs['artifact-run-id'] }}
       source-sha: ${{ inputs['source-sha'] }}
+      checkout-repository: ${{ inputs['checkout-repository'] }}
+      use-image-artifacts: ${{ inputs['use-image-artifacts'] }}
       deb-artifact-name: ${{ contains(inputs.test-matrix, '"deb"') && 'deb-linux-amd64' || '' }}
       rpm-artifact-name: ${{ contains(inputs.test-matrix, '"rpm"') && 'rpm-linux-x86_64' || '' }}
 
@@ -54,5 +66,6 @@ jobs:
     with:
       category: ${{ inputs.category }}
       source-sha: ${{ needs.prepare.outputs.source_sha }}
+      checkout-repository: ${{ inputs['checkout-repository'] }}
       integration-inputs-artifact-id: ${{ needs.prepare.outputs.integration_inputs_artifact_id }}
       test-matrix: ${{ inputs.test-matrix }}

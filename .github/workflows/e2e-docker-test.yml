@@ -17,6 +17,15 @@ on:
         required: false
         type: string
         default: ""
+      checkout-repository:
+        description: Repository containing the candidate revision
+        required: false
+        type: string
+        default: ""
+      use-image-artifacts:
+        required: false
+        type: boolean
+        default: false
       gateway-artifact:
         required: false
         type: string
@@ -63,17 +72,26 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ inputs.checkout-repository || github.repository }}
           ref: ${{ inputs.checkout-ref || github.sha }}
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-e2e-cli
+      - if: inputs.use-image-artifacts
+        uses: $/.github/actions/load-image-artifacts
+        with:
+          engine: docker
+          image-tag: ${{ inputs.image-tag }}
 
-      - uses: ./.github/actions/setup-e2e-gateway
+      - id: prebuilt-cli
+        uses: $/.github/actions/setup-e2e-cli
+
+      - id: prebuilt-gateway
+        uses: $/.github/actions/setup-e2e-gateway
         with:
           artifact-name: ${{ inputs.gateway-artifact }}
 
       - if: inputs.external-driver-binary != ''
-        uses: ./.github/actions/setup-e2e-driver
+        uses: $/.github/actions/setup-e2e-driver
         with:
           binary: ${{ inputs.external-driver-binary }}
 
@@ -98,6 +116,7 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Log in to GHCR
+        if: inputs.use-image-artifacts == false
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
 
       - name: Install Python dependencies and generate protobuf stubs
@@ -106,5 +125,7 @@ jobs:
 
       - name: Run tests
         env:
+          OPENSHELL_BIN: ${{ steps.prebuilt-cli.outputs.binary }}
+          OPENSHELL_GATEWAY_BIN: ${{ steps.prebuilt-gateway.outputs.binary }}
           OPENSHELL_MCP_CONFORMANCE_CLIENT_IMAGE: ${{ format('openshell-mcp-conformance-client:{0}', inputs.image-tag) }}
         run: ${{ matrix.cmd }}

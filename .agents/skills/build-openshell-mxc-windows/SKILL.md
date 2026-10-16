@@ -204,16 +204,18 @@ order:
 The GitHub Actions jobs layer architecture-specific `Swatinem/rust-cache`
 entries for Cargo registry and dependency target artifacts with sccache's GHA
 backend for cacheable Rust compiler outputs. Failed runs also save their usable
-dependency artifacts. Pull-request mirrors labeled `test:windows` run Clippy for the
-Windows-supported workspace and e2e crates plus Rust tests. Pushes to `windows` and
+dependency artifacts. Exact-SHA-approved pull requests labeled `test:windows`
+run Clippy for the Windows-supported workspace and e2e crates plus Rust tests.
+Pushes to `windows` and
 manual dispatches on that branch run the same lint and test commands in a cache-seed job,
 followed by a dependent release-binary build job. The seed and PR jobs use the
-same cache namespaces, but pull-request mirrors cannot restore the
-`windows` branch cache because GitHub scopes caches by branch. Merge queues do
+same cache namespaces, but PR jobs use read-only cache access. Merge queues do
 not run this workflow. Release-branch seed
 and build jobs use job-level `continue-on-error: true`; opt-in PR jobs report
-failures normally. Applying the label alone does not start a run: re-run all
-jobs in the current mirror push run, or push a new mirrored commit. The binaries are not uploaded or published.
+failures normally. If the current SHA is already approved, applying the label
+dispatches the run. Otherwise, a maintainer must comment `/ok to test <SHA>`;
+the approval dispatches all labels present on that revision. Every new commit
+requires a new approval. The binaries are not uploaded or published.
 
 The ARM64 check/build steps in this x64-host contract are cross-builds. The
 wrapper discovers and adds host-native LLVM and Ninja to `PATH`, requires the
