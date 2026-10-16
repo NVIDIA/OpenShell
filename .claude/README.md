@@ -4,5 +4,5 @@ Agent skills are canonical in `.agents/skills/` and shared across all harnesses 
 
 ## Contents
 
-- `agents/` — Sub-agent persona definitions with Claude Code-specific frontmatter (`model`, `memory`, `color`, `tools`). The same personas exist in `.opencode/agents/` with OpenCode-specific config.
+- `agents/` — Sub-agent persona definitions with Claude Code-specific frontmatter (`model`, `memory`, `color`, `tools`). OpenCode loads these files through `{file:}` entries in `.opencode/opencode.jsonc`, so edit only the copy here.
 - `agent-memory/` — Persistent agent memory files. Claude Code runtime state, not portable across tools.
