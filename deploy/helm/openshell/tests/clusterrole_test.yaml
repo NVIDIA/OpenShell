@@ -106,14 +106,19 @@ tests:
             resources: ["secrets"]
             verbs: ["get", "create", "patch", "delete"]
 
-  - it: omits all Secret rules in operator mode
+  - it: leaves operator Secret access to namespace Roles
     set:
       server.drivers.kubernetes.workspaceMode: operator
-      server.tls.clientTlsSecretName: custom-client-tls
-      server.credentialDrivers.kubernetesSecrets.enabled: true
+      server.disableTls: true
     asserts:
       - notExists:
           path: rules[*].resources[?(@ == "secrets")]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["get", "create", "patch", "delete"]
 
   - it: names no Secrets in managed mode
     set:
@@ -131,6 +136,14 @@ tests:
             apiGroups: [""]
             resources: ["secrets"]
             verbs: ["create", "delete"]
+      - notExists:
+          path: rules[*].verbs[?(@ == "escalate")]
+      - notContains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "get", "list", "delete"]
 
   - it: omits secrets rule entirely in shared mode
     set:
@@ -182,6 +195,9 @@ tests:
             apiGroups: [""]
             resources: ["services"]
             verbs: ["create", "get"]
+      - notExists:
+          path: rules[*].resources[?(@ == "secrets")]
+
   - it: omits the ClusterRole when cluster-scoped RBAC is disabled
     set:
       rbac.clusterScoped.create: false

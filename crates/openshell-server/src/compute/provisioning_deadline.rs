@@ -269,6 +269,18 @@ pub(super) fn driver_operation_pending(sandbox: &openshell_core::proto::Sandbox)
         .is_some_and(|record| record.driver_operation_pending)
 }
 
+/// Older gateways could acknowledge cleanup without retiring allocation intent.
+/// Such records must be reclaimed again before an explicit start is permitted.
+pub(super) fn cleanup_pending(sandbox: &openshell_core::proto::Sandbox) -> bool {
+    timed_out(sandbox)
+        && (super::warm_pool::has_allocation(sandbox)
+            || sandbox
+                .status
+                .as_ref()
+                .and_then(|status| status.provisioning.as_ref())
+                .is_some_and(|record| record.cleanup_completed_time.is_none()))
+}
+
 /// Adopt an existing untimed attempt without granting it a new preparation phase.
 /// New create/start operations use `new_preparation_record` instead.
 pub fn new_record(now_ms: i64) -> SandboxProvisioning {
@@ -424,6 +436,34 @@ pub async fn refresh_configuration(
 }
 
 impl super::ComputeRuntime {
+    /// The caller holds the global configuration guard. Refresh committed
+    /// source clocks before deciding expiry, both in the scanner and recovery.
+    pub(super) async fn refresh_provisioning_deadline(
+        &self,
+        mut current: openshell_core::proto::Sandbox,
+        now_ms: i64,
+    ) -> Result<openshell_core::proto::Sandbox, String> {
+        use openshell_core::{ObjectId, proto::Sandbox};
+        let previous = current.clone();
+        refresh_configuration(&self.store, &mut current, now_ms).await?;
+        if current != previous {
+            current = self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    previous.object_id(),
+                    super::sandbox_resource_version(&previous),
+                    |sandbox| sandbox.status.clone_from(&current.status),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            self.sandbox_watch_bus.notify(previous.object_id());
+        }
+        Ok(self
+            .claim_provisioning_timeout(&current, now_ms)
+            .await?
+            .unwrap_or(current))
+    }
+
     pub(super) async fn provisioning_loop(
         self: std::sync::Arc<Self>,
         mut cancel: tokio::sync::watch::Receiver<bool>,
@@ -472,7 +512,7 @@ impl super::ComputeRuntime {
             let local_guard = self
                 .lock_sandbox_local_in_workspace(candidate.object_workspace(), &record.id)
                 .await;
-            let Some(mut current) = self
+            let Some(current) = self
                 .store
                 .get_message::<Sandbox>(&record.id)
                 .await
@@ -480,36 +520,19 @@ impl super::ComputeRuntime {
             else {
                 continue;
             };
-            let previous = current.clone();
-            refresh_configuration(&self.store, &mut current, now_ms).await?;
-            if current != previous {
-                current = self
-                    .store
-                    .update_message_cas::<Sandbox, _>(
-                        &record.id,
-                        super::sandbox_resource_version(&previous),
-                        |sandbox| sandbox.status.clone_from(&current.status),
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
-                self.sandbox_watch_bus.notify(&record.id);
-            }
-            if let Some(expired) = self.claim_provisioning_timeout(&current, now_ms).await? {
-                current = expired;
-            }
+            let current = self.refresh_provisioning_deadline(current, now_ms).await?;
             drop(local_guard);
-            if timed_out(&current)
+            if cleanup_pending(&current)
                 && current
                     .status
                     .as_ref()
                     .and_then(|status| status.provisioning.as_ref())
                     .is_some_and(|record| {
-                        record.cleanup_completed_time.is_none()
-                            && record
-                                .cleanup_retry_time
-                                .as_ref()
-                                .and_then(|t| timestamp_to_millis(t).ok())
-                                .is_none_or(|t| t <= now_ms)
+                        record
+                            .cleanup_retry_time
+                            .as_ref()
+                            .and_then(|t| timestamp_to_millis(t).ok())
+                            .is_none_or(|t| t <= now_ms)
                     })
             {
                 let Some(gate) = self.lifecycle_gates.try_lock_for(&record.id) else {
@@ -654,7 +677,7 @@ impl super::ComputeRuntime {
         else {
             return Ok(());
         };
-        if record.timeout_time.is_none() || record.cleanup_completed_time.is_some() {
+        if !cleanup_pending(expired) {
             return Ok(());
         }
         // A stop can observe NotFound before an in-flight create materializes
@@ -681,12 +704,13 @@ impl super::ComputeRuntime {
                     expired.object_id(),
                     super::sandbox_resource_version(expired),
                     |sandbox| {
-                        sandbox
+                        let record = sandbox
                             .status
                             .as_mut()
                             .and_then(|status| status.provisioning.as_mut())
-                            .expect("timeout record exists")
-                            .cleanup_retry_time =
+                            .expect("timeout record exists");
+                        record.cleanup_completed_time = None;
+                        record.cleanup_retry_time =
                             timestamp_from_millis(now_ms.saturating_add(35_000)).ok();
                     },
                 )
@@ -695,29 +719,42 @@ impl super::ComputeRuntime {
         }
         let sandbox_id = expired.object_id().to_string();
         let sandbox_name = expired.object_name().to_string();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.driver.call(
-                openshell_otel::rpc::STOP_SANDBOX,
-                Some(&sandbox_id),
-                |driver| {
-                    let sandbox_id = sandbox_id.clone();
-                    async move {
-                        driver
-                            .stop_sandbox(tonic::Request::new(StopSandboxRequest {
-                                sandbox_id,
-                                name: sandbox_name,
-                            }))
-                            .await
-                    }
-                },
-            ),
-        )
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            super::warm_pool::retire_pending_allocation(self, expired).await?;
+            match self
+                .driver
+                .call(
+                    openshell_otel::rpc::STOP_SANDBOX,
+                    Some(&sandbox_id),
+                    |driver| {
+                        let sandbox_id = sandbox_id.clone();
+                        async move {
+                            driver
+                                .stop_sandbox(tonic::Request::new(StopSandboxRequest {
+                                    sandbox_id,
+                                    name: sandbox_name,
+                                }))
+                                .await
+                        }
+                    },
+                )
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) if error.code() == tonic::Code::NotFound => Ok(()),
+                Err(error) => Err(error),
+            }
+        })
         .await;
         let reclaimed = !pending_before_stop
-            && (matches!(&result, Ok(Ok(_)))
+            && (matches!(&result, Ok(Ok(())))
                 || matches!(&result, Ok(Err(error)) if error.code() == tonic::Code::NotFound));
         let _sandbox_guard = self.lock_sandbox_for_lifecycle(lifecycle_guard).await;
+        if reclaimed {
+            super::warm_pool::release_allocation(self, expired)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         let Some(current) = self
             .store
             .get_message::<Sandbox>(&sandbox_id)
@@ -753,6 +790,7 @@ impl super::ComputeRuntime {
                         record.cleanup_completed_time = timestamp_from_millis(completed_at_ms).ok();
                         record.cleanup_error.clear();
                         record.cleanup_retry_time = None;
+                        super::warm_pool::clear_allocation(sandbox);
                     } else {
                         record.cleanup_error =
                             "Compute reclamation is pending; the gateway will retry".into();

@@ -732,6 +732,9 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
                 match &sandbox.source {
                     SandboxIdentitySource::BootstrapJwt { .. } => "bootstrap_jwt",
                     SandboxIdentitySource::ComputeDriver { .. } => "compute_driver",
+                    SandboxIdentitySource::SupervisorRegistration { .. } => {
+                        "supervisor_registration"
+                    }
                 }
                 .to_string(),
             );

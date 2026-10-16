@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: Managed bootstrap journal permissions
+templates:
+  - templates/pair-journal-role.yaml
+  - templates/pair-journal-rolebinding.yaml
+release:
+  name: openshell
+  namespace: gateway-system
+tests:
+  - it: grants journal permissions for canonical managed mode
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: managed
+    asserts:
+      - hasDocuments:
+          count: 1
+  - it: canonical shared mode overrides legacy managed mode
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: shared
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: scopes managed journal access to the driver namespace
+    template: templates/pair-journal-role.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.sandboxNamespace: sandbox-system
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: sandbox-system
+      - contains:
+          path: rules
+          content:
+            apiGroups: [""]
+            resources: ["secrets"]
+            verbs: ["create", "get", "list", "delete"]
+  - it: binds only the configured gateway service account
+    template: templates/pair-journal-rolebinding.yaml
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      server.sandboxNamespace: sandbox-system
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: sandbox-system
+      - equal:
+          path: subjects[0].namespace
+          value: gateway-system
+      - equal:
+          path: roleRef.kind
+          value: Role
+  - it: omits managed journal permissions in operator mode
+    set:
+      server.drivers.kubernetes.workspaceMode: operator
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: omits managed journal permissions in shared mode
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: respects externally provisioned RBAC
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      rbac.create: false
+    asserts:
+      - hasDocuments:
+          count: 0

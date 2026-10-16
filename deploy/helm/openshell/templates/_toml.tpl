@@ -143,6 +143,13 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if not (hasKey $config "openshell.drivers.kubernetes.managed_ssh_ingress") -}}
 {{- $_ := set $config "openshell.drivers.kubernetes.managed_ssh_ingress" (dict "enabled" .Values.networkPolicy.enabled "gateway_namespace" .Release.Namespace "gateway_pod_selector" (dict "app.kubernetes.io/name" (include "openshell.name" .) "app.kubernetes.io/instance" .Release.Name)) -}}
 {{- end -}}
+{{- $warmPool := get $config "openshell.drivers.kubernetes.warm_pool" | default dict -}}
+{{- $legacyWarmPool := get $legacyKubernetes "warmPool" | default dict -}}
+{{/* Reused values may lack warmPool; omitted fields use the driver's typed defaults. */}}
+{{- range $legacyKey, $runtimeKey := dict "enabled" "enabled" "maxPairs" "max_pairs" "preparationTimeoutSeconds" "preparation_timeout_seconds" "maxIdleSeconds" "max_idle_seconds" -}}
+{{- if and (not (hasKey $warmPool $runtimeKey)) (hasKey $legacyWarmPool $legacyKey) -}}{{- $_ := set $warmPool $runtimeKey (get $legacyWarmPool $legacyKey) -}}{{- end -}}
+{{- end -}}
+{{- $_ := set $config "openshell.drivers.kubernetes.warm_pool" $warmPool -}}
 {{- $legacyOidc := get $legacyServer "oidc" | default dict -}}
 {{- $oidcConfig := get $config "openshell.gateway.oidc" | default dict -}}
 {{- if or (hasKey $config "openshell.gateway.oidc") (get $legacyOidc "issuer") -}}
