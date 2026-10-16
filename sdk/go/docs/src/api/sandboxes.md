@@ -47,7 +47,7 @@ sb, err := client.CreateSandboxFromTemplate(ctx,
         Providers: []string{"openai"},
         Policy:    policy,
     },
-    map[string]string{"team": "platform"},
+    v1.WithLabels(map[string]string{"team": "platform"}),
 )
 ```
 
