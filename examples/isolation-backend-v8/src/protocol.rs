@@ -24,7 +24,7 @@ mod openshell {
 pub use openshell::extension::v1::{PeerMetadata, ProtocolVersion};
 pub use openshell::sandbox::{backend::v1 as control, protocol::v1 as boundary};
 
-pub const BACKEND: &str = "example-v8";
+pub const BACKEND: &str = "js-sbx";
 pub const CAPABILITY: &str = "openshell.sandbox.protocol";
 
 pub fn metadata() -> PeerMetadata {
@@ -45,7 +45,7 @@ fn convert<T: prost::Message, U: prost::Message + Default>(value: T) -> Result<U
 }
 
 pub async fn read_request(
-    input: &mut tonic::Streaming<boundary::SandboxFrame>,
+    input: &mut tonic::Streaming<boundary::ExchangeFrame>,
 ) -> Result<openshell_sandbox_backend::boundary_protocol::RequestEnvelope, tonic::Status> {
     use openshell_sandbox_backend::{boundary_protocol as wire, protobuf::WireMessage};
     use prost::Message;
@@ -56,23 +56,55 @@ pub async fn read_request(
     if chunk.encoded_len() > openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES {
         return Err(tonic::Status::resource_exhausted("request too large"));
     }
-    let Some(boundary::sandbox_frame::Payload::Request(request)) = chunk.payload else {
+    let Some(boundary::exchange_frame::Payload::Request(request)) = chunk.payload else {
         return Err(tonic::Status::invalid_argument("typed request required"));
     };
     wire::RequestEnvelope::from_proto(convert(request)?)
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
 }
 
-pub fn data(bytes: Vec<u8>) -> boundary::SandboxFrame {
-    boundary::SandboxFrame {
-        payload: Some(boundary::sandbox_frame::Payload::RelayData(bytes)),
+pub async fn read_mediation_request(
+    input: &mut tonic::Streaming<boundary::MediateFrame>,
+) -> Result<openshell_sandbox_backend::boundary_protocol::RequestEnvelope, tonic::Status> {
+    use openshell_sandbox_backend::{boundary_protocol as wire, protobuf::WireMessage};
+    use prost::Message;
+    let frame = input
+        .message()
+        .await?
+        .ok_or_else(|| tonic::Status::invalid_argument("request required"))?;
+    if frame.encoded_len() > openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES {
+        return Err(tonic::Status::resource_exhausted("request too large"));
     }
+    let Some(boundary::mediate_frame::Payload::Request(request)) = frame.payload else {
+        return Err(tonic::Status::invalid_argument("OpenMediation required"));
+    };
+    let request = wire::RequestEnvelope::from_proto(convert(request)?)
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    if !matches!(request.request, wire::Request::OpenMediation) {
+        return Err(tonic::Status::invalid_argument(
+            "only OpenMediation is allowed on Mediate",
+        ));
+    }
+    Ok(request)
+}
+
+pub fn mediation_response(
+    request_id: String,
+    value: openshell_sandbox_backend::boundary_protocol::Response,
+) -> Result<boundary::MediateFrame, tonic::Status> {
+    let frame = response(request_id, value)?;
+    let Some(boundary::exchange_frame::Payload::Response(value)) = frame.payload else {
+        unreachable!();
+    };
+    Ok(boundary::MediateFrame {
+        payload: Some(boundary::mediate_frame::Payload::Response(value)),
+    })
 }
 
 pub fn response(
     request_id: String,
     response: openshell_sandbox_backend::boundary_protocol::Response,
-) -> Result<boundary::SandboxFrame, tonic::Status> {
+) -> Result<boundary::ExchangeFrame, tonic::Status> {
     use openshell_sandbox_backend::{boundary_protocol as wire, protobuf::WireMessage};
     let value = wire::ResponseEnvelope {
         request_id,
@@ -80,13 +112,13 @@ pub fn response(
     }
     .to_proto()
     .map_err(|error| tonic::Status::internal(error.to_string()))?;
-    Ok(boundary::SandboxFrame {
-        payload: Some(boundary::sandbox_frame::Payload::Response(convert(value)?)),
+    Ok(boundary::ExchangeFrame {
+        payload: Some(boundary::exchange_frame::Payload::Response(convert(value)?)),
     })
 }
 
-pub fn stream_frame(channel: u8, payload: &[u8]) -> Result<boundary::SandboxFrame, tonic::Status> {
-    use boundary::sandbox_frame::Payload;
+pub fn stream_frame(channel: u8, payload: &[u8]) -> Result<boundary::ExchangeFrame, tonic::Status> {
+    use boundary::exchange_frame::Payload;
     use openshell_sandbox_backend::{
         boundary_protocol as wire,
         protobuf::{self, WireMessage},
@@ -109,15 +141,7 @@ pub fn stream_frame(channel: u8, payload: &[u8]) -> Result<boundary::SandboxFram
             ));
         }
     };
-    Ok(boundary::SandboxFrame {
+    Ok(boundary::ExchangeFrame {
         payload: Some(payload),
     })
-}
-
-pub fn tcp_open_decision(
-    value: boundary::TcpOpenDecision,
-) -> Result<openshell_isolation_interface::contract::TcpOpenDecision, tonic::Status> {
-    use openshell_sandbox_backend::protobuf::WireMessage;
-    openshell_isolation_interface::contract::TcpOpenDecision::from_proto(convert(value)?)
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))
 }

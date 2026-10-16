@@ -17,6 +17,7 @@ test-support = []
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 async-trait = "0.1"
+bytes = { workspace = true }
 hyper-util = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
@@ -29,6 +30,7 @@ sha2 = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
 tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }

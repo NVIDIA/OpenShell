@@ -212,8 +212,8 @@ message DriverSandboxSpec {
   bytes launch_authentication = 16 [(openshell.options.v1.secret) = true];
   // Operator-selected external isolation backend. Never derived from the
   // public sandbox spec or workload environment. Omitted for the built-in
-  // runtime. Requires openshell.compute.sandbox-backend.
-  SandboxBackendRegistration isolation_backend = 17;
+  // runtime. Requires openshell.compute.isolation-backend.
+  IsolationBackendRegistration isolation_backend = 17;
 }
 
 // Trusted operator registration delivered to the compute driver on every
@@ -221,24 +221,24 @@ message DriverSandboxSpec {
 // exact name, and supplies its opaque descriptor and generation-specific launch
 // coordinates to the stock supervisor. It must reject unsupported selections
 // before provisioning; it must never fall back to another isolation backend.
-message SandboxBackendRegistration {
+message IsolationBackendRegistration {
   string name = 1;
   oneof endpoint {
     // Absolute path in the supervisor's filesystem namespace.
     string unix_socket_path = 2;
-    SandboxBackendTcpEndpoint tcp = 3;
-    SandboxBackendVsockEndpoint vsock = 4;
+    IsolationBackendTcpEndpoint tcp = 3;
+    IsolationBackendVsockEndpoint vsock = 4;
   }
 }
 
-message SandboxBackendTcpEndpoint {
+message IsolationBackendTcpEndpoint {
   // Logical HTTP authority; generation-specific TLS identity is driver-owned.
   string authority = 1;
   // Operator-pinned socket addresses reachable from the supervisor.
   repeated string addresses = 2;
 }
 
-message SandboxBackendVsockEndpoint {
+message IsolationBackendVsockEndpoint {
   uint32 guest_cid = 1;
   uint32 port = 2;
 }
@@ -461,7 +461,7 @@ message StartSandboxRequest {
   // The gateway pins the backend name at creation and rejects start/recovery
   // under a different selection. Operator endpoints may change without
   // changing that identity; the driver still validates the retained resource.
-  SandboxBackendRegistration isolation_backend = 6;
+  IsolationBackendRegistration isolation_backend = 6;
 }
 
 message StartSandboxResponse {

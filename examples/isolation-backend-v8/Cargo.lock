@@ -1059,6 +1059,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "js-sbx"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "clap",
+ "openshell-core",
+ "openshell-isolation-interface",
+ "openshell-sandbox-backend",
+ "prost",
+ "prost-types",
+ "protoc-bin-vendored",
+ "rustix 1.1.5",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "uuid",
+ "v8",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1389,6 +1418,7 @@ name = "openshell-sandbox-backend"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "hyper-util",
  "libc",
  "openshell-core",
@@ -1407,40 +1437,12 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tower",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "openshell-v8-backend-example"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "clap",
- "openshell-core",
- "openshell-isolation-interface",
- "openshell-sandbox-backend",
- "prost",
- "prost-types",
- "protoc-bin-vendored",
- "rustix 1.1.5",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-rustls",
- "tokio-stream",
- "tonic",
- "tonic-prost",
- "tonic-prost-build",
- "uuid",
- "v8",
 ]
 
 [[package]]

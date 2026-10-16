@@ -8,17 +8,17 @@ use tokio_stream::StreamExt as _;
 /// workload stops reading a relayed download. Other streams echo one chunk.
 #[derive(Clone)]
 struct StallingPeer {
-    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<SandboxFrame>>>>,
+    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<ExchangeFrame>>>>,
 }
 
 #[tonic::async_trait]
 impl SandboxProtocol for StallingPeer {
     type ExchangeStream = TestGrpcStream;
-    type MediateStream = TestGrpcStream;
+    type MediateStream = TestGrpcStream<MediateFrame>;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<SandboxFrame>>,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         let stall = request.metadata().get("x-stall").is_some();
         let mut inbound = request.into_inner();
@@ -52,7 +52,7 @@ impl SandboxProtocol for StallingPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<SandboxFrame>>,
+        _request: tonic::Request<tonic::Streaming<MediateFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("flow-control fixture"))
     }
@@ -96,10 +96,10 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
 }
 
 /// Push into one stalled stream until the peer stops granting credit.
-async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<SandboxFrame> {
+async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<ExchangeFrame> {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     sender
-        .send(sandbox_frame(TEST_BOUNDARY_HANDLE))
+        .send(exchange_frame(TEST_BOUNDARY_HANDLE))
         .await
         .unwrap();
     let mut request = tonic::Request::new(ReceiverStream::new(receiver));

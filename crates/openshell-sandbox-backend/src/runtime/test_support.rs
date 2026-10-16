@@ -6,11 +6,12 @@
 use crate::boundary_protocol::{self as w, Request, RequestEnvelope, Response, ResponseEnvelope};
 use crate::proto::{
     self as p,
-    sandbox_frame::Payload,
+    exchange_frame::Payload,
     sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
 };
 use crate::protobuf::WireMessage as _;
 use crate::runtime::BoundaryClient;
+use crate::stream_adapter::{Mode, ProtocolFrame};
 use async_trait::async_trait;
 use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionBearerTokenSlot};
 use openshell_core::provider_credentials::ProviderCredentialState;
@@ -110,12 +111,12 @@ struct Peer {
     terminals: Mutex<HashMap<String, Arc<dyn BoundaryTerminal>>>,
 }
 
-type Stream =
-    Pin<Box<dyn tokio_stream::Stream<Item = Result<p::SandboxFrame, tonic::Status>> + Send>>;
-type Sender = mpsc::Sender<Result<p::SandboxFrame, tonic::Status>>;
+type Stream<F = p::ExchangeFrame> =
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<F, tonic::Status>> + Send>>;
+type Sender<F = p::ExchangeFrame> = mpsc::Sender<Result<F, tonic::Status>>;
 
-fn chunk(payload: Payload) -> p::SandboxFrame {
-    p::SandboxFrame {
+fn chunk(payload: Payload) -> p::ExchangeFrame {
+    p::ExchangeFrame {
         payload: Some(payload),
     }
 }
@@ -137,7 +138,7 @@ impl Peer {
     }
     async fn exchange(
         self: Arc<Self>,
-        mut input: tonic::Streaming<p::SandboxFrame>,
+        mut input: tonic::Streaming<p::ExchangeFrame>,
         out: Sender,
         request: RequestEnvelope,
     ) -> Result<(), BackendError> {
@@ -177,14 +178,14 @@ impl Peer {
             Request::Wait { process_id } => Response::Exited {
                 status: self.process(&process_id)?.wait().await?.into(),
             },
-            Request::ExecSignal {
+            Request::Signal {
                 process_id,
                 signal: w::SignalWire::Kill,
             } => {
                 self.process(&process_id)?.terminate().await?;
                 Response::Signaled
             }
-            Request::Signal { process_id, signal } | Request::ExecSignal { process_id, signal } => {
+            Request::Signal { process_id, signal } => {
                 self.process(&process_id)?.signal(signal.into()).await?;
                 Response::Signaled
             }
@@ -236,7 +237,6 @@ impl Peer {
                     applied: true,
                 }
             }
-            Request::ProbeProviderFiles => Response::ProviderFilesSupported,
             Request::Exec { spec } => {
                 let a = self
                     .exec
@@ -320,10 +320,10 @@ struct Service(Arc<Peer>);
 #[tonic::async_trait]
 impl SandboxProtocol for Service {
     type ExchangeStream = Stream;
-    type MediateStream = Stream;
+    type MediateStream = Stream<p::MediateFrame>;
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<p::SandboxFrame>>,
+        request: tonic::Request<tonic::Streaming<p::ExchangeFrame>>,
     ) -> Result<tonic::Response<Stream>, tonic::Status> {
         let (out, rx) = mpsc::channel(8);
         let peer = self.0.clone();
@@ -348,8 +348,8 @@ impl SandboxProtocol for Service {
     }
     async fn mediate(
         &self,
-        request: tonic::Request<tonic::Streaming<p::SandboxFrame>>,
-    ) -> Result<tonic::Response<Stream>, tonic::Status> {
+        request: tonic::Request<tonic::Streaming<p::MediateFrame>>,
+    ) -> Result<tonic::Response<Stream<p::MediateFrame>>, tonic::Status> {
         let (out, rx) = mpsc::channel(8);
         let source = self.0.network.clone();
         tokio::spawn(async move {
@@ -388,7 +388,13 @@ impl SandboxProtocol for Service {
                     let mut wire = message.to_proto().unwrap();
                     wire.stream_id = stream_id;
                     pending.insert(stream_id, query.response);
-                    if out.send(Ok(chunk(Payload::DnsQuery(wire)))).await.is_err() {
+                    if out
+                        .send(Ok(p::MediateFrame {
+                            payload: Some(p::mediate_frame::Payload::DnsQuery(wire)),
+                        }))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                     stream_id += 1;
@@ -399,7 +405,7 @@ impl SandboxProtocol for Service {
                         match query {Ok(q)=>next=Some(q),Err(_)=>break}
                     },
                     response=input.message()=>{
-                        if let Ok(Some(p::SandboxFrame{payload:Some(Payload::DnsResponse(r))}))=response {
+                        if let Ok(Some(p::MediateFrame{payload:Some(p::mediate_frame::Payload::DnsResponse(r))}))=response {
                             if let Some(sender)=pending.remove(&r.stream_id){
                                 let result=match r.result {Some(p::dns_response::Result::Response(v))=>Ok(v),_=>Err(unsupported())};
                                 let _=sender.send(result);
@@ -412,26 +418,22 @@ impl SandboxProtocol for Service {
         Ok(tonic::Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 }
-async fn read_request(
-    input: &mut tonic::Streaming<p::SandboxFrame>,
+async fn read_request<F: ProtocolFrame>(
+    input: &mut tonic::Streaming<F>,
 ) -> Result<RequestEnvelope, tonic::Status> {
     let first = input
         .message()
-        .await
-        .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
-    assert!(matches!(
-        first.and_then(|c| c.payload),
-        Some(Payload::BoundaryId(_))
-    ));
-    let Some(Payload::Request(request)) = input
+        .await?
+        .ok_or_else(|| tonic::Status::invalid_argument("missing boundary binding"))?;
+    assert!(first.boundary_id().is_some());
+    let request = input
         .message()
-        .await
-        .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?
-        .and_then(|c| c.payload)
-    else {
-        return Err(tonic::Status::invalid_argument("missing request"));
-    };
-    RequestEnvelope::from_proto(request).map_err(|e| tonic::Status::invalid_argument(e.to_string()))
+        .await?
+        .ok_or_else(|| tonic::Status::invalid_argument("missing request"))?;
+    let bytes = request
+        .receive(&mut Mode::Request)
+        .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
+    w::decode_frame(&bytes).map_err(|e| tonic::Status::invalid_argument(e.to_string()))
 }
 fn error_response(e: BackendError) -> Response {
     Response::Error {
@@ -445,19 +447,17 @@ fn error_response(e: BackendError) -> Response {
         message: e.to_string(),
     }
 }
-async fn send_response(out: &Sender, id: String, response: Response) {
-    send(
-        out,
-        Payload::Response(
-            ResponseEnvelope {
-                request_id: id,
-                response,
-            }
-            .to_proto()
-            .unwrap(),
-        ),
-    )
-    .await;
+async fn send_response<F: ProtocolFrame>(out: &Sender<F>, id: String, response: Response) {
+    let bytes = w::encode_frame(&ResponseEnvelope {
+        request_id: id,
+        response,
+    })
+    .unwrap();
+    let frame = F::send(&mut bytes.as_slice(), &mut Mode::Response)
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = out.send(Ok(frame)).await;
 }
 
 async fn output(mut reader: BoundaryOutput, out: Sender, stderr: bool) {
@@ -480,7 +480,7 @@ async fn output(mut reader: BoundaryOutput, out: Sender, stderr: bool) {
     }
 }
 async fn process_io(
-    mut input: tonic::Streaming<p::SandboxFrame>,
+    mut input: tonic::Streaming<p::ExchangeFrame>,
     out: Sender,
     stdin: Option<BoundaryInput>,
     stdout: BoundaryOutput,
@@ -550,7 +550,7 @@ async fn process_io(
     read.abort();
 }
 async fn relay_io(
-    mut input: tonic::Streaming<p::SandboxFrame>,
+    mut input: tonic::Streaming<p::ExchangeFrame>,
     out: Sender,
     stream: BoundaryDuplexStream,
 ) {

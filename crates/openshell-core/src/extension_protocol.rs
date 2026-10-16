@@ -20,7 +20,7 @@ pub const PROTOCOL_MINOR: u32 = 0;
 pub const COMPUTE_LAUNCH_AUTHENTICATION: &str = "openshell.compute.launch-authentication";
 
 /// Driver stages operator-selected external isolation routes for the supervisor.
-pub const COMPUTE_SANDBOX_BACKEND: &str = "openshell.compute.sandbox-backend";
+pub const COMPUTE_ISOLATION_BACKEND: &str = "openshell.compute.isolation-backend";
 
 const MAX_IMPLEMENTATION_NAME_BYTES: usize = 128;
 const MAX_IMPLEMENTATION_VERSION_BYTES: usize = 128;
@@ -124,7 +124,7 @@ pub fn gateway_metadata(family: ExtensionFamily) -> PeerMetadata {
     let mut supported_capabilities = vec![contract.clone()];
     if family == ExtensionFamily::Compute {
         supported_capabilities.push(COMPUTE_LAUNCH_AUTHENTICATION.to_string());
-        supported_capabilities.push(COMPUTE_SANDBOX_BACKEND.to_string());
+        supported_capabilities.push(COMPUTE_ISOLATION_BACKEND.to_string());
     }
     PeerMetadata {
         protocol_version: Some(ProtocolVersion {

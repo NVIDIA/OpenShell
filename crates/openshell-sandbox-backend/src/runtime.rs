@@ -14,10 +14,10 @@ use crate::backend_proto::{
     DescribeIsolationBackendRequest, OpenBoundaryRequest,
     isolation_backend_client::IsolationBackendClient, open_boundary_response::LaunchOutcome,
 };
-use crate::isolation_protocol::sandbox_frame;
 #[cfg(test)]
 use crate::isolation_protocol::{chunk_data, data_chunk};
-use crate::proto::{SandboxFrame, sandbox_protocol_client::SandboxProtocolClient};
+use crate::proto::{ExchangeFrame, MediateFrame, sandbox_protocol_client::SandboxProtocolClient};
+use crate::stream_adapter::ProtocolFrame;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use openshell_isolation_interface::AgentSpec;
@@ -210,7 +210,6 @@ impl OpenShellRuntimeBackend {
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
                 policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
-                resource_claims: resource_claims.clone(),
             })
             .await?;
         let Response::Attached { snapshot } = response else {
@@ -224,7 +223,6 @@ impl OpenShellRuntimeBackend {
         Ok(Box::new(BoundBoundary {
             client: client.clone(),
             agent: sandbox.agent,
-            policy: sandbox.policy,
             sandbox_id: sandbox.sandbox_id,
             mediation: Arc::new(NetworkMediationSource { client }),
             host_gateway_ip,
@@ -335,7 +333,6 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
 pub struct BoundBoundary {
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
-    policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
     mediation: Arc<NetworkMediationSource>,
     host_gateway_ip: Option<std::net::IpAddr>,
@@ -381,7 +378,6 @@ impl BoundBoundary {
             Box::new(ReadyBoundary {
                 client: self.client,
                 agent: self.agent,
-                policy: self.policy,
                 sandbox_id: self.sandbox_id,
                 ca_file_paths: self.ca_file_paths,
                 provider_credentials: self.provider_credentials,
@@ -397,7 +393,6 @@ impl BoundBoundary {
 pub struct ReadyBoundary {
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
-    policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
@@ -432,26 +427,11 @@ impl ReadyBoundary {
             .map_err(|error| {
                 BackendError::Process(format!("snapshot provider environment: {error}"))
             })?;
-        if !provider_snapshot.files.is_empty() {
-            let response = self
-                .client
-                .call_idempotent(Request::ProbeProviderFiles)
-                .await
-                .map_err(|error| {
-                    BackendError::Process(format!("provider file capability probe failed: {error}"))
-                })?;
-            if !matches!(response, Response::ProviderFilesSupported) {
-                return Err(BackendError::Process(
-                    "sandbox boundary does not support provider files".to_string(),
-                ));
-            }
-        }
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
                 sandbox_id: self.sandbox_id,
                 spec: AgentSpecWire::from(self.agent),
-                policy: Box::new(SandboxPolicyWire::from(self.policy)),
                 ca_cert,
                 ca_bundle,
                 provider_env_revision: provider_snapshot.revision,
@@ -551,16 +531,9 @@ impl BoundaryProcess {
     pub async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
         let response = self
             .client
-            .call_idempotent(if self.exec {
-                Request::ExecSignal {
-                    process_id: self.process_id.clone(),
-                    signal: SignalWire::from(signal),
-                }
-            } else {
-                Request::Signal {
-                    process_id: self.process_id.clone(),
-                    signal: SignalWire::from(signal),
-                }
+            .call_idempotent(Request::Signal {
+                process_id: self.process_id.clone(),
+                signal: SignalWire::from(signal),
             })
             .await?;
         expect_response(response, "signaled")
@@ -676,22 +649,6 @@ impl BoundaryExec {
                 .map_err(|error| {
                     BackendError::Process(format!("snapshot provider environment: {error}"))
                 })?;
-            if !snapshot.files.is_empty() {
-                let response = self
-                    .client
-                    .call_idempotent(Request::ProbeProviderFiles)
-                    .await
-                    .map_err(|error| {
-                        BackendError::Process(format!(
-                            "provider file capability probe failed: {error}"
-                        ))
-                    })?;
-                if !matches!(response, Response::ProviderFilesSupported) {
-                    return Err(BackendError::Process(
-                        "sandbox boundary does not support provider files".to_string(),
-                    ));
-                }
-            }
             *generation = generation.checked_add(1).ok_or_else(|| {
                 BackendError::Process("provider environment publication exhausted".to_string())
             })?;
@@ -1504,9 +1461,10 @@ impl BoundaryClient {
             BackendError::Unavailable(format!("flush boundary control request: {error}"))
         })?;
         let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await.map_err(|error| {
-            BackendError::Unavailable(format!("read boundary control response header: {error}"))
-        })?;
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(control_read_error)?;
         let declared = u32::from_be_bytes(header) as usize;
         if declared > MAX_CONTROL_FRAME_BYTES {
             return Err(BackendError::Process(format!(
@@ -1516,9 +1474,10 @@ impl BoundaryClient {
         let mut frame = Vec::with_capacity(4 + declared);
         frame.extend_from_slice(&header);
         frame.resize(4 + declared, 0);
-        stream.read_exact(&mut frame[4..]).await.map_err(|error| {
-            BackendError::Unavailable(format!("read boundary control response: {error}"))
-        })?;
+        stream
+            .read_exact(&mut frame[4..])
+            .await
+            .map_err(control_read_error)?;
         let response: ResponseEnvelope = decode_frame(&frame)
             .map_err(|error| BackendError::Process(format!("decode control response: {error}")))?;
         if response.request_id != request_id {
@@ -1795,8 +1754,9 @@ impl BoundaryClient {
         let response =
             crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
                 .await
-                .map_err(|error| {
-                    BackendError::Unavailable(format!("read boundary control response: {error}"))
+                .map_err(|error| match error {
+                    crate::boundary_protocol::FrameError::Io(error) => control_read_error(error),
+                    error => BackendError::Descriptor(format!("decode control response: {error}")),
                 })?;
         if response.request_id != request_id {
             return Err(BackendError::Process(
@@ -1914,14 +1874,22 @@ impl BoundaryClient {
         let connector = self.connector.clone();
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
-        let endpoint =
-            tonic::transport::Endpoint::from_static("http://boundary.openshell.internal")
-                .initial_stream_window_size(crate::boundary_protocol::BOUNDARY_STREAM_WINDOW_BYTES)
-                .initial_connection_window_size(
-                    crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
-                )
-                .http2_keep_alive_interval(Duration::from_secs(10))
-                .keep_alive_while_idle(true);
+        let authority = match &runtime_descriptor.transport {
+            SandboxTransport::Tcp { authority, .. } => authority.as_str(),
+            SandboxTransport::Unix { .. } | SandboxTransport::Vsock { .. } => {
+                "boundary.openshell.internal"
+            }
+        };
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{authority}"))
+            .map_err(|error| {
+                BackendError::Descriptor(format!("invalid boundary authority: {error}"))
+            })?
+            .initial_stream_window_size(crate::boundary_protocol::BOUNDARY_STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(
+                crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
+            )
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
         let channel = endpoint
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let runtime_descriptor = runtime_descriptor.clone();
@@ -1989,11 +1957,8 @@ impl BoundaryClient {
             .into_inner();
         crate::isolation_protocol::negotiate(&supervisor, response.backend)
             .map_err(control_rpc_error)?;
-        let descriptor = &self.runtime_descriptor;
         let mut request = tonic::Request::new(OpenBoundaryRequest {
-            sandbox_id: descriptor.boundary_id.clone(),
-            session_id: descriptor.session_id.to_string(),
-            generation_id: descriptor.generation.clone(),
+            session_id: self.runtime_descriptor.session_id.to_string(),
             backend_name: self.backend_name.clone(),
             driver_descriptor: self.driver_descriptor.clone(),
         });
@@ -2147,47 +2112,63 @@ async fn open_grpc_client_stream_with_authorization(
     authorization: tonic::metadata::AsciiMetadataValue,
     boundary_id: &str,
 ) -> Result<BoundaryDuplexStream, BackendError> {
-    let (application, bridge) = tokio::io::duplex(256 * 1024);
-    let (reader, writer) = tokio::io::split(bridge);
-    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<SandboxFrame>(64);
-    outbound
-        .send(sandbox_frame(boundary_id))
-        .await
-        .map_err(|_| BackendError::Unavailable("queue boundary binding frame".to_string()))?;
-    tokio::spawn(pump_to_grpc(reader, outbound));
     let mut client = SandboxProtocolClient::new(channel)
         .max_decoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES);
-    let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
-    request
-        .metadata_mut()
-        .insert("authorization", authorization);
-    let response = match kind {
-        GrpcStreamKind::Exchange => client.exchange(request).await,
-        GrpcStreamKind::Mediate => client.mediate(request).await,
-    }
-    .map_err(|error| match error.code() {
+    let error = |error: tonic::Status| match error.code() {
         tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
             BackendError::Denied(format!("authenticate Sandbox Protocol stream: {error}"))
         }
         tonic::Code::Unimplemented => BackendError::Unsupported(error.to_string()),
         _ => BackendError::Unavailable(format!("open boundary gRPC stream: {error}")),
-    })?;
-    tokio::spawn(pump_from_grpc(
-        response.into_inner(),
-        writer,
-        crate::stream_adapter::Mode::Response,
-    ));
-    Ok(Box::new(application))
+    };
+    match kind {
+        GrpcStreamKind::Exchange => {
+            let (application, request) =
+                grpc_request::<ExchangeFrame>(boundary_id, authorization).await?;
+            let response = client.exchange(request).await.map_err(error)?;
+            Ok(Box::new(tokio::io::join(
+                grpc_reader(response.into_inner(), crate::stream_adapter::Mode::Response),
+                application,
+            )))
+        }
+        GrpcStreamKind::Mediate => {
+            let (application, request) =
+                grpc_request::<MediateFrame>(boundary_id, authorization).await?;
+            let response = client.mediate(request).await.map_err(error)?;
+            Ok(Box::new(tokio::io::join(
+                grpc_reader(response.into_inner(), crate::stream_adapter::Mode::Response),
+                application,
+            )))
+        }
+    }
 }
 
-async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<SandboxFrame>)
+async fn grpc_request<F: ProtocolFrame>(
+    boundary_id: &str,
+    authorization: tonic::metadata::AsciiMetadataValue,
+) -> Result<(tokio::io::DuplexStream, tonic::Request<ReceiverStream<F>>), BackendError> {
+    let (application, bridge) = tokio::io::duplex(256 * 1024);
+    let (outbound, outbound_rx) = tokio::sync::mpsc::channel(64);
+    outbound
+        .send(F::bind(boundary_id))
+        .await
+        .map_err(|_| BackendError::Unavailable("queue boundary binding frame".into()))?;
+    tokio::spawn(pump_to_grpc(bridge, outbound));
+    let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
+    request
+        .metadata_mut()
+        .insert("authorization", authorization);
+    Ok((application, request))
+}
+
+async fn pump_to_grpc<R, F: ProtocolFrame>(mut reader: R, sender: tokio::sync::mpsc::Sender<F>)
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send,
 {
     let mut mode = crate::stream_adapter::Mode::Request;
     loop {
-        match crate::stream_adapter::send(&mut reader, &mut mode).await {
+        match F::send(&mut reader, &mut mode).await {
             Ok(Some(chunk)) => {
                 if sender.send(chunk).await.is_err() {
                     return;
@@ -2202,38 +2183,38 @@ where
     }
 }
 
-async fn pump_from_grpc<W>(
-    mut stream: tonic::Streaming<SandboxFrame>,
-    mut writer: W,
+/// Read typed responses directly, preserving conversion failures as `InvalidData`.
+/// The caller classifies these as terminal protocol errors rather than EOF.
+fn grpc_reader<F: ProtocolFrame>(
+    stream: tonic::Streaming<F>,
     mut mode: crate::stream_adapter::Mode,
-) where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    loop {
-        match stream.message().await {
-            Ok(Some(chunk)) => {
-                let Ok(data) = crate::stream_adapter::receive(&mut mode, chunk) else {
-                    let _ = writer.shutdown().await;
-                    return;
-                };
-                if let Err(error) = writer.write_all(&data).await {
-                    tracing::debug!(%error, "boundary gRPC response writer ended");
-                    return;
+) -> impl tokio::io::AsyncRead + Unpin + Send {
+    use tokio_stream::StreamExt as _;
+    tokio_util::io::StreamReader::new(stream.map(move |frame| {
+        let frame = frame.map_err(|status| {
+            let kind = match status.code() {
+                tonic::Code::Unimplemented => std::io::ErrorKind::Unsupported,
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    std::io::ErrorKind::PermissionDenied
                 }
-            }
-            Ok(None) => {
-                let _ = writer.shutdown().await;
-                return;
-            }
-            Err(error) => {
-                tracing::debug!(%error, "boundary gRPC response stream ended");
-                // The request pump still owns the other duplex half. Explicitly
-                // close this direction so a waiting exchange observes EOF and
-                // can recover instead of waiting for both halves to drop.
-                let _ = writer.shutdown().await;
-                return;
-            }
-        }
+                tonic::Code::InvalidArgument
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::OutOfRange => std::io::ErrorKind::InvalidData,
+                _ => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(kind, status)
+        })?;
+        frame.receive(&mut mode).map(bytes::Bytes::from)
+    }))
+}
+
+fn control_read_error(error: std::io::Error) -> BackendError {
+    let message = format!("read boundary control response: {error}");
+    match error.kind() {
+        std::io::ErrorKind::InvalidData => BackendError::Descriptor(message),
+        std::io::ErrorKind::Unsupported => BackendError::Unsupported(message),
+        std::io::ErrorKind::PermissionDenied => BackendError::Denied(message),
+        _ => BackendError::Unavailable(message),
     }
 }
 
@@ -2388,7 +2369,9 @@ mod tests {
     mod delegated;
     mod flow_control;
     mod network_recovery;
+    mod protocol_errors;
 
+    use crate::isolation_protocol::exchange_frame;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -2401,7 +2384,7 @@ mod tests {
     };
     use crate::boundary_protocol::{ExitStatusWire, generate_sandbox_tls_material};
     use crate::proto::{
-        SandboxFrame,
+        ExchangeFrame,
         sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
     };
     use openshell_core::jwt::{SecretJwt, SessionBearerTokenSlot};
@@ -2485,11 +2468,9 @@ mod tests {
         }
     }
 
-    async fn test_bind(inbound: &mut tonic::Streaming<SandboxFrame>) {
-        assert_eq!(
-            inbound.message().await.unwrap().unwrap(),
-            sandbox_frame(TEST_BOUNDARY_HANDLE)
-        );
+    async fn test_bind<F: ProtocolFrame>(inbound: &mut tonic::Streaming<F>) {
+        let frame = inbound.message().await.unwrap().unwrap();
+        assert_eq!(frame.boundary_id(), Some(TEST_BOUNDARY_HANDLE));
     }
 
     #[tokio::test]
@@ -2623,19 +2604,14 @@ mod tests {
         confirmation: BoundaryConfirmation,
     }
 
-    type TestGrpcStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<SandboxFrame, tonic::Status>> + Send + 'static>,
-    >;
+    type TestGrpcStream<F = ExchangeFrame> =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<F, tonic::Status>> + Send + 'static>>;
 
-    #[tonic::async_trait]
-    impl SandboxProtocol for TestGrpcBoundary {
-        type ExchangeStream = TestGrpcStream;
-        type MediateStream = TestGrpcStream;
-
-        async fn exchange(
+    impl TestGrpcBoundary {
+        async fn serve<F: ProtocolFrame>(
             &self,
-            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
-        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            request: tonic::Request<tonic::Streaming<F>>,
+        ) -> Result<tonic::Response<TestGrpcStream<F>>, tonic::Status> {
             let authorization = request
                 .metadata()
                 .get("authorization")
@@ -2658,7 +2634,11 @@ mod tests {
                 loop {
                     match inbound.message().await {
                         Ok(Some(chunk)) => {
-                            frame.extend_from_slice(&chunk_data(chunk).expect("data frame"));
+                            frame.extend_from_slice(
+                                &chunk
+                                    .receive(&mut crate::stream_adapter::Mode::Request)
+                                    .expect("request frame"),
+                            );
                             if !wait_for_half_close && complete_control_frame(&frame) {
                                 break;
                             }
@@ -2697,7 +2677,6 @@ mod tests {
                             Request::Confirm => Response::Confirmed {
                                 confirmation: Box::new(confirmation),
                             },
-                            Request::ProbeProviderFiles => Response::ProviderFilesSupported,
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
@@ -2713,9 +2692,7 @@ mod tests {
                             Request::AttachProcess { .. } => {
                                 Response::ProcessAttached { terminal: false }
                             }
-                            Request::Signal { .. } | Request::ExecSignal { .. } => {
-                                Response::Signaled
-                            }
+                            Request::Signal { .. } => Response::Signaled,
                             Request::Terminate { .. } => Response::Terminated,
                             Request::TerminateBoundary => Response::BoundaryTerminated,
                             Request::UpdateProviderEnvironment {
@@ -2754,16 +2731,36 @@ mod tests {
                 } else {
                     b"complete response".to_vec()
                 };
-                let _ = outbound.send(Ok(test_response_chunk(response))).await;
+                let frame = F::send(
+                    &mut response.as_slice(),
+                    &mut crate::stream_adapter::Mode::Response,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let _ = outbound.send(Ok(frame)).await;
             });
             Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
                 outbound_rx,
             ))))
         }
+    }
+
+    #[tonic::async_trait]
+    impl SandboxProtocol for TestGrpcBoundary {
+        type ExchangeStream = TestGrpcStream;
+        type MediateStream = TestGrpcStream<MediateFrame>;
+
+        async fn exchange(
+            &self,
+            request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            self.serve(request).await
+        }
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
+            request: tonic::Request<tonic::Streaming<MediateFrame>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
             if self
                 .mediation_failures
@@ -2776,11 +2773,11 @@ mod tests {
                     "injected mediation transport failure",
                 ));
             }
-            self.exchange(request).await
+            self.serve(request).await
         }
     }
 
-    fn test_response_chunk(bytes: Vec<u8>) -> SandboxFrame {
+    fn test_response_chunk(bytes: Vec<u8>) -> ExchangeFrame {
         let response: ResponseEnvelope = decode_frame(&bytes).unwrap();
         crate::isolation_protocol::response_chunk(&response).unwrap()
     }
@@ -2901,7 +2898,6 @@ mod tests {
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-            resource_claims: std::collections::BTreeMap::new(),
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -3013,7 +3009,6 @@ mod tests {
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-            resource_claims: std::collections::BTreeMap::new(),
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -3358,7 +3353,6 @@ mod tests {
         let bound = BoundBoundary {
             client: client.clone(),
             agent: context.agent,
-            policy: context.policy,
             sandbox_id: context.sandbox_id,
             mediation: Arc::new(NetworkMediationSource {
                 client: client.clone(),
@@ -3868,7 +3862,6 @@ mod tests {
                 test_bearer(&"a".repeat(32)),
             )),
             agent: context.agent,
-            policy: context.policy,
             sandbox_id: context.sandbox_id,
             ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
             provider_credentials: credentials.clone(),
@@ -3948,7 +3941,6 @@ mod tests {
                     provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
-                    policy: Box::new(SandboxPolicyWire::from(context.policy)),
                     ca_cert: Some("c".repeat(16 * 1024)),
                     ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,
@@ -4008,7 +4000,6 @@ mod tests {
                     provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
-                    policy: Box::new(SandboxPolicyWire::from(context.policy)),
                     ca_cert: Some("c".repeat(16 * 1024)),
                     ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,

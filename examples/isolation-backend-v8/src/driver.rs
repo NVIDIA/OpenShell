@@ -76,9 +76,7 @@ impl Driver {
             .as_ref()
             .ok_or_else(|| Status::failed_precondition("configure the driver isolation_backend"))?;
         if registration.name != BACKEND {
-            return Err(Status::failed_precondition(
-                "this driver requires example-v8",
-            ));
+            return Err(Status::failed_precondition("this driver requires js-sbx"));
         }
         if spec.command != ["/work/guest.js"] || spec.tty {
             return Err(Status::invalid_argument(
@@ -95,7 +93,7 @@ impl Driver {
                 || template.driver_config.is_some()
                 || template.platform_config.is_some()
                 || template.resources.is_some()
-                || (!template.image.is_empty() && template.image != "v8-local:example"))
+                || (!template.image.is_empty() && template.image != "js-sbx:example"))
         {
             return Err(Status::invalid_argument(
                 "template overrides are unsupported",
@@ -203,7 +201,8 @@ impl Driver {
             private_key: tls.private_key_pem,
         };
         let selected = spec.isolation_backend.as_ref().unwrap();
-        let Some(sandbox_backend_registration::Endpoint::UnixSocketPath(path)) = &selected.endpoint
+        let Some(isolation_backend_registration::Endpoint::UnixSocketPath(path)) =
+            &selected.endpoint
         else {
             return Err(Status::invalid_argument(
                 "the local example requires a Unix backend socket",
@@ -249,7 +248,7 @@ impl Driver {
                 }
                 if attempt == 99 {
                     return Err(Status::deadline_exceeded(
-                        "start v8-backend backend before creating the sandbox",
+                        "start js-sbx serve before creating the sandbox",
                     ));
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -344,20 +343,20 @@ impl compute_driver_server::ComputeDriver for DriverService {
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         let mut extension = extension_protocol::extension_metadata(
             ExtensionFamily::Compute,
-            "example-v8",
+            "js-sbx",
             "0.0.0",
             [
                 extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.into(),
-                extension_protocol::COMPUTE_SANDBOX_BACKEND.into(),
+                extension_protocol::COMPUTE_ISOLATION_BACKEND.into(),
             ],
         );
         extension
             .required_capabilities
             .push(extension_protocol::COMPUTE_LAUNCH_AUTHENTICATION.into());
         Ok(Response::new(GetCapabilitiesResponse {
-            driver_name: "v8-example".into(),
+            driver_name: "js-sbx-example".into(),
             driver_version: "0.0.0".into(),
-            default_image: "v8-local:example".into(),
+            default_image: "js-sbx:example".into(),
             gateway_manages_lifecycle: true,
             driver_reports_runtime_readiness: false,
             extension: Some(extension),

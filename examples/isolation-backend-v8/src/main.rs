@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(about = "Local V8 backend and example compute driver")]
+#[command(about = "Network-disabled JavaScript sandbox and local compute driver")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -15,14 +15,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve driver-provisioned launches over authenticated TLS.
-    Backend {
-        #[arg(long, env = "V8_DEMO_STATE")]
+    /// Serve the JavaScript runtime on its authenticated Unix socket.
+    Serve {
+        #[arg(long, env = "JS_SBX_STATE")]
         state_dir: PathBuf,
     },
     /// Run the local-development compute driver on a private Unix socket.
     Driver {
-        #[arg(long, env = "V8_DEMO_STATE")]
+        #[arg(long, env = "JS_SBX_STATE")]
         state_dir: PathBuf,
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -44,11 +44,11 @@ enum Command {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Backend { state_dir } => {
+        Command::Serve { state_dir } => {
             rustls::crypto::aws_lc_rs::default_provider()
                 .install_default()
                 .ok();
-            openshell_v8_backend_example::lifecycle::serve(state_dir).await?;
+            js_sbx::lifecycle::serve(state_dir).await?;
         }
         Command::Driver {
             state_dir,
@@ -59,14 +59,14 @@ async fn main() -> Result<()> {
             policy_rules,
         } => {
             let socket = socket.unwrap_or_else(|| state_dir.join("compute.sock"));
-            let driver = openshell_v8_backend_example::driver::Driver::new(
+            let driver = js_sbx::driver::Driver::new(
                 state_dir,
                 supervisor,
                 script,
                 gateway_endpoint,
                 policy_rules,
             )?;
-            openshell_v8_backend_example::driver::serve(Arc::new(driver), socket).await?;
+            js_sbx::driver::serve(Arc::new(driver), socket).await?;
         }
     }
     Ok(())

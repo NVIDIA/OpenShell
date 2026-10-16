@@ -38,7 +38,7 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Evidence for capabilities the V8 runner actually grants.
 pub fn capability_evidence(digest: &str) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!({"script_sha256":digest,"network":"supervisor-http-host-call","filesystem":"no-host-access"})).expect("string-valued capability manifest")
+    serde_json::to_vec(&serde_json::json!({"script_sha256":digest,"network":"disabled","filesystem":"no-host-access"})).expect("string-valued capability manifest")
 }
 
 /// Admit the actual identity of the host process containing the V8 guest.

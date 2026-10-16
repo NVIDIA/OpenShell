@@ -356,7 +356,9 @@ impl WireMessage for c::BoundaryConfirmation {
             backend_audit: if v.backend_audit.is_empty() {
                 serde_json::Value::Null
             } else {
-                serde_json::from_slice(&v.backend_audit).map_err(invalid)?
+                serde_json::from_slice(&v.backend_audit).map_err(|error| {
+                    invalid(format!("backend_audit must be UTF-8 JSON: {error}"))
+                })?
             },
         })
     }
@@ -439,18 +441,14 @@ impl WireMessage for w::RequestEnvelope {
             W::Attach {
                 supervisor_instance_id,
                 policy,
-                resource_claims,
             } => P::Attach(p::Attach {
                 supervisor_instance_id: supervisor_instance_id.to_string(),
                 policy: Some(policy.to_proto()?),
-                resource_claims: resource_claims.clone(),
             }),
             W::Confirm => P::Confirm(p::Confirm {}),
-            W::ProbeProviderFiles => P::ProbeProviderFiles(p::ProbeProviderFiles {}),
             W::StartAgent {
                 sandbox_id,
                 spec,
-                policy,
                 ca_cert,
                 ca_bundle,
                 provider_env_revision,
@@ -459,7 +457,6 @@ impl WireMessage for w::RequestEnvelope {
             } => P::StartAgent(p::StartAgent {
                 sandbox_id: sandbox_id.clone(),
                 spec: Some(spec.to_proto()?),
-                policy: Some(policy.to_proto()?),
                 ca_cert: ca_cert.clone(),
                 ca_bundle: ca_bundle.clone(),
                 provider_env_revision: *provider_env_revision,
@@ -493,10 +490,10 @@ impl WireMessage for w::RequestEnvelope {
             W::TerminateBoundary => P::TerminateBoundary(p::TerminateBoundary {}),
             W::Exec { spec } => P::Exec(p::Exec {
                 spec: Some(spec.to_proto()?),
-            }),
-            W::ExecSignal { process_id, signal } => P::ExecSignal(p::ExecSignal {
-                process_id: process_id.clone(),
-                signal: signal.to_proto()? as i32,
+                exec_admission_deadline: Some(timestamp(
+                    self.exec_admission_deadline_unix_ms
+                        .ok_or_else(|| invalid("exec admission deadline missing"))?,
+                )?),
             }),
             W::Resize {
                 process_id,
@@ -516,29 +513,23 @@ impl WireMessage for w::RequestEnvelope {
         };
         Ok(p::RequestEnvelope {
             request_id: self.request_id.clone(),
-            exec_admission_deadline: self
-                .exec_admission_deadline_unix_ms
-                .map(timestamp)
-                .transpose()?,
             request: Some(request),
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
         use p::request_envelope::Request as P;
         use w::Request as W;
+        let mut expires = None;
         let request = match required(v.request)? {
             P::DiscoverPolicy(_) => W::DiscoverPolicy,
             P::Attach(v) => W::Attach {
                 supervisor_instance_id: parse(&v.supervisor_instance_id)?,
                 policy: Box::new(w::SandboxPolicyWire::from_proto(required(v.policy)?)?),
-                resource_claims: v.resource_claims,
             },
             P::Confirm(_) => W::Confirm,
-            P::ProbeProviderFiles(_) => W::ProbeProviderFiles,
             P::StartAgent(v) => W::StartAgent {
                 sandbox_id: v.sandbox_id,
                 spec: w::AgentSpecWire::from_proto(required(v.spec)?)?,
-                policy: Box::new(w::SandboxPolicyWire::from_proto(required(v.policy)?)?),
                 ca_cert: v.ca_cert,
                 ca_bundle: v.ca_bundle,
                 provider_env_revision: v.provider_env_revision,
@@ -565,13 +556,12 @@ impl WireMessage for w::RequestEnvelope {
                 process_id: v.process_id,
             },
             P::TerminateBoundary(_) => W::TerminateBoundary,
-            P::Exec(v) => W::Exec {
-                spec: w::ExecSpecWire::from_proto(required(v.spec)?)?,
-            },
-            P::ExecSignal(v) => W::ExecSignal {
-                process_id: v.process_id,
-                signal: w::SignalWire::from_proto(enum_value(v.signal)?)?,
-            },
+            P::Exec(v) => {
+                expires = Some(millis(required(v.exec_admission_deadline)?)?);
+                W::Exec {
+                    spec: w::ExecSpecWire::from_proto(required(v.spec)?)?,
+                }
+            }
             P::Resize(v) => W::Resize {
                 process_id: v.process_id,
                 cols: number(v.cols.into())?,
@@ -587,10 +577,6 @@ impl WireMessage for w::RequestEnvelope {
         // The server derives a fingerprint from decoded typed fields. Clients
         // supply only the random ID; protobuf map order never changes a replay.
         parse::<uuid::Uuid>(&v.request_id)?;
-        let expires = v.exec_admission_deadline.map(millis).transpose()?;
-        if matches!(request, W::Exec { .. }) != expires.is_some() {
-            return Err(invalid("exec deadline presence does not match operation"));
-        }
         let mut envelope = Self {
             request_id: v.request_id,
             payload_digest: String::new(),
@@ -617,7 +603,6 @@ impl WireMessage for w::ResponseEnvelope {
             W::Confirmed { confirmation } => P::Confirmed(p::Confirmed {
                 confirmation: Some(confirmation.to_proto()?),
             }),
-            W::ProviderFilesSupported => P::ProviderFilesSupported(p::ProviderFilesSupported {}),
             W::Started {
                 process_id,
                 provider_env_revision,
@@ -695,7 +680,6 @@ impl WireMessage for w::ResponseEnvelope {
                     v.confirmation,
                 )?)?),
             },
-            P::ProviderFilesSupported(_) => W::ProviderFilesSupported,
             P::Started(v) => W::Started {
                 process_id: v.process_id,
                 provider_env_revision: v.provider_env_revision,
@@ -807,17 +791,14 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let attach = p::RequestEnvelope {
             request_id: id.clone(),
-            exec_admission_deadline: None,
             request: Some(p::request_envelope::Request::Attach(p::Attach {
                 supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
                 policy: None,
-                resource_claims: std::collections::BTreeMap::default(),
             })),
         };
         assert!(w::RequestEnvelope::from_proto(attach).is_err());
         let signal = p::RequestEnvelope {
             request_id: id,
-            exec_admission_deadline: None,
             request: Some(p::request_envelope::Request::Signal(p::Signal {
                 process_id: "main".into(),
                 signal: 99,
@@ -841,13 +822,22 @@ mod tests {
         })
         .unwrap();
         let mut value = request.to_proto().unwrap();
-        value.exec_admission_deadline = None;
+        let Some(p::request_envelope::Request::Exec(exec)) = value.request.as_mut() else {
+            unreachable!()
+        };
+        exec.exec_admission_deadline = None;
         assert!(w::RequestEnvelope::from_proto(value).is_err());
         let mut value = request.to_proto().unwrap();
-        value.exec_admission_deadline.as_mut().unwrap().nanos = -1;
+        let Some(p::request_envelope::Request::Exec(exec)) = value.request.as_mut() else {
+            unreachable!()
+        };
+        exec.exec_admission_deadline.as_mut().unwrap().nanos = -1;
         assert!(w::RequestEnvelope::from_proto(value).is_err());
         let mut value = request.to_proto().unwrap();
-        value.exec_admission_deadline.as_mut().unwrap().seconds += 1;
+        let Some(p::request_envelope::Request::Exec(exec)) = value.request.as_mut() else {
+            unreachable!()
+        };
+        exec.exec_admission_deadline.as_mut().unwrap().seconds += 1;
         let changed = w::RequestEnvelope::from_proto(value).unwrap();
         assert_eq!(changed.request_id, request.request_id);
         assert_ne!(changed.payload_digest, request.payload_digest);
@@ -857,7 +847,6 @@ mod tests {
     fn resize_rejects_values_outside_the_rust_contract() {
         let value = p::RequestEnvelope {
             request_id: uuid::Uuid::new_v4().to_string(),
-            exec_admission_deadline: None,
             request: Some(p::request_envelope::Request::Resize(p::Resize {
                 process_id: "main".into(),
                 cols: 65_536,

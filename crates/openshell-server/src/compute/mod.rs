@@ -81,9 +81,9 @@ pub type SharedComputeDriver =
     Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
 
 fn supports_isolation_registration(capabilities: &[String]) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability == openshell_core::extension_protocol::COMPUTE_SANDBOX_BACKEND)
+    capabilities.iter().any(|capability| {
+        capability == openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND
+    })
 }
 
 use provisioning_operation::ProvisioningOperationError;
@@ -737,7 +737,7 @@ impl ComputeDriver for RemoteComputeDriver {
 
 #[derive(Clone)]
 pub struct ComputeRuntime {
-    isolation_backend: Option<openshell_core::proto::compute::v1::SandboxBackendRegistration>,
+    isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
     admission: openshell_core::resource_admission::DriverAdmissionConfig,
     admission_acknowledgement: String,
     driver: TracedDriver,
@@ -3664,7 +3664,7 @@ impl ComputeRuntime {
                 continue;
             }
             if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
-                warn!(sandbox_id, %error, "Rejected recovered sandbox backend selection");
+                warn!(sandbox_id, %error, "Rejected recovered isolation backend selection");
                 failed += 1;
                 continue;
             }
@@ -3958,7 +3958,7 @@ impl ComputeRuntime {
                 }
                 SandboxPhase::Starting => {
                     if let Err(error) = self.validate_isolation_backend_binding(&sandbox) {
-                        warn!(%error, "Rejected pending sandbox backend selection");
+                        warn!(%error, "Rejected pending isolation backend selection");
                         continue;
                     }
                     if let Err(error) = self.validate_caller_driver_config(
@@ -16769,7 +16769,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket_path = directory.path().join("compute.sock");
         let driver = FakeComputeDriver::new()
-            .with_sandbox_backend_registration()
+            .with_isolation_backend_registration()
             .with_gateway_manages_lifecycle();
         let _server = driver.serve_uds(&socket_path).unwrap();
         let endpoint = connect_remote_compute_driver("external", &socket_path)
@@ -16791,9 +16791,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         )
         .unwrap();
         let registration = file.isolation_backend("external").unwrap().unwrap();
-        let expected =
-            openshell_core::proto::compute::v1::SandboxBackendRegistration::try_from(registration)
-                .unwrap();
+        let expected = openshell_core::proto::compute::v1::IsolationBackendRegistration::try_from(
+            registration,
+        )
+        .unwrap();
         let runtime = ComputeRuntime::new_remote_driver(
             endpoint,
             store,
@@ -17035,7 +17036,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             .unwrap()
             .supported_capabilities
             .retain(|capability| {
-                capability != openshell_core::extension_protocol::COMPUTE_SANDBOX_BACKEND
+                capability != openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND
             });
         let _ = driver.clone().with_capabilities(capabilities);
         driver.clear_calls();

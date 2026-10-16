@@ -4,7 +4,7 @@
 [workspace]
 
 [package]
-name = "openshell-v8-backend-example"
+name = "js-sbx"
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.94"
@@ -40,5 +40,5 @@ protoc-bin-vendored = "3"
 tonic-prost-build = "0.14"
 
 [[bin]]
-name = "v8-backend"
+name = "js-sbx"
 path = "src/main.rs"

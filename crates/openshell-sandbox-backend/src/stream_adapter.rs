@@ -3,13 +3,15 @@
 
 //! Private adapter for Rust `AsyncRead`/`AsyncWrite` handles.
 //!
-//! Length/channel markers exist only on these in-process pipes; gRPC carries typed `SandboxFrame` values.
+//! Length/channel markers exist only on these in-process pipes; gRPC carries
+//! typed `ExchangeFrame` or `MediateFrame` values.
 //! Both directions check the operation's expected frame kind before forwarding.
 use crate::{
     boundary_protocol as w, mediation as m,
-    proto::{self as p, sandbox_frame::Payload},
+    proto::{self as p, exchange_frame::Payload},
     protobuf::{self, WireMessage},
 };
+use prost::Message as _;
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -29,8 +31,8 @@ pub enum Mode {
 fn bad(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
-fn chunk(payload: Payload) -> p::SandboxFrame {
-    p::SandboxFrame {
+fn chunk(payload: Payload) -> p::ExchangeFrame {
+    p::ExchangeFrame {
         payload: Some(payload),
     }
 }
@@ -71,7 +73,7 @@ fn dns_bytes(kind: m::MediationFrameKind, id: u64, payload: &[u8]) -> io::Result
     Ok(bytes)
 }
 /// Convert a checked typed frame to the local stream interface.
-pub fn receive(mode: &mut Mode, value: p::SandboxFrame) -> io::Result<Vec<u8>> {
+pub fn receive(mode: &mut Mode, value: p::ExchangeFrame) -> io::Result<Vec<u8>> {
     use prost::Message;
     if value.encoded_len() > MAX_MESSAGE_BYTES {
         return Err(bad("protocol message exceeds limit"));
@@ -117,24 +119,6 @@ pub fn receive(mode: &mut Mode, value: p::SandboxFrame) -> io::Result<Vec<u8>> {
             )
         }
         (Mode::Relay, Payload::RelayData(v)) if v.len() <= w::MAX_STREAM_FRAME_BYTES => Ok(v),
-        (Mode::DnsQueries, Payload::DnsQuery(v)) => {
-            let id = v.stream_id;
-            let v = m::DnsQueryWire::from_proto(v).map_err(bad)?;
-            dns_bytes(
-                m::MediationFrameKind::DnsQuery,
-                id,
-                &protobuf::encode(&v).map_err(bad)?,
-            )
-        }
-        (Mode::DnsResponses, Payload::DnsResponse(v)) => {
-            let id = v.stream_id;
-            let v = w::DnsQueryResultWire::from_proto(v).map_err(bad)?;
-            dns_bytes(
-                m::MediationFrameKind::DnsResponse,
-                id,
-                &protobuf::encode(&v).map_err(bad)?,
-            )
-        }
         _ => Err(bad(
             "frame kind does not match stream operation or direction",
         )),
@@ -161,7 +145,7 @@ async fn control<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<
 pub async fn send<R: AsyncRead + Unpin>(
     reader: &mut R,
     mode: &mut Mode,
-) -> io::Result<Option<p::SandboxFrame>> {
+) -> io::Result<Option<p::ExchangeFrame>> {
     let payload = match *mode {
         Mode::Request => {
             let Some(bytes) = control(reader).await? else {
@@ -227,30 +211,7 @@ pub async fn send<R: AsyncRead + Unpin>(
             bytes.truncate(len);
             Payload::RelayData(bytes)
         }
-        Mode::DnsQueries | Mode::DnsResponses => {
-            let Some(frame) = m::read_frame(reader).await? else {
-                return Ok(None);
-            };
-            match (*mode, frame.kind) {
-                (Mode::DnsQueries, m::MediationFrameKind::DnsQuery) => {
-                    let mut v = protobuf::decode::<m::DnsQueryWire>(&frame.payload)
-                        .map_err(bad)?
-                        .to_proto()
-                        .map_err(bad)?;
-                    v.stream_id = frame.stream_id;
-                    Payload::DnsQuery(v)
-                }
-                (Mode::DnsResponses, m::MediationFrameKind::DnsResponse) => {
-                    let mut v = protobuf::decode::<w::DnsQueryResultWire>(&frame.payload)
-                        .map_err(bad)?
-                        .to_proto()
-                        .map_err(bad)?;
-                    v.stream_id = frame.stream_id;
-                    Payload::DnsResponse(v)
-                }
-                _ => return Err(bad("wrong DNS stream direction")),
-            }
-        }
+        Mode::DnsQueries | Mode::DnsResponses => return Err(bad("DNS requires Mediate")),
         Mode::Done => {
             let mut byte = [0];
             if reader.read(&mut byte).await? != 0 {
@@ -260,6 +221,167 @@ pub async fn send<R: AsyncRead + Unpin>(
         }
     };
     Ok(Some(chunk(payload)))
+}
+
+/// Shared local byte adapter for the two distinct RPC stream types.
+/// The public schema limits payload kinds; this adapter also checks ordering.
+pub trait ProtocolFrame: prost::Message + Default + Send + 'static {
+    fn bind(boundary_id: &str) -> Self;
+    fn boundary_id(&self) -> Option<&str>;
+    fn receive(self, mode: &mut Mode) -> io::Result<Vec<u8>>;
+    fn send<R: AsyncRead + Unpin + Send>(
+        reader: &mut R,
+        mode: &mut Mode,
+    ) -> impl Future<Output = io::Result<Option<Self>>> + Send;
+}
+impl ProtocolFrame for p::ExchangeFrame {
+    fn bind(id: &str) -> Self {
+        chunk(Payload::BoundaryId(id.into()))
+    }
+    fn boundary_id(&self) -> Option<&str> {
+        match self.payload.as_ref() {
+            Some(Payload::BoundaryId(id)) => Some(id),
+            _ => None,
+        }
+    }
+    fn receive(self, mode: &mut Mode) -> io::Result<Vec<u8>> {
+        receive(mode, self)
+    }
+    async fn send<R: AsyncRead + Unpin + Send>(
+        reader: &mut R,
+        mode: &mut Mode,
+    ) -> io::Result<Option<Self>> {
+        send(reader, mode).await
+    }
+}
+impl ProtocolFrame for p::MediateFrame {
+    fn bind(id: &str) -> Self {
+        Self {
+            payload: Some(p::mediate_frame::Payload::BoundaryId(id.into())),
+        }
+    }
+    fn boundary_id(&self) -> Option<&str> {
+        match self.payload.as_ref() {
+            Some(p::mediate_frame::Payload::BoundaryId(id)) => Some(id),
+            _ => None,
+        }
+    }
+    fn receive(self, mode: &mut Mode) -> io::Result<Vec<u8>> {
+        use p::mediate_frame::Payload as M;
+        if self.encoded_len() > MAX_MESSAGE_BYTES {
+            return Err(bad("protocol message exceeds limit"));
+        }
+        match (
+            *mode,
+            self.payload.ok_or_else(|| bad("frame payload missing"))?,
+        ) {
+            (Mode::Request, M::Request(v))
+                if matches!(
+                    v.request,
+                    Some(p::request_envelope::Request::OpenMediation(_))
+                ) =>
+            {
+                receive(mode, chunk(Payload::Request(v)))
+            }
+            (Mode::Response, M::Response(v))
+                if matches!(
+                    v.response,
+                    Some(
+                        p::response_envelope::Response::MediationReady(_)
+                            | p::response_envelope::Response::Error(_)
+                    )
+                ) =>
+            {
+                receive(mode, chunk(Payload::Response(v)))
+            }
+            (Mode::DnsQueries, M::DnsQuery(v)) => {
+                let id = v.stream_id;
+                let v = m::DnsQueryWire::from_proto(v).map_err(bad)?;
+                dns_bytes(
+                    m::MediationFrameKind::DnsQuery,
+                    id,
+                    &protobuf::encode(&v).map_err(bad)?,
+                )
+            }
+            (Mode::DnsResponses, M::DnsResponse(v)) => {
+                let id = v.stream_id;
+                let v = w::DnsQueryResultWire::from_proto(v).map_err(bad)?;
+                dns_bytes(
+                    m::MediationFrameKind::DnsResponse,
+                    id,
+                    &protobuf::encode(&v).map_err(bad)?,
+                )
+            }
+
+            _ => Err(bad(
+                "frame kind does not match mediation operation or direction",
+            )),
+        }
+    }
+    async fn send<R: AsyncRead + Unpin + Send>(
+        reader: &mut R,
+        mode: &mut Mode,
+    ) -> io::Result<Option<Self>> {
+        use p::mediate_frame::Payload as M;
+        let payload = match *mode {
+            Mode::DnsQueries | Mode::DnsResponses => {
+                let Some(frame) = m::read_frame(reader).await? else {
+                    return Ok(None);
+                };
+                match (*mode, frame.kind) {
+                    (Mode::DnsQueries, m::MediationFrameKind::DnsQuery) => {
+                        let mut v = protobuf::decode::<m::DnsQueryWire>(&frame.payload)
+                            .map_err(bad)?
+                            .to_proto()
+                            .map_err(bad)?;
+                        v.stream_id = frame.stream_id;
+                        M::DnsQuery(v)
+                    }
+                    (Mode::DnsResponses, m::MediationFrameKind::DnsResponse) => {
+                        let mut v = protobuf::decode::<w::DnsQueryResultWire>(&frame.payload)
+                            .map_err(bad)?
+                            .to_proto()
+                            .map_err(bad)?;
+                        v.stream_id = frame.stream_id;
+                        M::DnsResponse(v)
+                    }
+                    _ => return Err(bad("wrong DNS stream direction")),
+                }
+            }
+
+            Mode::Request | Mode::Response | Mode::Done => {
+                let Some(frame) = send(reader, mode).await? else {
+                    return Ok(None);
+                };
+                match frame.payload {
+                    Some(Payload::Request(v))
+                        if matches!(
+                            v.request,
+                            Some(p::request_envelope::Request::OpenMediation(_))
+                        ) =>
+                    {
+                        M::Request(v)
+                    }
+                    Some(Payload::Response(v))
+                        if matches!(
+                            v.response,
+                            Some(
+                                p::response_envelope::Response::MediationReady(_)
+                                    | p::response_envelope::Response::Error(_)
+                            )
+                        ) =>
+                    {
+                        M::Response(v)
+                    }
+                    _ => return Err(bad("only OpenMediation is allowed on Mediate")),
+                }
+            }
+            _ => return Err(bad("process and relay I/O require Exchange")),
+        };
+        Ok(Some(Self {
+            payload: Some(payload),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -281,17 +403,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_dns_preserves_correlation_and_failure() {
-        let frame = chunk(Payload::DnsResponse(p::DnsResponse {
-            stream_id: 9_007_199_254_740_993,
-            result: Some(p::dns_response::Result::Error(
-                "resolver unavailable".into(),
+    async fn mediation_requires_its_control_handshake_before_dns() {
+        let request = w::RequestEnvelope::new(w::Request::OpenMediation).unwrap();
+        let bytes = w::encode_frame(&request).unwrap();
+        let mut outgoing = Mode::Request;
+        let frame = p::MediateFrame::send(&mut bytes.as_slice(), &mut outgoing)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut incoming = Mode::Request;
+        let decoded = frame.receive(&mut incoming).unwrap();
+        assert_eq!(
+            w::decode_frame::<w::RequestEnvelope>(&decoded).unwrap(),
+            request
+        );
+        assert!(matches!(outgoing, Mode::DnsResponses));
+        assert!(matches!(incoming, Mode::DnsResponses));
+
+        let other = w::RequestEnvelope::new(w::Request::DiscoverPolicy).unwrap();
+        let wrong = p::MediateFrame {
+            payload: Some(p::mediate_frame::Payload::Request(
+                other.to_proto().unwrap(),
             )),
-        }));
-        let bytes = receive(&mut Mode::DnsResponses, frame.clone()).unwrap();
+        };
+        assert!(wrong.receive(&mut Mode::Request).is_err());
+        let dns = p::MediateFrame {
+            payload: Some(p::mediate_frame::Payload::DnsResponse(p::DnsResponse {
+                stream_id: 1,
+                result: Some(p::dns_response::Result::Response(vec![])),
+            })),
+        };
+        assert!(dns.receive(&mut Mode::Request).is_err());
+        assert!(
+            p::ExchangeFrame::send(&mut &[][..], &mut Mode::DnsResponses)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_dns_preserves_correlation_and_failure() {
+        let frame = p::MediateFrame {
+            payload: Some(p::mediate_frame::Payload::DnsResponse(p::DnsResponse {
+                stream_id: 9_007_199_254_740_993,
+                result: Some(p::dns_response::Result::Error(
+                    "resolver unavailable".into(),
+                )),
+            })),
+        };
+        let bytes = frame.clone().receive(&mut Mode::DnsResponses).unwrap();
         let mut reader = bytes.as_slice();
         assert_eq!(
-            send(&mut reader, &mut Mode::DnsResponses).await.unwrap(),
+            p::MediateFrame::send(&mut reader, &mut Mode::DnsResponses)
+                .await
+                .unwrap(),
             Some(frame)
         );
     }

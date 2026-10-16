@@ -53,11 +53,11 @@ struct NetworkPeer {
 #[tonic::async_trait]
 impl SandboxProtocol for NetworkPeer {
     type ExchangeStream = TestGrpcStream;
-    type MediateStream = TestGrpcStream;
+    type MediateStream = TestGrpcStream<MediateFrame>;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<SandboxFrame>>,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if request.metadata().get("authorization").unwrap()
             != format!("Bearer {}", "a".repeat(32)).as_str()
@@ -80,7 +80,7 @@ impl SandboxProtocol for NetworkPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<SandboxFrame>>,
+        _request: tonic::Request<tonic::Streaming<MediateFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("TCP fixture"))
     }
@@ -89,8 +89,8 @@ impl SandboxProtocol for NetworkPeer {
 impl NetworkPeer {
     async fn respond(
         &self,
-        mut inbound: tonic::Streaming<SandboxFrame>,
-        outbound: tokio::sync::mpsc::Sender<Result<SandboxFrame, tonic::Status>>,
+        mut inbound: tonic::Streaming<ExchangeFrame>,
+        outbound: tokio::sync::mpsc::Sender<Result<ExchangeFrame, tonic::Status>>,
     ) -> Result<(), tonic::Status> {
         test_bind(&mut inbound).await;
         let mut frame = Vec::new();
@@ -198,12 +198,7 @@ impl NetworkPeer {
         if connected {
             let state = self.state.clone();
             tokio::spawn(async move {
-                let (mut reader, writer) = tokio::io::duplex(4096);
-                let pump = tokio::spawn(pump_from_grpc(
-                    inbound,
-                    writer,
-                    crate::stream_adapter::Mode::Decision,
-                ));
+                let mut reader = grpc_reader(inbound, crate::stream_adapter::Mode::Decision);
                 let result = tokio::time::timeout(Duration::from_secs(3), async {
                     let (channel, payload) = read_stream_frame(&mut reader).await.unwrap().unwrap();
                     assert_eq!(channel, STREAM_NETWORK_DECISION);
@@ -221,7 +216,6 @@ impl NetworkPeer {
                         .unwrap();
                 })
                 .await;
-                pump.abort();
                 result.expect("accepted network stream must receive its decision and payload");
             });
         }
@@ -341,7 +335,6 @@ impl Fixture {
                 .call_idempotent(Request::Attach {
                     supervisor_instance_id: client.supervisor_instance_id,
                     policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-                    resource_claims: std::collections::BTreeMap::new(),
                 })
                 .await
                 .unwrap();

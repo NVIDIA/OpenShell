@@ -9,24 +9,28 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "options.proto";
 
+// EXPERIMENTAL: This protocol is under active development. Its API and wire
+// format may change incompatibly before stabilization.
+//
 // Authenticated Sandbox Protocol for per-boundary and shared backends. Each
 // client stream starts with the OpenBoundary handle, checked against the
 // authenticated sandbox and generation. Subsequent frames are typed protocol
 // messages, with no nested JSON envelopes or application framing.
 // Exchange handles one request/response and its associated process or relay I/O.
 // Mediate handles OpenMediation followed by correlated DNS queries/responses.
-// Admission remains Attach -> Confirm -> StartAgent; no untrusted instruction
-// may execute before StartAgent. Exec and forwarding require Running.
+// DiscoverPolicy is allowed before Attach on its own authenticated stream.
+// Admission is Attach -> Confirm -> StartAgent; no untrusted instruction may
+// execute before StartAgent. Exec and forwarding require Running.
 service SandboxProtocol {
-  rpc Exchange(stream SandboxFrame) returns (stream SandboxFrame);
-  rpc Mediate(stream SandboxFrame) returns (stream SandboxFrame);
+  rpc Exchange(stream ExchangeFrame) returns (stream ExchangeFrame);
+  rpc Mediate(stream MediateFrame) returns (stream MediateFrame);
 }
 
 // The first client frame contains boundary_id, never repeated on that stream.
 // Control messages are bounded to 1 MiB; each I/O payload is at most 64 KiB.
 // Process stdin closes explicitly; ending a gRPC request stream does not end
 // the independent response stream. Exit follows all retained process output.
-message SandboxFrame {
+message ExchangeFrame {
   oneof payload {
     string boundary_id = 1;
     RequestEnvelope request = 3;
@@ -38,6 +42,16 @@ message SandboxFrame {
     StdinClosed stdin_closed = 9;
     TcpOpenDecision tcp_open_decision = 10;
     bytes relay_data = 11;
+  }
+}
+// DNS mediation has its own stream, with no process I/O or TCP relay frames.
+// The first frame binds the boundary; OpenMediation request/response follows,
+// then correlated DNS messages. Other control operations are rejected.
+message MediateFrame {
+  oneof payload {
+    string boundary_id = 1;
+    RequestEnvelope request = 3;
+    ResponseEnvelope response = 4;
     DnsQuery dns_query = 12;
     DnsResponse dns_response = 13;
   }
@@ -51,18 +65,14 @@ message StdinClosed {}
 // not authorize behavior: send behavior-affecting additions only after
 // negotiating the receiver's supporting capability. No client digest required.
 // Replayable mutations: Attach, Confirm, StartAgent, UpdateProviderEnvironment,
-// Exec, Signal, ExecSignal, Terminate, TerminateBoundary, and Resize. Exec
-// outcomes remain retained through the deadline even after process exit.
+// Exec, Signal, Terminate, TerminateBoundary, and Resize. Exec outcomes remain
+// retained through the deadline even after process exit.
 message RequestEnvelope {
   string request_id = 1;
-  // Required only for Exec. An absolute admission/retry deadline, not a process
-  // runtime limit; it remains unchanged on retries and transport recovery.
-  google.protobuf.Timestamp exec_admission_deadline = 2;
   oneof request {
     DiscoverPolicy discover_policy = 10;
     Attach attach = 11;
     Confirm confirm = 12;
-    ProbeProviderFiles probe_provider_files = 13;
     StartAgent start_agent = 14;
     UpdateProviderEnvironment update_provider_environment = 15;
     AttachProcess attach_process = 16;
@@ -71,7 +81,6 @@ message RequestEnvelope {
     Terminate terminate = 19;
     TerminateBoundary terminate_boundary = 20;
     Exec exec = 21;
-    ExecSignal exec_signal = 22;
     Resize resize = 23;
     LoopbackConnect loopback_connect = 24;
     OpenMediation open_mediation = 25;
@@ -84,7 +93,6 @@ message ResponseEnvelope {
     ImagePolicy image_policy = 10;
     Attached attached = 11;
     Confirmed confirmed = 12;
-    ProviderFilesSupported provider_files_supported = 13;
     Started started = 14;
     ProviderEnvironmentUpdated provider_environment_updated = 15;
     ProcessAttached process_attached = 16;
@@ -100,30 +108,31 @@ message ResponseEnvelope {
     Error error = 26;
   }
 }
+// Read-only image-policy discovery, permitted before attachment.
 message DiscoverPolicy {}
 message Attach {
   string supervisor_instance_id = 1;
   SandboxPolicy policy = 2;
-  map<string, string> resource_claims = 3;
 }
 // Success asserts that the backend can enforce the attached policy and trusted
-// workload identity. Unsupported requirements fail before StartAgent. No
-// untrusted instruction may execute until StartAgent installs all launch-time
-// controls. Supervisor or transport loss must never relax enforcement or open
-// an unmediated egress path; supervisor-dependent operations fail closed.
+// workload identity. Unsupported requirements fail before StartAgent, which
+// installs all launch-time controls as required by the admission sequence.
+// Supervisor or transport loss must never relax enforcement or open an
+// unmediated egress path; supervisor-dependent operations fail closed.
 // A backend may terminate, pause, or keep a disconnected workload contained.
 message Confirm {}
-message ProbeProviderFiles {}
+// Start with the policy retained by Attach. Unsupported provider files must be
+// rejected before workload execution.
 message StartAgent {
   string sandbox_id = 1;
   AgentSpec spec = 2;
-  SandboxPolicy policy = 3;
   optional string ca_cert = 4;
   optional string ca_bundle = 5;
   uint64 provider_env_revision = 6;
   map<string, string> provider_env = 7 [(openshell.options.v1.secret) = true];
   map<string, string> provider_files = 8 [(openshell.options.v1.secret) = true];
 }
+// Validate support and the complete snapshot before applying an update.
 message UpdateProviderEnvironment {
   uint64 generation = 1;
   uint64 revision = 2;
@@ -136,6 +145,7 @@ message AttachProcess {
 message Wait {
   string process_id = 1;
 }
+// Signal either a main or exec process using its generation-scoped ID.
 message Signal {
   string process_id = 1;
   BoundarySignal signal = 2;
@@ -146,10 +156,9 @@ message Terminate {
 message TerminateBoundary {}
 message Exec {
   ExecSpec spec = 1;
-}
-message ExecSignal {
-  string process_id = 1;
-  BoundarySignal signal = 2;
+  // Required absolute admission/retry deadline, not a process runtime limit.
+  // Remains unchanged on retries and participates in replay comparison.
+  google.protobuf.Timestamp exec_admission_deadline = 2;
 }
 message Resize {
   string process_id = 1;
@@ -164,6 +173,8 @@ message LoopbackConnect {
 message OpenMediation {}
 message AcceptNetwork {}
 
+// No image policy is yaml absent with invalid=false. invalid=true reports an
+// unreadable or invalid image policy; it must not be treated as missing.
 message ImagePolicy {
   optional string yaml = 1;
   bool invalid = 2;
@@ -174,7 +185,6 @@ message Attached {
 message Confirmed {
   BoundaryConfirmation confirmation = 1;
 }
-message ProviderFilesSupported {}
 message Started {
   string process_id = 1;
   uint64 provider_env_revision = 2;
@@ -305,9 +315,11 @@ message BoundaryConfirmation {
   string generation = 1;
   ResolvedWorkloadIdentity identity = 2;
   string session_id = 5;
+  // Derived from backend-owned provisioned state, not supervisor-supplied claims.
   map<string, string> resource_claims = 8;
-  // Optional opaque backend-owned audit document. Native clients may validate
-  // its schema; external backends need not provide Linux mechanism evidence.
+  // Optional backend-owned audit document encoded as a UTF-8 JSON value. Empty
+  // bytes mean absent. Native clients may validate its schema; external backends
+  // need not provide Linux mechanism evidence.
   bytes backend_audit = 9;
   // Required SHA-256 commitment to the driver's validated provisioning evidence
   // and this generation. Must match trusted launch metadata. A matching digest

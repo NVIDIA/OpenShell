@@ -29,7 +29,8 @@ returns `UNIMPLEMENTED` for those optional RPCs.
 `SandboxProtocol.Exchange` and `.Mediate` begin with the handle from
 `OpenBoundary`. The server authenticates the stream's bearer, checks the handle
 against its provisioned sandbox and generation, then accepts typed protobuf
-requests, responses, process I/O, network decisions, relay data, and DNS messages.
+messages. `ExchangeFrame` carries control, process I/O, network decisions, and
+TCP relay data. `MediateFrame` carries the OpenMediation handshake and DNS messages.
 Missing bindings, repeated bindings, and frames that do not match the operation
 or direction are rejected. There is no nested JSON or length/channel framing on
 the wire. Private in-process adapters retain the Rust byte-stream interfaces.
@@ -38,6 +39,11 @@ Opening a boundary only validates and reserves a route. It neither attaches a
 supervisor nor runs workload code. Policy discovery is followed by the existing
 attach, mediation setup, confirm, and explicit start sequence. The existing
 connection registry continues to govern supervisor replacement and recovery.
+
+Sandbox and generation identity come from the verified bearer, rather than
+duplicate fields on `OpenBoundaryRequest`. Attach supplies policy; confirmation
+reports resource claims from backend-owned provisioned state, which the
+supervisor compares with its trusted launch metadata.
 
 Update the supervisor and sandbox runtime together; an older peer fails during
 startup instead of using a fallback path.
@@ -89,7 +95,8 @@ Sandbox Protocol.
 For the built-in Linux backend, the client validates native audit evidence and
 rejects incomplete or foreign measurements. External backends validate their own
 mechanisms and may omit audit data; they do not need to reproduce Linux
-measurements. Successful confirmation asserts that the backend can enforce the
+measurements. Optional audit data is a UTF-8 JSON value; empty bytes mean absent.
+Successful confirmation asserts that the backend can enforce the
 admitted policy; unsupported requirements fail before workload start. Both paths
 retain generation, session, resource, identity, and provisioning evidence checks.
 

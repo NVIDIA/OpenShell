@@ -5,6 +5,5 @@ pub mod driver;
 pub mod guest;
 pub mod launch;
 pub mod lifecycle;
-pub mod network;
 pub mod protocol;
 pub mod transport;

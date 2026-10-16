@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Supervisor-facing lifecycle and mediated HTTP for the local V8 placement.
+//! Supervisor-facing lifecycle for the network-disabled JavaScript runtime.
 use crate::{
     guest::{Guest, GuestResult, GuestStatus, read_script},
     launch::Launch,
@@ -22,7 +22,7 @@ use tokio::sync::{Mutex, watch};
 use tonic::{Request, Response, Status, Streaming};
 
 type Chunks =
-    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SandboxFrame, Status>> + Send>>;
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<ExchangeFrame, Status>> + Send>>;
 struct State {
     policy: Option<wire::SandboxPolicyWire>,
     ledger: HashMap<String, (String, wire::Response)>,
@@ -34,8 +34,6 @@ struct State {
 pub struct Runtime {
     launch: Launch,
     guest: Arc<Guest>,
-    network: crate::network::Network,
-    network_requests: Mutex<tokio::sync::mpsc::Receiver<crate::network::HttpOpen>>,
     authenticator: SandboxProtocolAuthenticator,
     pub registry: Arc<SandboxConnectionRegistry>,
     opened: Mutex<HashSet<SandboxConnectionId>>,
@@ -90,11 +88,8 @@ impl Runtime {
             launch.boundary.session_id,
             launch.rotation,
         ));
-        let (network, network_requests) = crate::network::Network::channel();
         Ok(Arc::new(Self {
             launch,
-            network,
-            network_requests: Mutex::new(network_requests),
             guest: Arc::new(Guest::new(&bytes)?),
             authenticator,
             registry,
@@ -121,10 +116,11 @@ impl Runtime {
             .authenticate(id, request.metadata())
             .map_err(|_| Status::unauthenticated("invalid sandbox launch credential"))
     }
-    async fn route(
+    async fn route<F: prost::Message + Default>(
         &self,
-        mut request: Request<Streaming<SandboxFrame>>,
-    ) -> Result<(SandboxProtocolPrincipal, Streaming<SandboxFrame>), Status> {
+        mut request: Request<Streaming<F>>,
+        binding: fn(F) -> Option<String>,
+    ) -> Result<(SandboxProtocolPrincipal, Streaming<F>), Status> {
         let principal = self.authenticate(&request)?;
         if !self
             .opened
@@ -137,11 +133,7 @@ impl Runtime {
             ));
         }
         let first = request.get_mut().message().await?;
-        if first.and_then(|f| f.payload)
-            != Some(sandbox_frame::Payload::BoundaryId(
-                self.launch.boundary.generation.clone(),
-            ))
-        {
+        if first.and_then(binding) != Some(self.launch.boundary.generation.clone()) {
             return Err(Status::permission_denied("wrong boundary handle"));
         }
         Ok((principal, request.into_inner()))
@@ -277,7 +269,7 @@ impl Runtime {
         if let Q::Signal { signal, .. } = &envelope.request
             && !matches!(signal, wire::SignalWire::Term)
         {
-            return Err(Status::unimplemented("this V8 example supports TERM only"));
+            return Err(Status::unimplemented("js-sbx supports TERM only"));
         }
         if matches!(
             envelope.request,
@@ -290,15 +282,8 @@ impl Runtime {
         }
         let mut state = self.state.lock().await;
         let response = match &envelope.request {
-            Q::Attach {
-                policy,
-                resource_claims,
-                ..
-            } => {
+            Q::Attach { policy, .. } => {
                 self.validate_policy(policy)?;
-                if resource_claims != &self.launch.boundary.resource_claims {
-                    return Err(Status::permission_denied("resource claims mismatch"));
-                }
                 if state
                     .policy
                     .as_ref()
@@ -334,25 +319,19 @@ impl Runtime {
                             .boundary
                             .provisioning_evidence
                             .evidence_digest,
-                        backend_audit: serde_json::json!({"script_sha256": self.launch.boundary.workload_identity.resource_digest, "network": "supervisor-http-host-call", "filesystem": "no-host-access"}),
+                        backend_audit: serde_json::json!({"script_sha256": self.launch.boundary.workload_identity.resource_digest, "network": "disabled", "filesystem": "no-host-access"}),
                     }),
                 }
-            }
-            Q::ProbeProviderFiles => {
-                return Err(Status::unimplemented("V8 provider files are unsupported"));
             }
             Q::StartAgent {
                 sandbox_id,
                 spec,
-                policy,
                 provider_env_revision,
                 provider_env,
                 provider_files,
                 ..
             } => {
-                if sandbox_id != &self.launch.boundary.sandbox_id
-                    || state.policy.as_ref() != Some(policy)
-                {
+                if sandbox_id != &self.launch.boundary.sandbox_id || state.policy.is_none() {
                     return Err(Status::permission_denied("admitted launch changed"));
                 }
                 if spec.timeout_secs != 0
@@ -375,10 +354,9 @@ impl Runtime {
                 let runtime = self.clone();
                 let guest = self.guest.clone();
                 let output = self.output.clone();
-                let network = self.network.clone();
                 tokio::spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        guest.run(Some(network), |stdout, stderr| {
+                        guest.run(|stdout, stderr| {
                             *output.lock().unwrap() = Some((stdout, stderr));
                         })
                     })
@@ -452,7 +430,7 @@ impl Runtime {
             Q::OpenMediation => R::MediationReady,
             _ => {
                 return Err(Status::unimplemented(
-                    "operation is not supported by this V8 example",
+                    "operation is not supported by js-sbx",
                 ));
             }
         };
@@ -541,9 +519,7 @@ impl isolation_backend_server::IsolationBackend for Arc<Runtime> {
         let principal = self.authenticate(&request)?;
         let q = request.into_inner();
         let b = &self.launch.boundary;
-        if q.sandbox_id != b.sandbox_id
-            || q.session_id != b.session_id.to_string()
-            || q.generation_id != b.generation
+        if q.session_id != b.session_id.to_string()
             || q.backend_name != BACKEND
             || q.driver_descriptor != self.launch.descriptor
         {
@@ -576,18 +552,40 @@ impl isolation_backend_server::IsolationBackend for Arc<Runtime> {
 #[tonic::async_trait]
 impl sandbox_protocol_server::SandboxProtocol for Arc<Runtime> {
     type ExchangeStream = Chunks;
-    type MediateStream = Chunks;
+    type MediateStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<MediateFrame, Status>> + Send>>;
     async fn mediate(
         &self,
-        request: Request<Streaming<SandboxFrame>>,
-    ) -> Result<Response<Chunks>, Status> {
-        self.exchange(request).await
+        request: Request<Streaming<MediateFrame>>,
+    ) -> Result<Response<Self::MediateStream>, Status> {
+        let (principal, mut input) = self
+            .route(request, |f| match f.payload {
+                Some(mediate_frame::Payload::BoundaryId(id)) => Some(id),
+                _ => None,
+            })
+            .await?;
+        let runtime = self.clone();
+        let stream = async_stream::try_stream! {
+            let envelope = protocol::read_mediation_request(&mut input).await?;
+            let response = runtime.control(&principal, &envelope).await?;
+            yield protocol::mediation_response(envelope.request_id, response)?;
+            let mut ended = runtime.ended.subscribe();
+            while !*ended.borrow_and_update() {
+                ended.changed().await.map_err(|_| Status::unavailable("boundary closed"))?;
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
     }
     async fn exchange(
         &self,
-        request: Request<Streaming<SandboxFrame>>,
+        request: Request<Streaming<ExchangeFrame>>,
     ) -> Result<Response<Chunks>, Status> {
-        let (principal, mut input) = self.route(request).await?;
+        let (principal, mut input) = self
+            .route(request, |f| match f.payload {
+                Some(exchange_frame::Payload::BoundaryId(id)) => Some(id),
+                _ => None,
+            })
+            .await?;
         let runtime = self.clone();
         let stream = async_stream::try_stream! {
             let envelope = protocol::read_request(&mut input).await?;
@@ -597,52 +595,12 @@ impl sandbox_protocol_server::SandboxProtocol for Arc<Runtime> {
                 runtime.registry.require_active(&principal)
                     .map_err(|e| Status::failed_precondition(e.to_string()))?;
                 let mut ended = runtime.ended.subscribe();
-                let mut pending = loop {
-                    let queued = tokio::select! {
-                        biased;
-                        _ = ended.wait_for(|value| *value) => Err(Status::unavailable("boundary closed")),
-                        _ = input.message() => Err(Status::unavailable("network accept disconnected")),
-                        pending = async { runtime.network_requests.lock().await.recv().await } => pending.ok_or_else(||Status::unavailable("network source closed")),
-                    }?;
-                    if !queued.result.is_closed() {
-                        break queued;
-                    }
-                };
-                let identity = wire::BinaryIdentityWire::Resolved {
-                    executable: wire::ExecutableIdentityWire {
-                        path: PathBuf::from("/work/guest.js"),
-                        digest: Some(runtime.launch.boundary.workload_identity.resource_digest.parse().map_err(|_|Status::internal("invalid script digest"))?),
-                    },
-                    ancestors: vec![],
-                    cmdline_paths: vec![],
-                };
-                let response = wire::Response::NetworkConnected {
-                    identity,
-                    destination: pending.destination,
-                    socket: None,
-                    policy_generation: 0,
-                    timing: wire::MediationTimingWire {
-                        notification_to_queue_us: 0,
-                        queue_wait_us: pending.queued_at.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
-                    },
-                };
-                yield protocol::response(envelope.request_id, response)?;
-                let decision = tokio::select! {
-                    _ = pending.result.closed() => return,
-                    decision = crate::network::decision(&mut input) => decision,
-                }?;
-                use openshell_isolation_interface::contract::TcpOpenDecision;
-                let status = match decision {
-                    TcpOpenDecision::Denied(reason) => crate::network::denied(reason),
-                    TcpOpenDecision::RelayReady => {
-                        yield protocol::data(pending.request);
-                        tokio::select! {
-                            _ = pending.result.closed() => return,
-                            status = crate::network::http_status(&mut input) => status,
-                        }?
-                    }
-                };
-                let _ = pending.result.send(status);
+                // The guest has no socket bindings. Keep the network accept
+                // pending until shutdown or the supervisor disconnects.
+                tokio::select! {
+                    _ = ended.wait_for(|value| *value) => {},
+                    _ = input.message() => {},
+                }
                 return;
             }
             let response = match runtime.control(&principal, &envelope).await {
@@ -651,6 +609,7 @@ impl sandbox_protocol_server::SandboxProtocol for Arc<Runtime> {
                     kind: match error.code() {
                         tonic::Code::InvalidArgument => wire::BoundaryErrorKind::Invalid,
                         tonic::Code::Unavailable => wire::BoundaryErrorKind::Unavailable,
+                        tonic::Code::Unimplemented => wire::BoundaryErrorKind::Unsupported,
                         _ => wire::BoundaryErrorKind::Denied,
                     },
                     message: error.message().to_string(),
@@ -682,7 +641,7 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
     let state_dir = state_dir.canonicalize()?;
     let socket_path = state_dir.join("backend.sock");
     println!(
-        "V8 backend waiting for driver provisioning in {} on {}",
+        "js-sbx waiting for driver provisioning in {} on {}",
         state_dir.display(),
         socket_path.display()
     );
@@ -704,7 +663,7 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls));
         let runtime = Runtime::new(launch)?;
         println!(
-            "V8 boundary provisioned: {}",
+            "JavaScript runtime provisioned: {}",
             runtime.launch.boundary.sandbox_id
         );
         let registry = runtime.registry.clone();

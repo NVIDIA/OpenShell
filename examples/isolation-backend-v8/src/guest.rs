@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! One V8 isolate with two host functions: bounded logging and mediated HTTP.
+//! One V8 isolate with bounded console output and no guest I/O.
 use std::{
     ffi::c_void,
     fs::File,
@@ -17,9 +17,6 @@ use std::{
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
-
-use crate::network::{self, Network};
 
 const MAX_SCRIPT: usize = 256 * 1024;
 const MAX_OUTPUT: usize = 64 * 1024;
@@ -74,9 +71,8 @@ pub struct GuestResult {
 }
 
 struct State {
-    network: Option<Network>,
-    stopped: watch::Receiver<bool>,
     stdout: Output,
+    stderr: Output,
     rejections: Vec<v8::Global<v8::Promise>>,
 }
 
@@ -84,7 +80,6 @@ pub struct Guest {
     source: String,
     digest: String,
     cancelled: AtomicBool,
-    stopped: watch::Sender<bool>,
     isolate: Mutex<Option<v8::IsolateHandle>>,
 }
 
@@ -95,24 +90,18 @@ impl Guest {
             source: std::str::from_utf8(bytes)?.to_owned(),
             digest: format!("{:x}", Sha256::digest(bytes)),
             cancelled: AtomicBool::new(false),
-            stopped: watch::channel(false).0,
             isolate: Mutex::new(None),
         })
     }
 
     pub fn terminate(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        self.stopped.send_replace(true);
         if let Some(handle) = self.isolate.lock().unwrap().as_ref() {
             handle.terminate_execution();
         }
     }
 
-    pub fn run(
-        &self,
-        network: Option<Network>,
-        ready: impl FnOnce(Output, Output),
-    ) -> Result<GuestResult> {
+    pub fn run(&self, ready: impl FnOnce(Output, Output)) -> Result<GuestResult> {
         static INITIALIZE: Once = Once::new();
         INITIALIZE.call_once(|| {
             v8::V8::initialize_platform(v8::new_default_platform(0, false).make_shared());
@@ -132,7 +121,7 @@ impl Guest {
                     self.terminate();
                 }
             });
-            let outcome = self.execute(network, stdout.clone(), &stderr);
+            let outcome = self.execute(stdout.clone(), &stderr);
             drop(done);
             outcome
         })?;
@@ -150,21 +139,15 @@ impl Guest {
         })
     }
 
-    fn execute(
-        &self,
-        network: Option<Network>,
-        stdout: Output,
-        stderr: &Output,
-    ) -> Result<GuestStatus> {
+    fn execute(&self, stdout: Output, stderr: &Output) -> Result<GuestStatus> {
         let mut isolate = v8::Isolate::new(v8::CreateParams::default().heap_limits(0, MAX_HEAP));
         *self.isolate.lock().unwrap() = Some(isolate.thread_safe_handle());
         if self.cancelled.load(Ordering::SeqCst) {
             return Ok(GuestStatus::Terminated);
         }
         isolate.set_slot(State {
-            network,
-            stopped: self.stopped.subscribe(),
             stdout,
+            stderr: stderr.clone(),
             rejections: Vec::new(),
         });
         isolate.set_promise_reject_callback(promise_rejected);
@@ -175,8 +158,8 @@ impl Guest {
             v8::scope!(let scope, &mut isolate);
             let global = v8::ObjectTemplate::new(scope);
             global.set(
-                v8::String::new(scope, "httpGet").unwrap().into(),
-                v8::FunctionTemplate::new(scope, http_get).into(),
+                v8::String::new(scope, "fetch").unwrap().into(),
+                v8::FunctionTemplate::new(scope, deny_network).into(),
             );
             let context = v8::Context::new(
                 scope,
@@ -192,6 +175,9 @@ impl Guest {
             let logger = v8::Function::new(scope, log).unwrap();
             let log_key = v8::String::new(scope, "log").unwrap();
             console.set(scope, log_key.into(), logger.into());
+            let error_logger = v8::Function::new(scope, log_error).unwrap();
+            let error_key = v8::String::new(scope, "error").unwrap();
+            console.set(scope, error_key.into(), error_logger.into());
             let console_key = v8::String::new(scope, "console").unwrap();
             context
                 .global(scope)
@@ -263,6 +249,18 @@ unsafe extern "C" fn heap_limit(data: *mut c_void, current: usize, _initial: usi
 }
 
 fn log(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _result: v8::ReturnValue) {
+    write_output(scope, args, false);
+}
+
+fn log_error(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    _result: v8::ReturnValue,
+) {
+    write_output(scope, args, true);
+}
+
+fn write_output(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, error: bool) {
     let Some(text) = args.get(0).to_string(scope) else {
         return;
     };
@@ -271,32 +269,19 @@ fn log(scope: &mut v8::PinScope, args: v8::FunctionCallbackArguments, _result: v
         return;
     }
     let message = text.to_rust_string_lossy(scope);
-    let output = &scope.get_slot::<State>().unwrap().stdout;
+    let state = scope.get_slot::<State>().unwrap();
+    let output = if error { &state.stderr } else { &state.stdout };
     if !output.append(&message) || !output.append("\n") {
         scope.terminate_execution();
     }
 }
 
-fn http_get(
+fn deny_network(
     scope: &mut v8::PinScope,
-    args: v8::FunctionCallbackArguments,
-    mut result: v8::ReturnValue,
+    _args: v8::FunctionCallbackArguments,
+    _result: v8::ReturnValue,
 ) {
-    let Ok(url) = v8::Local::<v8::String>::try_from(args.get(0)) else {
-        result.set_int32(network::INVALID_REQUEST);
-        return;
-    };
-    if url.length() > network::MAX_URL {
-        result.set_int32(network::INVALID_REQUEST);
-        return;
-    }
-    let url = url.to_rust_string_lossy(scope);
-    let state = scope.get_slot::<State>().unwrap();
-    let status = state
-        .network
-        .as_ref()
-        .map_or(network::UNAVAILABLE, |network| {
-            network.http_get(&url, state.stopped.clone())
-        });
-    result.set_int32(status);
+    let message = v8::String::new(scope, "Network access is disabled").unwrap();
+    let error = v8::Exception::error(scope, message);
+    scope.throw_exception(error);
 }

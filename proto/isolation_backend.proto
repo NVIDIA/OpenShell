@@ -8,6 +8,9 @@ package openshell.sandbox.backend.v1;
 import "extension.proto";
 import "options.proto";
 
+// EXPERIMENTAL: This protocol is under active development. Its API and wire
+// format may change incompatibly before stabilization.
+//
 // Isolation Backend control contract. The supervisor uses this service on a
 // trusted, authenticated endpoint selected by operator configuration or compute
 // driver provisioning. Workload control, network mediation, and byte streams
@@ -34,14 +37,13 @@ service IsolationBackend {
   // conveys no sandbox credentials or driver descriptor.
   rpc Describe(DescribeIsolationBackendRequest) returns (DescribeIsolationBackendResponse);
 
-  // Bind a driver-provisioned resource to one fresh sandbox launch. The
-  // caller credential must match sandbox_id and generation_id. This call must
-  // not run untrusted workload code. The subsequent Sandbox Protocol Attach,
-  // Confirm, and StartAgent sequence remains mandatory. A resource that already is
-  // the boundary may only validate and reserve its binding, then return a handle.
+  // Bind a driver-provisioned resource to the authenticated sandbox and generation
+  // using the launch in OpenBoundaryRequest. Follow SandboxProtocol admission.
+  // A resource that already is the boundary may only validate and reserve its
+  // binding, then return a handle.
   // Reopening the same session and generation returns the same result. The
   // descriptor must bind to the same provisioned resource; a different resource
-  // binding fails. A route opened before attach never authorizes execution.
+  // binding fails.
   // Driver deletion invalidates all handles and retained-state references,
   // including abandoned launches and suspended boundaries.
   rpc OpenBoundary(OpenBoundaryRequest) returns (OpenBoundaryResponse);
@@ -53,10 +55,9 @@ service IsolationBackend {
   // calls and streams are rejected and the old workload cannot make progress.
   rpc SuspendBoundary(SuspendBoundaryRequest) returns (SuspendBoundaryResponse);
 
-  // Restore a suspended boundary into a fresh launch session and generation.
-  // The restored workload remains frozen until attach, confirm, and start
-  // complete under the new supervisor: no untrusted workload code executes
-  // before start. A permitted cold start is reported. Unsupported optional
+  // Restore a suspended boundary using the fresh launch in ResumeBoundaryRequest.
+  // Follow SandboxProtocol admission while keeping the restored workload frozen
+  // until StartAgent. A permitted cold start is reported. Unsupported optional
   // suspend/resume RPCs return UNIMPLEMENTED without advancing lifecycle state.
   rpc ResumeBoundary(ResumeBoundaryRequest) returns (OpenBoundaryResponse);
 }
@@ -69,13 +70,12 @@ message DescribeIsolationBackendResponse {
   openshell.extension.v1.PeerMetadata backend = 1;
 }
 
+// Launch identity is issued by the gateway: session and generation are fresh
+// for each launch and unchanged on retries. Sandbox and generation identity
+// come from the verified sandbox bearer; backends must bind that identity to
+// their own provisioned state.
 message OpenBoundaryRequest {
-  // Stable gateway-assigned sandbox identity, not a public resource name.
-  string sandbox_id = 1;
-  // Fresh for each launch and unchanged for retries of that launch.
   string session_id = 2;
-  // Fresh runtime generation bound to the supervisor's launch credential.
-  string generation_id = 3;
   // Must match trusted admission and the configured endpoint registration.
   string backend_name = 4;
   // Opaque descriptor from the trusted compute driver. The backend validates
@@ -95,9 +95,8 @@ message OpenBoundaryResponse {
     LAUNCH_OUTCOME_COLD_START_FALLBACK = 3;
   }
 
-  // Required. A restoration result remains frozen until the new supervisor
-  // authenticates, confirms enforcement, installs current policy and secrets,
-  // and explicitly starts the boundary. Fallback must be visible to callers.
+  // Required. Distinguishes restoration from cold-start fallback; admission
+  // follows SandboxProtocol for either outcome.
   LaunchOutcome outcome = 2;
 }
 
@@ -118,8 +117,8 @@ message SuspendBoundaryResponse {
 }
 
 message ResumeBoundaryRequest {
-  // Fresh launch identity and trusted driver descriptor. Replays reuse the
-  // same launch request; the old session and generation are never reused.
+  // New launch identity and trusted driver descriptor, as defined by
+  // OpenBoundaryRequest; replays reuse this launch request.
   OpenBoundaryRequest launch = 1;
   // Reference returned by SuspendBoundary for this sandbox. It carries no
   // authority without the new authenticated launch credential.

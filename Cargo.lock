@@ -4840,6 +4840,7 @@ name = "openshell-sandbox-backend"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "hyper-util",
  "libc",
  "openshell-core",
@@ -4858,6 +4859,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
  "tower",

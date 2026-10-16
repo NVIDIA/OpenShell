@@ -8,7 +8,7 @@ use openshell_core::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 
 use crate::backend_proto::OpenBoundaryRequest;
 use crate::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
-use crate::proto::{SandboxFrame, sandbox_frame::Payload};
+use crate::proto::{ExchangeFrame, exchange_frame::Payload};
 
 pub const SANDBOX_PROTOCOL_CAPABILITY: &str = "openshell.sandbox.protocol";
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
@@ -34,14 +34,15 @@ pub fn negotiate(local: &PeerMetadata, remote: Option<PeerMetadata>) -> Result<(
 }
 
 /// Check native driver coordinates against the protected runtime bootstrap.
+///
+/// The caller must first authenticate the bearer against the provisioned
+/// sandbox and generation using `SandboxProtocolAuthenticator`.
 /// This only opens a route; attach, confirm, and start retain their authority.
 pub fn validate_open(
     request: &OpenBoundaryRequest,
     config: &BoundaryConfig,
 ) -> Result<(), tonic::Status> {
     if request.backend_name != crate::BACKEND_NAME
-        || request.sandbox_id != config.boundary_id
-        || request.generation_id != config.generation
         || request.session_id != config.session_id.to_string()
     {
         return Err(tonic::Status::permission_denied(
@@ -66,21 +67,21 @@ pub fn validate_open(
 }
 
 #[must_use]
-pub fn data_chunk(data: Vec<u8>) -> SandboxFrame {
-    SandboxFrame {
+pub fn data_chunk(data: Vec<u8>) -> ExchangeFrame {
+    ExchangeFrame {
         payload: Some(Payload::RelayData(data)),
     }
 }
 
 #[must_use]
-pub fn sandbox_frame(boundary_id: &str) -> SandboxFrame {
-    SandboxFrame {
+pub fn exchange_frame(boundary_id: &str) -> ExchangeFrame {
+    ExchangeFrame {
         payload: Some(Payload::BoundaryId(boundary_id.to_string())),
     }
 }
 
 /// Adapt a single typed frame for callers inspecting a local response.
-pub fn chunk_data(chunk: SandboxFrame) -> Result<Vec<u8>, tonic::Status> {
+pub fn chunk_data(chunk: ExchangeFrame) -> Result<Vec<u8>, tonic::Status> {
     let mut mode = match chunk.payload.as_ref() {
         Some(Payload::Request(_)) => crate::stream_adapter::Mode::Request,
         Some(Payload::Response(_)) => crate::stream_adapter::Mode::Response,
@@ -89,8 +90,6 @@ pub fn chunk_data(chunk: SandboxFrame) -> Result<Vec<u8>, tonic::Status> {
             crate::stream_adapter::Mode::Output
         }
         Some(Payload::TcpOpenDecision(_)) => crate::stream_adapter::Mode::Decision,
-        Some(Payload::DnsQuery(_)) => crate::stream_adapter::Mode::DnsQueries,
-        Some(Payload::DnsResponse(_)) => crate::stream_adapter::Mode::DnsResponses,
         _ => crate::stream_adapter::Mode::Relay,
     };
     crate::stream_adapter::receive(&mut mode, chunk)
@@ -100,9 +99,9 @@ pub fn chunk_data(chunk: SandboxFrame) -> Result<Vec<u8>, tonic::Status> {
 /// A typed control request after the stream's boundary-binding frame.
 pub fn request_chunk(
     request: &crate::boundary_protocol::RequestEnvelope,
-) -> Result<SandboxFrame, crate::boundary_protocol::FrameError> {
+) -> Result<ExchangeFrame, crate::boundary_protocol::FrameError> {
     use crate::protobuf::WireMessage;
-    Ok(SandboxFrame {
+    Ok(ExchangeFrame {
         payload: Some(Payload::Request(request.to_proto()?)),
     })
 }
@@ -110,9 +109,9 @@ pub fn request_chunk(
 /// A typed control response, preserving the request's correlation ID.
 pub fn response_chunk(
     response: &crate::boundary_protocol::ResponseEnvelope,
-) -> Result<SandboxFrame, crate::boundary_protocol::FrameError> {
+) -> Result<ExchangeFrame, crate::boundary_protocol::FrameError> {
     use crate::protobuf::WireMessage;
-    Ok(SandboxFrame {
+    Ok(ExchangeFrame {
         payload: Some(Payload::Response(response.to_proto()?)),
     })
 }

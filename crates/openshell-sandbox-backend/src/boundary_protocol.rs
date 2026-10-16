@@ -654,15 +654,11 @@ pub enum Request {
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
-        resource_claims: std::collections::BTreeMap<String, String>,
     },
     Confirm,
-    /// Verify file-open mediation before sending a file-bearing snapshot.
-    ProbeProviderFiles,
     StartAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
-        policy: Box<SandboxPolicyWire>,
         ca_cert: Option<String>,
         ca_bundle: Option<String>,
         provider_env_revision: u64,
@@ -697,10 +693,6 @@ pub enum Request {
     Exec {
         spec: ExecSpecWire,
     },
-    ExecSignal {
-        process_id: String,
-        signal: SignalWire,
-    },
     Resize {
         process_id: String,
         cols: u16,
@@ -731,7 +723,6 @@ impl Request {
                 | Self::Signal { .. }
                 | Self::Terminate { .. }
                 | Self::TerminateBoundary
-                | Self::ExecSignal { .. }
                 | Self::Resize { .. }
         )
     }
@@ -744,18 +735,14 @@ impl fmt::Debug for Request {
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
-                resource_claims,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
-                .field("resource_claims", resource_claims)
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
-            Self::ProbeProviderFiles => formatter.write_str("ProbeProviderFiles"),
             Self::StartAgent {
                 sandbox_id,
                 spec,
-                policy: _,
                 ca_cert,
                 ca_bundle,
                 provider_env_revision,
@@ -765,7 +752,6 @@ impl fmt::Debug for Request {
                 .debug_struct("StartAgent")
                 .field("sandbox_id", sandbox_id)
                 .field("spec", spec)
-                .field("policy", &"<redacted>")
                 .field("ca_cert_present", &ca_cert.is_some())
                 .field("ca_bundle_present", &ca_bundle.is_some())
                 .field("provider_env_revision", provider_env_revision)
@@ -809,11 +795,6 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::TerminateBoundary => formatter.write_str("TerminateBoundary"),
             Self::Exec { spec } => formatter.debug_tuple("Exec").field(spec).finish(),
-            Self::ExecSignal { process_id, signal } => formatter
-                .debug_struct("ExecSignal")
-                .field("process_id", process_id)
-                .field("signal", signal)
-                .finish(),
             Self::Resize {
                 process_id,
                 cols,
@@ -856,7 +837,6 @@ pub enum Response {
         /// before workload launch.
         confirmation: Box<BoundaryConfirmation>,
     },
-    ProviderFilesSupported,
     Started {
         process_id: String,
         provider_env_revision: u64,
@@ -1551,13 +1531,6 @@ mod tests {
                     timeout_secs: 5,
                     interactive: false,
                 },
-                policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
-                    version: 1,
-                    filesystem: FilesystemPolicy::default(),
-                    network: NetworkPolicy::default(),
-                    landlock: LandlockPolicy::default(),
-                    process: ProcessPolicy::default(),
-                })),
                 ca_cert: Some("test certificate".to_string()),
                 ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
@@ -1576,7 +1549,6 @@ mod tests {
         let decoded: RequestEnvelope = decode_frame(&frame).expect("decode request");
         assert_eq!(decoded, request);
         let debug = format!("{request:?}");
-        assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("test credential"));
         assert!(!debug.contains("test certificate"));
         assert!(!debug.contains("test bundle"));
@@ -1613,10 +1585,7 @@ mod tests {
             Err(FrameError::PayloadDigestMismatch)
         ));
         retry.exec_admission_deadline_unix_ms = None;
-        assert!(matches!(
-            retry.validate_payload_digest(),
-            Err(FrameError::PayloadDigestMismatch)
-        ));
+        assert!(retry.validate_payload_digest().is_err());
     }
 
     #[test]
@@ -1719,13 +1688,6 @@ mod tests {
                 timeout_secs: 5,
                 interactive: false,
             },
-            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
-                version: 1,
-                filesystem: FilesystemPolicy::default(),
-                network: NetworkPolicy::default(),
-                landlock: LandlockPolicy::default(),
-                process: ProcessPolicy::default(),
-            })),
             ca_cert: Some("A".repeat(16 * 1024)),
             ca_bundle: Some("B".repeat(400 * 1024)),
             provider_env_revision: 0,
