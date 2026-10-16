@@ -103,8 +103,11 @@ For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
 and PriorityClasses need matching administrator-owned labels; namespace
-membership and read-only access do not grant approval. GPU devices and
-operator-selected image-pull Secrets do not need admission labels. In managed
+membership and read-only access do not grant approval. For Kata deployments,
+confirm the RuntimeClass selected by `server.defaultRuntimeClassName` exists
+and has the administrator-owned `openshell.ai/sandbox-attachable=true` label,
+including when it is the default. GPU devices and operator-selected image-pull
+Secrets do not need admission labels. In managed
 mode, inspect the configured source image-pull Secret in the gateway namespace
 and the generation copies (`openshell.ai/component=image-pull`) in the workspace
 namespace. Legacy workloads without
