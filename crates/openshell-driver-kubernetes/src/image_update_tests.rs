@@ -562,7 +562,7 @@ async fn image_update_conflict_does_not_blindly_retry_or_recreate() {
 
 #[tokio::test]
 async fn image_update_grpc_maps_validation_and_precondition_errors() {
-    use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriver;
+    use openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdates;
     let (driver, state) = fixture(SANDBOX_VERSION_V1BETA1, false);
     let service = crate::ComputeDriverService::new(driver);
     let mut invalid = request();

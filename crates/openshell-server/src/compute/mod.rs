@@ -43,6 +43,7 @@ use openshell_core::proto::compute::v1::{
     ResourceRequirements as DriverSandboxResourceRequirements, StartSandboxRequest,
     StopSandboxRequest, SuspendSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
     WatchSandboxesRequest, WorkloadIdentityRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_image_updates_client::ComputeDriverImageUpdatesClient,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
@@ -84,8 +85,11 @@ use tracing::{Instrument as _, debug, info, warn};
 
 pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
-pub type SharedComputeDriver =
-    Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+pub type SharedComputeDriver = Arc<
+    dyn openshell_core::compute::ComputeDriver<WatchSandboxesStream = DriverWatchStream>
+        + Send
+        + Sync,
+>;
 
 fn supports_isolation_registration(capabilities: &[String]) -> bool {
     capabilities.iter().any(|capability| {
@@ -677,6 +681,9 @@ impl AcquiredRemoteDriverEndpoint {
 #[derive(Debug, Clone)]
 struct RemoteComputeDriver {
     client: RemoteComputeDriverClient,
+    image_updates_client: ComputeDriverImageUpdatesClient<
+        tonic::service::interceptor::InterceptedService<Channel, TraceContextInterceptor>,
+    >,
     admission_acknowledgement: Arc<StdMutex<Option<String>>>,
 }
 
@@ -687,7 +694,11 @@ type RemoteComputeDriverClient = ComputeDriverClient<
 impl RemoteComputeDriver {
     fn new(channel: Channel) -> Self {
         Self {
-            client: ComputeDriverClient::with_interceptor(channel, TraceContextInterceptor),
+            client: ComputeDriverClient::with_interceptor(channel.clone(), TraceContextInterceptor),
+            image_updates_client: ComputeDriverImageUpdatesClient::with_interceptor(
+                channel,
+                TraceContextInterceptor,
+            ),
             admission_acknowledgement: Arc::new(StdMutex::new(None)),
         }
     }
@@ -729,7 +740,7 @@ impl RemoteComputeDriver {
 }
 
 #[tonic::async_trait]
-impl ComputeDriver for RemoteComputeDriver {
+impl openshell_core::compute::ComputeDriver for RemoteComputeDriver {
     async fn update_sandbox_image(
         &self,
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
@@ -738,9 +749,15 @@ impl ComputeDriver for RemoteComputeDriver {
         Status,
     > {
         self.verify_admission_policy(false).await?;
-        self.client().update_sandbox_image(request).await
+        self.image_updates_client
+            .clone()
+            .update_sandbox_image(request)
+            .await
     }
+}
 
+#[tonic::async_trait]
+impl ComputeDriver for RemoteComputeDriver {
     type WatchSandboxesStream = DriverWatchStream;
 
     async fn get_capabilities(
@@ -8202,19 +8219,11 @@ impl Default for NoopTestDriver {
 
 #[cfg(any(test, feature = "test-support"))]
 #[tonic::async_trait]
-impl ComputeDriver for NoopTestDriver {
-    async fn update_sandbox_image(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
-        Status,
-    > {
-        Err(Status::unimplemented(
-            "storage-preserving image updates are not supported by this driver",
-        ))
-    }
+impl openshell_core::compute::ComputeDriver for NoopTestDriver {}
 
+#[cfg(any(test, feature = "test-support"))]
+#[tonic::async_trait]
+impl ComputeDriver for NoopTestDriver {
     async fn authenticate_sandbox(
         &self,
         _request: Request<AuthenticateSandboxRequest>,
@@ -8854,19 +8863,10 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl ComputeDriver for TestDriver {
-        async fn update_sandbox_image(
-            &self,
-            _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-        ) -> Result<
-            tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
-            Status,
-        > {
-            Err(Status::unimplemented(
-                "storage-preserving image updates are not supported by this driver",
-            ))
-        }
+    impl openshell_core::compute::ComputeDriver for TestDriver {}
 
+    #[tonic::async_trait]
+    impl ComputeDriver for TestDriver {
         async fn authenticate_sandbox(
             &self,
             _request: Request<AuthenticateSandboxRequest>,
@@ -9329,19 +9329,10 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl ComputeDriver for ControlledDriver {
-        async fn update_sandbox_image(
-            &self,
-            _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-        ) -> Result<
-            tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
-            Status,
-        > {
-            Err(Status::unimplemented(
-                "storage-preserving image updates are not supported by this driver",
-            ))
-        }
+    impl openshell_core::compute::ComputeDriver for ControlledDriver {}
 
+    #[tonic::async_trait]
+    impl ComputeDriver for ControlledDriver {
         async fn authenticate_sandbox(
             &self,
             _request: Request<AuthenticateSandboxRequest>,
@@ -12635,19 +12626,10 @@ mod tests {
         struct FailingDriver(TestDriver);
 
         #[tonic::async_trait]
-        impl ComputeDriver for FailingDriver {
-            async fn update_sandbox_image(
-                &self,
-                _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-            ) -> Result<
-                tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
-                Status,
-            > {
-                Err(Status::unimplemented(
-                    "storage-preserving image updates are not supported by this driver",
-                ))
-            }
+        impl openshell_core::compute::ComputeDriver for FailingDriver {}
 
+        #[tonic::async_trait]
+        impl ComputeDriver for FailingDriver {
             async fn authenticate_sandbox(
                 &self,
                 _request: Request<AuthenticateSandboxRequest>,
@@ -17629,10 +17611,11 @@ mod tests {
     async fn remote_compute_driver_interceptor_propagates_every_rpc() {
         use crate::otel_tracing::test_exporter;
         use crate::test_support::FakeComputeDriver;
+        use openshell_core::compute::ComputeDriver as _;
 
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("compute-driver.sock");
-        let driver = FakeComputeDriver::new();
+        let driver = FakeComputeDriver::new().with_sandbox_image_updates();
         let _server = driver.serve_uds(&socket_path).unwrap();
         let endpoint = connect_remote_compute_driver("external-test", &socket_path)
             .await
@@ -17687,6 +17670,16 @@ mod tests {
                 .await
                 .unwrap();
             remote
+                .update_sandbox_image(Request::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxImageRequest {
+                        sandbox_id: sandbox.id.clone(),
+                        image: "example/workload:v2".into(),
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .unwrap();
+            remote
                 .delete_sandbox(Request::new(DeleteSandboxRequest {
                     sandbox_id: sandbox.id,
                     name: String::new(),
@@ -17703,7 +17696,7 @@ mod tests {
         let traceparents = driver.traceparents();
         assert_eq!(
             traceparents.len(),
-            10,
+            12,
             "the client interceptor should cover every RPC"
         );
         assert!(
@@ -18318,6 +18311,130 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             driver.calls(),
             vec![FakeComputeDriverCall::GetCapabilities; 3]
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn remote_compute_driver_negotiates_optional_image_service() {
+        use crate::test_support::{FakeComputeDriver, FakeComputeDriverCall};
+        use openshell_core::GetResourceVersion as _;
+        use openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE;
+
+        for supported in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("image-updates.sock");
+            let driver = FakeComputeDriver::new();
+            let driver = if supported {
+                driver.with_sandbox_image_updates()
+            } else {
+                driver
+            };
+            let _server = driver.serve_uds(&socket_path).unwrap();
+            let endpoint = connect_remote_compute_driver("external-test", &socket_path)
+                .await
+                .unwrap();
+            let store = Arc::new(crate::persistence::test_store().await);
+            crate::ensure_default_workspace(&store).await.unwrap();
+            let mut runtime = ComputeRuntime::new_remote_driver(
+                endpoint,
+                store.clone(),
+                SandboxIndex::new(),
+                SandboxWatchBus::new(),
+                TracingLogBus::new(),
+                Arc::new(SupervisorSessionRegistry::new()),
+            )
+            .await
+            .unwrap();
+            runtime.image_updates_enabled = true;
+            assert_eq!(
+                runtime
+                    .driver_info
+                    .negotiated_extension
+                    .supported_capabilities
+                    .iter()
+                    .any(|capability| capability == COMPUTE_UPDATE_SANDBOX_IMAGE),
+                supported,
+            );
+            let mut sandbox = sandbox_record("sb-image", "image-sandbox", SandboxPhase::Stopped);
+            sandbox.metadata.as_mut().unwrap().annotations.insert(
+                COMPUTE_RUNTIME_IDENTITY_ANNOTATION.into(),
+                "stable-runtime".into(),
+            );
+            sandbox.spec = Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    image: "example/workload:v1".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            store.put_message(&sandbox).await.unwrap();
+            let sandbox = store
+                .get_message::<Sandbox>("sb-image")
+                .await
+                .unwrap()
+                .unwrap();
+            driver.clear_calls();
+            let result = runtime
+                .update_sandbox_image(
+                    "sb-image",
+                    "example/workload:v2".into(),
+                    sandbox.get_resource_version(),
+                )
+                .await;
+            let requests = driver
+                .calls()
+                .into_iter()
+                .filter_map(|call| match call {
+                    FakeComputeDriverCall::UpdateSandboxImage { request } => Some(request),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if supported {
+                let updated = result.unwrap();
+                assert_eq!(
+                    updated.spec.unwrap().template.unwrap().image,
+                    "example/workload:v2"
+                );
+                assert_eq!(
+                    requests.len(),
+                    2,
+                    "preflight and mutation use the optional service"
+                );
+                assert!(requests[0].validate_only);
+                assert!(!requests[1].validate_only);
+                for request in &requests {
+                    assert_eq!(request.sandbox_id, "sb-image");
+                    assert_eq!(request.expected_runtime_identity, "stable-runtime");
+                    assert_eq!(request.expected_image, "example/workload:v1");
+                    assert_eq!(request.image, "example/workload:v2");
+                }
+                assert_eq!(requests[0].operation_id, requests[1].operation_id);
+            } else {
+                assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
+                assert!(
+                    requests.is_empty(),
+                    "capability admission must precede extension calls"
+                );
+                let unchanged = store
+                    .get_message::<Sandbox>("sb-image")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(unchanged, sandbox);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_driver_defaults_image_updates_to_unimplemented() {
+        let driver = NoopTestDriver::default();
+        let error = openshell_core::compute::ComputeDriver::update_sandbox_image(
+            &driver,
+            Request::new(openshell_core::proto::compute::v1::UpdateSandboxImageRequest::default()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), Code::Unimplemented);
     }
 
     #[tokio::test]

@@ -65,6 +65,19 @@ configuration validation live in `openshell_core::middleware`. Policy admission
 and the supervisor runtime consume the same contract without introducing a
 dependency from the policy crate to the supervisor implementation.
 
+## Optional Compute Image Updates
+
+The generated `proto::compute::v1::compute_driver_server::ComputeDriver` trait
+retains its baseline methods and streaming associated type. External drivers
+that support image updates additionally serve `ComputeDriverImageUpdates` on
+the same endpoint and advertise `openshell.compute.update-sandbox-image`.
+Drivers without that capability need no new generated-trait method.
+
+Linked in-process drivers implement `openshell_core::compute::ComputeDriver`
+in addition to the generated baseline trait. An empty implementation inherits
+`UNIMPLEMENTED` for image updates; supporting drivers override the optional
+method. The gateway negotiates the capability before invoking either path.
+
 ## Protobuf Struct Conversion
 
 Use `openshell_core::proto_struct` when crossing between `serde_json` values and

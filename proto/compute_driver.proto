@@ -45,13 +45,6 @@ service ComputeDriver {
   // Provision platform resources for a sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
-  // Idempotently replace only the workload image of a stopped sandbox, retaining
-  // its stable resource and storage. Requires the optional capability
-  // openshell.compute.update-sandbox-image. Unsupported drivers return
-  // UNIMPLEMENTED without changing any resource.
-  rpc UpdateSandboxImage(UpdateSandboxImageRequest)
-      returns (UpdateSandboxImageResponse);
-
   // Idempotently stop platform resources without deleting persistent state.
   rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
 
@@ -79,6 +72,19 @@ service ComputeDriver {
 
   // Tear down platform resources for a workspace.
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
+}
+
+// Optional image-update extension, served on the same endpoint as ComputeDriver.
+// Keeping this separate preserves the baseline generated server trait for
+// independently versioned external drivers. Drivers advertise
+// openshell.compute.update-sandbox-image only when they serve this service;
+// gateways must negotiate that capability before calling it.
+service ComputeDriverImageUpdates {
+  // Idempotently replace only the workload image of a stopped sandbox, retaining
+  // its stable resource and storage. Unsupported drivers omit this service and
+  // return UNIMPLEMENTED without changing any resource.
+  rpc UpdateSandboxImage(UpdateSandboxImageRequest)
+      returns (UpdateSandboxImageResponse);
 }
 
 message GetCapabilitiesRequest {

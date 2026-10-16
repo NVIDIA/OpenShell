@@ -11,6 +11,7 @@
 
 pub mod activity;
 pub mod auth;
+pub mod compute;
 pub mod config;
 pub mod container_paths;
 pub mod denial;

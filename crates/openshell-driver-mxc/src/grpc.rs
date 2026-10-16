@@ -33,17 +33,10 @@ impl ComputeDriverService {
 }
 
 #[tonic::async_trait]
-impl ComputeDriver for ComputeDriverService {
-    async fn update_sandbox_image(
-        &self,
-        _request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status>
-    {
-        Err(Status::unimplemented(
-            "storage-preserving image updates are not supported by this driver",
-        ))
-    }
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {}
 
+#[tonic::async_trait]
+impl ComputeDriver for ComputeDriverService {
     async fn get_capabilities(
         &self,
         request: Request<GetCapabilitiesRequest>,

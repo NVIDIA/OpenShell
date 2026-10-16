@@ -224,26 +224,6 @@ impl ComputeDriver for ComputeDriverService {
         .await
     }
 
-    async fn update_sandbox_image(
-        &self,
-        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
-    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status>
-    {
-        self.rpc_tracer
-            .trace(openshell_otel::rpc::UPDATE_SANDBOX_IMAGE, async {
-                self.driver
-                    .update_sandbox_image(&request.into_inner())
-                    .await
-                    .map_err(|error| {
-                        Status::from(openshell_core::ComputeDriverError::from(error))
-                    })?;
-                Ok(Response::new(
-                    openshell_core::proto::compute::v1::UpdateSandboxImageResponse {},
-                ))
-            })
-            .await
-    }
-
     async fn delete_sandbox(
         &self,
         request: Request<DeleteSandboxRequest>,
@@ -354,6 +334,41 @@ impl ComputeDriver for ComputeDriverService {
                 Ok(Response::new(DeleteWorkspaceResponse {}))
             })
             .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for ComputeDriverService {
+    async fn update_sandbox_image(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status>
+    {
+        self.rpc_tracer
+            .trace(openshell_otel::rpc::UPDATE_SANDBOX_IMAGE, async {
+                self.driver
+                    .update_sandbox_image(&request.into_inner())
+                    .await
+                    .map_err(|error| {
+                        Status::from(openshell_core::ComputeDriverError::from(error))
+                    })?;
+                Ok(Response::new(
+                    openshell_core::proto::compute::v1::UpdateSandboxImageResponse {},
+                ))
+            })
+            .await
+    }
+}
+
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdates
+    for ComputeDriverService
+{
+    async fn update_sandbox_image(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_image(self, request).await
     }
 }
 

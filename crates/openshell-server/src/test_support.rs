@@ -15,6 +15,8 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, stream};
 use openshell_core::Config;
 #[cfg(unix)]
+use openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdatesServer;
+#[cfg(unix)]
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -233,6 +235,20 @@ impl FakeComputeDriver {
     }
 
     #[must_use]
+    pub fn with_sandbox_image_updates(self) -> Self {
+        self.with_state(|state| {
+            state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities
+                .push(openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.into());
+        });
+        self
+    }
+
+    #[must_use]
     pub fn calls(&self) -> Vec<FakeComputeDriverCall> {
         self.with_state(|state| state.calls.clone())
     }
@@ -260,7 +276,8 @@ impl FakeComputeDriver {
         let driver = self.clone();
         let task = tokio::spawn(async move {
             tonic::transport::Server::builder()
-                .add_service(ComputeDriverServer::new(driver))
+                .add_service(ComputeDriverServer::new(driver.clone()))
+                .add_service(ComputeDriverImageUpdatesServer::new(driver))
                 .serve_with_incoming(UnixIncoming { listener })
                 .await
         });
@@ -326,7 +343,7 @@ impl Stream for UnixIncoming {
 }
 
 #[tonic::async_trait]
-impl ComputeDriver for FakeComputeDriver {
+impl openshell_core::compute::ComputeDriver for FakeComputeDriver {
     async fn update_sandbox_image(
         &self,
         request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
@@ -350,7 +367,22 @@ impl ComputeDriver for FakeComputeDriver {
             ))
         })
     }
+}
 
+#[tonic::async_trait]
+impl openshell_core::proto::compute::v1::compute_driver_image_updates_server::ComputeDriverImageUpdates
+    for FakeComputeDriver
+{
+    async fn update_sandbox_image(
+        &self,
+        request: Request<openshell_core::proto::compute::v1::UpdateSandboxImageRequest>,
+    ) -> Result<Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>, Status> {
+        openshell_core::compute::ComputeDriver::update_sandbox_image(self, request).await
+    }
+}
+
+#[tonic::async_trait]
+impl ComputeDriver for FakeComputeDriver {
     async fn authenticate_sandbox(
         &self,
         _request: Request<openshell_core::proto::compute::v1::AuthenticateSandboxRequest>,

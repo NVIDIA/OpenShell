@@ -63,6 +63,8 @@ where
 }
 
 pub const COMPUTE_DRIVER_RPC_SERVICE: &str = "openshell.compute.v1.ComputeDriver";
+pub const COMPUTE_DRIVER_IMAGE_UPDATES_RPC_SERVICE: &str =
+    "openshell.compute.v1.ComputeDriverImageUpdates";
 
 /// Low-cardinality semantic-convention identity for a compute-driver RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,10 +104,11 @@ pub mod rpc {
         "CreateSandbox",
         "openshell.compute.v1.ComputeDriver/CreateSandbox",
     );
-    pub const UPDATE_SANDBOX_IMAGE: ComputeDriverRpc = ComputeDriverRpc::new(
-        "UpdateSandboxImage",
-        "openshell.compute.v1.ComputeDriver/UpdateSandboxImage",
-    );
+    pub const UPDATE_SANDBOX_IMAGE: ComputeDriverRpc = ComputeDriverRpc {
+        service: super::COMPUTE_DRIVER_IMAGE_UPDATES_RPC_SERVICE,
+        method: "UpdateSandboxImage",
+        operation: "openshell.compute.v1.ComputeDriverImageUpdates/UpdateSandboxImage",
+    };
     pub const GET_SANDBOX: ComputeDriverRpc = ComputeDriverRpc::new(
         "GetSandbox",
         "openshell.compute.v1.ComputeDriver/GetSandbox",
