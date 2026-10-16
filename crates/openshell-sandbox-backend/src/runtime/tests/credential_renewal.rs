@@ -87,7 +87,7 @@ async fn renewing_boundary_client(
             let service = server_service.clone();
             connections.spawn(async move {
                 tonic::transport::Server::builder()
-                    .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                    .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
                     .add_service(SandboxBoundaryServer::new(service))
                     .serve_with_incoming(
                         tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(Box::new(stream)))])

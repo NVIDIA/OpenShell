@@ -527,11 +527,11 @@ impl Runtime {
 }
 
 #[tonic::async_trait]
-impl sandbox_backend_server::SandboxBackend for Arc<Runtime> {
+impl isolation_backend_server::IsolationBackend for Arc<Runtime> {
     async fn describe(
         &self,
-        request: Request<DescribeSandboxBackendRequest>,
-    ) -> Result<Response<DescribeSandboxBackendResponse>, Status> {
+        request: Request<DescribeIsolationBackendRequest>,
+    ) -> Result<Response<DescribeIsolationBackendResponse>, Status> {
         let peer = request
             .into_inner()
             .supervisor
@@ -545,7 +545,7 @@ impl sandbox_backend_server::SandboxBackend for Arc<Runtime> {
                 "incompatible Sandbox Protocol peer",
             ));
         }
-        Ok(Response::new(DescribeSandboxBackendResponse {
+        Ok(Response::new(DescribeIsolationBackendResponse {
             backend: Some(protocol::metadata()),
         }))
     }
@@ -742,7 +742,7 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
         };
         tonic::transport::Server::builder()
             .add_service(
-                sandbox_backend_server::SandboxBackendServer::new(runtime.clone())
+                isolation_backend_server::IsolationBackendServer::new(runtime.clone())
                     .max_decoding_message_size(64 * 1024)
                     .max_encoding_message_size(64 * 1024),
             )

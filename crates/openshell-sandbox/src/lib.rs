@@ -75,3 +75,5 @@ pub fn run(
     boundary_server::run_boundary(config_path, qualification)
         .map_err(|error| miette::miette!(error))
 }
+
+mod native_api;

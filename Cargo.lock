@@ -4668,7 +4668,6 @@ dependencies = [
 name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
- "async-trait",
  "openshell-core",
  "serde",
  "serde_json",
@@ -5100,6 +5099,7 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-policy-schema",
+ "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry_sdk",
@@ -5145,6 +5145,7 @@ dependencies = [
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
+ "openshell-sandbox-backend",
  "rand 0.10.2",
  "russh",
  "rustix 1.1.4",

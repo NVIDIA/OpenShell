@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendRegistry, EnforcedProperty,
-};
+use openshell_isolation_interface::contract::{BackendDescriptor, EnforcedProperty};
 
 const EXTERNAL_NAME: &str = "external-test";
 const OPAQUE_PAYLOAD: &[u8] = b"external-driver-v1\0\xffresource";
 
 async fn external_backend(
-    confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
+    confirmation: BoundaryConfirmation,
 ) -> (DelegatedRuntimeBackend, tokio::task::JoinHandle<()>) {
     let certificate = test_certificate();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -38,7 +36,7 @@ async fn external_backend(
                     confirmation,
                 };
                 tonic::transport::Server::builder()
-                    .add_service(SandboxBackendServer::new(TestIsolationBackend {
+                    .add_service(IsolationBackendServer::new(TestIsolationBackend {
                         backend_name: EXTERNAL_NAME.into(),
                         driver_descriptor: Some(OPAQUE_PAYLOAD.to_vec()),
                         ..TestIsolationBackend::default()
@@ -80,7 +78,7 @@ async fn external_backend(
     (backend, server)
 }
 
-fn external_confirmation() -> openshell_isolation_interface::contract::BoundaryConfirmation {
+fn external_confirmation() -> BoundaryConfirmation {
     let mut confirmation = test_confirmation();
     confirmation.backend_audit = serde_json::json!({"external_boundary": "verified-actor"});
     let property = EnforcedProperty::new(true, "external-actor-isolation");
@@ -93,18 +91,11 @@ fn external_confirmation() -> openshell_isolation_interface::contract::BoundaryC
     confirmation
 }
 
-async fn attach_external(backend: DelegatedRuntimeBackend) -> Box<dyn BoundBoundary> {
-    let mut registry = BackendRegistry::new();
-    registry.register(Arc::new(backend)).unwrap();
-    let (backend, descriptor) = registry
-        .resolve(
-            BackendDescriptor {
-                backend_name: EXTERNAL_NAME.into(),
-                payload: OPAQUE_PAYLOAD.to_vec(),
-            },
-            EXTERNAL_NAME,
-        )
-        .unwrap();
+async fn attach_external(backend: DelegatedRuntimeBackend) -> Box<BoundBoundary> {
+    let descriptor = BackendDescriptor {
+        backend_name: EXTERNAL_NAME.into(),
+        payload: OPAQUE_PAYLOAD.to_vec(),
+    };
     backend.attach(descriptor, sandbox()).await.unwrap()
 }
 
@@ -205,17 +196,10 @@ async fn delegated_backend_rejects_reserved_name_and_changed_payload_before_io()
         Err(BackendError::Descriptor(_))
     ));
     let (backend, server) = external_backend(external_confirmation()).await;
-    let mut registry = BackendRegistry::new();
-    registry.register(Arc::new(backend)).unwrap();
-    let (backend, descriptor) = registry
-        .resolve(
-            BackendDescriptor {
-                backend_name: EXTERNAL_NAME.into(),
-                payload: b"changed".to_vec(),
-            },
-            EXTERNAL_NAME,
-        )
-        .unwrap();
+    let descriptor = BackendDescriptor {
+        backend_name: EXTERNAL_NAME.into(),
+        payload: b"changed".to_vec(),
+    };
     assert!(matches!(backend.attach(descriptor, sandbox()).await,
         Err(BackendError::Descriptor(message)) if message.contains("payload changed")));
     server.abort();

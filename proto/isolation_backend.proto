@@ -20,10 +20,10 @@ import "options.proto";
 // or fields with compatible minor versions; incompatible semantics require a
 // major bump. Peers ignore unknown protobuf fields and must satisfy both peers'
 // required capabilities before use.
-service SandboxBackend {
+service IsolationBackend {
   // Describe the backend and negotiate before opening a boundary. This call
   // conveys no sandbox credentials or driver descriptor.
-  rpc Describe(DescribeSandboxBackendRequest) returns (DescribeSandboxBackendResponse);
+  rpc Describe(DescribeIsolationBackendRequest) returns (DescribeIsolationBackendResponse);
 
   // Bind a driver-provisioned resource to one fresh sandbox launch. The
   // caller credential must match sandbox_id and generation_id. This call must
@@ -52,11 +52,11 @@ service SandboxBackend {
   rpc ResumeBoundary(ResumeBoundaryRequest) returns (OpenBoundaryResponse);
 }
 
-message DescribeSandboxBackendRequest {
+message DescribeIsolationBackendRequest {
   openshell.extension.v1.PeerMetadata supervisor = 1;
 }
 
-message DescribeSandboxBackendResponse {
+message DescribeIsolationBackendResponse {
   openshell.extension.v1.PeerMetadata backend = 1;
 }
 

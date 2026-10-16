@@ -1,45 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runtime-selectable Isolation Backend contract (RFC 0012).
+//! Validated data shared by the Isolation Backend RPC client and native server.
 //!
-//! This module is the object-safe, runtime-selectable contract the supervisor
-//! role drives. A backend registers an [`IsolationBackend`] under a
-//! `backend_name`; the supervisor resolves it from a [`BackendRegistry`]
-//! against the admitted backend name and advances the boundary through a fixed
-//! chain of boxed states:
-//!
-//! ```text
-//! attach backend descriptor + sandbox context -> Bound -> confirm -> Ready
-//!     -> start_agent -> Running
-//! ```
-//!
-//! Each transition consumes the prior state by value (`self: Box<Self>`).
-//! Trusted backend implementations construct confirmation through a validating
-//! constructor; the supervisor cannot obtain a ready boundary without confirmed
-//! backend-neutral enforcement properties.
-//! The supervisor holds no `match`/downcast on concrete backends: the
-//! registry is the only lookup by `backend_name`, and everything past it is a
-//! `Box<dyn _>` / `Arc<dyn _>`.
-//!
-//! `attach` is atomic from the caller's perspective: it establishes and binds
-//! the boundary, returns `Bound`, or fails closed. It never binds a resource
-//! already bound to an active boundary. Binary identity travels on every
-//! [`PendingTcpOpen`], resolved for that exact socket and process
-//! generation; an unresolved identity denies the open.
-//!
-//! The contract is transport-neutral. Compute drivers keep runtime placement
-//! and coordination details behind these interfaces.
+//! Backend extension contracts live in `proto/isolation_backend.proto` and
+//! `proto/sandbox_protocol.proto`. This module contains data and validation,
+//! not a second trait-based backend interface.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
@@ -169,29 +143,6 @@ pub struct BackendDescriptor {
     pub payload: Vec<u8>,
 }
 
-/// A descriptor whose common envelope has passed registry verification.
-///
-/// Minted only by [`BackendRegistry::resolve`]; no public constructor, so an
-/// unverified descriptor cannot reach a backend. The type does not imply that
-/// the opaque payload has been validated: the backend validates the payload and
-/// atomically binds it to the sandbox context during `attach`.
-pub struct VerifiedBackendDescriptor {
-    descriptor: BackendDescriptor,
-}
-
-impl VerifiedBackendDescriptor {
-    /// The verified backend name.
-    #[must_use]
-    pub fn backend_name(&self) -> &str {
-        &self.descriptor.backend_name
-    }
-    /// The backend-specific payload (validated by the backend at `attach`).
-    #[must_use]
-    pub fn payload(&self) -> &[u8] {
-        &self.descriptor.payload
-    }
-}
-
 /// Exact non-root identity selected before the immutable workload is created.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedWorkloadIdentity {
@@ -264,127 +215,9 @@ pub struct SandboxContext {
 /// The agent workload to run inside the boundary.
 use crate::AgentSpec;
 
-/// Maps backend name to its implementation. This is the only lookup by name;
-/// supervisor lifecycle never branches on a concrete backend, and resolution
-/// never falls back to another backend.
-#[derive(Default)]
-pub struct BackendRegistry {
-    backends: HashMap<String, Arc<dyn IsolationBackend>>,
-}
-
-impl BackendRegistry {
-    /// An empty registry.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            backends: HashMap::new(),
-        }
-    }
-
-    /// Register a backend. Rejects a duplicate name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError::Descriptor`] for a duplicate `backend_name`.
-    pub fn register(&mut self, backend: Arc<dyn IsolationBackend>) -> Result<(), BackendError> {
-        let name = backend.backend_name().to_string();
-        if self.backends.contains_key(&name) {
-            return Err(BackendError::Descriptor(format!(
-                "duplicate backend name {name:?}"
-            )));
-        }
-        self.backends.insert(name, backend);
-        Ok(())
-    }
-
-    /// Verify the descriptor's common envelope against the admitted backend name
-    /// and resolve its backend. Fails closed and never falls back:
-    ///
-    /// - the descriptor's `backend_name` must equal the admitted name;
-    /// - a backend must be registered under that name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BackendError::Descriptor`] for an admission mismatch, and
-    /// [`BackendError::NotRegistered`] when no backend is
-    /// registered for the admitted name.
-    pub fn resolve(
-        &self,
-        descriptor: BackendDescriptor,
-        admitted_backend_name: &str,
-    ) -> Result<(Arc<dyn IsolationBackend>, VerifiedBackendDescriptor), BackendError> {
-        if descriptor.backend_name != admitted_backend_name {
-            return Err(BackendError::Descriptor(format!(
-                "descriptor backend {:?} does not match admitted backend {admitted_backend_name:?}",
-                descriptor.backend_name
-            )));
-        }
-        let backend = self
-            .backends
-            .get(&descriptor.backend_name)
-            .ok_or_else(|| BackendError::NotRegistered(descriptor.backend_name.clone()))?
-            .clone();
-        if backend.backend_name() != descriptor.backend_name {
-            return Err(BackendError::Descriptor(format!(
-                "registry returned backend {:?} for name {:?}",
-                backend.backend_name(),
-                descriptor.backend_name
-            )));
-        }
-        Ok((backend, VerifiedBackendDescriptor { descriptor }))
-    }
-}
-
-/// Establishes and operates boundaries for one admitted backend implementation.
-#[async_trait]
-pub trait IsolationBackend: Send + Sync {
-    /// The stable registered backend name.
-    fn backend_name(&self) -> &str;
-
-    /// Validate the opaque payload, establish any boundary-local resources,
-    /// and atomically bind them to the trusted sandbox context: returns `Bound`
-    /// or fails closed. Never binds a resource already bound to an active
-    /// boundary. The authenticated runtime session must match
-    /// `sandbox.session_id`; a session from an earlier launch is rejected.
-    /// Durable resource lifecycle remains owned by the compute driver or
-    /// external orchestrator that supplied the descriptor.
-    async fn attach(
-        &self,
-        descriptor: VerifiedBackendDescriptor,
-        sandbox: SandboxContext,
-    ) -> Result<Box<dyn BoundBoundary>, BackendError>;
-}
-
 // ============================================================================
 // Lifecycle states
 // ============================================================================
-
-/// Bound: the backend descriptor and trusted sandbox context are bound to the
-/// same resource, and the mediation source is available. No untrusted workload
-/// code is running.
-#[async_trait]
-pub trait BoundBoundary: Send {
-    /// The mediation service's backend-neutral source of workload network
-    /// requests. TCP and DNS remain typed operations so consumers cannot mix
-    /// their framing, decisions, or response semantics.
-    /// Retained by the supervisor before consuming `Bound`.
-    fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource>;
-
-    /// Trusted host-side dial target for the well-known host-gateway aliases.
-    ///
-    /// Backends return this when the mediation service runs outside the
-    /// workload boundary and therefore cannot use the boundary's resolver
-    /// view. The supervisor preserves the original hostname for policy, HTTP,
-    /// and TLS while dialing this backend-provided address. Returning `None`
-    /// leaves host-gateway discovery to the supervisor's local environment.
-    fn host_gateway_ip(&self) -> Option<IpAddr> {
-        None
-    }
-
-    /// Confirm standing enforcement and return measured sandbox evidence.
-    /// Confirmation fails closed and does not execute untrusted workload code.
-    async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError>;
-}
 
 /// Backend-neutral guarantees established by the component that owns the outer
 /// network fence.
@@ -558,82 +391,6 @@ impl BoundaryConfirmation {
     }
 }
 
-/// Ready boundary paired with the confirmation established by `confirm`.
-pub struct ConfirmedBoundary {
-    boundary: Box<dyn ReadyBoundary>,
-    confirmation: BoundaryConfirmation,
-}
-
-impl ConfirmedBoundary {
-    /// Construct confirmation after checking backend-neutral properties and
-    /// immutable identity binding.
-    ///
-    /// Backend implementations are trusted to validate their audit evidence and
-    /// bind this confirmation to their resource. This constructor enforces the
-    /// common requirements without requiring those implementations to live in
-    /// the interface crate.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if confirmation is incomplete or the identity does not match.
-    pub fn try_new(
-        boundary: Box<dyn ReadyBoundary>,
-        confirmation: BoundaryConfirmation,
-        expected: &ResolvedWorkloadIdentity,
-    ) -> Result<Self, BackendError> {
-        confirmation.validate(expected)?;
-        Ok(Self {
-            boundary,
-            confirmation,
-        })
-    }
-
-    /// Return the record carried by this confirmed state.
-    pub fn confirmation(&self) -> &BoundaryConfirmation {
-        &self.confirmation
-    }
-
-    /// Consume confirmation and advance to the sole launch-capable state.
-    pub fn into_boundary(self) -> Box<dyn ReadyBoundary> {
-        self.boundary
-    }
-}
-
-/// Ready: standing enforcement is confirmed, and the backend is prepared to
-/// ensure the admitted launch-time controls are in force
-/// before untrusted execution. Only agent activation is possible from here.
-#[async_trait]
-pub trait ReadyBoundary: Send {
-    /// Make the admitted agent runnable behind the boundary and return its
-    /// handle. `start_agent` is the sole operation that may make the admitted
-    /// agent runnable, and it fails closed if any `Ready` condition no longer
-    /// holds. Whether the backend creates the agent process or releases a held,
-    /// driver-provisioned execution object is backend-specific; every
-    /// applicable launch-time control is in force before the first untrusted
-    /// instruction.
-    async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError>;
-}
-
-/// Running: the agent is runnable behind the boundary and the returned agent
-/// handle represents the admitted agent process. Exec and forwarding are available.
-///
-/// All interface accessors return owned `Arc`s so a consumer can retain them
-/// past any later state consumption.
-#[async_trait]
-pub trait RunningBoundary: Send + Sync {
-    /// The admitted agent process handle.
-    fn agent(&self) -> Arc<dyn BoundaryProcess>;
-    /// The in-boundary exec interface.
-    fn exec(&self) -> Arc<dyn BoundaryExec>;
-    /// The loopback connection interface used by port forwarding and service exposure.
-    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector>;
-    /// Permanently terminate the boundary's owned process tree and return only
-    /// after the backend has acknowledged terminal state. A driver may use
-    /// destruction of the outer runtime as fallback proof when this operation
-    /// cannot complete.
-    async fn terminate(&self) -> Result<(), BackendError>;
-}
-
 // ============================================================================
 // Process and exec
 // ============================================================================
@@ -660,66 +417,10 @@ pub enum BoundarySignal {
     Hup,
 }
 
-/// A process running inside the boundary. `wait` returns one stable status
-/// however many times it is called; a local PID is never the process handle.
-#[async_trait]
-pub trait BoundaryProcess: Send + Sync {
-    /// Attach to the admitted process's retained standard I/O. The boundary
-    /// remains the process owner and may permit only one control attachment.
-    async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
-        Err(BackendError::Unsupported(
-            "process attachment is not supported".to_string(),
-        ))
-    }
-    /// Await terminal status (stable across repeated calls).
-    async fn wait(&self) -> Result<BoundaryExitStatus, BackendError>;
-    /// Deliver a signal to the process or its group.
-    async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError>;
-    /// Terminate the process and its backend-owned process group.
-    async fn terminate(&self) -> Result<(), BackendError>;
-}
-
 /// A boxed async writer into a boundary process's stdin.
 pub type BoundaryInput = Box<dyn AsyncWrite + Send + Unpin>;
 /// A boxed async reader from a boundary process's stdout or stderr.
 pub type BoundaryOutput = Box<dyn AsyncRead + Send + Unpin>;
-
-/// A control-side attachment to the admitted process's retained I/O.
-pub struct ProcessAttachment {
-    /// Stdin writer.
-    pub stdin: BoundaryInput,
-    /// Stdout reader, or the PTY-merged output stream.
-    pub stdout: BoundaryOutput,
-    /// Stderr reader, distinct from stdout for non-PTY processes.
-    pub stderr: Option<BoundaryOutput>,
-    /// PTY control, present when the admitted process owns a terminal.
-    pub terminal: Option<Arc<dyn BoundaryTerminal>>,
-}
-
-/// A PTY attached to an exec session.
-#[async_trait]
-pub trait BoundaryTerminal: Send + Sync {
-    /// Resize the terminal.
-    async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError>;
-}
-
-/// An owned exec session: the process handle plus its stdio and optional PTY.
-/// Owning the process keeps it alive after `exec` returns.
-pub struct ExecSession {
-    /// The spawned process.
-    pub process: Arc<dyn BoundaryProcess>,
-    /// Stdin writer, if not a PTY-merged stream.
-    pub stdin: Option<BoundaryInput>,
-    /// Stdout reader.
-    pub stdout: BoundaryOutput,
-    /// Stderr reader, distinct from stdout for non-PTY exec.
-    pub stderr: Option<BoundaryOutput>,
-    /// PTY control, present when a terminal was requested.
-    pub terminal: Option<Arc<dyn BoundaryTerminal>>,
-    /// Final status of the attached output stream, including delivery failure.
-    /// The process handle's stable wait status remains independent of attachment.
-    pub output_status: Option<oneshot::Receiver<BoundaryExitStatus>>,
-}
 
 /// What to run inside the boundary via [`BoundaryExec`].
 #[derive(Debug, Clone)]
@@ -755,30 +456,6 @@ pub struct ShellSpec {
     pub command: Option<String>,
     /// Whether command execution should load the shell's login environment.
     pub login: bool,
-}
-
-/// In-boundary process entry, consumed by the SSH server and supervisor session.
-///
-/// Like `start_agent`, every exec ensures the applicable launch-time controls
-/// are in force before the new process executes its first untrusted instruction
-/// and preserves the provisioned execution environment.
-#[async_trait]
-pub trait BoundaryExec: Send + Sync {
-    /// Spawn `spec` inside the boundary, returning an owned session.
-    async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError>;
-
-    /// Install the current provider environment for future process launches.
-    ///
-    /// Success requires an authenticated acknowledgment from the running
-    /// boundary. Implementations serialize this operation with exec so an
-    /// older publication cannot replace the acknowledged environment.
-    async fn synchronize_provider_environment(
-        &self,
-    ) -> Result<ProviderEnvironmentInstallation, BackendError> {
-        Err(BackendError::Unsupported(
-            "provider environment installation acknowledgment is unavailable".to_string(),
-        ))
-    }
 }
 
 /// Evidence that the running workload boundary installed one provider snapshot.
@@ -835,17 +512,6 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> DuplexStream for T {}
 
 /// An open connection into a boundary loopback target.
 pub type BoundaryDuplexStream = Box<dyn DuplexStream>;
-
-/// Protected connector to services listening inside the boundary.
-///
-/// Higher layers use this primitive for both end-user port forwarding and
-/// service exposure. Authentication, public listeners, routing, and exposure
-/// lifecycle remain outside the isolation backend.
-#[async_trait]
-pub trait BoundaryLoopbackConnector: Send + Sync {
-    /// Connect to `target` inside the boundary.
-    async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError>;
-}
 
 // ============================================================================
 // Mediation and binary identity
@@ -1027,25 +693,6 @@ pub struct PendingTcpOpen {
     pub timing: MediationTiming,
     /// Single-use completion channel back to the sandbox broker.
     pub decision: oneshot::Sender<TcpOpenDecision>,
-}
-
-/// A logical per-boundary stream of workload connections, consumed by the
-/// mediation service wherever that service runs.
-///
-/// It may wrap a dedicated listener or a demultiplexed view over shared
-/// transport; how it reaches a co-located proxy, a sidecar, or a shared
-/// mediation service is backend-private. A trusted backend component associates
-/// every returned request with its active boundary without relying solely on a
-/// transport tuple or workload-provided identifier. TCP and DNS use separate
-/// accepts so they can be consumed concurrently with independent backpressure.
-/// An `Err` means that mediation lane is unusable and fails closed.
-#[async_trait]
-pub trait NetworkMediationSource: Send + Sync {
-    /// Await the next staged workload TCP open.
-    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError>;
-
-    /// Await the next workload DNS query.
-    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError>;
 }
 
 /// DNS transport used by one workload exchange.

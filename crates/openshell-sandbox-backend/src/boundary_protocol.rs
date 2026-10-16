@@ -991,6 +991,7 @@ pub enum BoundaryErrorKind {
     Unavailable,
     Terminated,
     Process,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -78,7 +78,7 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
             .initial_connection_window_size(
                 crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
             )
-            .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+            .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
             .add_service(SandboxBoundaryServer::new(peer))
             .serve_with_incoming(incoming)
             .await

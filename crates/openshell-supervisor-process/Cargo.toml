@@ -11,6 +11,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
 openshell-core = { path = "../openshell-core", features = ["jwt"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -37,6 +38,8 @@ libc = "0.2"
 rustix = { workspace = true, features = ["termios"] }
 
 [dev-dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
+
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

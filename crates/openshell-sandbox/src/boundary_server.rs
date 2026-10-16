@@ -13,6 +13,10 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::native_api::{
+        BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal, ExecSession,
+    };
+
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
@@ -35,15 +39,14 @@ mod linux {
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
-        BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
-        BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
+        BoundaryConfirmation, LoopbackTarget, ResolvedWorkloadIdentity,
     };
     use openshell_sandbox_backend::backend_proto::{
-        DescribeSandboxBackendRequest, DescribeSandboxBackendResponse, OpenBoundaryRequest,
+        DescribeIsolationBackendRequest, DescribeIsolationBackendResponse, OpenBoundaryRequest,
         OpenBoundaryResponse, ResumeBoundaryRequest, SuspendBoundaryRequest,
         SuspendBoundaryResponse,
+        isolation_backend_server::{IsolationBackend, IsolationBackendServer},
         open_boundary_response::LaunchOutcome,
-        sandbox_backend_server::{SandboxBackend, SandboxBackendServer},
     };
     #[cfg(test)]
     use openshell_sandbox_backend::isolation_protocol::{chunk_data, data_chunk};
@@ -614,7 +617,7 @@ mod linux {
             .initial_stream_window_size(BOUNDARY_STREAM_WINDOW_BYTES)
             .initial_connection_window_size(BOUNDARY_CONNECTION_WINDOW_BYTES)
             .add_service(
-                SandboxBackendServer::new(service.clone())
+                IsolationBackendServer::new(service.clone())
                     .max_decoding_message_size(64 * 1024)
                     .max_encoding_message_size(64 * 1024),
             )
@@ -779,11 +782,11 @@ mod linux {
     }
 
     #[tonic::async_trait]
-    impl SandboxBackend for GrpcBoundaryService {
+    impl IsolationBackend for GrpcBoundaryService {
         async fn describe(
             &self,
-            request: tonic::Request<DescribeSandboxBackendRequest>,
-        ) -> Result<tonic::Response<DescribeSandboxBackendResponse>, tonic::Status> {
+            request: tonic::Request<DescribeIsolationBackendRequest>,
+        ) -> Result<tonic::Response<DescribeIsolationBackendResponse>, tonic::Status> {
             let backend =
                 openshell_sandbox_backend::isolation_protocol::metadata("openshell/sandbox");
             openshell_sandbox_backend::isolation_protocol::negotiate(
@@ -791,7 +794,7 @@ mod linux {
                 request.into_inner().supervisor,
             )?;
             self.negotiated.store(true, Ordering::Release);
-            Ok(tonic::Response::new(DescribeSandboxBackendResponse {
+            Ok(tonic::Response::new(DescribeIsolationBackendResponse {
                 backend: Some(backend),
             }))
         }
@@ -2280,7 +2283,6 @@ mod linux {
                 stdout,
                 stderr,
                 terminal,
-                output_status: _,
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
@@ -2291,7 +2293,7 @@ mod linux {
             let retained = {
                 let _runtime = self.process_runtime.enter();
                 MainSession::from_boundary(
-                    openshell_isolation_interface::contract::ProcessAttachment {
+                    crate::native_api::ProcessAttachment {
                         stdin,
                         stdout,
                         stderr,
@@ -4093,9 +4095,9 @@ mod linux {
             request: OpenBoundaryRequest,
             token: &str,
         ) -> String {
-            let mut control = openshell_sandbox_backend::backend_proto::sandbox_backend_client::SandboxBackendClient::new(channel);
+            let mut control = openshell_sandbox_backend::backend_proto::isolation_backend_client::IsolationBackendClient::new(channel);
             control
-                .describe(DescribeSandboxBackendRequest {
+                .describe(DescribeIsolationBackendRequest {
                     supervisor: Some(openshell_sandbox_backend::isolation_protocol::metadata(
                         "test/supervisor",
                     )),
@@ -5273,7 +5275,7 @@ mod linux {
                 .connect()
                 .await
                 .unwrap();
-            let mut control = openshell_sandbox_backend::backend_proto::sandbox_backend_client::SandboxBackendClient::new(channel.clone());
+            let mut control = openshell_sandbox_backend::backend_proto::isolation_backend_client::IsolationBackendClient::new(channel.clone());
             let mut streams = SandboxBoundaryClient::new(channel.clone());
             let before_open = streams
                 .exchange(bearer_request(
@@ -5295,7 +5297,7 @@ mod linux {
             );
             assert_eq!(
                 control
-                    .describe(DescribeSandboxBackendRequest { supervisor: None })
+                    .describe(DescribeIsolationBackendRequest { supervisor: None })
                     .await
                     .unwrap_err()
                     .code(),
@@ -5306,7 +5308,7 @@ mod linux {
             incompatible.protocol_version.as_mut().unwrap().major += 1;
             assert_eq!(
                 control
-                    .describe(DescribeSandboxBackendRequest {
+                    .describe(DescribeIsolationBackendRequest {
                         supervisor: Some(incompatible)
                     })
                     .await
@@ -5326,7 +5328,7 @@ mod linux {
                 .push("openshell.isolation.future".to_string());
             assert_eq!(
                 control
-                    .describe(DescribeSandboxBackendRequest {
+                    .describe(DescribeIsolationBackendRequest {
                         supervisor: Some(unmet_requirement),
                     })
                     .await
@@ -5335,7 +5337,7 @@ mod linux {
                 tonic::Code::FailedPrecondition
             );
             control
-                .describe(DescribeSandboxBackendRequest {
+                .describe(DescribeIsolationBackendRequest {
                     supervisor: Some(compatible),
                 })
                 .await

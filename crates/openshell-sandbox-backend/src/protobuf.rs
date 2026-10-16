@@ -61,7 +61,7 @@ enumeration!(w::NetworkModeWire, p::NetworkMode, {Block, Proxy, Allow});
 enumeration!(w::LandlockCompatibilityWire, p::LandlockCompatibility, {BestEffort, HardRequirement});
 enumeration!(w::RuntimeHelperWire, p::RuntimeHelper, { Sftp });
 enumeration!(w::ProcessKindWire, p::ProcessKind, {Main, Exec});
-enumeration!(w::BoundaryErrorKind, p::BoundaryErrorKind, {Invalid, Denied, Unavailable, Terminated, Process});
+enumeration!(w::BoundaryErrorKind, p::BoundaryErrorKind, {Invalid, Denied, Unavailable, Terminated, Process, Unsupported});
 enumeration!(c::OuterFenceGuarantee, p::OuterFenceGuarantee, {DefaultDenyEgress, NoUnmanagedEgressPath, RevocationVerified, ControllerLossFailsClosed});
 enumeration!(c::TcpOpenDenial, p::TcpOpenDenial, {PolicyDenied, IdentityUnavailable, InvalidDestination, ResourceExhausted, MediationUnavailable});
 enumeration!(c::DnsTransport, p::DnsTransport, {Udp, Tcp});

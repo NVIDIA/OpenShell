@@ -1,11 +1,18 @@
 # OpenShell sandbox backend
 
-This crate implements the supervisor-side isolation backend and the versioned
+This crate implements the concrete supervisor-side RPC client and the versioned
 control protocol shared with `openshell-sandbox`.
+
+The protobuf services replace the Rust backend traits. The supervisor holds
+concrete lifecycle, process, exec, forwarding, and mediation handles backed by
+RPCs. Confirmation consumes the bound handle, validates enforcement evidence,
+and produces the ready handle; starting consumes that ready handle. Both the
+in-tree Linux runtime and external backends implement the generated services.
+Linux process helpers remain internal to the runtime server.
 
 ## Boundary startup and routing
 
-The supervisor uses the generated `SandboxBackend` control service to
+The supervisor uses the generated `IsolationBackend` control service to
 negotiate capabilities and open a boundary before reading image policy. Each
 physical connection repeats that handshake, including credential-epoch changes
 and transport recovery. The launch session and generation identify retries;
@@ -94,4 +101,4 @@ Backends may supply a `BoundaryTransportConnector` for raw stream establishment.
 The shared client retains TLS peer verification, session bearer authentication,
 generation checks, and reconnection handling. The connector is reused for policy
 discovery and attachment; it does not define platform launch configuration or
-replace the isolation interface.
+replace the RPC contracts.

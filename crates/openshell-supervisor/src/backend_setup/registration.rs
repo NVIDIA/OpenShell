@@ -114,14 +114,17 @@ impl PreparedBackend for RegisteredLaunch {
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
         let payload = self.payload.clone();
-        let backend = Arc::new(DelegatedRuntimeBackend::new(
-            self.name,
-            self.descriptor,
-            self.payload,
-            services.ca_file_paths,
-            services.provider_credentials,
-            services.sandbox_bearer,
-        )?);
+        let backend = Arc::new(
+            DelegatedRuntimeBackend::new(
+                self.name,
+                self.descriptor,
+                self.payload,
+                services.ca_file_paths,
+                services.provider_credentials,
+                services.sandbox_bearer,
+            )?
+            .into_client(),
+        );
         Ok(BuiltBackend {
             backend,
             payload,

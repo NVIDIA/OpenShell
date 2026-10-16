@@ -254,7 +254,7 @@ fn network_response() -> Response {
 }
 
 struct Fixture {
-    source: RemoteNetworkMediation,
+    source: NetworkMediationSource,
     state: Arc<PeerState>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -304,7 +304,7 @@ impl Fixture {
                     ))])
                     .chain(tokio_stream::pending());
                     let serving = tonic::transport::Server::builder()
-                        .add_service(SandboxBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
                         .add_service(SandboxBoundaryServer::new(peer))
                         .serve_with_incoming(incoming);
                     tokio::select! {
@@ -350,7 +350,7 @@ impl Fixture {
         .await
         .expect("fixture must attach and confirm");
         Self {
-            source: RemoteNetworkMediation { client },
+            source: NetworkMediationSource { client },
             state,
             server,
         }
@@ -427,7 +427,7 @@ async fn concurrent_tcp_accepts_recover_a_lost_tls_connection() {
     .await;
     let mut accepts = tokio::task::JoinSet::new();
     for _ in 0..ACCEPTS {
-        let source = RemoteNetworkMediation {
+        let source = NetworkMediationSource {
             client: fixture.source.client.clone(),
         };
         accepts.spawn(async move { verify_connection(source.accept_tcp().await.unwrap()).await });
@@ -477,7 +477,7 @@ async fn tcp_accept_preserves_boundary_leaf_errors() {
 #[tokio::test]
 async fn tcp_accept_has_no_idle_operation_timeout() {
     let fixture = Fixture::new(Reply::Idle).await;
-    let source = RemoteNetworkMediation {
+    let source = NetworkMediationSource {
         client: fixture.source.client.clone(),
     };
     let pending = tokio::spawn(async move { source.accept_tcp().await });
@@ -564,7 +564,7 @@ async fn recovery_closes_an_unresponsive_connection_before_reattaching() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement() {
     let fixture = Fixture::new(Reply::DisconnectGated).await;
-    let first = RemoteNetworkMediation {
+    let first = NetworkMediationSource {
         client: fixture.source.client.clone(),
     };
     let first = tokio::spawn(async move { first.accept_tcp().await });
@@ -577,7 +577,7 @@ async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement()
     .expect("recovery must reach a same-epoch attach rejection");
 
     // Start an ordinary request while recovery waits for retirement.
-    let second = RemoteNetworkMediation {
+    let second = NetworkMediationSource {
         client: fixture.source.client.clone(),
     };
     let second = tokio::spawn(async move { second.accept_tcp().await });

@@ -536,7 +536,7 @@ mod tests {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
                 if package == "openshell.sandbox.backend.v1" {
-                    assert_eq!(service_name, "SandboxBackend");
+                    assert_eq!(service_name, "IsolationBackend");
                     isolation_methods.extend(
                         service
                             .method

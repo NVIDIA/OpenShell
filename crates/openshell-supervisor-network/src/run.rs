@@ -9,6 +9,7 @@
 //! whose RAII fields keep the proxy task alive for the lifetime of the
 //! sandbox supervisor.
 
+use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -38,7 +39,6 @@ use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 use openshell_core::endpoint_status::EndpointObservationSender;
-use openshell_isolation_interface::contract::NetworkMediationSource;
 
 /// Concrete listener options supplied by trusted supervisor composition.
 /// This is not an isolation-backend capability or a serialized launch contract.
@@ -248,7 +248,7 @@ pub async fn run_networking(
     proxy_tls_dir: Option<&std::path::Path>,
     host_gateway_ip: Option<IpAddr>,
     #[cfg(target_os = "linux")] transparent_runtime: Option<TransparentRuntimeSetup>,
-    network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+    network_mediation_source: Option<Arc<NetworkMediationSource>>,
     proxy_listener: Option<ProxyListenerConfig>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
