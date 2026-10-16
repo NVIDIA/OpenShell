@@ -1,0 +1,55 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Failure and Recovery"
+description: "Understand what happens to sandbox workloads when OpenShell components fail and how they recover."
+---
+
+A running sandbox depends on three things: the gateway, which manages the sandbox; the supervisor, which enforces its policy; and the sandbox process and compute runtime that run its workload. This page describes what happens to a sandbox when any of them fails, and what you can configure.
+
+## Failure Modes
+
+| Failure | Sandbox | Policy enforcement | Recovery |
+|---|---|---|---|
+| Gateway unreachable | Keeps running until the outage limit, then stopped | Installed policy stays enforced | Automatic if the gateway returns before the limit; after a stop, run `openshell sandbox start` |
+| Supervisor unreachable | Paused for up to 30 seconds, then stopped | No new network access | Automatic if the same supervisor reconnects within 30 seconds |
+| Sandbox process or compute runtime fails | Processes lost; reports `Error` | No workload left to enforce | Signal kills recover when the gateway restarts; otherwise run `openshell sandbox delete` |
+
+A stopped sandbox keeps its policies, provider attachments, settings, and persistent workspace. Its processes and their memory are not restored.
+
+### Gateway Unreachable
+
+The supervisor keeps enforcing the policy it already has and retries its gateway connection. Policy changes, credential updates, and remote access are unavailable until it reconnects. Retries back off to one attempt every 30 seconds, so reconnecting can take up to 30 seconds after the gateway returns.
+
+If the gateway does not return within the outage limit, the supervisor stops the sandbox so it does not run indefinitely on policy nobody can change. When the gateway returns, the sandbox reports `Error` with reason `GatewayUnreachable`.
+
+### Supervisor Unreachable
+
+OpenShell pauses the sandbox and starts a 30 second recovery window. If the supervisor reconnects and passes its security checks within the window, the sandbox resumes with its memory intact. Otherwise, OpenShell stops it.
+
+A replacement supervisor cannot take over a running sandbox, so if the supervisor crashed rather than lost its link, the sandbox always stops.
+
+### Sandbox Process or Compute Runtime Fails
+
+When the sandbox process crashes, or the compute runtime or host restarts, every process in the sandbox ends. The sandbox reports `Error`, and its restart policy does not apply because the main process never reported an exit.
+
+On Docker and Podman, a sandbox terminated by a signal, such as a daemon or host restart, reports `ContainerRuntimeRestart` or `ContainerStopped`. The gateway starts it again the next time the gateway itself starts. Any other failure, including a crash, an out-of-memory kill, or a MicroVM `ProcessExited`, does not recover, and `openshell sandbox start` refuses the sandbox. Delete it and create a new one; deleting discards its persistent workspace.
+
+## Configuration
+
+Set the gateway outage limit for all sandboxes in `gateway.toml`.
+
+| Field | Default | Description |
+|---|---|---|
+| `gateway_outage_limit_secs` | `120` | Seconds a sandbox keeps running without gateway contact before it stops. Set a large value for long-running jobs. |
+
+For example, to give long-running jobs 10 minutes:
+
+```toml
+[openshell.gateway.failure_handling]
+gateway_outage_limit_secs = 600
+```
+
+The supervisor reconnect backoff, the 30 second supervisor recovery window, and which compute failures the gateway recovers are fixed.
+
+A sandbox's restart policy, set with `--restart-policy`, applies only when its main process exits. It does not restart a sandbox after any of the failures on this page. Refer to [Sandboxes](/how-it-works/sandboxes/overview) for restart policy.
