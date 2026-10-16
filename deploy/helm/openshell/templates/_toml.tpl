@@ -157,6 +157,7 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if and (get $legacyOidc "userRole") (not (hasKey $oidcConfig "user_role")) -}}{{- $_ := set $oidcConfig "user_role" (get $legacyOidc "userRole") -}}{{- end -}}
 {{- if and (get $legacyOidc "scopesClaim") (not (hasKey $oidcConfig "scopes_claim")) -}}{{- $_ := set $oidcConfig "scopes_claim" (get $legacyOidc "scopesClaim") -}}{{- end -}}
 {{- end -}}
+{{- if and (get $legacyOidc "caConfigMapName") (not (hasKey $oidcConfig "ca_bundle")) -}}{{- $_ := set $oidcConfig "ca_bundle" "/etc/openshell-tls/oidc-ca/ca.crt" -}}{{- end -}}
 {{- $_ := set $config "openshell.gateway.oidc" $oidcConfig -}}
 {{- end -}}
 {{- $legacyOtlp := get $legacyServer "otlp" | default dict -}}
