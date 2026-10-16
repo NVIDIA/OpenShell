@@ -611,6 +611,14 @@ merge.
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.
 
+## Conformance source checks
+
+Branch Rust checks format and lint the separate
+`e2e/suites/conformance` workspace.
+The Rust test jobs include the conformance runner in the root workspace and select the pure policy assertion
+tests in the conformance CLI package with the CI nextest profile, without a gateway. Gateway-backed CLI tests retain their driver E2E and installed-artifact
+integration lanes; source unit-test jobs do not execute those entry points.
+
 ## Nix download recovery
 
 Jobs that enter the development shell enable `prepare-shell: "true"` on

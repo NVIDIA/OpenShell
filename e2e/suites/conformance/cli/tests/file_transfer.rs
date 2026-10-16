@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::{CommandResult, OpenShellRunner, Scenario, ScenarioFuture};
+use openshell_conformance::{CommandResult, OpenShellRunner};
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
@@ -18,52 +18,64 @@ const TRANSFER_TIMEOUT: Duration = Duration::from_mins(5);
 const LARGE_FILE_SIZE: usize = 512 * 1024;
 
 /// Certify basic file and directory upload and download behavior.
-pub const FILE_TRANSFER_ROUND_TRIP_SCENARIO: Scenario = Scenario {
-    name: "file-transfer/round-trip",
-    run: run_round_trip,
-};
-
-/// Certify Git-aware upload filtering and explicit unfiltered uploads.
-pub const FILE_TRANSFER_GIT_FILTERING_SCENARIO: Scenario = Scenario {
-    name: "file-transfer/git-filtering",
-    run: run_git_filtering,
-};
-
-/// Certify file-transfer workspace boundary and filename safety behavior.
-pub const FILE_TRANSFER_PATH_SAFETY_SCENARIO: Scenario = Scenario {
-    name: "file-transfer/path-safety",
-    run: run_path_safety,
-};
-
-fn run_round_trip(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+#[tokio::test]
+async fn round_trip() {
+    let mut runner = OpenShellRunner::from_env("file-transfer/round-trip")
+        .expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "round-trip").await?;
         upload_existing_directories(runner, &sandbox_name, &remote_root, local.path()).await?;
-        round_trip(runner, &sandbox_name, &remote_root, local.path()).await?;
+        transfer_round_trip(runner, &sandbox_name, &remote_root, local.path()).await?;
         download_file(runner, &sandbox_name, &remote_root, local.path()).await?;
         download_directory(runner, &sandbox_name, &remote_root, local.path()).await?;
         delete_sandbox(runner, &sandbox_name).await
-    })
+    }
+    .await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("file-transfer/round-trip conformance scenario failed:\n{error}");
+    }
 }
 
-fn run_git_filtering(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+/// Certify Git-aware upload filtering and explicit unfiltered uploads.
+#[tokio::test]
+async fn git_filtering() {
+    let mut runner = OpenShellRunner::from_env("file-transfer/git-filtering")
+        .expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "git-filtering").await?;
         gitignore_filtering(runner, &sandbox_name, &remote_root, local.path()).await?;
         single_file_from_git_repo(runner, &sandbox_name, &remote_root, local.path()).await?;
         gitignored_directory_requires_override(runner, &sandbox_name, &remote_root, local.path())
             .await?;
         delete_sandbox(runner, &sandbox_name).await
-    })
+    }
+    .await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("file-transfer/git-filtering conformance scenario failed:\n{error}");
+    }
 }
 
-fn run_path_safety(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+/// Certify file-transfer workspace boundary and filename safety behavior.
+#[tokio::test]
+async fn path_safety() {
+    let mut runner = OpenShellRunner::from_env("file-transfer/path-safety")
+        .expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         let (sandbox_name, remote_root, local) = prepare_sandbox(runner, "path-safety").await?;
         reject_workspace_escape(runner, &sandbox_name, &remote_root, local.path()).await?;
         download_dash_leading_name(runner, &sandbox_name, &remote_root, local.path()).await?;
         delete_sandbox(runner, &sandbox_name).await
-    })
+    }
+    .await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("file-transfer/path-safety conformance scenario failed:\n{error}");
+    }
 }
 
 async fn prepare_sandbox(
@@ -190,7 +202,7 @@ async fn upload_existing_directories(
     Ok(())
 }
 
-async fn round_trip(
+async fn transfer_round_trip(
     runner: &OpenShellRunner,
     sandbox: &str,
     remote_root: &str,

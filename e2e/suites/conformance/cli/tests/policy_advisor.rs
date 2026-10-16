@@ -11,7 +11,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use tokio::time::sleep;
 
-use crate::{OpenShellRunner, Scenario, ScenarioFuture};
+use openshell_conformance::OpenShellRunner;
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -25,21 +25,6 @@ struct SandboxState {
     phase: String,
 }
 
-pub const POLICY_LOCAL_SCENARIO: Scenario = Scenario {
-    name: "policy-local",
-    run: run_policy_local,
-};
-
-pub const MECHANISTIC_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "mechanistic-proposal",
-    run: run_mechanistic_proposal,
-};
-
-pub const NEW_HOSTNAME_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "new-hostname-proposal",
-    run: run_new_hostname_proposal,
-};
-
 const EMPTY_NETWORK_POLICY: &[u8] = br"version: 1
 filesystem_policy:
   include_workdir: true
@@ -49,8 +34,13 @@ landlock: { compatibility: best_effort }
 network_policies: {}
 ";
 
-fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+#[tokio::test]
+async fn policy_local() {
+    let mut runner =
+        OpenShellRunner::from_env("policy-local").expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         let name = format!("ct-{}-pl", runner.id());
         create_sandbox(runner, &name, None).await?;
         enable_proposals(runner, &name).await?;
@@ -162,7 +152,11 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
             return Err(review.failure_diagnostic("the submitted rule is in the reviewer inbox"));
         }
         Ok(())
-    })
+
+    }.await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("policy-local conformance scenario failed:\n{error}");
+    }
 }
 
 async fn sandbox_bash_path(runner: &OpenShellRunner, name: &str) -> Result<String, String> {
@@ -287,8 +281,13 @@ async fn request_policy_local_http(
         .map_err(|error| result.failure_diagnostic(&format!("valid JSON body: {error}")))
 }
 
-fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+#[tokio::test]
+async fn mechanistic_proposal() {
+    let mut runner = OpenShellRunner::from_env("mechanistic-proposal")
+        .expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         let mut policy = NamedTempFile::new().map_err(|error| error.to_string())?;
         policy
             .write_all(EMPTY_NETWORK_POLICY)
@@ -359,11 +358,20 @@ fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
             probe.stderr(),
         )
         .await
-    })
+
+    }.await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("mechanistic-proposal conformance scenario failed:\n{error}");
+    }
 }
 
-fn run_new_hostname_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+#[tokio::test]
+async fn new_hostname_proposal() {
+    let mut runner = OpenShellRunner::from_env("new-hostname-proposal")
+        .expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         let mut policy = NamedTempFile::new().map_err(|error| error.to_string())?;
         policy
             .write_all(EMPTY_NETWORK_POLICY)
@@ -409,7 +417,11 @@ fn run_new_hostname_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_>
             probe.stderr(),
         )
         .await
-    })
+
+    }.await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("new-hostname-proposal conformance scenario failed:\n{error}");
+    }
 }
 
 /// The single L4 mechanistic draft expected for one denied endpoint.

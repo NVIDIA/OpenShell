@@ -8,6 +8,20 @@ mise run e2e           # End-to-end tests (starts a Docker-backed gateway)
 mise run ci            # Everything: lint, compile checks, and tests
 ```
 
+## Test Families
+
+- Lint checks formatting, style, and static rules.
+- Unit tests verify a component in isolation.
+- Integration tests verify interactions between components.
+- End-to-end tests exercise a configured OpenShell target through a client.
+- Benchmarks measure performance or scale separately from behavioral correctness.
+
+Conformance stories under `e2e/suites/conformance/` verify required public behavior.
+The [conformance guide](e2e/suites/conformance/README.md) owns their authoring and
+execution guidance. Driver and feature suites remain under `tests/suites/`;
+existing mixed suites remain under `e2e/rust/`. `tests/` also supplies provisioning
+and artifact construction.
+
 ## Test Layout
 
 ```text
@@ -16,6 +30,9 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
+e2e/suites/conformance/ # Conformance stories
+tests/suites/          # Existing feature and driver suites
+tests/                 # Target provisioning and artifact construction
 ```
 
 ## Rust Tests
@@ -232,10 +249,16 @@ When more than one test needs this behavior, put the transport in the shared
 Rust e2e harness and require callers to use it instead of duplicating DNS,
 HTTP `Host`, TLS SNI, and mTLS handling.
 
+Conformance command execution, polling, diagnostics, and cleanup remain in
+`crates/openshell-conformance`. Story implementations live directly under
+`e2e/suites/conformance/cli/tests`. `mise run test:rust` includes runner and pure
+policy assertion tests without requiring a gateway. Existing Rust e2e tests
+retain their own harness.
+
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
+- CLI conformance (`e2e/suites/conformance`) - portable Cargo tests for
   lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
   including agent-authored permission requests. Driver E2E runs the complete
   Cargo test package. The installed-artifact conformance suite runs the same
@@ -285,7 +308,7 @@ cargo build --package openshell-cli
 OPENSHELL_BIN="$PWD/target/debug/openshell" \
   cargo test \
     --locked \
-    --manifest-path tests/suites/conformance/Cargo.toml \
+    --manifest-path e2e/suites/conformance/Cargo.toml \
     --package openshell-test-conformance-cli \
     --no-fail-fast \
     -- \

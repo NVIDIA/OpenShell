@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-conformance"
-description = "Reusable OpenShell CLI conformance scenarios and runner"
+description = "OpenShell CLI conformance command runner and test support"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
