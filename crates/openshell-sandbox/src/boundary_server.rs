@@ -174,6 +174,7 @@ mod linux {
         }
     }
 
+    #[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
     fn acquire_control_connection_slot(active: &Arc<AtomicUsize>) -> Option<ControlConnectionSlot> {
         active
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {

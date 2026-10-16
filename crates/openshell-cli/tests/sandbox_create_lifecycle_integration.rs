@@ -458,6 +458,7 @@ impl OpenShell for TestOpenShell {
         self.state
             .ssh_session_requests
             .fetch_add(1, Ordering::SeqCst);
+        #[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
         if self
             .state
             .ssh_session_failures_remaining

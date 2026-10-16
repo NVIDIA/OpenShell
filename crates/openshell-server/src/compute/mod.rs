@@ -7534,6 +7534,7 @@ impl ComputeDriver for NoopTestDriver {
         &self,
         _request: Request<DeleteWorkspaceRequest>,
     ) -> Result<tonic::Response<DeleteWorkspaceResponse>, Status> {
+        #[allow(deprecated, reason = "try_update requires Rust 1.95; MSRV is 1.94")]
         if self
             .workspace_delete_failures
             .fetch_update(

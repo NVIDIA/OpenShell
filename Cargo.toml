@@ -171,6 +171,15 @@ missing_panics_doc = "allow"
 # Allow noisy nursery lints
 significant_drop_tightening = "allow"  # Often gives incorrect suggestions
 missing_const_for_fn = "allow"  # Too noisy for async code patterns
+branches_sharing_code = "allow"  # Keep branch-local returns and drop order explicit
+unused_async_trait_impl = "allow"  # Async trait implementations may return immediately
+
+# Preserve assertion styles, including checks that must not print credentials.
+assert_is_empty = "allow"
+manual_assert_eq = "allow"
+
+# async-trait adds #[must_use] to futures that already carry that attribute.
+double_must_use = "allow"
 
 # Allow noisy pedantic lints
 too_many_lines = "allow"  # Function length limits are subjective

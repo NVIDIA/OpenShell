@@ -407,7 +407,7 @@ fn parse_proc_socket_addr(value: &str, address_family: ProcTcpAddressFamily) -> 
                 return None;
             }
             let mut bytes = [0u8; 16];
-            for (index, chunk) in address.as_bytes().chunks_exact(8).enumerate() {
+            for (index, chunk) in address.as_bytes().as_chunks::<8>().0.iter().enumerate() {
                 let chunk = std::str::from_utf8(chunk).ok()?;
                 let word = u32::from_str_radix(chunk, 16).ok()?;
                 bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
