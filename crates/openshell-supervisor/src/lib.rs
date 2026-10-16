@@ -22,6 +22,7 @@ mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
+mod otlp_relay;
 mod provider_readiness;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -623,6 +624,7 @@ pub async fn run_network_proxy(
         None,
         None,
         None,
+        None,
     )
     .await?;
 
@@ -688,6 +690,7 @@ pub async fn run_sandbox(
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    otlp_endpoint: Option<String>,
 ) -> Result<i32> {
     // Shared startup retains policy and networking state; box it to keep callers' futures small.
     Box::pin(run_sandbox_with_backend(
@@ -714,6 +717,7 @@ pub async fn run_sandbox(
             auth_bundle,
             admitted_isolation_backend,
             main_exit_marker,
+            otlp_endpoint,
         },
     ))
     .await
@@ -741,6 +745,9 @@ struct SandboxRunConfig {
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
     main_exit_marker: Option<std::path::PathBuf>,
+    /// OTLP/gRPC collector for relayed agent traces; `None` keeps the relay
+    /// inactive.
+    otlp_endpoint: Option<String>,
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
@@ -772,6 +779,7 @@ async fn run_sandbox_with_backend(
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
+        otlp_endpoint,
     } = config;
     // The current client attachment adapter is SSH; retaining a process's I/O
     // internally does not make it reachable by a foreground client.
@@ -986,6 +994,13 @@ async fn run_sandbox_with_backend(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // The agent trace relay must exist before networking starts so the
+    // handler is installed when the first staged connection arrives, and
+    // before attach so the agent spec can tell the boundary whether to point
+    // workload SDKs at it.
+    let (mut otlp_relay, otlp_reserved_destination) =
+        otlp_relay::activate(otlp_endpoint, sandbox_id.clone());
+
     // Construct the selected client only after shared policy and credential
     // setup has completed. Keep live credentials and later CA publication in
     // supervisor-owned handles shared with the backend.
@@ -1005,6 +1020,7 @@ async fn run_sandbox_with_backend(
                 workdir: workspace,
                 timeout_secs,
                 interactive,
+                otlp_relay_active: otlp_relay.is_some(),
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
@@ -1119,6 +1135,7 @@ async fn run_sandbox_with_backend(
             None,
             remote_network_source,
             proxy_listener,
+            otlp_reserved_destination,
         )
         .await?,
     );
@@ -1416,6 +1433,17 @@ async fn run_sandbox_with_backend(
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
             .await;
+        // Flush relayed agent traces before the exit is reported so the last
+        // spans of a short run are not lost. Bounded; never fails. When the
+        // access plane is retained for exec sessions, the relay keeps serving
+        // them and shuts down at final teardown instead.
+        if retain_access {
+            if let Some(relay) = otlp_relay.as_ref() {
+                relay.flush(otlp_relay::FLUSH_TIMEOUT).await;
+            }
+        } else if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
+        }
         // `shutdown_requested` has already completed when shutdown won the
         // lifecycle select above and must not be polled again.
         let mut completion_cancelled = !retain_access;
@@ -1461,6 +1489,11 @@ async fn run_sandbox_with_backend(
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
+        }
+        // Exec sessions served after the main exit may have exported traces;
+        // flush those too before the relay goes away.
+        if let Some(relay) = otlp_relay.take() {
+            relay.shutdown(otlp_relay::FLUSH_TIMEOUT).await;
         }
         drop(control_readiness);
         drop(running);
@@ -5222,6 +5255,7 @@ mod tests {
                 payload: b"in-process-only-launch-data".to_vec(),
             },
             auth_bundle,
+            None,
             None,
             None,
         )

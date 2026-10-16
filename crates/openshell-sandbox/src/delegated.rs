@@ -40,6 +40,7 @@ pub async fn spawn_workload(
     provider_env: std::collections::HashMap<String, String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     boundary_runtime: Option<Arc<crate::boundary_io::BoundaryRuntimeState>>,
+    otlp_relay_active: bool,
 ) -> Result<SpawnedAgent> {
     // Driver-selected workspaces are the sandbox identity's home. This keeps
     // canonical and later exec processes consistent for image WorkingDir and
@@ -82,6 +83,7 @@ pub async fn spawn_workload(
             provider_credentials,
             user_environment,
             boundary_runtime.clone(),
+            otlp_relay_active,
             launcher.clone(),
         ));
 
@@ -95,6 +97,7 @@ pub async fn spawn_workload(
         policy,
         ca_file_paths.as_ref(),
         &provider_env,
+        otlp_relay_active,
     )
     .wrap_err("spawn delegated workload process")?;
     #[cfg(not(target_os = "linux"))]
@@ -106,6 +109,7 @@ pub async fn spawn_workload(
         policy,
         ca_file_paths.as_ref(),
         &provider_env,
+        otlp_relay_active,
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);

@@ -354,6 +354,7 @@ fn sandbox_ctx() -> SandboxContext {
             workdir: None,
             timeout_secs: 0,
             interactive: false,
+            otlp_relay_active: false,
         },
         identity: workload_identity(),
     }

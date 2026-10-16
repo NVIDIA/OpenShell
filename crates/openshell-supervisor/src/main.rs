@@ -474,6 +474,7 @@ fn main() -> Result<()> {
                     auth_bundle,
                     admitted_isolation_backend,
                     args.main_exit_marker,
+                    args.otlp_endpoint.clone(),
                 ))
                 .await;
                 supervisor_exit(result)

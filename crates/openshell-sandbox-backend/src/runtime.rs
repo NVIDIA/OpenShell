@@ -2895,6 +2895,7 @@ mod tests {
                 workdir: Some("/sandbox".to_string()),
                 timeout_secs: 5,
                 interactive: false,
+                otlp_relay_active: false,
             },
             identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
                 10_001,

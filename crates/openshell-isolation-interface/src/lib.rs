@@ -48,6 +48,9 @@ pub struct AgentSpec {
     pub timeout_secs: u64,
     /// Whether the entrypoint runs interactively (inherits the parent pgrp).
     pub interactive: bool,
+    /// Whether the supervisor serves the OTLP relay for this sandbox. The
+    /// boundary points workload SDKs at the relay only while it is active.
+    pub otlp_relay_active: bool,
 }
 
 pub mod contract;

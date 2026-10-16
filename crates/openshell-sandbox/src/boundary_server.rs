@@ -2995,6 +2995,7 @@ mod linux {
                     provider_env,
                     ca_file_paths,
                     Some(boundary_runtime.clone()),
+                    spec.otlp_relay_active,
                 ))
                 .map_err(|error| format!("start process supervisor leaf: {error:?}"))?;
             let signaler = spawned.signaler();
@@ -3862,6 +3863,7 @@ mod linux {
                 workdir: Some("/sandbox".to_string()),
                 timeout_secs: 0,
                 interactive: true,
+                otlp_relay_active: false,
             })
             .expect("resolve scratch command");
 
@@ -4955,6 +4957,7 @@ mod linux {
                         workdir: None,
                         timeout_secs: 5,
                         interactive: false,
+                        otlp_relay_active: false,
                     },
                     vm_identity_test_policy(user, group),
                     None,
@@ -5409,6 +5412,7 @@ mod linux {
                 workdir: None,
                 timeout_secs: 60,
                 interactive: false,
+                otlp_relay_active: false,
             };
 
             assert!(matches!(
@@ -5685,6 +5689,7 @@ mod linux {
                 workdir: None,
                 timeout_secs: 5,
                 interactive: false,
+                otlp_relay_active: false,
             };
             let wire_policy = SandboxPolicyWire::from(policy.clone());
             let process = Arc::new(

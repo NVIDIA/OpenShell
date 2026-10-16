@@ -122,7 +122,9 @@ trace-context annotation. The same command exposes OTLP/gRPC on
 `http://127.0.0.1:4317` and, when deployed, the Kubernetes gateway on
 `http://127.0.0.1:8090`. The local `gateway:docker`, `gateway:podman`, and
 `gateway:vm` tasks detect the collector listener at startup and enable trace
-export only while it is reachable.
+export only while it is reachable. Spans an agent exports from inside a sandbox
+arrive through the supervisor's relay with `openshell.telemetry.source=agent`
+and share `openshell.sandbox.id` with that sandbox's supervisor spans.
 
 The Skaffold profile for HA reverse-proxy development is available from
 `deploy/helm/openshell/`:
