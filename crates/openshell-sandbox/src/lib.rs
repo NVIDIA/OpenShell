@@ -76,4 +76,5 @@ pub fn run(
         .map_err(|error| miette::miette!(error))
 }
 
+#[cfg(target_os = "linux")]
 mod native_api;

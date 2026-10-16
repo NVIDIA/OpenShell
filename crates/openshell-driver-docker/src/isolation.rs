@@ -47,6 +47,19 @@ impl DockerOuterFenceEvidence<'_> {
     }
 }
 
+/// Bind the validated container fence to the generation being launched.
+pub fn provisioning_evidence(
+    container_id: &str,
+    generation: &str,
+) -> Result<ProvisioningEvidence, BackendError> {
+    DockerOuterFenceEvidence {
+        container_id,
+        network_mode: "none",
+        unexpected_networks: &[],
+    }
+    .project(generation)
+}
+
 /// Driver-owned inputs that bind one Docker container to one boundary.
 pub struct DockerBoundarySpec {
     pub boundary_id: String,
@@ -85,13 +98,8 @@ impl DockerBoundarySpec {
         if self.gpu_requested {
             resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
         }
-        let unexpected_networks = Vec::new();
-        let provisioning_evidence = DockerOuterFenceEvidence {
-            container_id: &resource_claims["docker.container_id"],
-            network_mode: "none",
-            unexpected_networks: &unexpected_networks,
-        }
-        .project(&self.generation)?;
+        let provisioning_evidence =
+            provisioning_evidence(&resource_claims["docker.container_id"], &self.generation)?;
         Ok(DockerBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),

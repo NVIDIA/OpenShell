@@ -4843,6 +4843,17 @@ async fn refresh_docker_boundary_authentication(
         .map_err(|error| Status::internal(format!("rotate Docker boundary TLS: {error}")))?;
     boundary_config.session_id = session_id;
     boundary_config.generation = authentication.supervisor.runtime_generation.to_string();
+    // The stopped container retains its resource identity, but each new launch
+    // binds both protocol peers and their provisioning evidence to a fresh generation.
+    let container_id = boundary_config
+        .resource_claims
+        .get("docker.container_id")
+        .ok_or_else(|| Status::failed_precondition("Docker sandbox container claim is missing"))?;
+    boundary_config.provisioning_evidence =
+        isolation::provisioning_evidence(container_id, &boundary_config.generation)
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    runtime_descriptor.generation = boundary_config.generation.clone();
+    runtime_descriptor.provisioning_evidence = boundary_config.provisioning_evidence.clone();
     boundary_config.session_rotation = authentication.supervisor.session_rotation;
     boundary_config.auth_epoch = authentication.supervisor.auth_epoch;
     boundary_config.gateway_id = authentication.gateway_id;
