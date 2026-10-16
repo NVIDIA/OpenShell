@@ -260,6 +260,13 @@ brew uninstall nvidia/openshell/openshell
 rm -rf "$(brew --prefix)/var/openshell"
 ```
 
+Snap:
+
+```shell
+systemctl --user disable --now snap.openshell.user-gateway.service
+sudo snap remove --purge openshell
+```
+
 Debian and Ubuntu:
 
 ```shell
@@ -274,12 +281,6 @@ Fedora and RHEL:
 systemctl --user disable --now openshell-gateway
 sudo dnf remove openshell-gateway openshell-prover openshell
 rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
-```
-
-Snap:
-
-```shell
-sudo snap remove --purge openshell
 ```
 
 Remove any custom config or database set through `OPENSHELL_GATEWAY_CONFIG` or `OPENSHELL_DB_URL` separately.
