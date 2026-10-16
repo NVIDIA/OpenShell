@@ -50,7 +50,8 @@ GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -281,6 +282,13 @@ gateway_id = "${GATEWAY_NAME}"
 
 [openshell.drivers.vm]
 EOF
+# A rootless Linux libkrun refuses file creation on read-write bind mounts by
+# a guest UID/GID other than its own, so vm_bind_mount runs the sandbox as the
+# gateway user there.
+VM_IDENTITY_ARGS=()
+if [ "$(uname -s)" = "Linux" ] && [ "$(id -u)" != "0" ]; then
+  VM_IDENTITY_ARGS=(--sandbox-uid "$(id -u)" --sandbox-gid "$(id -g)")
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   printf 'socket_path = "%s"\n' "${DRIVER_SOCKET}" >>"${GATEWAY_CONFIG}"
 else
@@ -288,8 +296,20 @@ else
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${RUN_STATE_DIR}"
+enable_bind_mounts = true
 EOF
+  if [ "${#VM_IDENTITY_ARGS[@]}" -gt 0 ]; then
+    printf 'sandbox_uid = %s\nsandbox_gid = %s\n' "$(id -u)" "$(id -g)" >>"${GATEWAY_CONFIG}"
+  fi
 fi
+# Host bind mounts are exercised by vm_bind_mount, mirroring the Docker and
+# Podman e2e gateways. An external driver must acknowledge the same policy.
+# Keep [openshell.drivers.vm] the last table: vm_corporate_proxy appends bare
+# keys to it.
+cat >>"${GATEWAY_CONFIG}" <<EOF
+allow_driver_config = true
+resource_admission = { enabled = false }
+EOF
 
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   "${DRIVER_BIN}" \
@@ -299,6 +319,9 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
     --default-image "${SANDBOX_IMAGE}" \
     --state-dir "${RUN_STATE_DIR}" \
     --guest-tls-ca "${PKI_DIR}/ca.crt" \
+    --admission-config-json '{"allow_driver_config":true,"resource_admission":{"enabled":false}}' \
+    --enable-bind-mounts \
+    ${VM_IDENTITY_ARGS[@]+"${VM_IDENTITY_ARGS[@]}"} \
     >"${DRIVER_LOG}" 2>&1 &
   DRIVER_PID=$!
   e2e_wait_for_socket \
@@ -383,6 +406,10 @@ e2e_export_gateway_restart_metadata \
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 e2e_run_openshell_conformance "VM"
+if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+  echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
+  exit 0
+fi
 
 # Seed the catalog once for the whole lane. The profiles live in the gateway
 # for as long as it runs, and the import is create-only: a second import of
@@ -410,6 +437,7 @@ else
   run_e2e_test ephemeral_cleanup
   run_e2e_test host_gateway_alias
   run_e2e_test vm_overlay
+  run_e2e_test vm_bind_mount
   run_e2e_test vm_gateway_start
   run_e2e_test vm_corporate_proxy
 fi

@@ -4509,6 +4509,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "prost-types",
+ "rcgen",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -4667,7 +4668,6 @@ dependencies = [
 name = "openshell-isolation-interface"
 version = "0.0.0"
 dependencies = [
- "async-trait",
  "openshell-core",
  "serde",
  "serde_json",
@@ -4840,12 +4840,13 @@ name = "openshell-sandbox-backend"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "hyper-util",
  "libc",
  "openshell-core",
  "openshell-isolation-interface",
  "prost",
- "protoc-bin-vendored",
+ "prost-types",
  "rcgen",
  "rustix 1.1.4",
  "rustls",
@@ -4858,9 +4859,9 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tracing",
  "uuid",
@@ -5101,6 +5102,7 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-policy-schema",
+ "openshell-sandbox-backend",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry_sdk",
@@ -5146,6 +5148,7 @@ dependencies = [
  "openshell-core",
  "openshell-isolation-interface",
  "openshell-ocsf",
+ "openshell-sandbox-backend",
  "rand 0.10.2",
  "russh",
  "rustix 1.1.4",

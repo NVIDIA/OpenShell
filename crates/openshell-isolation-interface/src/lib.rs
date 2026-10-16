@@ -3,34 +3,16 @@
 
 #![forbid(unsafe_code)]
 
-//! The `OpenShell` **Isolation Backend** runtime contract (RFC 0012).
+//! Shared data and validation for the Isolation Backend RPC contracts.
 //!
-//! An isolation backend establishes and enforces a workload's isolation boundary;
-//! the supervisor role drives it through one contract. The supervisor-facing
-//! contract lives in [`contract`]: an object-safe, runtime-selectable backend
-//! plus a fixed chain of boxed lifecycle states the supervisor advances without
-//! branching on placement. Each driver places a sandbox boundary beside the
-//! workload and connects it to a separate supervisor.
+//! The backend extension interface is defined by `proto/isolation_backend.proto`
+//! and `proto/sandbox_protocol.proto`. The supervisor uses the concrete RPC
+//! client in `openshell-sandbox-backend`; backends implement the generated
+//! services without implementing a parallel Rust backend trait.
 //!
-//! The backend establishes standing enforcement before untrusted code runs and
-//! ensures launch-time controls are in force before each process's first
-//! untrusted instruction. It also exposes process operations and supplies
-//! workload egress to supervisor-owned network mediation.
-//!
-//! # Ordering is a security property
-//!
-//! The lifecycle states run in order: attach -> Bound -> confirm -> Ready ->
-//! `start_agent` -> Running. Nothing untrusted runs inside the boundary until it
-//! is confirmed ready. This is enforced *by construction*: each transition
-//! consumes the prior state by value. Trusted backends construct confirmation
-//! through [`contract::ConfirmedBoundary::try_new`], which checks common
-//! enforcement properties and immutable launch binding before the supervisor
-//! can obtain a [`contract::ReadyBoundary`]. Mechanism-specific evidence stays
-//! owned by the backend that can interpret it.
-//!
-//! [`AgentSpec`] is shared between the workload definition the supervisor
-//! submits and the [`contract::SandboxContext`] that `attach` binds to a
-//! boundary.
+//! [`contract`] retains validated workload identities, confirmation evidence,
+//! process specifications, and local byte-stream types shared by client and
+//! server. Confirmation and generation checks remain mandatory before launch.
 
 /// The agent workload to run inside the boundary.
 ///

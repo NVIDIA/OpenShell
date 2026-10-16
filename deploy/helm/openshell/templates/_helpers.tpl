@@ -624,4 +624,8 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
 {{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}
 {{- end -}}
+{{- $dataStorageSize := .Values.server.dataStorageSize -}}
+{{- if and (eq $workloadKind "statefulset") $dataStorageSize (not (regexMatch "^[0-9]+(\\.[0-9]+)?([KMGTPE]i|[kMGTPE])$" (toString $dataStorageSize))) -}}
+{{- fail "server.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi" -}}
+{{- end -}}
 {{- end }}

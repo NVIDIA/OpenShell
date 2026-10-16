@@ -101,7 +101,7 @@ async fn failed_gateway_start_can_be_stopped_and_retried() {
         PersistedSandboxIdentity::read(&failed.metadata.as_ref().unwrap().annotations).unwrap();
     let after =
         PersistedSandboxIdentity::read(&starting.metadata.as_ref().unwrap().annotations).unwrap();
-    assert_eq!(after.runtime_generation, before.runtime_generation);
+    assert_ne!(after.runtime_generation, before.runtime_generation);
     assert_eq!(after.auth_epoch.get(), before.auth_epoch.get() + 1);
     assert_ne!(after.gateway_token_id, before.gateway_token_id);
     assert_eq!(

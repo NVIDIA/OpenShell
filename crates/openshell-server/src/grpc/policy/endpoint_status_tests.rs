@@ -1591,6 +1591,9 @@ async fn startup_reconciliation_retries_no_lock_timeout_after_the_deadline() {
 
 #[tokio::test]
 async fn startup_reconciliation_retries_a_lock_timeout() {
+    const WAITS: &str = "openshell_server_mutation_lock_wait_seconds_count{scope=\"sandbox\"}";
+    const TIMEOUTS: &str = "openshell_server_mutation_lock_timeouts_total{scope=\"sandbox\"}";
+    let metrics = crate::gateway_metrics::MetricsCapture::install();
     let state = test_server_state().await;
     let sandbox_id = "endpoint-startup-lock-timeout";
     let initial = seed_stale_endpoint_status(&state, sandbox_id).await;
@@ -1607,7 +1610,13 @@ async fn startup_reconciliation_retries_a_lock_timeout() {
 
     // Release after the first attempt's lock wait timed out, while the retry
     // waits.
-    tokio::time::sleep(lock_timeout * 3 / 2).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while metrics.value(TIMEOUTS).is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the first lock wait times out");
     assert!(
         !reconciliation.is_finished(),
         "a lock timeout must not end the scan"
@@ -1623,6 +1632,10 @@ async fn startup_reconciliation_retries_a_lock_timeout() {
         .status
         .expect("status remains present");
     assert_eq!(status.endpoint_statuses, vec![initial]);
+
+    // The sweep counts the timed-out wait and records the retry's wait.
+    assert_eq!(metrics.value(TIMEOUTS), Some(1));
+    assert_eq!(metrics.value(WAITS), Some(1));
 }
 
 #[tokio::test]

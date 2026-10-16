@@ -21,6 +21,8 @@ This output is separate from the supervisor stderr and file output described bel
 
 Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
 
+The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request that presents no credential, or an operator certificate together with an `authorization` header. `status_detail` holds the reason category: `missing_credential` or `conflicting_credentials`. These events never include presented credentials or headers.
+
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
 ## Enable Sandbox JSON Export
@@ -245,6 +247,7 @@ The `class_uid` field identifies the event type:
 | 4007 | SSH Activity | `SSH:` |
 | 1007 | Process Activity | `PROC:` |
 | 2004 | Detection Finding | `FINDING:` |
+| 3002 | Authentication | `AUTH:` |
 | 5019 | Device Config State Change | `CONFIG:` |
 | 6002 | Application Lifecycle | `LIFECYCLE:` |
 

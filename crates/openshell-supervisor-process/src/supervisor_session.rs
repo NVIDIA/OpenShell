@@ -10,6 +10,10 @@
 //! and bridges bytes. The supervisor is a dumb byte bridge after target
 //! selection — it has no protocol awareness of the bytes flowing through.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
+use openshell_sandbox_backend::BoundaryLoopbackConnector;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +29,7 @@ use openshell_core::proto::{
     SupervisorHeartbeat, SupervisorHello, SupervisorMessage, TcpRelayTarget,
     config_snapshot_revision, gateway_message, relay_open, supervisor_message,
 };
-use openshell_isolation_interface::contract::{BoundaryLoopbackConnector, LoopbackTarget};
+use openshell_isolation_interface::contract::LoopbackTarget;
 use openshell_ocsf::{
     ActivityId, BaseEventBuilder, ConnectionInfo, Endpoint, EventContext, NetworkActivityBuilder,
     OcsfEvent, SeverityId, StatusId, ocsf_emit,
@@ -380,7 +384,7 @@ pub fn spawn(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
@@ -402,7 +406,7 @@ pub fn spawn_with_readiness(
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     runtime: SessionRuntimeContext,
@@ -428,7 +432,7 @@ struct SessionConfig {
     endpoint: String,
     sandbox_id: String,
     ssh_socket_path: std::path::PathBuf,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     terminating: Arc<AtomicBool>,
     instance_id: String,
@@ -860,7 +864,7 @@ pub async fn finalize_main_process_exit(
 struct GatewayMessageContext<'a> {
     sandbox_id: &'a str,
     ssh_socket_path: &'a std::path::Path,
-    port_forward: &'a Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: &'a Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     channel: &'a grpc_client::AuthedChannel,
     tx: &'a mpsc::Sender<SupervisorMessage>,
@@ -965,7 +969,7 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
 async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
     channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
@@ -1165,7 +1169,7 @@ async fn send_relay_open_result(
 async fn open_target(
     relay_open: &RelayOpen,
     ssh_socket_path: &std::path::Path,
-    port_forward: &Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: &Arc<BoundaryLoopbackConnector>,
     expected_ssh_peer_pid: Option<u32>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(unix))]
@@ -1200,7 +1204,7 @@ async fn open_target(
 
 async fn open_tcp_target(
     target: &TcpRelayTarget,
-    port_forward: &Arc<dyn BoundaryLoopbackConnector>,
+    port_forward: &Arc<BoundaryLoopbackConnector>,
 ) -> Result<Box<dyn TargetStream>, Box<dyn std::error::Error + Send + Sync>> {
     let host = normalize_tcp_target_host(target)?;
     let port = u16::try_from(target.port).map_err(|_| "tcp target port must fit in u16")?;
@@ -1356,7 +1360,7 @@ mod ocsf_event_tests {
     struct UnusedLoopbackConnector;
 
     #[async_trait::async_trait]
-    impl BoundaryLoopbackConnector for UnusedLoopbackConnector {
+    impl rpc_test::BoundaryLoopbackConnector for UnusedLoopbackConnector {
         async fn connect(
             &self,
             _target: LoopbackTarget,
@@ -1383,7 +1387,8 @@ mod ocsf_event_tests {
 
     #[tokio::test]
     async fn ssh_relay_without_adapter_is_rejected_on_every_host() {
-        let connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(UnusedLoopbackConnector);
+        let connector: Arc<BoundaryLoopbackConnector> =
+            rpc_test::loopback(Arc::new(UnusedLoopbackConnector));
         let result = open_target(
             &ssh_relay_open("no-ssh"),
             std::path::Path::new(""),
@@ -1687,7 +1692,8 @@ mod ocsf_event_tests {
 
         // The SSH relay path does not use the port-forward (that is the TCP
         // target path); connect from the supervisor's own namespace.
-        let port_forward: Arc<dyn BoundaryLoopbackConnector> = Arc::new(UnusedLoopbackConnector);
+        let port_forward: Arc<BoundaryLoopbackConnector> =
+            rpc_test::loopback(Arc::new(UnusedLoopbackConnector));
 
         let trusted = open_target(&relay, &socket, &port_forward, Some(std::process::id()))
             .await

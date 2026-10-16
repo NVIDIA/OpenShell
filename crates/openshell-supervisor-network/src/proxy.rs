@@ -9,6 +9,9 @@ mod relay;
 #[cfg(test)]
 pub(crate) use relay::relay_inspected_http_stream_for_test;
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use crate::identity::{BinaryIdentityCache, SuppliedIdentityError};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
@@ -36,13 +39,14 @@ use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked}
 use openshell_isolation_interface::contract::ExecutableIdentity as ContractExecutableIdentity;
 use openshell_isolation_interface::contract::{
     BinaryIdentity as ContractBinaryIdentity, BoundaryDuplexStream, MediationTiming,
-    NetworkMediationSource, PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
+    PendingTcpOpen, ResolveError, TcpOpenDecision, TcpOpenDenial,
 };
 use openshell_ocsf::{
     ActionId, ActivityId, BaseEventBuilder, DispositionId, Endpoint, HttpActivityBuilder,
     HttpRequest, HttpResponse, NetworkActivityBuilder, Process, SeverityId, StatusId,
     Url as OcsfUrl, ocsf_emit,
 };
+use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -250,7 +254,7 @@ impl ProxyHandle {
         engine_ready: tokio::sync::watch::Receiver<bool>,
         upstream_proxy_args: &upstream_proxy::UpstreamProxyArgs,
         backend_host_gateway: Option<IpAddr>,
-        network_mediation_source: Option<Arc<dyn NetworkMediationSource>>,
+        network_mediation_source: Option<Arc<NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
         direct_listener_identity: Option<ContractBinaryIdentity>,
         required_proxy_authorization: Option<Arc<str>>,
@@ -7453,11 +7457,13 @@ process:
                     stream: Box::new(stream),
                     binary_identity: identity(),
                     destination: destination.parse().unwrap(),
-                    socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                        socket_cookie: 7,
-                        nonblocking: false,
-                        process_generation: 1,
-                    },
+                    socket: Some(
+                        openshell_isolation_interface::contract::NetworkSocketMetadata {
+                            socket_cookie: 7,
+                            nonblocking: false,
+                            process_generation: 1,
+                        },
+                    ),
                     policy_generation: engine.current_generation(),
                     timing: MediationTiming::default(),
                     decision,
@@ -7643,11 +7649,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                     cmdline_paths: Vec::new(),
                 }),
                 destination,
-                socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                    socket_cookie: 7,
-                    nonblocking: false,
-                    process_generation: 1,
-                },
+                socket: Some(
+                    openshell_isolation_interface::contract::NetworkSocketMetadata {
+                        socket_cookie: 7,
+                        nonblocking: false,
+                        process_generation: 1,
+                    },
+                ),
                 policy_generation: generation,
                 timing: MediationTiming::default(),
                 decision,
@@ -8084,11 +8092,13 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             stream: Box::new(stream),
             binary_identity: Ok(identity.clone()),
             destination: SocketAddr::from((crate::policy_dns::POLICY_LOCAL_ADDRESS, 80)),
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8215,11 +8225,13 @@ network_policies:
                 cmdline_paths: Vec::new(),
             }),
             destination,
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8356,11 +8368,13 @@ process:
                 cmdline_paths: Vec::new(),
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8439,11 +8453,13 @@ process:
                 cmdline_paths: Vec::new(),
             }),
             destination: "203.0.113.7:443".parse().unwrap(),
-            socket: openshell_isolation_interface::contract::NetworkSocketMetadata {
-                socket_cookie: 7,
-                nonblocking: false,
-                process_generation: 1,
-            },
+            socket: Some(
+                openshell_isolation_interface::contract::NetworkSocketMetadata {
+                    socket_cookie: 7,
+                    nonblocking: false,
+                    process_generation: 1,
+                },
+            ),
             policy_generation: engine.current_generation(),
             timing: MediationTiming::default(),
             decision,
@@ -8492,7 +8508,7 @@ process:
     }
 
     #[async_trait::async_trait]
-    impl NetworkMediationSource for FailedMediationSource {
+    impl rpc_test::NetworkMediationSource for FailedMediationSource {
         async fn accept_tcp(
             &self,
         ) -> std::result::Result<
@@ -8866,7 +8882,7 @@ network_policies: {}
             ready_rx,
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
-            Some(Arc::new(FailedMediationSource)),
+            Some(rpc_test::network(Arc::new(FailedMediationSource))),
             None,
             None,
             None,

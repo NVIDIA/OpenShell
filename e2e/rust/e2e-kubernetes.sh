@@ -26,7 +26,8 @@ RUN_WITH_GATEWAY_COMMAND="__openshell_run_kubernetes_e2e"
 # shellcheck source=e2e/support/conformance.sh
 source "${ROOT}/e2e/support/conformance.sh"
 
-E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES-e2e,e2e-host-gateway,e2e-kubernetes}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+E2E_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}"
 
 # Fixed output path of the `e2e-kubernetes` nextest profile (`.config/nextest.toml`).
 JUNIT_XML="${ROOT}/results/e2e-kubernetes.xml"
@@ -90,7 +91,8 @@ run_suite() {
 
 run_e2e() {
   run_conformance
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
   fi
 

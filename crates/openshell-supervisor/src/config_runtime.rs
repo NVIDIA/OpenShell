@@ -30,8 +30,8 @@ use crate::{
     MiddlewareRegistryReconciliation, MiddlewareRegistryStatus, MiddlewareReloadContext,
     PolicyGatewayClient, PolicyPollLoopContext, PolicyStatusUpdate, RejectedPolicyGeneration,
     apply_gateway_runtime_reload_failure, apply_policy_validation_failure,
-    emit_policy_validation_failure, emit_transparent_tcp_expansion_rejection, endpoint_status,
-    enqueue_policy_status, gateway_policy_runtime_needs_reconciliation, initial_poll_disposition,
+    emit_policy_validation_failure, endpoint_status, enqueue_policy_status,
+    gateway_policy_runtime_needs_reconciliation, initial_poll_disposition,
     middleware_registry_needs_rebuild, next_poll_delay, ocsf_ctx,
     provider_environment_is_installable, reconcile_middleware_registry,
     reload_gateway_configuration_runtime, retain_extension_credentials, run_policy_status_reporter,
@@ -443,7 +443,6 @@ impl ConfigRuntime {
                     registry_changed: middleware_registry_changed,
                     connector: &ctx.middleware_connector,
                 },
-                ctx.transparent_tcp,
                 ctx.vm_identity,
                 || {
                     if let Some(prepared) = prepared_provider.as_ref() {
@@ -615,24 +614,6 @@ impl ConfigRuntime {
                                         result.version
                                     ))
                                     .build());
-                            }
-                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                                error,
-                                active_generation,
-                            } => {
-                                emit_transparent_tcp_expansion_rejection(
-                                    result.version,
-                                    &result.policy_hash,
-                                    active_generation,
-                                    &error,
-                                );
-                                if policy_changed
-                                    && result.version > 0
-                                    && result.policy_source == PolicySource::Sandbox
-                                {
-                                    policy_status =
-                                        Some(PolicyStatusUpdate::failed(result.version, error));
-                                }
                             }
                         }
                     }
@@ -1777,7 +1758,6 @@ mod tests {
         polled_sandboxes: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedPolicyGateway {
         async fn poll_settings(
             &self,
@@ -1836,7 +1816,6 @@ mod tests {
         credential_requests: Arc<AtomicUsize>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for CredentialRejectingPolicyGateway {
         async fn poll_settings(
             &self,
@@ -2073,7 +2052,6 @@ mod tests {
         requests: UnboundedSender<ProviderFetchRequest>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedProviderGateway {
         async fn poll_settings(
             &self,
@@ -2219,7 +2197,6 @@ mod tests {
         first_poll: Arc<AtomicBool>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for GenerationChangingPolicyGateway {
         async fn poll_settings(
             &self,
@@ -2751,7 +2728,6 @@ mod tests {
             extension_credentials: openshell_extension_core::ExtensionCredentialStore::new(),
             extension_authentication_enabled: false,
             middleware_connector,
-            transparent_tcp: TransparentTcpReloadState::default(),
             config_apply_rx: None,
             config_push_enabled: None,
             endpoint_observation_tx: None,
@@ -2828,54 +2804,6 @@ mod tests {
             0,
             "same-hash acknowledgement must not reload OPA"
         );
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn poll_rejects_first_tcp_expansion_and_reports_previous_policy_active() {
-        let v1 = settings_poll_result(
-            Some(proto_policy_fixture()),
-            1,
-            openshell_core::proto::PolicySource::Sandbox,
-        );
-        let v2 = settings_poll_result(
-            Some(proto_tcp_policy_fixture()),
-            2,
-            openshell_core::proto::PolicySource::Sandbox,
-        );
-        let engine =
-            Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
-        let active_generation = engine.current_generation();
-        let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
-        let mut ctx = policy_poll_test_context(
-            engine.clone(),
-            LoadedPolicyOrigin::Gateway {
-                revision: Some(loaded_revision),
-                has_last_valid_policy: true,
-            },
-            default_middleware_connector(),
-        );
-        ctx.transparent_tcp = TransparentTcpReloadState {
-            capable: true,
-            substrate_ready: false,
-        };
-        let (client, polls, mut reports) = scripted_policy_gateway();
-        polls.send(v1).unwrap();
-
-        let handle = tokio::spawn(run_policy_poll_loop_with_client(ctx, client));
-        expect_policy_report(&mut reports, 1).await;
-        polls.send(v2).unwrap();
-        let report = timeout(Duration::from_secs(1), reports.recv())
-            .await
-            .expect("TCP rejection report timed out")
-            .expect("policy reporter stopped");
-
-        assert_eq!(report.0, 2);
-        assert!(!report.1);
-        assert!(report.2.contains("recreate the sandbox"), "{}", report.2);
-        assert!(report.2.contains("previous policy remains active"));
-        assert_eq!(engine.current_generation(), active_generation);
-        assert!(engine.fail_closed_reason().is_none());
         handle.abort();
     }
 
@@ -3661,64 +3589,6 @@ mod tests {
         .await
         .expect("a session without push must resume polling");
         handle.abort();
-    }
-
-    #[tokio::test]
-    async fn streamed_tcp_expansion_reports_retained_active_policy() {
-        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
-
-        let engine = Arc::new(
-            OpaEngine::from_proto(&proto_policy_fixture()).expect("build initial OPA engine"),
-        );
-        let mut ctx = policy_poll_test_context(
-            Arc::clone(&engine),
-            LoadedPolicyOrigin::Gateway {
-                revision: None,
-                has_last_valid_policy: true,
-            },
-            default_middleware_connector(),
-        );
-        ctx.transparent_tcp = TransparentTcpReloadState {
-            capable: true,
-            substrate_ready: false,
-        };
-        let initial = settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
-        let mut candidate =
-            settings_poll_result(Some(proto_tcp_policy_fixture()), 2, PolicySource::Sandbox);
-        candidate.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
-        let (client, _polls, _reports) = scripted_policy_gateway();
-        let initial_revision = sandbox_config_revision(&initial);
-        let initial_generation = engine.current_generation();
-        let mut runtime = started_runtime(&ctx, &initial);
-        let result = apply_with_provider(&mut runtime, &ctx, &client, &candidate).await;
-
-        assert_eq!(engine.current_generation(), initial_generation);
-        assert!(engine.fail_closed_reason().is_none());
-        assert_eq!(
-            result.outcome,
-            ConfigApplyOutcome::FailedRetainedLastKnownGood
-        );
-        assert_eq!(runtime.applied_revision, Some(initial_revision));
-        assert!(
-            result
-                .failure
-                .as_ref()
-                .unwrap()
-                .message
-                .contains("without the transparent TCP substrate")
-        );
-        assert_eq!(
-            result.policy_load.map(|load| (load.version, load.loaded)),
-            Some((2, false))
-        );
-        // Readiness reports the rejected generation rather than claiming the
-        // retained policy as evidence for it.
-        assert_eq!(
-            ctx.provider_readiness
-                .observation(&ctx.provider_credentials)
-                .reason,
-            i32::from(ProviderReadinessReason::PolicyActivationFailed)
-        );
     }
 
     #[tokio::test]

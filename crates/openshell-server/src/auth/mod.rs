@@ -8,6 +8,7 @@
 //! - `identity`: Provider-agnostic identity representation
 //! - `http`: HTTP endpoints for auth discovery and token exchange
 
+pub mod audit;
 pub mod authenticator;
 pub mod authz;
 pub mod compute_driver;

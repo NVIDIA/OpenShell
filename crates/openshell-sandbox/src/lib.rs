@@ -75,3 +75,6 @@ pub fn run(
     boundary_server::run_boundary(config_path, qualification)
         .map_err(|error| miette::miette!(error))
 }
+
+#[cfg(target_os = "linux")]
+mod native_api;

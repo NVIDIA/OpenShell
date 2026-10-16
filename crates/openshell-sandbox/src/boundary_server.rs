@@ -13,6 +13,10 @@ use std::path::Path;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::native_api::{
+        BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess, BoundaryTerminal, ExecSession,
+    };
+
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::mem::size_of;
@@ -35,17 +39,25 @@ mod linux {
     };
     use openshell_core::provider_credentials::ProviderCredentialState;
     use openshell_isolation_interface::contract::{
-        BoundaryConfirmation, BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
-        BoundaryTerminal, ExecSession, LoopbackTarget, ResolvedWorkloadIdentity,
+        BoundaryConfirmation, LoopbackTarget, ResolvedWorkloadIdentity,
     };
+    use openshell_sandbox_backend::backend_proto::{
+        DescribeIsolationBackendRequest, DescribeIsolationBackendResponse, OpenBoundaryRequest,
+        OpenBoundaryResponse, ResumeBoundaryRequest, SuspendBoundaryRequest,
+        SuspendBoundaryResponse,
+        isolation_backend_server::{IsolationBackend, IsolationBackendServer},
+        open_boundary_response::LaunchOutcome,
+    };
+    #[cfg(test)]
+    use openshell_sandbox_backend::isolation_protocol::{chunk_data, data_chunk};
     use openshell_sandbox_backend::mediation::{
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
     #[cfg(test)]
-    use openshell_sandbox_backend::proto::isolation_boundary_client::IsolationBoundaryClient;
+    use openshell_sandbox_backend::proto::sandbox_protocol_client::SandboxProtocolClient;
     use openshell_sandbox_backend::proto::{
-        BoundaryChunk,
-        isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
+        ExchangeFrame, MediateFrame,
+        sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
     };
     use openshell_sandbox_backend::sandbox_auth::{
         SandboxAuthError, SandboxConnectionId, SandboxConnectionRegistry,
@@ -297,7 +309,7 @@ mod linux {
         }
         validate_resource_claims(&config.resource_claims).map_err(|error| error.to_string())?;
         config
-            .outer_fence
+            .provisioning_evidence
             .validate(&config.generation)
             .map_err(|error| error.to_string())?;
         for (claim, path) in &config.resource_claim_files {
@@ -589,6 +601,14 @@ mod linux {
             tokio_stream::pending(),
         );
         let mut shutdown = connection_closed.clone();
+        let service = GrpcBoundaryService {
+            runtime: runtime.clone(),
+            connection_id,
+            connection_expiry,
+            connection_closed,
+            negotiated: Arc::new(AtomicBool::new(false)),
+            opened: Arc::new(AtomicBool::new(false)),
+        };
         let result = tonic::transport::Server::builder()
             .http2_keepalive_interval(Some(CONTROL_KEEPALIVE_INTERVAL))
             .http2_keepalive_timeout(Some(CONTROL_KEEPALIVE_TIMEOUT))
@@ -596,14 +616,18 @@ mod linux {
             .initial_stream_window_size(BOUNDARY_STREAM_WINDOW_BYTES)
             .initial_connection_window_size(BOUNDARY_CONNECTION_WINDOW_BYTES)
             .add_service(
-                IsolationBoundaryServer::new(GrpcBoundaryService {
-                    runtime: runtime.clone(),
-                    connection_id,
-                    connection_expiry,
-                    connection_closed,
-                })
-                .max_decoding_message_size(64 * 1024)
-                .max_encoding_message_size(64 * 1024),
+                IsolationBackendServer::new(service.clone())
+                    .max_decoding_message_size(64 * 1024)
+                    .max_encoding_message_size(64 * 1024),
+            )
+            .add_service(
+                SandboxProtocolServer::new(service)
+                    .max_decoding_message_size(
+                        openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
+                    )
+                    .max_encoding_message_size(
+                        openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
+                    ),
             )
             .serve_with_incoming_shutdown(incoming, async move {
                 let _ = shutdown.changed().await;
@@ -677,6 +701,8 @@ mod linux {
         connection_id: SandboxConnectionId,
         connection_expiry: Arc<ConnectionExpiry>,
         connection_closed: tokio::sync::watch::Receiver<()>,
+        negotiated: Arc<AtomicBool>,
+        opened: Arc<AtomicBool>,
     }
 
     struct ConnectionExpiry {
@@ -754,24 +780,125 @@ mod linux {
         }
     }
 
-    type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
-
     #[tonic::async_trait]
-    impl IsolationBoundary for GrpcBoundaryService {
-        type ExchangeStream = GrpcResponseStream;
-        type MediateStream = GrpcResponseStream;
-
-        async fn exchange(
+    impl IsolationBackend for GrpcBoundaryService {
+        async fn describe(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
-        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            request: tonic::Request<DescribeIsolationBackendRequest>,
+        ) -> Result<tonic::Response<DescribeIsolationBackendResponse>, tonic::Status> {
+            let backend =
+                openshell_sandbox_backend::isolation_protocol::metadata("openshell/sandbox");
+            openshell_sandbox_backend::isolation_protocol::negotiate(
+                &backend,
+                request.into_inner().supervisor,
+            )?;
+            self.negotiated.store(true, Ordering::Release);
+            Ok(tonic::Response::new(DescribeIsolationBackendResponse {
+                backend: Some(backend),
+            }))
+        }
+
+        async fn open_boundary(
+            &self,
+            request: tonic::Request<OpenBoundaryRequest>,
+        ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
             let principal = self
                 .runtime
                 .authenticate_request(self.connection_id, request.metadata())?;
+            if !self.negotiated.load(Ordering::Acquire) {
+                return Err(tonic::Status::failed_precondition(
+                    "negotiate isolation capabilities before opening a boundary",
+                ));
+            }
+            let request = request.into_inner();
+            openshell_sandbox_backend::isolation_protocol::validate_open(
+                &request,
+                &self.runtime.config,
+            )?;
             self.connection_expiry
                 .update(principal.session().expires_at);
+            self.opened.store(true, Ordering::Release);
+            Ok(tonic::Response::new(OpenBoundaryResponse {
+                boundary_id: self.runtime.routing_handle.clone(),
+                outcome: LaunchOutcome::Fresh as i32,
+            }))
+        }
+
+        async fn suspend_boundary(
+            &self,
+            request: tonic::Request<SuspendBoundaryRequest>,
+        ) -> Result<tonic::Response<SuspendBoundaryResponse>, tonic::Status> {
+            self.runtime
+                .authenticate_request(self.connection_id, request.metadata())?;
+            Err(tonic::Status::unimplemented(
+                "OpenShell sandbox does not advertise suspend/resume",
+            ))
+        }
+
+        async fn resume_boundary(
+            &self,
+            request: tonic::Request<ResumeBoundaryRequest>,
+        ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
+            self.runtime
+                .authenticate_request(self.connection_id, request.metadata())?;
+            Err(tonic::Status::unimplemented(
+                "OpenShell sandbox does not advertise suspend/resume",
+            ))
+        }
+    }
+
+    impl GrpcBoundaryService {
+        async fn bind_stream<F: openshell_sandbox_backend::stream_adapter::ProtocolFrame>(
+            &self,
+            request: tonic::Request<tonic::Streaming<F>>,
+        ) -> Result<(tonic::Streaming<F>, SandboxProtocolPrincipal), tonic::Status> {
+            let principal = self
+                .runtime
+                .authenticate_request(self.connection_id, request.metadata())?;
+            if !self.opened.load(Ordering::Acquire) {
+                return Err(tonic::Status::failed_precondition(
+                    "open a boundary before opening Sandbox Protocol streams",
+                ));
+            }
+            self.connection_expiry
+                .update(principal.session().expires_at);
+            let mut inbound = request.into_inner();
+            let frame = tokio::time::timeout(CONTROL_HANDSHAKE_TIMEOUT, inbound.message())
+                .await
+                .map_err(|_| {
+                    tonic::Status::deadline_exceeded("boundary binding frame timed out")
+                })??;
+            match frame.as_ref().and_then(F::boundary_id) {
+                Some(id) if id == self.runtime.routing_handle => {}
+                Some(_) => {
+                    return Err(tonic::Status::permission_denied(
+                        "boundary handle does not match authenticated runtime",
+                    ));
+                }
+                _ => {
+                    return Err(tonic::Status::invalid_argument(
+                        "first Sandbox Protocol frame must bind a boundary",
+                    ));
+                }
+            }
+            Ok((inbound, principal))
+        }
+    }
+
+    type GrpcResponseStream<F = ExchangeFrame> = ReceiverStream<Result<F, tonic::Status>>;
+
+    #[tonic::async_trait]
+    impl SandboxProtocol for GrpcBoundaryService {
+        type ExchangeStream = GrpcResponseStream;
+        type MediateStream = GrpcResponseStream<MediateFrame>;
+
+        async fn exchange(
+            &self,
+            request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            let (inbound, principal) = self.bind_stream(request).await?;
             let (stream, response) =
-                bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
+                bridge_grpc_server_stream(inbound, self.connection_closed.clone());
             let runtime = self.runtime.clone();
             tokio::task::spawn_blocking(move || {
                 let stream = ControlStream::Grpc {
@@ -787,15 +914,11 @@ mod linux {
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<MediateFrame>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
-            let principal = self
-                .runtime
-                .authenticate_request(self.connection_id, request.metadata())?;
-            self.connection_expiry
-                .update(principal.session().expires_at);
+            let (inbound, principal) = self.bind_stream(request).await?;
             let (stream, response) =
-                bridge_grpc_server_stream(request.into_inner(), self.connection_closed.clone());
+                bridge_grpc_server_stream(inbound, self.connection_closed.clone());
             let runtime = self.runtime.clone();
             tokio::spawn(async move {
                 if let Err(error) = serve_persistent_mediation(stream, runtime, principal).await {
@@ -806,23 +929,36 @@ mod linux {
         }
     }
 
-    fn bridge_grpc_server_stream(
-        mut inbound: tonic::Streaming<BoundaryChunk>,
+    fn bridge_grpc_server_stream<F: openshell_sandbox_backend::stream_adapter::ProtocolFrame>(
+        mut inbound: tonic::Streaming<F>,
         connection_closed: tokio::sync::watch::Receiver<()>,
-    ) -> (tokio::io::DuplexStream, GrpcResponseStream) {
+    ) -> (tokio::io::DuplexStream, GrpcResponseStream<F>) {
         let (application, bridge) = tokio::io::duplex(256 * 1024);
         let (mut reader, mut writer) = tokio::io::split(bridge);
-        let (outbound, outbound_rx) =
-            tokio::sync::mpsc::channel::<Result<BoundaryChunk, tonic::Status>>(64);
+        let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<Result<F, tonic::Status>>(64);
+        // Do not retain the response sender while the client request direction
+        // stays open: finite exchanges must still observe the server's EOF.
+        let invalid_frames = outbound.downgrade();
         let mut inbound_closed = connection_closed.clone();
         tokio::spawn(async move {
             tokio::select! {
             _ = inbound_closed.changed() => {},
             () = async {
+            let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Request;
             loop {
                 match inbound.message().await {
                     Ok(Some(chunk)) => {
-                        if writer.write_all(&chunk.data).await.is_err() {
+                        let data = match chunk.receive(&mut mode).map_err(|error|tonic::Status::invalid_argument(error.to_string())) {
+                            Ok(data) => data,
+                            Err(error) => {
+                                if let Some(outbound) = invalid_frames.upgrade() {
+                                    let _ = outbound.send(Err(error)).await;
+                                }
+                                let _ = writer.shutdown().await;
+                                return;
+                            }
+                        };
+                        if writer.write_all(&data).await.is_err() {
                             return;
                         }
                     }
@@ -844,26 +980,12 @@ mod linux {
             tokio::select! {
             _ = outbound_closed.changed() => {},
             () = async {
-            let mut buffer = vec![0_u8; 16 * 1024];
+            let mut mode = openshell_sandbox_backend::stream_adapter::Mode::Response;
             loop {
-                let read = match reader.read(&mut buffer).await {
-                    Ok(read) => read,
-                    Err(error) => {
-                        tracing::debug!(%error, "Boundary gRPC response reader ended");
-                        return;
-                    }
-                };
-                if read == 0 {
-                    return;
-                }
-                if outbound
-                    .send(Ok(BoundaryChunk {
-                        data: buffer[..read].to_vec(),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return;
+                match F::send(&mut reader,&mut mode).await {
+                    Ok(Some(chunk)) => if outbound.send(Ok(chunk)).await.is_err() { return; },
+                    Ok(None) => return,
+                    Err(error) => { let _=outbound.send(Err(tonic::Status::invalid_argument(error.to_string()))).await;return; }
                 }
             }
             } => {},
@@ -1031,7 +1153,7 @@ mod linux {
                 queue_wait_us: duration_micros(pending.queued_at.elapsed()),
             },
         };
-        let Ok(payload) = mediation::encode_json(&query) else {
+        let Ok(payload) = mediation::encode_message(&query) else {
             routes.lock().await.remove(&stream_id);
             return;
         };
@@ -1052,7 +1174,7 @@ mod linux {
                 kind: MediationFrameKind::DnsResponse,
                 payload,
                 ..
-            }) => mediation::decode_json::<DnsQueryResultWire>(&payload)
+            }) => mediation::decode_message::<DnsQueryResultWire>(&payload)
                 .map_err(io::Error::other)
                 .and_then(|response| match response {
                     DnsQueryResultWire::Response(response) => Ok(response),
@@ -1107,7 +1229,7 @@ mod linux {
                 let started = match runtime.start_exec(
                     &request.request_id,
                     &request.payload_digest,
-                    request.exec_expires_at_unix_ms,
+                    request.exec_admission_deadline_unix_ms,
                     spec,
                 ) {
                     Ok(started) => started,
@@ -1186,7 +1308,7 @@ mod linux {
                     &mut stream,
                     &ResponseEnvelope {
                         request_id: request.request_id,
-                        response: Response::PortConnected,
+                        response: Response::LoopbackConnected,
                     },
                 )
                 .map_err(|error| format!("write port-forward response: {error}"))?;
@@ -1221,7 +1343,7 @@ mod linux {
                         response: Response::NetworkConnected {
                             identity: BinaryIdentityWire::from(pending.identity.clone()),
                             destination: pending.destination,
-                            socket: pending.socket,
+                            socket: Some(pending.socket),
                             policy_generation: 0,
                             timing: MediationTimingWire {
                                 notification_to_queue_us: duration_micros(
@@ -1247,7 +1369,7 @@ mod linux {
                             "unexpected network-open decision channel {channel}"
                         ));
                     }
-                    let decision = serde_json::from_slice(&payload)
+                    let decision = openshell_sandbox_backend::protobuf::decode(&payload)
                         .map_err(|error| format!("decode network-open decision: {error}"))?;
                     let Some(target) = pending
                         .complete(decision)
@@ -1306,6 +1428,7 @@ mod linux {
 
     struct BoundaryRuntime {
         config: BoundaryConfig,
+        routing_handle: String,
         authenticator: SandboxProtocolAuthenticator,
         connections: SandboxConnectionRegistry,
         connection_shutdowns:
@@ -1466,7 +1589,6 @@ mod linux {
     struct StartedAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
-        policy: SandboxPolicyWire,
         ca_cert: Option<String>,
         ca_bundle: Option<String>,
         provider_env_revision: u64,
@@ -1481,7 +1603,6 @@ mod linux {
         fn matches_replay(&self, other: &Self) -> bool {
             self.sandbox_id == other.sandbox_id
                 && self.spec == other.spec
-                && self.policy == other.policy
                 && self.ca_cert == other.ca_cert
                 && self.ca_bundle == other.ca_bundle
         }
@@ -1612,6 +1733,7 @@ mod linux {
                     config.session_rotation,
                 ),
                 connection_shutdowns: Mutex::new(std::collections::HashMap::new()),
+                routing_handle: uuid::Uuid::new_v4().to_string(),
                 config,
                 process_runtime,
                 state: Mutex::new(RuntimeState::AwaitingAttach),
@@ -1984,29 +2106,11 @@ mod linux {
             let payload_digest = envelope.payload_digest;
             let response = match envelope.request {
                 Request::DiscoverPolicy => Self::discover_image_policy(),
-                Request::Attach {
-                    supervisor_instance_id: _,
-                    policy,
-                    resource_claims,
-                } => {
-                    if resource_claims == self.config.resource_claims {
-                        self.attach(*policy)
-                    } else {
-                        guest_error(
-                            BoundaryErrorKind::Denied,
-                            "backend resource claims do not match the boundary configuration",
-                        )
-                    }
-                }
+                Request::Attach { policy, .. } => self.attach(*policy),
                 Request::Confirm => self.confirm(),
-                Request::ProbeProviderFiles => self.network_broker.confirm_healthy().map_or_else(
-                    |error| guest_error(BoundaryErrorKind::Unavailable, error.to_string()),
-                    |()| Response::ProviderFilesSupported,
-                ),
                 Request::StartAgent {
                     sandbox_id,
                     spec,
-                    policy,
                     ca_cert,
                     ca_bundle,
                     provider_env_revision,
@@ -2015,7 +2119,6 @@ mod linux {
                 } => self.start_agent(
                     sandbox_id,
                     spec,
-                    *policy,
                     ca_cert,
                     ca_bundle,
                     provider_env_revision,
@@ -2036,7 +2139,6 @@ mod linux {
                 Request::Wait { process_id } => self.wait(&process_id),
                 Request::Signal { process_id, signal } => self.signal(&process_id, signal),
                 Request::Terminate { process_id } => self.terminate(&process_id),
-                Request::ExecSignal { process_id, signal } => self.signal_exec(&process_id, signal),
                 Request::Resize {
                     process_id,
                     cols,
@@ -2156,7 +2258,6 @@ mod linux {
                 stdout,
                 stderr,
                 terminal,
-                output_status: _,
             } = session;
             let Some(stdin) = stdin else {
                 return Err(guest_error(
@@ -2167,7 +2268,7 @@ mod linux {
             let retained = {
                 let _runtime = self.process_runtime.enter();
                 MainSession::from_boundary(
-                    openshell_isolation_interface::contract::ProcessAttachment {
+                    crate::native_api::ProcessAttachment {
                         stdin,
                         stdout,
                         stderr,
@@ -2200,19 +2301,6 @@ mod linux {
                 terminal,
                 attachment,
             })
-        }
-
-        fn signal_exec(&self, process_id: &str, signal: SignalWire) -> Response {
-            let process = lock(&self.exec_handles)
-                .get(process_id)
-                .map(|handle| handle.process.clone());
-            let Some(process) = process else {
-                return guest_error(BoundaryErrorKind::Invalid, "unknown exec process ID");
-            };
-            match self.process_runtime.block_on(process.signal(signal.into())) {
-                Ok(()) => Response::Signaled,
-                Err(error) => guest_error(BoundaryErrorKind::Process, error.to_string()),
-            }
         }
 
         fn resize_process(&self, process_id: &str, cols: u16, rows: u16) -> Response {
@@ -2464,17 +2552,13 @@ mod linux {
             // backend validates it before constructing a ConfirmedBoundary.
             // Keeping that decision at the verifier also lets lifecycle tests
             // exercise the protocol without claiming host-kernel enforcement.
-            let properties = audit.properties();
             let backend_audit = serde_json::to_value(audit)
                 .map_err(|error| format!("encode OpenShell sandbox audit evidence: {error}"))?;
             Ok(BoundaryConfirmation {
                 generation: self.config.generation.clone(),
                 identity: self.config.workload_identity.clone(),
-                properties,
-                authenticated_supervisor: true,
                 session_id: self.config.session_id,
-                outer_fence: self.config.outer_fence.clone(),
-                runtime_exit_terminates_workload: true,
+                provisioning_evidence_digest: self.config.provisioning_evidence.evidence_digest,
                 resource_claims: self.config.resource_claims.clone(),
                 backend_audit,
             })
@@ -2485,18 +2569,18 @@ mod linux {
             &self,
             sandbox_id: String,
             spec: AgentSpecWire,
-            policy: SandboxPolicyWire,
             ca_cert: Option<String>,
             ca_bundle: Option<String>,
             provider_env_revision: u64,
             provider_env: std::collections::HashMap<String, String>,
             provider_files: std::collections::HashMap<String, String>,
         ) -> Response {
-            // Check the supplied launch policy before installing materials or
-            // replacing its selectors with the measured driver's numeric pair.
-            if let Err(error) = validate_vm_policy_identity(&self.config, &policy) {
-                return guest_error(BoundaryErrorKind::Denied, error);
-            }
+            let Some(policy) = lock(&self.attached_policy).clone() else {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    "boundary must be attached before start_agent",
+                );
+            };
             let spec = match resolve_agent_spec(spec) {
                 Ok(spec) => spec,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
@@ -2505,7 +2589,6 @@ mod linux {
             let requested = StartedAgent {
                 sandbox_id,
                 spec: spec.clone(),
-                policy: policy.clone(),
                 ca_cert: ca_cert.clone(),
                 ca_bundle: ca_bundle.clone(),
                 provider_env_revision,
@@ -2535,6 +2618,15 @@ mod linux {
                     "boundary must be confirmed before start_agent",
                 );
             };
+            if let Err(error) = self.network_broker.confirm_healthy() {
+                return guest_error(BoundaryErrorKind::Unavailable, error.to_string());
+            }
+            if let Err(error) = crate::provider_files::ProviderFiles::validate(&provider_files) {
+                return guest_error(
+                    BoundaryErrorKind::Invalid,
+                    format!("invalid provider files: {error}"),
+                );
+            }
             let ca_file_paths = match install_ca_material(ca_cert, ca_bundle) {
                 Ok(paths) => paths,
                 Err(error) => return guest_error(BoundaryErrorKind::Process, error),
@@ -2632,6 +2724,9 @@ mod linux {
                     applied: false,
                 };
             }
+            if let Err(error) = self.network_broker.confirm_healthy() {
+                return guest_error(BoundaryErrorKind::Unavailable, error.to_string());
+            }
             if let Err(error) = crate::provider_files::ProviderFiles::validate(&provider_files) {
                 return guest_error(
                     BoundaryErrorKind::Invalid,
@@ -2701,6 +2796,15 @@ mod linux {
         }
 
         fn signal(&self, process_id: &str, signal: SignalWire) -> Response {
+            let exec = lock(&self.exec_handles)
+                .get(process_id)
+                .map(|handle| handle.process.clone());
+            if let Some(process) = exec {
+                return match self.process_runtime.block_on(process.signal(signal.into())) {
+                    Ok(()) => Response::Signaled,
+                    Err(error) => guest_error(BoundaryErrorKind::Process, error.to_string()),
+                };
+            }
             let process = match self.running_process(process_id) {
                 Ok(process) => process,
                 Err(response) => return response,
@@ -3144,8 +3248,9 @@ mod linux {
                 Ok(MainOutput::Stdout(payload)) => (STREAM_STDOUT, payload.to_vec()),
                 Ok(MainOutput::Stderr(payload)) => (STREAM_STDERR, payload.to_vec()),
                 Ok(MainOutput::Exit(code)) => {
-                    let status = serde_json::to_vec(&attachment.exit_status(code))
-                        .map_err(|error| format!("encode main process exit: {error}"))?;
+                    let status =
+                        openshell_sandbox_backend::protobuf::encode(&attachment.exit_status(code))
+                            .map_err(|error| format!("encode main process exit: {error}"))?;
                     break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
                         .await
                         .map_err(|error| format!("write main process exit: {error}"));
@@ -3160,8 +3265,10 @@ mod linux {
                         let _ =
                             write_stream_frame(&mut *writer.lock().await, STREAM_STDERR, message)
                                 .await;
-                        let status = serde_json::to_vec(&ExitStatusWire::Exited(74))
-                            .map_err(|error| format!("encode exec output failure: {error}"))?;
+                        let status = openshell_sandbox_backend::protobuf::encode(
+                            &ExitStatusWire::Exited(74),
+                        )
+                        .map_err(|error| format!("encode exec output failure: {error}"))?;
                         break write_stream_frame(&mut *writer.lock().await, STREAM_EXIT, &status)
                             .await
                             .map_err(|error| format!("write exec output failure: {error}"));
@@ -3743,6 +3850,8 @@ mod linux {
             GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
             generate_sandbox_tls_material,
         };
+        use openshell_sandbox_backend::proto::{exchange_frame::Payload, mediate_frame};
+        use openshell_sandbox_backend::protobuf::WireMessage as _;
         use rcgen::{KeyPair, PKCS_ED25519};
 
         struct FailedWaitProcess;
@@ -3933,6 +4042,61 @@ mod linux {
             request
         }
 
+        fn test_open_request(config: &BoundaryConfig) -> OpenBoundaryRequest {
+            let descriptor =
+                openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor {
+                    boundary_id: config.boundary_id.clone(),
+                    generation: config.generation.clone(),
+                    session_id: config.session_id,
+                    workload_identity: config.workload_identity.clone(),
+                    transport:
+                        openshell_sandbox_backend::boundary_protocol::SandboxTransport::Unix {
+                            socket_path: Path::new("/test/boundary.sock").to_path_buf(),
+                        },
+                    tls: SandboxTlsClientConfig {
+                        server_name: "test-boundary".to_string(),
+                        trust_anchor_pem: "unused-test-anchor".to_string(),
+                    },
+                    host_gateway_ip: None,
+                    resource_claims: config.resource_claims.clone(),
+                    provisioning_evidence: config.provisioning_evidence.clone(),
+                };
+            OpenBoundaryRequest {
+                session_id: config.session_id.to_string(),
+                backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
+                driver_descriptor: serde_json::to_vec(&descriptor).unwrap(),
+            }
+        }
+
+        async fn test_open_boundary(
+            channel: tonic::transport::Channel,
+            request: OpenBoundaryRequest,
+            token: &str,
+        ) -> String {
+            let mut control = openshell_sandbox_backend::backend_proto::isolation_backend_client::IsolationBackendClient::new(channel);
+            control
+                .describe(DescribeIsolationBackendRequest {
+                    supervisor: Some(openshell_sandbox_backend::isolation_protocol::metadata(
+                        "test/supervisor",
+                    )),
+                })
+                .await
+                .unwrap();
+            let first = control
+                .open_boundary(bearer_request(request.clone(), token))
+                .await
+                .unwrap()
+                .into_inner();
+            let retry = control
+                .open_boundary(bearer_request(request, token))
+                .await
+                .unwrap()
+                .into_inner();
+            assert_eq!(first, retry, "opening a launch is idempotent");
+            assert_eq!(first.outcome, LaunchOutcome::Fresh as i32);
+            first.boundary_id
+        }
+
         fn placeholder_server_tls() -> SandboxTlsServerConfig {
             SandboxTlsServerConfig {
                 certificate_chain_path: Path::new("/tmp/openshell-sandbox.crt").to_path_buf(),
@@ -3996,7 +4160,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
             let debug = format!("{config:?}");
@@ -4110,7 +4274,7 @@ mod linux {
                 )]),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
             assert!(allows_runtime_supplementary_groups(&config));
@@ -4181,7 +4345,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -4460,14 +4624,23 @@ mod linux {
                     .await
                     .unwrap();
             let (sender, receiver) = tokio::sync::mpsc::channel(4);
-            let request = RequestEnvelope::new(Request::OpenMediation).unwrap();
+            let handle =
+                test_open_boundary(channel.clone(), test_open_request(&runtime.config), &token)
+                    .await;
             sender
-                .send(BoundaryChunk {
-                    data: encode_frame(&request).unwrap(),
+                .send(MediateFrame {
+                    payload: Some(mediate_frame::Payload::BoundaryId(handle.clone())),
                 })
                 .await
                 .unwrap();
-            let mut response = IsolationBoundaryClient::new(channel)
+            let request = RequestEnvelope::new(Request::OpenMediation).unwrap();
+            sender
+                .send(MediateFrame {
+                    payload: Some(mediate_frame::Payload::Request(request.to_proto().unwrap())),
+                })
+                .await
+                .unwrap();
+            let mut response = SandboxProtocolClient::new(channel)
                 .mediate(bearer_request(ReceiverStream::new(receiver), &token))
                 .await
                 .unwrap()
@@ -4616,17 +4789,10 @@ mod linux {
             .unwrap()
         }
 
-        fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
-            use openshell_isolation_interface::contract::OuterFenceGuarantee;
-
-            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+        fn test_provisioning_evidence()
+        -> openshell_isolation_interface::contract::ProvisioningEvidence {
+            openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
                 "generation-1",
-                [
-                    OuterFenceGuarantee::DefaultDenyEgress,
-                    OuterFenceGuarantee::NoUnmanagedEgressPath,
-                    OuterFenceGuarantee::RevocationVerified,
-                    OuterFenceGuarantee::ControllerLossFailsClosed,
-                ],
                 b"test-vm-fence",
             )
             .unwrap()
@@ -4775,7 +4941,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -4933,51 +5099,6 @@ mod linux {
         }
 
         #[test]
-        fn vm_start_rejects_conflicting_identity_without_launch() {
-            let (_runtime, boundary) = vm_identity_test_runtime();
-            let identity = &boundary.config.workload_identity;
-            let uid = identity.uid.to_string();
-            let gid = identity.gid.to_string();
-            let wrong_user = if uid == "10000" { "10001" } else { "10000" };
-            let wrong_group = if gid == "10000" { "10001" } else { "10000" };
-            *lock(&boundary.state) = RuntimeState::Ready(PreparedBoundary {
-                network_broker: boundary.network_broker.clone(),
-            });
-            for (user, group, field, requested) in [
-                (Some(wrong_user), None, "run_as_user", wrong_user),
-                (None, Some(wrong_group), "run_as_group", wrong_group),
-            ] {
-                let response = boundary.start_agent(
-                    boundary.config.boundary_id.clone(),
-                    AgentSpecWire {
-                        program: "/bin/true".to_string(),
-                        args: Vec::new(),
-                        workdir: None,
-                        timeout_secs: 5,
-                        interactive: false,
-                    },
-                    vm_identity_test_policy(user, group),
-                    None,
-                    None,
-                    0,
-                    std::collections::HashMap::new(),
-                    std::collections::HashMap::new(),
-                );
-                let Response::Error { kind, message } = response else {
-                    panic!("conflicting identity reached process start: {response:?}");
-                };
-                assert_eq!(kind, BoundaryErrorKind::Denied);
-                assert!(
-                    message.contains(&format!("{field} '{requested}'")),
-                    "{message}"
-                );
-                assert!(message.contains(&format!("{uid}:{gid}")), "{message}");
-                assert!(matches!(*lock(&boundary.state), RuntimeState::Ready(_)));
-                assert!(lock(&boundary.started_agent).is_none());
-            }
-        }
-
-        #[test]
         fn tcp_control_listener_rejects_loopback_addresses() {
             let directory = tempfile::tempdir().expect("temporary directory");
             let (server_tls, _client_tls) = stage_test_tls(directory.path(), "validate");
@@ -4997,7 +5118,7 @@ mod linux {
                 resource_claims: std::collections::BTreeMap::new(),
                 resource_claim_files: std::collections::BTreeMap::new(),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
             for address in [
@@ -5044,7 +5165,7 @@ mod linux {
                     pod_uid_path,
                 )]),
                 workload_identity: test_workload_identity(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
                 child_env: std::collections::HashMap::new(),
             };
 
@@ -5056,6 +5177,264 @@ mod linux {
                 "replacement-pod-uid".to_string(),
             );
             assert!(validate_runtime_resource_claims(&config).is_err());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn delegated_control_and_streams_reject_unbound_or_mismatched_launches() {
+            let (runtime, token) = availability_test_runtime();
+            let opening = test_open_request(&runtime.config);
+            let server_runtime = runtime.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let runtime = server_runtime.clone();
+                    connections.spawn(async move {
+                        serve_grpc(Box::new(stream), runtime, SandboxConnectionId::new())
+                            .await
+                            .unwrap();
+                    });
+                }
+            });
+            let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let mut control = openshell_sandbox_backend::backend_proto::isolation_backend_client::IsolationBackendClient::new(channel.clone());
+            let mut streams = SandboxProtocolClient::new(channel.clone());
+            let before_open = streams
+                .exchange(bearer_request(
+                    tokio_stream::iter([data_chunk(Vec::new())]),
+                    &token,
+                ))
+                .await;
+            assert_eq!(
+                before_open.err().unwrap().code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                control
+                    .open_boundary(bearer_request(opening.clone(), &token))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                control
+                    .describe(DescribeIsolationBackendRequest { supervisor: None })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let mut incompatible =
+                openshell_sandbox_backend::isolation_protocol::metadata("test/supervisor");
+            incompatible.protocol_version.as_mut().unwrap().major += 1;
+            assert_eq!(
+                control
+                    .describe(DescribeIsolationBackendRequest {
+                        supervisor: Some(incompatible)
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            let mut compatible =
+                openshell_sandbox_backend::isolation_protocol::metadata("test/supervisor");
+            compatible.protocol_version.as_mut().unwrap().minor += 1;
+            compatible
+                .supported_capabilities
+                .push("openshell.isolation.future".to_string());
+            let mut unmet_requirement = compatible.clone();
+            unmet_requirement
+                .required_capabilities
+                .push("openshell.isolation.future".to_string());
+            assert_eq!(
+                control
+                    .describe(DescribeIsolationBackendRequest {
+                        supervisor: Some(unmet_requirement),
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            control
+                .describe(DescribeIsolationBackendRequest {
+                    supervisor: Some(compatible),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                control
+                    .open_boundary(opening.clone())
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unauthenticated
+            );
+            for field in ["session", "backend", "descriptor"] {
+                let mut changed = opening.clone();
+                match field {
+                    "session" => changed.session_id = "other-session".to_string(),
+                    "backend" => changed.backend_name = "other-backend".to_string(),
+                    "descriptor" => {
+                        let mut descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor = serde_json::from_slice(&changed.driver_descriptor).unwrap();
+                        descriptor
+                            .resource_claims
+                            .insert("unprovisioned".to_string(), "resource".to_string());
+                        changed.driver_descriptor = serde_json::to_vec(&descriptor).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    control
+                        .open_boundary(bearer_request(changed, &token))
+                        .await
+                        .unwrap_err()
+                        .code(),
+                    tonic::Code::PermissionDenied
+                );
+            }
+            let handle = test_open_boundary(channel.clone(), opening.clone(), &token).await;
+            // JSON formatting does not change the provisioned resource binding.
+            let mut retry = opening.clone();
+            let descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor =
+                serde_json::from_slice(&retry.driver_descriptor).unwrap();
+            retry.driver_descriptor = serde_json::to_vec_pretty(&descriptor).unwrap();
+            assert_eq!(
+                control
+                    .open_boundary(bearer_request(retry, &token))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .boundary_id,
+                handle
+            );
+            // Knowing a previous handle does not open a new physical connection.
+            let replacement = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+            let binding = openshell_sandbox_backend::isolation_protocol::exchange_frame(&handle);
+            let mut replacement_streams = SandboxProtocolClient::new(replacement.clone());
+            assert_eq!(
+                replacement_streams
+                    .exchange(bearer_request(
+                        tokio_stream::iter([binding.clone()]),
+                        &token
+                    ))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                replacement_streams
+                    .mediate(bearer_request(
+                        tokio_stream::iter([MediateFrame {
+                            payload: Some(mediate_frame::Payload::BoundaryId(handle.clone()))
+                        }]),
+                        &token
+                    ))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            assert_eq!(
+                test_open_boundary(replacement, opening, &token).await,
+                handle
+            );
+            assert_eq!(
+                control
+                    .suspend_boundary(bearer_request(SuspendBoundaryRequest::default(), &token))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unimplemented
+            );
+            assert_eq!(
+                control
+                    .resume_boundary(bearer_request(ResumeBoundaryRequest::default(), &token))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::Unimplemented
+            );
+            for frames in [
+                vec![],
+                vec![data_chunk(Vec::new())],
+                vec![ExchangeFrame { payload: None }],
+                vec![openshell_sandbox_backend::isolation_protocol::exchange_frame("")],
+                vec![
+                    openshell_sandbox_backend::isolation_protocol::exchange_frame("other-boundary"),
+                ],
+            ] {
+                let expected = if frames
+                    .first()
+                    .is_some_and(|frame| matches!(frame.payload, Some(Payload::BoundaryId(_))))
+                {
+                    tonic::Code::PermissionDenied
+                } else {
+                    tonic::Code::InvalidArgument
+                };
+                assert_eq!(
+                    streams
+                        .exchange(bearer_request(tokio_stream::iter(frames.clone()), &token))
+                        .await
+                        .err()
+                        .unwrap()
+                        .code(),
+                    expected
+                );
+                assert_eq!(
+                    streams
+                        .mediate(bearer_request(
+                            tokio_stream::iter(frames.into_iter().map(|frame| MediateFrame {
+                                payload: match frame.payload {
+                                    Some(Payload::BoundaryId(id)) =>
+                                        Some(mediate_frame::Payload::BoundaryId(id)),
+                                    _ => None,
+                                }
+                            })),
+                            &token
+                        ))
+                        .await
+                        .err()
+                        .unwrap()
+                        .code(),
+                    expected
+                );
+            }
+            let binding = openshell_sandbox_backend::isolation_protocol::exchange_frame(&handle);
+            let mut response = streams
+                .exchange(bearer_request(
+                    tokio_stream::iter([binding.clone(), binding]),
+                    &token,
+                ))
+                .await
+                .unwrap()
+                .into_inner();
+            let error = tokio::time::timeout(Duration::from_secs(2), response.message())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(matches!(
+                *lock(&runtime.state),
+                RuntimeState::AwaitingAttach
+            ));
+            assert!(lock(&runtime.started_agent).is_none());
+            server.abort();
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -5083,7 +5462,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     tokio::runtime::Handle::current(),
@@ -5097,6 +5476,7 @@ mod linux {
                 .await
                 .expect("bind gRPC test listener");
             let address = listener.local_addr().expect("gRPC test address");
+            let opening = test_open_request(&boundary.config);
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept gRPC client");
                 serve_grpc(Box::new(stream), boundary, SandboxConnectionId::new()).await
@@ -5116,20 +5496,22 @@ mod linux {
             let request = RequestEnvelope::new(Request::Attach {
                 supervisor_instance_id: test_supervisor_instance_id(),
                 policy: Box::new(policy),
-                resource_claims: std::collections::BTreeMap::new(),
             })
             .expect("encode attach request");
-            let request_stream = tokio_stream::iter([BoundaryChunk {
-                data: encode_frame(&request).expect("encode logical request"),
-            }]);
-            let mut body = IsolationBoundaryClient::new(channel)
+            let handle = test_open_boundary(channel.clone(), opening, &token).await;
+            let request_stream = tokio_stream::iter([
+                openshell_sandbox_backend::isolation_protocol::exchange_frame(&handle),
+                openshell_sandbox_backend::isolation_protocol::request_chunk(&request)
+                    .expect("typed logical request"),
+            ]);
+            let mut body = SandboxProtocolClient::new(channel)
                 .exchange(bearer_request(request_stream, &token))
                 .await
                 .expect("exchange logical request")
                 .into_inner();
             let mut frame = Vec::new();
             while let Some(chunk) = body.message().await.expect("read gRPC response") {
-                frame.extend_from_slice(&chunk.data);
+                frame.extend_from_slice(&chunk_data(chunk).unwrap());
             }
             let response: ResponseEnvelope =
                 openshell_sandbox_backend::boundary_protocol::decode_frame(&frame)
@@ -5386,7 +5768,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
@@ -5420,7 +5802,6 @@ mod linux {
                 boundary.start_agent(
                     "sandbox-reconnect".to_string(),
                     spec.clone(),
-                    policy.clone(),
                     None,
                     None,
                     0,
@@ -5512,14 +5893,13 @@ mod linux {
             let mut changed_policy = policy.clone();
             changed_policy.version += 1;
             assert!(matches!(
-                boundary.attach(changed_policy.clone()),
+                boundary.attach(changed_policy),
                 Response::Error { kind, .. } if kind == BoundaryErrorKind::Denied
             ));
             assert!(matches!(
                 boundary.start_agent(
                     "sandbox-reconnect".to_string(),
-                    spec,
-                    changed_policy,
+                    AgentSpecWire { program: "/bin/false".to_string(), ..spec },
                     None,
                     None,
                     0,
@@ -5532,6 +5912,35 @@ mod linux {
             // Failed refresh and recovery can retain the same provider
             // fingerprint. Distinct publications must still replace the map,
             // while a delayed older clear must never undo the repair.
+            let process = boundary.running_process(&process_id).unwrap();
+            let before = process
+                .provider_credentials
+                .child_environment_snapshot()
+                .unwrap();
+            assert!(matches!(
+                boundary.update_provider_environment(
+                    2,
+                    8,
+                    std::collections::HashMap::from([(
+                        "ROTATED_TOKEN".to_string(),
+                        "must-not-install".to_string()
+                    )]),
+                    std::collections::HashMap::from([(
+                        "/outside/provider".to_string(),
+                        "invalid path".to_string()
+                    )]),
+                ),
+                Response::Error {
+                    kind: BoundaryErrorKind::Invalid,
+                    ..
+                }
+            ));
+            let after = process
+                .provider_credentials
+                .child_environment_snapshot()
+                .unwrap();
+            assert_eq!(before.revision, after.revision);
+            assert_eq!(before.environment, after.environment);
             assert_eq!(
                 boundary.update_provider_environment(
                     2,
@@ -5592,7 +6001,7 @@ mod linux {
                 .start_exec(
                     &exec_request.request_id,
                     &exec_request.payload_digest,
-                    exec_request.exec_expires_at_unix_ms,
+                    exec_request.exec_admission_deadline_unix_ms,
                     exec_spec,
                 )
                 .expect("exec after reconnect");
@@ -5624,7 +6033,7 @@ mod linux {
                     "exec status must remain available after its output attachment closes"
                 );
             }
-            let Response::Attached { snapshot } = boundary.attach(policy.clone()) else {
+            let Response::Attached { snapshot } = boundary.attach(policy) else {
                 panic!("reconnect attach did not return a session snapshot");
             };
             assert_eq!(snapshot.generation, "generation-reconnect");
@@ -5721,7 +6130,7 @@ mod linux {
                         resource_claims: std::collections::BTreeMap::new(),
                         resource_claim_files: std::collections::BTreeMap::new(),
                         workload_identity: test_workload_identity(),
-                        outer_fence: test_outer_fence(),
+                        provisioning_evidence: test_provisioning_evidence(),
                         child_env: std::collections::HashMap::new(),
                     },
                     process_runtime.handle().clone(),
@@ -5737,7 +6146,6 @@ mod linux {
                 provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-retained".to_string(),
                 spec: agent_spec.clone(),
-                policy: wire_policy.clone(),
                 ca_cert: None,
                 ca_bundle: None,
                 provider_env_revision: 0,
@@ -5755,7 +6163,6 @@ mod linux {
                 boundary.start_agent(
                     "sandbox-retained".to_string(),
                     agent_spec.clone(),
-                    wire_policy.clone(),
                     None,
                     None,
                     0,
@@ -5848,7 +6255,7 @@ mod linux {
             );
 
             assert!(matches!(
-                boundary.attach(wire_policy.clone()),
+                boundary.attach(wire_policy),
                 Response::Attached { .. }
             ));
             assert!(matches!(boundary.confirm(), Response::Confirmed { .. }));
@@ -5856,7 +6263,6 @@ mod linux {
                 boundary.start_agent(
                     "sandbox-retained".to_string(),
                     agent_spec,
-                    wire_policy,
                     None,
                     None,
                     99,
@@ -5909,7 +6315,7 @@ mod linux {
                     requests
                         .reserve(
                             &format!("completed-request-{index}"),
-                            sleep_request.exec_expires_at_unix_ms.unwrap(),
+                            sleep_request.exec_admission_deadline_unix_ms.unwrap(),
                         )
                         .unwrap();
                 }
@@ -5918,7 +6324,7 @@ mod linux {
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
-                    sleep_request.exec_expires_at_unix_ms,
+                    sleep_request.exec_admission_deadline_unix_ms,
                     sleep_spec.clone(),
                 )
                 .expect("start exec whose response is disconnected");
@@ -5928,7 +6334,7 @@ mod linux {
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
-                    sleep_request.exec_expires_at_unix_ms,
+                    sleep_request.exec_admission_deadline_unix_ms,
                     sleep_spec.clone(),
                 )
                 .expect("reattach exec after response loss");
@@ -5936,7 +6342,7 @@ mod linux {
             assert_eq!(lock(&boundary.exec_handles).len(), 1);
             drop(replayed);
             assert_eq!(
-                boundary.signal_exec(&retained_id, SignalWire::Kill),
+                boundary.signal(&retained_id, SignalWire::Kill),
                 Response::Signaled
             );
             for _ in 0..2 {
@@ -5954,7 +6360,7 @@ mod linux {
                     .start_exec(
                         &sleep_request.request_id,
                         &sleep_request.payload_digest,
-                        sleep_request.exec_expires_at_unix_ms,
+                        sleep_request.exec_admission_deadline_unix_ms,
                         sleep_spec,
                     )
                     .is_err(),
@@ -5988,7 +6394,7 @@ mod linux {
                     .start_exec(
                         &request.request_id,
                         &request.payload_digest,
-                        request.exec_expires_at_unix_ms,
+                        request.exec_admission_deadline_unix_ms,
                         spec,
                     )
                     .expect("start exec after canonical exit");

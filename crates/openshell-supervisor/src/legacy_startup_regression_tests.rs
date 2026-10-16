@@ -297,6 +297,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
             ocsf_schema_version: Arc::new(Mutex::new(String::new())),
             upstream_proxy_args:
                 openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            additional_ca_bundle: None,
             backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
                 backend_name: "test-held".into(),
                 payload: Vec::new(),

@@ -60,6 +60,7 @@ OpenShell maps sandbox events to these OCSF classes:
 | `SSH:` | SSH Activity | 4007 | SSH handshakes, authentication, channel operations |
 | `PROC:` | Process Activity | 1007 | Process start, exit, timeout, signal failures |
 | `FINDING:` | Detection Finding | 2004 | Security findings (nonce replay, proxy bypass, unsafe policy) |
+| `AUTH:` | Authentication | 3002 | Gateway authentication failures |
 | `CONFIG:` | Device Config State Change | 5019 | Policy load/reload, Landlock, TLS setup, provider and settings changes |
 | `LIFECYCLE:` | Application Lifecycle | 6002 | Sandbox supervisor start, SSH server ready |
 
@@ -97,6 +98,7 @@ endpoint, use `EVENT` rather than a network or lifecycle event.
 - Network: `process(pid) -> host:port` with the process identity and destination
 - HTTP: `METHOD url` with the HTTP method and target
 - SSH: peer address and authentication type
+- Authentication: the principal as `type:id`, or `unknown` when none was established, and the peer address when known
 - Process: `name(pid)` with exit code or command line
 - Config: description of what changed
 - Finding: quoted title with the stable finding type, optional confidence, and source-specific context attributes when available
@@ -104,6 +106,12 @@ endpoint, use `EVENT` rather than a network or lifecycle event.
 **Context** in brackets provides structured fields such as policy provenance, source-specific attributes, and denial reasons.
 
 ### Examples
+
+A gateway request rejected because it presented no credential:
+
+```text
+OCSF AUTH:LOGON [LOW] DENIED unknown [op:/openshell.v1.OpenShell/ListSandboxes reason:missing_credential]
+```
 
 An allowed HTTPS connection:
 

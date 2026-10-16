@@ -21,6 +21,7 @@ pub use openshell_extension_core::{
     MAX_EXTENSION_TOKEN_TTL,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use std::{
     io::Cursor,
     sync::Arc,
@@ -196,6 +197,20 @@ impl SandboxSessionJwtAuthority {
         gateway_token_id: uuid::Uuid,
         token_metadata: Option<(uuid::Uuid, i64)>,
     ) -> Result<SandboxLaunchAuthentication, Status> {
+        // Derive the session from durable launch identity, not token IDs or
+        // minting time. Retries and credential renewal retain this session;
+        // a fresh generation gets a different one without new stored metadata.
+        let mut digest = Sha256::new();
+        digest.update(b"openshell-launch-session-v1\0");
+        digest.update(sandbox_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(runtime_generation.as_str().as_bytes());
+        let mut session_bytes = [0_u8; 16];
+        session_bytes.copy_from_slice(&digest.finalize()[..16]);
+        let session_id = uuid::Uuid::from_bytes(session_bytes)
+            .to_string()
+            .parse::<SandboxSessionId>()
+            .map_err(|_| Status::internal("invalid derived sandbox session identity"))?;
         let identity = SandboxRuntimeIdentity {
             sandbox_id: SandboxId::parse(sandbox_id)
                 .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
@@ -223,7 +238,7 @@ impl SandboxSessionJwtAuthority {
             })?;
         Ok(SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
-                session_id: SandboxSessionId::new(),
+                session_id,
                 runtime_generation,
                 session_rotation: openshell_core::jwt::SessionRotation::new(1)
                     .map_err(|error| Status::internal(error.to_string()))?,
@@ -497,6 +512,54 @@ mod tests {
 
     fn extension_audience(value: &str) -> ExtensionAudience {
         ExtensionAudience::new(value).expect("valid extension audience")
+    }
+
+    #[test]
+    fn launch_session_survives_identity_reload_and_token_renewal() {
+        let material = generate_jwt_key().unwrap();
+        let authority = SandboxSessionJwtAuthority::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid,
+            "test-gateway",
+            Some(Duration::from_mins(15)),
+        )
+        .unwrap();
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let first = authority
+            .mint_persisted_launch("sandbox-a", &identity)
+            .unwrap();
+        let mut annotations = std::collections::HashMap::new();
+        identity.write(&mut annotations);
+        let mut reloaded =
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(&annotations).unwrap();
+        reloaded.gateway_token_id = uuid::Uuid::new_v4();
+        let renewed = authority
+            .mint_persisted_launch("sandbox-a", &reloaded)
+            .unwrap();
+        assert_eq!(first.supervisor.session_id, renewed.supervisor.session_id);
+        assert_eq!(
+            first.supervisor.runtime_generation,
+            renewed.supervisor.runtime_generation
+        );
+        assert_ne!(
+            first.supervisor.gateway_token.expose_secret(),
+            renewed.supervisor.gateway_token.expose_secret()
+        );
+
+        let other_sandbox = authority
+            .mint_persisted_launch("sandbox-b", &identity)
+            .unwrap();
+        assert_ne!(
+            first.supervisor.session_id,
+            other_sandbox.supervisor.session_id
+        );
+        let next = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let next_launch = authority.mint_persisted_launch("sandbox-a", &next).unwrap();
+        assert_ne!(
+            first.supervisor.session_id,
+            next_launch.supervisor.session_id
+        );
     }
 
     #[test]

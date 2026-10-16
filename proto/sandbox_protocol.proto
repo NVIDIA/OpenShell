@@ -1,0 +1,413 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.sandbox.protocol.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+import "options.proto";
+
+// EXPERIMENTAL: This protocol is under active development. Its API and wire
+// format may change incompatibly before stabilization.
+//
+// Authenticated Sandbox Protocol for per-boundary and shared backends. Each
+// client stream starts with the OpenBoundary handle, checked against the
+// authenticated sandbox and generation. Subsequent frames are typed protocol
+// messages, with no nested JSON envelopes or application framing.
+// Exchange handles one request/response and its associated process or relay I/O.
+// Mediate handles OpenMediation followed by correlated DNS queries/responses.
+// DiscoverPolicy is allowed before Attach on its own authenticated stream.
+// Admission is Attach -> Confirm -> StartAgent; no untrusted instruction may
+// execute before StartAgent. Exec and forwarding require Running.
+service SandboxProtocol {
+  rpc Exchange(stream ExchangeFrame) returns (stream ExchangeFrame);
+  rpc Mediate(stream MediateFrame) returns (stream MediateFrame);
+}
+
+// The first client frame contains boundary_id, never repeated on that stream.
+// Control messages are bounded to 1 MiB; each I/O payload is at most 64 KiB.
+// Process stdin closes explicitly; ending a gRPC request stream does not end
+// the independent response stream. Exit follows all retained process output.
+message ExchangeFrame {
+  oneof payload {
+    string boundary_id = 1;
+    RequestEnvelope request = 3;
+    ResponseEnvelope response = 4;
+    bytes stdin = 5;
+    bytes stdout = 6;
+    bytes stderr = 7;
+    ExitStatus exit = 8;
+    StdinClosed stdin_closed = 9;
+    TcpOpenDecision tcp_open_decision = 10;
+    bytes relay_data = 11;
+  }
+}
+// DNS mediation has its own stream, with no process I/O or TCP relay frames.
+// The first frame binds the boundary; OpenMediation request/response follows,
+// then correlated DNS messages. Other control operations are rejected.
+message MediateFrame {
+  oneof payload {
+    string boundary_id = 1;
+    RequestEnvelope request = 3;
+    ResponseEnvelope response = 4;
+    DnsQuery dns_query = 12;
+    DnsResponse dns_response = 13;
+  }
+}
+message StdinClosed {}
+
+// A random UUID scoped to the boundary generation. Retried mutations reuse the
+// same ID and typed request, including the exec deadline. Replays return the
+// original result; conflicting reuse is rejected. Compare decoded known fields
+// (map order is immaterial), not serialized protobuf bytes. Unknown fields do
+// not authorize behavior: send behavior-affecting additions only after
+// negotiating the receiver's supporting capability. No client digest required.
+// Replayable mutations: Attach, Confirm, StartAgent, UpdateProviderEnvironment,
+// Exec, Signal, Terminate, TerminateBoundary, and Resize. Exec outcomes remain
+// retained through the deadline even after process exit.
+message RequestEnvelope {
+  string request_id = 1;
+  oneof request {
+    DiscoverPolicy discover_policy = 10;
+    Attach attach = 11;
+    Confirm confirm = 12;
+    StartAgent start_agent = 14;
+    UpdateProviderEnvironment update_provider_environment = 15;
+    AttachProcess attach_process = 16;
+    Wait wait = 17;
+    Signal signal = 18;
+    Terminate terminate = 19;
+    TerminateBoundary terminate_boundary = 20;
+    Exec exec = 21;
+    Resize resize = 23;
+    LoopbackConnect loopback_connect = 24;
+    OpenMediation open_mediation = 25;
+    AcceptNetwork accept_network = 26;
+  }
+}
+message ResponseEnvelope {
+  string request_id = 1;
+  oneof response {
+    ImagePolicy image_policy = 10;
+    Attached attached = 11;
+    Confirmed confirmed = 12;
+    Started started = 14;
+    ProviderEnvironmentUpdated provider_environment_updated = 15;
+    ProcessAttached process_attached = 16;
+    Exited exited = 17;
+    Signaled signaled = 18;
+    Terminated terminated = 19;
+    BoundaryTerminated boundary_terminated = 20;
+    ExecStarted exec_started = 21;
+    Resized resized = 22;
+    LoopbackConnected loopback_connected = 23;
+    MediationReady mediation_ready = 24;
+    NetworkConnected network_connected = 25;
+    Error error = 26;
+  }
+}
+// Read-only image-policy discovery, permitted before attachment.
+message DiscoverPolicy {}
+message Attach {
+  string supervisor_instance_id = 1;
+  SandboxPolicy policy = 2;
+}
+// Success asserts that the backend can enforce the attached policy and trusted
+// workload identity. Unsupported requirements fail before StartAgent, which
+// installs all launch-time controls as required by the admission sequence.
+// Supervisor or transport loss must never relax enforcement or open an
+// unmediated egress path; supervisor-dependent operations fail closed.
+// A backend may terminate, pause, or keep a disconnected workload contained.
+message Confirm {}
+// Start with the policy retained by Attach. Unsupported provider files must be
+// rejected before workload execution.
+message StartAgent {
+  string sandbox_id = 1;
+  AgentSpec spec = 2;
+  optional string ca_cert = 4;
+  optional string ca_bundle = 5;
+  uint64 provider_env_revision = 6;
+  map<string, string> provider_env = 7 [(openshell.options.v1.secret) = true];
+  map<string, string> provider_files = 8 [(openshell.options.v1.secret) = true];
+}
+// Validate support and the complete snapshot before applying an update.
+message UpdateProviderEnvironment {
+  uint64 generation = 1;
+  uint64 revision = 2;
+  map<string, string> provider_env = 3 [(openshell.options.v1.secret) = true];
+  map<string, string> provider_files = 4 [(openshell.options.v1.secret) = true];
+}
+message AttachProcess {
+  string process_id = 1;
+}
+message Wait {
+  string process_id = 1;
+}
+// Signal either a main or exec process using its generation-scoped ID.
+message Signal {
+  string process_id = 1;
+  BoundarySignal signal = 2;
+}
+message Terminate {
+  string process_id = 1;
+}
+message TerminateBoundary {}
+message Exec {
+  ExecSpec spec = 1;
+  // Required absolute admission/retry deadline, not a process runtime limit.
+  // Remains unchanged on retries and participates in replay comparison.
+  google.protobuf.Timestamp exec_admission_deadline = 2;
+}
+message Resize {
+  string process_id = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+message LoopbackConnect {
+  // Numeric IPv4/IPv6 address inside the boundary. Loopback only.
+  string host = 1;
+  uint32 port = 2;
+}
+message OpenMediation {}
+message AcceptNetwork {}
+
+// No image policy is yaml absent with invalid=false. invalid=true reports an
+// unreadable or invalid image policy; it must not be treated as missing.
+message ImagePolicy {
+  optional string yaml = 1;
+  bool invalid = 2;
+}
+message Attached {
+  SessionSnapshot snapshot = 1;
+}
+message Confirmed {
+  BoundaryConfirmation confirmation = 1;
+}
+message Started {
+  string process_id = 1;
+  uint64 provider_env_revision = 2;
+  uint64 provider_env_generation = 3;
+}
+message ProviderEnvironmentUpdated {
+  uint64 revision = 1;
+  uint64 generation = 2;
+  bool applied = 3;
+}
+message ProcessAttached {
+  bool terminal = 1;
+}
+message Exited {
+  ExitStatus status = 1;
+}
+message Signaled {}
+message Terminated {}
+message BoundaryTerminated {}
+message ExecStarted {
+  string process_id = 1;
+  bool pty = 2;
+}
+message Resized {}
+message LoopbackConnected {}
+message MediationReady {}
+message NetworkConnected {
+  BinaryIdentity identity = 1;
+  // Numeric destination captured before mediation; never a workload-provided
+  // claim of executable identity. No upstream bytes flow before RelayReady.
+  string destination = 2;
+  NetworkSocketMetadata socket = 3;
+  uint64 policy_generation = 4;
+  // Omitted timing means unmeasured (zero).
+  MediationTiming timing = 5;
+}
+message Error {
+  BoundaryErrorKind kind = 1;
+  string message = 2;
+}
+
+enum BoundaryErrorKind {
+  BOUNDARY_ERROR_KIND_UNSPECIFIED = 0;
+  BOUNDARY_ERROR_KIND_INVALID = 1;
+  BOUNDARY_ERROR_KIND_DENIED = 2;
+  BOUNDARY_ERROR_KIND_UNAVAILABLE = 3;
+  BOUNDARY_ERROR_KIND_TERMINATED = 4;
+  BOUNDARY_ERROR_KIND_PROCESS = 5;
+  BOUNDARY_ERROR_KIND_UNSUPPORTED = 6;
+}
+enum BoundarySignal {
+  BOUNDARY_SIGNAL_UNSPECIFIED = 0;
+  BOUNDARY_SIGNAL_TERM = 1;
+  BOUNDARY_SIGNAL_KILL = 2;
+  BOUNDARY_SIGNAL_INT = 3;
+  BOUNDARY_SIGNAL_HUP = 4;
+}
+message ExitStatus {
+  oneof status {
+    int32 exited = 1;
+    int32 signaled = 2;
+  }
+}
+message AgentSpec {
+  string program = 1;
+  repeated string args = 2;
+  optional string workdir = 3;
+  // Omitted or zero means no timeout; otherwise whole nonnegative seconds.
+  google.protobuf.Duration timeout = 4;
+  bool interactive = 5;
+}
+message ExecSpec {
+  string program = 1;
+  repeated string args = 2;
+  ShellSpec shell = 3;
+  optional RuntimeHelper runtime_helper = 4;
+  // Ordered entries preserve duplicate-variable semantics of the existing API.
+  repeated EnvironmentEntry env = 5 [(openshell.options.v1.secret) = true];
+  optional string workdir = 6;
+  bool pty = 7;
+}
+message EnvironmentEntry {
+  string name = 1;
+  string value = 2;
+}
+message ShellSpec {
+  optional string command = 1;
+  bool login = 2;
+}
+enum RuntimeHelper {
+  RUNTIME_HELPER_UNSPECIFIED = 0;
+  RUNTIME_HELPER_SFTP = 1;
+}
+
+// Boundary launch controls, distinct from the authored gateway SandboxPolicy.
+message SandboxPolicy {
+  uint32 version = 1;
+  repeated string read_only = 2;
+  repeated string read_write = 3;
+  bool include_workdir = 4;
+  NetworkMode network = 5;
+  optional string proxy_addr = 6;
+  LandlockCompatibility landlock = 7;
+  optional string run_as_user = 8;
+  optional string run_as_group = 9;
+}
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  NETWORK_MODE_BLOCK = 1;
+  NETWORK_MODE_PROXY = 2;
+  NETWORK_MODE_ALLOW = 3;
+}
+enum LandlockCompatibility {
+  LANDLOCK_COMPATIBILITY_UNSPECIFIED = 0;
+  LANDLOCK_COMPATIBILITY_BEST_EFFORT = 1;
+  LANDLOCK_COMPATIBILITY_HARD_REQUIREMENT = 2;
+}
+message ResolvedWorkloadIdentity {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  repeated uint32 supplementary_gids = 3;
+  string source = 4;
+  string resource_digest = 5;
+}
+// Successful confirmation binds policy enforcement to the admitted launch.
+// Enforcement mechanisms are backend-specific, not a portable flag checklist.
+message BoundaryConfirmation {
+  string generation = 1;
+  ResolvedWorkloadIdentity identity = 2;
+  string session_id = 5;
+  // Derived from backend-owned provisioned state, not supervisor-supplied claims.
+  map<string, string> resource_claims = 8;
+  // Optional backend-owned audit document encoded as a UTF-8 JSON value. Empty
+  // bytes mean absent. Native clients may validate its schema; external backends
+  // need not provide Linux mechanism evidence.
+  bytes backend_audit = 9;
+  // Required SHA-256 commitment to the driver's validated provisioning evidence
+  // and this generation. Must match trusted launch metadata. A matching digest
+  // binds provisioning; it is not independent proof of policy enforcement.
+  string provisioning_evidence_digest = 10;
+}
+message SessionSnapshot {
+  string generation = 1;
+  repeated ProcessSnapshot processes = 2;
+}
+message ProcessSnapshot {
+  string process_id = 1;
+  ProcessKind kind = 2;
+  bool terminal = 3;
+  ExitStatus status = 4;
+  OutputWindow retained_output = 5;
+}
+enum ProcessKind {
+  PROCESS_KIND_UNSPECIFIED = 0;
+  PROCESS_KIND_MAIN = 1;
+  PROCESS_KIND_EXEC = 2;
+}
+message OutputWindow {
+  uint64 first_sequence = 1;
+  uint64 next_sequence = 2;
+  bool truncated = 3;
+}
+message ExecutableIdentity {
+  string path = 1;
+  optional string digest = 2;
+}
+message ResolvedBinaryIdentity {
+  ExecutableIdentity executable = 1;
+  repeated ExecutableIdentity ancestors = 2;
+  repeated string cmdline_paths = 3;
+}
+message BinaryIdentity {
+  oneof result {
+    ResolvedBinaryIdentity resolved = 1;
+    string failed = 2;
+  }
+}
+// Optional native socket evidence. Guests without kernel sockets omit it and
+// supply their authoritative executable identity; never fabricate host PIDs.
+message NetworkSocketMetadata {
+  uint64 socket_cookie = 1;
+  bool nonblocking = 2;
+  uint64 process_generation = 3;
+}
+message MediationTiming {
+  // Diagnostic backend-monotonic measurements; zero if unmeasured.
+  google.protobuf.Duration notification_to_queue = 1;
+  google.protobuf.Duration queue_wait = 2;
+}
+message TcpOpenDecision {
+  oneof decision {
+    TcpOpenDenial denied = 1;
+    RelayReady relay_ready = 2;
+  }
+}
+message RelayReady {}
+enum TcpOpenDenial {
+  TCP_OPEN_DENIAL_UNSPECIFIED = 0;
+  TCP_OPEN_DENIAL_POLICY_DENIED = 1;
+  TCP_OPEN_DENIAL_IDENTITY_UNAVAILABLE = 2;
+  TCP_OPEN_DENIAL_INVALID_DESTINATION = 3;
+  TCP_OPEN_DENIAL_RESOURCE_EXHAUSTED = 4;
+  TCP_OPEN_DENIAL_MEDIATION_UNAVAILABLE = 5;
+}
+message DnsQuery {
+  uint64 stream_id = 1;
+  // One DNS wire message, without DNS-over-TCP framing.
+  bytes request = 2;
+  DnsTransport transport = 3;
+  BinaryIdentity identity = 4;
+  // Omitted timing means unmeasured (zero).
+  MediationTiming timing = 5;
+}
+enum DnsTransport {
+  DNS_TRANSPORT_UNSPECIFIED = 0;
+  DNS_TRANSPORT_UDP = 1;
+  DNS_TRANSPORT_TCP = 2;
+}
+// Reply on the same authenticated mediation stream with the query stream_id.
+message DnsResponse {
+  uint64 stream_id = 1;
+  oneof result {
+    bytes response = 2;
+    string error = 3;
+  }
+}

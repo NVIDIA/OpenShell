@@ -533,11 +533,31 @@ mod tests {
         let mut methods = Vec::new();
         let mut public_roots = BTreeSet::new();
         let mut compiled_method_count = 0;
+        let mut isolation_methods = BTreeSet::new();
+        let mut sandbox_protocol_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
                 let service_name = service.name.as_deref().expect("service name");
                 compiled_method_count += service.method.len();
+                if package == "openshell.sandbox.backend.v1" {
+                    assert_eq!(service_name, "IsolationBackend");
+                    isolation_methods.extend(
+                        service
+                            .method
+                            .iter()
+                            .map(|method| method.name.as_deref().expect("isolation method name")),
+                    );
+                }
+                if package == "openshell.sandbox.protocol.v1" {
+                    assert_eq!(service_name, "SandboxProtocol");
+                    sandbox_protocol_methods.extend(service.method.iter().map(|method| {
+                        method
+                            .name
+                            .as_deref()
+                            .expect("sandbox protocol method name")
+                    }));
+                }
                 if !matches!(
                     (package, service_name),
                     ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
@@ -561,6 +581,19 @@ mod tests {
             }
         }
         methods.sort();
+        assert_eq!(
+            isolation_methods,
+            BTreeSet::from([
+                "Describe",
+                "OpenBoundary",
+                "ResumeBoundary",
+                "SuspendBoundary"
+            ])
+        );
+        assert_eq!(
+            sandbox_protocol_methods,
+            BTreeSet::from(["Exchange", "Mediate"])
+        );
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -583,7 +616,9 @@ mod tests {
             compiled_method_count,
             103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
-                + PEER_CONFIG_RPC_SIGNATURES.len(),
+                + PEER_CONFIG_RPC_SIGNATURES.len()
+                + isolation_methods.len()
+                + sandbox_protocol_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(

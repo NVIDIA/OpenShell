@@ -10,17 +10,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::proto::{BoundaryChunk, isolation_boundary_client::IsolationBoundaryClient};
+use crate::backend_proto::{
+    DescribeIsolationBackendRequest, OpenBoundaryRequest,
+    isolation_backend_client::IsolationBackendClient, open_boundary_response::LaunchOutcome,
+};
+#[cfg(test)]
+use crate::isolation_protocol::{chunk_data, data_chunk};
+use crate::proto::{ExchangeFrame, MediateFrame, sandbox_protocol_client::SandboxProtocolClient};
+use crate::stream_adapter::ProtocolFrame;
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundBoundary, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
-    BoundaryInput, BoundaryLoopbackConnector, BoundaryOutput, BoundaryProcess, BoundarySignal,
-    BoundaryTerminal, ConfirmedBoundary, ExecSession, ExecSpec, IsolationBackend, LoopbackTarget,
-    MediationTiming, NetworkMediationSource, PendingDnsQuery, PendingTcpOpen, ProcessAttachment,
-    ProviderEnvironmentInstallation, ReadyBoundary, RunningBoundary, SandboxContext,
-    TcpOpenDecision, TcpOpenDenial, VerifiedBackendDescriptor,
+    BackendDescriptor, BackendError, BoundaryConfirmation, BoundaryDuplexStream,
+    BoundaryExitStatus, BoundaryInput, BoundaryOutput, BoundarySignal, ExecSpec, LoopbackTarget,
+    MediationTiming, PendingDnsQuery, PendingTcpOpen, ProviderEnvironmentInstallation,
+    ResolvedWorkloadIdentity, SandboxContext, TcpOpenDecision, TcpOpenDenial,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,24 +69,40 @@ fn begin_recovery_window(
     *deadline.get_or_insert(failure_time + CONNECT_RETRY_TIMEOUT)
 }
 
-/// Backend-owned raw transport establishment; shared code still authenticates
+/// Internal raw transport establishment; shared code still authenticates
 /// the resulting stream with generation-pinned TLS and Sandbox Protocol JWTs.
 #[async_trait]
-pub trait BoundaryTransportConnector: std::fmt::Debug + Send + Sync {
+trait BoundaryTransportConnector: std::fmt::Debug + Send + Sync {
     async fn connect(
         &self,
         descriptor: &SandboxRuntimeDescriptor,
     ) -> Result<BoundaryDuplexStream, BackendError>;
 }
 
-/// Host-side `OpenShell` Sandbox Protocol implementation registered with the supervisor.
+/// Concrete RPC client used for both in-tree and endpoint-registered backends.
 #[derive(Debug)]
 pub struct OpenShellRuntimeBackend {
     connector: Option<Arc<dyn BoundaryTransportConnector>>,
-    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    delegated: Option<DelegatedRuntime>,
+}
+
+#[derive(Clone)]
+struct DelegatedRuntime {
+    backend_name: String,
+    descriptor: SandboxRuntimeDescriptor,
+    driver_descriptor: Vec<u8>,
+}
+
+impl std::fmt::Debug for DelegatedRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DelegatedRuntime")
+            .field("backend_name", &self.backend_name)
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpenShellRuntimeBackend {
@@ -90,22 +111,9 @@ impl OpenShellRuntimeBackend {
         descriptor: SandboxRuntimeDescriptor,
         bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Result<(Option<String>, bool), BackendError> {
-        Self::discover_policy_with_connector(descriptor, bearer, None).await
-    }
-
-    pub async fn discover_policy_with_connector(
-        descriptor: SandboxRuntimeDescriptor,
-        bearer: openshell_core::jwt::SessionBearerTokenSlot,
-        connector: Option<Arc<dyn BoundaryTransportConnector>>,
-    ) -> Result<(Option<String>, bool), BackendError> {
-        let mut client = BoundaryClient::new(descriptor, bearer);
-        client.connector = connector;
-        match client.call_idempotent(Request::DiscoverPolicy).await? {
-            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
-            _ => Err(BackendError::Descriptor(
-                "expected image policy discovery response".to_string(),
-            )),
-        }
+        BoundaryClient::new(descriptor, bearer)
+            .discover_policy()
+            .await
     }
 
     pub fn new(
@@ -115,62 +123,93 @@ impl OpenShellRuntimeBackend {
     ) -> Self {
         Self {
             connector: None,
-            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
             ca_file_paths,
             provider_credentials,
             sandbox_bearer,
+            delegated: None,
         }
     }
 
-    #[must_use]
-    pub fn with_transport_connector(
-        mut self,
-        connector: Arc<dyn BoundaryTransportConnector>,
-    ) -> Self {
-        self.connector = Some(connector);
-        self
+    /// Construct the same RPC client for an operator-registered backend.
+    pub fn registered(
+        backend_name: String,
+        descriptor: SandboxRuntimeDescriptor,
+        driver_descriptor: Vec<u8>,
+        ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
+        provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
+        sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    ) -> Result<Self, BackendError> {
+        crate::delegated::validate_backend_name(&backend_name)?;
+        validate_runtime_coordinates(&descriptor)?;
+        let mut backend = Self::new(ca_file_paths, provider_credentials, sandbox_bearer);
+        backend.delegated = Some(DelegatedRuntime {
+            backend_name,
+            descriptor,
+            driver_descriptor,
+        });
+        Ok(backend)
     }
 
-    /// Select the backend implementation that validates opaque audit evidence.
-    #[must_use]
-    pub fn with_audit_validator(
-        mut self,
-        validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
-    ) -> Self {
-        self.audit_validator = validator;
-        self
-    }
-}
-
-#[async_trait]
-impl IsolationBackend for OpenShellRuntimeBackend {
-    fn backend_name(&self) -> &str {
-        crate::BACKEND_NAME
+    /// Discover policy using the registered endpoint and opaque driver payload.
+    pub async fn discover_registered_policy(
+        backend_name: String,
+        descriptor: SandboxRuntimeDescriptor,
+        driver_descriptor: Vec<u8>,
+        bearer: openshell_core::jwt::SessionBearerTokenSlot,
+    ) -> Result<(Option<String>, bool), BackendError> {
+        crate::delegated::validate_backend_name(&backend_name)?;
+        validate_runtime_coordinates(&descriptor)?;
+        let client =
+            BoundaryClient::with_backend(descriptor, bearer, backend_name, driver_descriptor);
+        client.discover_policy().await
     }
 
-    async fn attach(
+    pub fn backend_name(&self) -> &str {
+        self.delegated
+            .as_ref()
+            .map_or(crate::BACKEND_NAME, |backend| backend.backend_name.as_str())
+    }
+
+    pub async fn attach(
         &self,
-        descriptor: VerifiedBackendDescriptor,
+        descriptor: BackendDescriptor,
         sandbox: SandboxContext,
-    ) -> Result<Box<dyn BoundBoundary>, BackendError> {
-        let runtime_descriptor: SandboxRuntimeDescriptor =
-            serde_json::from_slice(descriptor.payload()).map_err(|error| {
-                BackendError::Descriptor(format!("decode runtime descriptor: {error}"))
-            })?;
+    ) -> Result<Box<BoundBoundary>, BackendError> {
+        if descriptor.backend_name != self.backend_name() {
+            return Err(BackendError::Descriptor(
+                "backend descriptor name does not match selected backend".to_string(),
+            ));
+        }
+        let runtime_descriptor = if let Some(delegated) = &self.delegated {
+            if descriptor.payload != delegated.driver_descriptor {
+                return Err(BackendError::Descriptor(
+                    "backend payload changed after trusted selection".to_string(),
+                ));
+            }
+            delegated.descriptor.clone()
+        } else {
+            serde_json::from_slice::<SandboxRuntimeDescriptor>(&descriptor.payload).map_err(
+                |error| BackendError::Descriptor(format!("decode runtime descriptor: {error}")),
+            )?
+        };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox)?;
         let host_gateway_ip = runtime_descriptor.host_gateway_ip;
         let resource_claims = runtime_descriptor.resource_claims.clone();
         let generation = runtime_descriptor.generation.clone();
         let session_id = runtime_descriptor.session_id;
-        let outer_fence = runtime_descriptor.outer_fence.clone();
-        let mut client = BoundaryClient::new(runtime_descriptor, self.sandbox_bearer.clone());
+        let provisioning_evidence = runtime_descriptor.provisioning_evidence.clone();
+        let mut client = BoundaryClient::with_backend(
+            runtime_descriptor,
+            self.sandbox_bearer.clone(),
+            self.backend_name().to_string(),
+            descriptor.payload.clone(),
+        );
         client.connector = self.connector.clone();
         let client = Arc::new(client);
         let response = client
             .call_idempotent(Request::Attach {
                 supervisor_instance_id: client.supervisor_instance_id,
                 policy: Box::new(SandboxPolicyWire::from(sandbox.policy.clone())),
-                resource_claims: resource_claims.clone(),
             })
             .await?;
         let Response::Attached { snapshot } = response else {
@@ -181,13 +220,11 @@ impl IsolationBackend for OpenShellRuntimeBackend {
                 "sandbox session snapshot generation does not match runtime descriptor".to_string(),
             ));
         }
-        Ok(Box::new(RemoteBound {
-            audit_validator: self.audit_validator.clone(),
+        Ok(Box::new(BoundBoundary {
             client: client.clone(),
             agent: sandbox.agent,
-            policy: sandbox.policy,
             sandbox_id: sandbox.sandbox_id,
-            mediation: Arc::new(RemoteNetworkMediation { client }),
+            mediation: Arc::new(NetworkMediationSource { client }),
             host_gateway_ip,
             ca_file_paths: self.ca_file_paths.clone(),
             provider_credentials: self.provider_credentials.clone(),
@@ -195,7 +232,7 @@ impl IsolationBackend for OpenShellRuntimeBackend {
             generation,
             session_id,
             resource_claims,
-            outer_fence,
+            provisioning_evidence,
         }))
     }
 }
@@ -210,11 +247,6 @@ fn validate_runtime_descriptor(
             runtime_descriptor.boundary_id, sandbox.sandbox_id
         )));
     }
-    if runtime_descriptor.generation.is_empty() {
-        return Err(BackendError::Descriptor(
-            "boundary generation must not be empty".to_string(),
-        ));
-    }
     if runtime_descriptor.session_id != sandbox.session_id {
         return Err(BackendError::Descriptor(
             "runtime descriptor session ID does not match admitted sandbox session".to_string(),
@@ -226,49 +258,40 @@ fn validate_runtime_descriptor(
                 .to_string(),
         ));
     }
-    validate_resource_claims(&runtime_descriptor.resource_claims)?;
-    runtime_descriptor
-        .outer_fence
-        .validate(&runtime_descriptor.generation)?;
-    match &runtime_descriptor.transport {
-        SandboxTransport::Unix { socket_path } => {
-            validate_socket_path(socket_path)?;
-        }
-        SandboxTransport::Tcp {
-            authority,
-            addresses,
-        } => {
-            if authority.is_empty() || addresses.is_empty() {
-                return Err(BackendError::Descriptor(
-                    "boundary TCP transport requires an authority and at least one address"
-                        .to_string(),
-                ));
-            }
-            for address in addresses {
-                validate_tcp_address(*address)?;
-            }
-        }
-        SandboxTransport::Vsock { guest_cid, port } => {
-            if *guest_cid < 3 {
-                return Err(BackendError::Descriptor(
-                    "boundary CID must be at least 3".to_string(),
-                ));
-            }
-            validate_control_port(*port)?;
-        }
-    }
-    validate_client_tls(&runtime_descriptor.tls)?;
-    Ok(())
+    validate_runtime_coordinates(runtime_descriptor)
 }
 
-fn validate_tcp_address(address: std::net::SocketAddr) -> Result<(), BackendError> {
-    if address.port() == 0 || address.ip().is_unspecified() {
-        Err(BackendError::Descriptor(
-            "boundary TCP address must have a concrete IP and nonzero port".to_string(),
-        ))
-    } else {
-        Ok(())
+pub fn validate_runtime_coordinates(
+    runtime_descriptor: &SandboxRuntimeDescriptor,
+) -> Result<(), BackendError> {
+    if runtime_descriptor.boundary_id.is_empty() || runtime_descriptor.generation.is_empty() {
+        return Err(BackendError::Descriptor(
+            "sandbox identity and generation are required".to_string(),
+        ));
     }
+    let identity = &runtime_descriptor.workload_identity;
+    let normalized = ResolvedWorkloadIdentity::new(
+        identity.uid,
+        identity.gid,
+        identity.supplementary_gids.clone(),
+        identity.source.clone(),
+        identity.resource_digest.clone(),
+    )?;
+    if normalized != *identity {
+        return Err(BackendError::Descriptor(
+            "workload identity is not canonical".into(),
+        ));
+    }
+    validate_resource_claims(&runtime_descriptor.resource_claims)?;
+    runtime_descriptor
+        .provisioning_evidence
+        .validate(&runtime_descriptor.generation)?;
+    runtime_descriptor
+        .transport
+        .validate()
+        .map_err(|error| BackendError::Descriptor(error.into()))?;
+    validate_client_tls(&runtime_descriptor.tls)?;
+    Ok(())
 }
 
 fn validate_client_tls(tls: &SandboxTlsClientConfig) -> Result<(), BackendError> {
@@ -307,54 +330,31 @@ fn tls_client_config(tls: &SandboxTlsClientConfig) -> Result<rustls::ClientConfi
     Ok(config)
 }
 
-fn validate_socket_path(path: &std::path::Path) -> Result<(), BackendError> {
-    if path.is_absolute() {
-        Ok(())
-    } else {
-        Err(BackendError::Descriptor(
-            "boundary control Unix socket path must be absolute".to_string(),
-        ))
-    }
-}
-
-fn validate_control_port(port: u32) -> Result<(), BackendError> {
-    if port == 0 {
-        Err(BackendError::Descriptor(
-            "boundary control port must be nonzero".to_string(),
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-struct RemoteBound {
-    audit_validator: Arc<dyn crate::audit::BoundaryAuditValidator>,
+pub struct BoundBoundary {
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
-    policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
-    mediation: Arc<RemoteNetworkMediation>,
+    mediation: Arc<NetworkMediationSource>,
     host_gateway_ip: Option<std::net::IpAddr>,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
-    identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
+    identity: ResolvedWorkloadIdentity,
     generation: String,
     session_id: openshell_core::SandboxSessionId,
     resource_claims: std::collections::BTreeMap<String, String>,
-    outer_fence: openshell_isolation_interface::contract::OuterFenceGuarantees,
+    provisioning_evidence: openshell_isolation_interface::contract::ProvisioningEvidence,
 }
 
-#[async_trait]
-impl BoundBoundary for RemoteBound {
-    fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
+impl BoundBoundary {
+    pub fn network_mediation_source(&self) -> Arc<NetworkMediationSource> {
         self.mediation.clone()
     }
 
-    fn host_gateway_ip(&self) -> Option<std::net::IpAddr> {
+    pub fn host_gateway_ip(&self) -> Option<std::net::IpAddr> {
         self.host_gateway_ip
     }
 
-    async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
+    pub async fn confirm(self: Box<Self>) -> Result<ConfirmedBoundary, BackendError> {
         let response = self.client.call_idempotent(Request::Confirm).await?;
         let Response::Confirmed { confirmation } = response else {
             return Err(unexpected_response("confirmed", &response));
@@ -362,25 +362,22 @@ impl BoundBoundary for RemoteBound {
         if confirmation.generation != self.generation
             || confirmation.session_id != self.session_id
             || confirmation.resource_claims != self.resource_claims
-            || confirmation.outer_fence != self.outer_fence
+            || confirmation.provisioning_evidence_digest
+                != self.provisioning_evidence.evidence_digest
         {
             return Err(BackendError::Confirm(
-                "sandbox confirmation generation, session, resource claims, or outer fence do not match runtime descriptor"
+                "sandbox confirmation generation, session, resource claims, or provisioning evidence do not match runtime descriptor"
                     .to_string(),
             ));
         }
-        let properties = self.audit_validator.validate(&confirmation.backend_audit)?;
-        if confirmation.properties != properties {
-            return Err(BackendError::Confirm(
-                "sandbox confirmation properties do not match validated audit evidence".to_string(),
-            ));
+        if self.client.backend_name == crate::BACKEND_NAME {
+            crate::audit::validate_native_linux_audit(&confirmation.backend_audit)?;
         }
         let client = self.client.clone();
         let confirmed = ConfirmedBoundary::try_new(
-            Box::new(RemoteReady {
+            Box::new(ReadyBoundary {
                 client: self.client,
                 agent: self.agent,
-                policy: self.policy,
                 sandbox_id: self.sandbox_id,
                 ca_file_paths: self.ca_file_paths,
                 provider_credentials: self.provider_credentials,
@@ -393,18 +390,16 @@ impl BoundBoundary for RemoteBound {
     }
 }
 
-struct RemoteReady {
+pub struct ReadyBoundary {
     client: Arc<BoundaryClient>,
     agent: AgentSpec,
-    policy: openshell_core::policy::SandboxPolicy,
     sandbox_id: String,
     ca_file_paths: Arc<std::sync::Mutex<Option<(PathBuf, PathBuf)>>>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
 }
 
-#[async_trait]
-impl ReadyBoundary for RemoteReady {
-    async fn start_agent(self: Box<Self>) -> Result<Box<dyn RunningBoundary>, BackendError> {
+impl ReadyBoundary {
+    pub async fn start_agent(self: Box<Self>) -> Result<Box<RunningBoundary>, BackendError> {
         let ca_paths = self
             .ca_file_paths
             .lock()
@@ -432,26 +427,11 @@ impl ReadyBoundary for RemoteReady {
             .map_err(|error| {
                 BackendError::Process(format!("snapshot provider environment: {error}"))
             })?;
-        if !provider_snapshot.files.is_empty() {
-            let response = self
-                .client
-                .call_idempotent(Request::ProbeProviderFiles)
-                .await
-                .map_err(|error| {
-                    BackendError::Process(format!("provider file capability probe failed: {error}"))
-                })?;
-            if !matches!(response, Response::ProviderFilesSupported) {
-                return Err(BackendError::Process(
-                    "sandbox boundary does not support provider files".to_string(),
-                ));
-            }
-        }
         let response = self
             .client
             .call_idempotent(Request::StartAgent {
                 sandbox_id: self.sandbox_id,
                 spec: AgentSpecWire::from(self.agent),
-                policy: Box::new(SandboxPolicyWire::from(self.policy)),
                 ca_cert,
                 ca_bundle,
                 provider_env_revision: provider_snapshot.revision,
@@ -467,45 +447,45 @@ impl ReadyBoundary for RemoteReady {
         else {
             return Err(unexpected_response("started", &response));
         };
-        let process = Arc::new(RemoteProcess {
+        let process = Arc::new(BoundaryProcess {
+            exec: false,
             client: self.client.clone(),
             process_id,
         });
-        Ok(Box::new(RemoteRunning {
+        Ok(Box::new(RunningBoundary {
             process,
-            exec: Arc::new(RemoteExec {
+            exec: Arc::new(BoundaryExec {
                 client: self.client.clone(),
                 provider_credentials: self.provider_credentials,
                 publication_generation: tokio::sync::Mutex::new(provider_env_generation),
             }),
-            loopback_connector: Arc::new(RemoteLoopbackConnector {
+            loopback_connector: Arc::new(BoundaryLoopbackConnector {
                 client: self.client,
             }),
         }))
     }
 }
 
-struct RemoteRunning {
-    process: Arc<RemoteProcess>,
-    exec: Arc<RemoteExec>,
-    loopback_connector: Arc<RemoteLoopbackConnector>,
+pub struct RunningBoundary {
+    process: Arc<BoundaryProcess>,
+    exec: Arc<BoundaryExec>,
+    loopback_connector: Arc<BoundaryLoopbackConnector>,
 }
 
-#[async_trait]
-impl RunningBoundary for RemoteRunning {
-    fn agent(&self) -> Arc<dyn BoundaryProcess> {
+impl RunningBoundary {
+    pub fn agent(&self) -> Arc<BoundaryProcess> {
         self.process.clone()
     }
 
-    fn exec(&self) -> Arc<dyn BoundaryExec> {
+    pub fn exec(&self) -> Arc<BoundaryExec> {
         self.exec.clone()
     }
 
-    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
+    pub fn loopback_connector(&self) -> Arc<BoundaryLoopbackConnector> {
         self.loopback_connector.clone()
     }
 
-    async fn terminate(&self) -> Result<(), BackendError> {
+    pub async fn terminate(&self) -> Result<(), BackendError> {
         let response = self
             .process
             .client
@@ -515,18 +495,18 @@ impl RunningBoundary for RemoteRunning {
     }
 }
 
-struct RemoteProcess {
+pub struct BoundaryProcess {
+    exec: bool,
     client: Arc<BoundaryClient>,
     process_id: String,
 }
 
-#[async_trait]
-impl BoundaryProcess for RemoteProcess {
-    async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
+impl BoundaryProcess {
+    pub async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
         open_process_attachment(self.client.clone(), self.process_id.clone()).await
     }
 
-    async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
+    pub async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         let response = self
             .client
             .call_wait(Request::Wait {
@@ -548,7 +528,7 @@ impl BoundaryProcess for RemoteProcess {
         Ok(status.into())
     }
 
-    async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
+    pub async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
         let response = self
             .client
             .call_idempotent(Request::Signal {
@@ -559,7 +539,10 @@ impl BoundaryProcess for RemoteProcess {
         expect_response(response, "signaled")
     }
 
-    async fn terminate(&self) -> Result<(), BackendError> {
+    pub async fn terminate(&self) -> Result<(), BackendError> {
+        if self.exec {
+            return self.signal(BoundarySignal::Kill).await;
+        }
         let response = self
             .client
             .call_idempotent(Request::Terminate {
@@ -596,8 +579,8 @@ async fn open_process_attachment(
         stderr_pump,
         None,
     ));
-    let terminal: Option<Arc<dyn BoundaryTerminal>> = if has_terminal {
-        let terminal: Arc<dyn BoundaryTerminal> = Arc::new(RemoteTerminal { client, process_id });
+    let terminal: Option<Arc<BoundaryTerminal>> = if has_terminal {
+        let terminal: Arc<BoundaryTerminal> = Arc::new(BoundaryTerminal { client, process_id });
         Some(terminal)
     } else {
         None
@@ -635,7 +618,7 @@ async fn pump_process_responses(
                 }
             }
             Ok(Some((STREAM_EXIT, payload))) => {
-                break serde_json::from_slice::<ExitStatusWire>(&payload)
+                break crate::protobuf::decode::<ExitStatusWire>(&payload)
                     .map_or(BoundaryExitStatus::Exited(74), Into::into);
             }
             Ok(None | Some(_)) | Err(_) => break BoundaryExitStatus::Exited(74),
@@ -646,7 +629,7 @@ async fn pump_process_responses(
     }
 }
 
-struct RemoteExec {
+pub struct BoundaryExec {
     client: Arc<BoundaryClient>,
     provider_credentials: openshell_core::provider_credentials::ProviderCredentialState,
     // Shared by proactive synchronization and exec. Reserve generations before
@@ -654,7 +637,7 @@ struct RemoteExec {
     publication_generation: tokio::sync::Mutex<u64>,
 }
 
-impl RemoteExec {
+impl BoundaryExec {
     async fn synchronize(
         &self,
         generation: &mut u64,
@@ -666,22 +649,6 @@ impl RemoteExec {
                 .map_err(|error| {
                     BackendError::Process(format!("snapshot provider environment: {error}"))
                 })?;
-            if !snapshot.files.is_empty() {
-                let response = self
-                    .client
-                    .call_idempotent(Request::ProbeProviderFiles)
-                    .await
-                    .map_err(|error| {
-                        BackendError::Process(format!(
-                            "provider file capability probe failed: {error}"
-                        ))
-                    })?;
-                if !matches!(response, Response::ProviderFilesSupported) {
-                    return Err(BackendError::Process(
-                        "sandbox boundary does not support provider files".to_string(),
-                    ));
-                }
-            }
             *generation = generation.checked_add(1).ok_or_else(|| {
                 BackendError::Process("provider environment publication exhausted".to_string())
             })?;
@@ -726,15 +693,14 @@ impl RemoteExec {
     }
 }
 
-#[async_trait]
-impl BoundaryExec for RemoteExec {
-    async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
+impl BoundaryExec {
+    pub async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
         let mut generation = self.publication_generation.lock().await;
         self.synchronize(&mut generation).await?;
         open_exec_session(self.client.clone(), spec).await
     }
 
-    async fn synchronize_provider_environment(
+    pub async fn synchronize_provider_environment(
         &self,
     ) -> Result<ProviderEnvironmentInstallation, BackendError> {
         let mut generation = self.publication_generation.lock().await;
@@ -742,13 +708,15 @@ impl BoundaryExec for RemoteExec {
     }
 }
 
-struct RemoteLoopbackConnector {
+pub struct BoundaryLoopbackConnector {
     client: Arc<BoundaryClient>,
 }
 
-#[async_trait]
-impl BoundaryLoopbackConnector for RemoteLoopbackConnector {
-    async fn connect(&self, target: LoopbackTarget) -> Result<BoundaryDuplexStream, BackendError> {
+impl BoundaryLoopbackConnector {
+    pub async fn connect(
+        &self,
+        target: LoopbackTarget,
+    ) -> Result<BoundaryDuplexStream, BackendError> {
         let (stream, response) = self
             .client
             .call_stream(Request::LoopbackConnect {
@@ -757,57 +725,19 @@ impl BoundaryLoopbackConnector for RemoteLoopbackConnector {
             })
             .await?;
         match response {
-            Response::PortConnected => Ok(stream),
-            response => Err(unexpected_response("port_connected", &response)),
+            Response::LoopbackConnected => Ok(stream),
+            response => Err(unexpected_response("loopback_connected", &response)),
         }
     }
 }
 
-struct RemoteExecProcess {
+pub struct BoundaryTerminal {
     client: Arc<BoundaryClient>,
     process_id: String,
 }
 
-#[async_trait]
-impl BoundaryProcess for RemoteExecProcess {
-    async fn attach(&self) -> Result<ProcessAttachment, BackendError> {
-        open_process_attachment(self.client.clone(), self.process_id.clone()).await
-    }
-
-    async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
-        RemoteProcess {
-            client: self.client.clone(),
-            process_id: self.process_id.clone(),
-        }
-        .wait()
-        .await
-    }
-
-    async fn signal(&self, signal: BoundarySignal) -> Result<(), BackendError> {
-        expect_response(
-            self.client
-                .call_idempotent(Request::ExecSignal {
-                    process_id: self.process_id.clone(),
-                    signal: SignalWire::from(signal),
-                })
-                .await?,
-            "signaled",
-        )
-    }
-
-    async fn terminate(&self) -> Result<(), BackendError> {
-        self.signal(BoundarySignal::Kill).await
-    }
-}
-
-struct RemoteTerminal {
-    client: Arc<BoundaryClient>,
-    process_id: String,
-}
-
-#[async_trait]
-impl BoundaryTerminal for RemoteTerminal {
-    async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
+impl BoundaryTerminal {
+    pub async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
         let response = self
             .client
             .call_idempotent(Request::Resize {
@@ -849,12 +779,13 @@ async fn open_exec_session(
         Some(output_status_tx),
     ));
 
-    let process: Arc<dyn BoundaryProcess> = Arc::new(RemoteExecProcess {
+    let process: Arc<BoundaryProcess> = Arc::new(BoundaryProcess {
+        exec: true,
         client: client.clone(),
         process_id: process_id.clone(),
     });
-    let terminal: Option<Arc<dyn BoundaryTerminal>> = if pty {
-        Some(Arc::new(RemoteTerminal { client, process_id }))
+    let terminal: Option<Arc<BoundaryTerminal>> = if pty {
+        Some(Arc::new(BoundaryTerminal { client, process_id }))
     } else {
         None
     };
@@ -901,13 +832,12 @@ async fn pump_exec_input(
 /// session, but TCP byte streams use HTTP/2's native multiplexing. Nesting all
 /// TCP connections inside one application-level writer creates avoidable
 /// head-of-line blocking during concurrent TLS handshakes.
-struct RemoteNetworkMediation {
+pub struct NetworkMediationSource {
     client: Arc<BoundaryClient>,
 }
 
-#[async_trait]
-impl NetworkMediationSource for RemoteNetworkMediation {
-    async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
+impl NetworkMediationSource {
+    pub async fn accept_tcp(&self) -> Result<PendingTcpOpen, BackendError> {
         // An idle accept has no deadline. Recover transport loss before exposing
         // a source error, which permanently stops the proxy. The boundary drops
         // the interrupted pending open; a retry never replays its decision.
@@ -947,7 +877,7 @@ impl NetworkMediationSource for RemoteNetworkMediation {
         })
     }
 
-    async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
+    pub async fn accept_dns(&self) -> Result<PendingDnsQuery, BackendError> {
         loop {
             let session = self.client.mediation_session().await?;
             match session.accept_dns().await {
@@ -967,7 +897,7 @@ async fn complete_network_open(
     let decision = completion
         .await
         .unwrap_or(TcpOpenDecision::Denied(TcpOpenDenial::MediationUnavailable));
-    let Ok(payload) = serde_json::to_vec(&decision) else {
+    let Ok(payload) = crate::protobuf::encode(&decision) else {
         return;
     };
     if write_stream_frame(
@@ -982,6 +912,15 @@ async fn complete_network_open(
     }
     if matches!(decision, TcpOpenDecision::RelayReady) {
         let _ = tokio::io::copy_bidirectional(&mut boundary, &mut transport).await;
+    } else {
+        // The write only queues the decision for the request pump. Dropping the
+        // response stream now cancels the RPC before that pump can deliver it.
+        // Close the request direction and wait for the backend to finish.
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            boundary.shutdown().await?;
+            boundary.read_u8().await
+        })
+        .await;
     }
 }
 
@@ -1061,7 +1000,7 @@ async fn dispatch_client_mediation_frame(
 ) -> std::io::Result<()> {
     match frame.kind {
         MediationFrameKind::DnsQuery => {
-            let query: DnsQueryWire = mediation::decode_json(&frame.payload)?;
+            let query: DnsQueryWire = mediation::decode_message(&frame.payload)?;
             let (response, completion) =
                 tokio::sync::oneshot::channel::<Result<Vec<u8>, BackendError>>();
             let outbound = outbound.clone();
@@ -1073,7 +1012,7 @@ async fn dispatch_client_mediation_frame(
                         "supervisor dropped the mediated DNS query".to_string(),
                     ),
                 };
-                if let Ok(payload) = mediation::encode_json(&response) {
+                if let Ok(payload) = mediation::encode_message(&response) {
                     let _ = outbound
                         .send(OutboundMediationFrame {
                             kind: MediationFrameKind::DnsResponse,
@@ -1121,6 +1060,9 @@ async fn dispatch_client_mediation_frame(
 struct BoundaryClient {
     connector: Option<Arc<dyn BoundaryTransportConnector>>,
     runtime_descriptor: SandboxRuntimeDescriptor,
+    backend_name: String,
+    driver_descriptor: Vec<u8>,
+    boundary_handle: std::sync::OnceLock<String>,
     supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId,
     sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     grpc_channel: tokio::sync::Mutex<Option<CachedGrpcChannel>>,
@@ -1278,13 +1220,41 @@ impl BoundaryCredential {
 }
 
 impl BoundaryClient {
+    async fn discover_policy(&self) -> Result<(Option<String>, bool), BackendError> {
+        match self.call_idempotent(Request::DiscoverPolicy).await? {
+            Response::ImagePolicy { yaml, invalid } => Ok((yaml, invalid)),
+            _ => Err(BackendError::Descriptor(
+                "expected image policy discovery response".to_string(),
+            )),
+        }
+    }
+
     fn new(
         runtime_descriptor: SandboxRuntimeDescriptor,
         sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
     ) -> Self {
+        let payload =
+            serde_json::to_vec(&runtime_descriptor).expect("serializable runtime descriptor");
+        Self::with_backend(
+            runtime_descriptor,
+            sandbox_bearer,
+            crate::BACKEND_NAME.to_string(),
+            payload,
+        )
+    }
+
+    fn with_backend(
+        runtime_descriptor: SandboxRuntimeDescriptor,
+        sandbox_bearer: openshell_core::jwt::SessionBearerTokenSlot,
+        backend_name: String,
+        driver_descriptor: Vec<u8>,
+    ) -> Self {
         Self {
             connector: None,
             runtime_descriptor,
+            backend_name,
+            driver_descriptor,
+            boundary_handle: std::sync::OnceLock::new(),
             supervisor_instance_id: crate::boundary_protocol::SupervisorInstanceId::new(),
             sandbox_bearer,
             grpc_channel: tokio::sync::Mutex::new(None),
@@ -1500,9 +1470,10 @@ impl BoundaryClient {
             BackendError::Unavailable(format!("flush boundary control request: {error}"))
         })?;
         let mut header = [0_u8; 4];
-        stream.read_exact(&mut header).await.map_err(|error| {
-            BackendError::Unavailable(format!("read boundary control response header: {error}"))
-        })?;
+        stream
+            .read_exact(&mut header)
+            .await
+            .map_err(control_read_error)?;
         let declared = u32::from_be_bytes(header) as usize;
         if declared > MAX_CONTROL_FRAME_BYTES {
             return Err(BackendError::Process(format!(
@@ -1512,9 +1483,10 @@ impl BoundaryClient {
         let mut frame = Vec::with_capacity(4 + declared);
         frame.extend_from_slice(&header);
         frame.resize(4 + declared, 0);
-        stream.read_exact(&mut frame[4..]).await.map_err(|error| {
-            BackendError::Unavailable(format!("read boundary control response: {error}"))
-        })?;
+        stream
+            .read_exact(&mut frame[4..])
+            .await
+            .map_err(control_read_error)?;
         let response: ResponseEnvelope = decode_frame(&frame)
             .map_err(|error| BackendError::Process(format!("decode control response: {error}")))?;
         if response.request_id != request_id {
@@ -1536,7 +1508,7 @@ impl BoundaryClient {
     ) -> Result<BoundaryDuplexStream, BackendError> {
         self.ensure_current_credential_connection().await?;
         let channel = self.grpc_channel().await?;
-        open_grpc_client_stream(channel, kind, &self.sandbox_bearer).await
+        open_grpc_client_stream(channel, kind, &self.sandbox_bearer, self.boundary_handle()?).await
     }
 
     async fn ensure_current_credential_connection(&self) -> Result<(), BackendError> {
@@ -1730,7 +1702,7 @@ impl BoundaryClient {
         confirm: Option<&RequestEnvelope>,
         credential: &BoundaryCredential,
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
-        let (channel, transport) = self.build_grpc_channel().await?;
+        let (channel, transport) = self.build_grpc_channel(credential).await?;
         let result = async {
             self.exchange_on_channel(channel.clone(), attach, credential)
                 .await?;
@@ -1777,6 +1749,7 @@ impl BoundaryClient {
             channel,
             GrpcStreamKind::Exchange,
             credential.authorization.clone(),
+            self.boundary_handle()?,
         )
         .await?;
         let frame = encode_frame(envelope)
@@ -1790,8 +1763,9 @@ impl BoundaryClient {
         let response =
             crate::boundary_protocol::read_frame_async::<_, ResponseEnvelope>(&mut stream)
                 .await
-                .map_err(|error| {
-                    BackendError::Unavailable(format!("read boundary control response: {error}"))
+                .map_err(|error| match error {
+                    crate::boundary_protocol::FrameError::Io(error) => control_read_error(error),
+                    error => BackendError::Descriptor(format!("decode control response: {error}")),
                 })?;
         if response.request_id != request_id {
             return Err(BackendError::Process(
@@ -1888,7 +1862,7 @@ impl BoundaryClient {
             return Ok(cached.channel.clone());
         }
         let credential = BoundaryCredential::capture(&self.sandbox_bearer)?;
-        let (channel, transport) = self.build_grpc_channel().await?;
+        let (channel, transport) = self.build_grpc_channel(&credential).await?;
         *state = Some(CachedGrpcChannel {
             credential_epoch: credential.epoch,
             bearer_fingerprint: credential.fingerprint,
@@ -1903,19 +1877,28 @@ impl BoundaryClient {
 
     async fn build_grpc_channel(
         &self,
+        credential: &BoundaryCredential,
     ) -> Result<(tonic::transport::Channel, Arc<TransportAbort>), BackendError> {
         let runtime_descriptor = self.runtime_descriptor.clone();
         let connector = self.connector.clone();
         let transport = Arc::new(TransportAbort::default());
         let connector_transport = transport.clone();
-        let endpoint =
-            tonic::transport::Endpoint::from_static("http://boundary.openshell.internal")
-                .initial_stream_window_size(crate::boundary_protocol::BOUNDARY_STREAM_WINDOW_BYTES)
-                .initial_connection_window_size(
-                    crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
-                )
-                .http2_keep_alive_interval(Duration::from_secs(10))
-                .keep_alive_while_idle(true);
+        let authority = match &runtime_descriptor.transport {
+            SandboxTransport::Tcp { authority, .. } => authority.as_str(),
+            SandboxTransport::Unix { .. } | SandboxTransport::Vsock { .. } => {
+                "boundary.openshell.internal"
+            }
+        };
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{authority}"))
+            .map_err(|error| {
+                BackendError::Descriptor(format!("invalid boundary authority: {error}"))
+            })?
+            .initial_stream_window_size(crate::boundary_protocol::BOUNDARY_STREAM_WINDOW_BYTES)
+            .initial_connection_window_size(
+                crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
+            )
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
         let channel = endpoint
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let runtime_descriptor = runtime_descriptor.clone();
@@ -1937,7 +1920,82 @@ impl BoundaryClient {
             .map_err(|error| {
                 BackendError::Unavailable(format!("start boundary gRPC channel: {error}"))
             })?;
+        let opening = tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            self.open_boundary(channel.clone(), credential),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(BackendError::Unavailable(
+                "boundary opening timed out".to_string(),
+            ))
+        });
+        if let Err(error) = opening {
+            transport.abort();
+            return Err(error);
+        }
         Ok((channel, transport))
+    }
+
+    fn boundary_handle(&self) -> Result<&str, BackendError> {
+        self.boundary_handle
+            .get()
+            .map(String::as_str)
+            .ok_or_else(|| {
+                BackendError::Descriptor(
+                    "Sandbox Protocol boundary has not been opened".to_string(),
+                )
+            })
+    }
+
+    async fn open_boundary(
+        &self,
+        channel: tonic::transport::Channel,
+        credential: &BoundaryCredential,
+    ) -> Result<(), BackendError> {
+        let mut client = IsolationBackendClient::new(channel)
+            .max_decoding_message_size(64 * 1024)
+            .max_encoding_message_size(64 * 1024);
+        let supervisor = crate::isolation_protocol::metadata("openshell/supervisor");
+        let response = client
+            .describe(DescribeIsolationBackendRequest {
+                supervisor: Some(supervisor.clone()),
+            })
+            .await
+            .map_err(control_rpc_error)?
+            .into_inner();
+        crate::isolation_protocol::negotiate(&supervisor, response.backend)
+            .map_err(control_rpc_error)?;
+        let mut request = tonic::Request::new(OpenBoundaryRequest {
+            session_id: self.runtime_descriptor.session_id.to_string(),
+            backend_name: self.backend_name.clone(),
+            driver_descriptor: self.driver_descriptor.clone(),
+        });
+        request
+            .metadata_mut()
+            .insert("authorization", credential.authorization.clone());
+        let response = client
+            .open_boundary(request)
+            .await
+            .map_err(control_rpc_error)?
+            .into_inner();
+        if response.outcome != LaunchOutcome::Fresh as i32
+            || response.boundary_id.is_empty()
+            || response.boundary_id.len() > 128
+        {
+            return Err(BackendError::Descriptor(
+                "invalid fresh boundary opening response".to_string(),
+            ));
+        }
+        let handle = self
+            .boundary_handle
+            .get_or_init(|| response.boundary_id.clone());
+        if *handle != response.boundary_id {
+            return Err(BackendError::Denied(
+                "boundary handle changed during launch recovery".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2032,100 +2090,140 @@ enum GrpcStreamKind {
     Mediate,
 }
 
+fn control_rpc_error(error: tonic::Status) -> BackendError {
+    match error.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+            BackendError::Denied(format!("isolation control authentication: {error}"))
+        }
+        tonic::Code::Unimplemented => BackendError::Unsupported(error.to_string()),
+        tonic::Code::InvalidArgument | tonic::Code::FailedPrecondition => {
+            BackendError::Descriptor(format!("isolation control contract: {error}"))
+        }
+        _ => BackendError::Unavailable(format!("isolation control RPC: {error}")),
+    }
+}
+
 async fn open_grpc_client_stream(
     channel: tonic::transport::Channel,
     kind: GrpcStreamKind,
     sandbox_bearer: &openshell_core::jwt::SessionBearerTokenSlot,
+    boundary_id: &str,
 ) -> Result<BoundaryDuplexStream, BackendError> {
     let authorization = sandbox_bearer.authorization_metadata().map_err(|error| {
         BackendError::Unavailable(format!("Sandbox Protocol credential unavailable: {error}"))
     })?;
-    open_grpc_client_stream_with_authorization(channel, kind, authorization).await
+    open_grpc_client_stream_with_authorization(channel, kind, authorization, boundary_id).await
 }
 
 async fn open_grpc_client_stream_with_authorization(
     channel: tonic::transport::Channel,
     kind: GrpcStreamKind,
     authorization: tonic::metadata::AsciiMetadataValue,
+    boundary_id: &str,
 ) -> Result<BoundaryDuplexStream, BackendError> {
+    let mut client = SandboxProtocolClient::new(channel)
+        .max_decoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES);
+    let error = |error: tonic::Status| match error.code() {
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+            BackendError::Denied(format!("authenticate Sandbox Protocol stream: {error}"))
+        }
+        tonic::Code::Unimplemented => BackendError::Unsupported(error.to_string()),
+        _ => BackendError::Unavailable(format!("open boundary gRPC stream: {error}")),
+    };
+    match kind {
+        GrpcStreamKind::Exchange => {
+            let (application, request) =
+                grpc_request::<ExchangeFrame>(boundary_id, authorization).await?;
+            let response = client.exchange(request).await.map_err(error)?;
+            Ok(Box::new(tokio::io::join(
+                grpc_reader(response.into_inner(), crate::stream_adapter::Mode::Response),
+                application,
+            )))
+        }
+        GrpcStreamKind::Mediate => {
+            let (application, request) =
+                grpc_request::<MediateFrame>(boundary_id, authorization).await?;
+            let response = client.mediate(request).await.map_err(error)?;
+            Ok(Box::new(tokio::io::join(
+                grpc_reader(response.into_inner(), crate::stream_adapter::Mode::Response),
+                application,
+            )))
+        }
+    }
+}
+
+async fn grpc_request<F: ProtocolFrame>(
+    boundary_id: &str,
+    authorization: tonic::metadata::AsciiMetadataValue,
+) -> Result<(tokio::io::DuplexStream, tonic::Request<ReceiverStream<F>>), BackendError> {
     let (application, bridge) = tokio::io::duplex(256 * 1024);
-    let (reader, writer) = tokio::io::split(bridge);
-    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<BoundaryChunk>(64);
-    tokio::spawn(pump_to_grpc(reader, outbound));
-    let mut client = IsolationBoundaryClient::new(channel)
-        .max_decoding_message_size(64 * 1024)
-        .max_encoding_message_size(64 * 1024);
+    let (outbound, outbound_rx) = tokio::sync::mpsc::channel(64);
+    outbound
+        .send(F::bind(boundary_id))
+        .await
+        .map_err(|_| BackendError::Unavailable("queue boundary binding frame".into()))?;
+    tokio::spawn(pump_to_grpc(bridge, outbound));
     let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
     request
         .metadata_mut()
         .insert("authorization", authorization);
-    let response = match kind {
-        GrpcStreamKind::Exchange => client.exchange(request).await,
-        GrpcStreamKind::Mediate => client.mediate(request).await,
-    }
-    .map_err(|error| match error.code() {
-        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
-            BackendError::Denied(format!("authenticate Sandbox Protocol stream: {error}"))
-        }
-        _ => BackendError::Unavailable(format!("open boundary gRPC stream: {error}")),
-    })?;
-    tokio::spawn(pump_from_grpc(response.into_inner(), writer));
-    Ok(Box::new(application))
+    Ok((application, request))
 }
 
-async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<BoundaryChunk>)
+async fn pump_to_grpc<R, F: ProtocolFrame>(mut reader: R, sender: tokio::sync::mpsc::Sender<F>)
 where
-    R: tokio::io::AsyncRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin + Send,
 {
-    let mut buffer = vec![0_u8; 16 * 1024];
+    let mut mode = crate::stream_adapter::Mode::Request;
     loop {
-        let read = match reader.read(&mut buffer).await {
-            Ok(read) => read,
-            Err(error) => {
-                tracing::debug!(%error, "boundary gRPC request reader ended");
-                return;
-            }
-        };
-        if read == 0 {
-            return;
-        }
-        if sender
-            .send(BoundaryChunk {
-                data: buffer[..read].to_vec(),
-            })
-            .await
-            .is_err()
-        {
-            return;
-        }
-    }
-}
-
-async fn pump_from_grpc<W>(mut stream: tonic::Streaming<BoundaryChunk>, mut writer: W)
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    loop {
-        match stream.message().await {
+        match F::send(&mut reader, &mut mode).await {
             Ok(Some(chunk)) => {
-                if let Err(error) = writer.write_all(&chunk.data).await {
-                    tracing::debug!(%error, "boundary gRPC response writer ended");
+                if sender.send(chunk).await.is_err() {
                     return;
                 }
             }
-            Ok(None) => {
-                let _ = writer.shutdown().await;
-                return;
-            }
+            Ok(None) => return,
             Err(error) => {
-                tracing::debug!(%error, "boundary gRPC response stream ended");
-                // The request pump still owns the other duplex half. Explicitly
-                // close this direction so a waiting exchange observes EOF and
-                // can recover instead of waiting for both halves to drop.
-                let _ = writer.shutdown().await;
+                tracing::debug!(%error,"boundary request adapter ended");
                 return;
             }
         }
+    }
+}
+
+/// Read typed responses directly, preserving conversion failures as `InvalidData`.
+/// The caller classifies these as terminal protocol errors rather than EOF.
+fn grpc_reader<F: ProtocolFrame>(
+    stream: tonic::Streaming<F>,
+    mut mode: crate::stream_adapter::Mode,
+) -> impl tokio::io::AsyncRead + Unpin + Send {
+    use tokio_stream::StreamExt as _;
+    tokio_util::io::StreamReader::new(stream.map(move |frame| {
+        let frame = frame.map_err(|status| {
+            let kind = match status.code() {
+                tonic::Code::Unimplemented => std::io::ErrorKind::Unsupported,
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    std::io::ErrorKind::PermissionDenied
+                }
+                tonic::Code::InvalidArgument
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::OutOfRange => std::io::ErrorKind::InvalidData,
+                _ => std::io::ErrorKind::Other,
+            };
+            std::io::Error::new(kind, status)
+        })?;
+        frame.receive(&mut mode).map(bytes::Bytes::from)
+    }))
+}
+
+fn control_read_error(error: std::io::Error) -> BackendError {
+    let message = format!("read boundary control response: {error}");
+    match error.kind() {
+        std::io::ErrorKind::InvalidData => BackendError::Descriptor(message),
+        std::io::ErrorKind::Unsupported => BackendError::Unsupported(message),
+        std::io::ErrorKind::PermissionDenied => BackendError::Denied(message),
+        _ => BackendError::Unavailable(message),
     }
 }
 
@@ -2196,6 +2294,7 @@ fn guest_error(kind: crate::boundary_protocol::BoundaryErrorKind, message: Strin
     use crate::boundary_protocol::BoundaryErrorKind;
     let message = format!("boundary process leaf: {message}");
     match kind {
+        BoundaryErrorKind::Unsupported => BackendError::Unsupported(message),
         BoundaryErrorKind::Invalid => BackendError::Descriptor(message),
         BoundaryErrorKind::Denied => BackendError::Denied(message),
         BoundaryErrorKind::Unavailable => BackendError::Unavailable(message),
@@ -2208,38 +2307,283 @@ fn is_transport_unavailable(message: &str) -> bool {
     !message.starts_with("boundary process leaf:")
 }
 
+pub struct ConfirmedBoundary {
+    boundary: Box<ReadyBoundary>,
+    confirmation: BoundaryConfirmation,
+}
+impl ConfirmedBoundary {
+    /// Construct confirmation after checking backend-neutral properties and
+    /// immutable identity binding.
+    ///
+    /// Validate common evidence before exposing the launch-capable RPC handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if confirmation is incomplete or the identity does not match.
+    fn try_new(
+        boundary: Box<ReadyBoundary>,
+        confirmation: BoundaryConfirmation,
+        expected: &ResolvedWorkloadIdentity,
+    ) -> Result<Self, BackendError> {
+        confirmation.validate(expected)?;
+        Ok(Self {
+            boundary,
+            confirmation,
+        })
+    }
+
+    /// Return the record carried by this confirmed state.
+    pub fn confirmation(&self) -> &BoundaryConfirmation {
+        &self.confirmation
+    }
+
+    /// Consume confirmation and advance to the sole launch-capable state.
+    pub fn into_boundary(self) -> Box<ReadyBoundary> {
+        self.boundary
+    }
+}
+pub struct ProcessAttachment {
+    /// Stdin writer.
+    pub stdin: BoundaryInput,
+    /// Stdout reader, or the PTY-merged output stream.
+    pub stdout: BoundaryOutput,
+    /// Stderr reader, distinct from stdout for non-PTY processes.
+    pub stderr: Option<BoundaryOutput>,
+    /// PTY control, present when the admitted process owns a terminal.
+    pub terminal: Option<Arc<BoundaryTerminal>>,
+}
+
+pub struct ExecSession {
+    /// The spawned process.
+    pub process: Arc<BoundaryProcess>,
+    /// Stdin writer, if not a PTY-merged stream.
+    pub stdin: Option<BoundaryInput>,
+    /// Stdout reader.
+    pub stdout: BoundaryOutput,
+    /// Stderr reader, distinct from stdout for non-PTY exec.
+    pub stderr: Option<BoundaryOutput>,
+    /// PTY control, present when a terminal was requested.
+    pub terminal: Option<Arc<BoundaryTerminal>>,
+    /// Final status of the attached output stream, including delivery failure.
+    /// The process handle's stable wait status remains independent of attachment.
+    pub output_status: Option<tokio::sync::oneshot::Receiver<BoundaryExitStatus>>,
+}
+
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests {
     mod credential_renewal;
+    mod delegated;
     mod flow_control;
     mod network_recovery;
+    mod protocol_errors;
 
+    use crate::isolation_protocol::exchange_frame;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
     use super::*;
+    use crate::backend_proto::{
+        DescribeIsolationBackendResponse, OpenBoundaryResponse, ResumeBoundaryRequest,
+        SuspendBoundaryRequest, SuspendBoundaryResponse,
+        isolation_backend_server::{IsolationBackend as ControlBackend, IsolationBackendServer},
+    };
     use crate::boundary_protocol::{ExitStatusWire, generate_sandbox_tls_material};
     use crate::proto::{
-        BoundaryChunk,
-        isolation_boundary_server::{IsolationBoundary, IsolationBoundaryServer},
+        ExchangeFrame,
+        sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
     };
     use openshell_core::jwt::{SecretJwt, SessionBearerTokenSlot};
     use openshell_core::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
 
-    fn test_outer_fence() -> openshell_isolation_interface::contract::OuterFenceGuarantees {
-        use openshell_isolation_interface::contract::OuterFenceGuarantee;
+    const TEST_BOUNDARY_HANDLE: &str = "opaque-test-boundary";
 
-        openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+    #[derive(Clone)]
+    struct TestIsolationBackend {
+        metadata: Option<openshell_core::proto::extension::v1::PeerMetadata>,
+        outcome: i32,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        backend_name: String,
+        driver_descriptor: Option<Vec<u8>>,
+    }
+
+    impl Default for TestIsolationBackend {
+        fn default() -> Self {
+            Self {
+                metadata: Some(crate::isolation_protocol::metadata("test/backend")),
+                outcome: LaunchOutcome::Fresh as i32,
+                opens: Arc::default(),
+                backend_name: crate::BACKEND_NAME.to_string(),
+                driver_descriptor: None,
+            }
+        }
+    }
+
+    #[tonic::async_trait]
+    impl ControlBackend for TestIsolationBackend {
+        async fn describe(
+            &self,
+            request: tonic::Request<DescribeIsolationBackendRequest>,
+        ) -> Result<tonic::Response<DescribeIsolationBackendResponse>, tonic::Status> {
+            assert!(
+                request.metadata().get("authorization").is_none(),
+                "capability request must not convey sandbox credentials"
+            );
+            assert!(request.into_inner().supervisor.is_some());
+            Ok(tonic::Response::new(DescribeIsolationBackendResponse {
+                backend: self.metadata.clone(),
+            }))
+        }
+
+        async fn open_boundary(
+            &self,
+            request: tonic::Request<OpenBoundaryRequest>,
+        ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
+            assert!(request.metadata().get("authorization").is_some());
+            let request = request.into_inner();
+            assert_eq!(request.backend_name, self.backend_name);
+            if let Some(expected) = &self.driver_descriptor {
+                assert_eq!(
+                    &request.driver_descriptor, expected,
+                    "opaque payload must be forwarded unchanged"
+                );
+            }
+            assert!(!request.driver_descriptor.is_empty());
+            assert!(!request.session_id.is_empty());
+            self.opens.fetch_add(1, Ordering::AcqRel);
+            Ok(tonic::Response::new(OpenBoundaryResponse {
+                boundary_id: TEST_BOUNDARY_HANDLE.to_string(),
+                outcome: self.outcome,
+            }))
+        }
+
+        async fn suspend_boundary(
+            &self,
+            _request: tonic::Request<SuspendBoundaryRequest>,
+        ) -> Result<tonic::Response<SuspendBoundaryResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test backend"))
+        }
+
+        async fn resume_boundary(
+            &self,
+            _request: tonic::Request<ResumeBoundaryRequest>,
+        ) -> Result<tonic::Response<OpenBoundaryResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("test backend"))
+        }
+    }
+
+    async fn test_bind<F: ProtocolFrame>(inbound: &mut tonic::Streaming<F>) {
+        let frame = inbound.message().await.unwrap().unwrap();
+        assert_eq!(frame.boundary_id(), Some(TEST_BOUNDARY_HANDLE));
+    }
+
+    #[tokio::test]
+    async fn incompatible_isolation_contract_never_opens_a_boundary() {
+        let mut wrong_major = crate::isolation_protocol::metadata("test/backend");
+        wrong_major.protocol_version.as_mut().unwrap().major += 1;
+        let mut missing_contract = crate::isolation_protocol::metadata("test/backend");
+        missing_contract
+            .supported_capabilities
+            .retain(|capability| {
+                capability != crate::isolation_protocol::SANDBOX_PROTOCOL_CAPABILITY
+            });
+        let mut unsupported_requirement = crate::isolation_protocol::metadata("test/backend");
+        unsupported_requirement
+            .required_capabilities
+            .push("openshell.sandbox.future-required".to_string());
+        for metadata in [
+            None,
+            Some(wrong_major),
+            Some(missing_contract),
+            Some(unsupported_requirement),
+        ] {
+            let certificate = test_certificate();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let service = TestIsolationBackend {
+                metadata,
+                ..TestIsolationBackend::default()
+            };
+            let opens = service.opens.clone();
+            let client_tls = certificate.client_tls.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                tonic::transport::Server::builder()
+                    .add_service(IsolationBackendServer::new(service))
+                    .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                        Box::new(stream),
+                    ))]))
+                    .await
+                    .unwrap();
+            });
+            let result = OpenShellRuntimeBackend::discover_policy(
+                tls_runtime_descriptor(address, client_tls),
+                test_bearer(&"a".repeat(32)),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(BackendError::Descriptor(_))),
+                "{result:?}"
+            );
+            assert_eq!(opens.load(Ordering::Acquire), 0);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_launch_rejects_unspecified_restored_and_fallback_outcomes() {
+        for outcome in [
+            LaunchOutcome::Unspecified,
+            LaunchOutcome::Restored,
+            LaunchOutcome::ColdStartFallback,
+        ] {
+            let certificate = test_certificate();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client_tls = certificate.client_tls.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let stream = tokio_rustls::TlsAcceptor::from(certificate.server_config)
+                    .accept(stream)
+                    .await
+                    .unwrap();
+                tonic::transport::Server::builder()
+                    .add_service(IsolationBackendServer::new(TestIsolationBackend {
+                        outcome: outcome as i32,
+                        ..TestIsolationBackend::default()
+                    }))
+                    .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
+                        Box::new(stream),
+                    ))]))
+                    .await
+                    .unwrap();
+            });
+            let result = OpenShellRuntimeBackend::discover_policy(
+                tls_runtime_descriptor(address, client_tls),
+                test_bearer(&"a".repeat(32)),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(BackendError::Descriptor(_))),
+                "{result:?}"
+            );
+            server.abort();
+        }
+    }
+
+    fn test_provisioning_evidence() -> openshell_isolation_interface::contract::ProvisioningEvidence
+    {
+        openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
             "test-generation",
-            [
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::NoUnmanagedEgressPath,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ],
             b"test-vm-fence",
         )
         .unwrap()
@@ -2266,22 +2610,17 @@ mod tests {
         mediation_failures: Arc<std::sync::atomic::AtomicUsize>,
         mediation_ready: bool,
         provider_environment_generation: u64,
-        confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
+        confirmation: BoundaryConfirmation,
     }
 
-    type TestGrpcStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<BoundaryChunk, tonic::Status>> + Send + 'static>,
-    >;
+    type TestGrpcStream<F = ExchangeFrame> =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<F, tonic::Status>> + Send + 'static>>;
 
-    #[tonic::async_trait]
-    impl IsolationBoundary for TestGrpcBoundary {
-        type ExchangeStream = TestGrpcStream;
-        type MediateStream = TestGrpcStream;
-
-        async fn exchange(
+    impl TestGrpcBoundary {
+        async fn serve<F: ProtocolFrame>(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
-        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            request: tonic::Request<tonic::Streaming<F>>,
+        ) -> Result<tonic::Response<TestGrpcStream<F>>, tonic::Status> {
             let authorization = request
                 .metadata()
                 .get("authorization")
@@ -2292,6 +2631,7 @@ mod tests {
                 ));
             }
             let mut inbound = request.into_inner();
+            test_bind(&mut inbound).await;
             let wait_for_half_close = self.wait_for_half_close;
             let requests = self.requests.clone();
             let mediation_ready = self.mediation_ready;
@@ -2303,7 +2643,11 @@ mod tests {
                 loop {
                     match inbound.message().await {
                         Ok(Some(chunk)) => {
-                            frame.extend_from_slice(&chunk.data);
+                            frame.extend_from_slice(
+                                &chunk
+                                    .receive(&mut crate::stream_adapter::Mode::Request)
+                                    .expect("request frame"),
+                            );
                             if !wait_for_half_close && complete_control_frame(&frame) {
                                 break;
                             }
@@ -2342,7 +2686,6 @@ mod tests {
                             Request::Confirm => Response::Confirmed {
                                 confirmation: Box::new(confirmation),
                             },
-                            Request::ProbeProviderFiles => Response::ProviderFilesSupported,
                             Request::OpenMediation if mediation_ready => Response::MediationReady,
                             Request::OpenMediation => Response::Error {
                                 kind: crate::boundary_protocol::BoundaryErrorKind::Denied,
@@ -2358,9 +2701,7 @@ mod tests {
                             Request::AttachProcess { .. } => {
                                 Response::ProcessAttached { terminal: false }
                             }
-                            Request::Signal { .. } | Request::ExecSignal { .. } => {
-                                Response::Signaled
-                            }
+                            Request::Signal { .. } => Response::Signaled,
                             Request::Terminate { .. } => Response::Terminated,
                             Request::TerminateBoundary => Response::BoundaryTerminated,
                             Request::UpdateProviderEnvironment {
@@ -2373,7 +2714,7 @@ mod tests {
                                 applied: generation > provider_environment_generation,
                             },
                             Request::Resize { .. } => Response::Resized,
-                            Request::LoopbackConnect { .. } => Response::PortConnected,
+                            Request::LoopbackConnect { .. } => Response::LoopbackConnected,
                             Request::StartAgent {
                                 provider_env_revision,
                                 ..
@@ -2399,16 +2740,36 @@ mod tests {
                 } else {
                     b"complete response".to_vec()
                 };
-                let _ = outbound.send(Ok(BoundaryChunk { data: response })).await;
+                let frame = F::send(
+                    &mut response.as_slice(),
+                    &mut crate::stream_adapter::Mode::Response,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let _ = outbound.send(Ok(frame)).await;
             });
             Ok(tonic::Response::new(Box::pin(ReceiverStream::new(
                 outbound_rx,
             ))))
         }
+    }
+
+    #[tonic::async_trait]
+    impl SandboxProtocol for TestGrpcBoundary {
+        type ExchangeStream = TestGrpcStream;
+        type MediateStream = TestGrpcStream<MediateFrame>;
+
+        async fn exchange(
+            &self,
+            request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
+        ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
+            self.serve(request).await
+        }
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<MediateFrame>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
             if self
                 .mediation_failures
@@ -2421,8 +2782,13 @@ mod tests {
                     "injected mediation transport failure",
                 ));
             }
-            self.exchange(request).await
+            self.serve(request).await
         }
+    }
+
+    fn test_response_chunk(bytes: Vec<u8>) -> ExchangeFrame {
+        let response: ResponseEnvelope = decode_frame(&bytes).unwrap();
+        crate::isolation_protocol::response_chunk(&response).unwrap()
     }
 
     fn complete_control_frame(frame: &[u8]) -> bool {
@@ -2451,7 +2817,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             tonic::transport::Server::builder()
-                .add_service(IsolationBoundaryServer::new(service))
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
                 .await
                 .unwrap();
@@ -2465,6 +2832,13 @@ mod tests {
             tls_runtime_descriptor(address, test_certificate().client_tls),
             test_bearer(&"a".repeat(32)),
         );
+        client
+            .open_boundary(
+                channel.clone(),
+                &BoundaryCredential::capture(&client.sandbox_bearer).unwrap(),
+            )
+            .await
+            .unwrap();
         *client.grpc_channel.lock().await = Some(CachedGrpcChannel {
             credential_epoch: openshell_core::jwt::CredentialEpoch::new(1).expect("test epoch"),
             bearer_fingerprint: BoundaryCredential::capture(&client.sandbox_bearer)
@@ -2516,7 +2890,8 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(IsolationBoundaryServer::new(service))
+                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxProtocolServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -2532,7 +2907,6 @@ mod tests {
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-            resource_claims: std::collections::BTreeMap::new(),
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -2627,7 +3001,8 @@ mod tests {
                 };
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(IsolationBoundaryServer::new(service))
+                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxProtocolServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -2643,7 +3018,6 @@ mod tests {
         let attach = Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-            resource_claims: std::collections::BTreeMap::new(),
         };
         assert!(matches!(
             client.call_idempotent(attach).await.unwrap(),
@@ -2683,7 +3057,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             tonic::transport::Server::builder()
-                .add_service(IsolationBoundaryServer::new(service))
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
                 .await
                 .unwrap();
@@ -2697,14 +3072,23 @@ mod tests {
             channel,
             GrpcStreamKind::Exchange,
             &test_bearer(&"a".repeat(32)),
+            TEST_BOUNDARY_HANDLE,
         )
         .await
         .unwrap();
-        stream.write_all(b"finite request").await.unwrap();
+        let request = RequestEnvelope::new(Request::DiscoverPolicy).unwrap();
+        stream
+            .write_all(&encode_frame(&request).unwrap())
+            .await
+            .unwrap();
         stream.shutdown().await.unwrap();
-        let mut response = [0_u8; 17];
-        stream.read_exact(&mut response).await.unwrap();
-        assert_eq!(&response, b"complete response");
+        let response: ResponseEnvelope = crate::boundary_protocol::read_frame_async(&mut stream)
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.response,
+            Response::ImagePolicy { invalid: false, .. }
+        ));
         drop(stream);
         server.abort();
     }
@@ -2731,7 +3115,7 @@ mod tests {
                 &mut server_stream,
                 MediationFrameKind::DnsQuery,
                 42,
-                &mediation::encode_json(&query).unwrap(),
+                &mediation::encode_message(&query).unwrap(),
             )
             .await
             .unwrap();
@@ -2742,7 +3126,7 @@ mod tests {
             assert_eq!(reply.kind, MediationFrameKind::DnsResponse);
             assert_eq!(reply.stream_id, 42);
             assert_eq!(
-                mediation::decode_json::<DnsQueryResultWire>(&reply.payload).unwrap(),
+                mediation::decode_message::<DnsQueryResultWire>(&reply.payload).unwrap(),
                 DnsQueryResultWire::Response(vec![4, 5, 6])
             );
         });
@@ -2808,7 +3192,7 @@ mod tests {
             tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         }
     }
 
@@ -2858,7 +3242,7 @@ mod tests {
     async fn serve_test_grpc_with_confirmation(
         stream: BoundaryDuplexStream,
         expected_token: String,
-        confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
+        confirmation: BoundaryConfirmation,
     ) {
         let service = TestGrpcBoundary {
             wait_for_half_close: false,
@@ -2870,7 +3254,8 @@ mod tests {
             confirmation,
         };
         tonic::transport::Server::builder()
-            .add_service(IsolationBoundaryServer::new(service))
+            .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+            .add_service(SandboxProtocolServer::new(service))
             .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                 stream,
             ))]))
@@ -2896,7 +3281,7 @@ mod tests {
                 timeout_secs: 5,
                 interactive: false,
             },
-            identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            identity: ResolvedWorkloadIdentity::new(
                 10_001,
                 10_001,
                 Vec::new(),
@@ -2907,7 +3292,7 @@ mod tests {
         }
     }
 
-    fn test_confirmation() -> openshell_isolation_interface::contract::BoundaryConfirmation {
+    fn test_confirmation() -> BoundaryConfirmation {
         let audit = crate::boundary_protocol::NativeLinuxSandboxAuditEvidence {
             capabilities: crate::boundary_protocol::CapabilityEvidence {
                 inheritable: 0,
@@ -2939,22 +3324,17 @@ mod tests {
             tcp_deny_round_trip: true,
             socket_loopback_confinement: true,
         };
-        openshell_isolation_interface::contract::BoundaryConfirmation {
+        BoundaryConfirmation {
             generation: "test-generation".to_string(),
             identity: sandbox().identity,
-            properties: audit.properties(),
-            authenticated_supervisor: true,
             session_id: test_session_id(),
-            outer_fence: test_outer_fence(),
-            runtime_exit_terminates_workload: true,
+            provisioning_evidence_digest: test_provisioning_evidence().evidence_digest,
             resource_claims: std::collections::BTreeMap::new(),
             backend_audit: serde_json::to_value(audit).expect("serialize audit evidence"),
         }
     }
 
-    async fn assert_remote_confirmation_rejected(
-        confirmation: openshell_isolation_interface::contract::BoundaryConfirmation,
-    ) {
+    async fn assert_remote_confirmation_rejected(confirmation: BoundaryConfirmation) {
         let certificate = test_certificate();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2973,19 +3353,17 @@ mod tests {
         });
 
         let descriptor = tls_runtime_descriptor(address, certificate.client_tls);
-        let outer_fence = descriptor.outer_fence.clone();
+        let provisioning_evidence = descriptor.provisioning_evidence.clone();
         let context = sandbox();
         let client = Arc::new(BoundaryClient::new(
             descriptor,
             test_bearer(&expected_token),
         ));
-        let bound = RemoteBound {
-            audit_validator: Arc::new(crate::audit::LinuxBoundaryAuditValidator),
+        let bound = BoundBoundary {
             client: client.clone(),
             agent: context.agent,
-            policy: context.policy,
             sandbox_id: context.sandbox_id,
-            mediation: Arc::new(RemoteNetworkMediation {
+            mediation: Arc::new(NetworkMediationSource {
                 client: client.clone(),
             }),
             host_gateway_ip: None,
@@ -3001,7 +3379,7 @@ mod tests {
             generation: "test-generation".to_string(),
             session_id: test_session_id(),
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence,
+            provisioning_evidence,
         };
 
         assert!(matches!(
@@ -3027,32 +3405,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_confirm_rejects_property_projection_mismatch_before_monitoring() {
-        let mut confirmation = test_confirmation();
-        confirmation.properties.egress_interception.mechanism = "untrusted projection".to_string();
-
-        assert_remote_confirmation_rejected(confirmation).await;
-    }
-
-    #[tokio::test]
-    async fn remote_confirm_rejects_outer_fence_generation_mismatch_before_monitoring() {
-        let mut confirmation = test_confirmation();
-        confirmation.outer_fence.generation = "other-generation".to_string();
-
-        assert_remote_confirmation_rejected(confirmation).await;
-    }
-
-    #[tokio::test]
-    async fn remote_confirm_rejects_outer_fence_digest_mismatch_before_monitoring() {
+    async fn remote_confirm_rejects_provisioning_evidence_mismatch_before_monitoring() {
         let mut confirmation = test_confirmation();
         let different_fence =
-            openshell_isolation_interface::contract::OuterFenceGuarantees::from_enforcement_evidence(
+            openshell_isolation_interface::contract::ProvisioningEvidence::from_enforcement_evidence(
                 "test-generation",
-                confirmation.outer_fence.established.iter().copied(),
                 b"different evidence",
             )
             .expect("construct different test evidence");
-        confirmation.outer_fence.evidence_digest = different_fence.evidence_digest;
+        confirmation.provisioning_evidence_digest = different_fence.evidence_digest;
 
         assert_remote_confirmation_rejected(confirmation).await;
     }
@@ -3071,7 +3432,7 @@ mod tests {
             tls: certificate.client_tls.clone(),
             host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         let debug = format!("{runtime_descriptor:?}");
         assert!(debug.contains("<redacted>"));
@@ -3091,7 +3452,7 @@ mod tests {
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -3113,7 +3474,7 @@ mod tests {
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         assert!(matches!(
             validate_runtime_descriptor(&runtime_descriptor, &sandbox()),
@@ -3135,7 +3496,7 @@ mod tests {
             tls: test_certificate().client_tls,
             host_gateway_ip: None,
             resource_claims: std::collections::BTreeMap::new(),
-            outer_fence: test_outer_fence(),
+            provisioning_evidence: test_provisioning_evidence(),
         };
         validate_runtime_descriptor(&runtime_descriptor, &sandbox())
             .expect("TCP runtime descriptor should be valid");
@@ -3336,7 +3697,7 @@ mod tests {
         write_stream_frame(&mut peer, STREAM_STDOUT, b"hello")
             .await
             .unwrap();
-        let status = serde_json::to_vec(&ExitStatusWire::Exited(74)).unwrap();
+        let status = crate::protobuf::encode(&ExitStatusWire::Exited(74)).unwrap();
         write_stream_frame(&mut peer, STREAM_EXIT, &status)
             .await
             .unwrap();
@@ -3421,7 +3782,8 @@ mod tests {
                 let service = service.clone();
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
-                        .add_service(IsolationBoundaryServer::new(service))
+                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxProtocolServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3443,7 +3805,7 @@ mod tests {
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
             },
             test_bearer(&"a".repeat(32)),
         ));
@@ -3489,7 +3851,8 @@ mod tests {
                 .await
                 .unwrap();
             tonic::transport::Server::builder()
-                .add_service(IsolationBoundaryServer::new(service))
+                .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                .add_service(SandboxProtocolServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                     Box::new(stream),
                 ))]))
@@ -3502,13 +3865,12 @@ mod tests {
                 HashMap::new(),
             );
         let context = sandbox();
-        let ready = Box::new(RemoteReady {
+        let ready = Box::new(ReadyBoundary {
             client: Arc::new(BoundaryClient::new(
                 tls_runtime_descriptor(address, certificate.client_tls),
                 test_bearer(&"a".repeat(32)),
             )),
             agent: context.agent,
-            policy: context.policy,
             sandbox_id: context.sandbox_id,
             ca_file_paths: Arc::new(std::sync::Mutex::new(None)),
             provider_credentials: credentials.clone(),
@@ -3547,7 +3909,7 @@ mod tests {
             tls_runtime_descriptor(address, certificate.client_tls),
             test_bearer(&"a".repeat(32)),
         ));
-        let exec = RemoteExec {
+        let exec = BoundaryExec {
             client,
             provider_credentials: credentials.clone(),
             publication_generation: tokio::sync::Mutex::new(0),
@@ -3588,7 +3950,6 @@ mod tests {
                     provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
-                    policy: Box::new(SandboxPolicyWire::from(context.policy)),
                     ca_cert: Some("c".repeat(16 * 1024)),
                     ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,
@@ -3636,7 +3997,7 @@ mod tests {
                 tls: certificate.client_tls,
                 host_gateway_ip: None,
                 resource_claims: std::collections::BTreeMap::new(),
-                outer_fence: test_outer_fence(),
+                provisioning_evidence: test_provisioning_evidence(),
             },
             test_bearer(&"a".repeat(32)),
         );
@@ -3648,7 +4009,6 @@ mod tests {
                     provider_files: HashMap::new(),
                     sandbox_id: context.sandbox_id,
                     spec: AgentSpecWire::from(context.agent),
-                    policy: Box::new(SandboxPolicyWire::from(context.policy)),
                     ca_cert: Some("c".repeat(16 * 1024)),
                     ca_bundle: Some("b".repeat(256 * 1024)),
                     provider_env_revision: 0,

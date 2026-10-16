@@ -9,19 +9,104 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use openshell_core::jwt::{CredentialEpoch, SecretJwt, SessionRotation};
 use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
 use openshell_core::sandbox_generation::SandboxGenerationId;
-use openshell_isolation_interface::contract::{
-    BoundaryConfirmation, BoundaryDuplexStream, BoundaryExec, BoundaryExitStatus,
-    BoundaryLoopbackConnector, BoundaryProcess, BoundaryProperties, BoundarySignal,
-    ConfirmedBoundary, EnforcedProperty, ExecSession, ExecSpec, LoopbackTarget,
-    NetworkMediationSource, OuterFenceGuarantee, OuterFenceGuarantees, PendingDnsQuery,
-    PendingTcpOpen, ReadyBoundary, RunningBoundary, VerifiedBackendDescriptor,
-};
+use openshell_isolation_interface::contract::{BoundaryConfirmation, ProvisioningEvidence};
 #[cfg(unix)]
 use openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs;
 
 const TEST_BACKEND: &str = "in-process-test";
 // Deliberately not JSON or a SandboxRuntimeDescriptor. Only TestSetup accepts it.
 const TEST_PAYLOAD: &[u8] = b"in-process-v1\0owned-launch";
+
+#[test]
+fn endpoint_registrations_reject_duplicates_builtin_replacement_and_bad_routes() {
+    for config in [
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"relative"}}]}"#,
+        r#"{"backends":[{"name":"openshell-sandbox","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/a"}},{"name":"external","endpoint":{"kind":"unix","socket_path":"/b"}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"tcp","authority":"backend","addresses":["0.0.0.0:443"]}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"vsock","guest_cid":2,"port":47000}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"vsock","guest_cid":4294967295,"port":47000}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"vsock","guest_cid":3,"port":4294967295}}]}"#,
+        r#"{"backends":[{"name":" ","endpoint":{"kind":"unix","socket_path":"/a"}}]}"#,
+    ] {
+        let registrations: BackendRegistrations = serde_json::from_str(config).unwrap();
+        assert!(registrations.validate().is_err(), "{config}");
+    }
+}
+
+#[test]
+fn registered_backend_selects_operator_endpoint_and_preserves_opaque_payload() {
+    use openshell_sandbox_backend::boundary_protocol::SandboxTlsClientConfig;
+    use openshell_sandbox_backend::delegated::DelegatedLaunch;
+    let setup = TestSetup::new();
+    let tls = openshell_sandbox_backend::boundary_protocol::generate_sandbox_tls_material(
+        setup.auth.session_id,
+    )
+    .unwrap();
+    let registrations: BackendRegistrations = serde_json::from_str(
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#,
+    ).unwrap();
+    let launch = DelegatedLaunch {
+        backend_name: "external".into(),
+        sandbox_id: setup.sandbox_id.clone(),
+        generation: setup.auth.runtime_generation.to_string(),
+        session_id: setup.auth.session_id,
+        workload_identity: identity(),
+        tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: None,
+        resource_claims: BTreeMap::new(),
+        provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
+            "generation-1",
+            b"driver-fence",
+        )
+        .unwrap(),
+    };
+    assert!(registrations.resolve("unknown", launch.clone()).is_err());
+    assert!(registrations.resolve("External", launch.clone()).is_err());
+    for field in ["name", "tls", "fence", "identity"] {
+        let mut invalid = launch.clone();
+        match field {
+            "name" => invalid.backend_name = "other".into(),
+            "tls" => invalid.tls.trust_anchor_pem.clear(),
+            "fence" => invalid.provisioning_evidence.generation = "other".into(),
+            "identity" => invalid.workload_identity.uid = 0,
+            _ => unreachable!(),
+        }
+        assert!(
+            registrations.resolve("external", invalid).is_err(),
+            "{field}"
+        );
+    }
+    let registered = registrations.resolve("external", launch).unwrap();
+    let selected = SelectedBackend::select(
+        &registered,
+        BackendDescriptor {
+            backend_name: "external".into(),
+            payload: TEST_PAYLOAD.to_vec(),
+        },
+        Some("external"),
+        Some("sandbox-1"),
+        &setup.auth,
+    )
+    .unwrap();
+    assert_eq!(selected.descriptor.payload, TEST_PAYLOAD);
+    assert!(
+        SelectedBackend::select(
+            &registered,
+            BackendDescriptor {
+                backend_name: "external".into(),
+                payload: TEST_PAYLOAD.to_vec()
+            },
+            Some("workload-choice"),
+            Some("sandbox-1"),
+            &setup.auth
+        )
+        .is_err()
+    );
+}
 
 #[derive(Default)]
 struct Observed {
@@ -64,7 +149,7 @@ impl TestSetup {
                 gateway_token: SecretJwt::parse("test-gateway-token").unwrap(),
                 gateway_expires_at: 0,
                 sandbox_token: SecretJwt::parse("test-sandbox-token").unwrap(),
-                sandbox_expires_at: 0,
+                sandbox_expires_at: i64::MAX,
                 ssh_host_private_key: None,
                 ocsf_otlp_headers: None,
             },
@@ -191,212 +276,111 @@ impl PreparedBackend for TestLaunch {
         self.observed.record("build");
         let services = Arc::new(services);
         *self.observed.services.lock().unwrap() = Arc::downgrade(&services);
+        let lease = Lease(self.observed.clone());
+        let generation = self.generation.clone();
+        let session_id = self.expected_session;
+        let observed = self.observed.clone();
+        let live_services = services.clone();
+        let handler = Arc::new(
+            move |request: openshell_sandbox_backend::boundary_protocol::Request| {
+                use openshell_sandbox_backend::boundary_protocol::{
+                    ExitStatusWire, Request, Response, SessionSnapshotWire,
+                };
+                let _lease = &lease;
+                Ok(match request {
+                    Request::Attach { .. } => {
+                        observed.record("attach");
+                        if observed.active.swap(true, Ordering::SeqCst) {
+                            return Err(BackendError::Denied("already attached".into()));
+                        }
+                        Response::Attached {
+                            snapshot: SessionSnapshotWire {
+                                generation: generation.clone(),
+                                processes: vec![],
+                            },
+                        }
+                    }
+                    Request::Confirm => {
+                        observed.record("confirm");
+                        if observed.deny_confirmation.load(Ordering::SeqCst) {
+                            return Err(BackendError::Unsupported(
+                                "policy cannot be enforced".into(),
+                            ));
+                        }
+                        Response::Confirmed {
+                            confirmation: Box::new(BoundaryConfirmation {
+                                generation: generation.clone(),
+                                identity: identity(),
+                                session_id,
+                                provisioning_evidence_digest:
+                                    ProvisioningEvidence::from_enforcement_evidence(
+                                        &generation,
+                                        b"in-process-enforcement-evidence",
+                                    )?
+                                    .evidence_digest,
+                                resource_claims: BTreeMap::new(),
+                                backend_audit: serde_json::json!({"rpc_test":true}),
+                            }),
+                        }
+                    }
+                    Request::StartAgent {
+                        provider_env_revision,
+                        ..
+                    } => {
+                        if observed.require_networking.load(Ordering::SeqCst) {
+                            let paths = live_services.ca_file_paths.lock().unwrap();
+                            let (certificate, bundle) =
+                                paths.as_ref().expect("networking published CA paths");
+                            assert!(certificate.is_file());
+                            assert!(bundle.is_file());
+                        }
+                        observed.record("start");
+                        observed.starts.fetch_add(1, Ordering::SeqCst);
+                        Response::Started {
+                            process_id: "main".into(),
+                            provider_env_revision,
+                            provider_env_generation: 1,
+                        }
+                    }
+                    Request::Wait { .. } => Response::Exited {
+                        status: ExitStatusWire::Exited(0),
+                    },
+                    Request::AttachProcess { .. } => Response::ProcessAttached { terminal: false },
+                    Request::TerminateBoundary => Response::BoundaryTerminated,
+                    _ => return Err(BackendError::Unsupported("test peer".into())),
+                })
+            },
+        );
+        let backend = openshell_sandbox_backend::test_support::backend(
+            self.name.into(),
+            SandboxContext {
+                sandbox_id: "sandbox-1".into(),
+                session_id: self.expected_session,
+                policy: policy(),
+                agent: agent(),
+                identity: identity(),
+            },
+            self.generation,
+            TEST_PAYLOAD.to_vec(),
+            services.ca_file_paths.clone(),
+            services.provider_credentials.clone(),
+            services.sandbox_bearer.clone(),
+            handler,
+        );
         Ok(BuiltBackend {
             payload: TEST_PAYLOAD.to_vec(),
             proxy_listener: None,
-            backend: Arc::new(TestBackend {
-                name: self.name,
-                observed: self.observed,
-                services,
-                generation: self.generation,
-                expected_session: self.expected_session,
-            }),
+            backend: Arc::new(backend),
         })
     }
 }
 
-struct TestBackend {
-    name: &'static str,
-    observed: Arc<Observed>,
-    services: Arc<BackendServices>,
-    generation: String,
-    expected_session: SandboxSessionId,
-}
-
-#[tonic::async_trait]
-impl IsolationBackend for TestBackend {
-    fn backend_name(&self) -> &str {
-        self.name
-    }
-
-    async fn attach(
-        &self,
-        descriptor: VerifiedBackendDescriptor,
-        sandbox: SandboxContext,
-    ) -> std::result::Result<Box<dyn BoundBoundary>, BackendError> {
-        self.observed.record("attach");
-        assert_eq!(descriptor.payload(), TEST_PAYLOAD);
-        assert_eq!(descriptor.backend_name(), TEST_BACKEND);
-        assert_eq!(sandbox.sandbox_id, "sandbox-1");
-        assert_eq!(sandbox.session_id, self.expected_session);
-        assert_eq!(sandbox.identity, identity());
-        assert_eq!(sandbox.agent.program, "test-agent");
-        assert_eq!(sandbox.agent.args, ["test-argument"]);
-        assert_eq!(sandbox.agent.workdir.as_deref(), Some("/test-workspace"));
-        assert_eq!(sandbox.agent.timeout_secs, 15);
-        assert_eq!(sandbox.policy.version, 1);
-        if self.observed.active.swap(true, Ordering::SeqCst) {
-            return Err(BackendError::Denied("resource already owned".into()));
-        }
-        Ok(Box::new(TestBound {
-            lease: Lease(self.observed.clone()),
-            services: self.services.clone(),
-            generation: self.generation.clone(),
-            session_id: sandbox.session_id,
-        }))
-    }
-}
-
-// Models backend ownership only. Dropping a rejected or completed attempt
-// releases this in-process resource; these tests make no Linux cleanup claim.
 struct Lease(Arc<Observed>);
 
 impl Drop for Lease {
     fn drop(&mut self) {
         self.0.active.store(false, Ordering::SeqCst);
         self.0.releases.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-struct TestBound {
-    lease: Lease,
-    services: Arc<BackendServices>,
-    generation: String,
-    session_id: SandboxSessionId,
-}
-
-#[tonic::async_trait]
-impl BoundBoundary for TestBound {
-    fn network_mediation_source(&self) -> Arc<dyn NetworkMediationSource> {
-        Arc::new(TestIo)
-    }
-
-    async fn confirm(self: Box<Self>) -> std::result::Result<ConfirmedBoundary, BackendError> {
-        self.lease.0.record("confirm");
-        let property = EnforcedProperty::new(true, "in-process-test");
-        let confirmation = BoundaryConfirmation {
-            generation: self.generation.clone(),
-            identity: identity(),
-            properties: BoundaryProperties {
-                filesystem_confinement: property.clone(),
-                egress_interception: property.clone(),
-                request_attribution: property.clone(),
-                privilege_floor: property,
-            },
-            authenticated_supervisor: !self.lease.0.deny_confirmation.load(Ordering::SeqCst),
-            session_id: self.session_id,
-            outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
-                &self.generation,
-                [
-                    OuterFenceGuarantee::DefaultDenyEgress,
-                    OuterFenceGuarantee::NoUnmanagedEgressPath,
-                    OuterFenceGuarantee::RevocationVerified,
-                    OuterFenceGuarantee::ControllerLossFailsClosed,
-                ],
-                b"in-process-enforcement-evidence",
-            )?,
-            runtime_exit_terminates_workload: true,
-            resource_claims: BTreeMap::new(),
-            backend_audit: serde_json::json!({"in_process": true}),
-        };
-        ConfirmedBoundary::try_new(self, confirmation, &identity())
-    }
-}
-
-#[tonic::async_trait]
-impl ReadyBoundary for TestBound {
-    async fn start_agent(
-        self: Box<Self>,
-    ) -> std::result::Result<Box<dyn RunningBoundary>, BackendError> {
-        if self.lease.0.require_networking.load(Ordering::SeqCst) {
-            let paths = self.services.ca_file_paths.lock().unwrap();
-            let (certificate, bundle) = paths.as_ref().expect("networking published CA paths");
-            assert!(certificate.is_file());
-            assert!(bundle.is_file());
-        }
-        self.lease.0.record("start");
-        self.lease.0.starts.fetch_add(1, Ordering::SeqCst);
-        Ok(Box::new(TestRunning {
-            _lease: self.lease,
-            _services: self.services,
-        }))
-    }
-}
-
-struct TestRunning {
-    _lease: Lease,
-    _services: Arc<BackendServices>,
-}
-
-#[tonic::async_trait]
-impl RunningBoundary for TestRunning {
-    fn agent(&self) -> Arc<dyn BoundaryProcess> {
-        Arc::new(TestIo)
-    }
-    fn exec(&self) -> Arc<dyn BoundaryExec> {
-        Arc::new(TestIo)
-    }
-    fn loopback_connector(&self) -> Arc<dyn BoundaryLoopbackConnector> {
-        Arc::new(TestIo)
-    }
-    async fn terminate(&self) -> std::result::Result<(), BackendError> {
-        Ok(())
-    }
-}
-
-struct TestIo;
-
-#[tonic::async_trait]
-impl NetworkMediationSource for TestIo {
-    async fn accept_tcp(&self) -> std::result::Result<PendingTcpOpen, BackendError> {
-        std::future::pending().await
-    }
-    async fn accept_dns(&self) -> std::result::Result<PendingDnsQuery, BackendError> {
-        std::future::pending().await
-    }
-}
-
-#[tonic::async_trait]
-impl BoundaryProcess for TestIo {
-    async fn attach(
-        &self,
-    ) -> std::result::Result<openshell_isolation_interface::contract::ProcessAttachment, BackendError>
-    {
-        Ok(openshell_isolation_interface::contract::ProcessAttachment {
-            stdin: Box::new(tokio::io::sink()),
-            stdout: Box::new(tokio::io::empty()),
-            stderr: Some(Box::new(tokio::io::empty())),
-            terminal: None,
-        })
-    }
-
-    async fn wait(&self) -> std::result::Result<BoundaryExitStatus, BackendError> {
-        Ok(BoundaryExitStatus::Exited(0))
-    }
-    async fn signal(&self, _: BoundarySignal) -> std::result::Result<(), BackendError> {
-        Ok(())
-    }
-    async fn terminate(&self) -> std::result::Result<(), BackendError> {
-        Ok(())
-    }
-}
-
-#[tonic::async_trait]
-impl BoundaryExec for TestIo {
-    async fn exec(&self, _: ExecSpec) -> std::result::Result<ExecSession, BackendError> {
-        Err(BackendError::Unsupported("test backend has no exec".into()))
-    }
-}
-
-#[tonic::async_trait]
-impl BoundaryLoopbackConnector for TestIo {
-    async fn connect(
-        &self,
-        _: LoopbackTarget,
-    ) -> std::result::Result<BoundaryDuplexStream, BackendError> {
-        Err(BackendError::Unsupported(
-            "test backend has no connector".into(),
-        ))
     }
 }
 
@@ -532,6 +516,8 @@ async fn attachment_receives_live_supervisor_services() {
     );
     drop(backend_services);
     drop(bound);
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
 }
 
@@ -548,6 +534,7 @@ async fn constructed_backend_must_keep_selected_name() {
     );
     assert_eq!(setup.observed.events(), ["decode", "build"]);
     assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+    tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
 }
 
@@ -580,9 +567,8 @@ fn standard_setup_decodes_native_descriptor_and_preserves_vm_identity() {
         },
         host_gateway_ip: None,
         resource_claims: BTreeMap::new(),
-        outer_fence: OuterFenceGuarantees::from_enforcement_evidence(
+        provisioning_evidence: ProvisioningEvidence::from_enforcement_evidence(
             "generation-1",
-            [],
             b"test-evidence",
         )
         .unwrap(),
@@ -713,6 +699,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 ocsf_enabled: Arc::new(AtomicBool::new(false)),
                 ocsf_schema_version: Arc::new(Mutex::new(String::new())),
                 upstream_proxy_args: UpstreamProxyArgs::default(),
+                additional_ca_bundle: None,
                 backend_descriptor: TestSetup::descriptor(),
                 auth_bundle: setup.auth.clone(),
                 admitted_isolation_backend: Some(TEST_BACKEND.into()),
@@ -762,8 +749,10 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
         ]
     );
     assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 0);
+    tokio::task::yield_now().await;
     assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 1);
     assert!(!setup.observed.active.load(Ordering::SeqCst));
+    tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
     assert!(!readiness.exists());
     assert!(!marker.exists());
@@ -792,7 +781,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             }
         })
         .await
-        .expect("selected backend did not reach process completion and readiness");
+        .unwrap_or_else(|error| panic!("RPC startup did not reach completion/readiness: {error}; events={:?}, starts={}, marker={}", setup.observed.events(), setup.observed.starts.load(Ordering::SeqCst), marker.exists()));
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "exit_code=0\n");
         assert_eq!(setup.observed.starts.load(Ordering::SeqCst), 1);
         assert!(setup.observed.active.load(Ordering::SeqCst));
@@ -810,8 +799,10 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             "discover", "build", "attach", "confirm", "start"
         ]
     );
+    tokio::task::yield_now().await;
     assert_eq!(setup.observed.releases.load(Ordering::SeqCst), 2);
     assert!(!setup.observed.active.load(Ordering::SeqCst));
+    tokio::task::yield_now().await;
     assert!(setup.observed.services.lock().unwrap().upgrade().is_none());
     assert!(!readiness.exists());
     // Listener tasks are aborted on drop; let the runtime reap their sockets.

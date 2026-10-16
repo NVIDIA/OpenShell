@@ -31,7 +31,7 @@ let
       };
       aarch64-darwin = {
         platform = "darwin-aarch64";
-        hash = "sha256-cPfogd7QiPFk76kR1JJeKLaWwFksAZ9BeW/LsmDgsjo=";
+        hash = "sha256-Sm0zwSkctPETKd46zqOqDO02jLapQ3ST1hafqIVkVjU=";
         artifacts = [
           "libkrun.dylib"
           "libkrunfw.5.dylib"

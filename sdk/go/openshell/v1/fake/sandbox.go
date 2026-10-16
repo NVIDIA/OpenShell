@@ -309,7 +309,7 @@ func newFakeSandboxClient(
 }
 
 // Create creates a new sandbox with Provisioning phase.
-func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, spec *types.SandboxSpec, opts ...types.CreateOption) (*types.Sandbox, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -318,17 +318,14 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 		spec = &types.SandboxSpec{}
 	}
 
-	var annotations map[string]string
-	if len(opts) > 0 {
-		annotations = copyStringMap(opts[0].Annotations)
-	}
+	cfg := types.ApplyCreateOptions(opts)
 
 	sb := &types.Sandbox{
 		Name:            name,
 		Workspace:       workspace,
 		CreatedAt:       time.Now(),
-		Labels:          copyStringMap(labels),
-		Annotations:     annotations,
+		Labels:          copyStringMap(cfg.Labels()),
+		Annotations:     copyStringMap(cfg.Annotations()),
 		ResourceVersion: 1,
 		Spec:            copySandboxSpec(*spec),
 		Status: types.SandboxStatus{
@@ -350,7 +347,7 @@ func (c *fakeSandboxClient) Create(_ context.Context, workspace, name string, sp
 }
 
 // CreateFromTemplate creates a new sandbox from a named template with Provisioning phase.
-func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, spec *types.SandboxSpec, labels map[string]string, opts ...types.CreateOptions) (*types.Sandbox, error) {
+func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, name, templateName string, spec *types.SandboxSpec, opts ...types.CreateOption) (*types.Sandbox, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}
@@ -368,10 +365,7 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 		spec = &types.SandboxSpec{}
 	}
 
-	var annotations map[string]string
-	if len(opts) > 0 {
-		annotations = copyStringMap(opts[0].Annotations)
-	}
+	cfg := types.ApplyCreateOptions(opts)
 
 	resolvedSpec := sandboxSpecFromWorkloadTemplate(template)
 	resolvedSpec.Providers = copyStringSlice(spec.Providers)
@@ -383,8 +377,8 @@ func (c *fakeSandboxClient) CreateFromTemplate(_ context.Context, workspace, nam
 		Name:            name,
 		Workspace:       workspace,
 		CreatedAt:       time.Now(),
-		Labels:          copyStringMap(labels),
-		Annotations:     annotations,
+		Labels:          copyStringMap(cfg.Labels()),
+		Annotations:     copyStringMap(cfg.Annotations()),
 		ResourceVersion: 1,
 		Spec:            resolvedSpec,
 		CreatedFromWorkloadTemplate: &types.SandboxWorkloadTemplateProvenance{
