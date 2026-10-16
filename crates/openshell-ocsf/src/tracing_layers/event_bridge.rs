@@ -125,6 +125,7 @@ mod tests {
                     profiles: vec![],
                     uid: None,
                     log_source: None,
+                    correlation_uid: None,
                 },
             ),
         })

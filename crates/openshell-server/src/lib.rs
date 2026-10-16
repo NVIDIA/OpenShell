@@ -241,6 +241,7 @@ fn spawn_gateway_extension_token_refresh(
         }
     });
 }
+pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
@@ -1197,6 +1198,7 @@ fn spawn_gateway_connection(
                                     tls_stream,
                                     peer_identity,
                                     certificate_sha256,
+                                    ConnectionSource::Peer(addr),
                                 )
                                 .await
                             {
@@ -1223,7 +1225,7 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            if let Err(e) = service.serve(stream, ConnectionSource::Peer(addr)).await {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {

@@ -43,7 +43,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     OpenShellService, ServerState,
-    auth::audit,
+    auth::audit::{self, ConnectionSource, RequestOrigin},
     auth::authenticator::{AuthFailureReason, AuthMechanism, Authentication, AuthenticatorChain},
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
@@ -236,11 +236,15 @@ impl MultiplexService {
     }
 
     /// Serve a connection, routing to gRPC or HTTP based on content-type.
-    pub async fn serve<S>(&self, stream: S) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    pub async fn serve<S>(
+        &self,
+        stream: S,
+        source: ConnectionSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_peer_identity(stream, None).await
+        self.serve_with_peer_identity(stream, None, source).await
     }
 
     /// Serve a TLS connection with an optional mTLS peer identity.
@@ -248,11 +252,12 @@ impl MultiplexService {
         &self,
         stream: S,
         peer_identity: Option<Identity>,
+        source: ConnectionSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_verified_certificate(stream, peer_identity, None)
+        self.serve_with_verified_certificate(stream, peer_identity, None, source)
             .await
     }
 
@@ -262,6 +267,7 @@ impl MultiplexService {
         stream: S,
         peer_identity: Option<Identity>,
         certificate_sha256: Option<String>,
+        source: ConnectionSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -308,7 +314,8 @@ impl MultiplexService {
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         )
-        .with_operator(operator);
+        .with_operator(operator)
+        .with_connection_source(source);
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
@@ -1036,6 +1043,7 @@ pub struct AuthGrpcRouter<S> {
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
     operator: Option<OperatorPrincipal>,
+    connection_source: Option<ConnectionSource>,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -1064,11 +1072,17 @@ impl<S> AuthGrpcRouter<S> {
             mtls_auth_enabled,
             allow_unauthenticated_users,
             operator: None,
+            connection_source: None,
         }
     }
 
     fn with_operator(mut self, operator: Option<OperatorPrincipal>) -> Self {
         self.operator = operator;
+        self
+    }
+
+    fn with_connection_source(mut self, source: ConnectionSource) -> Self {
+        self.connection_source = Some(source);
         self
     }
 }
@@ -1111,12 +1125,17 @@ where
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
         let operator = self.operator.clone();
+        let connection_source = self.connection_source;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let mut req = req;
+            if let Some(source) = connection_source {
+                req.extensions_mut().insert(source);
+            }
 
             let path = req.uri().path().to_string();
+            let origin = |headers: &http::HeaderMap| RequestOrigin::new(connection_source, headers);
 
             // Health probes and reflection — truly unauthenticated.
             if oidc::is_unauthenticated_method(&path) {
@@ -1127,6 +1146,7 @@ where
                 if req.headers().contains_key(http::header::AUTHORIZATION) {
                     audit::emit_authentication_failure(
                         &path,
+                        &origin(req.headers()),
                         Some(AuthMechanism::Mtls),
                         AuthFailureReason::ConflictingCredentials,
                     );
@@ -1148,7 +1168,12 @@ where
                                 }
                                 _ => (None, AuthFailureReason::MissingCredential),
                             };
-                            audit::emit_authentication_failure(&path, mechanism, reason);
+                            audit::emit_authentication_failure(
+                                &path,
+                                &origin(req.headers()),
+                                mechanism,
+                                reason,
+                            );
                             return Ok(status_response(tonic::Status::unauthenticated(
                                 "missing authorization header",
                             )));
@@ -1157,6 +1182,7 @@ where
                     Err(rejection) => {
                         audit::emit_authentication_failure(
                             &path,
+                            &origin(req.headers()),
                             Some(rejection.mechanism),
                             rejection.reason,
                         );
@@ -1167,6 +1193,7 @@ where
                 let Some(identity) = peer_identity else {
                     audit::emit_authentication_failure(
                         &path,
+                        &origin(req.headers()),
                         Some(AuthMechanism::Mtls),
                         AuthFailureReason::MissingCredential,
                     );
@@ -3228,6 +3255,54 @@ mod tests {
         assert_eq!(normalize_http_path("/"), "unknown");
     }
 
+    #[tokio::test]
+    async fn served_connection_reports_its_peer_and_generated_request_id() {
+        use openshell_core::proto::{ListSandboxesRequest, open_shell_client::OpenShellClient};
+        use openshell_ocsf::test_support::OcsfCapture;
+
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        Arc::get_mut(&mut state).unwrap().config.mtls_auth.enabled = true;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = MultiplexService::new(state);
+        tokio::spawn(async move {
+            let (stream, peer) = listener.accept().await.unwrap();
+            openshell_core::net::set_tcp_nodelay_best_effort(&stream);
+            let _ = service.serve(stream, ConnectionSource::Peer(peer)).await;
+        });
+        let capture = OcsfCapture::default();
+        let _guard = capture.install();
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{address}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let error = OpenShellClient::new(channel)
+            .list_sandboxes(ListSandboxesRequest::default())
+            .await
+            .expect_err("a request without a client certificate must be rejected");
+        let returned_request_id = error
+            .metadata()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("the gateway returns the request ID it generated");
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        let events: Vec<_> = capture
+            .events()
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["src_endpoint"]["ip"], "127.0.0.1");
+        assert!(events[0]["src_endpoint"]["port"].as_u64().is_some());
+        assert_eq!(
+            events[0]["metadata"]["correlation_uid"],
+            returned_request_id
+        );
+    }
+
     mod auth_router {
         use super::*;
         use crate::auth::authenticator::AuthRejection;
@@ -3994,6 +4069,96 @@ mod tests {
             assert_eq!(events.len(), 1, "{events:?}");
             assert_authentication_failure(&events[0], path, "invalid_credential", 3);
             assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
+        }
+
+        const REQUEST_ID: &str = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
+
+        async fn missing_credential_event(
+            source: ConnectionSource,
+            request_id: &str,
+        ) -> serde_json::Value {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::new(recorder, Some(chain), None).with_connection_source(source);
+            let request = Request::builder()
+                .uri("/openshell.v1.OpenShell/ListSandboxes")
+                .header("x-request-id", request_id)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            router.call(request).await.unwrap();
+
+            let mut events = captured_json(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            events.remove(0)
+        }
+
+        #[tokio::test]
+        async fn authentication_failure_carries_peer_address_and_request_id() {
+            let event = missing_credential_event(
+                ConnectionSource::Peer("203.0.113.7:51234".parse().unwrap()),
+                REQUEST_ID,
+            )
+            .await;
+
+            assert_eq!(
+                event["src_endpoint"],
+                serde_json::json!({"ip": "203.0.113.7", "port": 51234})
+            );
+            assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID);
+        }
+
+        #[tokio::test]
+        async fn ipv4_mapped_peer_address_is_reported_as_ipv4() {
+            let event = missing_credential_event(
+                ConnectionSource::Peer("[::ffff:203.0.113.7]:51234".parse().unwrap()),
+                REQUEST_ID,
+            )
+            .await;
+
+            assert_eq!(event["src_endpoint"]["ip"], "203.0.113.7");
+        }
+
+        #[tokio::test]
+        async fn tunnel_source_is_named_and_non_uuid_request_ids_are_dropped() {
+            let event =
+                missing_credential_event(ConnectionSource::EdgeTunnel, "attacker [controlled]")
+                    .await;
+
+            assert_eq!(
+                event["src_endpoint"],
+                serde_json::json!({"name": "edge-tunnel"})
+            );
+            assert!(event["metadata"].get("correlation_uid").is_none());
+            assert!(!event.to_string().contains("attacker"));
+        }
+
+        #[tokio::test]
+        async fn connection_source_reaches_handlers() {
+            let seen = Arc::new(Mutex::new(None));
+            let recorded = seen.clone();
+            let inner = tower::service_fn(move |req: Request<Full<Bytes>>| {
+                *recorded.lock().unwrap() = req.extensions().get::<ConnectionSource>().copied();
+                async { Ok::<_, Infallible>(Response::new(tonic::body::Body::empty())) }
+            });
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user_principal("alice")),
+            )))]);
+            let source = ConnectionSource::Peer("203.0.113.7:51234".parse().unwrap());
+            let mut router =
+                AuthGrpcRouter::new(inner, Some(chain), None).with_connection_source(source);
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert_eq!(*seen.lock().unwrap(), Some(source));
         }
 
         #[tokio::test]

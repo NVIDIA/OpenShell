@@ -23,6 +23,7 @@ pub struct AuthenticationBuilder<'a> {
     status_detail: Option<String>,
     src_endpoint: Option<Endpoint>,
     http_request: Option<HttpRequest>,
+    correlation_uid: Option<String>,
     message: Option<String>,
 }
 
@@ -42,6 +43,7 @@ impl<'a> AuthenticationBuilder<'a> {
             status_detail: None,
             src_endpoint: None,
             http_request: None,
+            correlation_uid: None,
             message: None,
         }
     }
@@ -68,6 +70,13 @@ impl<'a> AuthenticationBuilder<'a> {
         self
     }
 
+    /// Set the identifier shared by events about the same request.
+    #[must_use]
+    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
+        self.correlation_uid = Some(uid.into());
+        self
+    }
+
     #[must_use]
     pub fn src_endpoint(mut self, endpoint: Endpoint) -> Self {
         self.src_endpoint = Some(endpoint);
@@ -83,6 +92,8 @@ impl<'a> AuthenticationBuilder<'a> {
 
     #[must_use]
     pub fn build(self) -> OcsfEvent {
+        let mut metadata = self.ctx.metadata(&["security_control", "host"]);
+        metadata.correlation_uid = self.correlation_uid;
         let mut base = BaseEventData::new(
             3002,
             "Authentication",
@@ -91,7 +102,7 @@ impl<'a> AuthenticationBuilder<'a> {
             1,
             "Logon",
             self.severity,
-            self.ctx.metadata(&["security_control", "host"]),
+            metadata,
         );
         if let Some(status) = self.status {
             base.set_status(status);
@@ -224,6 +235,36 @@ mod tests {
             serde_json::json!(["security_control", "host"])
         );
         assert!(json.get("container").is_none());
+        assert!(json["metadata"].get("correlation_uid").is_none());
+    }
+
+    #[test]
+    fn correlated_event_from_a_named_source_matches_vendored_schema() {
+        let ctx = test_sandbox_context();
+        let json = AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .src_endpoint(Endpoint::from_name("edge-tunnel"))
+        .correlation_uid("6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f")
+        .build()
+        .to_json()
+        .unwrap();
+
+        let endpoint = load_object_schema("network_endpoint");
+        validate_known_fields(&json["src_endpoint"], &endpoint);
+        let metadata = load_object_schema("metadata");
+        validate_required_fields(&json["metadata"], &metadata);
+        validate_known_fields(&json["metadata"], &metadata);
+        assert_eq!(
+            json["src_endpoint"],
+            serde_json::json!({"name": "edge-tunnel"})
+        );
+        assert_eq!(
+            json["metadata"]["correlation_uid"],
+            "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
+        );
     }
 
     #[test]

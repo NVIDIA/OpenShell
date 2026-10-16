@@ -430,7 +430,13 @@ impl OcsfEvent {
                     .as_ref()
                     .map(|ep| {
                         let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
-                        format!(" from {}{port}", ep.domain_or_ip())
+                        let host = ep
+                            .domain
+                            .as_deref()
+                            .or(ep.ip.as_deref())
+                            .or(ep.name.as_deref())
+                            .unwrap_or("unknown");
+                        format!(" from {}{port}", escape_context_field(host))
                     })
                     .unwrap_or_default();
                 let mut context = Vec::new();
@@ -614,6 +620,7 @@ mod tests {
             profiles: vec!["security_control".to_string()],
             uid: Some("sandbox-abc123".to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -1122,6 +1129,25 @@ mod tests {
         assert_eq!(
             event.format_shorthand(),
             "AUTH:LOGON [MED] DENIED unknown from 203.0.113.7:51234 [protocol:OpenID op:/openshell.v1.OpenShell/ListSandboxes reason:expired_credential]"
+        );
+    }
+
+    #[test]
+    fn test_authentication_shorthand_names_an_unaddressed_source() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .action(ActionId::Denied)
+        .severity(crate::enums::SeverityId::Low)
+        .src_endpoint(Endpoint::from_name("edge-tunnel"))
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [LOW] DENIED unknown from edge-tunnel"
         );
     }
 

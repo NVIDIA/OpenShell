@@ -15,7 +15,7 @@
 //! ordinary RPCs or select another successor.
 
 use crate::ServerState;
-use crate::auth::audit;
+use crate::auth::audit::{self, ConnectionSource, RequestOrigin};
 use crate::auth::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection};
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
@@ -271,6 +271,10 @@ pub async fn handle_refresh_sandbox_token(
     .map_err(|rejection| {
         audit::emit_authentication_failure(
             REFRESH_SANDBOX_TOKEN_PATH,
+            &RequestOrigin::new(
+                request.extensions().get::<ConnectionSource>().copied(),
+                request.metadata().as_ref(),
+            ),
             Some(rejection.mechanism),
             rejection.reason,
         );
@@ -784,6 +788,13 @@ mod tests {
             let _guard = capture.install();
             let mut replay = request();
             set_refresh_authorization(&mut replay, &first);
+            replay.extensions_mut().insert(ConnectionSource::Peer(
+                "203.0.113.7:51234".parse().expect("peer address"),
+            ));
+            replay.metadata_mut().insert(
+                "x-request-id",
+                "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f".parse().unwrap(),
+            );
             handle_refresh_sandbox_token(&state, replay)
                 .await
                 .expect_err("consumed predecessor must be rejected")
@@ -806,6 +817,11 @@ mod tests {
         assert_eq!(
             events[0]["http_request"]["url"]["path"],
             "/openshell.v1.OpenShell/RefreshSandboxToken"
+        );
+        assert_eq!(events[0]["src_endpoint"]["ip"], "203.0.113.7");
+        assert_eq!(
+            events[0]["metadata"]["correlation_uid"],
+            "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
         );
         assert!(!events[0].to_string().contains(&first));
     }

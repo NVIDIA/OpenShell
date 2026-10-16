@@ -108,6 +108,7 @@ mod tests {
                     profiles: vec!["security_control".to_string()],
                     uid: Some("sandbox-abc123".to_string()),
                     log_source: None,
+                    correlation_uid: None,
                 },
             ),
             finding_info: FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack")

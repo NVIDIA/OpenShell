@@ -101,6 +101,7 @@ mod tests {
                 profiles: vec!["ai_operation".to_string()],
                 uid: None,
                 log_source: None,
+                correlation_uid: None,
             },
         );
         base.set_ai_model(AiModel::new("claude-3-haiku", "anthropic"));

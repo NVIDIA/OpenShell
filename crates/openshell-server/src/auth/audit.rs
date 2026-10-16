@@ -7,9 +7,49 @@
 //! credentials or raw verification errors.
 
 use openshell_ocsf::{
-    ActionId, AuthProtocolId, AuthenticationBuilder, DispositionId, HttpMethod, HttpRequest,
-    Service, SeverityId, StatusId, Url, User, ocsf_emit,
+    ActionId, AuthProtocolId, AuthenticationBuilder, DispositionId, Endpoint, HttpMethod,
+    HttpRequest, Service, SeverityId, StatusId, Url, User, ocsf_emit,
 };
+use std::net::SocketAddr;
+
+/// Where a gateway connection came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionSource {
+    /// A direct TCP connection. The address is the immediate peer, which is
+    /// a proxy or load balancer when one fronts the gateway.
+    Peer(SocketAddr),
+    /// A connection carried over the WebSocket tunnel endpoint.
+    EdgeTunnel,
+}
+
+impl ConnectionSource {
+    fn endpoint(self) -> Endpoint {
+        match self {
+            Self::Peer(addr) => Endpoint::from_ip(addr.ip().to_canonical(), addr.port()),
+            Self::EdgeTunnel => Endpoint::from_name("edge-tunnel"),
+        }
+    }
+}
+
+/// Request details recorded on every audit event about the request.
+#[derive(Debug, Clone, Default)]
+pub struct RequestOrigin {
+    source: Option<ConnectionSource>,
+    request_id: Option<String>,
+}
+
+impl RequestOrigin {
+    /// Only a canonical UUID `x-request-id` is kept: the value is
+    /// client-controlled and the gateway generates one when it is absent.
+    pub fn new(source: Option<ConnectionSource>, headers: &http::HeaderMap) -> Self {
+        let request_id = headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| openshell_core::endpoint_failure::is_canonical_request_id(value))
+            .map(str::to_owned);
+        Self { source, request_id }
+    }
+}
 
 use super::authenticator::{AuthFailureReason, AuthMechanism};
 
@@ -58,6 +98,7 @@ fn with_protocol(
 /// Emit an Authentication failure event for a gRPC request to `path`.
 pub fn emit_authentication_failure(
     path: &str,
+    origin: &RequestOrigin,
     mechanism: Option<AuthMechanism>,
     reason: AuthFailureReason,
 ) {
@@ -79,6 +120,12 @@ pub fn emit_authentication_failure(
     .message(format!("authentication failed: {}", category(reason)));
     if let Some(mechanism) = mechanism {
         builder = with_protocol(builder, mechanism);
+    }
+    if let Some(source) = origin.source {
+        builder = builder.src_endpoint(source.endpoint());
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
     }
     ocsf_emit!(builder.build());
 }

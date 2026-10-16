@@ -213,6 +213,7 @@ impl EventContext {
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 

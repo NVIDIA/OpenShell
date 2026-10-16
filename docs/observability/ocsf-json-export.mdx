@@ -35,7 +35,9 @@ The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a 
 | `stale_identity` | Medium | The credential names a sandbox runtime or gateway pod that has since been replaced or stopped. |
 | `identity_provider_unavailable` | Medium | The OIDC key endpoint, Kubernetes API, compute driver, or gateway database could not verify the credential. |
 
-These events never include presented credentials, headers, or verification error text.
+`src_endpoint` holds the address of the connection's immediate peer, which is the proxy or load balancer when one fronts the gateway, or the name `edge-tunnel` for requests carried over the WebSocket tunnel. `metadata.correlation_uid` holds the request's `x-request-id` when it is a UUID. The gateway generates one when the client sends none and returns it in the response. A client-supplied ID is recorded as sent, so it identifies the request, not the client.
+
+These events never include presented credentials, other request headers, or verification error text.
 
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
