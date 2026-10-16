@@ -298,6 +298,8 @@ The gateway must already be installed, reachable, and selected before the tests
 start. The test suite does not provision a gateway or select a compute driver.
 Set `OPENSHELL_BIN` to another executable to test a different prebuilt CLI.
 
+The installed-artifact conformance playbook waits for gateway connectivity after each guest boot. On K3s, it also creates a temporary Agent Sandbox resource and waits for its controller-owned Pod. A scheduling gate prevents the probe Pod from running or pulling an image. The playbook removes the probe and its dependent resources before running conformance. This checks reconciliation because the upstream controller Deployment can become available before its controller starts processing resources. Failure diagnostics include controller state, leader leases, events, and current and previous controller logs from the last 30 minutes, with each command and output bounded. Controller logs retain both the beginning and end of that window so later scenarios do not discard startup evidence.
+
 The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
 depending on how the gateway was installed or which driver is configured. It
 requires machine-readable gRPC status, creates a uniquely named detached

@@ -16,6 +16,18 @@ collect() {
   printf '\ncommand status: %s\n' "${PIPESTATUS[0]}"
 }
 
+collect_log() {
+  printf '\n### %s\n' "$1"
+  shift
+  # Retain startup and recent evidence when later scenarios fill the log.
+  timeout 10s "$@" 2>&1 | {
+    head -c 131072
+    printf '\n### Remaining log tail\n'
+    tail -c 131072
+  }
+  printf '\ncommand status: %s\n' "${PIPESTATUS[0]}"
+}
+
 {
   date --utc --iso-8601=seconds
   collect 'K3s service state' systemctl show k3s.service \
@@ -34,6 +46,21 @@ collect() {
   collect 'K3s version' /usr/local/bin/k3s --version
   collect 'API readiness' /usr/local/bin/k3s kubectl --request-timeout=5s get --raw=/readyz
   collect 'Nodes' /usr/local/bin/k3s kubectl --request-timeout=5s get nodes -o wide
+  collect 'Agent Sandbox controller deployment' /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system get deployment agent-sandbox-controller \
+    -o 'custom-columns=NAME:.metadata.name,GENERATION:.metadata.generation,STATUS:.status'
+  collect 'Agent Sandbox controller Pods' /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system get pods \
+    -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,PHASE:.status.phase,CONDITIONS:.status.conditions,CONTAINERS:.status.containerStatuses'
+  collect 'Agent Sandbox leader leases' /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system get leases \
+    -o 'custom-columns=NAME:.metadata.name,HOLDER:.spec.holderIdentity,ACQUIRED:.spec.acquireTime,RENEWED:.spec.renewTime,DURATION:.spec.leaseDurationSeconds,TRANSITIONS:.spec.leaseTransitions'
+  collect 'Agent Sandbox controller events' /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system get events --sort-by=.lastTimestamp
+  collect 'Sandbox reconciliation status' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get sandboxes.agents.x-k8s.io \
+    -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,CREATED:.metadata.creationTimestamp,GENERATION:.metadata.generation,STATUS:.status'
+  mapfile -t controller_pods < <(timeout 10s /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system get pods \
+    --selector app=agent-sandbox-controller --output name 2>/dev/null)
+  for pod in "${controller_pods[@]}"; do
+    collect_log "Agent Sandbox current logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system logs "$pod" --since=30m --timestamps
+    collect_log "Agent Sandbox previous logs ($pod)" /usr/local/bin/k3s kubectl --request-timeout=5s -n agent-sandbox-system logs "$pod" --previous --since=30m --timestamps
+  done
   collect 'Gateway Pod identity and state' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get pods \
     -o 'custom-columns=NAME:.metadata.name,UID:.metadata.uid,PHASE:.status.phase,CONDITIONS:.status.conditions,CONTAINERS:.status.containerStatuses'
   collect 'Gateway Services' /usr/local/bin/k3s kubectl --request-timeout=5s -n openshell get services \
