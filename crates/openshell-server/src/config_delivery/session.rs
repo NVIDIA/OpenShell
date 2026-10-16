@@ -192,12 +192,7 @@ impl ConfigSessionState {
     }
 
     fn send(&mut self, config: SupervisorConfig) -> Result<Outgoing, DeliveryDisposition> {
-        let (update, in_flight) = build_config_update(config, false, |update| {
-            GatewayMessage {
-                payload: Some(gateway_message::Payload::ConfigUpdate(update.clone())),
-            }
-            .encoded_len()
-        });
+        let (update, in_flight) = build_config_update(config, false, live_message_len);
         let message = GatewayMessage {
             payload: Some(gateway_message::Payload::ConfigUpdate(update)),
         };
@@ -425,10 +420,49 @@ impl SupervisorSessionRegistry {
     }
 }
 
+/// The encoded length of a message whose one empty message field is replaced
+/// by a message of `field_len` bytes. An empty message field encodes as its
+/// key and a one-byte zero length. Measuring this way avoids copying a large
+/// configuration into its envelope.
+fn with_message_field(len_with_empty_field: usize, field_len: usize) -> usize {
+    len_with_empty_field - 1 + prost::encoding::encoded_len_varint(field_len as u64) + field_len
+}
+
+/// The encoded length of the message that carries a live update of
+/// `update_len` bytes.
+fn live_message_len(update_len: usize) -> usize {
+    let envelope = GatewayMessage {
+        payload: Some(gateway_message::Payload::ConfigUpdate(
+            ConfigUpdate::default(),
+        )),
+    };
+    with_message_field(envelope.encoded_len(), update_len)
+}
+
+/// The encoded length of the `accepted` message once it carries a bootstrap
+/// of `update_len` bytes.
+fn bootstrap_message_len(accepted: &SessionAccepted, update_len: usize) -> usize {
+    let accepted = SessionAccepted {
+        bootstrap: Some(ConfigUpdate::default()),
+        ..accepted.clone()
+    };
+    let envelope = GatewayMessage {
+        payload: Some(gateway_message::Payload::SessionAccepted(
+            SessionAccepted::default(),
+        )),
+    };
+    with_message_field(
+        envelope.encoded_len(),
+        with_message_field(accepted.encoded_len(), update_len),
+    )
+}
+
+/// `message_size` maps the encoded length of the update to the length of
+/// the message that carries it.
 fn build_config_update(
     config: SupervisorConfig,
     bootstrap: bool,
-    message_size: impl Fn(&ConfigUpdate) -> usize,
+    message_size: impl Fn(usize) -> usize,
 ) -> (ConfigUpdate, InFlightConfigUpdate) {
     let update_id = Uuid::new_v4().to_string();
     let mut update = ConfigUpdate {
@@ -436,7 +470,7 @@ fn build_config_update(
         sandbox_config: Some(config.sandbox_config),
         provider_environment: Some(config.provider_environment),
     };
-    let size = message_size(&update);
+    let size = message_size(update.encoded_len());
     if size > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
         let snapshot = update
             .sandbox_config
@@ -471,14 +505,8 @@ pub fn bootstrap_update(
     config: SupervisorConfig,
     accepted: &SessionAccepted,
 ) -> (ConfigUpdate, BootstrapInFlight) {
-    let (update, in_flight) = build_config_update(config, true, |update| {
-        GatewayMessage {
-            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
-                bootstrap: Some(update.clone()),
-                ..accepted.clone()
-            })),
-        }
-        .encoded_len()
+    let (update, in_flight) = build_config_update(config, true, |update_len| {
+        bootstrap_message_len(accepted, update_len)
     });
     (update, BootstrapInFlight(in_flight))
 }
@@ -1285,12 +1313,7 @@ mod tests {
         config.provider_environment.values[0]
             .value
             .truncate(MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES - overhead);
-        let (live, _) = build_config_update(config.clone(), false, |update| {
-            GatewayMessage {
-                payload: Some(gateway_message::Payload::ConfigUpdate(update.clone())),
-            }
-            .encoded_len()
-        });
+        let (live, _) = build_config_update(config.clone(), false, live_message_len);
         assert!(live.sandbox_config.unwrap().configuration_admitted);
         let acceptance = SessionAccepted {
             session_id: Uuid::new_v4().to_string(),
@@ -1299,6 +1322,47 @@ mod tests {
         };
         let (bootstrap, _) = bootstrap_update(config, &acceptance);
         assert!(!bootstrap.sandbox_config.unwrap().configuration_admitted);
+    }
+
+    #[test]
+    fn message_lengths_match_their_encodings() {
+        let accepted = SessionAccepted {
+            session_id: Uuid::new_v4().to_string(),
+            config_push_enabled: true,
+            heartbeat_interval: Some(prost_types::Duration {
+                seconds: 15,
+                nanos: 0,
+            }),
+            ..Default::default()
+        };
+        // Cover the lengths where a length prefix gains a byte.
+        for value_len in [0, 100, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152] {
+            let mut config = admitted_config();
+            config.provider_environment.values = vec![ProviderEnvironmentValue {
+                name: "TOKEN".into(),
+                value: "x".repeat(value_len),
+                ..Default::default()
+            }];
+            let update = ConfigUpdate {
+                update_id: Uuid::new_v4().to_string(),
+                sandbox_config: Some(config.sandbox_config),
+                provider_environment: Some(config.provider_environment),
+            };
+            let live = GatewayMessage {
+                payload: Some(gateway_message::Payload::ConfigUpdate(update.clone())),
+            };
+            assert_eq!(live_message_len(update.encoded_len()), live.encoded_len());
+            let bootstrap = GatewayMessage {
+                payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                    bootstrap: Some(update.clone()),
+                    ..accepted.clone()
+                })),
+            };
+            assert_eq!(
+                bootstrap_message_len(&accepted, update.encoded_len()),
+                bootstrap.encoded_len()
+            );
+        }
     }
 
     /// Register a streamed-apply session and return its outbound channel.

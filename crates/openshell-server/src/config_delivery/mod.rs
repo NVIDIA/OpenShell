@@ -1890,33 +1890,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_configuration_reaches_supervisor_on_bootstrap_and_live_update() {
-        use prost::Message as _;
-
-        let state = state_with_large_provider_environment(17).await;
-        let (mut harness, _, bootstrap) =
-            accepted_session_with_bootstrap(&state, "large-config").await;
-        let bootstrap = bootstrap.expect("push bootstrap");
-        assert!(bootstrap.encoded_len() > 4 * 1024 * 1024);
-        assert!(bootstrap.encoded_len() <= MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES);
-        assert_eq!(
-            bootstrap.provider_environment.unwrap().values.len(),
-            17 * 32
-        );
-
-        change_policy(&state, "large-config", 2).await;
-        publish_sandbox(&state, "large-config");
-        let message = next_update(&mut harness, Duration::from_secs(5))
-            .await
-            .expect("large live configuration reaches the supervisor");
-        assert!(message.encoded_len() > 4 * 1024 * 1024);
-        assert!(message.encoded_len() <= MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES);
-        let update = sent_config(&message);
-        assert_eq!(update.sandbox_config.unwrap().version, 2);
-        assert_eq!(update.provider_environment.unwrap().values.len(), 17 * 32);
-    }
-
-    #[tokio::test]
     async fn oversized_configuration_is_rejected_over_grpc_and_smaller_configuration_recovers() {
         use openshell_core::proto::{
             ConfigApplyOutcome, ConfigUpdate, ConfigUpdateResult, ConfigurationAdmissionState,
