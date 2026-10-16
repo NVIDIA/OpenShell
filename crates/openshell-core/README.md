@@ -73,10 +73,12 @@ that support image updates additionally serve `ComputeDriverImageUpdates` on
 the same endpoint and advertise `openshell.compute.update-sandbox-image`.
 Drivers without that capability need no new generated-trait method.
 
-Linked in-process drivers implement `openshell_core::compute::ComputeDriver`
-in addition to the generated baseline trait. An empty implementation inherits
-`UNIMPLEMENTED` for image updates; supporting drivers override the optional
-method. The gateway negotiates the capability before invoking either path.
+Existing linked in-process drivers and factories need no new trait or hook.
+Only drivers opting into image updates implement
+`openshell_core::compute::ComputeDriver` and register that implementation through
+`ComputeDriverFactory::build_with_image_updates`. The default factory hook calls
+the existing `build` method without an updater. The gateway requires both this
+separate registration and the negotiated capability before invoking updates.
 
 ## Protobuf Struct Conversion
 

@@ -123,6 +123,19 @@ or two minutes after the withdrawal, after their owner was told to stop them.
 Pool members still authenticate with the one shared supervisor token, so a
 member identity is asserted by its hello rather than bound to its Pod.
 
+## Optional in-process image updates
+
+`SharedComputeDriver` retains the generated baseline compute-driver trait, and
+`ComputeDriverInstance` retains its existing variants. Existing compiled drivers
+and factories need no new trait implementation or registration method.
+
+A supporting factory overrides `ComputeDriverFactory::build_with_image_updates`
+to return its ordinary instance plus a separately registered image updater. The
+default calls the existing `build` method and returns no updater. The gateway
+requires both this opt-in and the negotiated capability before recording image
+intent. Remote drivers register the separate `ComputeDriverImageUpdates` service
+on their existing endpoint instead.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

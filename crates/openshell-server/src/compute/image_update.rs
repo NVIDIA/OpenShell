@@ -53,6 +53,11 @@ impl ComputeRuntime {
                 "compute driver does not support storage-preserving sandbox image updates",
             ));
         }
+        if self.image_update_driver.is_none() {
+            return Err(Status::unimplemented(
+                "compute driver has no registered image updater",
+            ));
+        }
         let lifecycle_guard = self.lifecycle_gates.lock_for(sandbox_id).await;
         let sandbox_guard = self.lock_sandbox_for_lifecycle(&lifecycle_guard).await;
         let current = self
@@ -112,15 +117,7 @@ impl ComputeRuntime {
             current
         } else {
             let request = image_update_driver_request(&current, &intent, true);
-            self.driver
-                .call_owned(
-                    openshell_otel::rpc::UPDATE_SANDBOX_IMAGE,
-                    Some(sandbox_id),
-                    move |driver| async move {
-                        driver.update_sandbox_image(Request::new(request)).await
-                    },
-                )
-                .await?;
+            self.call_image_update_driver(request).await?;
             // The private intent, desired image, and OLD-understood pending
             // operation flag commit in one version-fenced transaction.
             self.store
@@ -156,8 +153,7 @@ impl ComputeRuntime {
     ) -> Result<Sandbox, Status> {
         ensure_image_update_interlock(&pending, &intent)?;
         let request = image_update_driver_request(&pending, &intent, false);
-        self.driver.call_owned(openshell_otel::rpc::UPDATE_SANDBOX_IMAGE, Some(pending.object_id()),
-            move |driver| async move { driver.update_sandbox_image(Request::new(request)).await }).await?;
+        self.call_image_update_driver(request).await?;
         let _guard = self.lock_sandbox_local(pending.object_id()).await;
         // An ambiguous error NEVER clears either the private intent or the
         // public operation interlock. Only exact successful reconciliation can.
@@ -173,6 +169,28 @@ impl ComputeRuntime {
         info!(sandbox_id = %updated.object_id(), operation_id = %intent.operation_id,
             "Sandbox workload image updated; sandbox remains stopped");
         Ok(updated)
+    }
+
+    async fn call_image_update_driver(
+        &self,
+        request: UpdateSandboxImageRequest,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::UpdateSandboxImageResponse>,
+        Status,
+    > {
+        let driver = self.image_update_driver.clone().ok_or_else(|| {
+            Status::unimplemented("compute driver has no registered image updater")
+        })?;
+        let sandbox_id = request.sandbox_id.clone();
+        self.driver
+            .call_owned(
+                openshell_otel::rpc::UPDATE_SANDBOX_IMAGE,
+                Some(&sandbox_id),
+                move |_baseline| async move {
+                    driver.update_sandbox_image(Request::new(request)).await
+                },
+            )
+            .await
     }
 
     pub(super) async fn ensure_no_pending_image_update(
@@ -279,6 +297,7 @@ mod tests {
         .unwrap();
         runtime.image_updates_enabled = true;
         if supported {
+            runtime.image_update_driver = Some(driver.clone());
             runtime
                 .driver_info
                 .negotiated_extension
@@ -412,6 +431,39 @@ mod tests {
             2
         );
         assert_eq!(image_calls(&driver)[1].revision, 2);
+    }
+
+    #[tokio::test]
+    async fn image_update_rejects_unregistered_updater_without_writes() {
+        let (mut runtime, driver, original) = fixture(true).await;
+        runtime.image_update_driver = None;
+        driver.clear_calls();
+        let error = runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "example/workload:new".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unimplemented);
+        assert!(driver.calls().is_empty());
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>(original.object_id())
+                .await
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

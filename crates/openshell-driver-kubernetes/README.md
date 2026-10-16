@@ -305,7 +305,9 @@ a usable stopped condition, so pod deletion alone confirms their stop.
 The optional `openshell.compute.update-sandbox-image` capability supports
 image-only updates while the sandbox is stopped. External drivers serve it as
 the separate `ComputeDriverImageUpdates` service on the baseline `ComputeDriver`
-endpoint, preserving the baseline generated server trait. `UpdateSandboxImage` requires
+endpoint, preserving the baseline generated server trait. The linked gateway
+factory opts in through `ComputeDriverFactory::build_with_image_updates` without
+changing the baseline driver object. `UpdateSandboxImage` requires
 the persisted Kubernetes runtime identity, current image, sandbox name, and a
 stable operation ID with a monotonic image revision. The driver verifies that
 the same Sandbox resource is suspended, runtime bootstrap has completed, and

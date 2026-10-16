@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fixed baseline server source fixture from 6546691d5e493343c7877573252e835d28bf9e23.
-//! It deliberately implements only the original generated `ComputeDriver` methods,
+//! Baseline server source fixture adapted for the upstream suspend RPC.
+//! It deliberately implements only the baseline generated `ComputeDriver` methods,
 //! including its concrete streaming associated type, with no image-update method
 //! or in-process extension trait. New optional RPCs must not break this source.
 
@@ -12,9 +12,9 @@ use openshell_core::proto::compute::v1::{
     DeleteWorkspaceResponse, EnsureWorkspaceRequest, EnsureWorkspaceResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StartSandboxRequest, StartSandboxResponse,
-    StopSandboxRequest, StopSandboxResponse, UpdateSandboxImageRequest, UpdateSandboxImageResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest,
+    StopSandboxRequest, StopSandboxResponse, SuspendSandboxRequest, SuspendSandboxResponse,
+    UpdateSandboxImageRequest, UpdateSandboxImageResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient,
     compute_driver_image_updates_client::ComputeDriverImageUpdatesClient,
     compute_driver_image_updates_server::{
@@ -84,6 +84,13 @@ impl ComputeDriver for BaselineDriver {
         &self,
         _request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
+        Err(Status::unimplemented("fixture"))
+    }
+
+    async fn suspend_sandbox(
+        &self,
+        _request: Request<SuspendSandboxRequest>,
+    ) -> Result<Response<SuspendSandboxResponse>, Status> {
         Err(Status::unimplemented("fixture"))
     }
 
@@ -273,6 +280,7 @@ fn baseline_compute_service_methods_are_frozen() {
             "CreateSandbox",
             "StopSandbox",
             "StartSandbox",
+            "SuspendSandbox",
             "DeleteSandbox",
             "WatchSandboxes",
             "EnsureWorkspace",

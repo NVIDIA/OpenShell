@@ -85,7 +85,11 @@ use tracing::{Instrument as _, debug, info, warn};
 
 pub type DriverWatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
-pub type SharedComputeDriver = Arc<
+pub type SharedComputeDriver =
+    Arc<dyn ComputeDriver<WatchSandboxesStream = DriverWatchStream> + Send + Sync>;
+
+/// Optional image-update registration, independent of the baseline driver object.
+pub type SharedComputeDriverImageUpdates = Arc<
     dyn openshell_core::compute::ComputeDriver<WatchSandboxesStream = DriverWatchStream>
         + Send
         + Sync,
@@ -912,6 +916,7 @@ pub struct ComputeRuntime {
     admission: openshell_core::resource_admission::DriverAdmissionConfig,
     admission_acknowledgement: String,
     driver: TracedDriver,
+    image_update_driver: Option<SharedComputeDriverImageUpdates>,
     driver_info: ComputeDriverInfoSnapshot,
     telemetry_compute_driver: TelemetryComputeDriver,
     driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -1027,6 +1032,7 @@ impl ComputeRuntime {
         Ok(Self {
             isolation_backend: None,
             driver: TracedDriver::new(driver, driver_name),
+            image_update_driver: None,
             admission: openshell_core::resource_admission::DriverAdmissionConfig::default(),
             admission_acknowledgement: capabilities.resource_admission_policy,
             driver_info,
@@ -1166,10 +1172,10 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
+        let driver = Arc::new(RemoteComputeDriver::new(endpoint.channel));
         Self::from_driver(
             endpoint.name,
-            driver,
+            driver.clone(),
             endpoint.driver_process,
             store,
             sandbox_index,
@@ -1178,6 +1184,15 @@ impl ComputeRuntime {
             supervisor_sessions,
         )
         .await
+        .map(|runtime| runtime.with_image_update_driver(Some(driver)))
+    }
+
+    pub(crate) fn with_image_update_driver(
+        mut self,
+        driver: Option<SharedComputeDriverImageUpdates>,
+    ) -> Self {
+        self.image_update_driver = driver;
+        self
     }
 
     #[must_use]
@@ -8219,10 +8234,6 @@ impl Default for NoopTestDriver {
 
 #[cfg(any(test, feature = "test-support"))]
 #[tonic::async_trait]
-impl openshell_core::compute::ComputeDriver for NoopTestDriver {}
-
-#[cfg(any(test, feature = "test-support"))]
-#[tonic::async_trait]
 impl ComputeDriver for NoopTestDriver {
     async fn authenticate_sandbox(
         &self,
@@ -8444,6 +8455,7 @@ pub fn new_test_runtime_with_driver(
     ComputeRuntime {
         isolation_backend: None,
         driver: TracedDriver::new(driver, "test".to_string()),
+        image_update_driver: None,
         admission: openshell_core::resource_admission::DriverAdmissionConfig {
             allow_driver_config: true,
             ..Default::default()
@@ -8861,9 +8873,6 @@ mod tests {
         create_calls: AtomicUsize,
         created_sandboxes: TestMutex<Vec<DriverSandbox>>,
     }
-
-    #[tonic::async_trait]
-    impl openshell_core::compute::ComputeDriver for TestDriver {}
 
     #[tonic::async_trait]
     impl ComputeDriver for TestDriver {
@@ -9647,6 +9656,7 @@ mod tests {
         ComputeRuntime {
             isolation_backend: None,
             driver: TracedDriver::new(driver, "test-driver".to_string()),
+            image_update_driver: None,
             admission: openshell_core::resource_admission::DriverAdmissionConfig {
                 allow_driver_config: true,
                 ..Default::default()
@@ -18427,14 +18437,21 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
 
     #[tokio::test]
     async fn in_process_driver_defaults_image_updates_to_unimplemented() {
-        let driver = NoopTestDriver::default();
-        let error = openshell_core::compute::ComputeDriver::update_sandbox_image(
-            &driver,
-            Request::new(openshell_core::proto::compute::v1::UpdateSandboxImageRequest::default()),
-        )
-        .await
-        .unwrap_err();
+        // NoopTestDriver implements only the baseline generated trait.
+        let mut runtime = test_runtime(Arc::new(NoopTestDriver::default()))
+            .await
+            .with_sandbox_image_updates(true);
+        runtime
+            .driver_info
+            .negotiated_extension
+            .supported_capabilities
+            .push(openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE.into());
+        let error = runtime
+            .update_sandbox_image("not-created", "example/workload:v2".into(), 1)
+            .await
+            .unwrap_err();
         assert_eq!(error.code(), Code::Unimplemented);
+        assert!(runtime.image_update_driver.is_none());
     }
 
     #[tokio::test]

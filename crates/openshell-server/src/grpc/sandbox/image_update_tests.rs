@@ -151,6 +151,7 @@ async fn state() -> (Arc<ServerState>, Arc<FakeComputeDriver>, Sandbox) {
     )
     .await
     .unwrap()
+    .with_image_update_driver(Some(driver.clone()))
     .with_sandbox_image_updates(true);
     Arc::get_mut(&mut state).unwrap().compute = compute;
     let mut sandbox = Sandbox {

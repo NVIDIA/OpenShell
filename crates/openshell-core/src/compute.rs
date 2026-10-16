@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! In-process compute contract, separate from the baseline generated gRPC trait.
+//! Opt-in in-process image updates, separate from the baseline driver contract.
 
 use crate::proto::compute::v1::{
     UpdateSandboxImageRequest, UpdateSandboxImageResponse, compute_driver_server,
 };
 
-/// Gateway-facing in-process compute driver with optional image updates.
+/// Optional in-process image updater, registered separately by a driver factory.
 ///
-/// External servers implement the unchanged generated
-/// [`compute_driver_server::ComputeDriver`] trait and, when supported, the
-/// separate generated `ComputeDriverImageUpdates` service on the same endpoint.
-/// In-process drivers use this default unless they advertise image updates.
+/// Existing drivers need only the generated baseline trait, not this extension.
+/// Supporting factories opt in through `ComputeDriverFactory::build_with_image_updates`
+/// and advertise the image-update capability. External servers use the separate
+/// generated `ComputeDriverImageUpdates` service on the same endpoint instead.
 #[tonic::async_trait]
 pub trait ComputeDriver: compute_driver_server::ComputeDriver {
     async fn update_sandbox_image(
