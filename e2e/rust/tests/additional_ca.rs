@@ -190,7 +190,9 @@ fn assert_additional_ca_command(command: &[Value]) -> Result<(), String> {
         .filter(|pair| pair[0] == "--additional-ca-bundle")
         .collect::<Vec<_>>();
     if bundle_pairs.len() != 1 || bundle_pairs[0][1] != ADDITIONAL_CA_MOUNT_PATH {
-        return Err(format!("unexpected additional CA command arguments: {command:#?}"));
+        return Err(format!(
+            "unexpected additional CA command arguments: {command:#?}"
+        ));
     }
     Ok(())
 }
@@ -312,7 +314,8 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
     {
         if container["volumeMounts"].as_array().is_some_and(|mounts| {
             mounts.iter().any(|mount| {
-                mount["name"] == ADDITIONAL_CA_VOLUME || mount["mountPath"] == ADDITIONAL_CA_MOUNT_PATH
+                mount["name"] == ADDITIONAL_CA_VOLUME
+                    || mount["mountPath"] == ADDITIONAL_CA_MOUNT_PATH
             })
         }) {
             return Err(format!(
@@ -347,9 +350,15 @@ fn inspect_kubernetes_pod() -> Result<String, String> {
         config_map["metadata"]["annotations"]["openshell.ai/additional-ca-generation"]
             .as_str()
             .ok_or("managed destination CA ConfigMap generation missing")?;
-    let expected_digest = format!("sha256:{:x}", sha2::Sha256::digest(
-        config_map["data"]["ca.crt"].as_str().unwrap_or_default().as_bytes(),
-    ));
+    let expected_digest = format!(
+        "sha256:{:x}",
+        sha2::Sha256::digest(
+            config_map["data"]["ca.crt"]
+                .as_str()
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+    );
     if config_map_digest != expected_digest {
         return Err("managed ConfigMap generation does not match its CA data".to_string());
     }
@@ -409,12 +418,7 @@ fn inspect_vm_overlay() -> Result<(), String> {
     let args = String::from_utf8(debugfs_read("/upper/opt/openshell/supervisor-args")?)
         .map_err(|error| format!("VM supervisor argument marker is not UTF-8: {error}"))?;
     let lines = args.lines().collect::<Vec<_>>();
-    if lines
-        != [
-            "--additional-ca-bundle",
-            ADDITIONAL_CA_MOUNT_PATH,
-        ]
-    {
+    if lines != ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH] {
         return Err(format!(
             "unexpected VM supervisor argument marker: {lines:?}"
         ));
