@@ -96,33 +96,39 @@ pub struct ConfigSessionState {
 #[derive(Debug, Default)]
 struct UnrecordedPolicyLoads {
     loaded: Option<PolicyLoadResult>,
-    latest: Option<PolicyLoadResult>,
+    failed: Option<PolicyLoadResult>,
 }
 
 impl UnrecordedPolicyLoads {
     fn keep(&mut self, mut result: PolicyLoadResult) {
-        if result.loaded {
+        let slot = if result.loaded {
             result.error.clear();
             if self
-                .loaded
+                .failed
                 .as_ref()
-                .is_none_or(|loaded| loaded.version <= result.version)
+                .is_some_and(|failed| failed.version == result.version)
             {
-                self.loaded = Some(result.clone());
+                self.failed = None;
             }
+            &mut self.loaded
         } else {
             result.error = result.error.chars().take(1024).collect();
+            &mut self.failed
+        };
+        if slot
+            .as_ref()
+            .is_none_or(|kept| kept.version <= result.version)
+        {
+            *slot = Some(result);
         }
-        self.latest = Some(result);
     }
 
     fn take(&mut self) -> Vec<PolicyLoadResult> {
-        let mut results = [self.loaded.take(), self.latest.take()]
+        let mut results = [self.loaded.take(), self.failed.take()]
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
         results.sort_by_key(|result| result.version);
-        results.dedup();
         results
     }
 }
@@ -2418,90 +2424,136 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         }
         assert_eq!(
             pending.take(),
-            vec![PolicyLoadResult {
-                version: 203,
-                loaded: true,
-                error: String::new()
-            }]
+            vec![
+                PolicyLoadResult {
+                    version: 202,
+                    loaded: false,
+                    error: String::new()
+                },
+                PolicyLoadResult {
+                    version: 203,
+                    loaded: true,
+                    error: String::new()
+                }
+            ]
         );
     }
 
-    #[tokio::test]
-    async fn newer_rejection_preserves_unrecorded_success() {
+    async fn assert_policy_load_recovery(
+        results: &[(u32, bool)],
+        expected_statuses: &[(u32, &str)],
+        active_version: u32,
+    ) {
         use crate::policy_store::PolicyStoreExt as _;
 
         let sandbox_id = "sb-unrecorded-success";
         let state = push_state_with_sandbox_spec(sandbox_id).await;
         put_sandbox_policy_revision(&state, sandbox_id).await;
-        state
-            .store
-            .put_policy_revision(
-                "policy-4",
-                sandbox_id,
-                "default",
-                4,
-                &SandboxPolicy::default().encode_to_vec(),
-                "policy-4-hash",
-            )
-            .await
-            .unwrap();
+        let latest = results.iter().map(|(version, _)| *version).max().unwrap();
+        for version in 4..=latest {
+            state
+                .store
+                .put_policy_revision(
+                    &format!("policy-{version}"),
+                    sandbox_id,
+                    "default",
+                    i64::from(version),
+                    &SandboxPolicy::default().encode_to_vec(),
+                    &format!("policy-{version}-hash"),
+                )
+                .await
+                .unwrap();
+        }
+        let snapshot = |version| SandboxConfigSnapshot {
+            version,
+            config_revision: 7 + u64::from(version - 3),
+            policy_hash: format!("policy-{version}-hash"),
+            ..sandbox_policy_snapshot()
+        };
+        let outcome = |loaded| {
+            if loaded {
+                ConfigApplyOutcome::Applied
+            } else {
+                ConfigApplyOutcome::FailedRetainedLastKnownGood
+            }
+        };
         let (tx, mut rx) = register_apply_session_in_state(&state, sandbox_id);
         let session = accepted_session(&state, sandbox_id, tx);
         state
             .store
             .execute_for_test(FAIL_POLICY_RECORD_WRITES)
             .await;
-        let success = deliver_and_report(
-            &state,
-            sandbox_id,
-            &mut rx,
-            &sandbox_policy_snapshot(),
-            ConfigApplyOutcome::Applied,
-        );
-        assert!(handle_config_update_result(&session, &success).await);
-        let failed_snapshot = SandboxConfigSnapshot {
-            version: 4,
-            config_revision: 8,
-            policy_hash: "policy-4-hash".into(),
-            ..sandbox_policy_snapshot()
-        };
-        let failure = deliver_and_report(
-            &state,
-            sandbox_id,
-            &mut rx,
-            &failed_snapshot,
-            ConfigApplyOutcome::FailedRetainedLastKnownGood,
-        );
-        assert!(handle_config_update_result(&session, &failure).await);
+        for &(version, loaded) in results {
+            let result = deliver_and_report(
+                &state,
+                sandbox_id,
+                &mut rx,
+                &snapshot(version),
+                outcome(loaded),
+            );
+            assert!(handle_config_update_result(&session, &result).await);
+        }
         state.store.execute_for_test(RESTORE_RESULT_WRITES).await;
+        let &(version, loaded) = results.last().unwrap();
         let mut repeated = deliver_and_report(
             &state,
             sandbox_id,
             &mut rx,
-            &failed_snapshot,
-            ConfigApplyOutcome::FailedRetainedLastKnownGood,
+            &snapshot(version),
+            outcome(loaded),
         );
         repeated.policy_load = None;
         assert!(handle_config_update_result(&session, &repeated).await);
-        let retained = state
-            .store
-            .get_policy_by_version(sandbox_id, 3)
-            .await
-            .unwrap()
-            .unwrap();
-        let rejected = state
-            .store
-            .get_policy_by_version(sandbox_id, 4)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(retained.status, "loaded");
-        assert_eq!(rejected.status, "failed");
+        for &(version, expected) in expected_statuses {
+            let record = state
+                .store
+                .get_policy_by_version(sandbox_id, i64::from(version))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(record.status, expected, "policy {version}");
+        }
         assert_eq!(
             stored_sandbox(&state, sandbox_id)
                 .await
                 .current_policy_version(),
-            3
+            active_version
         );
+    }
+
+    #[tokio::test]
+    async fn newer_rejection_preserves_unrecorded_success() {
+        assert_policy_load_recovery(&[(3, true), (4, false)], &[(3, "loaded"), (4, "failed")], 3)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn newer_success_preserves_unrecorded_rejection() {
+        assert_policy_load_recovery(
+            &[(3, true), (4, false), (5, true)],
+            &[(3, "superseded"), (4, "failed"), (5, "loaded")],
+            5,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn successful_retry_replaces_unrecorded_rejection_of_same_revision() {
+        assert_policy_load_recovery(
+            &[(3, true), (4, false), (4, true)],
+            &[(3, "superseded"), (4, "loaded")],
+            4,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejection_of_loaded_revision_preserves_its_unrecorded_success() {
+        assert_policy_load_recovery(
+            &[(3, true), (4, true), (4, false)],
+            &[(3, "superseded"), (4, "failed")],
+            4,
+        )
+        .await;
     }
 }
