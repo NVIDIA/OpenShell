@@ -4,8 +4,11 @@
 //! Resource attribution for relayed agent traces.
 //!
 //! Every forwarded `ResourceSpans` entry carries exactly two supervisor-owned
-//! attributes. Agent-supplied values for those keys are always discarded so
-//! a workload cannot impersonate another sandbox or pose as infrastructure.
+//! resource attributes. Agent-supplied values for those keys are always
+//! discarded at the resource level, so a workload cannot attribute its
+//! resources to another sandbox or to infrastructure. Scope and span
+//! attributes are copied unchanged and may carry the same keys with any
+//! value; only the resource attributes are authoritative.
 //!
 //! Enrichment works at the protobuf wire level. Only each entry's `resource`
 //! field is decoded and re-encoded, which drops unknown fields inside it;

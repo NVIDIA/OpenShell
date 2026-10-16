@@ -37,6 +37,7 @@ pub struct LocalBoundaryExec {
     provider_credentials: ProviderCredentialState,
     user_environment: HashMap<String, String>,
     runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+    otlp_relay_active: bool,
     #[cfg(target_os = "linux")]
     launcher: crate::linux::workload_launcher::WorkloadLauncher,
 }
@@ -44,6 +45,7 @@ pub struct LocalBoundaryExec {
 impl LocalBoundaryExec {
     /// Construct the executor owned by an active sandbox boundary.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         policy: SandboxPolicy,
         base_workdir: Option<String>,
@@ -51,6 +53,7 @@ impl LocalBoundaryExec {
         provider_credentials: ProviderCredentialState,
         user_environment: HashMap<String, String>,
         runtime: Arc<crate::boundary_io::BoundaryRuntimeState>,
+        otlp_relay_active: bool,
         #[cfg(target_os = "linux")] launcher: crate::linux::workload_launcher::WorkloadLauncher,
     ) -> Self {
         Self {
@@ -60,6 +63,7 @@ impl LocalBoundaryExec {
             provider_credentials,
             user_environment,
             runtime,
+            otlp_relay_active,
             #[cfg(target_os = "linux")]
             launcher,
         }
@@ -182,18 +186,17 @@ impl LocalBoundaryExec {
             }
         }
         crate::process::strip_proxy_env_std(&mut command);
-        // Point OTel SDKs at the supervisor's trace relay, after the creation
+        // Point OTel SDKs at the supervisor's trace relay after the creation
         // request's environment and the provider variables, matching the main
-        // process, and only when the creation request named no endpoint of
-        // its own. A per-exec `spec.env` value applied below still wins for
-        // that exec only.
-        if let Some(relay_env) =
-            crate::child_env::otlp_relay_env_vars_unless_configured(&self.user_environment)
-        {
-            for (key, value) in relay_env {
-                command.env(key, value);
-            }
-        }
+        // process. An endpoint in the creation request, the image, or this
+        // exec's `spec.env` suppresses it, and any other `spec.env` value
+        // applied below still wins for this exec only.
+        crate::child_env::apply_otlp_relay_env(
+            &mut command,
+            self.otlp_relay_active,
+            &self.user_environment,
+            &spec.env,
+        );
         for (key, value) in &spec.env {
             if !key.starts_with(crate::process::RESERVED_ENV_PREFIX) {
                 command.env(key, value);
@@ -691,6 +694,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn executor() -> LocalBoundaryExec {
+        executor_with_relay(true)
+    }
+
+    fn executor_with_relay(otlp_relay_active: bool) -> LocalBoundaryExec {
         let (launcher, listener) =
             crate::linux::workload_launcher::start().expect("start test workload launcher");
         std::thread::spawn(move || {
@@ -726,6 +733,7 @@ mod tests {
             ),
             HashMap::new(),
             crate::boundary_io::BoundaryRuntimeState::new(),
+            otlp_relay_active,
             launcher,
         )
     }
@@ -820,12 +828,22 @@ mod tests {
             Some("http/protobuf")
         );
 
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+            ),
+            None,
+            "only the generic default is injected"
+        );
+
         // A per-exec environment is a developer's explicit instruction and
-        // is applied last (contracts/sandbox-environment.md).
+        // is applied last (contracts/sandbox-environment.md). An endpoint in
+        // it suppresses the whole relay default, protocol included.
         let command = executor
             .command(&spec(vec![(
                 openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT.to_string(),
-                "http://127.0.0.1:4318".to_string(),
+                "http://127.0.0.1:4317".to_string(),
             )]))
             .expect("resolve exec");
         assert_eq!(
@@ -834,8 +852,40 @@ mod tests {
                 openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT
             )
             .as_deref(),
-            Some("http://127.0.0.1:4318")
+            Some("http://127.0.0.1:4317")
         );
+        assert_eq!(
+            env_of(
+                &command,
+                openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn exec_children_get_no_relay_endpoint_while_the_relay_is_inactive() {
+        let command = executor_with_relay(false)
+            .command(&ExecSpec {
+                program: "/bin/true".to_string(),
+                args: Vec::new(),
+                shell: None,
+                runtime_helper: None,
+                env: Vec::new(),
+                workdir: None,
+                pty: false,
+            })
+            .expect("resolve exec");
+        for key in [
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_ENDPOINT,
+            openshell_core::sandbox_env::OTEL_EXPORTER_OTLP_PROTOCOL,
+        ] {
+            assert_eq!(
+                env_of(&command, key),
+                None,
+                "{key} injected without a relay"
+            );
+        }
     }
 
     #[tokio::test]

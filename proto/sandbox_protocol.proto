@@ -255,6 +255,10 @@ message AgentSpec {
   // Omitted or zero means no timeout; otherwise whole nonnegative seconds.
   google.protobuf.Duration timeout = 4;
   bool interactive = 5;
+  // True while the supervisor relays agent OTLP traces, so the runtime may
+  // point workload SDKs at the relay by default. False keeps the workload
+  // environment unchanged.
+  bool otlp_relay_active = 6;
 }
 message ExecSpec {
   string program = 1;

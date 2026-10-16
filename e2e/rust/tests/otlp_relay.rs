@@ -56,11 +56,13 @@ raise SystemExit(0 if response.status_code == 200 else 1)
     )
 }
 
-/// Same export, but reports the failure class instead of raising, for the
-/// inert case.
+/// For the inert case: reports whether an endpoint was injected, then posts
+/// to the relay address directly and reports the failure class instead of
+/// raising.
 const INERT_SCRIPT: &str = r#"
 import os, requests
-url = os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] + "/v1/traces"
+print("ENDPOINT", os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "unset"))
+url = "http://192.0.0.8:4318/v1/traces"
 try:
     response = requests.post(url, data=b"", headers={"Content-Type": "application/x-protobuf"}, timeout=3)
     print("STATUS", response.status_code)
@@ -319,6 +321,10 @@ async fn relay_is_inert_without_collector() {
             .await
             .expect("sandbox attempts an export without a collector");
     let output = sandbox.create_output.clone();
+    assert!(
+        output.contains("ENDPOINT unset"),
+        "no relay endpoint is injected while the relay is inactive:\n{output}"
+    );
     assert!(
         output.contains("ERROR ConnectionError"),
         "the export must fail with a connection error, not a timeout:\n{output}"

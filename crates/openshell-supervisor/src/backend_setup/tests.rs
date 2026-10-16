@@ -212,6 +212,7 @@ fn agent() -> AgentSpec {
         workdir: Some("/test-workspace".into()),
         timeout_secs: 15,
         interactive: false,
+        otlp_relay_active: false,
     }
 }
 

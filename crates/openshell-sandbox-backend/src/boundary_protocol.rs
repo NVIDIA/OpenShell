@@ -1217,6 +1217,10 @@ pub struct AgentSpecWire {
     pub workdir: Option<String>,
     pub timeout_secs: u64,
     pub interactive: bool,
+    /// Omitted while false so the request digest of a sandbox without a
+    /// relay is unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub otlp_relay_active: bool,
 }
 
 impl From<AgentSpec> for AgentSpecWire {
@@ -1227,6 +1231,7 @@ impl From<AgentSpec> for AgentSpecWire {
             workdir: spec.workdir,
             timeout_secs: spec.timeout_secs,
             interactive: spec.interactive,
+            otlp_relay_active: spec.otlp_relay_active,
         }
     }
 }
@@ -1642,6 +1647,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_spec_omits_an_inactive_relay_flag_on_the_wire() {
+        let mut spec = AgentSpecWire {
+            program: "/bin/true".to_string(),
+            args: Vec::new(),
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            otlp_relay_active: false,
+        };
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert!(
+            encoded.get("otlp_relay_active").is_none(),
+            "a false flag keeps the encoding of earlier releases: {encoded}"
+        );
+        let decoded: AgentSpecWire = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, spec);
+
+        spec.otlp_relay_active = true;
+        let decoded: AgentSpecWire =
+            serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert!(decoded.otlp_relay_active);
+    }
+
+    #[test]
     fn request_round_trips_and_redacts_secrets() {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
@@ -1656,6 +1685,7 @@ mod tests {
                     workdir: Some("/sandbox".to_string()),
                     timeout_secs: 5,
                     interactive: false,
+                    otlp_relay_active: false,
                 },
                 ca_cert: Some("test certificate".to_string()),
                 ca_bundle: Some("test bundle".to_string()),
@@ -1813,6 +1843,7 @@ mod tests {
                 workdir: None,
                 timeout_secs: 5,
                 interactive: false,
+                otlp_relay_active: false,
             },
             ca_cert: Some("A".repeat(16 * 1024)),
             ca_bundle: Some("B".repeat(400 * 1024)),

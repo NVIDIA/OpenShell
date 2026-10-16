@@ -44,7 +44,9 @@ pub const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 /// [`MAX_BODY_BYTES`] (32 MiB); and the working set of the
 /// [`ENRICHMENT_CONCURRENCY`] enrichments in progress, each about twice the
 /// body plus at most about 1 MiB of decoded resource elements (about
-/// 12 MiB). Every allocation is sized to its content before it is held.
+/// 12 MiB). On top of that, the export task holds the batch it took from
+/// the buffer and tonic encodes a copy of it, one batch each (about 4 MiB).
+/// Every allocation is sized to its content before it is held.
 pub const MAX_ENRICHED_BYTES: usize =
     MAX_BODY_BYTES + enrichment::MAX_RESOURCE_SPANS * enrichment::ATTRIBUTION_BYTES_PER_ENTRY;
 /// How long a connection may idle before a complete request header arrives.
@@ -92,6 +94,9 @@ pub struct RelayCounters {
     exported: AtomicU64,
     rejected: AtomicU64,
     export_failures: AtomicU64,
+    /// Whether the most recent export attempt failed. Cleared by the next
+    /// success; flushes skip waiting while it is set.
+    last_export_failed: AtomicBool,
     first_rejection_logged: AtomicBool,
     first_failure_logged: AtomicBool,
     final_summary_logged: AtomicBool,
@@ -119,6 +124,7 @@ impl RelayCounters {
     /// first occurrence only.
     pub fn record_export_failure(&self, endpoint: &str, error: &dyn std::fmt::Display) {
         self.export_failures.fetch_add(1, Ordering::Relaxed);
+        self.last_export_failed.store(true, Ordering::Relaxed);
         if !self.first_failure_logged.swap(true, Ordering::Relaxed) {
             warn!(endpoint, %error, "OTLP relay export to collector failed");
         }
@@ -127,6 +133,12 @@ impl RelayCounters {
     /// Records one batch delivered to the collector.
     pub fn record_export_success(&self) {
         self.exported.fetch_add(1, Ordering::Relaxed);
+        self.last_export_failed.store(false, Ordering::Relaxed);
+    }
+
+    /// Whether the most recent export attempt failed.
+    fn last_export_failed(&self) -> bool {
+        self.last_export_failed.load(Ordering::Relaxed)
     }
 
     /// Current counts.
@@ -189,8 +201,11 @@ pub struct OtlpRelayConfig {
 /// The relay could not be started; it stays inactive.
 #[derive(Debug)]
 pub enum StartError {
-    /// The collector endpoint is not a URI tonic accepts.
-    InvalidEndpoint(tonic::transport::Error),
+    /// The collector endpoint is empty or not a URI, judged the same way as
+    /// for the supervisor's own exporter.
+    InvalidEndpoint(openshell_otel::SetupError),
+    /// The collector endpoint is a URI tonic does not accept.
+    Transport(tonic::transport::Error),
     /// The collector endpoint uses a scheme the relay does not speak. TLS to
     /// the collector is a tracked follow-up; the supervisor's own exporter
     /// rejects `https` the same way.
@@ -201,6 +216,7 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEndpoint(error) => write!(f, "invalid collector endpoint: {error}"),
+            Self::Transport(error) => write!(f, "invalid collector endpoint: {error}"),
             Self::UnsupportedScheme(scheme) => write!(
                 f,
                 "unsupported collector endpoint scheme {scheme:?}: the relay speaks plaintext OTLP/gRPC (http) only"
@@ -226,6 +242,19 @@ impl Drop for OtlpRelay {
     fn drop(&mut self) {
         self.export_task.abort();
         self.summary_task.abort();
+        // A lifecycle path that drops the relay without `shutdown` discards
+        // whatever is still buffered or in flight; count it so the final
+        // summary reports the loss. After `shutdown` nothing is pending.
+        let discarded = self.counters.pending();
+        if discarded > 0 {
+            self.counters
+                .export_failures
+                .fetch_add(discarded, Ordering::Relaxed);
+            warn!(
+                discarded,
+                "OTLP relay stopped without a flush; discarding buffered batches"
+            );
+        }
         self.counters.log_final_summary();
     }
 }
@@ -254,15 +283,17 @@ fn relay_addr() -> SocketAddr {
 ///
 /// Returns the relay handle and the reserved destination to install in the
 /// network proxy. Fails only when the endpoint is not a valid plaintext URI;
-/// an unreachable collector is handled lazily by the exporter.
+/// an unreachable collector is handled lazily by the exporter. Surrounding
+/// whitespace is trimmed, as for the supervisor's own exporter.
 pub fn start(config: OtlpRelayConfig) -> Result<(OtlpRelay, ReservedDestination), StartError> {
-    if let Ok(uri) = config.endpoint.parse::<http::Uri>()
-        && let Some(scheme) = uri.scheme_str()
+    let (endpoint, uri) = openshell_otel::validated_endpoint(&config.endpoint)
+        .map_err(StartError::InvalidEndpoint)?;
+    if let Some(scheme) = uri.scheme_str()
         && !scheme.eq_ignore_ascii_case("http")
     {
         return Err(StartError::UnsupportedScheme(scheme.to_string()));
     }
-    let exporter = Exporter::new(&config.endpoint).map_err(StartError::InvalidEndpoint)?;
+    let exporter = Exporter::new(endpoint).map_err(StartError::Transport)?;
     if config.sandbox_id.len() > enrichment::MAX_SANDBOX_ID_BYTES {
         // The attribution growth bound assumes a shorter id; batches near
         // the wire limit with many entries will be refused with 413.
@@ -278,7 +309,7 @@ pub fn start(config: OtlpRelayConfig) -> Result<(OtlpRelay, ReservedDestination)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .state(StateId::Enabled, "enabled")
-            .unmapped("endpoint", config.endpoint)
+            .unmapped("endpoint", endpoint.to_string())
             .message("OTLP agent trace relay enabled")
             .build()
     );
@@ -416,7 +447,21 @@ impl OtlpRelay {
     /// while the relay keeps serving. Used before the exit report when the
     /// supervisor stays up for exec sessions afterwards, so their traces
     /// are still relayed; [`Self::shutdown`] runs at final teardown.
+    ///
+    /// Returns at once when the most recent export failed: a collector that
+    /// is down would only run the clock out, and trace delivery must not
+    /// delay the exit report.
     pub async fn flush(&self, bound: Duration) {
+        if self.counters.last_export_failed() {
+            let pending = self.counters.pending();
+            if pending > 0 {
+                warn!(
+                    pending,
+                    "OTLP relay flush skipped: the last export to the collector failed"
+                );
+            }
+            return;
+        }
         let started = Instant::now();
         let exported_before = self.counters.snapshot().exported;
         while self.counters.pending() > 0 && started.elapsed() < bound {
@@ -440,7 +485,8 @@ impl OtlpRelay {
     /// Stops accepting agent connections, flushes buffered batches to the
     /// collector for at most `flush_bound`, and logs the final summary.
     /// Never fails; batches still pending at the deadline are discarded and
-    /// counted as export failures.
+    /// counted as export failures. Like [`Self::flush`], it does not wait for
+    /// the collector when the most recent export failed.
     pub async fn shutdown(mut self, flush_bound: Duration) {
         let started = Instant::now();
         let exported_before = self.counters.snapshot().exported;
@@ -450,6 +496,24 @@ impl OtlpRelay {
             receiver.shutdown().await;
         }
         self.server.close_buffer();
+
+        if self.counters.last_export_failed() {
+            self.export_task.abort();
+            let _ = (&mut self.export_task).await;
+            let discarded = self.counters.pending();
+            if discarded > 0 {
+                self.counters
+                    .export_failures
+                    .fetch_add(discarded, Ordering::Relaxed);
+                warn!(
+                    discarded,
+                    "OTLP relay flush skipped: the last export to the collector failed; discarding buffered batches"
+                );
+            }
+            self.summary_task.abort();
+            self.counters.log_final_summary();
+            return;
+        }
 
         let remaining = flush_bound.saturating_sub(started.elapsed());
         match tokio::time::timeout(remaining, &mut self.export_task).await {
@@ -724,10 +788,40 @@ mod tests {
         .err()
         .expect("unparsable endpoint fails");
         assert!(matches!(error, StartError::InvalidEndpoint(_)), "{error}");
+        for blank in ["", "   "] {
+            let error = start(OtlpRelayConfig {
+                endpoint: blank.into(),
+                sandbox_id: "sb-test".into(),
+            })
+            .err()
+            .expect("blank endpoint fails");
+            assert!(
+                matches!(
+                    error,
+                    StartError::InvalidEndpoint(openshell_otel::SetupError::EmptyEndpoint)
+                ),
+                "{error}"
+            );
+        }
         let after = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
         assert_eq!(before, after, "nothing is spawned for an inactive relay");
+    }
+
+    #[tokio::test]
+    async fn endpoint_whitespace_is_trimmed_like_the_supervisor_exporter() {
+        let collector = OtlpTestServer::start().await;
+        let (relay, _reserved) = start(OtlpRelayConfig {
+            endpoint: format!("  {}\n", collector.endpoint()),
+            sandbox_id: "sb-test".into(),
+        })
+        .expect("a padded endpoint starts the relay");
+        assert_eq!(post(&relay, "padded").await, 200);
+        collector.wait_for_export().await;
+        relay.shutdown(FLUSH_TIMEOUT).await;
+        let received = collector.shutdown().await;
+        assert!(received.spans.iter().any(|span| span.name == "padded"));
     }
 
     #[tokio::test]
@@ -814,6 +908,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_and_shutdown_skip_waiting_after_a_failed_export() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let collector = SilentCollector::start().await;
+        // The gate stays closed, so the batches stay buffered.
+        let (relay, _reserved, _gate) = gated(&collector.endpoint);
+        for span in ["one", "two"] {
+            assert_eq!(post(&relay, span).await, 200);
+        }
+        relay
+            .counters
+            .record_export_failure(&collector.endpoint, &"collector down");
+        let counters = Arc::clone(&relay.counters);
+        assert_eq!(counters.pending(), 1);
+
+        let started = Instant::now();
+        relay.flush(FLUSH_TIMEOUT).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "flush waited {:?} for a collector that is down",
+            started.elapsed()
+        );
+        assert_eq!(
+            logs.count(
+                tracing::Level::WARN,
+                "OTLP relay flush skipped: the last export to the collector failed"
+            ),
+            1
+        );
+
+        let started = Instant::now();
+        relay.shutdown(FLUSH_TIMEOUT).await;
+        assert!(
+            started.elapsed() < RECEIVER_SHUTDOWN_TIMEOUT + Duration::from_secs(1),
+            "shutdown waited {:?} for a collector that is down",
+            started.elapsed()
+        );
+        assert_eq!(counters.pending(), 0);
+        assert_eq!(counters.snapshot().export_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn a_successful_export_clears_the_failure_flag() {
+        let counters = RelayCounters::default();
+        counters.record_export_failure("http://collector:4317", &"boom");
+        assert!(counters.last_export_failed());
+        counters.record_export_success();
+        assert!(!counters.last_export_failed());
+    }
+
+    #[tokio::test]
     async fn dropping_the_relay_without_shutdown_logs_the_final_summary_once() {
         let logs = LogCapture::default();
         let _guard = logs.install();
@@ -823,6 +968,37 @@ mod tests {
         // An early-exit lifecycle path drops the relay without `shutdown`.
         drop(relay);
         assert_eq!(logs.count(tracing::Level::INFO, "OTLP relay summary"), 1);
+        drop(collector.shutdown().await);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_relay_counts_buffered_batches_as_discarded() {
+        let logs = LogCapture::default();
+        let _guard = logs.install();
+        let collector = OtlpTestServer::start().await;
+        // The gate stays closed, so both batches are still buffered.
+        let (relay, _reserved, _gate) = gated(collector.endpoint());
+        for span in ["one", "two"] {
+            assert_eq!(post(&relay, span).await, 200);
+        }
+        let counters = Arc::clone(&relay.counters);
+        drop(relay);
+        assert_eq!(counters.snapshot().export_failures, 2);
+        assert_eq!(counters.pending(), 0);
+        assert_eq!(
+            logs.count(
+                tracing::Level::WARN,
+                "OTLP relay stopped without a flush; discarding buffered batches"
+            ),
+            1
+        );
+        let summaries = logs.events(tracing::Level::INFO, "OTLP relay summary");
+        assert_eq!(
+            summaries.len(),
+            1,
+            "a loss alone triggers the final summary"
+        );
+        assert_eq!(summaries[0].field("export_failures"), Some(2));
         drop(collector.shutdown().await);
     }
 

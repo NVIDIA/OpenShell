@@ -188,7 +188,17 @@ impl OtlpConnectionServer {
                 "not found; the relay serves POST /v1/traces only",
             ));
         }
-        if request.headers().contains_key(CONTENT_ENCODING) {
+        // `identity` declares an uncompressed body; every other coding is
+        // refused rather than decoded.
+        let compressed = request
+            .headers()
+            .get(CONTENT_ENCODING)
+            .is_some_and(|value| {
+                !value
+                    .to_str()
+                    .is_ok_and(|coding| coding.trim().eq_ignore_ascii_case("identity"))
+            });
+        if compressed {
             return Ok(rejected(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "compressed body",
@@ -291,7 +301,7 @@ impl OtlpConnectionServer {
             return Ok(rejected(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "enriched body exceeds limit",
-                "request body exceeds the 2 MiB limit after attribution",
+                "request exceeds the relay's batch limit after attribution",
             ));
         }
 
@@ -309,11 +319,13 @@ impl OtlpConnectionServer {
             }
             Err(SendError::BufferFull) => {
                 self.counters.record_rejection();
-                Ok(unavailable())
+                Ok(unavailable(
+                    "relay buffer is full; retry after the Retry-After interval",
+                ))
             }
             Err(SendError::BufferClosed) => {
                 debug!("OTLP relay refused an export: relay is shutting down");
-                Ok(unavailable())
+                Ok(unavailable("relay is shutting down"))
             }
         }
     }
@@ -407,11 +419,11 @@ fn rejected(status: StatusCode, reason: &str, message: &str) -> Response<Full<By
     status_response(status, code, message)
 }
 
-fn unavailable() -> Response<Full<Bytes>> {
+fn unavailable(message: &str) -> Response<Full<Bytes>> {
     let mut response = status_response(
         StatusCode::SERVICE_UNAVAILABLE,
         tonic::Code::Unavailable,
-        "relay buffer is full; retry after the Retry-After interval",
+        message,
     );
     response.headers_mut().insert(
         RETRY_AFTER,
@@ -708,6 +720,24 @@ mod tests {
             "415 body must say compression is unsupported: {}",
             status.message
         );
+    }
+
+    #[tokio::test]
+    async fn identity_content_encoding_is_accepted() {
+        let (server, _handle, mut rx) = start(BUFFER_CAPACITY);
+        let mut client = connect(&server);
+        let head = send(
+            &mut client,
+            &request_with_headers(
+                "POST",
+                "/v1/traces",
+                &[("Content-Type", PROTOBUF), ("Content-Encoding", "Identity")],
+                &body(),
+            ),
+        )
+        .await;
+        assert_eq!(head.status, 200);
+        assert!(rx.recv().await.is_some());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1159,6 +1189,7 @@ mod tests {
         )
         .await;
         assert_eq!(head.status, 503);
+        assert_eq!(head.rpc_status().message, "relay is shutting down");
         let rejections = server.counters.snapshot().rejected;
         assert_eq!(rejections, 0, "shutdown refusals are not back-pressure");
     }
