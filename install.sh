@@ -455,12 +455,15 @@ resolve_latest_prerelease_tag() {
     }
 
     for _run_id in $_run_ids; do
-      _successful="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
-        .status == "completed" and .conclusion == "success" and
-        (.path | startswith(".github/workflows/release-tag.yml"))')" || {
+      # Packages are published before qualification; a failed or running
+      # qualification must not hide an already-published candidate.
+      _release_workflow="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
+        (.path | split("@")[0]) |
+        . == ".github/workflows/release-prerelease.yml" or
+        . == ".github/workflows/release-tag.yml"')" || {
         error "failed to check prerelease workflow run ${_run_id}"
       }
-      if [ "$_successful" = "true" ]; then
+      if [ "$_release_workflow" = "true" ]; then
         printf '%s\n' "$_tag"
         return 0
       fi

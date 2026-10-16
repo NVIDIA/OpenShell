@@ -129,8 +129,8 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
   "metadata": {
     "product": {
       "name": "OpenShell Sandbox Supervisor",
-      "vendor_name": "NVIDIA",
-      "version": "0.3.0"
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
     },
     "version": "1.8.0"
   },
@@ -159,38 +159,73 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
 }
 ```
 
-And a denied connection:
+And a denied connection, produced when `curl https://github.com` runs in a sandbox without a network policy that allows `github.com`:
 
 ```json
 {
   "class_uid": 4001,
   "class_name": "Network Activity",
+  "category_uid": 4,
+  "category_name": "Network Activity",
   "activity_id": 1,
   "activity_name": "Open",
+  "type_uid": 400101,
+  "type_name": "Network Activity: Open",
+  "time": 1791996125789,
   "severity_id": 3,
   "severity": "Medium",
   "status_id": 2,
   "status": "Failure",
-  "action_id": 2,
-  "action": "Denied",
-  "disposition_id": 2,
-  "disposition": "Blocked",
-  "status_detail": "no matching policy",
-  "message": "CONNECT denied httpbin.org:443",
+  "message": "Transparent TCP denied before relay: network connections not allowed by policy",
+  "status_detail": "transparent_tcp_policy_denied",
+  "metadata": {
+    "version": "1.8.0",
+    "product": {
+      "name": "OpenShell Sandbox Supervisor",
+      "vendor_name": "OpenShell",
+      "version": "0.1.4"
+    },
+    "profiles": [
+      "security_control",
+      "network_proxy",
+      "container",
+      "host"
+    ],
+    "uid": "b885957d-124a-4af7-9eef-75cc410ff070"
+  },
+  "device": {
+    "hostname": "docker-desktop",
+    "type_id": 99,
+    "type": "Sandbox",
+    "os": {
+      "name": "Linux"
+    }
+  },
+  "container": {
+    "name": "docs-deny",
+    "uid": "3949f6fc-2b84-45b2-a631-46debe41d84f"
+  },
   "dst_endpoint": {
-    "domain": "httpbin.org",
+    "domain": "github.com",
+    "ip": "198.18.0.2",
     "port": 443
+  },
+  "proxy_endpoint": {
+    "ip": "127.0.0.1",
+    "port": 3128
   },
   "actor": {
     "process": {
       "name": "/usr/bin/curl",
-      "pid": 63
+      "pid": 2187,
+      "cmd_line": "curl https://github.com"
     }
   },
-  "firewall_rule": {
-    "name": "-",
-    "type": "opa"
-  }
+  "action_id": 2,
+  "action": "Denied",
+  "disposition_id": 2,
+  "disposition": "Blocked",
+  "is_src_dst_assignment_known": true
 }
 ```
 
@@ -315,5 +350,6 @@ Shorthand stderr output follows the diagnostic log filter; its local file is ava
 
 ## Next Steps
 
+- See the [Observability Overview](/observability/overview) to compare JSONL files with OTLP log export.
 - Learn how to [read the shorthand format](/observability/logging) for real-time monitoring.
 - Refer to the [OCSF specification](https://schema.ocsf.io/) for the full schema reference.

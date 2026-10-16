@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::super::tests::{mcp_policy_with_versions, test_sandbox, with_sandbox};
+use super::super::tests::{mcp_policy_with_versions, test_provider, test_sandbox, with_sandbox};
 use super::super::{handle_get_sandbox_config, handle_report_policy_status, handle_update_config};
 use super::*;
 use crate::grpc::OpenShellService;
@@ -12,7 +12,8 @@ use openshell_core::proto::open_shell_server::OpenShellServer;
 use openshell_core::proto::{
     EndpointObservation, GetSandboxConfigRequest, GetSandboxRequest, NetworkEndpoint,
     NetworkPolicyRule, PolicyStatus, ReportPolicyStatusRequest, SandboxCondition, SandboxPhase,
-    SupervisorHello, SupervisorMessage, UpdateConfigRequest, supervisor_message,
+    SupervisorHello, SupervisorMessage, TokenGrantFailureObservation, UpdateConfigRequest,
+    supervisor_message,
 };
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Code;
@@ -29,6 +30,7 @@ fn test_initial_endpoint_status(endpoint_id: &str, host: &str, path: &str) -> En
         path: path.to_string(),
         last_result: EndpointResult::NoObservedExchange as i32,
         last_reported_time: None,
+        last_failure: None,
     }
 }
 
@@ -163,10 +165,12 @@ async fn sandbox_with_accepted_endpoint_result(
         observations: vec![EndpointObservation {
             endpoint_id: endpoint_id.clone(),
             result: EndpointResult::HttpResponseReceived as i32,
+            failure: None,
         }],
         observed_endpoint_ids: vec![endpoint_id],
         supervisor_session_id: "session-a".to_string(),
         report_sequence: 1,
+        token_grant_status: None,
     };
     handle_report_endpoint_status(
         &state,
@@ -580,6 +584,7 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
     let observation = EndpointObservation {
         endpoint_id: endpoint_id(endpoint),
         result: EndpointResult::NoObservedExchange as i32,
+        failure: None,
     };
     let (session_tx, _session_rx) = tokio::sync::mpsc::channel(1);
     let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
@@ -604,6 +609,7 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
             observed_endpoint_ids: Vec::new(),
             supervisor_session_id: "session-current".to_string(),
             report_sequence: 1,
+            token_grant_status: None,
         },
         ReportEndpointStatusRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -613,6 +619,7 @@ async fn report_endpoint_status_rejects_stale_configuration_epoch() {
             observed_endpoint_ids: Vec::new(),
             supervisor_session_id: "session-current".to_string(),
             report_sequence: 1,
+            token_grant_status: None,
         },
     ] {
         let error =
@@ -652,8 +659,9 @@ fn endpoint_snapshot_rejects_credential_failure_for_uncredentialed_path() {
     let reported = vec![EndpointObservation {
         endpoint_id: "endpoint:v1:public".to_string(),
         result: EndpointResult::CredentialUnavailable as i32,
+        failure: None,
     }];
-    let error = validate_endpoint_snapshot(&reported, &[], &expected)
+    let error = validate_endpoint_snapshot(&reported, &[], &expected, &[])
         .expect_err("uncredentialed endpoint cannot report credential failure");
     assert_eq!(error.code(), Code::InvalidArgument);
     assert_eq!(
@@ -766,6 +774,358 @@ fn endpoint_reconciliation_advances_only_observed_endpoint_timestamp() {
             },
             endpoint_b
         ]
+    );
+}
+
+fn reauthorize_failure() -> openshell_core::proto::EndpointFailure {
+    openshell_core::endpoint_failure::EndpointFailure::token_grant(
+        openshell_core::token_grant_failure::TokenGrantFailure::new(
+            openshell_core::token_grant_failure::TokenGrantFailureKind::ProviderAuthorizationRequired,
+            openshell_core::token_grant_failure::TokenGrantStage::GatewayRpc,
+        ),
+        "github",
+        "access_token",
+        "7e6d5c4b-3a29-4180-9f6e-5d4c3b2a1908",
+    )
+    .to_proto()
+}
+
+fn sandbox_grant_failure() -> TokenGrantFailureObservation {
+    TokenGrantFailureObservation {
+        destination_host: "api.example.com".to_string(),
+        destination_port: 443,
+        failure: Some(reauthorize_failure()),
+    }
+}
+
+async fn rest_grant_status_fixture(
+    sandbox_id: &str,
+) -> (Arc<ServerState>, ReportEndpointStatusRequest) {
+    let state = test_server_state().await;
+    state
+        .store
+        .put_message(&test_provider("github", "github"))
+        .await
+        .expect("store attached provider");
+    let mut policy = openshell_policy::restrictive_default_policy();
+    policy.network_policies.insert(
+        "rest".to_string(),
+        NetworkPolicyRule {
+            name: "rest".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                access: openshell_core::proto::NetworkAccessPreset::Full as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+    state
+        .store
+        .put_message(&test_sandbox(
+            sandbox_id,
+            sandbox_id,
+            policy.clone(),
+            vec!["github".to_string()],
+        ))
+        .await
+        .expect("store REST-only sandbox");
+    state
+        .store
+        .put_policy_revision(
+            &format!("{sandbox_id}-v1"),
+            sandbox_id,
+            "default",
+            1,
+            &policy.encode_to_vec(),
+            &deterministic_policy_hash(&policy),
+        )
+        .await
+        .expect("store REST policy");
+    acknowledge_loaded_policy(&state, sandbox_id, 1).await;
+    register_session(&state, sandbox_id, "session-a");
+    reset_endpoint_status_for_supervisor_session(&state, sandbox_id, "session-a")
+        .await
+        .expect("initialize REST observation session");
+    assert!(
+        state
+            .supervisor_sessions
+            .initialize_endpoint_status_authority(sandbox_id, "session-a")
+    );
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let context = active_endpoint_context(&state, &sandbox).await.unwrap();
+    (
+        state,
+        ReportEndpointStatusRequest {
+            sandbox_id: sandbox_id.to_string(),
+            policy_hash: context.policy_hash,
+            provider_env_revision: context.provider_env_revision,
+            supervisor_session_id: "session-a".to_string(),
+            report_sequence: 1,
+            token_grant_status: Some(TokenGrantStatus {
+                last_failure: Some(sandbox_grant_failure()),
+            }),
+            ..Default::default()
+        },
+    )
+}
+
+async fn stored_grant_failure(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Option<Box<TokenGrantFailureObservation>> {
+    public_status(state, sandbox_id)
+        .await
+        .last_token_grant_failure
+}
+
+#[test]
+fn token_grant_status_rejects_invalid_fields() {
+    use openshell_core::rpc_error::StatusExt;
+
+    let attached = ["github".to_string()];
+    let validate = |observation: TokenGrantFailureObservation, attached: &[String]| {
+        validate_token_grant_status(
+            Some(&TokenGrantStatus {
+                last_failure: Some(observation),
+            }),
+            attached,
+        )
+    };
+    validate(sandbox_grant_failure(), &attached).expect("valid observation is accepted");
+    // A failure raised before credential selection names no provider.
+    let mut unnamed = sandbox_grant_failure();
+    let cause = unnamed.failure.as_mut().unwrap();
+    cause.provider.clear();
+    cause.credential_key.clear();
+    validate(unnamed, &[]).expect("unnamed failure is accepted");
+
+    type Mutation = fn(&mut TokenGrantFailureObservation);
+    let rows: [(Mutation, &str); 5] = [
+        (
+            |o| o.destination_host = "API.EXAMPLE.COM".to_string(),
+            "token_grant_status.last_failure",
+        ),
+        (
+            |o| o.destination_host = "bad\nSECRET".to_string(),
+            "token_grant_status.last_failure",
+        ),
+        (
+            |o| o.failure = None,
+            "token_grant_status.last_failure.failure",
+        ),
+        (
+            |o| o.failure.as_mut().unwrap().domain = 99,
+            "token_grant_status.last_failure.failure.domain",
+        ),
+        (
+            |o| o.failure.as_mut().unwrap().code = "bogus".to_string(),
+            "token_grant_status.last_failure.failure",
+        ),
+    ];
+    for (mutate, field) in rows {
+        let mut observation = sandbox_grant_failure();
+        mutate(&mut observation);
+        let error = validate(observation, &attached).unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument, "{field}");
+        assert!(!error.message().contains("SECRET"));
+        assert_eq!(
+            error
+                .get_error_details()
+                .bad_request()
+                .unwrap()
+                .field_violations[0]
+                .field,
+            field
+        );
+    }
+
+    let mut foreign = sandbox_grant_failure();
+    foreign.failure.as_mut().unwrap().provider = "other-team".to_string();
+    let error = validate(foreign, &attached).unwrap_err();
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    let info = openshell_core::rpc_error::decode_details(&error)
+        .and_then(|details| details.error_info().cloned())
+        .expect("stable error reason");
+    assert_eq!(info.reason, "ENDPOINT_FAILURE_PROVIDER_NOT_ATTACHED");
+}
+
+#[test]
+fn endpoint_snapshot_stores_failure_only_for_a_result_its_domain_explains() {
+    let expected = BTreeMap::from([(
+        "endpoint:v1:tools".to_string(),
+        ExpectedEndpoint {
+            provider_credentialed: true,
+            status: test_initial_endpoint_status(
+                "endpoint:v1:tools",
+                "tools.example.com",
+                "/mcp/**",
+            ),
+        },
+    )]);
+    let validate = |result: EndpointResult| {
+        validate_endpoint_snapshot(
+            &[EndpointObservation {
+                endpoint_id: "endpoint:v1:tools".to_string(),
+                result: result as i32,
+                failure: Some(reauthorize_failure()),
+            }],
+            &["endpoint:v1:tools".to_string()],
+            &expected,
+            &["github".to_string()],
+        )
+    };
+    let (reports, _) = validate(EndpointResult::CredentialUnavailable)
+        .expect("a classified credential failure is accepted");
+    assert_eq!(
+        reports["endpoint:v1:tools"].last_failure,
+        Some(reauthorize_failure())
+    );
+
+    let error = validate(EndpointResult::TransportFailed).unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert_eq!(
+        error.message(),
+        "endpoint failure domain does not explain this endpoint result"
+    );
+}
+
+/// Send `report` with a new sequence and grant status; return the public cause.
+async fn send_grant_report(
+    state: &Arc<ServerState>,
+    report: &mut ReportEndpointStatusRequest,
+    sequence: u64,
+    grant_status: Option<TokenGrantStatus>,
+) -> Option<Box<TokenGrantFailureObservation>> {
+    report.report_sequence = sequence;
+    report.token_grant_status = grant_status;
+    let sandbox_id = report.sandbox_id.clone();
+    handle_report_endpoint_status(
+        state,
+        with_sandbox(Request::new(report.clone()), &sandbox_id),
+    )
+    .await
+    .expect("report accepted");
+    public_status(state, &sandbox_id)
+        .await
+        .last_token_grant_failure
+}
+
+#[tokio::test]
+async fn rest_grant_failure_is_retained_cleared_and_reset() {
+    let sandbox_id = "rest-grant-status";
+    let (state, mut report) = rest_grant_status_fixture(sandbox_id).await;
+    let failure = report.token_grant_status.clone();
+    let stored = Some(Box::new(sandbox_grant_failure()));
+
+    // A REST-only sandbox reports a failure without MCP observations. A report
+    // without the extension retains it; an explicit success clears it.
+    assert_eq!(
+        send_grant_report(&state, &mut report, 1, failure.clone()).await,
+        stored
+    );
+    assert_eq!(
+        send_grant_report(&state, &mut report, 2, None).await,
+        stored
+    );
+    let success = Some(TokenGrantStatus::default());
+    assert_eq!(
+        send_grant_report(&state, &mut report, 3, success).await,
+        None
+    );
+
+    // A report without the extension from a new provider revision cannot keep
+    // the earlier cause.
+    send_grant_report(&state, &mut report, 4, failure.clone()).await;
+    state
+        .store
+        .update_message_cas::<openshell_core::proto::Provider, _>(
+            "provider-github",
+            0,
+            |provider| {
+                provider.credentials.insert(
+                    "GITHUB_TOKEN".to_string(),
+                    "changed-inert-token".to_string(),
+                );
+            },
+        )
+        .await
+        .unwrap();
+    let sandbox = stored_sandbox(&state, sandbox_id).await;
+    let context = active_endpoint_context(&state, &sandbox).await.unwrap();
+    report.policy_hash = context.policy_hash;
+    report.provider_env_revision = context.provider_env_revision;
+    assert_eq!(send_grant_report(&state, &mut report, 5, None).await, None);
+
+    // Losing the session clears the cause.
+    send_grant_report(&state, &mut report, 6, failure).await;
+    state
+        .supervisor_sessions
+        .remove_if_current(sandbox_id, "session-a")
+        .unwrap();
+    reset_endpoint_status_after_supervisor_disconnect(&state, sandbox_id)
+        .await
+        .unwrap();
+    assert!(stored_grant_failure(&state, sandbox_id).await.is_none());
+
+    // Startup invalidates a sandbox whose only evidence is a grant failure.
+    state
+        .store
+        .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+            sandbox.status.as_mut().unwrap().last_token_grant_failure = stored.clone();
+        })
+        .await
+        .unwrap();
+    invalidate_endpoint_status_on_startup(&state).await.unwrap();
+    assert!(stored_grant_failure(&state, sandbox_id).await.is_none());
+}
+
+#[test]
+fn endpoint_failure_change_without_marker_keeps_report_time() {
+    let mut sandbox = test_sandbox(
+        "sandbox-id",
+        "sandbox-name",
+        ProtoSandboxPolicy::default(),
+        Vec::new(),
+    );
+    let endpoint = EndpointStatus {
+        last_result: EndpointResult::CredentialUnavailable as i32,
+        last_failure: Some(reauthorize_failure()),
+        ..test_initial_endpoint_status("endpoint", "api.example.com", "/**")
+    };
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &BTreeMap::from([("endpoint".to_string(), endpoint.clone())]),
+        &HashSet::from(["endpoint".to_string()]),
+        &timestamp("2026-09-05T01:00:00.000Z"),
+    );
+
+    // Only a new result needs an observation marker; a new cause for the same
+    // result is stored and keeps the earlier report time.
+    let mut retry = reauthorize_failure();
+    retry.request_id = "1a2b3c4d-5e6f-4a1b-8c2d-3e4f5a6b7c8d".to_string();
+    let changed = BTreeMap::from([(
+        "endpoint".to_string(),
+        EndpointStatus {
+            last_failure: Some(retry.clone()),
+            ..endpoint
+        },
+    )]);
+    validate_endpoint_observation_markers(&sandbox, &changed, &HashSet::new())
+        .expect("a changed cause for the same result needs no marker");
+    reconcile_endpoint_statuses(
+        &mut sandbox,
+        &changed,
+        &HashSet::new(),
+        &timestamp("2026-09-05T02:00:00.000Z"),
+    );
+    let status = &sandbox.status.as_ref().unwrap().endpoint_statuses[0];
+    assert_eq!(status.last_failure, Some(retry));
+    assert_eq!(
+        status.last_reported_time,
+        Some(timestamp("2026-09-05T01:00:00.000Z"))
     );
 }
 
@@ -1689,15 +2049,18 @@ async fn report_endpoint_status_is_session_bound_and_retry_idempotent() {
             EndpointObservation {
                 endpoint_id: observed_id.clone(),
                 result: EndpointResult::TransportFailed as i32,
+                failure: None,
             },
             EndpointObservation {
                 endpoint_id: unobserved_id,
                 result: EndpointResult::NoObservedExchange as i32,
+                failure: None,
             },
         ],
         observed_endpoint_ids: vec![observed_id.clone()],
         supervisor_session_id: "session-a".to_string(),
         report_sequence: 1,
+        token_grant_status: None,
     };
     handle_report_endpoint_status(
         &state,
@@ -1929,10 +2292,12 @@ async fn loaded_policy_and_unknown_endpoint_inventory_commit_atomically() {
                 observations: vec![EndpointObservation {
                     endpoint_id: initial_active.endpoint_id.clone(),
                     result: EndpointResult::HttpResponseReceived as i32,
+                    failure: None,
                 }],
                 observed_endpoint_ids: vec![initial_active.endpoint_id.clone()],
                 supervisor_session_id: "active-session".to_string(),
                 report_sequence: 1,
+                token_grant_status: None,
             }),
             sandbox_id,
         ),

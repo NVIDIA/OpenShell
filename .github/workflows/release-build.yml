@@ -1,0 +1,215 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Build Release
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Git tag to build and publish
+        required: true
+        type: string
+      is-prerelease:
+        description: Whether the caller is publishing a pre-release
+        required: true
+        type: boolean
+    outputs:
+      python_version:
+        description: Python package version
+        value: ${{ jobs.compute-versions.outputs.python_version }}
+      npm_version:
+        description: TypeScript package version
+        value: ${{ jobs.compute-versions.outputs.npm_version }}
+      semver:
+        description: Release version without the v prefix
+        value: ${{ jobs.compute-versions.outputs.semver }}
+      source_sha:
+        description: Source commit resolved from the release tag
+        value: ${{ jobs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release-tag }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compute-versions:
+    name: Compute Versions
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 5
+    container:
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      python_version: ${{ steps.v.outputs.python }}
+      cargo_version: ${{ steps.v.outputs.cargo }}
+      npm_version: ${{ steps.v.outputs.npm }}
+      deb_version: ${{ steps.v.outputs.deb }}
+      rpm_version: ${{ steps.v.outputs.rpm_version }}
+      rpm_release: ${{ steps.v.outputs.rpm_release }}
+      # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
+      semver: ${{ steps.v.outputs.semver }}
+      # Commit resolved from RELEASE_TAG, used for image tags and downstream metadata
+      source_sha: ${{ steps.v.outputs.source_sha }}
+      is_prerelease: ${{ steps.v.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.release-tag }}
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Compute all versions
+        id: v
+        env:
+          EXPECTED_PRERELEASE: ${{ inputs.is-prerelease }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
+            is_prerelease=true
+          elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            is_prerelease=false
+          else
+            echo "Unsupported release tag: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          if [[ "${is_prerelease}" != "${EXPECTED_PRERELEASE}" ]]; then
+            echo "Tag ${RELEASE_TAG} does not match this release workflow's prerelease mode." >&2
+            exit 1
+          fi
+          {
+            echo "is_prerelease=${is_prerelease}"
+            echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
+            echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
+            echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
+            echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)"
+            echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)"
+            echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)"
+            echo "semver=${RELEASE_TAG#v}"
+            echo "source_sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+  build-binaries:
+    needs: compute-versions
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  build-vm-driver:
+    needs: [compute-versions, build-binaries]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build-vm-driver.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  package-binaries:
+    needs: [compute-versions, build-binaries, build-vm-driver]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/package-release-binaries.yml
+    with:
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+  build-images:
+    needs: [compute-versions, build-binaries]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/build-images.yml
+    with:
+      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+  build-python-wheel:
+    name: Build Python Wheel
+    needs: [compute-versions]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: ${{ needs.compute-versions.outputs.python_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Sync Python dependencies
+        run: uv sync
+
+      - name: Build Python wheel
+        run: |
+          set -euo pipefail
+          mise run python:build
+          ls -la target/wheels/*.whl
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: python-wheel
+          path: target/wheels/*.whl
+          retention-days: 5
+
+  build-deb:
+    name: Build Debian Packages
+    needs: [compute-versions, build-binaries, build-vm-driver]
+    uses: ./.github/workflows/deb-package.yml
+    with:
+      deb-version: ${{ needs.compute-versions.outputs.deb_version }}
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+  build-snap:
+    name: Build Snap
+    needs: [compute-versions, build-binaries]
+    uses: ./.github/workflows/snap-package.yml
+    with:
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+
+  build-rpm:
+    name: Build RPM Packages
+    needs: [compute-versions, build-binaries]
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
+      rpm-version: ${{ needs.compute-versions.outputs.rpm_version }}
+      rpm-release: ${{ needs.compute-versions.outputs.rpm_release }}
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}

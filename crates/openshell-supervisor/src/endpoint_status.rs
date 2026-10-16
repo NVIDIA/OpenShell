@@ -3,7 +3,7 @@
 
 //! Report the last observed network result for configured external tool endpoints.
 //!
-//! Only MCP-over-HTTP traffic currently supplies observations. Reporting is
+//! MCP outcomes and token grant attempts supply observations. Reporting is
 //! passive, bounded, and independent of policy enforcement and sandbox readiness.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -329,11 +329,15 @@ fn apply_command(
                     .collect::<BTreeSet<_>>(),
             )
         }
-        EndpointStatusCommand::Observe { .. } => None,
+        EndpointStatusCommand::Observe { .. } | EndpointStatusCommand::ObserveTokenGrant { .. } => {
+            None
+        }
     };
     let observed_endpoint_id = match &command {
         EndpointStatusCommand::Observe { endpoint_id, .. } => Some(endpoint_id.clone()),
-        EndpointStatusCommand::Reset { .. } => None,
+        EndpointStatusCommand::Reset { .. } | EndpointStatusCommand::ObserveTokenGrant { .. } => {
+            None
+        }
     };
     if !tracker.apply(command) {
         return false;

@@ -10,6 +10,11 @@ attachments. Managed mode stages an immutable copy for each sandbox runtime
 generation.
 See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
+Caller PVC mounts cannot overlap the driver-managed `/.openshell` control tree
+or `/run`, including nested `subPath` mounts. Resource approval labels do not
+permit mounting over these paths. Use data paths such as `/data` or a directory
+below `/sandbox`.
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:

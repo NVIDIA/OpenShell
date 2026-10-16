@@ -235,6 +235,32 @@ impl EndpointObserver {
 
     /// Report the first terminal exchange result, dropping later attempts.
     pub(crate) fn observe(&self, result: EndpointResult) {
+        self.observe_with_failure(result, None);
+    }
+
+    /// Report a refused token grant as an unavailable credential with its cause.
+    ///
+    /// As with [`Self::observe_credential_failure`], an endpoint that does not
+    /// use provider credentials records nothing.
+    pub(crate) fn observe_token_grant_refusal(
+        &self,
+        refusal: &token_grant_injection::TokenGrantInjectionError,
+        request_id: &str,
+    ) {
+        if !self.uses_provider_credentials {
+            return;
+        }
+        self.observe_with_failure(
+            EndpointResult::CredentialUnavailable,
+            Some(refusal.endpoint_failure(request_id)),
+        );
+    }
+
+    fn observe_with_failure(
+        &self,
+        result: EndpointResult,
+        failure: Option<openshell_core::endpoint_failure::EndpointFailure>,
+    ) {
         let Ok(mut pending) = self.observation.lock() else {
             // Status reporting cannot interrupt traffic if another observer panicked.
             return;
@@ -253,7 +279,9 @@ impl EndpointObserver {
             // that activation gap, including a return to equal policy values.
             return;
         }
-        let _accepted = self.sender.try_observe(observation, result);
+        let _accepted = self
+            .sender
+            .try_observe_with_failure(observation, result, failure);
     }
 
     /// Report an endpoint mismatch or an unavailable provider credential.

@@ -317,6 +317,11 @@ Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
+`nix run .#build-artifacts` also builds
+`artifacts/packages/openshell.deb` for tmachine's `deb` installer, targeting the
+host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
+override the default package version, `0.0.0-local`.
+
 Run the portable subset in a disposable rootless Podman guest:
 
 ```shell

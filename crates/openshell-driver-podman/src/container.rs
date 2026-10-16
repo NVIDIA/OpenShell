@@ -69,6 +69,7 @@ const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str =
     openshell_core::driver_utils::UPSTREAM_PROXY_AUTH_MOUNT_PATH;
 const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 const PROXY_CA_MOUNT_PATH: &str = openshell_core::driver_utils::PROXY_CA_MOUNT_PATH;
+const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR: &str =
     openshell_core::driver_utils::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR;
 
@@ -608,6 +609,19 @@ fn upstream_proxy_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
     if config.proxy_ca_bundle.is_some() {
         args.push("--upstream-proxy-ca-bundle".to_string());
         args.push(PROXY_CA_MOUNT_PATH.to_string());
+    }
+    args
+}
+
+/// Build the additional-destination-CA command-line argument passed to the
+/// supervisor. Independent of `upstream_proxy_cli_args`: this applies to
+/// direct, inspected egress regardless of whether a corporate proxy is
+/// configured.
+fn additional_ca_cli_args(config: &PodmanComputeConfig) -> Vec<String> {
+    let mut args = Vec::new();
+    if config.additional_ca_bundle.is_some() {
+        args.push("--additional-ca-bundle".to_string());
+        args.push(ADDITIONAL_CA_MOUNT_PATH.to_string());
     }
     args
 }
@@ -1286,6 +1300,7 @@ fn build_base_spec(
     image_volumes.extend(user_mounts.image_volumes);
     let mut command = vec!["--workdir".to_string(), image.workspace_root.clone()];
     command.extend(upstream_proxy_cli_args(config));
+    command.extend(additional_ca_cli_args(config));
 
     let container_spec = ContainerSpec {
         name,
@@ -1449,6 +1464,24 @@ fn build_base_spec(
                     kind: "bind".into(),
                     source: ca_bundle.clone(),
                     destination: PROXY_CA_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
+            // Bind-mount an operator-supplied additional destination CA
+            // bundle read-only when configured. Independent of the corporate
+            // proxy CA above: this applies to direct, inspected egress. The
+            // supervisor reads it via the --additional-ca-bundle argv path
+            // (see additional_ca_cli_args) and folds it into its upstream
+            // trust store alongside the system bundle.
+            if let Some(ca_bundle) = &config.additional_ca_bundle {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: ca_bundle.clone(),
+                    destination: ADDITIONAL_CA_MOUNT_PATH.into(),
                     options: ro,
                 });
             }
@@ -1743,7 +1776,10 @@ pub fn build_isolation_specs(
 fn trusted_mount(destination: &str) -> bool {
     matches!(
         destination,
-        TLS_CA_MOUNT_PATH | PROXY_CA_MOUNT_PATH | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
+        TLS_CA_MOUNT_PATH
+            | PROXY_CA_MOUNT_PATH
+            | ADDITIONAL_CA_MOUNT_PATH
+            | PROVIDER_SPIFFE_WORKLOAD_API_SOCKET_MOUNT_DIR
     ) || destination == openshell_core::container_paths::NETNS_MOUNT_ROOT
 }
 
@@ -2913,6 +2949,128 @@ mod tests {
                 |m| m["destination"].as_str() == Some("/etc/openshell/tls/proxy/ca-bundle.pem")
             ),
             "no CA bundle mount without operator config"
+        );
+    }
+
+    #[test]
+    fn container_spec_binds_additional_ca_bundle_and_passes_argv_without_proxy() {
+        // #3781: the additional CA must work for direct, inspected egress
+        // with no corporate proxy configured at all — unlike proxy_ca_bundle,
+        // which requires https_proxy.
+        let sandbox = test_sandbox("additional-ca-id", "additional-ca-name");
+        let mut config = test_config();
+        assert!(
+            config.https_proxy.is_none(),
+            "test must exercise the no-proxy case"
+        );
+        config.additional_ca_bundle = Some("/host/additional-ca.pem".to_string());
+
+        let spec = build_container_spec(&sandbox, &config);
+        let command = spec_command(&spec);
+
+        let idx = command
+            .iter()
+            .position(|a| a == "--additional-ca-bundle")
+            .expect("additional CA bundle flag present");
+        assert_eq!(
+            command.get(idx + 1).map(String::as_str),
+            Some("/etc/openshell/tls/additional/ca-bundle.pem")
+        );
+
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        let ca_mount = mounts
+            .iter()
+            .find(|m| {
+                m["type"].as_str() == Some("bind")
+                    && m["destination"].as_str()
+                        == Some("/etc/openshell/tls/additional/ca-bundle.pem")
+            })
+            .expect("additional CA bundle bind mount present");
+        assert_eq!(ca_mount["source"].as_str(), Some("/host/additional-ca.pem"));
+        assert!(
+            ca_mount["options"]
+                .as_array()
+                .expect("options array")
+                .iter()
+                .any(|o| o.as_str() == Some("ro")),
+            "additional CA bundle mount must be read-only"
+        );
+    }
+
+    #[test]
+    fn isolated_pair_mounts_additional_ca_bundle_only_on_supervisor() {
+        // build_isolation_specs() filters the base spec's mounts per role, so
+        // the base-spec test above does not prove the final supervisor keeps
+        // the CA the --additional-ca-bundle argv points at.
+        let sandbox = test_sandbox("additional-ca-pair", "additional-ca-pair");
+        let mut config = test_config();
+        config.additional_ca_bundle = Some("/host/additional-ca.pem".to_string());
+        let identity = openshell_isolation_interface::contract::ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            Vec::new(),
+            "default".into(),
+            "sha256:image".into(),
+        )
+        .unwrap();
+        let specs = build_isolation_specs(IsolationSpecInput {
+            sandbox: &sandbox,
+            config: &config,
+            token_secret: Some("jwt"),
+            resolver_secret: "resolver",
+            gpu_devices: None,
+            image: &ResolvedPodmanImage::new("sha256:image"),
+            supervisor_bin: None,
+            tls_secrets: None,
+            identity: &identity,
+        })
+        .unwrap();
+
+        let ca_mount = specs
+            .supervisor
+            .mounts
+            .iter()
+            .find(|mount| mount.destination == ADDITIONAL_CA_MOUNT_PATH)
+            .expect("supervisor keeps the additional CA bind mount");
+        assert_eq!(ca_mount.kind, "bind");
+        assert_eq!(ca_mount.source, "/host/additional-ca.pem");
+        assert!(ca_mount.options.contains(&"ro".to_string()));
+        let idx = specs
+            .supervisor
+            .command
+            .iter()
+            .position(|arg| arg == "--additional-ca-bundle")
+            .expect("supervisor argv carries the additional CA flag");
+        assert_eq!(
+            specs.supervisor.command.get(idx + 1).map(String::as_str),
+            Some(ADDITIONAL_CA_MOUNT_PATH)
+        );
+        assert!(
+            specs
+                .workload
+                .mounts
+                .iter()
+                .all(|mount| mount.destination != ADDITIONAL_CA_MOUNT_PATH),
+            "workload must not receive the additional CA mount"
+        );
+    }
+
+    #[test]
+    fn container_spec_omits_additional_ca_bundle_when_unconfigured() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let spec = build_container_spec(&sandbox, &test_config());
+        let command = spec_command(&spec);
+        assert!(
+            !command.iter().any(|a| a == "--additional-ca-bundle"),
+            "no additional-ca-bundle flag without operator config"
+        );
+        let mounts = spec["mounts"].as_array().expect("mounts array");
+        assert!(
+            !mounts.iter().any(|m| m["destination"].as_str()
+                == Some("/etc/openshell/tls/additional/ca-bundle.pem")),
+            "no additional CA bundle mount without operator config"
         );
     }
 

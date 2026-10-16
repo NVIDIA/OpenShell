@@ -51,6 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the build process environment. With a caller-supplied PROTOC, leave both
     // to prost.
     let mut proto_config = tonic_prost_build::Config::new();
+    // Keep optional grant evidence off sandbox lifecycle futures' stacks.
+    proto_config.boxed(".openshell.v1.SandboxStatus.last_token_grant_failure");
     let proto_include = if use_vendored_protoc {
         proto_config.protoc_executable(protoc_bin_vendored::protoc_bin_path()?);
         Some(protoc_bin_vendored::include_path()?)

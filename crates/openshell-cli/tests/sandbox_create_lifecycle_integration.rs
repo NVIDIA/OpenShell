@@ -2991,25 +2991,25 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         .run_async(async {
             let tls = test_tls(&server);
             install_fake_forwarding_ssh(&fake_ssh_dir);
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let forward_port = listener.local_addr().unwrap().port();
-            drop(listener);
-
-            run::sandbox_create(
-                &server.endpoint,
-                "openshell",
-                run::SandboxCreateConfig {
-                    name: Some("persistent-forward"),
-                    keep: false,
-                    forward: Some(openshell_core::forward::ForwardSpec::new(forward_port)),
-                    command: &["echo".into(), "OK".into()],
-                    ..test_config()
-                },
-                "default",
-                &tls,
-            )
-            .await
-            .expect("sandbox create with forward should succeed");
+            let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+            let (forward_port, result) = with_free_forward_port(|spec| async move {
+                run::sandbox_create(
+                    endpoint,
+                    "openshell",
+                    run::SandboxCreateConfig {
+                        name: Some("persistent-forward"),
+                        keep: false,
+                        forward: Some(spec),
+                        command: &["echo".into(), "OK".into()],
+                        ..test_config()
+                    },
+                    "default",
+                    tls,
+                )
+                .await
+            })
+            .await;
+            result.expect("sandbox create with forward should succeed");
 
             assert!(deleted_names(&server).await.is_empty());
             let record = openshell_core::forward::read_forward_pid(
@@ -3104,21 +3104,14 @@ async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails(
             let tls = test_tls(&server);
             install_fake_forwarding_ssh(&fake_ssh_dir);
             install_fake_pgrep_no_match(&fake_ssh_dir);
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let forward_port = listener.local_addr().unwrap().port();
-            drop(listener);
-
-            let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-            run::sandbox_forward(
-                &server.endpoint,
-                "owned-forward",
-                &spec,
-                true,
-                &tls,
-                "default",
-            )
-            .await
-            .expect("background forward should track the owned SSH child without PID discovery");
+            let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+            let (forward_port, result) = with_free_forward_port(|spec| async move {
+                run::sandbox_forward(endpoint, "owned-forward", &spec, true, tls, "default").await
+            })
+            .await;
+            result.expect(
+                "background forward should track the owned SSH child without PID discovery",
+            );
             let record =
                 openshell_core::forward::read_forward_pid("default", "owned-forward", forward_port)
                     .expect("owned background forward should write a PID file");
@@ -3147,21 +3140,15 @@ async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens()
         .run_async(async {
             let tls = test_tls(&server);
             install_fake_ssh(&fake_ssh_dir);
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let forward_port = listener.local_addr().unwrap().port();
-            drop(listener);
-
-            let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-            let err = run::sandbox_forward(
-                &server.endpoint,
-                "foreground-forward",
-                &spec,
-                false,
-                &tls,
-                "default",
-            )
-            .await
-            .expect_err("foreground forward should fail when ssh exits before listener readiness");
+            let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+            let (_, result) = with_free_forward_port(|spec| async move {
+                run::sandbox_forward(endpoint, "foreground-forward", &spec, false, tls, "default")
+                    .await
+            })
+            .await;
+            let err = result.expect_err(
+                "foreground forward should fail when ssh exits before listener readiness",
+            );
             let msg = format!("{err}");
             assert!(
                 msg.contains("ssh exited before local forward listener opened"),
@@ -3181,21 +3168,12 @@ async fn sandbox_forward_background_terminates_owned_child_when_listener_never_o
     test_env(&fake_ssh_dir, &xdg_dir).run_async(async {
     let tls = test_tls(&server);
     let fake_forward = install_fake_unreachable_forwarding_ssh(&fake_ssh_dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forward_port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(
-        &server.endpoint,
-        "unreachable-forward",
-        &spec,
-        true,
-        &tls,
-        "default",
-    )
-    .await
-    .expect_err("background forward should fail when the listener never opens");
+    let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+    let (forward_port, result) = with_free_forward_port(|spec| async move {
+        run::sandbox_forward(endpoint, "unreachable-forward", &spec, true, tls, "default").await
+    })
+    .await;
+    let err = result.expect_err("background forward should fail when the listener never opens");
     let msg = format!("{err}");
     assert!(
         msg.contains("ssh process started but local forward listener was not reachable"),
@@ -3850,6 +3828,24 @@ async fn sandbox_template_create_suppresses_credential_env_warnings() {
 fn reserve_local_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Run a CLI forward on a free loopback port, retrying on a new port if another
+/// process takes it first. The CLI checks the port before it binds it, which can
+/// be seconds later for `sandbox create`, so a concurrent test can claim it.
+async fn with_free_forward_port<F, Fut, T>(mut forward: F) -> (u16, miette::Result<T>)
+where
+    F: FnMut(openshell_core::forward::ForwardSpec) -> Fut,
+    Fut: Future<Output = miette::Result<T>>,
+{
+    for _ in 0..10 {
+        let port = reserve_local_port();
+        let result = forward(openshell_core::forward::ForwardSpec::new(port)).await;
+        if !matches!(&result, Err(err) if err.to_string().contains("is already in use")) {
+            return (port, result);
+        }
+    }
+    panic!("another process took the forward port on every attempt");
 }
 
 fn spawn_service_forward(
