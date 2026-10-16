@@ -37,6 +37,10 @@ pub struct AtomicPolicyRevisionWrite {
     /// Populate the create-time baseline, or replace it while startup admission
     /// is blocked and no workload has consumed the static restrictions.
     pub backfill_policy: Option<ProtoSandboxPolicy>,
+    /// Allow `backfill_policy` to replace an existing baseline while startup
+    /// admission is blocked. Only a management repair may do this; a
+    /// sandbox-originated write must conflict instead of overwriting it.
+    pub replace_startup_baseline: bool,
 }
 
 pub fn policy_record_for_atomic_write(
@@ -108,7 +112,7 @@ pub fn project_policy_revision_onto_sandbox(
                 changed = true;
             }
             Some(current) if current == backfill_policy => {}
-            Some(_) if startup_blocked => {
+            Some(_) if startup_blocked && write.replace_startup_baseline => {
                 spec.policy = Some(backfill_policy.clone());
                 changed = true;
             }
@@ -710,7 +714,7 @@ mod tests {
             .unwrap()
             .read_write
             .push("/new-static-path".to_string());
-        let write = AtomicPolicyRevisionWrite {
+        let mut write = AtomicPolicyRevisionWrite {
             id: "revision".to_string(),
             sandbox_id: "sandbox".to_string(),
             workspace: "default".to_string(),
@@ -721,6 +725,7 @@ mod tests {
             expected_resource_version: 0,
             annotations: HashMap::new(),
             backfill_policy: Some(replacement.clone()),
+            replace_startup_baseline: true,
         };
         for activated in [None, Some(false), Some(true)] {
             for state in [Admission::Pending, Admission::Rejected, Admission::Accepted] {
@@ -753,5 +758,27 @@ mod tests {
                 }
             }
         }
+        // A sandbox-originated write built from a stale read must not replace an
+        // operator's repair, even while startup admission is still blocked.
+        write.replace_startup_baseline = false;
+        let blocked = Sandbox {
+            spec: Some(SandboxSpec {
+                policy: Some(baseline),
+                ..Default::default()
+            }),
+            status: Some(SandboxStatus {
+                configuration_activated: Some(false),
+                configuration_admission: Some(SandboxConfigurationAdmission {
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            project_policy_revision_onto_sandbox(&write, &blocked.encode_to_vec(), 1),
+            Err(PersistenceError::Conflict { .. })
+        ));
     }
 }

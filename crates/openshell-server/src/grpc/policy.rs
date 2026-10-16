@@ -2663,6 +2663,7 @@ async fn persist_existing_policy_projection(
     annotations: &HashMap<String, String>,
     current_annotations: &HashMap<String, String>,
     backfill_policy: Option<&ProtoSandboxPolicy>,
+    replace_startup_baseline: bool,
 ) -> Result<HashMap<String, String>, Status> {
     let annotations_match = annotations
         .iter()
@@ -2680,7 +2681,7 @@ async fn persist_existing_policy_projection(
                 crate::policy_store::permits_initial_static_policy_repair(sandbox);
             if let Some(policy) = backfill_policy.as_ref()
                 && let Some(spec) = sandbox.spec.as_mut()
-                && (spec.policy.is_none() || startup_blocked)
+                && (spec.policy.is_none() || (startup_blocked && replace_startup_baseline))
             {
                 spec.policy = Some(policy.clone());
             }
@@ -4289,6 +4290,7 @@ async fn handle_update_config_inner(
                 &req.annotations,
                 &response_annotations,
                 None,
+                false,
             )
             .await?
         };
@@ -4437,6 +4439,7 @@ async fn handle_update_config_inner(
                     &req.annotations,
                     &response_annotations,
                     backfill_policy.as_ref(),
+                    startup_blocked && !sandbox_caller,
                 )
                 .await?;
                 if backfill_policy.is_some() {
@@ -4466,6 +4469,7 @@ async fn handle_update_config_inner(
                 expected_resource_version: req.expected_resource_version,
                 annotations: req.annotations.clone(),
                 backfill_policy: backfill_policy.clone(),
+                replace_startup_baseline: startup_blocked && !sandbox_caller,
             };
 
             match state.store.put_policy_revision_atomic(&write).await {
@@ -7395,6 +7399,7 @@ async fn apply_merge_operations_with_retry(
                     expected_resource_version: context.expected_resource_version,
                     annotations: context.annotations.clone(),
                     backfill_policy: None,
+                    replace_startup_baseline: false,
                 })
                 .await
                 .map(Some)
