@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::enums::DeviceTypeId;
+use crate::enums::{DeviceTypeId, OsTypeId};
 
 /// OCSF Device object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,9 +38,33 @@ pub struct Device {
 pub struct OsInfo {
     /// OS name (e.g., "Linux").
     pub name: String,
+
+    /// OS type id. Required by the OCSF schema.
+    pub type_id: OsTypeId,
+
+    /// Sibling label for `type_id`; the platform name when `type_id` is Other.
+    #[serde(rename = "type")]
+    pub type_label: String,
 }
 
 impl OsInfo {
+    /// OS info for a `std::env::consts::OS` value.
+    #[must_use]
+    pub fn for_target(os: &str) -> Self {
+        let type_id = match os {
+            "linux" => OsTypeId::Linux,
+            "windows" => OsTypeId::Windows,
+            "macos" => OsTypeId::MacOs,
+            _ => OsTypeId::Other,
+        };
+        let name = Self::pretty_name(os).to_string();
+        Self {
+            type_label: name.clone(),
+            name,
+            type_id,
+        }
+    }
+
     /// Display name for a `std::env::consts::OS` value.
     #[must_use]
     pub fn pretty_name(os: &str) -> &str {
@@ -63,9 +87,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo {
-                name: "Linux".to_string(),
-            }),
+            os: Some(OsInfo::for_target("linux")),
         }
     }
 
@@ -78,9 +100,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo {
-                name: "Windows".to_string(),
-            }),
+            os: Some(OsInfo::for_target("windows")),
         }
     }
 
@@ -111,9 +131,7 @@ impl Device {
             name: Some(name.to_string()),
             // Operators assign a unique name per installation; replicas share this UID.
             uid: Some(name.to_string()),
-            os: Some(OsInfo {
-                name: OsInfo::pretty_name(std::env::consts::OS).to_string(),
-            }),
+            os: Some(OsInfo::for_target(std::env::consts::OS)),
         }
     }
 }
@@ -179,6 +197,42 @@ mod tests {
             ("freebsd", "freebsd"),
         ] {
             assert_eq!(OsInfo::pretty_name(os), expected);
+        }
+    }
+
+    #[test]
+    fn os_type_follows_the_target_os() {
+        for (target, name, type_id, type_label) in [
+            ("linux", "Linux", 200, "Linux"),
+            ("windows", "Windows", 100, "Windows"),
+            ("macos", "macOS", 300, "macOS"),
+            ("freebsd", "freebsd", 99, "freebsd"),
+        ] {
+            let json = serde_json::to_value(OsInfo::for_target(target)).unwrap();
+            assert_eq!(json["name"], name);
+            assert_eq!(json["type_id"], type_id);
+            assert_eq!(json["type"], type_label);
+        }
+    }
+
+    #[test]
+    fn device_os_matches_vendored_schema() {
+        use crate::validation::schema::{
+            load_object_schema, validate_enum_value, validate_known_fields,
+            validate_required_fields,
+        };
+
+        let schema = load_object_schema("os");
+        for device in [
+            Device::linux("sandbox"),
+            Device::windows("sandbox"),
+            Device::for_current_os("sandbox"),
+            Device::gateway("gateway-0", "production"),
+        ] {
+            let os = serde_json::to_value(device.os).unwrap();
+            validate_required_fields(&os, &schema);
+            validate_known_fields(&os, &schema);
+            validate_enum_value(&os, "type_id", &schema);
         }
     }
 

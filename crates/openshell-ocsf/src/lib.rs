@@ -49,8 +49,8 @@ pub use events::{
 // --- Enum types ---
 pub use enums::{
     ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId,
-    HttpMethod, LaunchTypeId, OcsfEnum, RiskLevelId, SecurityLevelId, SeverityId, StateId,
-    StatusId, UserTypeId,
+    HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId, SecurityLevelId, SeverityId,
+    StateId, StatusId, UserTypeId,
 };
 
 // --- Object types ---
