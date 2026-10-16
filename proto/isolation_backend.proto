@@ -12,6 +12,15 @@ import "options.proto";
 // trusted, authenticated endpoint selected by operator configuration or compute
 // driver provisioning. Workload control, network mediation, and byte streams
 // remain on the Sandbox Protocol.
+// Before serving a launch, the trusted compute driver provisions the backend
+// with gateway_id and verification_keys from the gateway-created
+// launch_authentication in compute_driver.proto. These public keys verify the
+// supervisor's sandbox bearer; the driver delivers supervisor bearer credentials
+// only to the supervisor, never to workload code. The gateway identity and key
+// set remain fixed for that runtime generation. Bearers may be renewed within
+// the generation using the provisioned keys; changing the gateway identity or
+// key set requires a fresh launch and generation. These RPCs do not provision
+// or update verification keys.
 // Describe exchanges PeerMetadata to negotiate the base contract and optional
 // suspend/resume support.
 // Version 1.0 requires openshell.sandbox.protocol on both peers and includes
