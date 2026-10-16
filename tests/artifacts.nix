@@ -214,8 +214,13 @@ rec {
   binaries = pkgs.writeShellApplication {
     name = "build-artifacts-binaries";
     runtimeInputs = [
+      pkgs.binutils-unwrapped
       pkgs.coreutils
+      pkgs.file
+      pkgs.gawk
       pkgs.git
+      pkgs.gnugrep
+      pkgs.gnused
       rustToolchain
     ];
     runtimeEnv = toolchainEnv;
@@ -223,10 +228,19 @@ rec {
       root=$(git rev-parse --show-toplevel)
       cd "$root"
 
-      cargo build --target ${muslToolchain.target} \
+      # z3-sys links libstdc++ dynamically unless CXXSTDLIB says otherwise, and
+      # the musl binaries must be fully static. CXXSTDLIB applies to every
+      # target, so set it only for the musl build: Darwin has no libstdc++.
+      CXXSTDLIB=static:-bundle=stdc++ cargo build --target ${muslToolchain.target} \
         -p openshell-cli \
         -p openshell-sandbox \
         -p openshell-prover-cli
+
+      # Fail as the release does if a musl binary is not fully static.
+      tasks/scripts/verify-static-binary.sh \
+        target/${muslToolchain.target}/debug/openshell \
+        target/${muslToolchain.target}/debug/openshell-sandbox \
+        target/${muslToolchain.target}/debug/openshell-prover
 
       cargo build --target ${gnuToolchain.target} \
         -p openshell-gateway \
