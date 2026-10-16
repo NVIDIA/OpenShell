@@ -61,9 +61,6 @@ message DescribeIsolationBackendResponse {
 }
 
 message OpenBoundaryRequest {
-  reserved 6;
-  reserved "request_id";
-
   // Stable gateway-assigned sandbox identity, not a public resource name.
   string sandbox_id = 1;
   // Fresh for each launch and unchanged for retries of that launch.
@@ -96,9 +93,6 @@ message OpenBoundaryResponse {
 }
 
 message SuspendBoundaryRequest {
-  reserved 4;
-  reserved "request_id";
-
   // Retries for this session and generation return the same reference or a
   // terminal error.
   string boundary_id = 1;

@@ -27,8 +27,6 @@ service SandboxBoundary {
 // Process stdin closes explicitly; ending a gRPC request stream does not end
 // the independent response stream. Exit follows all retained process output.
 message BoundaryChunk {
-  reserved 2;
-  reserved "data";
   oneof payload {
     string boundary_id = 1;
     RequestEnvelope request = 3;
