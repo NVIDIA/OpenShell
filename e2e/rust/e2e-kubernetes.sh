@@ -92,6 +92,7 @@ run_suite() {
 run_e2e() {
   run_conformance
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
   fi
 

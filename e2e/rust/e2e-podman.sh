@@ -74,6 +74,7 @@ fi
 if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   e2e_run_openshell_conformance "Podman"
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     exit 0
   fi
 

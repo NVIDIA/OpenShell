@@ -407,6 +407,7 @@ export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 e2e_run_openshell_conformance "VM"
 if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+  echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
   exit 0
 fi
 

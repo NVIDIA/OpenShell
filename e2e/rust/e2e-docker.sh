@@ -22,6 +22,7 @@ run_e2e() {
   e2e_run_openshell_conformance "Docker"
 
   if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
   fi
 
