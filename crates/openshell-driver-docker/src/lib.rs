@@ -149,8 +149,7 @@ const MAX_WORKSPACE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 static WORKSPACE_ARCHIVE_ADMISSION: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(2));
 /// Fixed in-container path for the gateway-owned additional destination trust.
 /// It is mounted only into the separate trusted supervisor container.
-const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
-    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
+const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
 
 fn provisioning_span(
     parent: &opentelemetry::Context,
@@ -5641,12 +5640,10 @@ fn docker_supervisor_host_address(grpc_endpoint: &str) -> Option<IpAddr> {
 fn docker_network_trust_supervisor_args(
     bundle: Option<&NetworkSupervisorTrustBundle>,
 ) -> Vec<String> {
-    bundle.map_or_else(Vec::new, |bundle| {
+    bundle.map_or_else(Vec::new, |_bundle| {
         vec![
-            "--network-additional-ca-bundle".to_string(),
-            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
-            "--network-additional-ca-digest".to_string(),
-            bundle.digest().to_string(),
+            "--additional-ca-bundle".to_string(),
+            ADDITIONAL_CA_MOUNT_PATH.to_string(),
         ]
     })
 }
@@ -5668,7 +5665,7 @@ fn docker_network_trust_supervisor_mount(
     driver_mounts::validate_absolute_mount_source(source, "network additional CA artifact")
         .map_err(Status::failed_precondition)?;
     Ok(Mount {
-        target: Some(NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string()),
+        target: Some(ADDITIONAL_CA_MOUNT_PATH.to_string()),
         source: Some(source.to_string()),
         typ: Some(MountTypeEnum::BIND),
         read_only: Some(true),

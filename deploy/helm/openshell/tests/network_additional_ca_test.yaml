@@ -35,12 +35,12 @@ tests:
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
-            name: network-additional-ca-source
+            name: additional-ca-source
           any: true
       - notContains:
           path: spec.template.spec.volumes
           content:
-            name: network-additional-ca-source
+            name: additional-ca-source
           any: true
 
   - it: omits shared namespace ConfigMap permissions by default
@@ -70,10 +70,10 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.supervisor\.network\]\s*additional_ca_cert_paths\s*=\s*\["/etc/openshell-tls/network-additional-ca-source/ca\.crt"\]'
+          pattern: '(?ms)\[openshell\.supervisor\.network\]\s*additional_ca_bundle\s*=\s*"/etc/openshell-tls/additional-ca-source/ca\.crt"'
       - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*additional_ca_cert_paths'
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\][^\[]*additional_ca_bundle'
 
   - it: mounts the operator source ConfigMap into the gateway
     template: templates/statefulset.yaml
@@ -83,14 +83,14 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
-            name: network-additional-ca-source
-            mountPath: /etc/openshell-tls/network-additional-ca-source/ca.crt
+            name: additional-ca-source
+            mountPath: /etc/openshell-tls/additional-ca-source/ca.crt
             subPath: ca.crt
             readOnly: true
       - contains:
           path: spec.template.spec.volumes
           content:
-            name: network-additional-ca-source
+            name: additional-ca-source
             configMap:
               name: private-destination-ca
               items:
@@ -116,7 +116,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["configmaps"]
-            resourceNames: ["openshell-network-additional-ca-openshell"]
+            resourceNames: ["openshell-additional-ca-openshell"]
           any: true
       - notContains:
           path: rules
@@ -181,7 +181,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["configmaps"]
-            resourceNames: ["openshell-network-additional-ca-openshell"]
+            resourceNames: ["openshell-additional-ca-openshell"]
           any: true
 
   - it: omits a shared Role in managed workspace mode
@@ -210,7 +210,7 @@ tests:
           content:
             apiGroups: [""]
             resources: ["configmaps"]
-            resourceNames: ["openshell-network-additional-ca-openshell"]
+            resourceNames: ["openshell-additional-ca-openshell"]
           any: true
 
   - it: omits a shared Role in operator workspace mode

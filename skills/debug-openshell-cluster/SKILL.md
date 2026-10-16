@@ -426,13 +426,13 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
-- Gateway fails to start with an `additional_ca_bundle` error: the Podman
-  driver validates the setting at startup. The file must exist on the gateway
-  host, be non-empty, and contain at least one PEM certificate.
+- Gateway fails to start with an `additional_ca_bundle` error: gateway startup
+  validates the configured single bundle. The file must exist on the gateway
+  host, be a regular non-symlink file, and contain at least one PEM certificate.
 - Inspected HTTPS to a private-CA destination fails (for example
   `curl: (52) Empty reply from server`), or the supervisor exits at startup,
-  with `additional_ca_bundle` set: the supervisor container needs the CA, not
-  just the workload. Check
+  with a global `additional_ca_bundle` configured: the supervisor container
+  needs the staged CA, not just the workload. Check
   `podman inspect <sandbox>-supervisor --format '{{json .Mounts}}'` for a
   read-only bind of the bundle at `/etc/openshell/tls/additional/ca-bundle.pem`,
   and `--format '{{json .Config.Cmd}}'` for `--additional-ca-bundle` with that
@@ -515,12 +515,12 @@ pod, and the gateway propagates the effective value to sandbox supervisors.
 
 When `supervisor.network.additionalCaConfigMapName` is set, Helm must mount the
 **source** operator ConfigMap's `ca.crt` key into the gateway at
-`/etc/openshell-tls/network-additional-ca-source/ca.crt`. The rendered
+`/etc/openshell-tls/additional-ca-source/ca.crt`. The rendered
 `gateway.toml` must contain the global (not Kubernetes-driver-local) setting:
 
 ```toml
 [openshell.supervisor.network]
-additional_ca_cert_paths = ["/etc/openshell-tls/network-additional-ca-source/ca.crt"]
+additional_ca_bundle = "/etc/openshell-tls/additional-ca-source/ca.crt"
 ```
 
 Inspect the source, render, and live gateway mount before inspecting sandbox
@@ -530,7 +530,7 @@ pods:
 helm -n openshell get values openshell | grep -A3 additionalCaConfigMapName
 kubectl -n openshell get configmap <source-configmap> -o jsonpath='{.data.ca\.crt}' >/dev/null
 kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -A2 '^\[openshell.supervisor.network\]'
-kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="network-additional-ca-source")]}{"\n"}'
+kubectl -n openshell get pod <gateway-pod> -o jsonpath='{.spec.volumes[?(@.name=="additional-ca-source")]}{"\n"}'
 ```
 
 At startup, the gateway normalizes the source once and stages a

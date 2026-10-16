@@ -31,6 +31,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+
+use sha2::Digest;
 use tracing::{Instrument as _, debug, info, warn};
 
 const STOP_COMPLETION_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -165,7 +167,9 @@ pub struct PodmanComputeDriver {
     gpu_inventory_refresh: Arc<dyn Fn() -> (CdiGpuInventory, bool) + Send + Sync>,
     lifecycle_event_fences: LifecycleEventFences,
     /// Gateway-normalized destination trust held outside untrusted sandbox
-    /// specs. Standalone external drivers always construct this as `None`.
+    /// specs. Gateway-managed drivers receive the staged bundle from the
+    /// gateway; standalone drivers self-source one from the
+    /// `--sandbox-additional-ca-bundle` operator path.
     network_trust: Option<NetworkSupervisorTrustBundle>,
 }
 
@@ -466,6 +470,29 @@ fn resolve_socket_path(
     })
 }
 
+/// Build destination trust from an operator-supplied standalone bundle path.
+///
+/// Standalone (non-gateway) drivers accept `--sandbox-additional-ca-bundle`
+/// directly. The file is read with the same bounded, no-symlink validation
+/// the gateway applies to its own configured bundle, and a SHA-256 digest of
+/// the material becomes the trust generation so stop/start reconciliation
+/// behaves identically to gateway-managed deployments.
+fn operator_network_trust(path: &str) -> Result<NetworkSupervisorTrustBundle, PodmanApiError> {
+    let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
+        path,
+        "additional_ca_bundle",
+    )
+    .map_err(PodmanApiError::InvalidInput)?;
+    let certificate_count = pem.matches("-----BEGIN CERTIFICATE-----").count();
+    let digest = format!("sha256:{:x}", sha2::Sha256::digest(pem.as_bytes()));
+    Ok(NetworkSupervisorTrustBundle::new(
+        pem.into_bytes(),
+        certificate_count,
+        digest,
+        PathBuf::from(path),
+    ))
+}
+
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(
@@ -477,6 +504,18 @@ impl PodmanComputeDriver {
 
         let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
         config.socket_path = Some(socket_path.clone());
+
+        let network_trust = match (network_trust, config.additional_ca_bundle.as_deref()) {
+            (Some(_), Some(path)) => {
+                return Err(PodmanApiError::InvalidInput(format!(
+                    "destination CA trust was supplied both by the gateway and through \
+                     --sandbox-additional-ca-bundle ('{path}'); configure exactly one source"
+                )));
+            }
+            (Some(bundle), None) => Some(bundle),
+            (None, Some(path)) => Some(operator_network_trust(path)?),
+            (None, None) => None,
+        };
 
         if !socket_path.exists() {
             if cfg!(target_os = "macos") {
@@ -2608,7 +2647,7 @@ mod tests {
             vec![
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"[{"Id":"ctr-1","State":"stopped","Labels":{"openshell.ai/network-additional-ca-generation":"none"}}]"#,
+                    r#"[{"Id":"ctr-1","State":"stopped","Labels":{"openshell.ai/additional-ca-generation":"none"}}]"#,
                 ),
                 StubResponse::new(
                     StatusCode::OK,
@@ -2963,7 +3002,7 @@ mod tests {
             vec![
                 StubResponse::new(
                     StatusCode::OK,
-                    r#"[{"Id":"ctr-1","State":"stopped","Labels":{"openshell.ai/network-additional-ca-generation":"none"}}]"#,
+                    r#"[{"Id":"ctr-1","State":"stopped","Labels":{"openshell.ai/additional-ca-generation":"none"}}]"#,
                 ),
                 StubResponse::new(
                     StatusCode::OK,

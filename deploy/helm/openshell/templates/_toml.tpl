@@ -312,7 +312,7 @@ operator ConfigMap reference. */}}
 {{- if hasKey $config "openshell.supervisor.network" -}}
 {{- fail "gatewayConfig must not define openshell.supervisor.network; the chart derives it from supervisor.network.additionalCaConfigMapName" -}}
 {{- end -}}
-{{- $_ := set $config "openshell.supervisor.network" (dict "additional_ca_cert_paths" (list "/etc/openshell-tls/network-additional-ca-source/ca.crt")) -}}
+{{- $_ := set $config "openshell.supervisor.network" (dict "additional_ca_bundle" "/etc/openshell-tls/additional-ca-source/ca.crt") -}}
 {{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}

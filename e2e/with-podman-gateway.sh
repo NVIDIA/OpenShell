@@ -592,7 +592,7 @@ if [ "${ADDITIONAL_CA_MODE}" = "1" ]; then
   awk -v ca_path="$(e2e_podman_toml_string "${ADDITIONAL_CA_DIR}/ca.crt")" '
     !inserted && $0 == "[openshell.drivers.podman]" {
       print "[openshell.supervisor.network]"
-      print "additional_ca_cert_paths = [" ca_path "]"
+      print "additional_ca_bundle = " ca_path
       print ""
       inserted = 1
     }

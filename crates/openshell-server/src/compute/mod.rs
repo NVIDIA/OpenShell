@@ -2236,16 +2236,18 @@ impl ComputeRuntime {
         // The request (including its durable provisioning snapshot) is always
         // reconstructed from the gateway's record; never let a driver derive
         // provisioning input from mutable runtime inspection output.
-        let request =
-            match self.driver_start_request(&starting, launch_authentication, expected_runtime_identity)
-            {
-                Ok(request) => request,
-                Err(error) => {
-                    self.persist_invalid_start_snapshot(&starting, error.message())
-                        .await;
-                    return Err(error);
-                }
-            };
+        let request = match self.driver_start_request(
+            &starting,
+            launch_authentication,
+            expected_runtime_identity,
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.persist_invalid_start_snapshot(&starting, error.message())
+                    .await;
+                return Err(error);
+            }
+        };
         let driver = self.driver.clone();
         let operation_id = sandbox_id.clone();
         let result = Box::pin(self.await_provisioning_operation(&starting, async move {
@@ -3659,11 +3661,13 @@ impl ComputeRuntime {
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-start state on its first poll.
     pub async fn start_persisted_sandboxes(&self) -> Result<(), String> {
-        self.start_persisted_sandboxes_with_authentication(
+        // The reconciliation futures carry full persisted sandbox records;
+        // keep them off the caller's stack (clippy::large_futures).
+        Box::pin(self.start_persisted_sandboxes_with_authentication(
             |_| async { Ok(Vec::new()) },
             |_| async { Ok(()) },
             |_| {},
-        )
+        ))
         .await
     }
 
@@ -4086,17 +4090,18 @@ impl ComputeRuntime {
                     // Recovery retains the original attempt and deadline. A
                     // stalled driver must release this lifecycle gate after
                     // expiry so the deadline worker can reclaim its compute.
-                    if let Err(err) = Box::pin(self.await_provisioning_operation(
-                        &sandbox,
-                        self.driver.call_owned(
-                            openshell_otel::rpc::START_SANDBOX,
-                            Some(&sandbox_id),
-                            |driver| async move {
-                                driver.start_sandbox(Request::new(request)).await
-                            },
-                        ),
-                    ))
-                    .await
+                    if let Err(err) =
+                        Box::pin(self.await_provisioning_operation(
+                            &sandbox,
+                            self.driver.call_owned(
+                                openshell_otel::rpc::START_SANDBOX,
+                                Some(&sandbox_id),
+                                |driver| async move {
+                                    driver.start_sandbox(Request::new(request)).await
+                                },
+                            ),
+                        ))
+                        .await
                     {
                         warn!(sandbox_id = %sandbox.object_id(), error = %err, "Failed to recover sandbox start");
                     }
@@ -17571,6 +17576,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             launch_authentication: b"opaque-auth".to_vec(),
             generation_id: "generation-id".into(),
             expected_runtime_identity: String::new(),
+            isolation_backend: None,
             sandbox: None,
         };
         let with_snapshot = StartSandboxRequest {
@@ -19489,9 +19495,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let recovered_runtime = runtime.clone();
         let mut recovery = tokio::spawn(async move {
             recovered_runtime
-                .recover_persisted_lifecycle_transitions(&|_sandbox: &Sandbox| async {
-                    Ok::<Vec<u8>, String>(Vec::new())
-                })
+                .recover_persisted_lifecycle_transitions()
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), driver.start_started.notified())

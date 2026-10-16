@@ -67,11 +67,10 @@ pub const CONTROL_HEALTH_SOCKET_PATH: &str = "/run/openshell/health.sock";
 pub const CONTROL_HEALTH_PORT: u16 = 5501;
 
 /// `ConfigMap` volume name reserved for gateway-normalized destination trust.
-pub const NETWORK_ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-network-additional-ca";
+pub const ADDITIONAL_CA_VOLUME_NAME: &str = "openshell-additional-ca";
 /// The only destination-trust path exposed to the dedicated supervisor Pod.
-pub const NETWORK_ADDITIONAL_CA_BUNDLE_PATH: &str =
-    openshell_core::container_paths::NETWORK_ADDITIONAL_CA_BUNDLE_PATH;
-const NETWORK_ADDITIONAL_CA_KEY: &str = "ca.crt";
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = openshell_core::driver_utils::ADDITIONAL_CA_MOUNT_PATH;
+const ADDITIONAL_CA_KEY: &str = "ca.crt";
 pub const NAMESPACE_WORKLOAD_POLICY_NAME: &str = "openshell-sandbox-workloads";
 pub const NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME: &str = "openshell-sandbox-supervisors";
 pub const SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS: i64 = 30;
@@ -488,26 +487,20 @@ pub fn supervisor_pod(
             UPSTREAM_PROXY_CA_BUNDLE_PATH.to_string(),
         ]);
     }
-    if let Some((config_map_name, digest)) = network_additional_ca {
+    if let Some((config_map_name, _digest)) = network_additional_ca {
         command.extend([
-            "--network-additional-ca-bundle".to_string(),
-            NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
-            "--network-additional-ca-digest".to_string(),
-            digest.to_string(),
+            "--additional-ca-bundle".to_string(),
+            ADDITIONAL_CA_MOUNT_PATH.to_string(),
         ]);
-        let mut mount = volume_mount(
-            NETWORK_ADDITIONAL_CA_VOLUME_NAME,
-            NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
-            true,
-        );
+        let mut mount = volume_mount(ADDITIONAL_CA_VOLUME_NAME, ADDITIONAL_CA_MOUNT_PATH, true);
         // A subPath exposes `ca.crt` at the exact protected file path rather
         // than mounting a ConfigMap directory over the supervisor's filesystem.
-        mount.sub_path = Some(NETWORK_ADDITIONAL_CA_KEY.to_string());
+        mount.sub_path = Some(ADDITIONAL_CA_KEY.to_string());
         volume_mounts.push(mount);
         volumes.push(config_map_volume(
-            NETWORK_ADDITIONAL_CA_VOLUME_NAME,
+            ADDITIONAL_CA_VOLUME_NAME,
             config_map_name,
-            NETWORK_ADDITIONAL_CA_KEY,
+            ADDITIONAL_CA_KEY,
         ));
     }
     if let Some((secret_name, secret_key)) = proxy_auth_secret {
@@ -1398,7 +1391,7 @@ mod tests {
             false,
             false,
             None,
-            Some(("openshell-network-additional-ca-gateway-generation", digest)),
+            Some(("openshell-additional-ca-gateway-generation", digest)),
             owner(),
             &[],
         )
@@ -1406,14 +1399,9 @@ mod tests {
         let spec = pod.spec.expect("Pod spec");
         let container = &spec.containers[0];
         assert!(container.command.as_deref().is_some_and(|command| {
-            command.windows(2).any(|args| {
-                args == [
-                    "--network-additional-ca-bundle",
-                    NETWORK_ADDITIONAL_CA_BUNDLE_PATH,
-                ]
-            }) && command
+            command
                 .windows(2)
-                .any(|args| args == ["--network-additional-ca-digest", digest])
+                .any(|args| args == ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH])
         }));
         assert_eq!(
             container
@@ -1421,14 +1409,14 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .iter()
-                .filter(|mount| mount.name == NETWORK_ADDITIONAL_CA_VOLUME_NAME)
+                .filter(|mount| mount.name == ADDITIONAL_CA_VOLUME_NAME)
                 .collect::<Vec<_>>()
                 .as_slice(),
             &[&VolumeMount {
-                name: NETWORK_ADDITIONAL_CA_VOLUME_NAME.to_string(),
-                mount_path: NETWORK_ADDITIONAL_CA_BUNDLE_PATH.to_string(),
+                name: ADDITIONAL_CA_VOLUME_NAME.to_string(),
+                mount_path: ADDITIONAL_CA_MOUNT_PATH.to_string(),
                 read_only: Some(true),
-                sub_path: Some(NETWORK_ADDITIONAL_CA_KEY.to_string()),
+                sub_path: Some(ADDITIONAL_CA_KEY.to_string()),
                 ..Default::default()
             }]
         );
@@ -1437,14 +1425,14 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .iter()
-            .find(|volume| volume.name == NETWORK_ADDITIONAL_CA_VOLUME_NAME)
+            .find(|volume| volume.name == ADDITIONAL_CA_VOLUME_NAME)
             .expect("destination trust ConfigMap volume");
         assert_eq!(
             volume
                 .config_map
                 .as_ref()
                 .map(|source| source.name.as_str()),
-            Some("openshell-network-additional-ca-gateway-generation")
+            Some("openshell-additional-ca-gateway-generation")
         );
         assert_eq!(
             volume
@@ -1453,7 +1441,7 @@ mod tests {
                 .and_then(|source| source.items.as_deref())
                 .and_then(|items| items.first())
                 .map(|item| (item.key.as_str(), item.path.as_str())),
-            Some((NETWORK_ADDITIONAL_CA_KEY, NETWORK_ADDITIONAL_CA_KEY))
+            Some((ADDITIONAL_CA_KEY, ADDITIONAL_CA_KEY))
         );
     }
 

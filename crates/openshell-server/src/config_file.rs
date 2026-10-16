@@ -449,11 +449,11 @@ pub struct SupervisorFileSection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorNetworkFileSection {
-    /// Gateway-local PEM files whose certificates augment the supervisor's
-    /// destination trust roots. The gateway validates and normalizes these
-    /// files during startup before any compute driver is constructed.
+    /// Gateway-local pre-assembled PEM bundle whose certificates augment the
+    /// supervisor's destination trust roots. The gateway validates and stages
+    /// this single file during startup before any compute driver is constructed.
     #[serde(default)]
-    pub additional_ca_cert_paths: Vec<PathBuf>,
+    pub additional_ca_bundle: Option<PathBuf>,
 }
 
 impl ConfigFile {
@@ -819,13 +819,13 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         .openshell
         .supervisor
         .network
-        .additional_ca_cert_paths
-        .iter()
-        .any(|path| path.as_os_str().is_empty())
+        .additional_ca_bundle
+        .as_ref()
+        .is_some_and(|path| path.as_os_str().is_empty())
     {
         return Err(ConfigFileError::InvalidValue {
-            field: "openshell.supervisor.network.additional_ca_cert_paths",
-            message: "path entries must not be empty",
+            field: "openshell.supervisor.network.additional_ca_bundle",
+            message: "path must not be empty",
         });
     }
 
@@ -1466,33 +1466,30 @@ allow_unauthenticated_users = true
     }
 
     #[test]
-    fn parses_supervisor_network_additional_ca_paths() {
+    fn parses_supervisor_network_additional_ca_bundle() {
         let tmp = write_tmp(
             r#"
 [openshell.supervisor.network]
-additional_ca_cert_paths = ["/etc/openshell/ca-one.crt", "/etc/openshell/ca-two.crt"]
+additional_ca_bundle = "/etc/openshell/ca-bundle.crt"
 "#,
         );
 
         let file = load(tmp.path()).expect("network supervisor config parses");
         assert_eq!(
-            file.openshell.supervisor.network.additional_ca_cert_paths,
-            vec![
-                PathBuf::from("/etc/openshell/ca-one.crt"),
-                PathBuf::from("/etc/openshell/ca-two.crt"),
-            ]
+            file.openshell.supervisor.network.additional_ca_bundle,
+            Some(PathBuf::from("/etc/openshell/ca-bundle.crt"))
         );
     }
 
     #[test]
-    fn supervisor_network_additional_ca_paths_default_to_empty() {
+    fn supervisor_network_additional_ca_bundle_defaults_to_unset() {
         let file: ConfigFile = toml::from_str("[openshell.supervisor]\n").expect("valid config");
         assert!(
             file.openshell
                 .supervisor
                 .network
-                .additional_ca_cert_paths
-                .is_empty()
+                .additional_ca_bundle
+                .is_none()
         );
     }
 
@@ -1511,18 +1508,18 @@ unknown = true
     }
 
     #[test]
-    fn supervisor_network_rejects_empty_ca_path_entries() {
+    fn supervisor_network_rejects_empty_ca_bundle_path() {
         let tmp = write_tmp(
             r#"
 [openshell.supervisor.network]
-additional_ca_cert_paths = ["", "/etc/openshell/ca.crt"]
+additional_ca_bundle = ""
 "#,
         );
         let error = load(tmp.path()).expect_err("empty source paths must fail");
         assert!(
             error
                 .to_string()
-                .contains("openshell.supervisor.network.additional_ca_cert_paths")
+                .contains("openshell.supervisor.network.additional_ca_bundle")
         );
         assert!(error.to_string().contains("must not be empty"));
     }
