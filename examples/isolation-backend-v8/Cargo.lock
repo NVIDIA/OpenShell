@@ -1352,6 +1352,7 @@ dependencies = [
  "glob",
  "ipnet",
  "jsonwebtoken",
+ "libc",
  "miette",
  "nix",
  "openshell-extension-core",

@@ -90,6 +90,7 @@ fn combined_output(output: &Output) -> String {
         }
     }
     String::from_utf8_lossy(&plain)
+        .replace('│', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -99,6 +100,21 @@ fn pem_payload_marker(pem: &str) -> &str {
     pem.lines()
         .find(|line| line.len() > 32 && !line.starts_with("-----"))
         .expect("PEM fixture payload line")
+}
+
+/// Substring check that ignores the gateway CLI's diagnostic line wrapping.
+///
+/// The rendered diagnostic wraps at a fixed width with `│` continuation
+/// markers, and long tokens (for example source paths) are hard-broken
+/// mid-word. Squashing whitespace and continuation glyphs on both sides
+/// keeps assertions independent of where the wrap lands.
+fn contains_wrapped(haystack: &str, needle: &str) -> bool {
+    fn squash(text: &str) -> String {
+        text.chars()
+            .filter(|c| !c.is_whitespace() && *c != '│')
+            .collect()
+    }
+    squash(haystack).contains(&squash(needle))
 }
 
 fn generated_certificate() -> rcgen::CertifiedKey {
@@ -120,16 +136,25 @@ fn valid_bundle_reports_only_redacted_metadata_before_custom_driver_rejection() 
 
     assert!(!output.status.success(), "custom driver must be rejected");
     assert!(
-        diagnostic.contains("Network supervisor additional destination trust configured"),
+        contains_wrapped(
+            &diagnostic,
+            "Network supervisor additional destination trust configured"
+        ),
         "missing startup metadata in:\n{diagnostic}"
     );
-    assert!(diagnostic.contains("certificate_count=1"), "{diagnostic}");
-    assert!(diagnostic.contains("sha256:"), "{diagnostic}");
-    assert!(diagnostic.contains(CONFIG_FIELD), "{diagnostic}");
-    assert!(diagnostic.contains("custom-driver"), "{diagnostic}");
-    assert!(diagnostic.contains("unsupported"), "{diagnostic}");
     assert!(
-        !diagnostic.contains(pem_payload_marker(&pem)),
+        contains_wrapped(&diagnostic, "certificate_count=1"),
+        "{diagnostic}"
+    );
+    assert!(contains_wrapped(&diagnostic, "sha256:"), "{diagnostic}");
+    assert!(contains_wrapped(&diagnostic, CONFIG_FIELD), "{diagnostic}");
+    assert!(
+        contains_wrapped(&diagnostic, "custom-driver"),
+        "{diagnostic}"
+    );
+    assert!(contains_wrapped(&diagnostic, "unsupported"), "{diagnostic}");
+    assert!(
+        !contains_wrapped(&diagnostic, pem_payload_marker(&pem)),
         "certificate payload leaked"
     );
 }
@@ -166,18 +191,18 @@ fn invalid_bundles_fail_startup_with_actionable_redacted_errors() {
         let diagnostic = combined_output(&output);
 
         assert!(!output.status.success(), "invalid bundle must fail startup");
-        assert!(diagnostic.contains(CONFIG_FIELD), "{diagnostic}");
+        assert!(contains_wrapped(&diagnostic, CONFIG_FIELD), "{diagnostic}");
         assert!(
-            diagnostic.contains(&source_path.display().to_string()),
+            contains_wrapped(&diagnostic, &source_path.display().to_string()),
             "{diagnostic}"
         );
-        assert!(diagnostic.contains(expected), "{diagnostic}");
+        assert!(contains_wrapped(&diagnostic, expected), "{diagnostic}");
         assert!(
-            !diagnostic.contains(pem_payload_marker(&private_key)),
+            !contains_wrapped(&diagnostic, pem_payload_marker(&private_key)),
             "private key payload leaked"
         );
         assert!(
-            !diagnostic.contains("Starting OpenShell server"),
+            !contains_wrapped(&diagnostic, "Starting OpenShell server"),
             "driver/server startup began after invalid material:\n{diagnostic}"
         );
     }
@@ -196,15 +221,18 @@ fn configured_remote_endpoint_is_rejected_before_connection() {
     let diagnostic = combined_output(&output);
 
     assert!(!output.status.success(), "remote override must be rejected");
-    assert!(diagnostic.contains(CONFIG_FIELD), "{diagnostic}");
-    assert!(diagnostic.contains("unsupported remote"), "{diagnostic}");
-    assert!(diagnostic.contains("endpoint"), "{diagnostic}");
+    assert!(contains_wrapped(&diagnostic, CONFIG_FIELD), "{diagnostic}");
     assert!(
-        !diagnostic.contains("failed to create compute runtime"),
+        contains_wrapped(&diagnostic, "unsupported remote"),
+        "{diagnostic}"
+    );
+    assert!(contains_wrapped(&diagnostic, "endpoint"), "{diagnostic}");
+    assert!(
+        !contains_wrapped(&diagnostic, "failed to create compute runtime"),
         "gateway attempted remote-driver construction:\n{diagnostic}"
     );
     assert!(
-        !diagnostic.contains("No such file or directory"),
+        !contains_wrapped(&diagnostic, "No such file or directory"),
         "gateway attempted to connect to the sentinel socket:\n{diagnostic}"
     );
 }
