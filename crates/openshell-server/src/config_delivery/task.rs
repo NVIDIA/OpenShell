@@ -52,6 +52,9 @@ pub struct Registration {
     /// [`super::ConfigDelivery::publications`] observed before the bootstrap
     /// inputs were read.
     pub captured_seq: u64,
+    /// The bootstrap could not resolve part of the configuration, so the
+    /// session rebuilds it at once rather than at its first reconciliation.
+    pub rebuild: bool,
 }
 
 #[derive(Debug)]
@@ -333,6 +336,7 @@ mod tests {
             providers: providers.iter().map(ToString::to_string).collect(),
             provider_environment: None,
             captured_seq: 0,
+            rebuild: false,
         }))
     }
 

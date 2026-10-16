@@ -280,7 +280,7 @@ empty in poll mode, where `GetSandboxConfig` and
 | `openshell_supervisor_config_apply_results_total` | Counter | `outcome` | Apply results that supervisors reported. |
 | `openshell_supervisor_config_apply_duration_seconds` | Histogram | `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |
 | `openshell_supervisor_policy_apply_results_total` | Counter | `source`, `outcome` | Sandbox policy load results that supervisors reported. `source` is `polling` or `stream`, and `outcome` is `loaded` or `failed`. |
-| `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built` or `build_failed`. |
+| `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built`, `rejected` (stored configuration invalid), `provider_environment_failed` (delivered unresolved and rebuilt), `build_failed`, or `payload_too_large`. |
 | `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
 
 The labels take these values:

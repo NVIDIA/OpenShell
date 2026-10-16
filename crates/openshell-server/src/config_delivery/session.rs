@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use metrics::{counter, histogram};
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigUpdate, ConfigUpdateResult, GatewayMessage, PolicyLoadResult,
-    PolicySource, Sandbox, SandboxConfigRevision, SandboxConfigSnapshot,
-    SandboxConfigurationAdmission, SessionAccepted, gateway_message,
+    PolicySource, ProviderEnvironmentSnapshot, Sandbox, SandboxConfigRevision,
+    SandboxConfigSnapshot, SandboxConfigurationAdmission, SessionAccepted, gateway_message,
 };
 use prost::Message;
 use tokio::sync::mpsc;
@@ -32,8 +32,9 @@ use crate::grpc::policy::{
 use crate::persistence::ObjectId;
 use crate::supervisor_session::{AcceptedSession, SupervisorSessionRegistry};
 
-/// Allow a slow credential resolution before rejecting the session. Session
-/// setup does not hold a delivery build slot.
+/// Bounds the whole bootstrap build. The provider environment has its own
+/// shorter timeout and is delivered unresolved when it expires, so only a
+/// store that cannot answer refuses the session.
 const CONFIG_BOOTSTRAP_BUILD_TIMEOUT: Duration = Duration::from_secs(45);
 
 // ---------------------------------------------------------------------------
@@ -820,11 +821,55 @@ async fn persist_admission(
 // Bootstrap
 // ---------------------------------------------------------------------------
 
+/// How a session's bootstrap was built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapOutcome {
+    Built,
+    /// The stored configuration is invalid, so the bootstrap carries the
+    /// not-admitted configuration and the supervisor applies its failure
+    /// mode.
+    Rejected,
+    /// The provider environment could not be built, so the bootstrap carries
+    /// it unresolved, as live delivery does. The supervisor revokes static
+    /// credentials and rejects the update until a rebuild resolves it.
+    ProviderEnvironmentFailed,
+}
+
+impl BootstrapOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Built => "built",
+            Self::Rejected => "rejected",
+            Self::ProviderEnvironmentFailed => "provider_environment_failed",
+        }
+    }
+}
+
+/// The configuration a streamed-apply session is accepted with.
+#[derive(Debug, Clone)]
+pub struct SessionBootstrap {
+    pub config: SupervisorConfig,
+    pub outcome: BootstrapOutcome,
+}
+
+impl SessionBootstrap {
+    /// The resolved provider environment the session can reuse, if any.
+    pub fn resolved_provider_environment(&self) -> Option<ProviderEnvironmentSnapshot> {
+        (self.outcome == BootstrapOutcome::Built).then(|| self.config.provider_environment.clone())
+    }
+
+    /// Whether the session must rebuild its configuration at once, because
+    /// the bootstrap could not resolve part of it.
+    pub fn needs_rebuild(&self) -> bool {
+        self.outcome == BootstrapOutcome::ProviderEnvironmentFailed
+    }
+}
+
 /// Build the bootstrap a streamed-apply session is accepted with.
 pub async fn build_session_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
-) -> Result<SupervisorConfig, Status> {
+) -> Result<SessionBootstrap, Status> {
     // Bootstraps share the build permits with session reconciliation, so a
     // burst of reconnects, such as a replica's sessions redirected at
     // shutdown, cannot exhaust the database pool user requests need.
@@ -835,11 +880,9 @@ pub async fn build_session_bootstrap(
         .await
         .expect("the build semaphore is never closed");
     let bootstrap = build_config_bootstrap(state, sandbox).await;
-    let outcome = if bootstrap.is_ok() {
-        "built"
-    } else {
-        "build_failed"
-    };
+    let outcome = bootstrap
+        .as_ref()
+        .map_or("build_failed", |bootstrap| bootstrap.outcome.label());
     counter!("openshell_supervisor_config_bootstrap_total", "outcome" => outcome).increment(1);
     if let Err(error) = &bootstrap {
         warn!(
@@ -852,33 +895,68 @@ pub async fn build_session_bootstrap(
 }
 
 /// Build both parts of a session's configuration from one load of their
-/// inputs.
+/// inputs. Only a failure to read the stored configuration refuses the
+/// session; anything the supervisor can act on is delivered.
 async fn build_config_bootstrap(
     state: &Arc<ServerState>,
     sandbox: &Sandbox,
-) -> Result<SupervisorConfig, Status> {
-    let built = tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
-        let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
-        let sandbox_config = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
-        let provider_environment =
-            build_provider_environment_snapshot_from_inputs(state, &inputs, true, true).await?;
-        Ok(SupervisorConfig {
-            sandbox_config,
-            provider_environment,
+) -> Result<SessionBootstrap, Status> {
+    tokio::time::timeout(CONFIG_BOOTSTRAP_BUILD_TIMEOUT, async {
+        let built = async {
+            let inputs = load_sandbox_config_inputs(state, sandbox.clone()).await?;
+            let sandbox_config = build_sandbox_config_snapshot_from_inputs(state, &inputs).await?;
+            Ok::<_, Status>((inputs, sandbox_config))
+        }
+        .await;
+        let (inputs, sandbox_config) = match built {
+            Ok(built) => built,
+            Err(error) if is_configuration_rejection(&error) => {
+                let sandbox_config = unadmitted_sandbox_config(state, sandbox, &error);
+                return Ok(SessionBootstrap {
+                    config: SupervisorConfig {
+                        provider_environment: super::unresolved_provider_environment(
+                            &sandbox_config,
+                        ),
+                        sandbox_config,
+                    },
+                    outcome: BootstrapOutcome::Rejected,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        let provider_environment = tokio::time::timeout(
+            super::PROVIDER_ENVIRONMENT_BUILD_TIMEOUT,
+            build_provider_environment_snapshot_from_inputs(state, &inputs, true, true),
+        )
+        .await;
+        let (provider_environment, outcome) = match provider_environment {
+            Ok(Ok(provider_environment)) => (provider_environment, BootstrapOutcome::Built),
+            failed => {
+                let error_code = match &failed {
+                    Ok(Err(error)) => error.code(),
+                    _ => tonic::Code::DeadlineExceeded,
+                };
+                warn!(
+                    sandbox_id = %sandbox.object_id(),
+                    ?error_code,
+                    "failed to build the bootstrap provider environment; delivering it unresolved"
+                );
+                (
+                    super::unresolved_provider_environment(&sandbox_config),
+                    BootstrapOutcome::ProviderEnvironmentFailed,
+                )
+            }
+        };
+        Ok(SessionBootstrap {
+            config: SupervisorConfig {
+                sandbox_config,
+                provider_environment,
+            },
+            outcome,
         })
     })
     .await
-    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?;
-    match built {
-        Err(error) if is_configuration_rejection(&error) => {
-            let sandbox_config = unadmitted_sandbox_config(state, sandbox, &error);
-            Ok(SupervisorConfig {
-                provider_environment: super::unresolved_provider_environment(&sandbox_config),
-                sandbox_config,
-            })
-        }
-        result => result,
-    }
+    .map_err(|_| Status::deadline_exceeded("supervisor configuration bootstrap timed out"))?
 }
 
 /// The result a supervisor reports after applying `update` in full.
@@ -2217,7 +2295,9 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
             .await
             .unwrap()
             .expect("sandbox exists");
-        build_config_bootstrap(state, &sandbox).await.unwrap()
+        let bootstrap = build_config_bootstrap(state, &sandbox).await.unwrap();
+        assert_eq!(bootstrap.outcome, BootstrapOutcome::Built);
+        bootstrap.config
     }
 
     /// Put `config` in flight on `session-1` as its bootstrap.

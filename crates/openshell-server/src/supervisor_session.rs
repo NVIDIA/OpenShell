@@ -2172,7 +2172,7 @@ struct SessionSetup {
     connection_epoch: u64,
     supports_session_redirect: bool,
     mode: SessionMode,
-    bootstrap: Option<crate::config_delivery::SupervisorConfig>,
+    bootstrap: Option<config_session::SessionBootstrap>,
     provider_readiness: ProviderReadinessEvidence,
     config_push: Option<ConfigPushSetup>,
     outbound_tx: mpsc::Sender<GatewayMessage>,
@@ -2196,10 +2196,15 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
         session_lifetime,
     } = setup;
     let pushes_config = matches!(mode, SessionMode::Push);
-    // The registration seeds the session's provider environment cache.
+    // The registration seeds the session's provider environment cache, and
+    // rebuilds at once what the bootstrap could not resolve.
     let bootstrap_provider_environment = bootstrap
         .as_ref()
-        .map(|bootstrap| bootstrap.provider_environment.clone());
+        .and_then(config_session::SessionBootstrap::resolved_provider_environment);
+    let rebuild = bootstrap
+        .as_ref()
+        .is_some_and(config_session::SessionBootstrap::needs_rebuild);
+    let bootstrap = bootstrap.map(|bootstrap| bootstrap.config);
     let session_id = Uuid::new_v4().to_string();
     let mut acceptance = SessionAccepted {
         session_id: session_id.clone(),
@@ -2413,6 +2418,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
                 providers: setup.providers,
                 provider_environment: bootstrap_provider_environment,
                 captured_seq: setup.captured_seq,
+                rebuild,
             },
         );
     }

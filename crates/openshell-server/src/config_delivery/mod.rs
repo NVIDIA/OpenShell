@@ -278,6 +278,7 @@ fn publish_fanout(state: &Arc<ServerState>, scope: &FanoutScope) {
 /// delivery task.
 pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
     let captured_seq = registration.captured_seq;
+    let rebuild = registration.rebuild;
     let record = Arc::new(SessionRecord::new(registration));
     let raced = {
         let mut sessions = state.config_delivery.sessions();
@@ -299,7 +300,7 @@ pub fn register_session(state: &Arc<ServerState>, registration: Registration) {
     };
     // A publication between the bootstrap read and registration may have
     // missed this session.
-    if raced {
+    if raced || rebuild {
         record.mark();
     }
     let state = Arc::clone(state);
@@ -870,6 +871,7 @@ fn register_test_apply_session_after(
                 .unwrap_or_default(),
             provider_environment: None,
             captured_seq,
+            rebuild: false,
         },
     );
     TestApplySession { outbound }
@@ -1264,6 +1266,25 @@ mod tests {
                     bootstrap.provider_environment.as_ref().unwrap(),
                     &unresolved_provider_environment(snapshot)
                 );
+                let record = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let record = state
+                            .config_delivery
+                            .sessions()
+                            .records
+                            .get("sandbox")
+                            .cloned();
+                        if let Some(record) =
+                            record.filter(|record| record.session_id == accepted.session_id)
+                        {
+                            break record;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("accepted session is registered for configuration delivery");
+                assert!(record.provider_environment().is_none());
                 let mut rejected = session::applied_result(&bootstrap);
                 rejected.outcome = ConfigApplyOutcome::FailedClosed.into();
                 rejected.policy_load = None;
@@ -1288,6 +1309,151 @@ mod tests {
                 assert_eq!(i64::from(snapshot.version), repaired_version);
             }
         }
+    }
+
+    /// The delivery record registered for `session_id`, once registration
+    /// completes.
+    async fn registered_record(
+        state: &ServerState,
+        sandbox_id: &str,
+        session_id: &str,
+    ) -> Arc<SessionRecord> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let record = state
+                    .config_delivery
+                    .sessions()
+                    .records
+                    .get(sandbox_id)
+                    .cloned();
+                if let Some(record) = record.filter(|record| record.session_id == session_id) {
+                    return record;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted session is registered for configuration delivery")
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_a_policy_seeds_the_provider_environment() {
+        let state = push_state().await;
+        put_sandbox(&state, "sandbox", &[]).await;
+        let (_harness, session_id, bootstrap) =
+            accepted_session_with_bootstrap(&state, "sandbox").await;
+        let bootstrap = bootstrap.expect("push bootstrap");
+        // A sandbox without a policy is not admitted, but nothing was
+        // rejected and its provider environment resolved.
+        assert!(!bootstrap.sandbox_config.unwrap().configuration_admitted);
+        let record = registered_record(&state, "sandbox", &session_id).await;
+        assert_eq!(
+            record.provider_environment(),
+            bootstrap.provider_environment
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_delivers_an_unresolved_provider_environment_and_rebuilds_it() {
+        let state = push_state().await;
+        put_driver_provider(
+            &state,
+            HashMap::from([(
+                "GITHUB_TOKEN".to_string(),
+                openshell_core::proto::CredentialHandle {
+                    driver: "test-static".into(),
+                    handle: "missing".into(),
+                    metadata: HashMap::new(),
+                },
+            )]),
+        )
+        .await;
+        put_sandbox(&state, "sandbox", &["provider"]).await;
+        change_policy(&state, "sandbox", 1).await;
+
+        // The supervisor revokes static credentials and rejects an update
+        // whose provider environment is unresolved.
+        let reject = |update: &openshell_core::proto::ConfigUpdate| {
+            use openshell_core::proto::{
+                ConfigApplyOutcome, ConfigurationAdmissionState, SupervisorMessage,
+                supervisor_message,
+            };
+            let mut result = session::applied_result(update);
+            result.outcome = ConfigApplyOutcome::FailedRetainedLastKnownGood.into();
+            result.policy_load = None;
+            if let Some(admission) = result.admission.as_mut() {
+                admission.state = ConfigurationAdmissionState::Rejected.into();
+            }
+            SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(result)),
+            }
+        };
+
+        // The credential does not resolve, but the session is still accepted
+        // with the admitted policy and an unresolved environment.
+        let mut harness = connect_supervisor_stream(&state, "sandbox", StreamFeatures::Apply)
+            .await
+            .expect("an unresolved provider environment does not refuse the session");
+        let first = next_update(&mut harness, Duration::from_secs(5))
+            .await
+            .expect("accepted session");
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
+            panic!("expected SessionAccepted");
+        };
+        let bootstrap = accepted.bootstrap.expect("push bootstrap");
+        let sandbox_config = bootstrap
+            .sandbox_config
+            .clone()
+            .expect("sandbox configuration");
+        assert!(sandbox_config.configuration_admitted);
+        assert_eq!(sandbox_config.version, 1);
+        assert_eq!(
+            bootstrap
+                .provider_environment
+                .clone()
+                .expect("provider environment"),
+            unresolved_provider_environment(&sandbox_config)
+        );
+        let record = registered_record(&state, "sandbox", &accepted.session_id).await;
+        assert!(record.provider_environment().is_none());
+        harness.outbound.send(reject(&bootstrap)).await.unwrap();
+
+        // Once the credential resolves, the session delivers it without a
+        // publication or waiting for its reconciliation interval.
+        let credential_handles = state
+            .credentials
+            .store_provider_credentials(
+                "provider",
+                "default",
+                "provider",
+                &HashMap::from([("GITHUB_TOKEN".to_string(), "token".to_string())]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        put_driver_provider(&state, credential_handles).await;
+        let resolved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = next_update(&mut harness, Duration::from_secs(10))
+                    .await
+                    .expect("rebuilt configuration");
+                let update = sent_config(&message);
+                if !update
+                    .provider_environment
+                    .as_ref()
+                    .unwrap()
+                    .values
+                    .is_empty()
+                {
+                    break update;
+                }
+                // A rebuild that still could not resolve it is rejected too.
+                harness.outbound.send(reject(&update)).await.unwrap();
+            }
+        })
+        .await
+        .expect("the session rebuilds the unresolved provider environment");
+        assert_eq!(resolved.sandbox_config.unwrap().version, 1);
     }
 
     #[tokio::test]
@@ -1481,6 +1647,7 @@ mod tests {
                     providers: HashSet::new(),
                     provider_environment: None,
                     captured_seq: 0,
+                    rebuild: false,
                 }))
             })
             .collect();
@@ -1750,6 +1917,7 @@ mod tests {
             providers: HashSet::from(["provider".to_string()]),
             provider_environment: bootstrap.and_then(|bootstrap| bootstrap.provider_environment),
             captured_seq: 0,
+            rebuild: false,
         });
         (harness, record)
     }
