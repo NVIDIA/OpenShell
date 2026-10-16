@@ -26,6 +26,7 @@ enum Reply {
     /// Stop answering on the first connection once it is confirmed.
     Blackhole,
     Leaf(BoundaryErrorKind),
+    Deny,
     Idle,
 }
 
@@ -183,7 +184,8 @@ impl NetworkPeer {
                     | Reply::DisconnectLate
                     | Reply::DisconnectGated
                     | Reply::DropFirstAccept
-                    | Reply::Blackhole => network_response(),
+                    | Reply::Blackhole
+                    | Reply::Deny => network_response(),
                 }
             }
             _ => unreachable!(),
@@ -202,6 +204,14 @@ impl NetworkPeer {
                 let result = tokio::time::timeout(Duration::from_secs(3), async {
                     let (channel, payload) = read_stream_frame(&mut reader).await.unwrap().unwrap();
                     assert_eq!(channel, STREAM_NETWORK_DECISION);
+                    if matches!(state.reply, Reply::Deny) {
+                        assert_eq!(
+                            crate::protobuf::decode::<TcpOpenDecision>(&payload).unwrap(),
+                            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+                        );
+                        state.decisions.fetch_add(1, Ordering::AcqRel);
+                        return;
+                    }
                     assert_eq!(
                         crate::protobuf::decode::<TcpOpenDecision>(&payload).unwrap(),
                         TcpOpenDecision::RelayReady
@@ -381,6 +391,25 @@ async fn verify_connection(mut pending: PendingTcpOpen) {
     let mut pong = [0; 4];
     pending.stream.read_exact(&mut pong).await.unwrap();
     assert_eq!(&pong, b"pong");
+}
+
+#[tokio::test]
+async fn tcp_policy_denial_reaches_backend_before_stream_is_closed() {
+    let fixture = Fixture::new(Reply::Deny).await;
+    let pending = fixture.source.accept_tcp().await.unwrap();
+    pending
+        .decision
+        .send(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+        .unwrap();
+    drop(pending.stream);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.state.decisions.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("policy denial must reach the backend before the RPC is dropped");
+    assert_eq!(fixture.state.connections.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]

@@ -912,6 +912,15 @@ async fn complete_network_open(
     }
     if matches!(decision, TcpOpenDecision::RelayReady) {
         let _ = tokio::io::copy_bidirectional(&mut boundary, &mut transport).await;
+    } else {
+        // The write only queues the decision for the request pump. Dropping the
+        // response stream now cancels the RPC before that pump can deliver it.
+        // Close the request direction and wait for the backend to finish.
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            boundary.shutdown().await?;
+            boundary.read_u8().await
+        })
+        .await;
     }
 }
 
