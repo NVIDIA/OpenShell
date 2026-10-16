@@ -43,8 +43,8 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     OpenShellService, ServerState,
-    auth::audit::{self, AuthFailureReason, AuthMechanism},
-    auth::authenticator::AuthenticatorChain,
+    auth::audit,
+    auth::authenticator::{AuthFailureReason, AuthMechanism, Authentication, AuthenticatorChain},
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
@@ -1137,22 +1137,31 @@ where
                 Principal::Operator(operator)
             } else if let Some(chain) = chain {
                 match chain.authenticate(req.headers(), &path).await {
-                    Ok(Some(p)) => p,
-                    Ok(None) => match (mtls_auth_enabled, peer_identity) {
+                    Ok(Authentication::Accepted(p)) => p,
+                    Ok(outcome) => match (mtls_auth_enabled, peer_identity) {
                         (true, Some(identity)) => Principal::User(UserPrincipal { identity }),
                         _ if allow_unauthenticated_users => unauthenticated_dev_user_principal(),
                         _ => {
-                            audit::emit_authentication_failure(
-                                &path,
-                                None,
-                                AuthFailureReason::MissingCredential,
-                            );
+                            let (mechanism, reason) = match outcome {
+                                Authentication::Declined(decline) => {
+                                    (Some(decline.mechanism), decline.reason)
+                                }
+                                _ => (None, AuthFailureReason::MissingCredential),
+                            };
+                            audit::emit_authentication_failure(&path, mechanism, reason);
                             return Ok(status_response(tonic::Status::unauthenticated(
                                 "missing authorization header",
                             )));
                         }
                     },
-                    Err(status) => return Ok(status_response(status)),
+                    Err(rejection) => {
+                        audit::emit_authentication_failure(
+                            &path,
+                            Some(rejection.mechanism),
+                            rejection.reason,
+                        );
+                        return Ok(status_response(rejection.status));
+                    }
                 }
             } else if mtls_auth_enabled {
                 let Some(identity) = peer_identity else {
@@ -2784,7 +2793,11 @@ mod tests {
             Ok::<_, Infallible>(tonic::Status::unimplemented("test fallback").into_http())
         });
         let rejecting_oidc = Arc::new(MockAuthenticator::returning(Err(
-            tonic::Status::unauthenticated("OIDC credentials required"),
+            crate::auth::authenticator::AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
+                tonic::Status::unauthenticated("OIDC credentials required"),
+            ),
         )));
         let grpc = AuthGrpcRouter::with_peer_identity(
             GrpcRouter::new(unrouted, reflection),
@@ -3217,6 +3230,7 @@ mod tests {
 
     mod auth_router {
         use super::*;
+        use crate::auth::authenticator::AuthRejection;
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::identity::{Identity, IdentityProvider};
         use crate::auth::principal::{
@@ -3394,7 +3408,7 @@ mod tests {
                 }),
             ] {
                 let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
-                    Ok(Some(principal)),
+                    Ok(Authentication::Accepted(principal)),
                 ))]);
                 let (recorder, _) = PrincipalRecorder::new();
                 let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3449,7 +3463,9 @@ mod tests {
 
         #[tokio::test]
         async fn mtls_peer_identity_fills_missing_principal_when_enabled() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::with_peer_identity(
@@ -3518,9 +3534,11 @@ mod tests {
 
         #[tokio::test]
         async fn reflection_bypasses_oidc_and_mtls_user_authentication() {
-            let oidc = Arc::new(MockAuthenticator::returning(Err(
+            let oidc = Arc::new(MockAuthenticator::returning(Err(AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
                 tonic::Status::unauthenticated("OIDC credentials required"),
-            )));
+            ))));
             let chain = AuthenticatorChain::new(vec![oidc]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
@@ -3543,7 +3561,9 @@ mod tests {
 
         #[tokio::test]
         async fn unauthenticated_dev_user_fills_missing_principal_when_enabled() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router =
@@ -3586,9 +3606,9 @@ mod tests {
 
         #[tokio::test]
         async fn user_principal_lands_in_request_extensions() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(user_principal(
-                "alice",
-            )))));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                user_principal("alice"),
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3605,7 +3625,9 @@ mod tests {
 
         #[tokio::test]
         async fn sandbox_principal_lands_in_request_extensions() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                sandbox_principal(),
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3622,7 +3644,9 @@ mod tests {
 
         #[tokio::test]
         async fn sandbox_principal_can_call_allowlisted_method() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                sandbox_principal(),
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3673,7 +3697,9 @@ mod tests {
                 "/openshell.v1.OpenShell/IssueSandboxToken",
                 "/openshell.v1.OpenShell/RefreshSandboxToken",
             ] {
-                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                    admin_user(),
+                ))));
                 let chain = AuthenticatorChain::new(vec![mock]);
                 let (recorder, seen) = PrincipalRecorder::new();
                 let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy.clone()));
@@ -3694,7 +3720,7 @@ mod tests {
                 scopes_enabled: true,
             };
 
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
                 provider_writer_principal(),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
@@ -3707,7 +3733,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert!(seen.lock().unwrap().is_some());
 
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
                 provider_writer_principal(),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
@@ -3729,7 +3755,9 @@ mod tests {
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
             ] {
-                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
+                    sandbox_principal(),
+                ))));
                 let chain = AuthenticatorChain::new(vec![mock]);
                 let (recorder, seen) = PrincipalRecorder::new();
                 let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3743,7 +3771,9 @@ mod tests {
 
         #[tokio::test]
         async fn missing_principal_returns_unauthenticated() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let mock = Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3804,9 +3834,11 @@ mod tests {
 
         #[tokio::test]
         async fn authenticator_error_short_circuits() {
-            let mock = Arc::new(MockAuthenticator::returning(Err(
+            let mock = Arc::new(MockAuthenticator::returning(Err(AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
                 tonic::Status::unauthenticated("forged"),
-            )));
+            ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3852,8 +3884,9 @@ mod tests {
         async fn missing_credential_emits_authentication_failure() {
             let capture = OcsfCapture::default();
             let _guard = capture.install();
-            let chain =
-                AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(None)))]);
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::NotApplicable,
+            )))]);
             let (recorder, _) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
             let path = "/openshell.v1.OpenShell/ListSandboxes";
@@ -3913,12 +3946,107 @@ mod tests {
             assert!(!events[0].to_string().contains("canary-secret-token"));
         }
 
+        async fn call_with_rejection(
+            rejection: AuthRejection,
+            path: &str,
+        ) -> (tonic::Status, Vec<serde_json::Value>) {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Err(
+                rejection,
+            )))]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let request = Request::builder()
+                .uri(path)
+                .header("authorization", "Bearer canary-secret-token-9f2c")
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let res = router.call(request).await.unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            let status = tonic::Status::from_header_map(res.headers()).expect("grpc status");
+            (status, captured_json(&capture))
+        }
+
+        #[tokio::test]
+        async fn declined_credential_emits_its_classification_with_the_missing_credential_status() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Declined(crate::auth::authenticator::AuthDecline {
+                    mechanism: AuthMechanism::GatewayPeer,
+                    reason: AuthFailureReason::InvalidCredential,
+                }),
+            )))]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/PeerRelay";
+
+            let res = router.call(empty_request(path)).await.unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            let status = tonic::Status::from_header_map(res.headers()).expect("grpc status");
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(status.message(), "missing authorization header");
+            let events = captured_json(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authentication_failure(&events[0], path, "invalid_credential", 3);
+            assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
+        }
+
+        #[tokio::test]
+        async fn rejected_oidc_credential_emits_classified_authentication_failure() {
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            let (status, events) = call_with_rejection(
+                AuthRejection::new(
+                    AuthMechanism::Oidc,
+                    AuthFailureReason::ExpiredCredential,
+                    tonic::Status::unauthenticated("invalid token: ExpiredSignature"),
+                ),
+                path,
+            )
+            .await;
+
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(status.message(), "invalid token: ExpiredSignature");
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authentication_failure(&events[0], path, "expired_credential", 2);
+            assert_eq!(events[0]["auth_protocol_id"], 4);
+            assert_eq!(events[0]["auth_protocol"], "OpenID");
+            assert!(!events[0].to_string().contains("canary-secret-token"));
+            assert!(!events[0].to_string().contains("ExpiredSignature"));
+        }
+
+        #[tokio::test]
+        async fn rejected_sandbox_credential_emits_classified_authentication_failure() {
+            let path = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment";
+            let (status, events) = call_with_rejection(
+                AuthRejection::new(
+                    AuthMechanism::SandboxJwt,
+                    AuthFailureReason::StaleIdentity,
+                    tonic::Status::unauthenticated(
+                        "gateway token does not match the active sandbox identity",
+                    ),
+                ),
+                path,
+            )
+            .await;
+
+            assert_eq!(status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authentication_failure(&events[0], path, "stale_identity", 3);
+            assert_eq!(events[0]["auth_protocol_id"], 99);
+            assert_eq!(events[0]["auth_protocol"], "sandbox_jwt");
+        }
+
         #[tokio::test]
         async fn authenticated_and_exempt_requests_emit_no_authentication_event() {
             let capture = OcsfCapture::default();
             let _guard = capture.install();
             let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
-                Some(user_principal("alice")),
+                Authentication::Accepted(user_principal("alice")),
             )))]);
             let (recorder, _) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
@@ -3939,9 +4067,11 @@ mod tests {
         async fn health_methods_bypass_chain() {
             // Authenticator is wired to fail-closed; the request still gets
             // through because the path is exempt.
-            let mock = Arc::new(MockAuthenticator::returning(Err(
+            let mock = Arc::new(MockAuthenticator::returning(Err(AuthRejection::new(
+                AuthMechanism::Oidc,
+                AuthFailureReason::InvalidCredential,
                 tonic::Status::unauthenticated("would reject"),
-            )));
+            ))));
             let chain = AuthenticatorChain::new(vec![mock.clone()]);
             let (recorder, _) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);

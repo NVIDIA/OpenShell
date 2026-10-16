@@ -11,7 +11,8 @@
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
 
-use super::authenticator::{Authenticator, bearer_credential};
+use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -34,8 +35,9 @@ use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::Subject
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
     AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
-    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtIssuer, SessionJwtVerifier,
-    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
+    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
+    SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
+    SystemJwtClock,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
 
@@ -255,10 +257,17 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
-    pub fn verify_gateway_token(&self, token: &str) -> Result<AuthenticatedSandboxSession, Status> {
-        self.gateway_verifier
-            .verify(token)
-            .map_err(|error| Status::unauthenticated(format!("invalid gateway session: {error}")))
+    pub fn verify_gateway_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSandboxSession, AuthRejection> {
+        self.gateway_verifier.verify(token).map_err(|error| {
+            AuthRejection::new(
+                AuthMechanism::SandboxJwt,
+                session_failure_reason(&error),
+                Status::unauthenticated(format!("invalid gateway session: {error}")),
+            )
+        })
     }
 }
 
@@ -292,15 +301,15 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         &self,
         headers: &http::HeaderMap,
         path: &str,
-    ) -> Result<Option<Principal>, Status> {
+    ) -> Result<Authentication, AuthRejection> {
         let Some(token) = bearer_credential(headers) else {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         };
         let Ok(header) = decode_header(token) else {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         };
         if header.typ.as_deref() != Some(GATEWAY_SESSION_JWT_TYPE) {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         }
         let authenticated = self.authority.verify_gateway_token(token)?;
         // Refresh performs its own lineage check so the immediately consumed
@@ -309,13 +318,28 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
             crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
         }
-        Ok(Some(Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: authenticated.sandbox_id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "launch-session".to_string(),
+        Ok(Authentication::Accepted(Principal::Sandbox(
+            SandboxPrincipal {
+                sandbox_id: authenticated.sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "launch-session".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
             },
-            trust_domain: Some("openshell".to_string()),
-        })))
+        )))
+    }
+}
+
+fn session_failure_reason(error: &SessionJwtError) -> AuthFailureReason {
+    match error {
+        SessionJwtError::Expired => AuthFailureReason::ExpiredCredential,
+        SessionJwtError::WrongIssuer | SessionJwtError::WrongAudience => {
+            AuthFailureReason::AudienceOrIssuerMismatch
+        }
+        SessionJwtError::MissingKeyId | SessionJwtError::InvalidJti => {
+            AuthFailureReason::MalformedCredential
+        }
+        _ => AuthFailureReason::InvalidCredential,
     }
 }
 
@@ -560,6 +584,42 @@ mod tests {
             first.supervisor.session_id,
             next_launch.supervisor.session_id
         );
+    }
+
+    #[test]
+    fn session_verification_errors_map_to_reason_categories() {
+        for (error, reason) in [
+            (
+                SessionJwtError::Expired,
+                AuthFailureReason::ExpiredCredential,
+            ),
+            (
+                SessionJwtError::WrongIssuer,
+                AuthFailureReason::AudienceOrIssuerMismatch,
+            ),
+            (
+                SessionJwtError::WrongAudience,
+                AuthFailureReason::AudienceOrIssuerMismatch,
+            ),
+            (
+                SessionJwtError::MissingKeyId,
+                AuthFailureReason::MalformedCredential,
+            ),
+            (
+                SessionJwtError::InvalidJti,
+                AuthFailureReason::MalformedCredential,
+            ),
+            (
+                SessionJwtError::InvalidToken,
+                AuthFailureReason::InvalidCredential,
+            ),
+            (
+                SessionJwtError::UnknownKeyId,
+                AuthFailureReason::InvalidCredential,
+            ),
+        ] {
+            assert_eq!(session_failure_reason(&error), reason, "{error:?}");
+        }
     }
 
     #[test]

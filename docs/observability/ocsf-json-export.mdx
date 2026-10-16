@@ -21,7 +21,21 @@ This output is separate from the supervisor stderr and file output described bel
 
 Gateway records use the configured gateway name for both `device.uid` and `device.name`. Replicas of one installation share that identity; `device.hostname` identifies the emitting replica. Assign distinct gateway names to installations whose events are collected together. Reusing a name, including the default name, groups those installations under the same identity. Renaming a gateway changes its audit identity.
 
-The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request that presents no credential, or an operator certificate together with an `authorization` header. `status_detail` holds the reason category: `missing_credential` or `conflicting_credentials`. These events never include presented credentials or headers.
+The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a gRPC request during authentication. The caller receives the same error either way. `auth_protocol` names the mechanism involved, when one applies: `OpenID` for OIDC bearer tokens, or `mtls`, `sandbox_jwt`, `compute_driver`, or `k8s_service_account`. `status_detail` holds the reason category:
+
+| Reason | Severity | Meaning |
+|---|---|---|
+| `missing_credential` | Low | No credential was presented. |
+| `expired_credential` | Low | The credential has expired. |
+| `conflicting_credentials` | Medium | An operator certificate arrived together with an `authorization` header. |
+| `malformed_credential` | Medium | The credential could not be parsed. |
+| `invalid_credential` | Medium | The credential failed signature, key, or claim verification. |
+| `audience_or_issuer_mismatch` | Medium | The credential was issued by or for a different party. |
+| `unknown_identity` | Medium | The credential names an identity the gateway does not recognize. |
+| `stale_identity` | Medium | The credential names a sandbox runtime or gateway pod that has since been replaced or stopped. |
+| `identity_provider_unavailable` | Medium | The OIDC key endpoint, Kubernetes API, compute driver, or gateway database could not verify the credential. |
+
+These events never include presented credentials, headers, or verification error text.
 
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 

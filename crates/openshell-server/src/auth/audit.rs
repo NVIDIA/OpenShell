@@ -7,47 +7,51 @@
 //! credentials or raw verification errors.
 
 use openshell_ocsf::{
-    ActionId, AuthenticationBuilder, DispositionId, HttpMethod, HttpRequest, Service, SeverityId,
-    StatusId, Url, User, ocsf_emit,
+    ActionId, AuthProtocolId, AuthenticationBuilder, DispositionId, HttpMethod, HttpRequest,
+    Service, SeverityId, StatusId, Url, User, ocsf_emit,
 };
 
-/// Why an authentication attempt failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthFailureReason {
-    /// No credential was presented.
-    MissingCredential,
-    /// Credentials for more than one mechanism were presented together.
-    ConflictingCredentials,
-}
+use super::authenticator::{AuthFailureReason, AuthMechanism};
 
-impl AuthFailureReason {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MissingCredential => "missing_credential",
-            Self::ConflictingCredentials => "conflicting_credentials",
-        }
-    }
-
-    fn severity(self) -> SeverityId {
-        match self {
-            Self::MissingCredential => SeverityId::Low,
-            Self::ConflictingCredentials => SeverityId::Medium,
-        }
+fn category(reason: AuthFailureReason) -> &'static str {
+    match reason {
+        AuthFailureReason::MissingCredential => "missing_credential",
+        AuthFailureReason::ConflictingCredentials => "conflicting_credentials",
+        AuthFailureReason::MalformedCredential => "malformed_credential",
+        AuthFailureReason::InvalidCredential => "invalid_credential",
+        AuthFailureReason::ExpiredCredential => "expired_credential",
+        AuthFailureReason::AudienceOrIssuerMismatch => "audience_or_issuer_mismatch",
+        AuthFailureReason::UnknownIdentity => "unknown_identity",
+        AuthFailureReason::StaleIdentity => "stale_identity",
+        AuthFailureReason::IdentityProviderUnavailable => "identity_provider_unavailable",
     }
 }
 
-/// The mechanism a caller attempted to authenticate with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthMechanism {
-    Mtls,
+fn severity(reason: AuthFailureReason) -> SeverityId {
+    match reason {
+        AuthFailureReason::MissingCredential | AuthFailureReason::ExpiredCredential => {
+            SeverityId::Low
+        }
+        AuthFailureReason::ConflictingCredentials
+        | AuthFailureReason::MalformedCredential
+        | AuthFailureReason::InvalidCredential
+        | AuthFailureReason::AudienceOrIssuerMismatch
+        | AuthFailureReason::UnknownIdentity
+        | AuthFailureReason::StaleIdentity
+        | AuthFailureReason::IdentityProviderUnavailable => SeverityId::Medium,
+    }
 }
 
-impl AuthMechanism {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Mtls => "mtls",
-        }
+fn with_protocol(
+    builder: AuthenticationBuilder<'_>,
+    mechanism: AuthMechanism,
+) -> AuthenticationBuilder<'_> {
+    match mechanism {
+        AuthMechanism::Oidc => builder.auth_protocol(AuthProtocolId::OpenId),
+        AuthMechanism::Mtls => builder.auth_protocol_other("mtls"),
+        AuthMechanism::SandboxJwt => builder.auth_protocol_other("sandbox_jwt"),
+        AuthMechanism::ComputeDriver => builder.auth_protocol_other("compute_driver"),
+        AuthMechanism::GatewayPeer => builder.auth_protocol_other("k8s_service_account"),
     }
 }
 
@@ -65,16 +69,16 @@ pub fn emit_authentication_failure(
     )
     .action(ActionId::Denied)
     .disposition(DispositionId::Blocked)
-    .severity(reason.severity())
+    .severity(severity(reason))
     .status(StatusId::Failure)
-    .status_detail(reason.as_str())
+    .status_detail(category(reason))
     .http_request(HttpRequest {
         http_method: HttpMethod::Post,
         url: Some(Url::from_path(path)),
     })
-    .message(format!("authentication failed: {}", reason.as_str()));
+    .message(format!("authentication failed: {}", category(reason)));
     if let Some(mechanism) = mechanism {
-        builder = builder.auth_protocol_other(mechanism.label());
+        builder = with_protocol(builder, mechanism);
     }
     ocsf_emit!(builder.build());
 }

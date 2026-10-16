@@ -12500,6 +12500,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err()
+                .status
                 .code(),
                 Code::Unauthenticated,
             );
