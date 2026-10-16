@@ -3,12 +3,14 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod image_activation;
 mod legacy_time_wire;
 pub mod lock_order;
 pub mod mutation_lock;
 mod postgres;
 #[cfg(test)]
 mod refresh_lock_tests;
+mod sandbox_image;
 mod sqlite;
 
 pub use crate::storage_proto::{

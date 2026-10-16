@@ -557,12 +557,21 @@ retained memory state.
 ### Change a stopped sandbox's workload image
 
 Do not invent a `sandbox update` command or use delete/create to change an
-existing sandbox's image. The raw `UpdateSandbox` RPC initially supports only
-stopped Kubernetes sandboxes; other drivers return `UNIMPLEMENTED`. Stop and
+existing sandbox's image. The separate
+`openshell.v1.SandboxUpdates/UpdateSandbox` RPC uses the same gateway listener
+and authentication as `OpenShell`. It defaults to disabled; the operator must
+complete the published
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-image-updates)
+before enabling `enable_sandbox_image_updates`. Keep it false during a rolling
+upgrade and never enable it merely to bypass a failed compatibility check.
+After activation, the RPC initially supports only stopped Kubernetes sandboxes;
+other drivers return `UNIMPLEMENTED`. Stop and
 wait for `Stopped`, read the sandbox's current resource version through
 `GetSandbox`, call raw `UpdateSandbox` with the named workspace, sandbox name,
 OCI image, and required nonzero `expected_resource_version`, then start after
-success. There is no curated SDK update method. The sandbox identity, Kubernetes
+success. Rust SDK callers use `client.raw_sandbox_updates_fresh()`; generated
+clients use `SandboxUpdates`, not the unchanged `OpenShell` service. There is no
+curated SDK update method. The sandbox identity, Kubernetes
 custom resource, and persistent volume claim remain; the existing workspace is
 not reseeded and trusted runtime images do not change.
 
@@ -571,8 +580,10 @@ cleanup completion and settlement of the original driver operation, then run
 `sandbox stop` to obtain `Stopped` before correcting the image. This retains the
 timeout diagnostic and storage and does not bypass pending cleanup.
 
-If raw `sandbox.status.image_update` is present after a failure, start is
-blocked. Read a fresh version and retry that same pending image. An optional
+An operation-pending error after a failure blocks start, stop, provisioning
+retry, and delete. Image intent and revision are private; the public `SandboxStatus`
+shape is unchanged. Read a fresh version and retry the same image originally
+requested, even if the spec already names it. An optional
 `request_id` with an unresolved admission does not execute again; inspect and
 reconcile state before submitting a new conditional request with a fresh
 version and new ID, or no ID. Never change the payload under the original ID or

@@ -1012,17 +1012,24 @@ For a provisioning timeout, wait for cleanup to finish, then run `sandbox start`
 
 ### Update the Image of a Stopped Sandbox
 
-Use the raw `UpdateSandbox` RPC to change only a stopped sandbox's workload
-image. This operation initially supports the Kubernetes compute driver only;
-other drivers return `UNIMPLEMENTED`. There is no `sandbox update` CLI command
-or curated SDK update method.
+Use `openshell.v1.SandboxUpdates/UpdateSandbox` to change only a stopped
+sandbox's workload image. This separate service uses the same gateway listener
+and authentication as `OpenShell`; it requires `sandbox:write` and workspace
+user access. This operation initially supports the Kubernetes compute driver
+only; other drivers return `UNIMPLEMENTED` after activation. There is no
+`sandbox update` CLI command or curated SDK update method.
+
+Image updates default to disabled. Ask the operator to complete the
+[compatible deployment rollout](/kubernetes/high-availability#activate-sandbox-image-updates)
+before enabling `enable_sandbox_image_updates` in the
+[gateway configuration](/how-it-works/gateways/configuration#sandbox-image-updates).
 
 The update preserves the sandbox ID, Kubernetes custom resource, and persistent
 volume claim. It does not delete and recreate the sandbox, reseed its existing
 workspace from the new image, or change the trusted supervisor and sandbox
-runtime images. Other create-time configuration remains unchanged. Submitting the
-same image reference is a no-op; use a different tag or an immutable digest to
-select new image content.
+runtime images. Other create-time configuration remains unchanged. Without a
+pending update, submitting the same image reference is a no-op. Use a different
+tag or an immutable digest to select new image content.
 
 Follow this sequence through the CLI and a generated/raw RPC client.
 
@@ -1035,6 +1042,25 @@ Follow this sequence through the CLI and a generated/raw RPC client.
 4. After the update succeeds, run `openshell sandbox start my-sandbox` to launch
    the new image.
 
+With an authenticated Rust SDK `OpenShellClient`, use the separate raw client
+and the `current_resource_version` read in step 2:
+
+```rust
+use openshell_sdk::raw::{UpdateSandboxRequest, proto};
+
+let mut updates = client.raw_sandbox_updates_fresh().await?;
+let response = updates.update_sandbox(UpdateSandboxRequest {
+    workspace_scope: Some(proto::workspace_selector("default")),
+    name: "my-sandbox".into(),
+    image: "registry.example.com/agents/my-agent:2.0".into(),
+    expected_resource_version: current_resource_version,
+    request_id: String::new(),
+}).await?;
+```
+
+The helper shares the main client's transport and live authentication slot.
+Generated clients use the `SandboxUpdates` service, not `OpenShell`.
+
 If the new image fails to start and provisioning times out, wait until
 `provisioning.cleanup_completed_time` is present and
 `provisioning.driver_operation_pending` is false. Run `sandbox stop` to move the
@@ -1044,17 +1070,21 @@ compute again. Cleanup that is still pending cannot be bypassed.
 
 An `ABORTED` version conflict requires another read before you construct a new
 conditional request. An update failure or disconnected response can leave a
-persistent `sandbox.status.image_update` intent, even when
-`sandbox.spec.template.image` already names the target image. While that intent
-exists, start is blocked. Read the current version and retry `UpdateSandbox`
-with the intent's same `image`; do not select a different image or delete the
-sandbox to bypass reconciliation. Only a successful retry clears the intent.
+pending operation, even when `sandbox.spec.template.image` already names the
+target image. Start, stop, provisioning retry, and delete reject the pending
+operation.
+The public `SandboxStatus` shape is unchanged; image intent and revision remain
+private. Use the operation-pending error to guide recovery, not a status image
+field. Read the current version and retry `UpdateSandbox` with the same image
+you originally requested. Do not select another image or delete the sandbox to
+bypass reconciliation. Only a successful retry clears the pending operation.
 
 The optional `request_id` uses [durable request admission](/sdk/api-errors#durable-request-admission).
 A retry with the same ID must keep the original payload, including its expected
 version. An unresolved admission returns `REQUEST_OUTCOME_UNCERTAIN` rather than
-executing again. Reconcile the sandbox and pending target first, then submit a
-new conditional same-image request with a fresh version and a new ID, or no ID.
+executing again. Reconcile against the sandbox state and your original requested
+image, then submit a new conditional same-image request with a fresh version
+and a new ID, or no ID.
 Do not change the expected version under the original ID or blindly switch IDs
 after a timeout.
 

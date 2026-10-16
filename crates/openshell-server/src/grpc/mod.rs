@@ -243,6 +243,16 @@ impl OpenShellService {
 // ---------------------------------------------------------------------------
 
 #[tonic::async_trait]
+impl openshell_core::proto::sandbox_updates_server::SandboxUpdates for OpenShellService {
+    async fn update_sandbox(
+        &self,
+        request: Request<openshell_core::proto::UpdateSandboxRequest>,
+    ) -> Result<Response<SandboxResponse>, Status> {
+        mutation_replay::run(&self.state, request).await
+    }
+}
+
+#[tonic::async_trait]
 impl OpenShell for OpenShellService {
     async fn health(
         &self,
@@ -318,13 +328,6 @@ impl OpenShell for OpenShellService {
     async fn create_sandbox(
         &self,
         request: Request<CreateSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
-    }
-
-    async fn update_sandbox(
-        &self,
-        request: Request<openshell_core::proto::UpdateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         mutation_replay::run(&self.state, request).await
     }

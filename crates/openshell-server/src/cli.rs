@@ -313,6 +313,11 @@ struct RunArgs {
         action = ArgAction::Set
     )]
     enable_websocket_tunnel: bool,
+
+    /// Activate image updates only after retiring every incompatible gateway
+    /// and settling its outstanding driver operations. See HA upgrade guidance.
+    #[arg(long, env = "OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES", default_value_t = false, action = ArgAction::Set)]
+    enable_sandbox_image_updates: bool,
 }
 
 pub fn command() -> Command {
@@ -594,6 +599,8 @@ fn prepare_server_config_with_drivers(
         .service_routing
         .validate(&config.name)
         .map_err(|error| miette::miette!("invalid service routing configuration: {error}"))?;
+
+    config.enable_sandbox_image_updates = args.enable_sandbox_image_updates;
     if let Some(sources) = file
         .as_ref()
         .and_then(|file| file.openshell.gateway.provider_profile_sources.clone())
@@ -1378,6 +1385,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_websocket_tunnel")
     {
         args.enable_websocket_tunnel = enabled;
+    }
+    if let Some(enabled) = file.enable_sandbox_image_updates
+        && arg_defaulted(matches, "enable_sandbox_image_updates")
+    {
+        args.enable_sandbox_image_updates = enabled;
     }
     if let Some(mtls_auth) = &file.mtls_auth
         && arg_defaulted(matches, "enable_mtls_auth")
@@ -3093,6 +3105,43 @@ mod tests {
 
     fn config_file_from_toml(toml: &str) -> ConfigFile {
         toml::from_str(toml).expect("valid TOML in test fixture")
+    }
+
+    #[test]
+    fn image_update_activation_defaults_off_and_file_requires_explicit_opt_in() {
+        Environment::new().remove("OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES").run(|| {
+            let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+            assert!(!args.enable_sandbox_image_updates);
+            assert!(!openshell_core::Config::new(None).enable_sandbox_image_updates);
+            let file = config_file_from_toml("[openshell]\nversion = 2\n[openshell.gateway]\nenable_sandbox_image_updates = true\n");
+            merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+            assert!(args.enable_sandbox_image_updates);
+        });
+    }
+
+    #[test]
+    fn explicit_cli_or_environment_disable_overrides_file_activation() {
+        let file = config_file_from_toml(
+            "[openshell]\nversion = 2\n[openshell.gateway]\nenable_sandbox_image_updates = true\n",
+        );
+        Environment::new()
+            .remove("OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--enable-sandbox-image-updates",
+                    "false",
+                ]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_sandbox_image_updates);
+            });
+        Environment::new()
+            .set("OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES", "false")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&["openshell-gateway"]);
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                assert!(!args.enable_sandbox_image_updates);
+            });
     }
 
     #[test]

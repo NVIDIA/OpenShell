@@ -13,7 +13,7 @@ use std::time::Duration;
 use openshell_bootstrap::{load_active_gateway, load_gateway_metadata};
 use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
 use openshell_e2e::harness::sandbox::SandboxGuard;
-use openshell_sdk::raw::{AuthedGrpcClient, proto};
+use openshell_sdk::raw::{AuthedGrpcClient, AuthedSandboxUpdatesClient, proto};
 use openshell_sdk::{ClientConfig, EdgeAuthInterceptor, OpenShellClient};
 use serde_json::Value;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
@@ -26,14 +26,14 @@ const SENTINEL_PATH: &str = "/sandbox/.image-update-sentinel";
 /// Reuse the wrapper's registered endpoint (including its isolated XDG config).
 /// The SDK owns plaintext transport; the `OpenShift` wrapper registers an mTLS
 /// gateway, for which we attach its existing client bundle to a tonic channel.
-async fn gateway_client() -> AuthedGrpcClient {
+async fn gateway_client() -> OpenShellClient {
     let name = std::env::var("OPENSHELL_GATEWAY")
         .ok()
         .filter(|name| !name.trim().is_empty())
         .or_else(load_active_gateway)
         .expect("Kubernetes E2E wrapper must register a gateway");
     let metadata = load_gateway_metadata(&name).expect("load E2E gateway metadata");
-    let client = if metadata.gateway_endpoint.starts_with("http://") {
+    if metadata.gateway_endpoint.starts_with("http://") {
         OpenShellClient::connect(ClientConfig::new(metadata.gateway_endpoint))
             .await
             .expect("connect to E2E gateway")
@@ -65,8 +65,7 @@ async fn gateway_client() -> AuthedGrpcClient {
             .await
             .expect("connect to E2E gateway over mTLS");
         OpenShellClient::from_parts(channel, EdgeAuthInterceptor::noop())
-    };
-    client.raw_grpc()
+    }
 }
 
 fn request_id() -> String {
@@ -248,8 +247,11 @@ fn assert_update_completed(original: &proto::Sandbox, updated: &proto::Sandbox) 
     let status = updated.status.as_ref().expect("updated status");
     assert_eq!(status.phase, proto::SandboxPhase::Stopped as i32);
     assert!(
-        status.image_update.is_none(),
-        "successful update must clear pending intent"
+        status
+            .provisioning
+            .as_ref()
+            .is_none_or(|record| !record.driver_operation_pending),
+        "successful image update must settle the old-understood operation interlock"
     );
     assert_eq!(
         updated
@@ -265,13 +267,28 @@ fn assert_update_completed(original: &proto::Sandbox, updated: &proto::Sandbox) 
 }
 
 async fn assert_replay(
-    client: &mut AuthedGrpcClient,
+    client: &mut AuthedSandboxUpdatesClient,
     update: proto::UpdateSandboxRequest,
     updated: &proto::Sandbox,
 ) {
-    // Replay the exact old resource-version request. Sandbox replay returns its
-    // current state: ordinary watch observations may have advanced metadata and
-    // status since the original response, without applying the image again.
+    // Replay restores current resource state, not a captured transient status.
+    // Use retained driver evidence to prove that no new image operation ran.
+    let id = &updated.metadata.as_ref().expect("updated metadata").id;
+    let before = sandbox_resource(id).await;
+    let evidence = before["metadata"]["annotations"]["openshell.ai/sandbox-image-update"].clone();
+    let operation: Value =
+        serde_json::from_str(evidence.as_str().expect("image operation evidence"))
+            .expect("parse image operation evidence");
+    assert!(
+        operation["revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > 0)
+    );
+    assert!(
+        operation["operation_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty())
+    );
     let replay = client
         .update_sandbox(rpc(update))
         .await
@@ -286,18 +303,11 @@ async fn assert_replay(
     let replayed = replay.into_inner().sandbox.expect("replayed Sandbox");
     assert_update_completed(updated, &replayed);
     assert_eq!(replayed.spec, updated.spec);
+    let after = sandbox_resource(id).await;
+    assert_eq!(after["metadata"]["uid"], before["metadata"]["uid"]);
     assert_eq!(
-        replayed
-            .status
-            .as_ref()
-            .expect("replayed status")
-            .image_revision,
-        updated
-            .status
-            .as_ref()
-            .expect("updated status")
-            .image_revision,
-        "replay must not admit another image operation"
+        after["metadata"]["annotations"]["openshell.ai/sandbox-image-update"], evidence,
+        "replay must retain the exact driver operation identity and revision"
     );
     assert!(
         replayed
@@ -313,9 +323,7 @@ async fn assert_replay(
     );
 }
 
-#[tokio::test]
-async fn image_update_retains_workspace_and_identity() {
-    let mut client = gateway_client().await;
+async fn assert_image_update_supported(client: &mut AuthedGrpcClient) {
     // This test is Kubernetes-only: missing support is a regression, not a skip.
     let info = client
         .get_gateway_info(rpc(proto::GetGatewayInfoRequest {}))
@@ -328,6 +336,14 @@ async fn image_update_retains_workspace_and_identity() {
             .iter()
             .any(|capability| capability == "openshell.compute.update-sandbox-image")
     }));
+}
+
+#[tokio::test]
+async fn image_update_retains_workspace_and_identity() {
+    let gateway = gateway_client().await;
+    let mut client = gateway.raw_grpc();
+    let mut image_client = gateway.raw_sandbox_updates();
+    assert_image_update_supported(&mut client).await;
 
     let mut sandbox = SandboxGuard::create(&["--from", ORIGINAL_IMAGE, "--no-auto-providers"])
         .await
@@ -363,7 +379,7 @@ async fn image_update_retains_workspace_and_identity() {
             .resource_version,
         request_id: String::new(),
     };
-    let error = client
+    let error = image_client
         .update_sandbox(rpc(running_update.clone()))
         .await
         .expect_err("running update must be rejected");
@@ -385,7 +401,7 @@ async fn image_update_retains_workspace_and_identity() {
         request_id: request_id(),
         ..running_update
     };
-    let updated = client
+    let updated = image_client
         .update_sandbox(rpc(update.clone()))
         .await
         .expect("update stopped sandbox image")
@@ -395,7 +411,7 @@ async fn image_update_retains_workspace_and_identity() {
     assert_update_completed(&original, &updated);
     assert_resource_retained(&before, &sandbox_resource(id).await, UPDATED_IMAGE);
 
-    assert_replay(&mut client, update, &updated).await;
+    assert_replay(&mut image_client, update, &updated).await;
 
     let (output, code) = run_cli(&["sandbox", "start", &sandbox.name]).await;
     assert_eq!(code, 0, "sandbox start: {output}");

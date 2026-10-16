@@ -900,6 +900,7 @@ pub struct ComputeRuntime {
     driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     image_preparation_timeout_seconds: u32,
+    image_updates_enabled: bool,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -1016,6 +1017,7 @@ impl ComputeRuntime {
             driver_process,
             default_image,
             image_preparation_timeout_seconds: 1800,
+            image_updates_enabled: false,
             store,
             sandbox_index,
             sandbox_watch_bus,
@@ -2301,7 +2303,7 @@ impl ComputeRuntime {
             self.validate_launch_signer_configured(authority.is_some())?;
         }
         provisioning_operation::ensure_operation_settled(&candidate)?;
-        image_update::ensure_no_pending_image_update(&candidate)?;
+        self.ensure_no_pending_image_update(&candidate).await?;
         if provisioning_deadline::timed_out(&candidate)
             && candidate
                 .status
@@ -2339,7 +2341,7 @@ impl ComputeRuntime {
         let mut attempts = 0;
         let (previous, starting, launch_authentication) = loop {
             provisioning_operation::ensure_operation_settled(&current)?;
-            image_update::ensure_no_pending_image_update(&current)?;
+            self.ensure_no_pending_image_update(&current).await?;
             let phase = SandboxPhase::try_from(current.phase()).unwrap_or(SandboxPhase::Unknown);
             if let StartIntent::Resume { .. } = intent {
                 // Resume restores only retained state. A Starting record may
@@ -7390,8 +7392,6 @@ fn public_status_from_driver(
         next_restart_time: None,
         main_process_started_time: None,
         last_token_grant_failure: None,
-        image_update: None,
-        image_revision: 0,
     }
 }
 
@@ -7478,8 +7478,6 @@ fn apply_driver_snapshot(
         new_status.restart_count = old_status.restart_count;
         new_status.next_restart_time = old_status.next_restart_time;
         new_status.main_process_started_time = old_status.main_process_started_time;
-        new_status.image_update.clone_from(&old_status.image_update);
-        new_status.image_revision = old_status.image_revision;
     }
 
     phase = match old_phase {
@@ -8458,6 +8456,7 @@ pub fn new_test_runtime_with_driver(
         driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         image_preparation_timeout_seconds: 1800,
+        image_updates_enabled: false,
         store,
         sandbox_index: SandboxIndex::new(),
         sandbox_watch_bus: SandboxWatchBus::new(),
@@ -9678,6 +9677,7 @@ mod tests {
             driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             image_preparation_timeout_seconds: 1800,
+            image_updates_enabled: false,
             store,
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),

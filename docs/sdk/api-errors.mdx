@@ -105,6 +105,10 @@ Thirty-one user-callable unary RPCs accept an optional `request_id` in their pro
 | Provider profile | `ImportProviderProfiles`, `UpdateProviderProfiles`, `DeleteProviderProfile` |
 | Policy and config | `UpdateConfig`, `ApproveDraftChunk`, `RejectDraftChunk`, `EditDraftChunk`, `UndoDraftChunk`, `ApproveAllDraftChunks`, `ClearDraftChunks` |
 
+`UpdateSandbox` belongs to the separate `openshell.v1.SandboxUpdates` service
+on the same authenticated gateway listener. The other RPCs above remain on
+`openshell.v1.OpenShell`.
+
 Use a nonzero, hyphenated UUID of exactly 36 characters. Uppercase and lowercase
 forms identify the same request. An empty ID preserves the existing behavior
 without deduplication. This ID is separate from transport correlation metadata.
@@ -194,23 +198,27 @@ before relying on IDs; older protobuf servers can silently ignore unknown fields
 
 ### Sandbox image update recovery
 
-`UpdateSandbox` is an image-only conditional mutation for stopped Kubernetes
-sandboxes. Other compute drivers return `UNIMPLEMENTED`. Supply a named
+`SandboxUpdates.UpdateSandbox` is an image-only conditional mutation for stopped
+Kubernetes sandboxes. It defaults to disabled and returns `FAILED_PRECONDITION`
+until the operator [activates a compatible deployment](/kubernetes/high-availability#activate-sandbox-image-updates).
+After activation, other compute drivers return `UNIMPLEMENTED`. Supply a named
 `workspace_scope`, sandbox `name`, nonempty OCI `image`, and a required nonzero
 `expected_resource_version` read from `sandbox.metadata.resource_version`.
 A stale version returns `ABORTED`; read fresh state before constructing another
 conditional request. The operation does not start compute.
 
-A failed or interrupted update can leave durable `sandbox.status.image_update`
-state. The desired spec image alone does not prove driver reconciliation
-completed. Start returns `FAILED_PRECONDITION` until you successfully retry the
-same pending image using the current resource version. A different target image
-cannot replace a pending update.
+A failed or interrupted update can leave a pending operation. The desired spec
+image alone does not prove driver reconciliation completed. Start, stop,
+provisioning retry, and delete return `FAILED_PRECONDITION` while that operation remains.
+Image intent and revision are private; the public `SandboxStatus` shape does not
+change. On an operation-pending error, read a fresh resource version and retry
+the same image originally requested. A different target image cannot replace a
+pending update.
 
 If the original request supplied `request_id`, an error leaves its admission
 unresolved. Reusing that ID with the original payload returns
 `REQUEST_OUTCOME_UNCERTAIN`; changing its expected version returns
-`REQUEST_ID_PAYLOAD_MISMATCH`. Inspect and reconcile the pending image first,
+`REQUEST_ID_PAYLOAD_MISMATCH`. Reconcile against the original requested image,
 then make a new conditional same-image request with the fresh version and a new
 ID, or without an ID. This is explicit recovery, not permission to blindly
 repeat uncertain mutations. A replay of a confirmed success returns the

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Interceptable `OpenShell` route classification.
+//! Interceptable public gateway route classification.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,13 +10,16 @@ use prost_reflect::DescriptorPool;
 use crate::{InterceptorError, Result};
 
 const SERVICE_OPEN_SHELL: &str = "openshell.v1.OpenShell";
+const SERVICE_SANDBOX_UPDATES: &str = "openshell.v1.SandboxUpdates";
+
+/// Unary sandbox-update methods that may be targeted by gateway interceptors.
+pub const INTERCEPTABLE_SANDBOX_UPDATE_METHODS: &[&str] = &["UpdateSandbox"];
 
 /// Unary `openshell.v1.OpenShell` methods that may be targeted by gateway
 /// interceptors. New methods are non-interceptable until deliberately added
 /// here.
 pub const INTERCEPTABLE_METHODS: &[&str] = &[
     "CreateSandbox",
-    "UpdateSandbox",
     "AttachSandboxProvider",
     "DetachSandboxProvider",
     "DeleteSandbox",
@@ -59,25 +62,25 @@ impl OpenShellRouteIndex {
     }
 
     pub(crate) fn from_descriptor_pool(pool: &DescriptorPool) -> Result<Self> {
-        let service = pool
-            .get_service_by_name(SERVICE_OPEN_SHELL)
-            .ok_or_else(|| {
-                InterceptorError::Config(format!(
-                    "descriptor set does not contain service '{SERVICE_OPEN_SHELL}'"
-                ))
-            })?;
         let mut all_methods = BTreeSet::new();
         let mut unary_methods = BTreeSet::new();
         let mut input_types = BTreeMap::new();
         let mut output_types = BTreeMap::new();
 
-        for method in service.methods() {
-            let name = method.name().to_string();
-            all_methods.insert(name.clone());
-            if !method.is_client_streaming() && !method.is_server_streaming() {
-                unary_methods.insert(name.clone());
-                input_types.insert(name.clone(), method.input().full_name().to_string());
-                output_types.insert(name, method.output().full_name().to_string());
+        for service_name in [SERVICE_OPEN_SHELL, SERVICE_SANDBOX_UPDATES] {
+            let service = pool.get_service_by_name(service_name).ok_or_else(|| {
+                InterceptorError::Config(format!(
+                    "descriptor set does not contain service '{service_name}'"
+                ))
+            })?;
+            for method in service.methods() {
+                let route = format!("{service_name}/{}", method.name());
+                all_methods.insert(route.clone());
+                if !method.is_client_streaming() && !method.is_server_streaming() {
+                    unary_methods.insert(route.clone());
+                    input_types.insert(route.clone(), method.input().full_name().to_string());
+                    output_types.insert(route, method.output().full_name().to_string());
+                }
             }
         }
 
@@ -93,37 +96,45 @@ impl OpenShellRouteIndex {
 
     #[must_use]
     pub fn is_interceptable(&self, service: &str, method: &str) -> bool {
-        service == SERVICE_OPEN_SHELL
-            && self.unary_methods.contains(method)
-            && INTERCEPTABLE_METHODS.contains(&method)
+        let allowed = match service {
+            SERVICE_OPEN_SHELL => INTERCEPTABLE_METHODS,
+            SERVICE_SANDBOX_UPDATES => INTERCEPTABLE_SANDBOX_UPDATE_METHODS,
+            _ => return false,
+        };
+        allowed.contains(&method) && self.unary_methods.contains(&format!("{service}/{method}"))
     }
 
     #[must_use]
     pub fn input_type(&self, service: &str, method: &str) -> Option<&str> {
-        if service == SERVICE_OPEN_SHELL && self.unary_methods.contains(method) {
-            self.input_types.get(method).map(String::as_str)
-        } else {
-            None
-        }
+        self.input_types
+            .get(&format!("{service}/{method}"))
+            .map(String::as_str)
     }
 
     #[must_use]
     pub fn output_type(&self, service: &str, method: &str) -> Option<&str> {
-        if service == SERVICE_OPEN_SHELL && self.unary_methods.contains(method) {
-            self.output_types.get(method).map(String::as_str)
-        } else {
-            None
-        }
+        self.output_types
+            .get(&format!("{service}/{method}"))
+            .map(String::as_str)
     }
 
     fn validate_interceptable_list(&self) -> Result<()> {
         let mut stale = Vec::new();
         let mut streaming = Vec::new();
-        for method in INTERCEPTABLE_METHODS {
-            if !self.all_methods.contains(*method) {
-                stale.push((*method).to_string());
-            } else if !self.unary_methods.contains(*method) {
-                streaming.push((*method).to_string());
+        for (service, methods) in [
+            (SERVICE_OPEN_SHELL, INTERCEPTABLE_METHODS),
+            (
+                SERVICE_SANDBOX_UPDATES,
+                INTERCEPTABLE_SANDBOX_UPDATE_METHODS,
+            ),
+        ] {
+            for method in methods {
+                let route = format!("{service}/{method}");
+                if !self.all_methods.contains(&route) {
+                    stale.push(route);
+                } else if !self.unary_methods.contains(&route) {
+                    streaming.push(route);
+                }
             }
         }
         if !stale.is_empty() {
@@ -154,6 +165,22 @@ mod tests {
         let index =
             OpenShellRouteIndex::from_descriptor_set(openshell_core::FILE_DESCRIPTOR_SET).unwrap();
         assert!(index.is_interceptable("openshell.v1.OpenShell", "CreateSandbox"));
+        assert!(index.is_interceptable(SERVICE_SANDBOX_UPDATES, "UpdateSandbox"));
+        assert!(!index.is_interceptable(SERVICE_OPEN_SHELL, "UpdateSandbox"));
+        assert!(!index.is_interceptable(SERVICE_SANDBOX_UPDATES, "CreateSandbox"));
+        assert_eq!(
+            index.input_type(SERVICE_SANDBOX_UPDATES, "UpdateSandbox"),
+            Some("openshell.v1.UpdateSandboxRequest")
+        );
+        assert_eq!(
+            index.output_type(SERVICE_SANDBOX_UPDATES, "UpdateSandbox"),
+            Some("openshell.v1.SandboxResponse")
+        );
+        assert!(
+            index
+                .input_type(SERVICE_OPEN_SHELL, "UpdateSandbox")
+                .is_none()
+        );
         assert!(index.is_interceptable("openshell.v1.OpenShell", "UpdateConfig"));
         assert!(index.is_interceptable("openshell.v1.OpenShell", "SubmitPolicyAnalysis"));
         assert!(!index.is_interceptable("openshell.v1.OpenShell", "Health"));

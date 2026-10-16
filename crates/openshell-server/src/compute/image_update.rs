@@ -1,27 +1,47 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Stopped-only image changes. Persist intent before touching the driver so a
-//! lost response cannot allow Start to run a different image than the gateway.
+//! Stopped-only image changes with private durable intent and an operation
+//! interlock understood by supported older gateways.
 
-use super::{
-    ComputeRuntime, START_PHASE_CAS_RETRY_LIMIT, provisioning_operation,
-    sandbox_compute_runtime_identity,
-};
+use super::{ComputeRuntime, provisioning_operation, sandbox_compute_runtime_identity};
+use crate::storage_proto::StoredSandboxImageUpdate as SandboxImageUpdate;
 use openshell_core::extension_protocol::COMPUTE_UPDATE_SANDBOX_IMAGE;
 use openshell_core::proto::compute::v1::UpdateSandboxImageRequest;
-use openshell_core::proto::{Sandbox, SandboxImageUpdate, SandboxPhase};
+use openshell_core::proto::{Sandbox, SandboxPhase};
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName};
 use tonic::{Request, Status};
 use tracing::info;
 
 impl ComputeRuntime {
+    pub(crate) fn with_sandbox_image_updates(mut self, enabled: bool) -> Self {
+        self.image_updates_enabled = enabled;
+        self
+    }
+
     pub(crate) async fn update_sandbox_image(
         &self,
         sandbox_id: &str,
         image: String,
         expected_resource_version: u64,
     ) -> Result<Sandbox, Status> {
+        // Explicit operator activation follows retirement of incompatible
+        // gateways and their outstanding driver work. Refuse before preflight
+        // or durable effects; a cached placement ring is not a version proof.
+        if !self.image_updates_enabled {
+            return Err(Status::failed_precondition(
+                "sandbox image updates are disabled; complete the compatible deployment rollout before activating them",
+            ));
+        }
+        self.store
+            .ensure_image_update_deployment_compatible()
+            .await
+            .map_err(|error| match error {
+                crate::persistence::PersistenceError::Config(message) => {
+                    Status::failed_precondition(message)
+                }
+                _ => Status::unavailable("cannot verify image-update deployment compatibility"),
+            })?;
         if !self
             .driver_info
             .negotiated_extension
@@ -39,7 +59,7 @@ impl ComputeRuntime {
             .store
             .get_message::<Sandbox>(sandbox_id)
             .await
-            .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+            .map_err(|_| Status::internal("fetch sandbox failed"))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         ensure_image_update_stopped(&current)?;
         if current.get_resource_version() != expected_resource_version {
@@ -50,6 +70,22 @@ impl ComputeRuntime {
                 "update sandbox image",
             ));
         }
+        let state = self
+            .store
+            .get_sandbox_image_state(sandbox_id)
+            .await
+            .map_err(|_| Status::internal("fetch private sandbox image state failed"))?;
+        let pending = state.as_ref().and_then(|state| state.pending.clone());
+        if let Some(intent) = &pending {
+            ensure_image_update_interlock(&current, intent)?;
+            if intent.image != image {
+                return Err(Status::failed_precondition(
+                    "another image update is pending; retry that image before selecting a different image",
+                ));
+            }
+        } else {
+            provisioning_operation::ensure_operation_settled(&current)?;
+        }
         let old_image = current
             .spec
             .as_ref()
@@ -57,42 +93,24 @@ impl ComputeRuntime {
             .map(|template| template.image.clone())
             .filter(|image| !image.is_empty())
             .ok_or_else(|| Status::failed_precondition("sandbox has no workload image"))?;
-        let pending = current
-            .status
-            .as_ref()
-            .and_then(|status| status.image_update.clone());
-        if pending
-            .as_ref()
-            .is_some_and(|pending| pending.image != image)
-        {
-            return Err(Status::failed_precondition(
-                "another image update is pending; retry that image before selecting a different image",
-            ));
-        }
         if pending.is_none() && old_image == image {
             return Ok(current);
         }
-        let intent = if let Some(intent) = pending {
-            intent
+        let revision = state.as_ref().map_or(0, |state| state.revision);
+        let intent = pending.clone().unwrap_or_else(|| SandboxImageUpdate {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            previous_image: old_image,
+            image,
+            revision: revision.saturating_add(1),
+        });
+        if pending.is_none() && revision == u64::MAX {
+            return Err(Status::resource_exhausted(
+                "sandbox image revision exhausted",
+            ));
+        }
+        let accepted = if pending.is_some() {
+            current
         } else {
-            let revision = current
-                .status
-                .as_ref()
-                .map_or(0, |status| status.image_revision)
-                .checked_add(1)
-                .ok_or_else(|| Status::resource_exhausted("sandbox image revision exhausted"))?;
-            SandboxImageUpdate {
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                previous_image: old_image,
-                image: image.clone(),
-                revision,
-            }
-        };
-        if current
-            .status
-            .as_ref()
-            .is_none_or(|status| status.image_update.is_none())
-        {
             let request = image_update_driver_request(&current, &intent, true);
             self.driver
                 .call_owned(
@@ -103,52 +121,32 @@ impl ComputeRuntime {
                     },
                 )
                 .await?;
-        }
-        let pending = if current
-            .status
-            .as_ref()
-            .is_some_and(|status| status.image_update.is_some())
-        {
-            current
-        } else {
-            let intent_for_write = intent.clone();
+            // The private intent, desired image, and OLD-understood pending
+            // operation flag commit in one version-fenced transaction.
             self.store
-                .update_message_cas::<Sandbox, _>(
+                .begin_sandbox_image_update(
                     sandbox_id,
                     expected_resource_version,
-                    move |sandbox| {
-                        sandbox
-                            .spec
-                            .as_mut()
-                            .expect("validated spec")
-                            .template
-                            .as_mut()
-                            .expect("validated template")
-                            .image
-                            .clone_from(&image);
-                        let status = sandbox.status.get_or_insert_with(Default::default);
-                        status.image_revision = intent_for_write.revision;
-                        status.image_update = Some(intent_for_write.clone());
-                    },
+                    revision,
+                    &intent,
                 )
                 .await
                 .map_err(|error| {
                     crate::grpc::persistence_error_to_status(error, "record sandbox image update")
                 })?
         };
-        self.sandbox_index.update_from_sandbox(&pending);
+        self.sandbox_index.update_from_sandbox(&accepted);
         self.sandbox_watch_bus.notify(sandbox_id);
         drop(sandbox_guard);
-
-        // The durable intent commits ownership. Cancellation of the public RPC
-        // must not release the lifecycle gate while the driver can still apply.
         let runtime = self.clone();
         tokio::spawn(async move {
             let _lifecycle_guard = lifecycle_guard;
-            runtime.complete_image_update(pending, intent).await
+            runtime.complete_image_update(accepted, intent).await
         })
         .await
-        .map_err(|error| Status::internal(format!("sandbox image update worker failed: {error}")))?
+        .map_err(|_| {
+            Status::internal("sandbox image update worker failed; intent remains pending")
+        })?
     }
 
     async fn complete_image_update(
@@ -156,66 +154,62 @@ impl ComputeRuntime {
         pending: Sandbox,
         intent: SandboxImageUpdate,
     ) -> Result<Sandbox, Status> {
+        ensure_image_update_interlock(&pending, &intent)?;
         let request = image_update_driver_request(&pending, &intent, false);
-        self.driver
-            .call_owned(openshell_otel::rpc::UPDATE_SANDBOX_IMAGE, Some(pending.object_id()), move |driver| async move {
-                driver.update_sandbox_image(Request::new(request)).await
-            })
-            .await?;
-
-        // Watchers may have advanced the resource version. Never restore an old
-        // record or overwrite a concurrent deletion to acknowledge the driver.
+        self.driver.call_owned(openshell_otel::rpc::UPDATE_SANDBOX_IMAGE, Some(pending.object_id()),
+            move |driver| async move { driver.update_sandbox_image(Request::new(request)).await }).await?;
         let _guard = self.lock_sandbox_local(pending.object_id()).await;
-        for _ in 0..START_PHASE_CAS_RETRY_LIMIT {
-            let current = self
-                .store
-                .get_message::<Sandbox>(pending.object_id())
-                .await
-                .map_err(|error| Status::internal(format!("reload image update failed: {error}")))?
-                .ok_or_else(|| Status::not_found("sandbox was deleted"))?;
-            ensure_image_update_stopped(&current)?;
-            if current
-                .status
-                .as_ref()
-                .and_then(|status| status.image_update.as_ref())
-                != Some(&intent)
-            {
-                return Err(Status::aborted("sandbox image update intent changed"));
-            }
-            match self
-                .store
-                .update_message_cas::<Sandbox, _>(
-                    pending.object_id(),
-                    current.get_resource_version(),
-                    |sandbox| {
-                        sandbox
-                            .status
-                            .as_mut()
-                            .expect("pending status")
-                            .image_update = None;
-                    },
-                )
-                .await
-            {
-                Ok(updated) => {
-                    self.sandbox_index.update_from_sandbox(&updated);
-                    self.sandbox_watch_bus.notify(updated.object_id());
-                    info!(sandbox_id = %updated.object_id(), operation_id = %intent.operation_id, "Sandbox workload image updated; sandbox remains stopped");
-                    return Ok(updated);
-                }
-                Err(crate::persistence::PersistenceError::Conflict { .. }) => {}
-                Err(error) => {
-                    return Err(crate::grpc::persistence_error_to_status(
-                        error,
-                        "complete sandbox image update",
-                    ));
-                }
-            }
-        }
-        Err(Status::aborted(
-            "sandbox changed while acknowledging image update; read and retry the pending image",
-        ))
+        // An ambiguous error NEVER clears either the private intent or the
+        // public operation interlock. Only exact successful reconciliation can.
+        let updated = self
+            .store
+            .complete_sandbox_image_update(pending.object_id(), &intent)
+            .await
+            .map_err(|error| {
+                crate::grpc::persistence_error_to_status(error, "complete sandbox image update")
+            })?;
+        self.sandbox_index.update_from_sandbox(&updated);
+        self.sandbox_watch_bus.notify(updated.object_id());
+        info!(sandbox_id = %updated.object_id(), operation_id = %intent.operation_id,
+            "Sandbox workload image updated; sandbox remains stopped");
+        Ok(updated)
     }
+
+    pub(super) async fn ensure_no_pending_image_update(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<(), Status> {
+        let state = self
+            .store
+            .get_sandbox_image_state(sandbox.object_id())
+            .await
+            .map_err(|_| Status::unavailable("cannot read private sandbox image state"))?;
+        if state.as_ref().is_some_and(|state| state.pending.is_some()) {
+            return Err(Status::failed_precondition(
+                "sandbox image update is pending; read the current resource version and retry UpdateSandbox with the same image before starting",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn ensure_image_update_interlock(
+    sandbox: &Sandbox,
+    intent: &SandboxImageUpdate,
+) -> Result<(), Status> {
+    if sandbox
+        .status
+        .as_ref()
+        .and_then(|status| status.provisioning.as_ref())
+        .is_none_or(|record| {
+            !record.driver_operation_pending || record.driver_operation_id != intent.operation_id
+        })
+    {
+        return Err(Status::aborted(
+            "sandbox image-update operation interlock changed",
+        ));
+    }
+    Ok(())
 }
 
 fn image_update_driver_request(
@@ -236,7 +230,6 @@ fn image_update_driver_request(
 }
 
 fn ensure_image_update_stopped(sandbox: &Sandbox) -> Result<(), Status> {
-    provisioning_operation::ensure_operation_settled(sandbox)?;
     if sandbox.phase() != SandboxPhase::Stopped as i32
         || sandbox
             .metadata
@@ -245,22 +238,6 @@ fn ensure_image_update_stopped(sandbox: &Sandbox) -> Result<(), Status> {
     {
         return Err(Status::failed_precondition(
             "sandbox must be Stopped before updating its image",
-        ));
-    }
-    Ok(())
-}
-
-/// Checked both before and after lifecycle locking by Start. A failed driver
-/// response does not prove it had no effects, so only a successful retry clears
-/// the durable intent. Ordinary stop and deletion never clear it.
-pub(super) fn ensure_no_pending_image_update(sandbox: &Sandbox) -> Result<(), Status> {
-    if sandbox
-        .status
-        .as_ref()
-        .is_some_and(|status| status.image_update.is_some())
-    {
-        return Err(Status::failed_precondition(
-            "sandbox image update is pending; read the current resource version and retry UpdateSandbox with the same image before starting",
         ));
     }
     Ok(())
@@ -300,6 +277,7 @@ mod tests {
         )
         .await
         .unwrap();
+        runtime.image_updates_enabled = true;
         if supported {
             runtime
                 .driver_info
@@ -380,8 +358,15 @@ mod tests {
             original.metadata.as_ref().unwrap().labels
         );
         assert_eq!(updated.phase(), SandboxPhase::Stopped as i32);
-        assert!(updated.status.as_ref().unwrap().image_update.is_none());
-        assert_eq!(updated.status.as_ref().unwrap().image_revision, 1);
+        let state = runtime
+            .store
+            .get_sandbox_image_state(updated.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(state.pending.is_none());
+        assert_eq!(state.revision, 1);
+        assert_eq!(updated.status, original.status);
         let calls = image_calls(&driver);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].expected_image, "example/workload:old");
@@ -416,7 +401,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(back.status.as_ref().unwrap().image_revision, 2);
+        assert_eq!(
+            runtime
+                .store
+                .get_sandbox_image_state(back.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            2
+        );
         assert_eq!(image_calls(&driver)[1].revision, 2);
     }
 
@@ -575,6 +569,13 @@ mod tests {
             )
             .await
             .unwrap();
+        let upgraded_revision = runtime
+            .store
+            .get_sandbox_image_state(upgraded.object_id())
+            .await
+            .unwrap()
+            .unwrap()
+            .revision;
         let starting = runtime
             .start_sandbox("default", original.object_name())
             .await
@@ -669,8 +670,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            corrected.status.as_ref().unwrap().image_revision,
-            upgraded.status.as_ref().unwrap().image_revision + 1
+            runtime
+                .store
+                .get_sandbox_image_state(corrected.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            upgraded_revision + 1
         );
         assert_eq!(corrected.object_id(), original.object_id());
         assert_eq!(
@@ -729,7 +736,16 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(pending.status.as_ref().unwrap().image_update.is_some());
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(pending.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+                .is_some()
+        );
         assert_eq!(
             runtime
                 .start_sandbox("default", original.object_name())
@@ -759,44 +775,336 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(complete.status.as_ref().unwrap().image_update.is_none());
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(complete.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+                .is_none()
+        );
         let calls = image_calls(&driver);
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], calls[1]);
     }
 
-    #[test]
-    fn image_update_intent_survives_driver_status_replacement() {
-        let intent = SandboxImageUpdate {
-            operation_id: "operation".into(),
-            previous_image: "old".into(),
-            image: "new".into(),
-            revision: 1,
-        };
+    #[tokio::test]
+    async fn image_update_intent_survives_driver_status_replacement() {
+        let (runtime, driver, original) = fixture(true).await;
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "example/workload:new".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let expected = runtime
+            .store
+            .get_sandbox_image_state(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut sandbox = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
         let grant_failure = Box::new(openshell_core::proto::TokenGrantFailureObservation {
             destination_host: "api.example.com".into(),
             ..Default::default()
         });
-        let mut sandbox = Sandbox::default();
-        sandbox.set_phase(SandboxPhase::Stopped as i32);
-        let status = sandbox.status.as_mut().unwrap();
-        status.image_update = Some(intent.clone());
-        status.image_revision = 1;
-        status.last_token_grant_failure = Some(grant_failure.clone());
+        sandbox.status.as_mut().unwrap().last_token_grant_failure = Some(grant_failure.clone());
         let incoming = DriverSandbox {
-            name: "test".into(),
+            id: original.object_id().into(),
+            name: original.object_name().into(),
             status: Some(DriverSandboxStatus::default()),
             ..Default::default()
         };
         apply_driver_snapshot(&mut sandbox, &incoming, false, false);
+        runtime.store.put_message(&sandbox).await.unwrap();
         assert_eq!(
-            sandbox.status.as_ref().unwrap().image_update.as_ref(),
-            Some(&intent)
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            expected
         );
-        assert_eq!(sandbox.status.as_ref().unwrap().image_revision, 1);
+        assert!(
+            sandbox
+                .status
+                .as_ref()
+                .unwrap()
+                .provisioning
+                .as_ref()
+                .unwrap()
+                .driver_operation_pending
+        );
         assert_eq!(
             sandbox.status.as_ref().unwrap().last_token_grant_failure,
             Some(grant_failure)
+        );
+        assert_eq!(
+            runtime
+                .start_sandbox("default", original.object_name())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+    }
+
+    #[tokio::test]
+    async fn image_update_activation_is_disabled_by_default_without_effects() {
+        let (mut runtime, driver, original) = fixture(true).await;
+        runtime.image_updates_enabled = false;
+        assert_eq!(
+            runtime
+                .update_sandbox_image(
+                    original.object_id(),
+                    "example/workload:new".into(),
+                    original.get_resource_version()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert!(
+            !driver
+                .calls()
+                .iter()
+                .any(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxImage { .. }))
+        );
+        assert_eq!(
+            runtime
+                .store
+                .get_message::<Sandbox>(original.object_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            original
+        );
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    // These are the relevant pre-feature wire fields: no image-update fields
+    // exist in public status. Older readers already understand provisioning.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyStatus014 {
+        #[prost(int32, tag = "6")]
+        phase: i32,
+        #[prost(message, optional, tag = "13")]
+        provisioning: Option<openshell_core::proto::SandboxProvisioning>,
+    }
+
+    #[tokio::test]
+    async fn legacy_status_roundtrip_cannot_erase_intent_or_bypass_lifecycle_interlock() {
+        use prost::Message;
+        let (runtime, driver, original) = fixture(true).await;
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "example/workload:new".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let private_before = runtime
+            .store
+            .get_sandbox_image_state(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut pending = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        let legacy =
+            LegacyStatus014::decode(pending.status.as_ref().unwrap().encode_to_vec().as_slice())
+                .unwrap();
+        assert!(
+            legacy
+                .provisioning
+                .as_ref()
+                .unwrap()
+                .driver_operation_pending
+        );
+        pending.status = Some(
+            openshell_core::proto::SandboxStatus::decode(legacy.encode_to_vec().as_slice())
+                .unwrap(),
+        );
+        runtime.store.put_message(&pending).await.unwrap();
+        let rewritten = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .unwrap(),
+            private_before
+        );
+        // This existing guard is also present in v0.1.4, unlike our private check.
+        assert_eq!(
+            provisioning_operation::ensure_operation_settled(&rewritten)
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            runtime
+                .start_sandbox("default", original.object_name())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            runtime
+                .stop_sandbox("default", original.object_name())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            runtime
+                .delete_sandbox("default", original.object_name())
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        runtime
+            .recover_persisted_lifecycle_transitions()
+            .await
+            .unwrap();
+        assert!(!driver.calls().iter().any(|call| matches!(
+            call,
+            FakeComputeDriverCall::StartSandbox { .. }
+                | FakeComputeDriverCall::StopSandbox { .. }
+                | FakeComputeDriverCall::DeleteSandbox { .. }
+        )));
+        driver.set_image_update_error(None);
+        let complete = runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "example/workload:new".into(),
+                rewritten.get_resource_version(),
+            )
+            .await
+            .unwrap();
+        assert!(provisioning_operation::ensure_operation_settled(&complete).is_ok());
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_legacy_start_cas_loses_to_atomic_image_acceptance() {
+        let (runtime, driver, original) = fixture(true).await;
+        // Model an old Start paused after reading Stopped but before its CAS.
+        driver.set_image_update_error(Some(Code::Unavailable));
+        runtime
+            .update_sandbox_image(
+                original.object_id(),
+                "example/workload:new".into(),
+                original.get_resource_version(),
+            )
+            .await
+            .unwrap_err();
+        let stale_start = runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                original.object_id(),
+                original.get_resource_version(),
+                |sandbox| sandbox.set_phase(SandboxPhase::Starting as i32),
+            )
+            .await;
+        assert!(matches!(
+            stale_start,
+            Err(crate::persistence::PersistenceError::Conflict { .. })
+        ));
+        let current = runtime
+            .store
+            .get_message::<Sandbox>(original.object_id())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(provisioning_operation::ensure_operation_settled(&current).is_err());
+        assert!(
+            !driver
+                .calls()
+                .iter()
+                .any(|call| matches!(call, FakeComputeDriverCall::StartSandbox { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn image_acceptance_loses_if_legacy_start_already_claimed_starting() {
+        let (runtime, driver, original) = fixture(true).await;
+        let starting = runtime
+            .store
+            .update_message_cas::<Sandbox, _>(
+                original.object_id(),
+                original.get_resource_version(),
+                |sandbox| sandbox.set_phase(SandboxPhase::Starting as i32),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .update_sandbox_image(
+                    original.object_id(),
+                    "example/workload:new".into(),
+                    starting.get_resource_version()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert!(
+            runtime
+                .store
+                .get_sandbox_image_state(original.object_id())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !driver
+                .calls()
+                .iter()
+                .any(|call| matches!(call, FakeComputeDriverCall::UpdateSandboxImage { .. }))
         );
     }
 }
