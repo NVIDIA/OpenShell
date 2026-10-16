@@ -32,7 +32,7 @@ usage() {
 Options:
   --agent NAME|PATH       Agent manifest directory or name under scripts/agents/
   --gateway NAME          Gateway name to use
-  --name NAME             Sandbox name
+  --name NAME             Sandbox name (DNS-1123 label, at most 19 characters)
   --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
   --harness NAME          Agent harness to run
   --github-provider NAME  Override the github-gator provider instance name
@@ -513,6 +513,10 @@ configure_provider_refresh() {
 
 GATEWAY="${GATEWAY_OVERRIDE:-${GATOR_GATEWAY:-$GATEWAY_DEFAULT}}"
 SANDBOX_NAME="${SANDBOX_NAME_OVERRIDE:-${GATOR_SANDBOX_NAME:-$SANDBOX_NAME_PREFIX-$(date +%Y%m%d%H%M%S)}}"
+# Match the gateway's MAX_ROUTABLE_NAME_LEN: workspace, sandbox, and service
+# segments must fit together in one DNS label. Check before any build or writes.
+[[ ${#SANDBOX_NAME} -le 19 ]] || fail "invalid sandbox name '$SANDBOX_NAME': maximum length is 19 characters"
+[[ "$SANDBOX_NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || fail "invalid sandbox name '$SANDBOX_NAME': expected a DNS-1123 label (lowercase letters, digits, internal hyphens)"
 SANDBOX_FROM="${SANDBOX_FROM_OVERRIDE:-${GATOR_SANDBOX_FROM:-$(resolve_manifest_path "$SANDBOX_FROM_DEFAULT")}}"
 RUN_MODE="${RUN_MODE_OVERRIDE:-$RUNTIME_MODE}"
 POLL_INTERVAL_SECONDS="${POLL_INTERVAL_OVERRIDE:-$RUNTIME_POLL_INTERVAL_SECONDS}"
