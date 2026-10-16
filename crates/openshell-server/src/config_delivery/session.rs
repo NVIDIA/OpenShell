@@ -15,7 +15,7 @@ use metrics::{counter, histogram};
 use openshell_core::proto::{
     ConfigApplyOutcome, ConfigUpdate, ConfigUpdateResult, GatewayMessage, PolicyLoadResult,
     PolicySource, Sandbox, SandboxConfigRevision, SandboxConfigSnapshot,
-    SandboxConfigurationAdmission, gateway_message,
+    SandboxConfigurationAdmission, SessionAccepted, gateway_message,
 };
 use prost::Message;
 use tokio::sync::mpsc;
@@ -153,7 +153,12 @@ impl ConfigSessionState {
     }
 
     fn send(&mut self, config: SupervisorConfig) -> Result<Outgoing, DeliveryDisposition> {
-        let (update, in_flight) = build_config_update(config, false);
+        let (update, in_flight) = build_config_update(config, false, |update| {
+            GatewayMessage {
+                payload: Some(gateway_message::Payload::ConfigUpdate(update.clone())),
+            }
+            .encoded_len()
+        });
         let message = GatewayMessage {
             payload: Some(gateway_message::Payload::ConfigUpdate(update)),
         };
@@ -384,27 +389,58 @@ impl SupervisorSessionRegistry {
 fn build_config_update(
     config: SupervisorConfig,
     bootstrap: bool,
+    message_size: impl Fn(&ConfigUpdate) -> usize,
 ) -> (ConfigUpdate, InFlightConfigUpdate) {
     let update_id = Uuid::new_v4().to_string();
-    let in_flight = InFlightConfigUpdate {
+    let mut update = ConfigUpdate {
         update_id: update_id.clone(),
-        fingerprint: ConfigFingerprint::of(&config.sandbox_config),
-        admission: expected_configuration_admission(&config.sandbox_config),
-        bootstrap,
-        sent_at: Instant::now(),
-    };
-    let update = ConfigUpdate {
-        update_id,
         sandbox_config: Some(config.sandbox_config),
         provider_environment: Some(config.provider_environment),
+    };
+    let size = message_size(&update);
+    if size > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
+        let snapshot = update
+            .sandbox_config
+            .as_mut()
+            .expect("sandbox configuration");
+        snapshot.policy = None;
+        snapshot.settings.clear();
+        snapshot.supervisor_middleware_services.clear();
+        snapshot.configuration_admitted = false;
+        snapshot.configuration_error = format!(
+            "configuration_too_large: encoded configuration is {size} bytes; maximum is {MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES} bytes"
+        );
+        update.provider_environment = Some(super::unresolved_provider_environment(snapshot));
+    }
+    let snapshot = update
+        .sandbox_config
+        .as_ref()
+        .expect("sandbox configuration");
+    let in_flight = InFlightConfigUpdate {
+        update_id,
+        fingerprint: ConfigFingerprint::of(snapshot),
+        admission: expected_configuration_admission(snapshot),
+        bootstrap,
+        sent_at: Instant::now(),
     };
     (update, in_flight)
 }
 
 /// The update a session is accepted with, and its in-flight state for
 /// [`SupervisorSessionRegistry::begin_config_bootstrap`].
-pub fn bootstrap_update(config: SupervisorConfig) -> (ConfigUpdate, BootstrapInFlight) {
-    let (update, in_flight) = build_config_update(config, true);
+pub fn bootstrap_update(
+    config: SupervisorConfig,
+    accepted: &SessionAccepted,
+) -> (ConfigUpdate, BootstrapInFlight) {
+    let (update, in_flight) = build_config_update(config, true, |update| {
+        GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                bootstrap: Some(update.clone()),
+                ..accepted.clone()
+            })),
+        }
+        .encoded_len()
+    });
     (update, BootstrapInFlight(in_flight))
 }
 
@@ -1039,34 +1075,182 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn config_delivery_rejects_oversized_messages() {
-        let registry = SupervisorSessionRegistry::new();
-        let (tx, mut outbound) =
-            register_apply_session_with_outbound(&registry, "sb-1", "session-1");
+    fn oversized_config() -> SupervisorConfig {
+        let mut config = admitted_config();
+        config.sandbox_config.policy = Some(SandboxPolicy::default());
+        config.sandbox_config.version = 3;
+        config.sandbox_config.policy_hash = "policy-hash".into();
+        config.sandbox_config.provider_attachment_epoch = "attachment-1".into();
+        config.sandbox_config.policy_validation_failure_mode = "retain_last_valid".into();
+        config.provider_environment.values = vec![ProviderEnvironmentValue {
+            name: "TOKEN".into(),
+            value: "secret".repeat(MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES / 6 + 1),
+            ..Default::default()
+        }];
+        config
+    }
 
-        let mut oversized = config(1);
-        oversized.provider_environment.values = vec![ProviderEnvironmentValue {
+    fn assert_oversized_rejection(update: &ConfigUpdate, original: &SandboxConfigSnapshot) {
+        let rejected = update.sandbox_config.as_ref().unwrap();
+        assert_eq!(
+            ConfigFingerprint::of(rejected),
+            ConfigFingerprint::of(original)
+        );
+        assert_eq!(
+            rejected.configuration_instance_id,
+            original.configuration_instance_id
+        );
+        assert_eq!(
+            rejected.policy_validation_failure_mode,
+            original.policy_validation_failure_mode
+        );
+        assert!(!rejected.configuration_admitted);
+        assert!(
+            rejected
+                .configuration_error
+                .starts_with("configuration_too_large:")
+        );
+        assert!(rejected.configuration_error.len() < 200);
+        assert!(rejected.policy.is_none());
+        assert!(rejected.settings.is_empty());
+        assert!(rejected.supervisor_middleware_services.is_empty());
+        assert_eq!(
+            update.provider_environment.as_ref().unwrap(),
+            &super::super::unresolved_provider_environment(rejected)
+        );
+        assert!(update.encoded_len() < 1024);
+        assert!(!String::from_utf8_lossy(&update.encode_to_vec()).contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn oversized_live_and_pending_updates_deliver_rejections_and_recover() {
+        for pending in [false, true] {
+            let registry = SupervisorSessionRegistry::new();
+            let (_tx, mut outbound) =
+                register_apply_session_with_outbound(&registry, "sb-1", "session-1");
+            let first = pending.then(|| {
+                assert_eq!(
+                    registry.deliver_config("sb-1", "session-1", config(1)),
+                    DeliveryDisposition::Queued
+                );
+                sent_update(outbound.try_recv().unwrap())
+            });
+            let oversized = oversized_config();
+            let original = oversized.sandbox_config.clone();
+            assert_eq!(
+                registry.deliver_config("sb-1", "session-1", oversized),
+                if pending {
+                    DeliveryDisposition::Coalesced
+                } else {
+                    DeliveryDisposition::Queued
+                }
+            );
+            if let Some(first) = first {
+                answer_bootstrap(
+                    &registry,
+                    "sb-1",
+                    "session-1",
+                    &first,
+                    ConfigApplyOutcome::Applied,
+                );
+            }
+            let rejection = sent_update(outbound.recv().await.unwrap());
+            assert_oversized_rejection(&rejection, &original);
+            let completed = registry
+                .complete_config_update(
+                    "sb-1",
+                    "session-1",
+                    &update_result(&rejection, ConfigApplyOutcome::FailedRetainedLastKnownGood),
+                )
+                .unwrap();
+            assert_eq!(
+                completed.admission.state,
+                i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
+            );
+            assert!(
+                validate_configuration_admission(
+                    Some(&completed.admission),
+                    &completed.admission,
+                    completed.outcome
+                )
+                .is_ok()
+            );
+            registry.finalize_config_update("sb-1", "session-1", &completed, true);
+            let recovery = SupervisorConfig {
+                sandbox_config: SandboxConfigSnapshot {
+                    configuration_admitted: true,
+                    ..original
+                },
+                provider_environment: ProviderEnvironmentSnapshot::default(),
+            };
+            assert_eq!(
+                registry.deliver_config("sb-1", "session-1", recovery),
+                DeliveryDisposition::Queued
+            );
+            let recovered = sent_update(outbound.recv().await.unwrap());
+            assert!(recovered.sandbox_config.unwrap().configuration_admitted);
+        }
+    }
+
+    #[test]
+    fn oversized_bootstrap_delivers_rejection_with_original_identity() {
+        let config = oversized_config();
+        let original = config.sandbox_config.clone();
+        let acceptance = SessionAccepted {
+            session_id: "session-1".into(),
+            config_push_enabled: true,
+            ..Default::default()
+        };
+        let (update, in_flight) = bootstrap_update(config, &acceptance);
+        assert_oversized_rejection(&update, &original);
+        assert_eq!(
+            in_flight.0.admission.state,
+            i32::from(openshell_core::proto::ConfigurationAdmissionState::Rejected)
+        );
+        let message = GatewayMessage {
+            payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
+                bootstrap: Some(update),
+                ..acceptance
+            })),
+        };
+        assert!(message.encoded_len() <= MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn bootstrap_size_limit_includes_the_session_envelope() {
+        let mut config = admitted_config();
+        config.provider_environment.values = vec![ProviderEnvironmentValue {
             name: "TOKEN".into(),
             value: "x".repeat(MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES),
             ..Default::default()
         }];
-        assert_eq!(
-            registry.deliver_config("sb-1", "session-1", oversized),
-            DeliveryDisposition::PayloadTooLarge
-        );
-        assert_eq!(
-            registry.deliver_config("sb-1", "session-1", config(2)),
-            DeliveryDisposition::Queued,
-            "an oversized configuration is not left in flight"
-        );
-        drop(tx);
-        registry.remove_if_current("sb-1", "session-1");
-        assert_eq!(
-            config_revision(&sent_update(outbound.recv().await.unwrap())),
-            2
-        );
-        assert!(outbound.recv().await.is_none());
+        let raw = ConfigUpdate {
+            update_id: Uuid::new_v4().to_string(),
+            sandbox_config: Some(config.sandbox_config.clone()),
+            provider_environment: Some(config.provider_environment.clone()),
+        };
+        let overhead = GatewayMessage {
+            payload: Some(gateway_message::Payload::ConfigUpdate(raw)),
+        }
+        .encoded_len()
+            - MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES;
+        config.provider_environment.values[0]
+            .value
+            .truncate(MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES - overhead);
+        let (live, _) = build_config_update(config.clone(), false, |update| {
+            GatewayMessage {
+                payload: Some(gateway_message::Payload::ConfigUpdate(update.clone())),
+            }
+            .encoded_len()
+        });
+        assert!(live.sandbox_config.unwrap().configuration_admitted);
+        let acceptance = SessionAccepted {
+            session_id: Uuid::new_v4().to_string(),
+            config_push_enabled: true,
+            ..Default::default()
+        };
+        let (bootstrap, _) = bootstrap_update(config, &acceptance);
+        assert!(!bootstrap.sandbox_config.unwrap().configuration_admitted);
     }
 
     /// Register a streamed-apply session and return its outbound channel.
@@ -1119,7 +1303,7 @@ mod tests {
         bootstrap: SupervisorConfig,
     ) -> (mpsc::Receiver<GatewayMessage>, ConfigUpdate) {
         let slots = register_apply_session(registry, sandbox_id, session_id);
-        let (update, in_flight) = bootstrap_update(bootstrap);
+        let (update, in_flight) = bootstrap_update(bootstrap, &SessionAccepted::default());
         registry.begin_config_bootstrap(sandbox_id, session_id, in_flight, None);
         (slots, update)
     }
@@ -1760,7 +1944,8 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         // write could change the sandbox record.
         let (tx, _rx) = mpsc::channel(4);
         register_running_push_session(&state, sandbox_id, &tx);
-        let (bootstrap, in_flight) = bootstrap_update(sandbox_policy_config());
+        let (bootstrap, in_flight) =
+            bootstrap_update(sandbox_policy_config(), &SessionAccepted::default());
         state.supervisor_sessions.begin_config_bootstrap(
             sandbox_id,
             "session-1",
@@ -1929,7 +2114,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
         sandbox_id: &str,
         config: SupervisorConfig,
     ) -> ConfigUpdate {
-        let (update, in_flight) = bootstrap_update(config);
+        let (update, in_flight) = bootstrap_update(config, &SessionAccepted::default());
         state
             .supervisor_sessions
             .begin_config_bootstrap(sandbox_id, "session-1", in_flight, None);
@@ -1988,7 +2173,7 @@ BEGIN SELECT RAISE(ABORT, 'database unavailable'); END;
 
         // The reconnect starts from the stored admission and reports it again.
         let (tx, _rx) = register_apply_session_in_state(&state, sandbox_id);
-        let (update, in_flight) = bootstrap_update(config);
+        let (update, in_flight) = bootstrap_update(config, &SessionAccepted::default());
         state.supervisor_sessions.begin_config_bootstrap(
             sandbox_id,
             "session-1",

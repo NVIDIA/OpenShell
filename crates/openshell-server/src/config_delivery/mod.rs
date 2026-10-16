@@ -1751,4 +1751,210 @@ mod tests {
         assert!(!provider.values.is_empty());
         assert_eq!(record.provider_environment(), Some(provider));
     }
+
+    async fn state_with_large_provider_environment(provider_count: usize) -> Arc<ServerState> {
+        use crate::grpc::test_support::authed_request;
+        use openshell_core::proto::CreateProviderRequest;
+        use openshell_core::proto::open_shell_server::OpenShell as _;
+
+        let mut state = push_state().await;
+        let profiles = (0..provider_count)
+            .map(|index| {
+                let mut profile = openshell_providers::example_profiles::load("github").to_proto();
+                profile.id = format!("large-provider-{index}");
+                profile.credentials[0].env_vars = (0..32)
+                    .map(|key| format!("PROVIDER_{index}_TOKEN_{key}"))
+                    .collect();
+                profile
+            })
+            .collect();
+        Arc::get_mut(&mut state).unwrap().provider_profile_sources =
+            crate::provider_profile_sources::ProviderProfileSources::from_test_profiles(profiles);
+        let service = crate::grpc::OpenShellService::new(Arc::clone(&state));
+        let mut providers = Vec::new();
+        for index in 0..provider_count {
+            let name = format!("large-provider-{index}");
+            service
+                .create_provider(authed_request(CreateProviderRequest {
+                    workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                    provider: Some(Provider {
+                        metadata: Some(ObjectMeta {
+                            name: name.clone(),
+                            ..Default::default()
+                        }),
+                        r#type: name.clone(),
+                        credentials: (0..32)
+                            .map(|key| (format!("PROVIDER_{index}_TOKEN_{key}"), "x".repeat(8192)))
+                            .collect(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }))
+                .await
+                .expect("provider credentials within public limits are accepted");
+            providers.push(name);
+        }
+        let provider_names = providers.iter().map(String::as_str).collect::<Vec<_>>();
+        put_sandbox(&state, "large-config", &provider_names).await;
+        change_policy(&state, "large-config", 1).await;
+
+        state
+    }
+
+    #[tokio::test]
+    async fn large_configuration_reaches_supervisor_on_bootstrap_and_live_update() {
+        use prost::Message as _;
+
+        let state = state_with_large_provider_environment(17).await;
+        let (mut harness, _, bootstrap) =
+            accepted_session_with_bootstrap(&state, "large-config").await;
+        let bootstrap = bootstrap.expect("push bootstrap");
+        assert!(bootstrap.encoded_len() > 4 * 1024 * 1024);
+        assert!(bootstrap.encoded_len() <= MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES);
+        assert_eq!(
+            bootstrap.provider_environment.unwrap().values.len(),
+            17 * 32
+        );
+
+        change_policy(&state, "large-config", 2).await;
+        publish_sandbox(&state, "large-config");
+        let message = next_update(&mut harness, Duration::from_secs(5))
+            .await
+            .expect("large live configuration reaches the supervisor");
+        assert!(message.encoded_len() > 4 * 1024 * 1024);
+        assert!(message.encoded_len() <= MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES);
+        let update = sent_config(&message);
+        assert_eq!(update.sandbox_config.unwrap().version, 2);
+        assert_eq!(update.provider_environment.unwrap().values.len(), 17 * 32);
+    }
+
+    #[tokio::test]
+    async fn oversized_configuration_is_rejected_over_grpc_and_smaller_configuration_recovers() {
+        use openshell_core::proto::{
+            ConfigApplyOutcome, ConfigUpdate, ConfigUpdateResult, ConfigurationAdmissionState,
+            SandboxConfigurationAdmission, SupervisorMessage, supervisor_message,
+        };
+        use prost::Message as _;
+
+        let state = state_with_large_provider_environment(32).await;
+        let mut harness = connect_supervisor_stream(&state, "large-config", StreamFeatures::Apply)
+            .await
+            .unwrap();
+        let first = harness.inbound.message().await.unwrap().unwrap();
+        assert!(first.encoded_len() < 1024);
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) = first.payload else {
+            panic!("expected accepted session with explicit rejection");
+        };
+        let bootstrap = accepted.bootstrap.unwrap();
+        let report_rejection = |update: &ConfigUpdate| {
+            let snapshot = update.sandbox_config.as_ref().unwrap();
+            assert!(!snapshot.configuration_admitted);
+            assert!(
+                snapshot
+                    .configuration_error
+                    .starts_with("configuration_too_large:")
+            );
+            assert!(snapshot.policy.is_none());
+            let provider = update.provider_environment.as_ref().unwrap();
+            assert!(provider.values.is_empty());
+            assert!(provider.dynamic_credentials.is_empty());
+            assert!(provider.files.is_empty());
+            SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                    ConfigUpdateResult {
+                        update_id: update.update_id.clone(),
+                        outcome: ConfigApplyOutcome::FailedClosed.into(),
+                        admission: Some(SandboxConfigurationAdmission {
+                            instance_id: snapshot.configuration_instance_id.clone(),
+                            state: ConfigurationAdmissionState::Rejected.into(),
+                            policy_version: snapshot.version,
+                            policy_hash: snapshot.policy_hash.clone(),
+                            config_revision: snapshot.config_revision,
+                            provider_env_revision: snapshot.provider_env_revision,
+                            error: snapshot.configuration_error.clone(),
+                        }),
+                        ..Default::default()
+                    },
+                )),
+            }
+        };
+        harness
+            .outbound
+            .send(report_rejection(&bootstrap))
+            .await
+            .unwrap();
+        let expected = bootstrap.sandbox_config.as_ref().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stored = state
+                    .store
+                    .get_message::<Sandbox>("large-config")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let Some(admission) = stored
+                    .status
+                    .and_then(|status| status.configuration_admission)
+                    && admission.state == i32::from(ConfigurationAdmissionState::Rejected)
+                {
+                    assert_eq!(admission.config_revision, expected.config_revision);
+                    assert_eq!(
+                        admission.provider_env_revision,
+                        expected.provider_env_revision
+                    );
+                    assert_eq!(admission.error, expected.configuration_error);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("gateway persists explicit bootstrap rejection");
+
+        change_policy(&state, "large-config", 2).await;
+        publish_sandbox(&state, "large-config");
+        let live = sent_config(
+            &next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("oversized live update produces explicit rejection"),
+        );
+        assert_eq!(live.sandbox_config.as_ref().unwrap().version, 2);
+        harness
+            .outbound
+            .send(report_rejection(&live))
+            .await
+            .unwrap();
+
+        let mut sandbox = state
+            .store
+            .get_message::<Sandbox>("large-config")
+            .await
+            .unwrap()
+            .unwrap();
+        sandbox.spec.as_mut().unwrap().providers.truncate(16);
+        state.store.put_message(&sandbox).await.unwrap();
+        change_policy(&state, "large-config", 3).await;
+        publish_sandbox(&state, "large-config");
+        let recovery = sent_config(
+            &next_update(&mut harness, Duration::from_secs(5))
+                .await
+                .expect("smaller update recovers on the same stream"),
+        );
+        let snapshot = recovery.sandbox_config.as_ref().unwrap();
+        assert!(snapshot.configuration_admitted);
+        assert_eq!(snapshot.version, 3);
+        assert_eq!(
+            recovery.provider_environment.as_ref().unwrap().values.len(),
+            16 * 32
+        );
+        harness
+            .outbound
+            .send(SupervisorMessage {
+                payload: Some(supervisor_message::Payload::ConfigUpdateResult(
+                    session::applied_result(&recovery),
+                )),
+            })
+            .await
+            .unwrap();
+    }
 }

@@ -923,6 +923,18 @@ impl ConfigRuntime {
         let requested_revision = sandbox_config_revision(&snapshot);
         let desired_environment = EnvironmentIdentity::from_settings(&snapshot);
         let provider = if !snapshot.configuration_admitted {
+            if !self.reloads_gateway_policy {
+                return DeliveredResult {
+                    outcome: ConfigApplyOutcome::FailedRetainedLastKnownGood,
+                    failure: Some(config_apply_failure(
+                        "configuration_rejected",
+                        &snapshot.configuration_error,
+                        true,
+                    )),
+                    admission: config_admission(&snapshot, false),
+                    policy_load: None,
+                };
+            }
             if self.reloads_gateway_policy
                 && let Some(rejected) = self.stream.rejected_sandbox.as_ref()
                 && rejected.matches(&snapshot, &requested_revision, &desired_environment)
@@ -1028,7 +1040,11 @@ impl ConfigRuntime {
         let outcome = match retained_revision.as_ref() {
             // The requested configuration is still the enforced one, so only
             // its runtime upgrade failed.
-            Some(retained) if *retained == requested_revision && !consumes_provider => {
+            Some(retained)
+                if *retained == requested_revision
+                    && !consumes_provider
+                    && snapshot.configuration_admitted =>
+            {
                 ConfigApplyOutcome::Degraded
             }
             Some(_) => ConfigApplyOutcome::FailedRetainedLastKnownGood,
@@ -3792,6 +3808,138 @@ mod tests {
         );
         assert_eq!(runtime.config_revision, initial.config_revision);
         assert_eq!(result.policy_load, None);
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_rejection_obeys_failure_posture_and_recovers() {
+        use openshell_core::proto::{
+            ConfigApplyOutcome, ConfigurationAdmissionState, PolicySource,
+            ProviderEnvironmentSnapshot,
+        };
+
+        for mode in [
+            PolicyValidationFailureMode::FailClosed,
+            PolicyValidationFailureMode::RetainLastValid,
+        ] {
+            for has_last_valid in [false, true] {
+                let initial =
+                    settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+                let mut rejected = initial.clone();
+                rejected.policy = None;
+                rejected.settings.clear();
+                rejected.configuration_admitted = false;
+                rejected.configuration_error =
+                    "configuration_too_large: encoded configuration exceeds 8388608 bytes".into();
+                rejected.policy_validation_failure_mode = mode;
+                let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+                let ctx = policy_poll_test_context(
+                    Arc::clone(&engine),
+                    LoadedPolicyOrigin::Gateway {
+                        revision: has_last_valid
+                            .then(|| LoadedPolicyRevision::from_snapshot(&initial)),
+                        has_last_valid_policy: has_last_valid,
+                    },
+                    default_middleware_connector(),
+                );
+                let (client, _polls, _reports) = scripted_policy_gateway();
+                let mut runtime = if has_last_valid {
+                    started_runtime(&ctx, &initial)
+                } else {
+                    ConfigRuntime::new(&ctx)
+                };
+                let expected =
+                    if has_last_valid && mode == PolicyValidationFailureMode::RetainLastValid {
+                        ConfigApplyOutcome::FailedRetainedLastKnownGood
+                    } else {
+                        ConfigApplyOutcome::FailedClosed
+                    };
+                let result = runtime
+                    .apply_delivered_sandbox(
+                        &ctx,
+                        &client,
+                        rejected.clone(),
+                        ProviderEnvironmentSnapshot::default(),
+                    )
+                    .await;
+                assert_eq!(result.outcome, expected);
+                assert_eq!(
+                    result.admission.state,
+                    i32::from(ConfigurationAdmissionState::Rejected)
+                );
+                assert_eq!(result.admission.config_revision, initial.config_revision);
+                assert_eq!(
+                    engine.fail_closed_reason().is_some(),
+                    expected == ConfigApplyOutcome::FailedClosed
+                );
+                let generation = engine.current_generation();
+                let duplicate = runtime
+                    .apply_delivered_sandbox(
+                        &ctx,
+                        &client,
+                        rejected,
+                        ProviderEnvironmentSnapshot::default(),
+                    )
+                    .await;
+                assert_eq!(duplicate.outcome, expected);
+                assert_eq!(engine.current_generation(), generation);
+                let restored = apply_with_provider(&mut runtime, &ctx, &client, &initial).await;
+                assert_eq!(
+                    restored.admission.state,
+                    i32::from(ConfigurationAdmissionState::Accepted)
+                );
+                assert!(engine.fail_closed_reason().is_none());
+                assert_eq!(
+                    runtime.applied_revision,
+                    Some(sandbox_config_revision(&initial))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_rejection_preserves_local_policy_and_settings() {
+        use openshell_core::proto::{
+            ConfigApplyOutcome, ConfigurationAdmissionState, PolicySource,
+            ProviderEnvironmentSnapshot,
+        };
+
+        let mut initial =
+            settings_poll_result(Some(proto_policy_fixture()), 1, PolicySource::Sandbox);
+        initial
+            .settings
+            .insert("ocsf_json_enabled".into(), effective_bool(true));
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let ctx = policy_poll_test_context(
+            Arc::clone(&engine),
+            LoadedPolicyOrigin::LocalOverride,
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+        let generation = engine.current_generation();
+        let mut rejected = initial.clone();
+        rejected.policy = None;
+        rejected.settings.clear();
+        rejected.configuration_admitted = false;
+        rejected.configuration_error = "configuration_too_large".into();
+        let result = runtime
+            .apply_delivered_sandbox(
+                &ctx,
+                &client,
+                rejected,
+                ProviderEnvironmentSnapshot::default(),
+            )
+            .await;
+        assert_eq!(
+            result.outcome,
+            ConfigApplyOutcome::FailedRetainedLastKnownGood
+        );
+        assert_eq!(
+            result.admission.state,
+            i32::from(ConfigurationAdmissionState::Rejected)
+        );
+        assert_eq!(engine.current_generation(), generation);
+        assert_eq!(runtime.settings, initial.settings);
     }
 
     #[tokio::test]

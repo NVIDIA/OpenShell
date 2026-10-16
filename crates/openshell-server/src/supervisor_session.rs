@@ -2200,8 +2200,20 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     let bootstrap_provider_environment = bootstrap
         .as_ref()
         .map(|bootstrap| bootstrap.provider_environment.clone());
-    let (bootstrap, bootstrap_in_flight) = bootstrap.map(config_session::bootstrap_update).unzip();
     let session_id = Uuid::new_v4().to_string();
+    let mut acceptance = SessionAccepted {
+        session_id: session_id.clone(),
+        config_push_enabled: pushes_config,
+        heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
+            u64::from(HEARTBEAT_INTERVAL_SECS),
+        ))
+        .ok(),
+        ..Default::default()
+    };
+    let (bootstrap, bootstrap_in_flight) = bootstrap
+        .map(|config| config_session::bootstrap_update(config, &acceptance))
+        .unzip();
+    acceptance.bootstrap = bootstrap;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     // Keep the session unroutable to the response stream until every fallible
     // acceptance step completes. Registry traffic can safely queue here while
@@ -2209,15 +2221,7 @@ async fn accept_supervisor_session(setup: SessionSetup) -> Result<(), Status> {
     // after SessionAccepted has been queued on the public stream.
     let (session_tx, mut session_rx) = mpsc::channel::<GatewayMessage>(64);
     let accepted = GatewayMessage {
-        payload: Some(gateway_message::Payload::SessionAccepted(SessionAccepted {
-            session_id: session_id.clone(),
-            bootstrap,
-            config_push_enabled: pushes_config,
-            heartbeat_interval: openshell_core::time::duration_from_std(Duration::from_secs(
-                u64::from(HEARTBEAT_INTERVAL_SECS),
-            ))
-            .ok(),
-        })),
+        payload: Some(gateway_message::Payload::SessionAccepted(acceptance)),
     };
     if accepted.encoded_len() > MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES {
         counter!(

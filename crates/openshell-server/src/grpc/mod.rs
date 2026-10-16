@@ -1073,7 +1073,10 @@ pub mod test_support {
         );
         let mut client = OpenShellClient::connect(format!("http://{address}"))
             .await
-            .unwrap();
+            .unwrap()
+            .max_decoding_message_size(
+                openshell_core::grpc_client::MAX_SUPERVISOR_STREAM_MESSAGE_BYTES,
+            );
         let (outbound, rx) = mpsc::channel(4);
         outbound
             .send(SupervisorMessage {
