@@ -1472,6 +1472,10 @@ enum SandboxCommands {
         /// Outside a Git work tree, uploads proceed unfiltered with a warning.
         /// Filtering errors or empty selections stop the upload; use
         /// `--no-git-ignore` to intentionally upload everything.
+        ///
+        /// Cannot be combined with a trailing command, because uploads finish
+        /// after the main process starts. Create the sandbox without a command,
+        /// then run the workload with `sandbox exec`.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -4876,6 +4880,35 @@ mod tests {
             "sandbox create with no --upload should succeed, got: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn sandbox_create_upload_conflicts_with_command_and_help_says_so() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "true",
+        ])
+        .expect_err("--upload with a trailing command should be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let cmd = Cli::command();
+        let create = cmd
+            .find_subcommand("sandbox")
+            .and_then(|c| c.find_subcommand("create"))
+            .expect("missing sandbox create subcommand");
+        let help = create
+            .get_arguments()
+            .find(|a| a.get_id() == "upload")
+            .and_then(|a| a.get_long_help())
+            .expect("--upload has long help")
+            .to_string();
+        assert!(help.contains("Cannot be combined with a trailing command"));
+        assert!(help.contains("sandbox exec"));
     }
 
     #[test]
