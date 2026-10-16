@@ -33,7 +33,7 @@ they continue to exercise the dev Debian package. Kubernetes pins the matching
 `0.0.0-dev` chart and `:dev` images.
 
 RPM package installation also has tmachine conformance coverage in
-`Branch E2E Checks` (with `test:e2e`), `Release Dev`, and `Release Tag`. Those
+`Branch E2E Checks` (with `test:e2e`), `Release Dev`, `Release`, and `Pre-release`. Those
 lanes use the `rpm` installer on `fedora-podman-rootful` and
 `fedora-podman-rootless` with candidate CLI and
 gateway RPMs and matching runtime images. Branch RPM package builds run on

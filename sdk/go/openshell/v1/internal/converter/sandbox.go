@@ -122,7 +122,15 @@ func sandboxStatusFromProto(status *pb.SandboxStatus) types.SandboxStatus {
 			Path:           endpoint.GetPath(),
 			LastResult:     endpointResultFromProto(endpoint.GetLastResult()),
 			LastReportedAt: TimestampStringFromProto(endpoint.GetLastReportedTime()),
+			LastFailure:    endpointFailureFromProto(endpoint.GetLastFailure()),
 		})
+	}
+	if observation := status.GetLastTokenGrantFailure(); observation != nil {
+		result.LastTokenGrantFailure = &types.TokenGrantFailureObservation{
+			DestinationHost: observation.GetDestinationHost(),
+			DestinationPort: observation.GetDestinationPort(),
+			Failure:         endpointFailureFromProto(observation.GetFailure()),
+		}
 	}
 	result.ExitCode = CopyInt32Ptr(status.ExitCode)
 	if admission := status.GetConfigurationAdmission(); admission != nil {
@@ -170,6 +178,32 @@ func endpointResultFromProto(result pb.EndpointResult) types.EndpointResult {
 	default:
 		// Unknown wire values must not imply an observation or a successful call.
 		return types.EndpointUnspecified
+	}
+}
+
+func endpointFailureFromProto(failure *pb.EndpointFailure) *types.EndpointFailure {
+	if failure == nil {
+		return nil
+	}
+	return &types.EndpointFailure{
+		Domain:             endpointFailureDomainFromProto(failure.GetDomain()),
+		Code:               failure.GetCode(),
+		RecoveryAction:     RefreshRecoveryActionFromProto(failure.GetRecoveryAction()),
+		Provider:           failure.GetProvider(),
+		CredentialKey:      failure.GetCredentialKey(),
+		Stage:              failure.GetStage(),
+		UpstreamHTTPStatus: CopyUint32Ptr(failure.UpstreamHttpStatus),
+		RequestID:          failure.GetRequestId(),
+	}
+}
+
+func endpointFailureDomainFromProto(domain pb.EndpointFailureDomain) types.EndpointFailureDomain {
+	switch domain {
+	case pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT:
+		return types.EndpointFailureDomainTokenGrant
+	default:
+		// Unknown wire values must not select a closed code set.
+		return types.EndpointFailureDomainUnspecified
 	}
 }
 

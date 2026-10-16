@@ -20,7 +20,8 @@ pub(super) use endpoint_status::{
     handle_peer_report_endpoint_status, handle_report_endpoint_status,
 };
 pub use endpoint_status::{
-    invalidate_endpoint_status_on_startup, reset_endpoint_status_for_supervisor_session,
+    invalidate_endpoint_status_on_startup, invalidate_endpoint_status_without_session,
+    reset_endpoint_status_for_supervisor_session,
     retry_endpoint_status_after_supervisor_disconnect,
 };
 
@@ -5017,10 +5018,9 @@ pub(super) async fn handle_report_policy_status(
                 |sandbox| {
                     sandbox.set_current_policy_version(version_to_set);
                     if let Some(endpoints) = &endpoint_reset {
-                        endpoint_status::reconcile_endpoint_statuses(
+                        endpoint_status::reset_endpoint_statuses(
                             sandbox,
                             endpoints,
-                            &HashSet::new(),
                             &prost_types::Timestamp::default(),
                         );
                     }

@@ -744,7 +744,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveAllDraftChunksRequest>,
     ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        Box::pin(mutation_replay::run(&self.state, request)).await
     }
 
     async fn edit_draft_chunk(

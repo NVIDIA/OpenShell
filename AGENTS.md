@@ -27,8 +27,8 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
-| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
-| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
+| `crates/openshell-isolation-interface/` | Isolation backend interface | Shared data and validation for the Isolation Backend RPC contracts |
+| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
@@ -226,7 +226,7 @@ When behavior, commands, or development workflows change, review the related age
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
 ## Terminology

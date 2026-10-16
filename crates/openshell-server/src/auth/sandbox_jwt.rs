@@ -11,7 +11,8 @@
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
 
-use super::authenticator::{Authenticator, bearer_credential};
+use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -21,6 +22,7 @@ pub use openshell_extension_core::{
     MAX_EXTENSION_TOKEN_TTL,
 };
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use std::{
     io::Cursor,
     sync::Arc,
@@ -33,8 +35,9 @@ use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::Subject
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
     AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
-    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtIssuer, SessionJwtVerifier,
-    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SystemJwtClock,
+    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
+    SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
+    SystemJwtClock,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
 
@@ -196,6 +199,20 @@ impl SandboxSessionJwtAuthority {
         gateway_token_id: uuid::Uuid,
         token_metadata: Option<(uuid::Uuid, i64)>,
     ) -> Result<SandboxLaunchAuthentication, Status> {
+        // Derive the session from durable launch identity, not token IDs or
+        // minting time. Retries and credential renewal retain this session;
+        // a fresh generation gets a different one without new stored metadata.
+        let mut digest = Sha256::new();
+        digest.update(b"openshell-launch-session-v1\0");
+        digest.update(sandbox_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(runtime_generation.as_str().as_bytes());
+        let mut session_bytes = [0_u8; 16];
+        session_bytes.copy_from_slice(&digest.finalize()[..16]);
+        let session_id = uuid::Uuid::from_bytes(session_bytes)
+            .to_string()
+            .parse::<SandboxSessionId>()
+            .map_err(|_| Status::internal("invalid derived sandbox session identity"))?;
         let identity = SandboxRuntimeIdentity {
             sandbox_id: SandboxId::parse(sandbox_id)
                 .map_err(|_| Status::invalid_argument("sandbox ID is invalid"))?,
@@ -223,7 +240,7 @@ impl SandboxSessionJwtAuthority {
             })?;
         Ok(SandboxLaunchAuthentication {
             supervisor: SupervisorAuthBundle {
-                session_id: SandboxSessionId::new(),
+                session_id,
                 runtime_generation,
                 session_rotation: openshell_core::jwt::SessionRotation::new(1)
                     .map_err(|error| Status::internal(error.to_string()))?,
@@ -240,10 +257,17 @@ impl SandboxSessionJwtAuthority {
         })
     }
 
-    pub fn verify_gateway_token(&self, token: &str) -> Result<AuthenticatedSandboxSession, Status> {
-        self.gateway_verifier
-            .verify(token)
-            .map_err(|error| Status::unauthenticated(format!("invalid gateway session: {error}")))
+    pub fn verify_gateway_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSandboxSession, AuthRejection> {
+        self.gateway_verifier.verify(token).map_err(|error| {
+            AuthRejection::new(
+                AuthMechanism::SandboxJwt,
+                session_failure_reason(&error),
+                Status::unauthenticated(format!("invalid gateway session: {error}")),
+            )
+        })
     }
 }
 
@@ -277,15 +301,15 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         &self,
         headers: &http::HeaderMap,
         path: &str,
-    ) -> Result<Option<Principal>, Status> {
+    ) -> Result<Authentication, AuthRejection> {
         let Some(token) = bearer_credential(headers) else {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         };
         let Ok(header) = decode_header(token) else {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         };
         if header.typ.as_deref() != Some(GATEWAY_SESSION_JWT_TYPE) {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         }
         let authenticated = self.authority.verify_gateway_token(token)?;
         // Refresh performs its own lineage check so the immediately consumed
@@ -294,13 +318,28 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
             crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
         }
-        Ok(Some(Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: authenticated.sandbox_id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "launch-session".to_string(),
+        Ok(Authentication::Accepted(Principal::Sandbox(
+            SandboxPrincipal {
+                sandbox_id: authenticated.sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "launch-session".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
             },
-            trust_domain: Some("openshell".to_string()),
-        })))
+        )))
+    }
+}
+
+fn session_failure_reason(error: &SessionJwtError) -> AuthFailureReason {
+    match error {
+        SessionJwtError::Expired => AuthFailureReason::ExpiredCredential,
+        SessionJwtError::WrongIssuer | SessionJwtError::WrongAudience => {
+            AuthFailureReason::AudienceOrIssuerMismatch
+        }
+        SessionJwtError::MissingKeyId | SessionJwtError::InvalidJti => {
+            AuthFailureReason::MalformedCredential
+        }
+        _ => AuthFailureReason::InvalidCredential,
     }
 }
 
@@ -497,6 +536,90 @@ mod tests {
 
     fn extension_audience(value: &str) -> ExtensionAudience {
         ExtensionAudience::new(value).expect("valid extension audience")
+    }
+
+    #[test]
+    fn launch_session_survives_identity_reload_and_token_renewal() {
+        let material = generate_jwt_key().unwrap();
+        let authority = SandboxSessionJwtAuthority::from_pem(
+            material.signing_key_pem.as_bytes(),
+            material.public_key_pem.as_bytes(),
+            material.kid,
+            "test-gateway",
+            Some(Duration::from_mins(15)),
+        )
+        .unwrap();
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let first = authority
+            .mint_persisted_launch("sandbox-a", &identity)
+            .unwrap();
+        let mut annotations = std::collections::HashMap::new();
+        identity.write(&mut annotations);
+        let mut reloaded =
+            crate::auth::sandbox_session::PersistedSandboxIdentity::read(&annotations).unwrap();
+        reloaded.gateway_token_id = uuid::Uuid::new_v4();
+        let renewed = authority
+            .mint_persisted_launch("sandbox-a", &reloaded)
+            .unwrap();
+        assert_eq!(first.supervisor.session_id, renewed.supervisor.session_id);
+        assert_eq!(
+            first.supervisor.runtime_generation,
+            renewed.supervisor.runtime_generation
+        );
+        assert_ne!(
+            first.supervisor.gateway_token.expose_secret(),
+            renewed.supervisor.gateway_token.expose_secret()
+        );
+
+        let other_sandbox = authority
+            .mint_persisted_launch("sandbox-b", &identity)
+            .unwrap();
+        assert_ne!(
+            first.supervisor.session_id,
+            other_sandbox.supervisor.session_id
+        );
+        let next = crate::auth::sandbox_session::PersistedSandboxIdentity::new().unwrap();
+        let next_launch = authority.mint_persisted_launch("sandbox-a", &next).unwrap();
+        assert_ne!(
+            first.supervisor.session_id,
+            next_launch.supervisor.session_id
+        );
+    }
+
+    #[test]
+    fn session_verification_errors_map_to_reason_categories() {
+        for (error, reason) in [
+            (
+                SessionJwtError::Expired,
+                AuthFailureReason::ExpiredCredential,
+            ),
+            (
+                SessionJwtError::WrongIssuer,
+                AuthFailureReason::AudienceOrIssuerMismatch,
+            ),
+            (
+                SessionJwtError::WrongAudience,
+                AuthFailureReason::AudienceOrIssuerMismatch,
+            ),
+            (
+                SessionJwtError::MissingKeyId,
+                AuthFailureReason::MalformedCredential,
+            ),
+            (
+                SessionJwtError::InvalidJti,
+                AuthFailureReason::MalformedCredential,
+            ),
+            (
+                SessionJwtError::InvalidToken,
+                AuthFailureReason::InvalidCredential,
+            ),
+            (
+                SessionJwtError::UnknownKeyId,
+                AuthFailureReason::InvalidCredential,
+            ),
+        ] {
+            assert_eq!(session_failure_reason(&error), reason, "{error:?}");
+        }
     }
 
     #[test]

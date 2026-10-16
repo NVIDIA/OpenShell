@@ -12,6 +12,9 @@ let
   gnuToolchain = toolchains.${if isAarch64 then "aarch64-gnu" else "x86_64-gnu"};
   muslToolchain = toolchains.${if isAarch64 then "aarch64-musl" else "x86_64-musl"};
   dockerArch = if isAarch64 then "arm64" else "amd64";
+  linuxVmRuntime = pkgs.callPackage ../nix/pkgs/vm-runtime.nix {
+    stdenv = gnuToolchain.stdenv;
+  };
   toolchainEnv = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (
     builtins.attrValues toolchains
   );
@@ -222,7 +225,8 @@ rec {
 
       cargo build --target ${muslToolchain.target} \
         -p openshell-cli \
-        -p openshell-sandbox
+        -p openshell-sandbox \
+        -p openshell-prover-cli
 
       cargo build --target ${gnuToolchain.target} \
         -p openshell-gateway \
@@ -243,6 +247,55 @@ rec {
       install -D -m 0755 \
         target/${gnuToolchain.target}/debug/openshell-supervisor \
         artifacts/binaries/${gnuToolchain.target}/openshell-supervisor
+
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell-prover \
+        artifacts/binaries/${muslToolchain.target}/openshell-prover
+    '';
+  };
+
+  vmDriver = pkgs.writeShellApplication {
+    name = "build-artifacts-vm-driver";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.git
+      pkgs.zstd
+      rustToolchain
+    ];
+    runtimeEnv = toolchainEnv;
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      cargo build --target ${muslToolchain.target} \
+        -p openshell-driver-vm --no-default-features --bin openshell-vm-init
+
+      install -D -m 0755 \
+        target/${muslToolchain.target}/debug/openshell-vm-init \
+        artifacts/binaries/${muslToolchain.target}/openshell-vm-init
+
+      compressed_dir=$(mktemp -d -p /tmp openshell-vm-runtime.XXXXXX)
+      cleanup() {
+        status=$?
+        trap - EXIT
+        rm -rf -- "$compressed_dir"
+        exit "$status"
+      }
+      trap cleanup EXIT
+      cp ${linuxVmRuntime}/compressed/*.zst "$compressed_dir/"
+      zstd -19 -T1 artifacts/binaries/${muslToolchain.target}/openshell-sandbox \
+        -o "$compressed_dir/openshell-sandbox.zst"
+      zstd -19 -T1 artifacts/binaries/${gnuToolchain.target}/openshell-supervisor \
+        -o "$compressed_dir/openshell-supervisor.zst"
+      zstd -19 -T1 artifacts/binaries/${muslToolchain.target}/openshell-vm-init \
+        -o "$compressed_dir/openshell-vm-init.zst"
+      OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$compressed_dir" \
+        cargo build --target ${gnuToolchain.target} \
+          -p openshell-driver-vm --bin openshell-driver-vm
+
+      install -D -m 0755 \
+        target/${gnuToolchain.target}/debug/openshell-driver-vm \
+        artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm
     '';
   };
 
@@ -352,6 +405,32 @@ rec {
     '';
   };
 
+  deb = pkgs.writeShellApplication {
+    name = "build-artifacts-deb";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.dpkg
+      pkgs.git
+      pkgs.gzip
+    ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      package_version="''${OPENSHELL_DEB_VERSION:-0.0.0-local}"
+      OPENSHELL_CLI_BINARY="$root/artifacts/binaries/${muslToolchain.target}/openshell" \
+        OPENSHELL_GATEWAY_BINARY="$root/artifacts/binaries/${gnuToolchain.target}/openshell-gateway" \
+        OPENSHELL_PROVER_BINARY="$root/artifacts/binaries/${muslToolchain.target}/openshell-prover" \
+        OPENSHELL_DRIVER_VM_BINARY="$root/artifacts/binaries/${gnuToolchain.target}/openshell-driver-vm" \
+        OPENSHELL_DEB_VERSION="$package_version" \
+        OPENSHELL_DEB_ARCH=${dockerArch} \
+        OPENSHELL_OUTPUT_DIR="$root/artifacts/packages" \
+        tasks/scripts/package-deb.sh
+      install -m 0644 "artifacts/packages/openshell_''${package_version}_${dockerArch}.deb" \
+        artifacts/packages/openshell.deb
+    '';
+  };
+
   helm = pkgs.writeShellApplication {
     name = "build-artifacts-helm";
     runtimeInputs = [
@@ -371,12 +450,16 @@ rec {
     name = "build-artifacts";
     runtimeInputs = [
       binaries
+      vmDriver
+      deb
       testArchives
       images
       helm
     ];
     text = ''
       build-artifacts-binaries
+      build-artifacts-vm-driver
+      build-artifacts-deb
       build-artifacts-test-archives
       build-artifacts-images
       build-artifacts-helm

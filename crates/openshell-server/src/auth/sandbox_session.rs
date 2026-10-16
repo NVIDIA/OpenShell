@@ -12,6 +12,8 @@ use sha2::{Digest as _, Sha256};
 use tonic::Status;
 use uuid::Uuid;
 
+use crate::auth::authenticator::AuthRejection;
+use crate::auth::authenticator::{AuthFailureReason, AuthMechanism};
 use crate::persistence::Store;
 
 pub const RUNTIME_GENERATION_ANNOTATION: &str = "internal.openshell.ai/runtime-generation";
@@ -244,16 +246,37 @@ impl PersistedSandboxIdentity {
     }
 }
 
+fn reject(reason: AuthFailureReason, status: Status) -> AuthRejection {
+    AuthRejection::new(AuthMechanism::SandboxJwt, reason, status)
+}
+
+fn stale_identity() -> AuthRejection {
+    reject(
+        AuthFailureReason::StaleIdentity,
+        Status::unauthenticated("gateway token does not match the active sandbox identity"),
+    )
+}
+
 #[allow(clippy::result_large_err)]
 async fn load_identity(
     store: &Store,
     principal: &AuthenticatedSandboxSession,
-) -> Result<(Sandbox, PersistedSandboxIdentity), Status> {
+) -> Result<(Sandbox, PersistedSandboxIdentity), AuthRejection> {
     let sandbox = store
         .get_message::<Sandbox>(principal.sandbox_id.as_str())
         .await
-        .map_err(|error| Status::unavailable(format!("load sandbox identity failed: {error}")))?
-        .ok_or_else(|| Status::unauthenticated("sandbox identity does not exist"))?;
+        .map_err(|error| {
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::unavailable(format!("load sandbox identity failed: {error}")),
+            )
+        })?
+        .ok_or_else(|| {
+            reject(
+                AuthFailureReason::UnknownIdentity,
+                Status::unauthenticated("sandbox identity does not exist"),
+            )
+        })?;
 
     let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
     if !matches!(
@@ -264,23 +287,28 @@ async fn load_identity(
             | SandboxPhase::Completed
             | SandboxPhase::Error
     ) {
-        return Err(Status::failed_precondition(
-            "sandbox runtime identity is not active",
+        return Err(reject(
+            AuthFailureReason::StaleIdentity,
+            Status::failed_precondition("sandbox runtime identity is not active"),
         ));
     }
 
-    let metadata = sandbox
-        .metadata
-        .as_ref()
-        .ok_or_else(|| Status::unauthenticated("sandbox identity metadata is missing"))?;
-    let identity = PersistedSandboxIdentity::read(&metadata.annotations)
-        .map_err(|_| Status::unauthenticated("sandbox runtime identity is invalid"))?;
+    let metadata = sandbox.metadata.as_ref().ok_or_else(|| {
+        reject(
+            AuthFailureReason::UnknownIdentity,
+            Status::unauthenticated("sandbox identity metadata is missing"),
+        )
+    })?;
+    let identity = PersistedSandboxIdentity::read(&metadata.annotations).map_err(|_| {
+        reject(
+            AuthFailureReason::UnknownIdentity,
+            Status::unauthenticated("sandbox runtime identity is invalid"),
+        )
+    })?;
     if principal.runtime_generation != identity.runtime_generation
         || principal.auth_epoch != identity.auth_epoch
     {
-        return Err(Status::unauthenticated(
-            "gateway token does not match the active sandbox identity",
-        ));
+        return Err(stale_identity());
     }
     Ok((sandbox, identity))
 }
@@ -289,12 +317,10 @@ async fn load_identity(
 pub async fn authorize_persisted(
     store: &Store,
     principal: &AuthenticatedSandboxSession,
-) -> Result<PersistedSandboxIdentity, Status> {
+) -> Result<PersistedSandboxIdentity, AuthRejection> {
     let (_, identity) = load_identity(store, principal).await?;
     if principal.token_id != identity.gateway_token_id {
-        return Err(Status::unauthenticated(
-            "gateway token does not match the active sandbox identity",
-        ));
+        return Err(stale_identity());
     }
     Ok(identity)
 }
@@ -311,22 +337,21 @@ pub async fn authorize_refresh(
     principal: &AuthenticatedSandboxSession,
     request_hash: &RefreshRequestHash,
     now: i64,
-) -> Result<RefreshAuthorization, Status> {
+) -> Result<RefreshAuthorization, AuthRejection> {
     let (_, identity) = load_identity(store, principal).await?;
     if principal.token_id == identity.gateway_token_id {
         return Ok(RefreshAuthorization::Current(identity));
     }
     let Some(replay) = &identity.refresh_replay else {
-        return Err(Status::unauthenticated(
-            "gateway token does not match the active sandbox identity",
-        ));
+        return Err(stale_identity());
     };
     if principal.token_id != replay.previous_gateway_token_id
         || request_hash != &replay.request_hash
         || now > replay.replay_until
     {
-        return Err(Status::unauthenticated(
-            "gateway refresh retry does not match the active lineage",
+        return Err(reject(
+            AuthFailureReason::StaleIdentity,
+            Status::unauthenticated("gateway refresh retry does not match the active lineage"),
         ));
     }
     Ok(RefreshAuthorization::Replay(identity))
@@ -343,7 +368,11 @@ pub async fn rotate_gateway_token(
     principal: &AuthenticatedSandboxSession,
     next: &PersistedSandboxIdentity,
 ) -> Result<PersistedSandboxIdentity, Status> {
-    let (sandbox, current) = load_identity(store, principal).await?;
+    // `authorize_refresh` already audited this bearer; a rejection here means
+    // the sandbox changed during the refresh.
+    let (sandbox, current) = load_identity(store, principal)
+        .await
+        .map_err(|rejection| rejection.status)?;
     if principal.token_id != current.gateway_token_id {
         return Err(Status::unauthenticated(
             "gateway token does not match the active sandbox identity",
@@ -435,7 +464,8 @@ mod tests {
         let error = authorize_persisted(&store, &principal(1, Uuid::from_u128(2)))
             .await
             .expect_err("a different token lineage must be rejected");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
 
         store
             .update_message_cas::<Sandbox, _>("sandbox-a", 0, |sandbox| {
@@ -454,7 +484,8 @@ mod tests {
         let error = authorize_persisted(&store, &principal(1, Uuid::from_u128(1)))
             .await
             .expect_err("old epoch must be revoked on every replica");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
         authorize_persisted(&store, &principal(2, Uuid::from_u128(2)))
             .await
             .expect("new epoch is active");
@@ -468,7 +499,8 @@ mod tests {
         let error = authorize_persisted(&store, &principal(2, Uuid::from_u128(2)))
             .await
             .expect_err("stopped runtime must reject its token");
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
     }
 
     #[tokio::test]
@@ -502,7 +534,8 @@ mod tests {
         let error = authorize_persisted(&store, &first)
             .await
             .expect_err("consumed gateway token must be rejected");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
         assert!(matches!(
             authorize_refresh(&store, &first, &request_hash, 130)
                 .await
@@ -512,7 +545,8 @@ mod tests {
         let error = authorize_refresh(&store, &first, &request_hash, 131)
             .await
             .expect_err("predecessor retry must expire");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
         authorize_persisted(&store, &principal(1, next.gateway_token_id))
             .await
             .expect("successor gateway token is current");

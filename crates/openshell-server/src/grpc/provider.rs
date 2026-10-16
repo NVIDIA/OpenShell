@@ -2509,8 +2509,8 @@ use openshell_core::proto::{
     UpdateProviderProfilesRequest, UpdateProviderProfilesResponse, UpdateProviderRequest,
 };
 use openshell_core::spiffe::{
-    JwtSvidParseError, SpiffeJwtClaims, parse_unverified_jwt_svid_claims,
-    trust_domain as spiffe_trust_domain, workload_api_endpoint,
+    SpiffeJwtClaims, parse_unverified_jwt_svid_claims, trust_domain as spiffe_trust_domain,
+    workload_api_endpoint,
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile,
@@ -2526,33 +2526,26 @@ use crate::auth::workspace_authz::{
     authorize_workspace, require_platform_admin,
 };
 use openshell_core::oauth::{
-    self, TokenExchangeParams, effective_client_assertion_type, effective_token_type,
+    self, TokenExchangeParams, TokenGrantClient, effective_client_assertion_type,
+    effective_token_type,
+};
+use openshell_core::token_grant_failure::{
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
 const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
 const INTERMEDIATE_TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_INTERMEDIATE_TOKEN_CACHE_ENTRIES: usize = 1024;
 
-static TOKEN_EXCHANGE_HTTP_CLIENT: LazyLock<Result<reqwest::Client, String>> =
-    LazyLock::new(|| {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| {
-                format!("provider token exchange HTTP client configuration failed: {err}")
-            })
-    });
+static TOKEN_EXCHANGE_HTTP_CLIENT: LazyLock<Result<TokenGrantClient, TokenGrantFailure>> =
+    LazyLock::new(TokenGrantClient::new);
 static INTERMEDIATE_TOKEN_CACHE: LazyLock<IntermediateTokenCache> =
     LazyLock::new(IntermediateTokenCache::new);
 
-fn token_exchange_http_client() -> Result<&'static reqwest::Client, Status> {
+fn token_exchange_http_client() -> Result<&'static TokenGrantClient, Status> {
     TOKEN_EXCHANGE_HTTP_CLIENT
         .as_ref()
-        .map_err(|err| Status::internal(err.clone()))
+        .map_err(|failure| failure.to_status_with_code(tonic::Code::Internal))
 }
 
 #[derive(Clone)]
@@ -4092,43 +4085,188 @@ pub(super) async fn handle_update_provider(
     }
 }
 
+/// Exchange a supervisor's attached provider credential with safe failure details.
 pub(super) async fn handle_exchange_provider_subject_token(
     state: &Arc<ServerState>,
     request: Request<ExchangeProviderSubjectTokenRequest>,
 ) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
+    let request_id = canonical_request_id(request.metadata());
+    // A supervisor's failures go to its own authenticated sandbox's log stream,
+    // never to the sandbox named in the request. Other callers are logged on
+    // the gateway only.
+    let log_sandbox_id = match request.extensions().get::<Principal>() {
+        Some(Principal::Sandbox(principal)) => Some(principal.sandbox_id.clone()),
+        _ => None,
+    };
+    exchange_provider_subject_token_inner(state, request, request_id.as_deref())
+        .await
+        .map_err(|status| {
+            let status = sanitize_token_grant_status(status);
+            log_token_grant_failure(
+                log_sandbox_id.as_deref(),
+                request_id.as_deref(),
+                TokenGrantFailure::from_status(&status),
+            );
+            status
+        })
+}
+
+fn sanitize_token_grant_status(status: Status) -> Status {
+    // Rebuild even valid details so foreign metadata, sources and diagnostics
+    // cannot escape an early return from a shared dependency.
+    TokenGrantFailure::from_status(&status).to_status_with_code(status.code())
+}
+
+/// Return the request's `x-request-id` only when it is a canonical UUID.
+///
+/// The supervisor sends the ID of the HTTP exchange that needs the grant. Any
+/// other value is not echoed into logs or a token-service request.
+fn canonical_request_id(metadata: &tonic::metadata::MetadataMap) -> Option<String> {
+    metadata
+        .get("x-request-id")?
+        .to_str()
+        .ok()
+        .filter(|value| openshell_core::endpoint_failure::is_canonical_request_id(value))
+        .map(str::to_owned)
+}
+
+/// Log a grant failure for operators with its bounded classification.
+///
+/// The gateway log stream keeps only an event's message and `sandbox_id`, so
+/// the classification goes into the message. It never contains remote text.
+fn log_token_grant_failure(
+    sandbox_id: Option<&str>,
+    request_id: Option<&str>,
+    failure: TokenGrantFailure,
+) {
+    let upstream_http_status = failure
+        .upstream_status()
+        .map_or_else(|| "none".to_string(), |status| status.to_string());
+    let message = format!(
+        "dynamic token grant failed request_id={} code={} stage={} upstream_http_status={upstream_http_status}",
+        request_id.unwrap_or("none"),
+        failure.code(),
+        failure.stage().code(),
+    );
+    if let Some(sandbox_id) = sandbox_id {
+        warn!(sandbox_id = %sandbox_id, "{message}");
+    } else {
+        warn!("{message}");
+    }
+}
+
+fn token_grant_configuration_status(code: tonic::Code) -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::Configuration,
+        TokenGrantStage::Configuration,
+    )
+    .to_status_with_code(code)
+}
+
+fn token_grant_store_status() -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::Unavailable,
+        TokenGrantStage::GatewayRpc,
+    )
+    .to_status_with_code(tonic::Code::Internal)
+}
+
+fn token_grant_identity_rejected(code: tonic::Code) -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::WorkloadIdentityRejected,
+        TokenGrantStage::WorkloadIdentity,
+    )
+    .to_status_with_code(code)
+}
+
+fn token_grant_workload_api_status(error: spiffe::WorkloadApiError, code: tonic::Code) -> Status {
+    use spiffe::WorkloadApiError;
+    let kind = match error {
+        WorkloadApiError::Endpoint(_) => TokenGrantFailureKind::Configuration,
+        WorkloadApiError::NoIdentityIssued | WorkloadApiError::PermissionDenied(_) => {
+            TokenGrantFailureKind::WorkloadIdentityRejected
+        }
+        WorkloadApiError::Transport(spiffe::transport::TransportError::Status(status)) => {
+            match status.code() {
+                tonic::Code::DeadlineExceeded => TokenGrantFailureKind::Timeout,
+                tonic::Code::Unavailable => TokenGrantFailureKind::Unavailable,
+                tonic::Code::InvalidArgument => TokenGrantFailureKind::Configuration,
+                _ => TokenGrantFailureKind::Unclassified,
+            }
+        }
+        WorkloadApiError::Transport(spiffe::transport::TransportError::Tonic(_)) => {
+            TokenGrantFailureKind::Unavailable
+        }
+        _ => TokenGrantFailureKind::Unclassified,
+    };
+    TokenGrantFailure::new(kind, TokenGrantStage::WorkloadIdentity).to_status_with_code(code)
+}
+
+fn token_grant_dependency_status(status: Status) -> Status {
+    // Dependency status text is untrusted; only transport codes establish
+    // availability. No provider authorization meaning is inferred from prose.
+    let kind = match status.code() {
+        tonic::Code::DeadlineExceeded => TokenGrantFailureKind::Timeout,
+        tonic::Code::Unavailable => TokenGrantFailureKind::Unavailable,
+        _ => TokenGrantFailureKind::Unclassified,
+    };
+    TokenGrantFailure::new(kind, TokenGrantStage::GatewayRpc).to_status_with_code(status.code())
+}
+
+async fn exchange_provider_subject_token_inner(
+    state: &Arc<ServerState>,
+    request: Request<ExchangeProviderSubjectTokenRequest>,
+    request_id: Option<&str>,
+) -> Result<Response<ExchangeProviderSubjectTokenResponse>, Status> {
     let req = request.get_ref().clone();
-    let principal = crate::auth::guard::enforce_sandbox_scope(&request, &req.sandbox_id)?;
-    crate::auth::guard::ensure_sandbox_principal_scope(&principal, &req.sandbox_id)?;
+    // This RPC requires the exact sandbox supervisor. Check without emitting
+    // caller-controlled identity fields through the general scope guard's log.
+    let auth_code = match request.extensions().get::<Principal>() {
+        Some(Principal::Sandbox(principal)) if principal.sandbox_id == req.sandbox_id => None,
+        Some(
+            Principal::Sandbox(_)
+            | Principal::User(_)
+            | Principal::Operator(_)
+            | Principal::Peer(_),
+        ) => Some(tonic::Code::PermissionDenied),
+        Some(Principal::Anonymous) | None => Some(tonic::Code::Unauthenticated),
+    };
+    if let Some(code) = auth_code {
+        return Err(TokenGrantFailure::new(
+            TokenGrantFailureKind::WorkloadIdentityRejected,
+            TokenGrantStage::GatewayRpc,
+        )
+        .to_status_with_code(code));
+    }
     drop(request);
 
-    if req.provider.trim().is_empty() {
-        return Err(Status::invalid_argument("provider is required"));
-    }
-    if req.credential_key.trim().is_empty() {
-        return Err(Status::invalid_argument("credential_key is required"));
-    }
-    if req.supervisor_jwt_svid.trim().is_empty() {
-        return Err(Status::invalid_argument("supervisor_jwt_svid is required"));
+    if req.provider.trim().is_empty()
+        || req.credential_key.trim().is_empty()
+        || req.supervisor_jwt_svid.trim().is_empty()
+    {
+        return Err(token_grant_configuration_status(
+            tonic::Code::InvalidArgument,
+        ));
     }
 
     let sandbox = state
         .store
         .get_message::<Sandbox>(&req.sandbox_id)
         .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
     let workspace = sandbox.object_workspace().to_string();
     let spec = sandbox
         .spec
         .as_ref()
-        .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::Internal))?;
     if !spec
         .providers
         .iter()
         .any(|provider| provider == &req.provider)
     {
-        return Err(Status::permission_denied(
-            "provider is not attached to this sandbox",
+        return Err(token_grant_configuration_status(
+            tonic::Code::PermissionDenied,
         ));
     }
 
@@ -4136,44 +4274,43 @@ pub(super) async fn handle_exchange_provider_subject_token(
         .store
         .get_message_by_name::<Provider>(&workspace, &req.provider)
         .await
-        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-        .ok_or_else(|| Status::not_found("provider not found"))?;
+        .map_err(|_| token_grant_store_status())?
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::NotFound))?;
     let catalog = state
         .provider_profile_sources
         .snapshot_catalog(state.store.as_ref(), &workspace)
-        .await?;
+        .await
+        .map_err(token_grant_dependency_status)?;
     let profile = get_provider_type_profile_for_scope(
         &catalog,
         &provider.r#type,
         &provider.profile_workspace,
     )
-    .ok_or_else(|| Status::failed_precondition("provider profile not found"))?;
+    .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let profile_proto = profile.to_proto();
     let credential = profile_proto
         .credentials
         .iter()
         .find(|credential| credential.name == req.credential_key)
-        .ok_or_else(|| {
-            Status::failed_precondition("credential not declared by provider profile")
-        })?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let token_grant = credential
         .token_grant
         .as_ref()
-        .ok_or_else(|| Status::failed_precondition("credential does not declare token_grant"))?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let grant_type = ProviderCredentialTokenGrantType::try_from(token_grant.grant_type)
         .unwrap_or(ProviderCredentialTokenGrantType::ClientCredentials);
     if grant_type != ProviderCredentialTokenGrantType::TokenExchange {
-        return Err(Status::failed_precondition(
-            "credential token_grant is not token_exchange",
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
         ));
     }
     let subject_token = token_grant
         .subject_token
         .as_ref()
-        .ok_or_else(|| Status::failed_precondition("token_exchange subject_token is missing"))?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     if subject_token.source != "provider_credential" {
-        return Err(Status::failed_precondition(
-            "unsupported subject_token source",
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
         ));
     }
     if !profile_proto
@@ -4181,10 +4318,17 @@ pub(super) async fn handle_exchange_provider_subject_token(
         .iter()
         .any(|credential| credential.name == subject_token.credential)
     {
-        return Err(Status::failed_precondition(
-            "subject token credential not declared by provider profile",
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
         ));
     }
+    // Validate configuration before identity acquisition, cache lookup or any
+    // token exchange; invalid configuration must never trigger an outbound grant.
+    let (cache_ttl, subject_token_expires_at_ms) = validate_intermediate_grant_configuration(
+        token_grant,
+        &provider,
+        &subject_token.credential,
+    )?;
     let stored_subject_token =
         resolve_subject_token_credential(&state.credentials, &provider, &subject_token.credential)
             .await?;
@@ -4226,42 +4370,22 @@ pub(super) async fn handle_exchange_provider_subject_token(
 
     let token_response = perform_intermediate_token_exchange(
         &token_grant.token_endpoint,
-        &gateway_jwt_svid,
-        &token_grant.client_assertion_type,
-        &stored_subject_token,
-        &subject_token.subject_token_type,
-        &supervisor_claims.sub,
-        &token_grant.requested_token_type,
+        &TokenExchangeParams {
+            client_assertion: &gateway_jwt_svid,
+            client_assertion_type: &token_grant.client_assertion_type,
+            subject_token: &stored_subject_token,
+            subject_token_type: &subject_token.subject_token_type,
+            audience: &supervisor_claims.sub,
+            scopes: &[],
+            requested_token_type: &token_grant.requested_token_type,
+        },
+        request_id,
     )
-    .await
-    .inspect_err(|status| {
-        warn!(
-            sandbox_id = %req.sandbox_id,
-            provider = %req.provider,
-            credential_key = %req.credential_key,
-            subject_credential = %subject_token.credential,
-            client_assertion_type = %effective_client_assertion_type(&token_grant.client_assertion_type),
-            gateway_svid_issuer = %gateway_claims.iss,
-            gateway_svid_subject = %gateway_claims.sub,
-            gateway_svid_audience = ?gateway_claims.aud,
-            supervisor_svid_issuer = %supervisor_claims.iss,
-            supervisor_svid_subject = %supervisor_claims.sub,
-            supervisor_svid_audience = ?supervisor_claims.aud,
-            status = ?status.code(),
-            error = %status.message(),
-            "intermediate provider token exchange failed"
-        );
-    })?;
+    .await?;
     let cache_expires_at_ms = intermediate_token_cache_expires_at_ms(
         &token_response,
-        token_grant
-            .cache_ttl
-            .as_ref()
-            .map(openshell_core::time::duration_to_std)
-            .transpose()
-            .map_err(|error| Status::invalid_argument(error.to_string()))?,
-        provider_credential_expiration_ms(&provider, &subject_token.credential)?
-            .unwrap_or_default(),
+        cache_ttl,
+        subject_token_expires_at_ms.unwrap_or_default(),
         supervisor_claims.exp,
     );
     if cache_expires_at_ms > crate::persistence::current_time_ms() {
@@ -4278,24 +4402,43 @@ pub(super) async fn handle_exchange_provider_subject_token(
     }))
 }
 
+fn validate_intermediate_grant_configuration(
+    grant: &openshell_core::proto::ProviderCredentialTokenGrant,
+    provider: &Provider,
+    subject_credential: &str,
+) -> Result<(Option<std::time::Duration>, Option<i64>), Status> {
+    oauth::parse_token_endpoint_url(&grant.token_endpoint).map_err(TokenGrantFailure::to_status)?;
+    let cache_ttl = grant
+        .cache_ttl
+        .as_ref()
+        .map(openshell_core::time::duration_to_std)
+        .transpose()
+        .map_err(|_| token_grant_configuration_status(tonic::Code::InvalidArgument))?;
+    let subject_expires_at_ms = provider_credential_expiration_ms(provider, subject_credential)?;
+    Ok((cache_ttl, subject_expires_at_ms))
+}
+
 async fn resolve_subject_token_credential(
     credentials: &crate::credentials::CredentialRuntime,
     provider: &Provider,
     credential_key: &str,
 ) -> Result<String, Status> {
+    // Check the provider's expiry before asking a credential driver to resolve
+    // a handle; stale stored material cannot authorize another grant attempt.
+    ensure_subject_token_credential_not_expired(provider, credential_key)?;
     if let Some(value) = provider
         .credentials
         .get(credential_key)
         .filter(|value| !value.is_empty())
     {
-        ensure_subject_token_credential_not_expired(provider, credential_key)?;
         return Ok(value.clone());
     }
 
     if provider.credential_handles.contains_key(credential_key) {
         let resolved = credentials
             .resolve_provider_handles(provider, crate::persistence::current_time_ms())
-            .await?;
+            .await
+            .map_err(token_grant_dependency_status)?;
         if let Some(value) = resolved
             .values
             .get(credential_key)
@@ -4305,9 +4448,7 @@ async fn resolve_subject_token_credential(
         }
     }
 
-    Err(Status::failed_precondition(
-        "subject token credential is not configured",
-    ))
+    Err(token_grant_authorization_required_status())
 }
 
 fn ensure_subject_token_credential_not_expired(
@@ -4316,11 +4457,19 @@ fn ensure_subject_token_credential_not_expired(
 ) -> Result<(), Status> {
     let expires_at_ms = provider_credential_expiration_ms(provider, credential_key)?;
     if expires_at_ms.is_some_and(|value| value <= crate::persistence::current_time_ms()) {
-        return Err(Status::failed_precondition(
-            "subject token credential has expired",
-        ));
+        return Err(token_grant_authorization_required_status());
     }
     Ok(())
+}
+
+/// The user's stored subject credential is absent or expired. Only the user
+/// can restore it, by authorizing the provider again.
+fn token_grant_authorization_required_status() -> Status {
+    TokenGrantFailure::new(
+        TokenGrantFailureKind::ProviderAuthorizationRequired,
+        TokenGrantStage::GatewayRpc,
+    )
+    .to_status_with_code(tonic::Code::FailedPrecondition)
 }
 
 fn provider_credential_expiration_ms(
@@ -4332,7 +4481,7 @@ fn provider_credential_expiration_ms(
         .get(credential_key)
         .map(openshell_core::time::timestamp_to_millis)
         .transpose()
-        .map_err(|error| Status::failed_precondition(error.to_string()))
+        .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))
 }
 
 struct IntermediateTokenCacheKeyInput<'a> {
@@ -4440,39 +4589,29 @@ async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
     let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{GATEWAY_SPIFFE_WORKLOAD_API_SOCKET} is required for provider token exchange"
-            ))
-        })?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
     let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
         .await
-        .map_err(|e| {
-            Status::failed_precondition(format!("SPIFFE Workload API unavailable: {e}"))
-        })?;
+        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))?;
     client
         .fetch_jwt_token([audience], None)
         .await
-        .map_err(|e| Status::failed_precondition(format!("failed to fetch gateway JWT-SVID: {e}")))
+        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))
 }
 
 fn validate_gateway_jwt_svid_claims(
     claims: &SpiffeJwtClaims,
     expected_audience: &str,
 ) -> Result<(), Status> {
-    if !claims.aud.contains(expected_audience) {
-        return Err(Status::failed_precondition(
-            "gateway SVID audience does not match token grant audience",
+    if !claims.aud.contains(expected_audience)
+        || spiffe_trust_domain(&claims.sub).is_none()
+        || (claims.exp > 0
+            && claims.exp.saturating_mul(1000) <= crate::persistence::current_time_ms())
+    {
+        return Err(token_grant_identity_rejected(
+            tonic::Code::FailedPrecondition,
         ));
-    }
-    if spiffe_trust_domain(&claims.sub).is_none() {
-        return Err(Status::failed_precondition(
-            "gateway SVID subject is not a SPIFFE ID",
-        ));
-    }
-    if claims.exp > 0 && claims.exp.saturating_mul(1000) <= crate::persistence::current_time_ms() {
-        return Err(Status::failed_precondition("gateway SVID has expired"));
     }
     Ok(())
 }
@@ -4484,81 +4623,54 @@ async fn validate_supervisor_jwt_svid(
 ) -> Result<SpiffeJwtClaims, Status> {
     let unverified = parse_unverified_spiffe_claims(token)?;
     if unverified.iss != gateway_claims.iss {
-        return Err(Status::permission_denied(
-            "supervisor SVID issuer does not match gateway SVID issuer",
-        ));
+        return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
     if !unverified.aud.contains(expected_audience) {
-        return Err(Status::permission_denied(
-            "supervisor SVID audience does not match token grant audience",
-        ));
+        return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
     let supervisor_trust_domain = spiffe_trust_domain(&unverified.sub)
-        .ok_or_else(|| Status::permission_denied("supervisor SVID subject is not a SPIFFE ID"))?;
+        .ok_or_else(|| token_grant_identity_rejected(tonic::Code::PermissionDenied))?;
     let gateway_trust_domain = spiffe_trust_domain(&gateway_claims.sub)
-        .ok_or_else(|| Status::failed_precondition("gateway SVID subject is not a SPIFFE ID"))?;
+        .ok_or_else(|| token_grant_identity_rejected(tonic::Code::FailedPrecondition))?;
     if supervisor_trust_domain != gateway_trust_domain {
-        return Err(Status::permission_denied(
-            "supervisor SVID trust domain does not match gateway SVID trust domain",
-        ));
+        return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
 
     let socket_path = std::env::var(GATEWAY_SPIFFE_WORKLOAD_API_SOCKET)
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "{GATEWAY_SPIFFE_WORKLOAD_API_SOCKET} is required for supervisor JWT-SVID validation"
-            ))
-        })?;
+        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
     let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
         .await
-        .map_err(|e| {
-            Status::failed_precondition(format!("SPIFFE Workload API unavailable: {e}"))
-        })?;
+        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))?;
     let bundles = client
         .fetch_jwt_bundles()
         .await
-        .map_err(|e| Status::internal(format!("SPIFFE JWT bundle fetch failed: {e}")))?;
+        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::Internal))?;
     spiffe::JwtSvid::parse_and_validate(token, &bundles, &[expected_audience])
-        .map_err(|e| Status::permission_denied(format!("invalid supervisor JWT-SVID: {e}")))?;
+        .map_err(|_| token_grant_identity_rejected(tonic::Code::PermissionDenied))?;
     Ok(unverified)
 }
 
 fn parse_unverified_spiffe_claims(token: &str) -> Result<SpiffeJwtClaims, Status> {
-    parse_unverified_jwt_svid_claims(token).map_err(jwt_svid_parse_error_status)
-}
-
-fn jwt_svid_parse_error_status(error: JwtSvidParseError) -> Status {
-    Status::permission_denied(error.to_string())
+    parse_unverified_jwt_svid_claims(token)
+        .map_err(|_| token_grant_identity_rejected(tonic::Code::PermissionDenied))
 }
 
 async fn perform_intermediate_token_exchange(
     token_endpoint: &str,
-    gateway_jwt_svid: &str,
-    client_assertion_type: &str,
-    subject_token: &str,
-    subject_token_type: &str,
-    audience: &str,
-    requested_token_type: &str,
+    params: &TokenExchangeParams<'_>,
+    request_id: Option<&str>,
 ) -> Result<oauth::OAuthTokenResponse, Status> {
     let client = token_exchange_http_client()?;
-    oauth::post_oauth_token_exchange(
-        client,
-        token_endpoint,
-        &TokenExchangeParams {
-            client_assertion: gateway_jwt_svid,
-            client_assertion_type,
-            subject_token,
-            subject_token_type,
-            audience,
-            scopes: &[],
-            requested_token_type,
-        },
-    )
-    .await
-    .map_err(|e| Status::failed_precondition(e.to_string()))
+    oauth::post_oauth_token_exchange(client, token_endpoint, params, request_id)
+        .await
+        .map_err(|failure| {
+            failure
+                .at_stage(TokenGrantStage::IntermediateExchange)
+                .to_status()
+        })
 }
 
 fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) -> String {
@@ -5393,6 +5505,317 @@ mod tests {
         assert_eq!(error.code(), Code::FailedPrecondition);
         ensure_subject_token_credential_not_expired(&provider, "UNSET_TOKEN")
             .expect("an absent expiration remains non-expiring");
+    }
+
+    mod token_grant_failures {
+        use super::*;
+        use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal};
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        const SECRET: &str = "GRANT_SECRET_CANARY_3319";
+        const REQUEST_ID: &str = "2f3e4d5c-6b7a-4891-a0b1-c2d3e4f5a6b7";
+
+        #[derive(Clone, Default)]
+        struct GrantTraceBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+        impl std::io::Write for GrantTraceBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn assert_generic(status: &Status, code: Code) -> TokenGrantFailure {
+            assert_eq!(status.code(), code);
+            assert_eq!(status.message(), "dynamic token grant failed");
+            assert!(!format!("{status:?} {status}").contains(SECRET));
+            assert!(!String::from_utf8_lossy(status.details()).contains(SECRET));
+            assert!(status.metadata().is_empty());
+            TokenGrantFailure::from_status(status)
+        }
+
+        #[test]
+        fn residual_status_drops_message_details_metadata_and_source() {
+            let mut raw =
+                Status::with_details(Code::Internal, SECRET, SECRET.as_bytes().to_vec().into());
+            raw.metadata_mut()
+                .insert("x-upstream-secret", SECRET.parse().unwrap());
+            raw.set_source(Arc::new(std::io::Error::other(SECRET)));
+            let status = sanitize_token_grant_status(raw);
+            let failure = assert_generic(&status, Code::Internal);
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
+            assert!(std::error::Error::source(&status).is_none());
+        }
+
+        #[test]
+        fn strict_typed_failure_survives_final_boundary() {
+            let failure = TokenGrantFailure::new(
+                TokenGrantFailureKind::ProviderAuthorizationRequired,
+                TokenGrantStage::IntermediateExchange,
+            )
+            .with_upstream_status(409);
+            let raw = failure.to_status();
+            let code = raw.code();
+            let status = sanitize_token_grant_status(raw);
+            assert_eq!(assert_generic(&status, code), failure);
+        }
+
+        #[test]
+        fn only_canonical_request_ids_are_echoed() {
+            let mut metadata = tonic::metadata::MetadataMap::new();
+            assert_eq!(canonical_request_id(&metadata), None);
+            metadata.insert("x-request-id", REQUEST_ID.parse().unwrap());
+            assert_eq!(canonical_request_id(&metadata).as_deref(), Some(REQUEST_ID));
+            for rejected in [
+                "2F3E4D5C-6B7A-4891-A0B1-C2D3E4F5A6B7",
+                "2f3e4d5c6b7a4891a0b1c2d3e4f5a6b7",
+                "request code=provider_authorization_required",
+            ] {
+                metadata.insert("x-request-id", rejected.parse().unwrap());
+                assert_eq!(canonical_request_id(&metadata), None, "{rejected}");
+            }
+        }
+
+        #[tokio::test]
+        async fn handler_failure_log_names_request_and_classification_without_secrets() {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut request = Request::new(ExchangeProviderSubjectTokenRequest {
+                sandbox_id: "grant-sandbox".to_string(),
+                provider: SECRET.to_string(),
+                credential_key: SECRET.to_string(),
+                supervisor_jwt_svid: SECRET.to_string(),
+            });
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "grant-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                    },
+                    trust_domain: None,
+                }));
+            request
+                .metadata_mut()
+                .insert("x-request-id", REQUEST_ID.parse().unwrap());
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let error = handle_exchange_provider_subject_token(&state, request)
+                .await
+                .unwrap_err();
+            drop(capture);
+
+            let failure = assert_generic(&error, Code::NotFound);
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "dynamic token grant failed request_id={REQUEST_ID} code={} stage={} upstream_http_status=none",
+                    failure.code(),
+                    failure.stage().code(),
+                )),
+                "{logs}"
+            );
+            assert!(logs.contains("sandbox_id=grant-sandbox"), "{logs}");
+            assert!(!logs.contains(SECRET), "{logs}");
+        }
+
+        #[tokio::test]
+        async fn missing_expired_or_unresolvable_subject_credential_is_generic() {
+            let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
+            let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();
+            let mut provider = provider_with_values("grant-provider", "custom");
+            provider.credentials.clear();
+            let missing = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            let failure = assert_generic(&missing, Code::FailedPrecondition);
+            assert_eq!(
+                failure.kind(),
+                TokenGrantFailureKind::ProviderAuthorizationRequired
+            );
+            assert_eq!(failure.stage(), TokenGrantStage::GatewayRpc);
+
+            // Driver diagnostics name the unknown driver; the gateway drops them.
+            provider.credential_handles.insert(
+                "subject".to_string(),
+                CredentialHandle {
+                    driver: SECRET.to_string(),
+                    handle: SECRET.to_string(),
+                    metadata: HashMap::new(),
+                },
+            );
+            let unresolvable = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            assert_generic(&unresolvable, Code::InvalidArgument);
+
+            // Expiry is checked before the driver is asked.
+            provider
+                .credential_expiration_times
+                .insert("subject".to_string(), ts(0));
+            let expired = resolve_subject_token_credential(&credentials, &provider, "subject")
+                .await
+                .unwrap_err();
+            assert_eq!(
+                assert_generic(&expired, Code::FailedPrecondition).kind(),
+                TokenGrantFailureKind::ProviderAuthorizationRequired
+            );
+        }
+
+        #[test]
+        fn invalid_grant_configuration_fails_before_acquisition() {
+            let valid = token_grant_credential("access_token").token_grant.unwrap();
+            let provider = provider_with_values("grant-provider", "custom");
+            let mut bad_expiry = provider.clone();
+            bad_expiry.credential_expiration_times.insert(
+                "subject".to_string(),
+                prost_types::Timestamp {
+                    seconds: 0,
+                    nanos: -1,
+                },
+            );
+            let negative_ttl = ProviderCredentialTokenGrant {
+                cache_ttl: Some(prost_types::Duration {
+                    seconds: -1,
+                    nanos: 0,
+                }),
+                ..valid.clone()
+            };
+            let bad_endpoint = ProviderCredentialTokenGrant {
+                token_endpoint: format!("ftp://example.com/{SECRET}"),
+                ..valid.clone()
+            };
+            for (grant, provider, code) in [
+                (&negative_ttl, &provider, Code::InvalidArgument),
+                (&valid, &bad_expiry, Code::FailedPrecondition),
+                (&bad_endpoint, &provider, Code::FailedPrecondition),
+            ] {
+                let status = validate_intermediate_grant_configuration(grant, provider, "subject")
+                    .unwrap_err();
+                assert_eq!(
+                    assert_generic(&status, code).kind(),
+                    TokenGrantFailureKind::Configuration,
+                );
+            }
+        }
+
+        #[test]
+        fn workload_api_status_classifies_and_discards_diagnostics() {
+            use spiffe::WorkloadApiError;
+            for (error, kind) in [
+                (
+                    WorkloadApiError::from(Status::permission_denied(SECRET)),
+                    TokenGrantFailureKind::WorkloadIdentityRejected,
+                ),
+                (
+                    WorkloadApiError::NoIdentityIssued,
+                    TokenGrantFailureKind::WorkloadIdentityRejected,
+                ),
+                (
+                    WorkloadApiError::from(Status::deadline_exceeded(SECRET)),
+                    TokenGrantFailureKind::Timeout,
+                ),
+                (
+                    WorkloadApiError::from(Status::unavailable(SECRET)),
+                    TokenGrantFailureKind::Unavailable,
+                ),
+                (
+                    WorkloadApiError::from(Status::invalid_argument(SECRET)),
+                    TokenGrantFailureKind::Configuration,
+                ),
+                (
+                    WorkloadApiError::HintNotFound(SECRET.to_string()),
+                    TokenGrantFailureKind::Unclassified,
+                ),
+            ] {
+                let status = token_grant_workload_api_status(error, Code::FailedPrecondition);
+                let failure = assert_generic(&status, Code::FailedPrecondition);
+                assert_eq!(failure.kind(), kind);
+                assert_eq!(failure.stage(), TokenGrantStage::WorkloadIdentity);
+            }
+        }
+
+        #[tokio::test]
+        async fn malformed_svid_and_claim_denials_are_generic() {
+            let malformed = parse_unverified_spiffe_claims(SECRET).unwrap_err();
+            let failure = assert_generic(&malformed, Code::PermissionDenied);
+            assert_eq!(
+                failure.kind(),
+                TokenGrantFailureKind::WorkloadIdentityRejected
+            );
+            assert_eq!(failure.stage(), TokenGrantStage::WorkloadIdentity);
+            let claims = SpiffeJwtClaims {
+                iss: SECRET.to_string(),
+                sub: SECRET.to_string(),
+                aud: openshell_core::spiffe::AudienceClaim::One(SECRET.to_string()),
+                exp: 0,
+            };
+            let gateway =
+                validate_gateway_jwt_svid_claims(&claims, "expected-audience").unwrap_err();
+            assert_generic(&gateway, Code::FailedPrecondition);
+            let supervisor = validate_supervisor_jwt_svid(SECRET, &claims, "expected-audience")
+                .await
+                .unwrap_err();
+            assert_generic(&supervisor, Code::PermissionDenied);
+        }
+
+        #[tokio::test]
+        async fn intermediate_http_failure_keeps_stage_status_and_request_id_without_body() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(count, 0, "request headers ended early");
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let body = format!(
+                    "{{\"error\":\"provider_authorization_required\",\"openshell_error_contract\":\"openshell.token-grant.v1\",\"error_description\":\"{SECRET}\"}}"
+                );
+                let response = format!(
+                    "HTTP/1.1 409 Conflict\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8_lossy(&request).to_ascii_lowercase()
+            });
+            let params = TokenExchangeParams {
+                client_assertion: SECRET,
+                client_assertion_type: "",
+                subject_token: SECRET,
+                subject_token_type: "",
+                audience: SECRET,
+                scopes: &[],
+                requested_token_type: "",
+            };
+            let result =
+                perform_intermediate_token_exchange(&endpoint, &params, Some(REQUEST_ID)).await;
+            let headers = server.await.unwrap();
+            assert!(
+                headers.contains(&format!("x-openshell-request-id: {REQUEST_ID}")),
+                "{headers}"
+            );
+            let status = result.unwrap_err();
+            let failure = assert_generic(&status, status.code());
+            assert_eq!(failure.kind(), TokenGrantFailureKind::Unclassified);
+            assert_eq!(failure.stage(), TokenGrantStage::IntermediateExchange);
+            assert_eq!(failure.upstream_status(), Some(409));
+        }
     }
 
     #[test]

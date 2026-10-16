@@ -312,14 +312,30 @@ Common findings:
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
 - SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
-- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
+- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. For token grant failures on any HTTP protocol, including failures before endpoint selection, inspect `last_token_grant_failure` in JSON output. It contains the bounded destination and cause, survives unrelated successful traffic, and clears on matching grant success or a policy, provider, or supervisor reset. If several paths share a host and port, other failures before the path is known, such as TLS failures, remain only in logs. A `CredentialUnavailable` result from a failed dynamic token grant also carries `last_failure` with a closed-set `code`, `stage`, `recovery_action`, the provider and credential names, and the `request_id` that the workload received in its `x-openshell-request-id` response header. Search `openshell logs <name>` for that ID: the supervisor's `Token grant failed` line carries the code and stage for every endpoint, and the gateway's `dynamic token grant failed` line appears when the gateway hop failed. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
-  can mean host networking is disabled. Enable host networking in Docker
-  Desktop, ensure Enhanced Container Isolation is disabled, and verify the
-  gateway's primary endpoint is reachable from a host-networked container.
+  can mean the supervisor's selected network mode cannot reach the gateway.
+  Check the gateway's `Selected Docker supervisor networking` log. The default
+  `supervisor_network_mode = "host"` uses host networking; `auto` also selects
+  host. Host mode requires Desktop host networking enabled; set `bridge`
+  explicitly to use the bridge network. Bridge mode uses `host.docker.internal`
+  for the Desktop host and requires a bridge-reachable listener on native Linux. Explicit
+  `grpc_endpoint` values must be reachable in the selected mode, including any
+  remapped published port, with matching TLS certificate names. The local
+  `gateway:docker` task discovers its endpoint unless `OPENSHELL_GRPC_ENDPOINT`
+  supplies an override. The OTLP collector endpoint must also be reachable
+  from the supervisor's selected network. Mode selection does not bypass
+  Landlock/seccomp qualification. Bridge mode and `host.docker.internal`
+  gateway endpoints discover Docker's host address once at driver startup.
+  If discovery fails, check that the configured supervisor image can run
+  `--help` and the Docker API permits container creation, startup, archive
+  download, and removal. `host_gateway_ip` overrides discovery if needed. See the
+  published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
+  for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
-- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
+- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: inspect supervisor and backend logs for policy rejection, network-mediation initialization, protected-channel setup, or listener failures. A backend that cannot enforce the admitted policy must reject it before starting workload code.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
+- Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 - Docker or Podman rejects an explicit `cdi_devices` selector: use a CDI qualified name (`<vendor>/<class>=<name>`), not a host-device path. Syntax validation accepts other vendors; it does not establish that the runtime has the device or that its GPU workload is supported. Consult the published GPU selection documentation for request requirements.
@@ -399,6 +415,17 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
+- Gateway fails to start with an `additional_ca_bundle` error: the Podman
+  driver validates the setting at startup. The file must exist on the gateway
+  host, be non-empty, and contain at least one PEM certificate.
+- Inspected HTTPS to a private-CA destination fails (for example
+  `curl: (52) Empty reply from server`), or the supervisor exits at startup,
+  with `additional_ca_bundle` set: the supervisor container needs the CA, not
+  just the workload. Check
+  `podman inspect <sandbox>-supervisor --format '{{json .Mounts}}'` for a
+  read-only bind of the bundle at `/etc/openshell/tls/additional/ca-bundle.pem`,
+  and `--format '{{json .Config.Cmd}}'` for `--additional-ca-bundle` with that
+  path. The `sandbox` role container must not have the mount.
 - On Linux, verify that the host-networked Podman supervisor can reach the
   gateway's primary loopback endpoint. On macOS, verify Podman Machine's
   host-loopback forwarding or configure an explicit `grpc_endpoint`.
@@ -556,8 +583,11 @@ that scan, then logs
 the `sandbox_id` and exits with
 `tool server endpoint-status startup reconciliation failed`. A pod that
 restarts with that error during a rollout or scale-out is waiting behind a
-long holder: find it as above. Those startup timeouts appear in the gateway log
-only, because the metrics endpoint starts after the scan.
+long holder: find it as above. When the scan finishes, its waits and timeouts
+are already in the lock metrics at the pod's first scrape, so read the counter
+and `_count` values on the new pod: `rate()` and `increase()` take that first
+scrape as their baseline and do not show them. A scan that fails exits before
+the metrics endpoint starts, so its timeouts appear in the gateway log only.
 
 A lock connection that PostgreSQL does not open, although at least a second of
 the 10-second limit remained, is not a lock timeout. The request fails with
@@ -1122,6 +1152,14 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its authenticated gateway session.
 
+For `vm.mounts` (virtiofs host bind mounts) failures, also verify:
+
+- `[openshell.drivers.vm]` sets `allow_driver_config = true` and `enable_bind_mounts = true`; an external VM driver needs `--enable-bind-mounts` and `allow_driver_config` in `--admission-config-json`.
+- `[openshell.drivers.vm.resource_admission]` sets `enabled = false`; bind mounts are rejected while resource admission is on.
+- The libkrun runtime exports `krun_add_virtiofs4`; otherwise the driver reports "VM bind mounts need a libkrun runtime with virtiofs support". The driver extracts its runtime under `$XDG_DATA_HOME/openshell/vm-runtime/<version>/` (default `~/.local/share`). Check with `nm -D <dir>/libkrun.so | grep krun_add_virtiofs4` on Linux or `nm -gU <dir>/libkrun.dylib | grep krun_add_virtiofs4` on macOS.
+- The sandbox launches on libkrun. GPU sandboxes and QEMU launches do not support VM mounts.
+- On Linux with a non-root gateway, file creation in a read-write mount fails unless `sandbox_uid`/`sandbox_gid` match the gateway user's UID/GID. Compare `id -u`/`id -g` of the gateway user with the configured values.
+
 Then run:
 
 ```bash
@@ -1165,7 +1203,8 @@ credential failures.
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
 | CPU-only VM startup reports that read-only `/proc` cannot be removed | Older supervisors can infer GPU requirements from host devices | Check gateway, VM driver, and bundled supervisor versions; use matching updated artifacts. CPU-only VMs do not require read-write `/proc`. |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
-| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
+| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>`; if the gateway PVC is unbound because the cluster has no default `StorageClass`, set `server.dataStorageClass` to a valid one, and size the claim with `server.dataStorageSize` |
+| `helm upgrade` fails on a forbidden update to the gateway StatefulSet after changing `server.dataStorageSize` or `server.dataStorageClass` | `volumeClaimTemplates` is immutable on an existing StatefulSet | `kubectl -n openshell delete statefulset openshell --cascade=orphan`, then re-upgrade; the orphaned PVC keeps its original size and class, so grow it with in-place PVC expansion or copy the data to a new claim |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |

@@ -3,6 +3,10 @@
 
 //! Retained I/O multiplexer for the canonical sandbox process.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
+use openshell_sandbox_backend::{BoundaryProcess, BoundaryTerminal, ProcessAttachment};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,9 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
-use openshell_isolation_interface::contract::{
-    BoundaryProcess, BoundarySignal, BoundaryTerminal, ProcessAttachment,
-};
+use openshell_isolation_interface::contract::BoundarySignal;
 
 const OUTPUT_BUFFER_BYTES: usize = 1024 * 1024;
 
@@ -181,8 +183,8 @@ pub struct MainSession {
     output: Arc<OutputLog>,
     input_owner: Mutex<Option<u64>>,
     next_owner: AtomicU64,
-    boundary_process: Option<Arc<dyn BoundaryProcess>>,
-    boundary_terminal: Option<Arc<dyn BoundaryTerminal>>,
+    boundary_process: Option<Arc<BoundaryProcess>>,
+    boundary_terminal: Option<Arc<BoundaryTerminal>>,
     readers_remaining: AtomicUsize,
     readers_done: Notify,
     finished: std::sync::atomic::AtomicBool,
@@ -227,7 +229,7 @@ impl MainSession {
     #[must_use]
     pub fn from_boundary(
         attachment: ProcessAttachment,
-        process: Arc<dyn BoundaryProcess>,
+        process: Arc<BoundaryProcess>,
     ) -> Arc<Self> {
         let ProcessAttachment {
             stdin,
@@ -525,7 +527,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl BoundaryProcess for TestBoundaryProcess {
+    impl rpc_test::BoundaryProcess for TestBoundaryProcess {
         async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
             Ok(BoundaryExitStatus::Exited(0))
         }
@@ -545,7 +547,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl BoundaryTerminal for TestBoundaryTerminal {
+    impl rpc_test::BoundaryTerminal for TestBoundaryTerminal {
         async fn resize(&self, cols: u16, rows: u16) -> Result<(), BackendError> {
             *self.size.lock().unwrap() = Some((cols, rows));
             Ok(())
@@ -568,9 +570,9 @@ mod tests {
             stdin,
             stdout,
             stderr: None,
-            terminal: Some(terminal.clone()),
+            terminal: Some(rpc_test::terminal(terminal.clone())),
         };
-        let session = MainSession::from_boundary(attachment, process.clone());
+        let session = MainSession::from_boundary(attachment, rpc_test::process(process.clone()));
         let mut output = session.subscribe();
 
         stdout_peer.write_all(b"ready\n").await.unwrap();

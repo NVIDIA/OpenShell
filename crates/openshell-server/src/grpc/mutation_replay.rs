@@ -99,7 +99,6 @@ struct AuthorizationBarrier {
     resume: tokio::sync::Notify,
 }
 
-#[tonic::async_trait]
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     type Output: Send + 'static;
     const METHOD: &'static str;
@@ -115,13 +114,20 @@ pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     fn canonical_message(&self) -> Result<DynamicMessage, Status> {
         decode_request_message(&format!("{}Request", Self::METHOD), self)
     }
-    async fn authorize(&self, state: &ServerState, principal: &Principal) -> Result<Scope, Status>;
-    async fn execute(
+    fn authorize(
+        &self,
+        state: &ServerState,
+        principal: &Principal,
+    ) -> impl Future<Output = Result<Scope, Status>> + Send;
+    fn execute(
         state: &Arc<ServerState>,
         request: Request<Self>,
-    ) -> Result<Response<Self::Output>, Status>;
+    ) -> impl Future<Output = Result<Response<Self::Output>, Status>> + Send;
     fn capture(response: &Response<Self::Output>) -> Result<Success, Status>;
-    async fn restore(store: &Store, success: Success) -> Result<Self::Output, Status>;
+    fn restore(
+        store: &Store,
+        success: Success,
+    ) -> impl Future<Output = Result<Self::Output, Status>> + Send;
 }
 
 /// Empty IDs preserve the existing RPC contract, including cancellation.
@@ -673,7 +679,6 @@ async fn restore_resource<
 
 macro_rules! resource_mutation {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $field:ident, $auth:expr) => {
-        #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
@@ -707,7 +712,6 @@ macro_rules! resource_mutation {
 
 macro_rules! deletion_mutation {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $auth:expr) => {
-        #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;

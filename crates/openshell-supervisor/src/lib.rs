@@ -18,7 +18,7 @@ compile_error!(
 );
 
 mod activity_aggregator;
-mod backend_setup;
+pub mod backend_setup;
 mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
@@ -548,6 +548,7 @@ pub async fn run_network_proxy(
     policy_data: String,
     tls_dir: Option<std::path::PathBuf>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
 ) -> Result<i32> {
     if !listen.ip().is_loopback() {
         return Err(miette::miette!(
@@ -615,6 +616,7 @@ pub async fn run_network_proxy(
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
+        additional_ca_bundle.as_deref(),
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
@@ -681,6 +683,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
@@ -706,6 +709,7 @@ pub async fn run_sandbox(
             ocsf_enabled,
             ocsf_schema_version,
             upstream_proxy_args,
+            additional_ca_bundle,
             backend_descriptor,
             auth_bundle,
             admitted_isolation_backend,
@@ -715,33 +719,35 @@ pub async fn run_sandbox(
     .await
 }
 
-struct SandboxRunConfig {
-    command: Vec<String>,
-    workdir: Option<String>,
-    timeout_secs: u64,
-    interactive: bool,
-    await_main_process_attachment: bool,
-    sandbox_id: Option<String>,
-    sandbox: Option<String>,
-    openshell_endpoint: Option<String>,
-    policy_rules: Option<String>,
-    policy_data: Option<String>,
-    ssh_socket_path: Option<String>,
-    health_socket_path: Option<std::path::PathBuf>,
-    health_port: Option<u16>,
-    ocsf_enabled: Arc<AtomicBool>,
-    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
-    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
-    auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    admitted_isolation_backend: Option<String>,
-    main_exit_marker: Option<std::path::PathBuf>,
+/// Trusted inputs for one supervisor launch.
+pub struct SandboxRunConfig {
+    pub command: Vec<String>,
+    pub workdir: Option<String>,
+    pub timeout_secs: u64,
+    pub interactive: bool,
+    pub await_main_process_attachment: bool,
+    pub sandbox_id: Option<String>,
+    pub sandbox: Option<String>,
+    pub openshell_endpoint: Option<String>,
+    pub policy_rules: Option<String>,
+    pub policy_data: Option<String>,
+    pub ssh_socket_path: Option<String>,
+    pub health_socket_path: Option<std::path::PathBuf>,
+    pub health_port: Option<u16>,
+    pub ocsf_enabled: Arc<AtomicBool>,
+    pub ocsf_schema_version: Arc<std::sync::Mutex<String>>,
+    pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    pub additional_ca_bundle: Option<String>,
+    pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
+    pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
+    pub admitted_isolation_backend: Option<String>,
+    pub main_exit_marker: Option<std::path::PathBuf>,
 }
 
 /// Trusted composition chooses the setup before shared admission, policy, and
 /// lifecycle handling. Payload contents never select a backend implementation.
 #[allow(clippy::similar_names)]
-async fn run_sandbox_with_backend(
+pub async fn run_sandbox_with_backend(
     backend_setup: &dyn backend_setup::BackendSetup,
     config: SandboxRunConfig,
 ) -> Result<i32> {
@@ -762,6 +768,7 @@ async fn run_sandbox_with_backend(
         ocsf_enabled,
         ocsf_schema_version,
         upstream_proxy_args,
+        additional_ca_bundle,
         backend_descriptor,
         auth_bundle,
         admitted_isolation_backend,
@@ -1006,8 +1013,6 @@ async fn run_sandbox_with_backend(
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
-    let transparent_tcp_capable = true;
-    let transparent_tcp_substrate_ready = true;
     // The denial channel is owned by the orchestrator: the proxy (in the
     // networking leaf) and the bypass monitor (in the process leaf) both
     // produce DenialEvents that the denial aggregator (orchestrator-side)
@@ -1106,6 +1111,7 @@ async fn run_sandbox_with_backend(
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
+            additional_ca_bundle.as_deref(),
             None,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
@@ -1261,10 +1267,6 @@ async fn run_sandbox_with_backend(
             extension_credentials: extension_credentials.clone(),
             extension_authentication_enabled: initial_extension_authentication_enabled,
             middleware_connector: default_middleware_connector(),
-            transparent_tcp: TransparentTcpReloadState {
-                capable: transparent_tcp_capable,
-                substrate_ready: transparent_tcp_substrate_ready,
-            },
             endpoint_observation_tx,
             endpoint_status_rx,
             endpoint_policy: poll_endpoint_policy,
@@ -2114,37 +2116,35 @@ where
     ))
 }
 
-#[tonic::async_trait]
 trait StartupGateway: Send + Sync {
-    async fn snapshot(
+    fn snapshot(
         &self,
         sandbox: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
-    async fn provider(
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
+    fn provider(
         &self,
         id: &str,
-    ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult>;
-    async fn sync(
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::ProviderEnvironmentResult>> + Send;
+    fn sync(
         &self,
         sandbox: &str,
         policy: &openshell_core::proto::SandboxPolicy,
         workspace: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
-    async fn report(
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
+    fn report(
         &self,
         id: &str,
         instance_id: &str,
         snapshot: Option<&openshell_core::grpc_client::SettingsPollResult>,
         state: openshell_core::proto::ConfigurationAdmissionState,
         error: &str,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 struct RemoteStartupGateway {
     endpoint: String,
 }
 
-#[tonic::async_trait]
 impl StartupGateway for RemoteStartupGateway {
     async fn snapshot(
         &self,
@@ -2213,7 +2213,7 @@ enum LocalPolicyIdentity {
 /// init maps the `sandbox` account to this pair; the host must not resolve
 /// guest selectors through its own account database.
 #[derive(Clone, Copy)]
-struct VmPolicyIdentity {
+pub struct VmPolicyIdentity {
     uid: u32,
     gid: u32,
 }
@@ -3020,14 +3020,12 @@ enum MiddlewareRegistryStatus {
 #[derive(Debug)]
 enum GatewayRuntimeReloadError {
     PolicyValidation(miette::Report),
-    TransparentTcpPrerequisite(miette::Report),
     MiddlewareRegistry(miette::Report),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GatewayRuntimeFailureClass {
     PolicyValidation,
-    TransparentTcpPrerequisite,
     MiddlewareRegistry,
 }
 
@@ -3035,9 +3033,6 @@ impl GatewayRuntimeReloadError {
     fn class(&self) -> GatewayRuntimeFailureClass {
         match self {
             Self::PolicyValidation(_) => GatewayRuntimeFailureClass::PolicyValidation,
-            Self::TransparentTcpPrerequisite(_) => {
-                GatewayRuntimeFailureClass::TransparentTcpPrerequisite
-            }
             Self::MiddlewareRegistry(_) => GatewayRuntimeFailureClass::MiddlewareRegistry,
         }
     }
@@ -3073,18 +3068,9 @@ async fn reload_gateway_policy_runtime(
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
-    transparent_tcp: TransparentTcpReloadState,
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
-    reload_gateway_configuration_runtime(
-        engine,
-        policy,
-        entrypoint_pid,
-        middleware,
-        transparent_tcp,
-        None,
-        || {},
-    )
-    .await
+    reload_gateway_configuration_runtime(engine, policy, entrypoint_pid, middleware, None, || {})
+        .await
 }
 
 async fn reload_gateway_configuration_runtime(
@@ -3092,7 +3078,6 @@ async fn reload_gateway_configuration_runtime(
     policy: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: u32,
     middleware: MiddlewareReloadContext<'_>,
-    transparent_tcp: TransparentTcpReloadState,
     vm_identity: Option<VmPolicyIdentity>,
     commit_credentials: impl FnOnce(),
 ) -> std::result::Result<PolicyGenerationGuard, GatewayRuntimeReloadError> {
@@ -3102,24 +3087,6 @@ async fn reload_gateway_configuration_runtime(
         identity
             .validate(policy)
             .map_err(GatewayRuntimeReloadError::PolicyValidation)?;
-    }
-    if let Some(policy) = policy
-        && policy_contains_explicit_tcp(policy)
-    {
-        if !transparent_tcp.capable {
-            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
-                miette::miette!(
-                    "candidate policy introduces protocol: tcp, but the runtime does not advertise transparent TCP support; previous policy remains active"
-                ),
-            ));
-        }
-        if !transparent_tcp.substrate_ready {
-            return Err(GatewayRuntimeReloadError::TransparentTcpPrerequisite(
-                miette::miette!(
-                    "candidate policy introduces protocol: tcp, but this sandbox started without the transparent TCP substrate; recreate the sandbox to enable TCP; previous policy remains active"
-                ),
-            ));
-        }
     }
     match policy {
         Some(policy) if middleware.registry_changed => {
@@ -3153,20 +3120,6 @@ async fn reload_gateway_configuration_runtime(
             miette::miette!("runtime reload requires a policy payload but none was returned"),
         )),
     }
-}
-
-fn policy_contains_explicit_tcp(policy: &openshell_core::proto::SandboxPolicy) -> bool {
-    policy.network_policies.values().any(|rule| {
-        rule.endpoints
-            .iter()
-            .any(|endpoint| endpoint.protocol.eq_ignore_ascii_case("tcp"))
-    })
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct TransparentTcpReloadState {
-    capable: bool,
-    substrate_ready: bool,
 }
 
 /// True when the installed middleware registry no longer matches the desired
@@ -3529,59 +3482,64 @@ fn initial_provider_credentials(
 /// The channel is FIFO, so a delayed older status can never arrive after a
 /// newer status and move the gateway's active version backward. Delivery uses
 /// the existing bounded retry, but failures never delay policy enforcement.
-#[tonic::async_trait]
 trait PolicyGatewayClient: Clone + Send + Sync + 'static {
     /// Refresh credentials while preserving the activated delivery requirement.
-    async fn fetch_provider_environment(
+    fn fetch_provider_environment(
         &self,
         endpoint: &str,
         sandbox_id: &str,
         requires_stable_placeholders: bool,
-    ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
-        openshell_core::grpc_client::fetch_provider_environment_with_stable_placeholders(
-            endpoint,
-            sandbox_id,
-            requires_stable_placeholders,
-        )
-        .await
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::ProviderEnvironmentResult>> + Send
+    {
+        async move {
+            openshell_core::grpc_client::fetch_provider_environment_with_stable_placeholders(
+                endpoint,
+                sandbox_id,
+                requires_stable_placeholders,
+            )
+            .await
+        }
     }
 
-    async fn poll_settings(
+    fn poll_settings(
         &self,
         sandbox: &str,
-    ) -> Result<openshell_core::grpc_client::SettingsPollResult>;
+    ) -> impl Future<Output = Result<openshell_core::grpc_client::SettingsPollResult>> + Send;
 
-    async fn report_policy_status(
+    fn report_policy_status(
         &self,
         sandbox_id: &str,
         version: u32,
         loaded: bool,
         error: &str,
-    ) -> Result<()>;
+    ) -> impl Future<Output = Result<()>> + Send;
 
-    async fn report_endpoint_status(
+    fn report_endpoint_status(
         &self,
         _sandbox_id: &str,
         _snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
-    ) -> Result<()> {
-        Ok(())
+    ) -> impl Future<Output = Result<()>> + Send {
+        async move { Ok(()) }
     }
 
-    async fn refresh_installed_extension_credentials(&self) -> Result<()> {
-        Ok(())
+    fn refresh_installed_extension_credentials(&self) -> impl Future<Output = Result<()>> + Send {
+        async move { Ok(()) }
     }
 
-    async fn extension_credentials_for(
+    fn extension_credentials_for(
         &self,
         _services: &[openshell_core::proto::SupervisorMiddlewareService],
-    ) -> Result<std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>> {
-        Ok(std::collections::HashMap::new())
+    ) -> impl Future<
+        Output = Result<
+            std::collections::HashMap<String, openshell_extension_core::BearerTokenSlot>,
+        >,
+    > + Send {
+        async move { Ok(std::collections::HashMap::new()) }
     }
 
     fn workspace(&self) -> String;
 }
 
-#[tonic::async_trait]
 impl PolicyGatewayClient for openshell_core::grpc_client::CachedOpenShellClient {
     async fn poll_settings(
         &self,
@@ -3790,8 +3748,6 @@ struct PolicyPollLoopContext {
     extension_credentials: openshell_extension_core::ExtensionCredentialStore,
     extension_authentication_enabled: bool,
     middleware_connector: MiddlewareConnector,
-    /// Immutable driver capability and startup substrate state.
-    transparent_tcp: TransparentTcpReloadState,
     /// Producer shared with network enforcement and policy installation.
     endpoint_observation_tx: Option<openshell_core::endpoint_status::EndpointObservationSender>,
     /// Single FIFO consumed by the endpoint status reporter.
@@ -3986,10 +3942,6 @@ enum GatewayRuntimeFailureDisposition {
     MiddlewareUnavailable {
         error: String,
     },
-    TransparentTcpExpansionRejected {
-        error: String,
-        active_generation: u64,
-    },
 }
 
 fn apply_gateway_runtime_reload_failure(
@@ -4011,42 +3963,12 @@ fn apply_gateway_runtime_reload_failure(
             )?;
             Ok(GatewayRuntimeFailureDisposition::PolicyRejected { error, disposition })
         }
-        GatewayRuntimeReloadError::TransparentTcpPrerequisite(error) => Ok(
-            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                error: error.to_string(),
-                active_generation: engine.current_generation(),
-            },
-        ),
         GatewayRuntimeReloadError::MiddlewareRegistry(error) => {
             Ok(GatewayRuntimeFailureDisposition::MiddlewareUnavailable {
                 error: error.to_string(),
             })
         }
     }
-}
-
-fn emit_transparent_tcp_expansion_rejection(
-    version: u32,
-    policy_hash: &str,
-    active_generation: u64,
-    error: &str,
-) {
-    let message = format!(
-        "Transparent TCP policy expansion rejected; previous policy IS active [version:{version} active_generation:{active_generation} error:{error}]"
-    );
-    ocsf_emit!(
-        ConfigStateChangeBuilder::new(ocsf_ctx())
-            .severity(SeverityId::High)
-            .status(StatusId::Failure)
-            .state(StateId::Enabled, "retained_previous_policy")
-            .unmapped("candidate_version", serde_json::json!(version))
-            .unmapped("candidate_policy_hash", serde_json::json!(policy_hash))
-            .unmapped("previous_policy_active", serde_json::json!(true))
-            .unmapped("active_generation", serde_json::json!(active_generation))
-            .unmapped("validation_error", serde_json::json!(error))
-            .message(message)
-            .build()
-    );
 }
 
 fn apply_policy_validation_failure(
@@ -4691,7 +4613,6 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     registry_changed: middleware_registry_changed,
                     connector: &ctx.middleware_connector,
                 },
-                ctx.transparent_tcp,
                 ctx.vm_identity,
                 || {
                     if let Some(prepared) = prepared_provider.as_ref() {
@@ -4869,26 +4790,6 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                                         result.version
                                     ))
                                     .build());
-                            }
-                            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                                error,
-                                active_generation,
-                            } => {
-                                emit_transparent_tcp_expansion_rejection(
-                                    result.version,
-                                    &result.policy_hash,
-                                    active_generation,
-                                    &error,
-                                );
-                                if policy_changed
-                                    && result.version > 0
-                                    && result.policy_source == PolicySource::Sandbox
-                                {
-                                    enqueue_policy_status(
-                                        &status_sender,
-                                        PolicyStatusUpdate::failed(result.version, error),
-                                    );
-                                }
                             }
                         }
                     }
@@ -5209,6 +5110,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(String::new())),
             openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            None,
             openshell_isolation_interface::contract::BackendDescriptor {
                 backend_name: "in-process-test".to_string(),
                 payload: b"in-process-only-launch-data".to_vec(),
@@ -5774,7 +5676,6 @@ network_policies:
         pending_acceptance: bool,
     }
 
-    #[tonic::async_trait]
     impl StartupGateway for TestStartupGateway {
         async fn snapshot(
             &self,
@@ -5989,7 +5890,6 @@ network_policies:
                 registry_changed: false,
                 connector: &default_middleware_connector(),
             },
-            TransparentTcpReloadState::default(),
             Some(VmPolicyIdentity {
                 uid: 1000,
                 gid: 1001,
@@ -6319,7 +6219,6 @@ network_policies:
         calls: UnboundedSender<StartupCall>,
     }
 
-    #[tonic::async_trait]
     impl StartupGateway for WriteRefusingStartupGateway {
         async fn snapshot(
             &self,
@@ -7267,7 +7166,6 @@ network_policies:
         polled_sandboxes: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedPolicyGateway {
         async fn poll_settings(
             &self,
@@ -7325,7 +7223,6 @@ network_policies:
         credential_requests: Arc<AtomicUsize>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for CredentialRejectingPolicyGateway {
         async fn poll_settings(
             &self,
@@ -7561,7 +7458,6 @@ network_policies:
         requests: UnboundedSender<ProviderFetchRequest>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ScriptedProviderGateway {
         async fn poll_settings(
             &self,
@@ -7707,7 +7603,6 @@ network_policies:
         first_poll: Arc<AtomicBool>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for GenerationChangingPolicyGateway {
         async fn poll_settings(
             &self,
@@ -8239,7 +8134,6 @@ network_policies:
             extension_credentials: openshell_extension_core::ExtensionCredentialStore::new(),
             extension_authentication_enabled: false,
             middleware_connector,
-            transparent_tcp: TransparentTcpReloadState::default(),
             endpoint_observation_tx: None,
             endpoint_status_rx: None,
             endpoint_policy: None,
@@ -8318,7 +8212,7 @@ network_policies:
     }
 
     #[tokio::test]
-    async fn poll_rejects_first_tcp_expansion_and_reports_previous_policy_active() {
+    async fn poll_installs_tcp_policy_reload() {
         let v1 = settings_poll_result(
             Some(proto_policy_fixture()),
             1,
@@ -8333,7 +8227,7 @@ network_policies:
             Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
         let active_generation = engine.current_generation();
         let loaded_revision = LoadedPolicyRevision::from_snapshot(&v1);
-        let mut ctx = policy_poll_test_context(
+        let ctx = policy_poll_test_context(
             engine.clone(),
             LoadedPolicyOrigin::Gateway {
                 revision: Some(loaded_revision),
@@ -8341,10 +8235,6 @@ network_policies:
             },
             default_middleware_connector(),
         );
-        ctx.transparent_tcp = TransparentTcpReloadState {
-            capable: true,
-            substrate_ready: false,
-        };
         let (client, polls, mut reports) = scripted_policy_gateway();
         polls.send(v1).unwrap();
 
@@ -8353,14 +8243,12 @@ network_policies:
         polls.send(v2).unwrap();
         let report = timeout(Duration::from_secs(1), reports.recv())
             .await
-            .expect("TCP rejection report timed out")
+            .expect("TCP reload report timed out")
             .expect("policy reporter stopped");
 
         assert_eq!(report.0, 2);
-        assert!(!report.1);
-        assert!(report.2.contains("recreate the sandbox"), "{}", report.2);
-        assert!(report.2.contains("previous policy remains active"));
-        assert_eq!(engine.current_generation(), active_generation);
+        assert!(report.1, "{}", report.2);
+        assert!(engine.current_generation() > active_generation);
         assert!(engine.fail_closed_reason().is_none());
         handle.abort();
     }
@@ -8795,15 +8683,9 @@ network_policies:
             .unwrap()
             .endpoints[0]
             .host = "repaired.example.com".into();
-        let failure = reload_gateway_policy_runtime(
-            &engine,
-            Some(&candidate),
-            0,
-            middleware(),
-            TransparentTcpReloadState::default(),
-        )
-        .await
-        .expect_err("invalid protobuf scalar must reject the complete candidate");
+        let failure = reload_gateway_policy_runtime(&engine, Some(&candidate), 0, middleware())
+            .await
+            .expect_err("invalid protobuf scalar must reject the complete candidate");
         assert!(matches!(
             failure,
             GatewayRuntimeReloadError::PolicyValidation(_)
@@ -8827,15 +8709,9 @@ network_policies:
         // Repair only the rejected scalar: the endpoint change must now install
         // with both runtime provenance flags and one new generation.
         candidate.landlock.as_mut().unwrap().compatibility = "best_effort".into();
-        reload_gateway_policy_runtime(
-            &engine,
-            Some(&candidate),
-            0,
-            middleware(),
-            TransparentTcpReloadState::default(),
-        )
-        .await
-        .expect("install repaired gateway policy");
+        reload_gateway_policy_runtime(&engine, Some(&candidate), 0, middleware())
+            .await
+            .expect("install repaired gateway policy");
         assert_gateway_policy_authorization(&engine, "repaired.example.com", generation + 1);
         assert_eq!(
             connections.load(Ordering::Relaxed),
@@ -9006,7 +8882,6 @@ network_policies:
                 registry_changed: true,
                 connector: &default_middleware_connector(),
             },
-            TransparentTcpReloadState::default(),
         )
         .await
         .expect_err("unavailable middleware must fail candidate preparation");
@@ -9025,74 +8900,6 @@ network_policies:
         ));
         assert_eq!(engine.current_generation(), active_generation);
         assert!(engine.fail_closed_reason().is_none());
-    }
-
-    #[tokio::test]
-    async fn tcp_policy_reload_without_startup_substrate_is_rejected_and_keeps_previous_policy() {
-        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
-        let active_generation = engine.current_generation();
-
-        let failure = reload_gateway_policy_runtime(
-            &engine,
-            Some(&proto_tcp_policy_fixture()),
-            0,
-            MiddlewareReloadContext {
-                desired_services: &[],
-                authentication: &MiddlewareAuthentication::default(),
-                registry_changed: false,
-                connector: &default_middleware_connector(),
-            },
-            TransparentTcpReloadState {
-                capable: true,
-                substrate_ready: false,
-            },
-        )
-        .await
-        .expect_err("TCP expansion must require startup substrate");
-        let disposition = apply_gateway_runtime_reload_failure(
-            &engine,
-            failure,
-            PolicyValidationFailureMode::FailClosed,
-            true,
-            2,
-        )
-        .expect("runtime prerequisite failure handling must succeed");
-
-        assert!(matches!(
-            disposition,
-            GatewayRuntimeFailureDisposition::TransparentTcpExpansionRejected {
-                active_generation: generation,
-                ..
-            } if generation == active_generation
-        ));
-        assert_eq!(engine.current_generation(), active_generation);
-        assert!(engine.fail_closed_reason().is_none());
-    }
-
-    #[tokio::test]
-    async fn tcp_policy_reload_on_unsupported_runtime_is_rejected() {
-        let engine = OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine");
-
-        let failure = reload_gateway_policy_runtime(
-            &engine,
-            Some(&proto_tcp_policy_fixture()),
-            0,
-            MiddlewareReloadContext {
-                desired_services: &[],
-                authentication: &MiddlewareAuthentication::default(),
-                registry_changed: false,
-                connector: &default_middleware_connector(),
-            },
-            TransparentTcpReloadState::default(),
-        )
-        .await
-        .expect_err("unsupported runtime must reject TCP expansion");
-
-        assert!(matches!(
-            failure,
-            GatewayRuntimeReloadError::TransparentTcpPrerequisite(_)
-        ));
-        assert_eq!(engine.current_generation(), 0);
     }
 
     #[test]

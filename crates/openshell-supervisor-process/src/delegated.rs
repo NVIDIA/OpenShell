@@ -3,14 +3,15 @@
 
 //! Supervisor-owned access-plane assembly for a remote sandbox.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
+use openshell_sandbox_backend::{BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use miette::Result;
-use openshell_isolation_interface::contract::{
-    BoundaryExec, BoundaryLoopbackConnector, BoundaryProcess,
-};
 #[cfg(unix)]
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
@@ -85,9 +86,9 @@ pub async fn start_boundary_access(
     ssh_socket_path: Option<&str>,
     shared_ssh_socket: bool,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    boundary_exec: Arc<dyn BoundaryExec>,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
-    agent: Arc<dyn BoundaryProcess>,
+    boundary_exec: Arc<BoundaryExec>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
+    agent: Arc<BoundaryProcess>,
     supervisor_session_updates: Option<tokio::sync::watch::Sender<Option<String>>>,
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<BoundaryAccess> {
@@ -147,8 +148,8 @@ async fn start_optional_ssh(
     socket_path: Option<std::path::PathBuf>,
     shared_socket: bool,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    boundary_exec: Arc<dyn BoundaryExec>,
-    port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    boundary_exec: Arc<BoundaryExec>,
+    port_forward: Arc<BoundaryLoopbackConnector>,
     main_session: Arc<crate::main_session::MainSession>,
     host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
@@ -203,8 +204,8 @@ async fn start_optional_ssh(
     socket_path: Option<std::path::PathBuf>,
     _shared_socket: bool,
     _ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    _boundary_exec: Arc<dyn BoundaryExec>,
-    _port_forward: Arc<dyn BoundaryLoopbackConnector>,
+    _boundary_exec: Arc<BoundaryExec>,
+    _port_forward: Arc<BoundaryLoopbackConnector>,
     _main_session: Arc<crate::main_session::MainSession>,
     _host_key: Option<russh::keys::PrivateKey>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>> {
@@ -273,14 +274,14 @@ mod tests {
     struct AccessBoundary;
 
     #[async_trait::async_trait]
-    impl BoundaryProcess for AccessBoundary {
+    impl rpc_test::BoundaryProcess for AccessBoundary {
         async fn attach(
             &self,
         ) -> std::result::Result<
-            openshell_isolation_interface::contract::ProcessAttachment,
+            openshell_sandbox_backend::ProcessAttachment,
             openshell_isolation_interface::contract::BackendError,
         > {
-            Ok(openshell_isolation_interface::contract::ProcessAttachment {
+            Ok(openshell_sandbox_backend::ProcessAttachment {
                 stdin: Box::new(tokio::io::sink()),
                 stdout: Box::new(tokio::io::empty()),
                 stderr: Some(Box::new(tokio::io::empty())),
@@ -311,12 +312,12 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl BoundaryExec for AccessBoundary {
+    impl rpc_test::BoundaryExec for AccessBoundary {
         async fn exec(
             &self,
             _: openshell_isolation_interface::contract::ExecSpec,
         ) -> std::result::Result<
-            openshell_isolation_interface::contract::ExecSession,
+            rpc_test::ExecSession,
             openshell_isolation_interface::contract::BackendError,
         > {
             Err(
@@ -328,7 +329,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl BoundaryLoopbackConnector for AccessBoundary {
+    impl rpc_test::BoundaryLoopbackConnector for AccessBoundary {
         async fn connect(
             &self,
             _: openshell_isolation_interface::contract::LoopbackTarget,
@@ -353,9 +354,9 @@ mod tests {
             None,
             false,
             None,
-            boundary.clone(),
-            boundary.clone(),
-            boundary,
+            rpc_test::exec(boundary.clone()),
+            rpc_test::loopback(boundary.clone()),
+            rpc_test::process(boundary),
             None,
             None,
         )
@@ -392,9 +393,9 @@ mod tests {
             Some("health.sock"),
             false,
             None,
-            boundary.clone(),
-            boundary.clone(),
-            boundary,
+            rpc_test::exec(boundary.clone()),
+            rpc_test::loopback(boundary.clone()),
+            rpc_test::process(boundary),
             None,
             None,
         )

@@ -827,6 +827,17 @@ pub(crate) async fn run_server(
 
     let state = Arc::new(state);
 
+    // Install the recorders before the endpoint-status startup reconciliation so
+    // the lock waits and timeouts recorded there are exported. Its listener
+    // binds with the others.
+    let prometheus_handle = gateway_metrics::install_global_recorder(
+        supervisor_session::RELAY_CAPACITY,
+        store.mutation_lock_connections(),
+        config.metrics_bind_address.is_some(),
+        meter_provider.as_ref(),
+    )
+    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+
     // Reconcile local-driver running intent before watchers spawn so their
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
@@ -874,15 +885,7 @@ pub(crate) async fn run_server(
         info!("Health server disabled");
     }
 
-    // Record metrics when the Prometheus endpoint or OTLP push is configured, and serve the
-    // endpoint on a dedicated port when configured.
-    let prometheus_handle = gateway_metrics::install_global_recorder(
-        supervisor_session::RELAY_CAPACITY,
-        store.mutation_lock_connections(),
-        config.metrics_bind_address.is_some(),
-        meter_provider.as_ref(),
-    )
-    .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let (Some(metrics_bind_address), Some(prometheus_handle)) =
         (config.metrics_bind_address, prometheus_handle)
     {
@@ -1665,6 +1668,17 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ComputeRuntime> {
+    let isolation_backend = driver_startup
+        .file
+        .map(|file| file.isolation_backend(selection.name()))
+        .transpose()
+        .map_err(Error::config)?
+        .flatten();
+    if isolation_backend.is_some() && config.gateway_jwt.is_none() {
+        return Err(Error::config(
+            "external isolation backends require gateway launch signing; configure openshell.gateway.gateway_jwt or the package-managed local signing keys",
+        ));
+    }
     let driver = validate_compute_driver_config(
         registry,
         selection.name(),
@@ -1760,7 +1774,8 @@ async fn build_compute_runtime(
     };
 
     let runtime = runtime
-        .with_admission_policy(admission)
+        .with_isolation_backend(isolation_backend)
+        .and_then(|runtime| runtime.with_admission_policy(admission))
         .and_then(|runtime| {
             runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
         })

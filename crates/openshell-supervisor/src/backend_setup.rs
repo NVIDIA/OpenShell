@@ -3,6 +3,9 @@
 
 //! Backend-owned launch decoding and client construction for supervisor startup.
 
+mod registration;
+pub use registration::{BackendRegistration, BackendRegistrations, RegisteredBackendSetup};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -12,9 +15,9 @@ use openshell_core::jwt::{SessionBearerTokenSlot, SupervisorAuthBundle};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::{
-    BackendDescriptor, BackendError, BackendRegistry, BoundBoundary, IsolationBackend,
-    ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
+    BackendDescriptor, BackendError, ResolvedWorkloadIdentity, SandboxContext, SandboxPolicy,
 };
+use openshell_sandbox_backend::BoundBoundary;
 
 /// Coordinates decoded by the selected trusted backend. Shared startup checks
 /// these against admission before credentials or discovery reach that backend.
@@ -27,8 +30,9 @@ pub struct LaunchIdentity {
     pub vm_policy_identity: Option<super::VmPolicyIdentity>,
 }
 
-/// Runtime state remains owned by the supervisor. Backends retain these same
-/// handles so CA publication, provider reload, and bearer rotation stay visible
+/// Runtime state remains owned by the supervisor.
+///
+/// Backends retain these same handles so CA publication, provider reload, and bearer rotation stay visible
 /// after attachment; copying their current contents would lose later updates.
 pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
@@ -36,10 +40,10 @@ pub struct BackendServices {
     pub sandbox_bearer: SessionBearerTokenSlot,
 }
 
-/// Private startup result; native payload decoding never reaches shared runtime
+/// Startup result; native payload decoding never reaches shared runtime
 /// descriptors or the public isolation interface.
 pub struct BuiltBackend {
-    pub backend: Arc<dyn IsolationBackend>,
+    pub backend: Arc<openshell_sandbox_backend::OpenShellRuntimeBackend>,
     pub payload: Vec<u8>,
     pub proxy_listener: Option<openshell_supervisor_network::run::ProxyListenerConfig>,
 }
@@ -159,14 +163,14 @@ impl SelectedBackend {
     }
 
     /// Construct and attach the selected client using the admitted policy and
-    /// shared services. Registry verification rejects a differently named client.
+    /// shared services. Client validation rejects a differently named endpoint selection.
     pub async fn attach(
         mut self,
         services: BackendServices,
         policy: SandboxPolicy,
         agent: AgentSpec,
     ) -> Result<(
-        Box<dyn BoundBoundary>,
+        Box<BoundBoundary>,
         Option<openshell_supervisor_network::run::ProxyListenerConfig>,
     )> {
         let built = self
@@ -174,17 +178,15 @@ impl SelectedBackend {
             .build(services)
             .map_err(|error| miette::miette!(error.to_string()))?;
         self.descriptor.payload = built.payload;
-        let mut registry = BackendRegistry::new();
-        registry
-            .register(built.backend)
-            .map_err(|error| miette::miette!(error.to_string()))?;
-        let admitted_backend = self.descriptor.backend_name.clone();
-        let (backend, verified) = registry
-            .resolve(self.descriptor, &admitted_backend)
-            .map_err(|error| miette::miette!(error.to_string()))?;
+        if built.backend.backend_name() != self.descriptor.backend_name {
+            return Err(miette::miette!(
+                "RPC client backend does not match admitted backend"
+            ));
+        }
+        let backend = built.backend;
         let bound = backend
             .attach(
-                verified,
+                self.descriptor,
                 SandboxContext {
                     sandbox_id: self.identity.sandbox_id,
                     session_id: self.identity.session_id,

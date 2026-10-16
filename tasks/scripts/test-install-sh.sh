@@ -870,8 +870,15 @@ gh() {
         *"?name=openshell-v0.1.0-pre.9-linux-amd64-deb"*)
           [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '123456\n'
           ;;
-        *"actions/runs/999"*) printf 'false\n' ;;
-        *"actions/runs/101"*) printf 'true\n' ;;
+        *"actions/runs/999"*)
+          printf '%s\n' '{"path":".github/workflows/branch.yml","status":"completed","conclusion":"success"}' | jq -r "$4"
+          ;;
+        *"actions/runs/101"*)
+          jq -n --arg path "${MOCK_PRERELEASE_WORKFLOW:-.github/workflows/release-prerelease.yml}" \
+            --arg status "${MOCK_PRERELEASE_STATUS:-completed}" \
+            --arg conclusion "${MOCK_PRERELEASE_CONCLUSION:-failure}" \
+            '{path: $path, status: $status, conclusion: $conclusion}' | jq -r "$4"
+          ;;
         *)
           ;;
       esac
@@ -909,13 +916,23 @@ if ! grep -Fq 'actions/artifacts?name=openshell-v1.0.0-pre.2-linux-amd64-deb' "$
 fi
 if ! grep -Fq 'actions/runs/999' "$mock_gh_log" ||
   ! grep -Fq 'actions/runs/101' "$mock_gh_log"; then
-  echo "FAIL: pre alias did not skip an unsuccessful run" >&2
+  echo "FAIL: pre alias did not skip an unrelated workflow" >&2
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq '.conclusion == "success"' "$mock_gh_log"; then
-  echo "FAIL: pre alias did not require a successful workflow run" >&2
-  cat "$mock_gh_log" >&2
+for workflow_state in completed:failure in_progress:null completed:success; do
+  resolved_prerelease="$(MOCK_PRERELEASE_STATUS="${workflow_state%:*}" \
+    MOCK_PRERELEASE_CONCLUSION="${workflow_state#*:}" OPENSHELL_VERSION=pre resolve_release_tag)"
+  if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
+    echo "FAIL: published prerelease was hidden by qualification state ${workflow_state}" >&2
+    exit 1
+  fi
+done
+
+resolved_prerelease="$(MOCK_PRERELEASE_WORKFLOW=.github/workflows/release-tag.yml \
+  MOCK_PRERELEASE_CONCLUSION=success OPENSHELL_VERSION=pre resolve_release_tag)"
+if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
+  echo "FAIL: pre alias did not accept packages published by the legacy release workflow" >&2
   exit 1
 fi
 if grep -Fq -- '--paginate' "$mock_gh_log"; then

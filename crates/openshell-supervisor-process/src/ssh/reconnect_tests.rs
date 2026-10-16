@@ -3,12 +3,14 @@
 
 //! Exercise a half-open gateway path through the production supervisor frame bridge.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use super::tests::{AcceptAnyServerKey, RejectingExec, TestLoopbackConnector};
 use super::*;
 use openshell_core::proto::{RelayFrame, relay_frame};
-use openshell_isolation_interface::contract::{
-    BackendError, BoundaryExitStatus, BoundaryProcess, BoundarySignal, ProcessAttachment,
-};
+use openshell_isolation_interface::contract::{BackendError, BoundaryExitStatus, BoundarySignal};
+use openshell_sandbox_backend::ProcessAttachment;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -27,7 +29,7 @@ enum RelayMode {
 struct RetainedProcess(AtomicUsize);
 
 #[async_trait::async_trait]
-impl BoundaryProcess for RetainedProcess {
+impl rpc_test::BoundaryProcess for RetainedProcess {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         std::future::pending().await
     }
@@ -62,7 +64,7 @@ impl CanonicalProcess {
                 stderr: None,
                 terminal: None,
             },
-            process.clone(),
+            rpc_test::process(process.clone()),
         );
         Self {
             session,
@@ -126,8 +128,8 @@ impl Connection {
             let _ = handle_connection(
                 stream,
                 config,
-                Arc::new(TestLoopbackConnector),
-                Arc::new(RejectingExec),
+                rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+                rpc_test::exec(Arc::new(RejectingExec)),
                 Some(main),
                 TEST_INTERVAL * 4,
             )

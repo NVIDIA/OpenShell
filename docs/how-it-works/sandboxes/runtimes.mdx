@@ -107,7 +107,7 @@ To pin specific GPUs, pass `cdi_devices` for Docker or Podman, or `gpu_device_id
 
 ## Docker Driver
 
-[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the gateway host. Docker is also required to build sandbox images from local directories or Dockerfiles.
+[Docker](https://www.docker.com/get-started/) runs sandboxes as containers on the Docker daemon host. The gateway accesses the daemon through its configured Unix socket. Docker is also required to build sandbox images from local directories or Dockerfiles.
 
 ```toml
 [openshell.gateway]
@@ -117,9 +117,15 @@ compute_driver = "docker"
 socket_path = "/var/run/docker.sock"
 ```
 
-Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
+Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `supervisor_network_mode`, `host_gateway_ip`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
-Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+`supervisor_network_mode` defaults to `host`. Set `bridge` to use Docker bridge networking; `auto` also selects host. The workload always retains `network=none`.
+
+Host mode on Docker Desktop requires host networking enabled. Bridge mode automatically uses `host.docker.internal` for a gateway on the Desktop host. On native Linux, the gateway and host services must listen on bridge-reachable addresses. Set `grpc_endpoint` for remote gateways, remapped published ports, or other custom layouts. Endpoint selection preserves TLS verification and does not change the gateway's listener. See [Docker configuration](/how-it-works/gateways/configuration#docker).
+
+OpenShell discovers Docker's host address automatically in bridge mode. Set `host_gateway_ip` only to override discovery.
+
+The sandbox must pass its Landlock and seccomp qualification in either network mode. For GPU sandboxes, configure Docker CDI before starting the gateway.
 
 ### Docker Corporate Proxy Egress
 
@@ -196,6 +202,8 @@ On macOS, set `host_gateway_ip` only if your Podman machine uses a non-standard 
 
 For networks that require a corporate proxy, set `https_proxy`, `no_proxy`, and related `proxy_*` options. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference.
 
+To trust a private CA for direct, policy-inspected HTTPS egress without a corporate proxy — for example, because the supervisor container cannot inherit a private CA baked into the workload image — set `additional_ca_bundle`. Both the supervisor and the workload trust the CA for all destinations, so use a CA you control. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for details.
+
 ### Podman Mounts
 
 Podman supports the same `volume`, `tmpfs`, and `bind` mounts as [Docker](#docker-mounts), using the `podman` key in driver config, and the same bind-mount warning applies. Podman `volume` mounts do not support `subpath`.
@@ -229,6 +237,36 @@ Registry downloads must match the resolved image digest, including the selected 
 VM sandboxes have no network interface. All traffic flows through the OpenShell supervisor on the host. For networks that require a corporate proxy, the VM driver accepts the same `https_proxy` and `proxy_*` options as Podman. To reach a proxy on the gateway host, use `http://host.openshell.internal:<port>`.
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
+
+### MicroVM Mounts
+
+The VM driver shares gateway-host directories into the guest with virtiofs. Each entry in `mounts` takes `source` (absolute host directory), `target`, optional `read_only` (default `true`), and optional `type`, which must be `bind` so Docker and Podman bind entries work unchanged:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"vm":{"mounts":[{"type":"bind","source":"/srv/datasets","target":"/sandbox/datasets"}]}}' \
+  -- claude
+```
+
+A sandbox takes at most 32 mounts on an arm64 gateway host and three on an x86_64 host. Single-file sources, sources that are symbolic links, `selinux_label`, and other mount types are not supported. VM mounts work only with the libkrun backend, so GPU sandboxes cannot use them.
+
+<Warning>
+VM bind mounts expose host files to sandbox workloads. Additionally, libkrun does not confine a compromised guest kernel to the configured source directory; it may access other host files permitted by the gateway user's permissions. VM mounts require the same opt-in as [Docker bind mounts](#docker-mounts):
+
+```toml
+[openshell.drivers.vm]
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.vm.resource_admission]
+enabled = false
+```
+
+</Warning>
+
+Targets cannot replace the workspace root, OpenShell paths, or VM-internal paths such as `/tmp`, `/proc`, `/dev`, and `/srv`, and cannot be nested inside one another. The guest refuses a target that passes through a symlink in the image.
+
+On Linux with a non-root gateway, the sandbox can create files in a read-write mount only when its UID and GID match the gateway user's. Set `sandbox_uid` and `sandbox_gid` under `[openshell.drivers.vm]` to match. Otherwise the sandbox cannot create files, and its access to existing files follows the host permission bits for its numeric UID and GID.
 
 ## Kubernetes Driver
 

@@ -404,6 +404,66 @@ impl OcsfEvent {
                 format!("SSH:{activity} {sev}{detail}{auth_ctx}")
             }
 
+            Self::Authentication(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e
+                    .action
+                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let principal = e
+                    .user
+                    .uid
+                    .as_deref()
+                    .or(e.user.name.as_deref())
+                    .unwrap_or_default();
+                let principal =
+                    escape_context_field(&truncate_with_ellipsis(principal, MAX_REASON_LEN));
+                let principal = if e.user.type_id == crate::enums::UserTypeId::Unknown {
+                    principal
+                } else {
+                    format!(
+                        "{}:{principal}",
+                        escape_context_field(&e.user.type_label.to_lowercase())
+                    )
+                };
+                let peer = e
+                    .src_endpoint
+                    .as_ref()
+                    .map(|ep| {
+                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
+                        format!(" from {}{port}", ep.domain_or_ip())
+                    })
+                    .unwrap_or_default();
+                let mut context = Vec::new();
+                if let Some(protocol) = e.auth_protocol.map(|p| {
+                    e.auth_protocol_label
+                        .as_deref()
+                        .unwrap_or_else(|| p.label())
+                }) {
+                    context.push(format!("protocol:{}", escape_context_field(protocol)));
+                }
+                if let Some(path) = e
+                    .http_request
+                    .as_ref()
+                    .and_then(|r| r.url.as_ref())
+                    .and_then(|u| u.path.as_deref())
+                {
+                    context.push(format!(
+                        "op:{}",
+                        escape_context_field(&truncate_with_ellipsis(path, MAX_REASON_LEN))
+                    ));
+                }
+                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
+                    context.push(format!("reason:{}", escape_context_field(&reason)));
+                }
+                let context = if context.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", context.join(" "))
+                };
+
+                format!("AUTH:{activity} {sev}{action} {principal}{peer}{context}")
+            }
+
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
                 let proc_str = format!("{}({})", e.process.name, e.process.pid);
@@ -1037,6 +1097,49 @@ mod tests {
         assert_eq!(
             shorthand,
             "SSH:OPEN [INFO] ALLOWED 10.42.0.1:48201 [auth:NSSH1]"
+        );
+    }
+
+    #[test]
+    fn test_authentication_failure_shorthand() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .auth_protocol(crate::enums::AuthProtocolId::OpenId)
+        .action(ActionId::Denied)
+        .severity(crate::enums::SeverityId::Medium)
+        .status_detail("expired_credential")
+        .src_endpoint(Endpoint::from_ip_str("203.0.113.7", 51234))
+        .http_request(HttpRequest {
+            http_method: crate::enums::HttpMethod::Post,
+            url: Some(Url::from_path("/openshell.v1.OpenShell/ListSandboxes")),
+        })
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [MED] DENIED unknown from 203.0.113.7:51234 [protocol:OpenID op:/openshell.v1.OpenShell/ListSandboxes reason:expired_credential]"
+        );
+    }
+
+    #[test]
+    fn test_authentication_success_shorthand_labels_principal_type() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::other("sb 7f3a", "Sandbox"),
+            Service::new("openshell-gateway"),
+        )
+        .auth_protocol_other("sandbox_jwt")
+        .action(ActionId::Allowed)
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [INFO] ALLOWED sandbox:sb\\u{20}7f3a [protocol:sandbox_jwt]"
         );
     }
 

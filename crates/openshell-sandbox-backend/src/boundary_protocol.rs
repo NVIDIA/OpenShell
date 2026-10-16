@@ -5,9 +5,9 @@
 //!
 //! Drivers choose and provision the transport, but they do not redefine the
 //! process lifecycle, streaming, identity, or authentication messages.  The
-//! supervisor and sandbox exchange these length-delimited JSON frames inside
-//! gRPC streams on one mutually authenticated connection. The driver chooses
-//! the underlying private Unix socket, TCP connection, or virtio-vsock stream.
+//! supervisor and sandbox exchange typed protobuf messages over gRPC. The
+//! length-delimited helpers below adapt only private, in-process Rust streams.
+//! The driver chooses the underlying private Unix socket, TCP connection, or virtio-vsock stream.
 
 use std::fmt;
 use std::io;
@@ -25,11 +25,9 @@ use openshell_isolation_interface::AgentSpec;
 use openshell_isolation_interface::contract::Sha256Digest;
 use openshell_isolation_interface::contract::{
     BackendDescriptor, BackendError, BinaryIdentity, BoundaryConfirmation, BoundaryExitStatus,
-    BoundaryProperties, BoundarySignal, EnforcedProperty, ExecSpec, ExecutableIdentity,
-    OuterFenceGuarantees, ResolveError, ShellSpec,
+    BoundarySignal, ExecSpec, ExecutableIdentity, ProvisioningEvidence, ResolveError, ShellSpec,
 };
 use rcgen::{CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -162,42 +160,6 @@ impl NativeLinuxSandboxAuditEvidence {
             ))
         }
     }
-
-    /// Project backend measurements into the common property contract.
-    #[must_use]
-    pub fn properties(&self) -> BoundaryProperties {
-        BoundaryProperties {
-            filesystem_confinement: EnforcedProperty::new(
-                self.landlock_abi >= 3 && self.landlock_allow_deny,
-                format!("landlock-v{}", self.landlock_abi),
-            ),
-            egress_interception: EnforcedProperty::new(
-                self.seccomp.new_listener
-                    && self.seccomp.notification_round_trip
-                    && self.seccomp.addfd_send
-                    && self.udp_dns_round_trip
-                    && self.tcp_dns_round_trip
-                    && self.tcp_allow_round_trip
-                    && self.tcp_deny_round_trip
-                    && self.socket_loopback_confinement,
-                "seccomp-notify",
-            ),
-            request_attribution: EnforcedProperty::new(
-                self.seccomp.id_validation
-                    && self.seccomp.proc_fd_identity
-                    && self.seccomp.task_memory_read,
-                "seccomp-notify-procfs",
-            ),
-            privilege_floor: EnforcedProperty::new(
-                self.capabilities.is_empty()
-                    && self.no_new_privileges
-                    && !self.sandbox_dumpable
-                    && self.child_dumpable
-                    && self.core_limit_zero,
-                "linux-capability-free",
-            ),
-        }
-    }
 }
 
 /// Ephemeral identity of the supervisor process that owns one sandbox runtime.
@@ -276,25 +238,7 @@ impl<'de> Deserialize<'de> for SupervisorInstanceId {
 #[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
 pub struct SupervisorInstanceIdError;
 
-/// Driver-selected byte-stream transport for the `OpenShell` Sandbox Protocol.
-/// Authentication is configured separately and is identical for every variant.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-pub enum SandboxTransport {
-    Unix {
-        socket_path: PathBuf,
-    },
-    Tcp {
-        /// Stable logical Kubernetes Service authority used for diagnostics.
-        authority: String,
-        /// Explicit connection candidates resolved by the compute driver.
-        addresses: Vec<std::net::SocketAddr>,
-    },
-    Vsock {
-        guest_cid: u32,
-        port: u32,
-    },
-}
+pub use openshell_core::isolation_registration::SandboxTransport;
 
 /// Supervisor-side, generation-pinned TLS server authentication.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,7 +389,7 @@ pub struct SandboxRuntimeDescriptor {
     #[serde(default)]
     pub resource_claims: std::collections::BTreeMap<String, String>,
     /// Backend-neutral projection of the validated outer network fence.
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
 }
 
 impl fmt::Debug for SandboxRuntimeDescriptor {
@@ -459,7 +403,7 @@ impl fmt::Debug for SandboxRuntimeDescriptor {
             .field("tls", &self.tls)
             .field("host_gateway_ip", &self.host_gateway_ip)
             .field("resource_claims", &self.resource_claims)
-            .field("outer_fence", &self.outer_fence)
+            .field("provisioning_evidence", &self.provisioning_evidence)
             .finish()
     }
 }
@@ -513,7 +457,7 @@ pub struct BoundaryConfig {
     /// Exact identity already applied by the runtime to the sandbox process.
     pub workload_identity: openshell_isolation_interface::contract::ResolvedWorkloadIdentity,
     /// Backend-neutral projection of the validated outer network fence.
-    pub outer_fence: OuterFenceGuarantees,
+    pub provisioning_evidence: ProvisioningEvidence,
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
@@ -541,7 +485,7 @@ impl fmt::Debug for BoundaryConfig {
             .field("resource_claims", &self.resource_claims)
             .field("resource_claim_files", &self.resource_claim_files)
             .field("workload_identity", &self.workload_identity)
-            .field("outer_fence", &self.outer_fence)
+            .field("provisioning_evidence", &self.provisioning_evidence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
             .finish()
     }
@@ -626,12 +570,12 @@ pub async fn read_stream_frame(
 pub struct RequestEnvelope {
     /// Cryptographically random idempotency key scoped to one sandbox generation.
     pub request_id: String,
-    /// SHA-256 of the canonically serialized request payload.
+    /// Local replay fingerprint of decoded protobuf fields; never transmitted.
     pub payload_digest: String,
     /// Absolute exec admission deadline, preserved across retries and bound to
     /// the payload digest. Other request kinds do not expire through this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exec_expires_at_unix_ms: Option<u64>,
+    pub exec_admission_deadline_unix_ms: Option<u64>,
     pub request: Request,
 }
 
@@ -639,18 +583,18 @@ impl RequestEnvelope {
     /// Build a request envelope with a fresh idempotency key and normalized
     /// payload digest.
     pub fn new(request: Request) -> Result<Self, FrameError> {
-        let exec_expires_at_unix_ms = if matches!(request, Request::Exec { .. }) {
+        let exec_admission_deadline_unix_ms = if matches!(request, Request::Exec { .. }) {
             let window_ms =
                 u64::try_from(EXEC_REQUEST_RETRY_WINDOW.as_millis()).map_err(io::Error::other)?;
             Some(unix_time_millis()?.saturating_add(window_ms))
         } else {
             None
         };
-        let payload_digest = request_envelope_digest(&request, exec_expires_at_unix_ms)?;
+        let payload_digest = request_envelope_digest(&request, exec_admission_deadline_unix_ms)?;
         Ok(Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload_digest,
-            exec_expires_at_unix_ms,
+            exec_admission_deadline_unix_ms,
             request,
         })
     }
@@ -658,7 +602,7 @@ impl RequestEnvelope {
     /// Verify that the request body still matches the immutable digest bound
     /// to this idempotency key.
     pub fn validate_payload_digest(&self) -> Result<(), FrameError> {
-        let actual = request_envelope_digest(&self.request, self.exec_expires_at_unix_ms)?;
+        let actual = request_envelope_digest(&self.request, self.exec_admission_deadline_unix_ms)?;
         if actual == self.payload_digest {
             Ok(())
         } else {
@@ -675,19 +619,19 @@ pub fn unix_time_millis() -> Result<u64, FrameError> {
     u64::try_from(elapsed.as_millis()).map_err(|error| FrameError::Io(io::Error::other(error)))
 }
 
-fn request_envelope_digest(
+pub(crate) fn request_envelope_digest(
     request: &Request,
-    exec_expires_at_unix_ms: Option<u64>,
+    exec_admission_deadline_unix_ms: Option<u64>,
 ) -> Result<String, FrameError> {
-    // Sort every object explicitly: dependency features may make Value retain
-    // insertion order. Provider environments must hash identically after
-    // deserialization and across independently serialized retries.
-    let mut normalized = serde_json::to_value(request).map_err(FrameError::Serialize)?;
-    if let Some(expires_at) = exec_expires_at_unix_ms {
-        normalized["exec_expires_at_unix_ms"] = expires_at.into();
-    }
-    normalized.sort_all_objects();
-    let payload = serde_json::to_vec(&normalized).map_err(FrameError::Serialize)?;
+    // Stable local replay fingerprint of decoded protobuf fields. Maps use
+    // BTreeMap in generated messages; neither clients nor the wire carry this.
+    let envelope = RequestEnvelope {
+        request_id: String::new(),
+        payload_digest: String::new(),
+        exec_admission_deadline_unix_ms,
+        request: request.clone(),
+    };
+    let payload = crate::protobuf::encode(&envelope)?;
     let digest = Sha256::digest(payload);
     Ok(format!("{digest:x}"))
 }
@@ -710,15 +654,11 @@ pub enum Request {
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
-        resource_claims: std::collections::BTreeMap<String, String>,
     },
     Confirm,
-    /// Verify file-open mediation before sending a file-bearing snapshot.
-    ProbeProviderFiles,
     StartAgent {
         sandbox_id: String,
         spec: AgentSpecWire,
-        policy: Box<SandboxPolicyWire>,
         ca_cert: Option<String>,
         ca_bundle: Option<String>,
         provider_env_revision: u64,
@@ -753,10 +693,6 @@ pub enum Request {
     Exec {
         spec: ExecSpecWire,
     },
-    ExecSignal {
-        process_id: String,
-        signal: SignalWire,
-    },
     Resize {
         process_id: String,
         cols: u16,
@@ -787,7 +723,6 @@ impl Request {
                 | Self::Signal { .. }
                 | Self::Terminate { .. }
                 | Self::TerminateBoundary
-                | Self::ExecSignal { .. }
                 | Self::Resize { .. }
         )
     }
@@ -800,18 +735,14 @@ impl fmt::Debug for Request {
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
-                resource_claims,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
-                .field("resource_claims", resource_claims)
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
-            Self::ProbeProviderFiles => formatter.write_str("ProbeProviderFiles"),
             Self::StartAgent {
                 sandbox_id,
                 spec,
-                policy: _,
                 ca_cert,
                 ca_bundle,
                 provider_env_revision,
@@ -821,7 +752,6 @@ impl fmt::Debug for Request {
                 .debug_struct("StartAgent")
                 .field("sandbox_id", sandbox_id)
                 .field("spec", spec)
-                .field("policy", &"<redacted>")
                 .field("ca_cert_present", &ca_cert.is_some())
                 .field("ca_bundle_present", &ca_bundle.is_some())
                 .field("provider_env_revision", provider_env_revision)
@@ -865,11 +795,6 @@ impl fmt::Debug for Request {
                 .finish(),
             Self::TerminateBoundary => formatter.write_str("TerminateBoundary"),
             Self::Exec { spec } => formatter.debug_tuple("Exec").field(spec).finish(),
-            Self::ExecSignal { process_id, signal } => formatter
-                .debug_struct("ExecSignal")
-                .field("process_id", process_id)
-                .field("signal", signal)
-                .finish(),
             Self::Resize {
                 process_id,
                 cols,
@@ -912,7 +837,6 @@ pub enum Response {
         /// before workload launch.
         confirmation: Box<BoundaryConfirmation>,
     },
-    ProviderFilesSupported,
     Started {
         process_id: String,
         provider_env_revision: u64,
@@ -938,12 +862,14 @@ pub enum Response {
         pty: bool,
     },
     Resized,
-    PortConnected,
+    LoopbackConnected,
     MediationReady,
     NetworkConnected {
         identity: BinaryIdentityWire,
         destination: std::net::SocketAddr,
-        socket: openshell_isolation_interface::contract::NetworkSocketMetadata,
+        /// Native evidence is absent for guest host calls without kernel sockets.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<openshell_isolation_interface::contract::NetworkSocketMetadata>,
         policy_generation: u64,
         timing: MediationTimingWire,
     },
@@ -1008,6 +934,7 @@ pub enum BoundaryErrorKind {
     Unavailable,
     Terminated,
     Process,
+    Unsupported,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1366,8 +1293,11 @@ impl From<BoundaryExitStatus> for ExitStatusWire {
     }
 }
 
-pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
-    let payload = serde_json::to_vec(message).map_err(FrameError::Serialize)?;
+pub fn encode_frame<T: crate::protobuf::WireMessage>(message: &T) -> Result<Vec<u8>, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
+    let payload = crate::protobuf::encode(message)?;
     if payload.len() > MAX_CONTROL_FRAME_BYTES {
         return Err(FrameError::TooLarge(payload.len()));
     }
@@ -1378,7 +1308,10 @@ pub fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> {
+pub fn decode_frame<T: crate::protobuf::WireMessage>(frame: &[u8]) -> Result<T, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let header: [u8; 4] = frame
         .get(..4)
         .ok_or(FrameError::Truncated)?
@@ -1395,10 +1328,13 @@ pub fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> Result<T, FrameError> 
             actual: payload.len(),
         });
     }
-    serde_json::from_slice(payload).map_err(FrameError::Deserialize)
+    crate::protobuf::decode(payload)
 }
 
-pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, FrameError> {
+pub fn read_frame<T: crate::protobuf::WireMessage>(reader: &mut impl Read) -> Result<T, FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let mut header = [0_u8; 4];
     reader.read_exact(&mut header)?;
     let declared = u32::from_be_bytes(header) as usize;
@@ -1415,7 +1351,8 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T, Fram
 pub async fn read_frame_async<R, T>(reader: &mut R) -> Result<T, FrameError>
 where
     R: AsyncRead + Unpin,
-    T: DeserializeOwned,
+    T: crate::protobuf::WireMessage,
+    T::Proto: prost::Message + Default,
 {
     use tokio::io::AsyncReadExt as _;
 
@@ -1432,7 +1369,13 @@ where
     decode_frame(&frame)
 }
 
-pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result<(), FrameError> {
+pub fn write_frame<T: crate::protobuf::WireMessage>(
+    writer: &mut impl Write,
+    message: &T,
+) -> Result<(), FrameError>
+where
+    T::Proto: prost::Message + Default,
+{
     let frame = encode_frame(message)?;
     writer.write_all(&frame)?;
     writer.flush()?;
@@ -1441,16 +1384,14 @@ pub fn write_frame<T: Serialize>(writer: &mut impl Write, message: &T) -> Result
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
+    #[error("invalid protobuf message: {0}")]
+    Protobuf(String),
     #[error("control frame is truncated")]
     Truncated,
     #[error("control frame is too large: {0} bytes")]
     TooLarge(usize),
     #[error("control frame declared {declared} bytes but contained {actual}")]
     LengthMismatch { declared: usize, actual: usize },
-    #[error("serialize control frame: {0}")]
-    Serialize(serde_json::Error),
-    #[error("deserialize control frame: {0}")]
-    Deserialize(serde_json::Error),
     #[error("control request payload digest does not match its envelope")]
     PayloadDigestMismatch,
     #[error("read or write control frame: {0}")]
@@ -1496,23 +1437,10 @@ mod tests {
     }
 
     #[test]
-    fn native_linux_audit_evidence_projects_backend_neutral_properties() {
-        let audit = complete_audit_evidence();
-        audit.validate().unwrap();
-        let properties = audit.properties();
-        assert!(properties.filesystem_confinement.enforced);
-        assert_eq!(properties.filesystem_confinement.mechanism, "landlock-v6");
-        assert!(properties.egress_interception.enforced);
-        assert!(properties.request_attribution.enforced);
-        assert!(properties.privilege_floor.enforced);
-    }
-
-    #[test]
     fn native_linux_audit_evidence_rejects_mechanism_failure() {
         let mut audit = complete_audit_evidence();
         audit.seccomp.addfd_send = false;
         assert!(audit.validate().is_err());
-        assert!(!audit.properties().egress_interception.enforced);
     }
 
     #[test]
@@ -1520,7 +1448,6 @@ mod tests {
         let mut audit = complete_audit_evidence();
         audit.socket_loopback_confinement = false;
         assert!(audit.validate().is_err());
-        assert!(!audit.properties().egress_interception.enforced);
     }
 
     #[test]
@@ -1593,7 +1520,7 @@ mod tests {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
-            exec_expires_at_unix_ms: None,
+            exec_admission_deadline_unix_ms: None,
             request: Request::StartAgent {
                 provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-1".to_string(),
@@ -1604,13 +1531,6 @@ mod tests {
                     timeout_secs: 5,
                     interactive: false,
                 },
-                policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
-                    version: 1,
-                    filesystem: FilesystemPolicy::default(),
-                    network: NetworkPolicy::default(),
-                    landlock: LandlockPolicy::default(),
-                    process: ProcessPolicy::default(),
-                })),
                 ca_cert: Some("test certificate".to_string()),
                 ca_bundle: Some("test bundle".to_string()),
                 provider_env_revision: 7,
@@ -1629,7 +1549,6 @@ mod tests {
         let decoded: RequestEnvelope = decode_frame(&frame).expect("decode request");
         assert_eq!(decoded, request);
         let debug = format!("{request:?}");
-        assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("test credential"));
         assert!(!debug.contains("test certificate"));
         assert!(!debug.contains("test bundle"));
@@ -1654,30 +1573,27 @@ mod tests {
         .unwrap();
         let after = unix_time_millis().unwrap();
         let window_ms = u64::try_from(EXEC_REQUEST_RETRY_WINDOW.as_millis()).unwrap();
-        let deadline = request.exec_expires_at_unix_ms.unwrap();
+        let deadline = request.exec_admission_deadline_unix_ms.unwrap();
         assert!((before + window_ms..=after + window_ms).contains(&deadline));
         let frame = encode_frame(&request).unwrap();
         let mut retry: RequestEnvelope = decode_frame(&frame).unwrap();
         assert_eq!(retry, request);
         retry.validate_payload_digest().unwrap();
-        retry.exec_expires_at_unix_ms = Some(deadline + 1);
+        retry.exec_admission_deadline_unix_ms = Some(deadline + 1);
         assert!(matches!(
             retry.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
-        retry.exec_expires_at_unix_ms = None;
-        assert!(matches!(
-            retry.validate_payload_digest(),
-            Err(FrameError::PayloadDigestMismatch)
-        ));
+        retry.exec_admission_deadline_unix_ms = None;
+        assert!(retry.validate_payload_digest().is_err());
     }
 
     #[test]
     fn non_exec_requests_have_no_deadline() {
         let envelope = RequestEnvelope::new(Request::Confirm).unwrap();
-        assert!(envelope.exec_expires_at_unix_ms.is_none());
+        assert!(envelope.exec_admission_deadline_unix_ms.is_none());
         let encoded = serde_json::to_value(&envelope).unwrap();
-        assert!(encoded.get("exec_expires_at_unix_ms").is_none());
+        assert!(encoded.get("exec_admission_deadline_unix_ms").is_none());
         let decoded: RequestEnvelope = serde_json::from_value(encoded).unwrap();
         decoded.validate_payload_digest().unwrap();
     }
@@ -1696,15 +1612,9 @@ mod tests {
             revision: 2,
             provider_env,
         };
-        // Pin the canonical bytes, including the nested environment object.
-        // Two randomized HashMaps can otherwise happen to iterate identically
-        // and conceal a serializer that preserves insertion order.
-        let expected = format!(
-            "{:x}",
-            Sha256::digest(
-                br#"{"generation":1,"operation":"update_provider_environment","provider_env":{"A":"1","B":"2"},"provider_files":{},"revision":2}"#
-            )
-        );
+        // The fingerprint is local: independently ordered protobuf maps must
+        // compare equally, while changed decoded fields must not replay.
+        let expected = request_envelope_digest(&build(first.clone()), None).unwrap();
         for provider_env in [first, second] {
             let request = build(provider_env);
             assert_eq!(
@@ -1778,13 +1688,6 @@ mod tests {
                 timeout_secs: 5,
                 interactive: false,
             },
-            policy: Box::new(SandboxPolicyWire::from(SandboxPolicy {
-                version: 1,
-                filesystem: FilesystemPolicy::default(),
-                network: NetworkPolicy::default(),
-                landlock: LandlockPolicy::default(),
-                process: ProcessPolicy::default(),
-            })),
             ca_cert: Some("A".repeat(16 * 1024)),
             ca_bundle: Some("B".repeat(400 * 1024)),
             provider_env_revision: 0,

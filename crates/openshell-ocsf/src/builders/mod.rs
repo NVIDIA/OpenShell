@@ -135,6 +135,7 @@ macro_rules! impl_src_endpoint_addr_setter {
 }
 
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
 mod finding;
@@ -145,6 +146,7 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
 pub use finding::DetectionFindingBuilder;

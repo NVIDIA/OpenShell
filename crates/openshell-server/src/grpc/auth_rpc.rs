@@ -15,6 +15,8 @@
 //! ordinary RPCs or select another successor.
 
 use crate::ServerState;
+use crate::auth::audit;
+use crate::auth::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection};
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
@@ -147,6 +149,71 @@ pub async fn handle_issue_sandbox_token(
 }
 
 #[allow(clippy::result_large_err, clippy::unused_async)]
+const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
+
+/// The authenticator chain defers lineage checks for refresh to this handler,
+/// so its rejections are audited here.
+async fn authenticate_refresh(
+    state: &ServerState,
+    session_authority: &crate::auth::sandbox_jwt::SandboxSessionJwtAuthority,
+    metadata: &tonic::metadata::MetadataMap,
+    sandbox_id: &str,
+    request_hash: &crate::auth::sandbox_session::RefreshRequestHash,
+    now: i64,
+) -> Result<
+    (
+        openshell_core::jwt::AuthenticatedSandboxSession,
+        crate::auth::sandbox_session::RefreshAuthorization,
+    ),
+    AuthRejection,
+> {
+    let reject = |reason, message: &str| {
+        AuthRejection::new(
+            AuthMechanism::SandboxJwt,
+            reason,
+            Status::unauthenticated(message),
+        )
+    };
+    let mut authorization_values = metadata.get_all("authorization").iter();
+    let authorization = authorization_values.next().ok_or_else(|| {
+        reject(
+            AuthFailureReason::MissingCredential,
+            "missing authorization metadata",
+        )
+    })?;
+    if authorization_values.next().is_some() {
+        return Err(reject(
+            AuthFailureReason::ConflictingCredentials,
+            "duplicate authorization metadata",
+        ));
+    }
+    let gateway_token = authorization
+        .to_str()
+        .ok()
+        .and_then(openshell_core::auth::strip_bearer_scheme)
+        .ok_or_else(|| {
+            reject(
+                AuthFailureReason::MalformedCredential,
+                "invalid bearer authorization metadata",
+            )
+        })?;
+    let principal = session_authority.verify_gateway_token(gateway_token)?;
+    if principal.sandbox_id.as_str() != sandbox_id {
+        return Err(reject(
+            AuthFailureReason::InvalidCredential,
+            "gateway token does not match the authenticated sandbox",
+        ));
+    }
+    let authorization = crate::auth::sandbox_session::authorize_refresh(
+        &state.store,
+        &principal,
+        request_hash,
+        now,
+    )
+    .await?;
+    Ok((principal, authorization))
+}
+
 pub async fn handle_refresh_sandbox_token(
     state: &Arc<ServerState>,
     request: Request<RefreshSandboxTokenRequest>,
@@ -188,36 +255,27 @@ pub async fn handle_refresh_sandbox_token(
         .as_ref()
         .ok_or_else(|| Status::unavailable("sandbox session minting is not configured"))?;
 
-    let authorization_values = request.metadata().get_all("authorization");
-    let mut authorization_values = authorization_values.iter();
-    let authorization = authorization_values
-        .next()
-        .ok_or_else(|| Status::unauthenticated("missing authorization metadata"))?;
-    if authorization_values.next().is_some() {
-        return Err(Status::unauthenticated("duplicate authorization metadata"));
-    }
-    let gateway_token = authorization
-        .to_str()
-        .ok()
-        .and_then(openshell_core::auth::strip_bearer_scheme)
-        .ok_or_else(|| Status::unauthenticated("invalid bearer authorization metadata"))?;
-    let principal = session_authority.verify_gateway_token(gateway_token)?;
-    if principal.sandbox_id.as_str() != sandbox.sandbox_id {
-        return Err(Status::unauthenticated(
-            "gateway token does not match the authenticated sandbox",
-        ));
-    }
     let request_hash = crate::auth::sandbox_session::RefreshRequestHash::from_extension_services(
         &requested_extension_services,
     );
     let issued_at = current_unix_seconds();
-    let authorization = crate::auth::sandbox_session::authorize_refresh(
-        &state.store,
-        &principal,
+    let (principal, authorization) = authenticate_refresh(
+        state,
+        session_authority,
+        request.metadata(),
+        &sandbox.sandbox_id,
         &request_hash,
         issued_at,
     )
-    .await?;
+    .await
+    .map_err(|rejection| {
+        audit::emit_authentication_failure(
+            REFRESH_SANDBOX_TOKEN_PATH,
+            Some(rejection.mechanism),
+            rejection.reason,
+        );
+        rejection.status
+    })?;
     let (successor, should_rotate) = match authorization {
         crate::auth::sandbox_session::RefreshAuthorization::Current(identity) => (
             identity.next_gateway_token(
@@ -696,6 +754,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_with_a_consumed_bearer_emits_stale_identity() {
+        use openshell_ocsf::test_support::OcsfCapture;
+
+        let state = state_with_issuer().await;
+        let request = || {
+            let mut request = Request::new(RefreshSandboxTokenRequest {
+                extension_service_names: Vec::new(),
+            });
+            request
+                .extensions_mut()
+                .insert(sandbox_principal("sandbox-a"));
+            request
+        };
+        let mut first_request = request();
+        let first = authorize_refresh(&state, &mut first_request).await;
+        let second = handle_refresh_sandbox_token(&state, first_request)
+            .await
+            .expect("first refresh")
+            .into_inner();
+        let mut second_request = request();
+        set_refresh_authorization(&mut second_request, &second.token);
+        handle_refresh_sandbox_token(&state, second_request)
+            .await
+            .expect("successor refresh");
+
+        let capture = OcsfCapture::default();
+        let error = {
+            let _guard = capture.install();
+            let mut replay = request();
+            set_refresh_authorization(&mut replay, &first);
+            handle_refresh_sandbox_token(&state, replay)
+                .await
+                .expect_err("consumed predecessor must be rejected")
+        };
+
+        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(
+            error.message(),
+            "gateway refresh retry does not match the active lineage"
+        );
+        let events: Vec<_> = capture
+            .events()
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0]["class_uid"], 3002);
+        assert_eq!(events[0]["status_detail"], "stale_identity");
+        assert_eq!(events[0]["auth_protocol"], "sandbox_jwt");
+        assert_eq!(
+            events[0]["http_request"]["url"]["path"],
+            "/openshell.v1.OpenShell/RefreshSandboxToken"
+        );
+        assert!(!events[0].to_string().contains(&first));
+    }
+
+    #[tokio::test]
+    async fn successful_or_unauthorized_refresh_emits_no_authentication_event() {
+        use openshell_ocsf::test_support::OcsfCapture;
+
+        let state = state_with_issuer().await;
+        let capture = OcsfCapture::default();
+        let _guard = capture.install();
+        let mut unauthorized = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: vec!["unknown-service".to_string()],
+        });
+        unauthorized
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        let current = authorize_refresh(&state, &mut unauthorized).await;
+        handle_refresh_sandbox_token(&state, unauthorized)
+            .await
+            .expect_err("unknown extension service must be rejected");
+        let mut refresh = Request::new(RefreshSandboxTokenRequest {
+            extension_service_names: Vec::new(),
+        });
+        refresh
+            .extensions_mut()
+            .insert(sandbox_principal("sandbox-a"));
+        set_refresh_authorization(&mut refresh, &current);
+        handle_refresh_sandbox_token(&state, refresh)
+            .await
+            .expect("refresh OK");
+
+        assert!(capture.events().is_empty(), "{:?}", capture.events());
+    }
+
+    #[tokio::test]
     async fn failed_refresh_does_not_consume_the_gateway_bearer() {
         let state = state_with_issuer().await;
         let mut rejected = Request::new(RefreshSandboxTokenRequest {
@@ -828,13 +974,14 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
-    #[tokio::test]
-    async fn issue_returns_generation_bound_token_and_rejects_it_after_runtime_replacement() {
-        use crate::auth::authenticator::Authenticator;
+    async fn issue_session_bearer(
+        state: &Arc<ServerState>,
+    ) -> (
+        crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator,
+        String,
+    ) {
         use crate::auth::principal::SandboxIdentitySource;
-        use crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator;
 
-        let state = state_with_issuer().await;
         let mut req = Request::new(IssueSandboxTokenRequest {});
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
@@ -845,32 +992,46 @@ mod tests {
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
-        let resp = handle_issue_sandbox_token(&state, req)
+        let resp = handle_issue_sandbox_token(state, req)
             .await
             .expect("issue OK")
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expiration_time.is_some());
 
-        let authenticator = SandboxSessionJwtAuthenticator::new(
+        let authenticator = crate::auth::sandbox_jwt::SandboxSessionJwtAuthenticator::new(
             state
                 .sandbox_session_jwt_authority
                 .clone()
                 .expect("session authority"),
             state.store.clone(),
         );
+        (authenticator, resp.token)
+    }
+
+    fn bearer_headers(token: &str) -> http::HeaderMap {
         let mut headers = http::HeaderMap::new();
         headers.insert(
             "authorization",
-            format!("Bearer {}", resp.token)
-                .parse()
-                .expect("bearer header"),
+            format!("Bearer {token}").parse().expect("bearer header"),
         );
+        headers
+    }
+
+    #[tokio::test]
+    async fn issue_returns_generation_bound_token_and_rejects_it_after_runtime_replacement() {
+        use crate::auth::authenticator::Authenticator;
+        use crate::auth::authenticator::{AuthFailureReason, AuthMechanism};
+
+        let state = state_with_issuer().await;
+        let (authenticator, token) = issue_session_bearer(&state).await;
+        let headers = bearer_headers(&token);
         let provider_path = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment";
         let principal = authenticator
             .authenticate(&headers, provider_path)
             .await
             .expect("active runtime token must authenticate")
+            .principal()
             .expect("session authenticator must recognize its token");
         assert!(matches!(principal, Principal::Sandbox(_)));
 
@@ -887,7 +1048,52 @@ mod tests {
             .authenticate(&headers, provider_path)
             .await
             .expect_err("obsolete runtime token must not reach provider access");
-        assert_eq!(error.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.mechanism, AuthMechanism::SandboxJwt);
+        assert_eq!(error.reason, AuthFailureReason::StaleIdentity);
+    }
+
+    #[tokio::test]
+    async fn session_bearer_for_deleted_sandbox_is_rejected_as_unknown_identity() {
+        use crate::auth::authenticator::AuthFailureReason;
+        use crate::auth::authenticator::Authenticator;
+
+        let state = state_with_issuer().await;
+        let (authenticator, token) = issue_session_bearer(&state).await;
+        assert!(state.store.delete("sandbox", "sandbox-a").await.unwrap());
+
+        let error = authenticator
+            .authenticate(
+                &bearer_headers(&token),
+                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+            )
+            .await
+            .expect_err("a bearer for a deleted sandbox must be rejected");
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.reason, AuthFailureReason::UnknownIdentity);
+    }
+
+    #[tokio::test]
+    async fn tampered_session_bearer_is_rejected_as_invalid() {
+        use crate::auth::authenticator::Authenticator;
+        use crate::auth::authenticator::{AuthFailureReason, AuthMechanism};
+
+        let state = state_with_issuer().await;
+        let (authenticator, token) = issue_session_bearer(&state).await;
+        let (signed, signature) = token.rsplit_once('.').expect("JWT segments");
+        let flipped = if signature.starts_with('A') { 'B' } else { 'A' };
+        let tampered = format!("{signed}.{flipped}{}", &signature[1..]);
+
+        let error = authenticator
+            .authenticate(
+                &bearer_headers(&tampered),
+                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+            )
+            .await
+            .expect_err("a tampered bearer must be rejected");
+        assert_eq!(error.status.code(), tonic::Code::Unauthenticated);
+        assert_eq!(error.mechanism, AuthMechanism::SandboxJwt);
+        assert_eq!(error.reason, AuthFailureReason::InvalidCredential);
     }
 
     #[tokio::test]

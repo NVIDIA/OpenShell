@@ -1074,9 +1074,13 @@ default_image      = "nvcr.io/nvidia/base/ubuntu:24.04"
 image_pull_policy  = "if_not_present"
 # Value assigned to the openshell.sandbox_namespace label on sandbox containers.
 sandbox_label      = "docker-dev"
-# Optional override. When omitted, the host-networked supervisor uses the
-# gateway's primary loopback endpoint.
-grpc_endpoint      = "https://127.0.0.1:17670"
+# host (default) or bridge networking for the supervisor.
+# Operator-owned; sandbox driver config cannot override this choice.
+supervisor_network_mode = "host"
+# Optional override; Docker's host address is discovered automatically.
+# host_gateway_ip = "172.29.0.254"
+# Optional override. Omit for automatic host or bridge callback selection.
+# grpc_endpoint = "https://gateway.example.com:17670"
 # Workload-side runtime. Defaults to the gateway version.
 # sandbox_runtime_image = "ghcr.io/nvidia/openshell/sandbox:<version>"
 # Supervisor runtime. Defaults to the gateway version.
@@ -1109,8 +1113,21 @@ proxy_ca_bundle = "/etc/openshell/tls/proxy-ca.pem"
 provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
 ```
 
-Use `sandbox_label` for Docker configurations. The legacy
-`sandbox_namespace` key is rejected.
+Use `sandbox_label` for Docker configurations.
+
+`supervisor_network_mode` accepts `host` (the default), `bridge`, or `auto`.
+`auto` also selects host; the driver does not infer a mode from the workload runtime.
+The workload always uses `network=none`.
+
+Omit `grpc_endpoint` for automatic selection: host mode uses loopback; bridge
+uses `host.docker.internal` on Desktop or with a wildcard listener, otherwise
+the Linux listener's non-loopback address.
+
+Docker's host address is discovered automatically for bridge mode and gateway
+endpoints using `host.docker.internal`. Set `host_gateway_ip` only to override it.
+In bridge mode, host services and the configured OTLP collector endpoint must
+be reachable from containers; native Linux loopback-only listeners are unreachable.
+Host mode on Docker Desktop requires host networking enabled.
 
 Docker accepts `http://` and `https://` proxy URLs in explicit
 `scheme://host:port` form. `no_proxy` bypasses only the corporate proxy;
@@ -1276,6 +1293,22 @@ health_check_interval_secs = 10
 # proxy_connect_by_hostname = true
 # Corporate CA trusted for an https:// proxy and TLS-intercepting proxies.
 # proxy_ca_bundle           = "/etc/openshell/tls/proxy-ca.pem"
+# additional_ca_bundle points at a PEM CA bundle (on the gateway host) trusted
+# for direct, policy-inspected HTTPS egress to a destination signed by a
+# private CA — independent of proxy_ca_bundle above, this applies whether or
+# not https_proxy is set. The Podman supervisor runs as its own container,
+# separate from the workload image, so it cannot inherit a private CA baked
+# into the workload's own trust store; this setting restores that trust
+# without rebuilding the supervisor image. The gateway bind-mounts the file
+# read-only into the supervisor container and folds it into the upstream
+# trust store alongside (not instead of) the system CA bundle. The CA is also
+# added to the trust bundle inside each sandbox, so workloads trust it directly.
+# It is trusted for every destination, not only the one that needs it, so use a
+# CA you control or one with name constraints. The file must
+# exist and contain at least one certificate; the gateway validates this on
+# the gateway host when the Podman driver starts, so a bad path or a
+# certificate-free bundle fails gateway startup rather than a later sandbox.
+# additional_ca_bundle      = "/etc/openshell/tls/additional-ca.pem"
 # Project a host Workload API Unix socket into the supervisor, or use an
 # explicit container-reachable TCP endpoint, for provider token exchange.
 # provider_spiffe_workload_api_socket = "/run/spire/agent.sock"
@@ -1374,6 +1407,11 @@ overlay_disk_mib = 4096
 # the exposure; host-only sockets are never exposed automatically.
 # provider_spiffe_workload_api_tcp_endpoint = "tcp:192.0.2.10:8081"
 # provider_spiffe_allow_guest_tcp = true
+# Unsafe operator override. Host bind mounts expose gateway-host paths inside
+# VM sandboxes and can negate OpenShell isolation and filesystem controls.
+# Requires allow_driver_config = true and
+# [openshell.drivers.vm.resource_admission] enabled = false; libkrun only.
+# enable_bind_mounts = false
 # Where the gateway stages rootfs tar archives for `--from ./rootfs.tar`.
 # Defaults to <state_dir>/rootfs-tar-staging. The gateway creates one
 # request-scoped subdirectory per staging slot and removes it after use.

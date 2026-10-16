@@ -649,7 +649,6 @@ struct Control {
     fail_after_effect: bool,
 }
 
-#[tonic::async_trait]
 impl Mutation for ControlledCreate {
     type Output = CreateWorkspaceResponse;
     const METHOD: &'static str = "CreateWorkspace";
