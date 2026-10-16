@@ -135,6 +135,9 @@ impl Driver {
     async fn stop_entry(&self, entry: &mut Entry) -> Result<(), Status> {
         let _ = entry.supervisor.start_kill();
         let _ = entry.supervisor.wait().await;
+        self.retire_boundary().await
+    }
+    async fn retire_boundary(&self) -> Result<(), Status> {
         match std::fs::remove_file(self.state_dir.join("launch.json")) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -219,93 +222,104 @@ impl Driver {
                 socket_path: path.into(),
             },
         };
-        for (name, bytes) in [
-            (
-                "auth.json",
-                serde_json::to_vec(&auth.supervisor).map_err(internal)?,
-            ),
-            (
-                "boundary.json",
-                serde_json::to_vec(&boundary).map_err(internal)?,
-            ),
-            ("descriptor.json", descriptor),
-            (
-                "registrations.json",
-                serde_json::to_vec(&serde_json::json!({"backends":[registration]}))
-                    .map_err(internal)?,
-            ),
-            (
-                "launch.json",
-                serde_json::to_vec(&launch).map_err(internal)?,
-            ),
-        ] {
-            write_private(&self.state_dir.join(name), &bytes).map_err(internal)?;
-        }
-        for attempt in 0..100 {
-            if self.state_dir.join("active").exists() {
-                break;
+        let result = async {
+            for (name, bytes) in [
+                (
+                    "auth.json",
+                    serde_json::to_vec(&auth.supervisor).map_err(internal)?,
+                ),
+                (
+                    "boundary.json",
+                    serde_json::to_vec(&boundary).map_err(internal)?,
+                ),
+                ("descriptor.json", descriptor),
+                (
+                    "registrations.json",
+                    serde_json::to_vec(&serde_json::json!({"backends":[registration]}))
+                        .map_err(internal)?,
+                ),
+                (
+                    "launch.json",
+                    serde_json::to_vec(&launch).map_err(internal)?,
+                ),
+            ] {
+                write_private(&self.state_dir.join(name), &bytes).map_err(internal)?;
             }
-            if attempt == 99 {
-                return Err(Status::deadline_exceeded(
-                    "start v8-backend backend before creating the sandbox",
-                ));
+            for attempt in 0..100 {
+                if self.state_dir.join("active").exists() {
+                    break;
+                }
+                if attempt == 99 {
+                    return Err(Status::deadline_exceeded(
+                        "start v8-backend backend before creating the sandbox",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let output =
+                std::fs::File::create(self.state_dir.join("supervisor.log")).map_err(internal)?;
+            let errors = std::fs::File::create(self.state_dir.join("supervisor.err.log"))
+                .map_err(internal)?;
+            let mut command = tokio::process::Command::new(&self.supervisor);
+            command
+                .kill_on_drop(true)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", &self.state_dir)
+                .env(
+                    openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
+                    openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(Some(spec))
+                        .map_err(internal)?,
+                )
+                .env(
+                    openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
+                    BACKEND,
+                )
+                .env(
+                    openshell_core::sandbox_env::PROXY_TLS_DIR,
+                    self.state_dir.join("proxy-tls"),
+                )
+                .args([
+                    "--sandbox-id",
+                    &sandbox.id,
+                    "--sandbox",
+                    &sandbox.name,
+                    "--openshell-endpoint",
+                    &self.gateway,
+                    "--workdir",
+                    "/work",
+                    "--log-level",
+                    "info",
+                ])
+                .arg("--policy-rules")
+                .arg(&self.policy_rules)
+                .arg("--ssh-socket-path")
+                .arg(self.state_dir.join("ssh.sock"))
+                .arg("--health-socket-path")
+                .arg(self.state_dir.join("ready.sock"))
+                .arg("--auth-bundle-file")
+                .arg(self.state_dir.join("auth.json"))
+                .arg("--backend-descriptor-file")
+                .arg(self.state_dir.join("descriptor.json"))
+                .arg("--boundary-launch-file")
+                .arg(self.state_dir.join("boundary.json"))
+                .arg("--isolation-backends-file")
+                .arg(self.state_dir.join("registrations.json"))
+                .arg("--parent-liveness-stdin")
+                .stdin(std::process::Stdio::piped())
+                .stdout(output)
+                .stderr(errors);
+            let supervisor = command.spawn().map_err(internal)?;
+            Ok(supervisor)
         }
-        let output =
-            std::fs::File::create(self.state_dir.join("supervisor.log")).map_err(internal)?;
-        let errors =
-            std::fs::File::create(self.state_dir.join("supervisor.err.log")).map_err(internal)?;
-        let mut command = tokio::process::Command::new(&self.supervisor);
-        command
-            .kill_on_drop(true)
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
-            .env("HOME", &self.state_dir)
-            .env(
-                openshell_core::sandbox_env::MAIN_PROCESS_SPEC,
-                openshell_core::sandbox_env::MainProcessConfig::encode_driver_spec(Some(spec))
-                    .map_err(internal)?,
-            )
-            .env(
-                openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND,
-                BACKEND,
-            )
-            .env(
-                openshell_core::sandbox_env::PROXY_TLS_DIR,
-                self.state_dir.join("proxy-tls"),
-            )
-            .args([
-                "--sandbox-id",
-                &sandbox.id,
-                "--sandbox",
-                &sandbox.name,
-                "--openshell-endpoint",
-                &self.gateway,
-                "--workdir",
-                "/work",
-                "--log-level",
-                "info",
-            ])
-            .arg("--policy-rules")
-            .arg(&self.policy_rules)
-            .arg("--ssh-socket-path")
-            .arg(self.state_dir.join("ssh.sock"))
-            .arg("--health-socket-path")
-            .arg(self.state_dir.join("ready.sock"))
-            .arg("--auth-bundle-file")
-            .arg(self.state_dir.join("auth.json"))
-            .arg("--backend-descriptor-file")
-            .arg(self.state_dir.join("descriptor.json"))
-            .arg("--boundary-launch-file")
-            .arg(self.state_dir.join("boundary.json"))
-            .arg("--isolation-backends-file")
-            .arg(self.state_dir.join("registrations.json"))
-            .arg("--parent-liveness-stdin")
-            .stdin(std::process::Stdio::piped())
-            .stdout(output)
-            .stderr(errors);
-        let supervisor = command.spawn().map_err(internal)?;
+        .await;
+        let supervisor = match result {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                self.retire_boundary().await?;
+                return Err(error);
+            }
+        };
         Ok(Entry {
             sandbox,
             supervisor,

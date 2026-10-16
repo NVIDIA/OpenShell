@@ -5,7 +5,7 @@
 use crate::{
     guest::{Guest, GuestResult, GuestStatus, read_script},
     launch::Launch,
-    protocol::{BACKEND, PeerMetadata, ProtocolVersion, boundary::*, control::*},
+    protocol::{self, BACKEND, boundary::*, control::*},
 };
 use anyhow::{Result, ensure};
 use openshell_core::jwt::{SandboxId, SessionJwtVerifier, SessionTokenProfile, SystemJwtClock};
@@ -479,6 +479,41 @@ impl Runtime {
         }
         Ok(response)
     }
+    fn process_output(self: Arc<Self>) -> Chunks {
+        Box::pin(async_stream::try_stream! {
+            let mut offsets = [0usize, 0usize];
+            loop {
+                let complete = self.result.borrow().clone();
+                let buffers = if let Some(result) = &complete {
+                    [result.stdout.clone(), result.stderr.clone()]
+                } else {
+                    self.output.lock().unwrap().as_ref()
+                        .map(|(out, err)| [out.contents(), err.contents()])
+                        .unwrap_or_default()
+                };
+                for (index, data) in buffers.into_iter().enumerate() {
+                    let channel = if index == 0 {
+                        wire::STREAM_STDOUT
+                    } else {
+                        wire::STREAM_STDERR
+                    };
+                    let pending = data.get(offsets[index]..)
+                        .ok_or_else(|| Status::internal("guest output was truncated"))?;
+                    for piece in pending.chunks(wire::MAX_STREAM_FRAME_BYTES) {
+                        yield protocol::stream_frame(channel, piece);
+                    }
+                    offsets[index] = data.len();
+                }
+                if let Some(result) = complete {
+                    let bytes = serde_json::to_vec(&Runtime::exit(&result))
+                        .map_err(|_| Status::internal("encode exit status"))?;
+                    yield protocol::stream_frame(wire::STREAM_EXIT, &bytes);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+    }
     fn process_id(&self) -> String {
         format!("{}:main", self.launch.boundary.generation)
     }
@@ -501,7 +536,7 @@ impl sandbox_backend_server::SandboxBackend for Arc<Runtime> {
             .into_inner()
             .supervisor
             .ok_or_else(|| Status::failed_precondition("peer metadata required"))?;
-        let capability = "openshell.sandbox.protocol".to_string();
+        let capability = protocol::CAPABILITY.to_string();
         if peer.protocol_version.map(|v| v.major) != Some(1)
             || !peer.supported_capabilities.contains(&capability)
             || peer.required_capabilities.iter().any(|c| c != &capability)
@@ -511,13 +546,7 @@ impl sandbox_backend_server::SandboxBackend for Arc<Runtime> {
             ));
         }
         Ok(Response::new(DescribeSandboxBackendResponse {
-            backend: Some(PeerMetadata {
-                protocol_version: Some(ProtocolVersion { major: 1, minor: 0 }),
-                implementation_name: BACKEND.into(),
-                implementation_version: "0.0.0".into(),
-                supported_capabilities: vec![capability.clone()],
-                required_capabilities: vec![capability],
-            }),
+            backend: Some(protocol::metadata()),
         }))
     }
     async fn open_boundary(
@@ -576,21 +605,12 @@ impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
         let (principal, mut input) = self.route(request).await?;
         let runtime = self.clone();
         let stream = async_stream::try_stream! {
-            let mut bytes = Vec::new();
-            let envelope = loop {
-                if bytes.len() >= 4 {
-                    let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-                    if length == 0 || length > wire::MAX_CONTROL_FRAME_BYTES { Err(Status::invalid_argument("invalid frame length"))?; }
-                    if bytes.len() >= 4+length { break wire::decode_frame::<wire::RequestEnvelope>(&bytes[..4+length]).map_err(|_|Status::invalid_argument("invalid request frame"))?; }
-                }
-                let chunk = input.message().await?.ok_or_else(||Status::invalid_argument("incomplete request"))?;
-                let Some(boundary_chunk::Payload::Data(data)) = chunk.payload else { Err(Status::invalid_argument("data frame required"))?; unreachable!() };
-                if bytes.len()+data.len()>wire::MAX_CONTROL_FRAME_BYTES+4 { Err(Status::resource_exhausted("request too large"))?; }
-                bytes.extend_from_slice(&data);
-            };
+            let envelope = protocol::read_request(&mut input).await?;
             if matches!(envelope.request, wire::Request::AcceptNetwork) {
-                envelope.validate_payload_digest().map_err(|_|Status::invalid_argument("request digest mismatch"))?;
-                runtime.registry.require_active(&principal).map_err(|e|Status::failed_precondition(e.to_string()))?;
+                envelope.validate_payload_digest()
+                    .map_err(|_| Status::invalid_argument("request digest mismatch"))?;
+                runtime.registry.require_active(&principal)
+                    .map_err(|e| Status::failed_precondition(e.to_string()))?;
                 let mut ended = runtime.ended.subscribe();
                 let mut pending = loop {
                     let queued = tokio::select! {
@@ -599,7 +619,9 @@ impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
                         _ = input.message() => Err(Status::unavailable("network accept disconnected")),
                         pending = async { runtime.network_requests.lock().await.recv().await } => pending.ok_or_else(||Status::unavailable("network source closed")),
                     }?;
-                    if !queued.result.is_closed() { break queued; }
+                    if !queued.result.is_closed() {
+                        break queued;
+                    }
                 };
                 let identity = wire::BinaryIdentityWire::Resolved {
                     executable: wire::ExecutableIdentityWire {
@@ -619,7 +641,7 @@ impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
                         queue_wait_us: pending.queued_at.elapsed().as_micros().try_into().unwrap_or(u64::MAX),
                     },
                 };
-                yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(wire::encode_frame(&wire::ResponseEnvelope { request_id:envelope.request_id,response }).map_err(|_|Status::internal("encode network response"))?))};
+                yield protocol::response(envelope.request_id, response)?;
                 let decision = tokio::select! {
                     _ = pending.result.closed() => return,
                     decision = crate::network::decision(&mut input) => decision,
@@ -628,7 +650,7 @@ impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
                 let status = match decision {
                     TcpOpenDecision::Denied(reason) => crate::network::denied(reason),
                     TcpOpenDecision::RelayReady => {
-                        yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(pending.request))};
+                        yield protocol::data(pending.request);
                         tokio::select! {
                             _ = pending.result.closed() => return,
                             status = crate::network::http_status(&mut input) => status,
@@ -638,7 +660,7 @@ impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
                 let _ = pending.result.send(status);
                 return;
             }
-            let response = match runtime.control(&principal,&envelope).await {
+            let response = match runtime.control(&principal, &envelope).await {
                 Ok(response) => response,
                 Err(error) => wire::Response::Error {
                     kind: match error.code() {
@@ -649,33 +671,23 @@ impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
                     message: error.message().to_string(),
                 },
             };
-            let attached = matches!(response,wire::Response::ProcessAttached {..});
-            let mediation = matches!(response,wire::Response::MediationReady);
-            yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(wire::encode_frame(&wire::ResponseEnvelope { request_id:envelope.request_id,response }).map_err(|_|Status::internal("encode response"))?))};
+            let attached = matches!(response, wire::Response::ProcessAttached { .. });
+            let mediation = matches!(response, wire::Response::MediationReady);
+            yield protocol::response(envelope.request_id, response)?;
             if attached {
-                let mut offsets = [0usize, 0usize];
-                loop {
-                    let complete = runtime.result.borrow().clone();
-                    let buffers = runtime.output.lock().unwrap().as_ref().map(|(out,err)| [out.contents(), err.contents()]);
-                    let buffers = complete.as_ref().map(|r| [r.stdout.clone(),r.stderr.clone()]).or(buffers).unwrap_or_default();
-                    for (index, data) in buffers.into_iter().enumerate() {
-                        for piece in data[offsets[index]..].chunks(wire::MAX_STREAM_FRAME_BYTES) {
-                            let mut frame=vec![if index==0 {wire::STREAM_STDOUT}else{wire::STREAM_STDERR}];
-                            frame.extend_from_slice(&(piece.len() as u32).to_be_bytes()); frame.extend_from_slice(piece);
-                            yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(frame))};
-                        }
-                        offsets[index] = data.len();
-                    }
-                    if let Some(result)=complete {
-                        let bytes=serde_json::to_vec(&Runtime::exit(&result)).unwrap();
-                        let mut frame=vec![wire::STREAM_EXIT];frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());frame.extend_from_slice(&bytes);
-                        yield BoundaryChunk {payload:Some(boundary_chunk::Payload::Data(frame))};
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                use tokio_stream::StreamExt;
+                let mut output = runtime.clone().process_output();
+                while let Some(chunk) = output.next().await {
+                    yield chunk?;
                 }
             }
-            if mediation { let mut ended=runtime.ended.subscribe(); while !*ended.borrow_and_update() { ended.changed().await.map_err(|_|Status::unavailable("boundary closed"))?; } }
+            if mediation {
+                let mut ended = runtime.ended.subscribe();
+                while !*ended.borrow_and_update() {
+                    ended.changed().await
+                        .map_err(|_| Status::unavailable("boundary closed"))?;
+                }
+            }
         };
         Ok(Response::new(Box::pin(stream)))
     }

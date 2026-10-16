@@ -71,6 +71,8 @@ console.log("Request denied by supervisor network policy (expected)");
 
 The create command prints the script's output and returns its exit code. The
 sandbox becomes `Completed` on exit code 0 or `Error` on a nonzero exit code.
+Uncaught exceptions and Promise rejections left unhandled after microtasks finish
+print an error and return exit code 1.
 `--keep` retains the sandbox so you can inspect that result after the command.
 `openshell logs v8-demo` shows the supervisor's policy-denial audit.
 

@@ -36,3 +36,62 @@ pub fn metadata() -> PeerMetadata {
         required_capabilities: vec![CAPABILITY.into()],
     }
 }
+
+/// Read one length-prefixed control request across arbitrary gRPC fragments.
+pub async fn read_request(
+    input: &mut tonic::Streaming<boundary::BoundaryChunk>,
+) -> Result<openshell_sandbox_backend::boundary_protocol::RequestEnvelope, tonic::Status> {
+    use boundary::boundary_chunk::Payload;
+    use openshell_sandbox_backend::boundary_protocol as wire;
+    use tonic::Status;
+    let mut bytes = Vec::new();
+    loop {
+        if bytes.len() >= 4 {
+            let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            if length == 0 || length > wire::MAX_CONTROL_FRAME_BYTES {
+                return Err(Status::invalid_argument("invalid frame length"));
+            }
+            if bytes.len() >= 4 + length {
+                return wire::decode_frame(&bytes[..4 + length])
+                    .map_err(|_| Status::invalid_argument("invalid request frame"));
+            }
+        }
+        let chunk = input
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("incomplete request"))?;
+        let Some(Payload::Data(data)) = chunk.payload else {
+            return Err(Status::invalid_argument("data frame required"));
+        };
+        if bytes.len() + data.len() > wire::MAX_CONTROL_FRAME_BYTES + 4 {
+            return Err(Status::resource_exhausted("request too large"));
+        }
+        bytes.extend_from_slice(&data);
+    }
+}
+
+pub fn data(bytes: Vec<u8>) -> boundary::BoundaryChunk {
+    boundary::BoundaryChunk {
+        payload: Some(boundary::boundary_chunk::Payload::Data(bytes)),
+    }
+}
+
+pub fn response(
+    request_id: String,
+    response: openshell_sandbox_backend::boundary_protocol::Response,
+) -> Result<boundary::BoundaryChunk, tonic::Status> {
+    use openshell_sandbox_backend::boundary_protocol as wire;
+    wire::encode_frame(&wire::ResponseEnvelope {
+        request_id,
+        response,
+    })
+    .map(data)
+    .map_err(|_| tonic::Status::internal("encode response"))
+}
+
+pub fn stream_frame(channel: u8, payload: &[u8]) -> boundary::BoundaryChunk {
+    let mut bytes = vec![channel];
+    bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(payload);
+    data(bytes)
+}

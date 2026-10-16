@@ -77,6 +77,7 @@ struct State {
     network: Option<Network>,
     stopped: watch::Receiver<bool>,
     stdout: Output,
+    rejections: Vec<v8::Global<v8::Promise>>,
 }
 
 pub struct Guest {
@@ -164,7 +165,9 @@ impl Guest {
             network,
             stopped: self.stopped.subscribe(),
             stdout,
+            rejections: Vec::new(),
         });
+        isolate.set_promise_reject_callback(promise_rejected);
         // The callback borrows this Guest only while execute() owns the isolate.
         isolate
             .add_near_heap_limit_callback(heap_limit, std::ptr::from_ref(self).cast_mut().cast());
@@ -202,13 +205,20 @@ impl Guest {
             if result.is_some() {
                 scope.perform_microtask_checkpoint();
             }
+            let rejections = std::mem::take(&mut scope.get_slot_mut::<State>().unwrap().rejections);
+            let rejection = rejections
+                .iter()
+                .map(|promise| v8::Local::new(scope, promise))
+                .find(|promise| !promise.has_handler())
+                .map(|promise| promise.result(scope));
             if scope.has_terminated() {
                 Ok(GuestStatus::Terminated)
-            } else if result.is_some() {
+            } else if result.is_some() && rejection.is_none() {
                 Ok(GuestStatus::Exited)
             } else {
                 let message = scope
                     .exception()
+                    .or(rejection)
                     .and_then(|value| value.to_string(scope))
                     .map(|value| {
                         if value.length() > MAX_OUTPUT {
@@ -224,8 +234,23 @@ impl Guest {
             }
         })();
         isolate.remove_near_heap_limit_callback(heap_limit, 0);
+        isolate.remove_slot::<State>();
         result
     }
+}
+
+extern "C" fn promise_rejected(message: v8::PromiseRejectMessage) {
+    if message.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
+        return;
+    }
+    // SAFETY: V8 invokes this callback with a live promise on the current isolate.
+    v8::callback_scope!(unsafe scope, &message);
+    let promise = v8::Global::new(scope, message.get_promise());
+    scope
+        .get_slot_mut::<State>()
+        .unwrap()
+        .rejections
+        .push(promise);
 }
 
 unsafe extern "C" fn heap_limit(data: *mut c_void, current: usize, _initial: usize) -> usize {
