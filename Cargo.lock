@@ -4622,6 +4622,9 @@ name = "openshell-gateway"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
  "hyper-util",
  "miette",
  "nix 0.29.0",
@@ -4633,6 +4636,7 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-server",
+ "rand 0.9.4",
  "rustix 1.1.4",
  "serde",
  "serde_json",
