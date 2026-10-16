@@ -29,6 +29,12 @@ pub enum SandboxTransport {
         guest_cid: u32,
         port: u32,
     },
+    /// The supervisor accepts a connection from its sandbox runtime. TLS and
+    /// gRPC roles stay unchanged.
+    RuntimeInitiatedTcp {
+        authority: String,
+        listen_address: SocketAddr,
+    },
 }
 
 impl SandboxTransport {
@@ -45,6 +51,10 @@ impl SandboxTransport {
                         .iter()
                         .all(|address| address.port() != 0 && !address.ip().is_unspecified())
             }
+            Self::RuntimeInitiatedTcp {
+                authority,
+                listen_address,
+            } => !authority.is_empty() && listen_address.port() != 0,
             Self::Vsock { guest_cid, port } => {
                 *guest_cid >= 3 && *guest_cid != u32::MAX && *port != 0 && *port != u32::MAX
             }
@@ -82,6 +92,12 @@ pub fn validate_registrations(registrations: &[BackendRegistration]) -> Result<(
     let mut names = BTreeSet::new();
     for registration in registrations {
         validate_backend_name(&registration.name)?;
+        if matches!(
+            registration.endpoint,
+            SandboxTransport::RuntimeInitiatedTcp { .. }
+        ) {
+            return Err("runtime-initiated control is not a registered backend endpoint");
+        }
         if !names.insert(&registration.name) {
             return Err("duplicate isolation backend registration");
         }
@@ -101,6 +117,9 @@ impl TryFrom<&BackendRegistration> for crate::proto::compute::v1::IsolationBacke
         validate_backend_name(&registration.name)?;
         registration.endpoint.validate()?;
         let endpoint = match &registration.endpoint {
+            SandboxTransport::RuntimeInitiatedTcp { .. } => {
+                return Err("runtime-initiated control is not a registered backend endpoint");
+            }
             SandboxTransport::Unix { socket_path } => Endpoint::UnixSocketPath(
                 socket_path
                     .to_str()

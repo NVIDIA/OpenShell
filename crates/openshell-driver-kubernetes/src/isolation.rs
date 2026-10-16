@@ -29,6 +29,8 @@ use openshell_sandbox_backend::boundary_protocol::{
 };
 use serde::Serialize;
 
+use crate::config::KubernetesControlConnection;
+
 #[derive(Serialize)]
 struct KubernetesOuterFenceEvidence<'a> {
     network_policy_uid: &'a str,
@@ -36,6 +38,29 @@ struct KubernetesOuterFenceEvidence<'a> {
     ingress_isolated: bool,
     egress_isolated: bool,
     egress_rule_count: u32,
+    /// Present only for runtime-initiated control. Omitted otherwise so the
+    /// supervisor-initiated evidence encoding and digest are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_control_policy: Option<KubernetesControlPolicyEvidence<'a>>,
+}
+
+/// The stored per-pair control policy bound into this generation. The driver
+/// supplies it only after verifying the stored object equals
+/// [`runtime_control_policy`] for this pair and port, so its only added path
+/// is the runtime's connection to its own supervisor.
+#[derive(Serialize)]
+struct KubernetesControlPolicyEvidence<'a> {
+    network_policy_uid: &'a str,
+    network_policy_resource_version: &'a str,
+    port: u16,
+}
+
+impl KubernetesControlPolicyEvidence<'_> {
+    fn is_bound(&self) -> bool {
+        !self.network_policy_uid.is_empty()
+            && !self.network_policy_resource_version.is_empty()
+            && self.port != 0
+    }
 }
 
 impl KubernetesOuterFenceEvidence<'_> {
@@ -48,6 +73,15 @@ impl KubernetesOuterFenceEvidence<'_> {
         {
             return Err(BackendError::Descriptor(
                 "Kubernetes provisioning evidence is incomplete".to_string(),
+            ));
+        }
+        if self
+            .runtime_control_policy
+            .as_ref()
+            .is_some_and(|control| !control.is_bound())
+        {
+            return Err(BackendError::Descriptor(
+                "Kubernetes control policy evidence is incomplete".into(),
             ));
         }
         let encoded = serde_json::to_vec(self).map_err(|error| {
@@ -174,6 +208,101 @@ fn role_labels(role: &str) -> BTreeMap<String, String> {
     BTreeMap::from([(BOUNDARY_ROLE_LABEL.to_string(), role.to_string())])
 }
 
+/// Labels selecting one role of one workload/supervisor pair.
+#[must_use]
+pub fn pair_role_labels(pair: &str, role: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (BOUNDARY_PAIR_LABEL.to_string(), pair.to_string()),
+        (BOUNDARY_ROLE_LABEL.to_string(), role.to_string()),
+    ])
+}
+
+/// Pod role the per-sandbox boundary Service selects for a connection mode.
+#[must_use]
+pub const fn boundary_service_role(mode: KubernetesControlConnection) -> &'static str {
+    match mode {
+        KubernetesControlConnection::SupervisorInitiated => WORKLOAD_ROLE,
+        KubernetesControlConnection::RuntimeInitiated => SUPERVISOR_ROLE,
+    }
+}
+
+/// Per-sandbox allowance for runtime-initiated control.
+///
+/// Policies are additive: this admits exactly one flow, from this pair's
+/// workload Pod to this pair's supervisor Pod on the control port, at both
+/// enforcement points. Egress is required because the namespace fence denies
+/// all workload egress; ingress is required because supervisors may be
+/// ingress-isolated (for example by the managed SSH ingress policy). The
+/// selector matches only this pair, so the extra rules can name only the pair
+/// itself. It never adds DNS, gateway, API-server, or address-block access and
+/// leaves the namespace-wide policies untouched.
+#[must_use]
+pub fn runtime_control_policy(namespace: &str, name: &str, pair: &str, port: u16) -> NetworkPolicy {
+    let pair_role = |role| {
+        Some(vec![NetworkPolicyPeer {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(pair_role_labels(pair, role)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }])
+    };
+    let control_port = || {
+        Some(vec![NetworkPolicyPort {
+            port: Some(IntOrString::Int(i32::from(port))),
+            protocol: Some("TCP".to_string()),
+            ..Default::default()
+        }])
+    };
+    NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            pod_selector: LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    BOUNDARY_PAIR_LABEL.to_string(),
+                    pair.to_string(),
+                )])),
+                ..Default::default()
+            },
+            policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
+            ingress: Some(vec![NetworkPolicyIngressRule {
+                from: pair_role(WORKLOAD_ROLE),
+                ports: control_port(),
+            }]),
+            egress: Some(vec![NetworkPolicyEgressRule {
+                to: pair_role(SUPERVISOR_ROLE),
+                ports: control_port(),
+            }]),
+        }),
+    }
+}
+
+/// Which side opens the Sandbox Protocol connection, with the verified
+/// Kubernetes coordinates that mode needs.
+pub enum KubernetesControlPath {
+    /// The supervisor dials the workload's listener through the Service.
+    SupervisorInitiated {
+        boundary_listener: SocketAddr,
+        control_authority: String,
+        control_address: SocketAddr,
+    },
+    /// The workload runtime dials the supervisor through the Service.
+    RuntimeInitiated {
+        control_authority: String,
+        /// Service address the runtime dials.
+        supervisor_address: SocketAddr,
+        /// Supervisor bind address.
+        supervisor_listen: SocketAddr,
+        /// Verified per-sandbox control policy coordinates.
+        control_policy_uid: String,
+        control_policy_resource_version: String,
+    },
+}
+
 /// Driver-owned inputs that bind one workload/supervisor pair to one boundary.
 ///
 /// The driver constructs this only after Kubernetes has assigned every UID and
@@ -195,9 +324,7 @@ pub struct KubernetesSandboxRuntimeBoundarySpec {
     pub supervisor_pod_uid: String,
     pub egress_policy_uid: String,
     pub egress_policy_resource_version: String,
-    pub boundary_listener: SocketAddr,
-    pub control_authority: String,
-    pub control_address: SocketAddr,
+    pub control_path: KubernetesControlPath,
     pub sandbox_tls: SandboxTlsServerConfig,
     pub supervisor_tls: SandboxTlsClientConfig,
     pub host_gateway_ip: Option<IpAddr>,
@@ -215,7 +342,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
     /// Produce both sides of the common protocol from one observed Kubernetes
     /// resource set so a stale or recreated object cannot be attached.
     pub fn provision(self) -> Result<KubernetesSandboxRuntimeBoundaryProvisioning, BackendError> {
-        let resource_claims = BTreeMap::from([
+        let mut resource_claims = BTreeMap::from([
             ("kubernetes.namespace_uid".to_string(), self.namespace_uid),
             (
                 "kubernetes.sandbox_resource_uid".to_string(),
@@ -238,6 +365,55 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.egress_policy_resource_version,
             ),
         ]);
+        let (listener, transport) = match self.control_path {
+            KubernetesControlPath::SupervisorInitiated {
+                boundary_listener,
+                control_authority,
+                control_address,
+            } => (
+                BoundaryListener::TlsTcp {
+                    address: boundary_listener,
+                    tls: self.sandbox_tls,
+                },
+                SandboxTransport::Tcp {
+                    authority: control_authority,
+                    addresses: vec![control_address],
+                },
+            ),
+            KubernetesControlPath::RuntimeInitiated {
+                control_authority,
+                supervisor_address,
+                supervisor_listen,
+                control_policy_uid,
+                control_policy_resource_version,
+            } => {
+                resource_claims.insert(
+                    "kubernetes.control_policy_uid".to_string(),
+                    control_policy_uid,
+                );
+                resource_claims.insert(
+                    "kubernetes.control_policy_resource_version".to_string(),
+                    control_policy_resource_version,
+                );
+                (
+                    BoundaryListener::RuntimeInitiatedTlsTcp {
+                        authority: control_authority.clone(),
+                        addresses: vec![supervisor_address],
+                        tls: self.sandbox_tls,
+                    },
+                    SandboxTransport::RuntimeInitiatedTcp {
+                        authority: control_authority,
+                        listen_address: supervisor_listen,
+                    },
+                )
+            }
+        };
+        let control_port = match &transport {
+            SandboxTransport::RuntimeInitiatedTcp { listen_address, .. } => {
+                Some(listen_address.port())
+            }
+            _ => None,
+        };
         let provisioning_evidence = KubernetesOuterFenceEvidence {
             network_policy_uid: &resource_claims["kubernetes.egress_policy_uid"],
             network_policy_resource_version: &resource_claims
@@ -245,6 +421,12 @@ impl KubernetesSandboxRuntimeBoundarySpec {
             ingress_isolated: true,
             egress_isolated: true,
             egress_rule_count: 0,
+            runtime_control_policy: control_port.map(|port| KubernetesControlPolicyEvidence {
+                network_policy_uid: &resource_claims["kubernetes.control_policy_uid"],
+                network_policy_resource_version: &resource_claims
+                    ["kubernetes.control_policy_resource_version"],
+                port,
+            }),
         }
         .project(&self.generation)?;
         Ok(KubernetesSandboxRuntimeBoundaryProvisioning {
@@ -256,10 +438,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 auth_epoch: self.auth_epoch,
                 gateway_id: self.gateway_id,
                 verification_keys: self.verification_keys,
-                listener: BoundaryListener::TlsTcp {
-                    address: self.boundary_listener,
-                    tls: self.sandbox_tls,
-                },
+                listener,
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::from([(
                     "kubernetes.workload_pod_uid".to_string(),
@@ -274,10 +453,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 generation: self.generation,
                 session_id: self.session_id,
                 workload_identity: self.workload_identity,
-                transport: SandboxTransport::Tcp {
-                    authority: self.control_authority,
-                    addresses: vec![self.control_address],
-                },
+                transport,
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
@@ -300,6 +476,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 0,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -307,6 +484,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 0,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -314,6 +492,7 @@ mod tests {
                 ingress_isolated: false,
                 egress_isolated: true,
                 egress_rule_count: 0,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -321,6 +500,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: false,
                 egress_rule_count: 0,
+                runtime_control_policy: None,
             },
             KubernetesOuterFenceEvidence {
                 network_policy_uid: "uid",
@@ -328,6 +508,7 @@ mod tests {
                 ingress_isolated: true,
                 egress_isolated: true,
                 egress_rule_count: 1,
+                runtime_control_policy: None,
             },
         ] {
             assert!(evidence.project("generation-1").is_err());
@@ -353,9 +534,11 @@ mod tests {
             supervisor_pod_uid: "supervisor-pod-uid".to_string(),
             egress_policy_uid: "network-policy-uid".to_string(),
             egress_policy_resource_version: "1945".to_string(),
-            boundary_listener: "0.0.0.0:5500".parse().expect("valid listener"),
-            control_authority: "os-boundary-sandbox.default.svc:5500".to_string(),
-            control_address: "10.42.0.7:5500".parse().expect("valid target"),
+            control_path: KubernetesControlPath::SupervisorInitiated {
+                boundary_listener: "0.0.0.0:5500".parse().expect("valid listener"),
+                control_authority: "os-boundary-sandbox.default.svc:5500".to_string(),
+                control_address: "10.42.0.7:5500".parse().expect("valid target"),
+            },
             sandbox_tls: SandboxTlsServerConfig {
                 certificate_chain_path: PathBuf::from("/run/boundary/tls.crt"),
                 private_key_path: PathBuf::from("/run/boundary/tls.key"),

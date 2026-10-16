@@ -7112,6 +7112,12 @@ fn inject_guest_boundary_bundle(
         BoundaryListener::Unix { tls, .. }
         | BoundaryListener::TlsTcp { tls, .. }
         | BoundaryListener::Vsock { tls, .. } => tls.clone(),
+        // The VM driver provisions only listener transports.
+        BoundaryListener::RuntimeInitiatedTlsTcp { .. } => {
+            return Err(
+                "VM sandboxes do not support runtime-initiated boundary control".to_string(),
+            );
+        }
     };
     let encoded_config = config
         .encode()

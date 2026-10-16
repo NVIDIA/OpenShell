@@ -354,6 +354,15 @@ pub enum BoundaryListener {
         control_port: u32,
         tls: SandboxTlsServerConfig,
     },
+    /// The boundary dials the supervisor's listener and serves TLS and gRPC
+    /// over that outbound connection. Only driver-resolved addresses are used.
+    RuntimeInitiatedTlsTcp {
+        /// Stable logical Service authority, for diagnostics.
+        authority: String,
+        /// Driver-resolved supervisor endpoints, tried in order.
+        addresses: Vec<std::net::SocketAddr>,
+        tls: SandboxTlsServerConfig,
+    },
 }
 
 /// Public verification key staged in the sandbox's immutable auth bundle.

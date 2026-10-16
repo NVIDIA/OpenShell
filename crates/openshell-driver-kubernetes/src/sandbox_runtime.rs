@@ -19,9 +19,14 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use rcgen::{CertificateParams, DnType, IsCa, KeyPair, KeyUsagePurpose};
 
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+
+use crate::config::KubernetesControlConnection;
+#[cfg(test)]
+use crate::isolation::BOUNDARY_ROLE_LABEL;
 use crate::isolation::{
-    BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeNetworkFence,
-    KubernetesSandboxRuntimeNetworkFenceSpec,
+    KubernetesSandboxRuntimeNetworkFence, KubernetesSandboxRuntimeNetworkFenceSpec,
+    boundary_service_role, runtime_control_policy,
 };
 
 pub const SANDBOX_SECRET_COMPONENT: &str = "sandbox-bootstrap";
@@ -108,6 +113,8 @@ pub struct SandboxRuntimeNames {
     pub sandbox_secret: String,
     pub supervisor_secret: String,
     pub boundary_service: String,
+    /// Per-sandbox egress allowance used only by runtime-initiated control.
+    pub control_policy: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
@@ -122,6 +129,7 @@ impl SandboxRuntimeNames {
             sandbox_secret: format!("os-sandbox-{suffix}"),
             supervisor_secret: format!("os-supervisor-{suffix}"),
             boundary_service: format!("os-boundary-{suffix}"),
+            control_policy: format!("os-control-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
@@ -176,12 +184,16 @@ pub fn workload_fence(
     .provision()
 }
 
+/// Per-sandbox Sandbox Protocol endpoint. Its stable `ClusterIP` is allocated
+/// before either Pod runs; the selected role follows the current generation's
+/// connection mode. A legacy endpoint is upgraded when both Pods are replaced.
 #[must_use]
 pub fn boundary_service(
     namespace: &str,
     names: &SandboxRuntimeNames,
     sandbox_id: &str,
     boundary_port: u16,
+    mode: KubernetesControlConnection,
     owner: OwnerReference,
 ) -> Service {
     Service {
@@ -193,7 +205,7 @@ pub fn boundary_service(
             ..Default::default()
         },
         spec: Some(ServiceSpec {
-            selector: Some(pair_labels(sandbox_id, "workload")),
+            selector: Some(pair_labels(sandbox_id, boundary_service_role(mode))),
             ports: Some(vec![ServicePort {
                 name: Some("boundary".to_string()),
                 protocol: Some("TCP".to_string()),
@@ -201,10 +213,59 @@ pub fn boundary_service(
                 target_port: Some(IntOrString::Int(i32::from(boundary_port))),
                 ..Default::default()
             }]),
+            publish_not_ready_addresses: publishes_not_ready_supervisor(mode),
             ..Default::default()
         }),
         ..Default::default()
     }
+}
+
+/// A runtime-initiated supervisor becomes Ready only after the runtime has
+/// attached through this Service, so the Service must route to it before it is
+/// Ready. TLS and the Sandbox Protocol bearer, not readiness, authenticate the
+/// endpoint. Supervisor-initiated Services keep their original encoding.
+const fn publishes_not_ready_supervisor(mode: KubernetesControlConnection) -> Option<bool> {
+    match mode {
+        KubernetesControlConnection::RuntimeInitiated => Some(true),
+        KubernetesControlConnection::SupervisorInitiated => None,
+    }
+}
+
+/// Whether an existing boundary Service still selects the role required by
+/// `mode` for this sandbox's pair.
+#[must_use]
+pub fn boundary_service_matches_mode(
+    service: &Service,
+    sandbox_id: &str,
+    mode: KubernetesControlConnection,
+) -> bool {
+    let Some(spec) = service.spec.as_ref() else {
+        return false;
+    };
+    let publishes_not_ready = spec.publish_not_ready_addresses == Some(true);
+    spec.selector.as_ref() == Some(&pair_labels(sandbox_id, boundary_service_role(mode)))
+        && publishes_not_ready == (publishes_not_ready_supervisor(mode) == Some(true))
+}
+
+/// Per-sandbox control egress policy, owned by the Sandbox resource so it is
+/// garbage-collected with that sandbox only.
+#[must_use]
+pub fn control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    boundary_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = runtime_control_policy(
+        namespace,
+        &names.control_policy,
+        &pair_label_value(sandbox_id),
+        boundary_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-control-egress"));
+    policy
 }
 
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
@@ -632,13 +693,7 @@ pub fn sandbox_owner_reference(
 }
 
 fn pair_labels(sandbox_id: &str, role: &str) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            BOUNDARY_PAIR_LABEL.to_string(),
-            pair_label_value(sandbox_id),
-        ),
-        (BOUNDARY_ROLE_LABEL.to_string(), role.to_string()),
-    ])
+    crate::isolation::pair_role_labels(&pair_label_value(sandbox_id), role)
 }
 
 fn common_labels(sandbox_id: &str, component: &str) -> BTreeMap<String, String> {
@@ -726,7 +781,14 @@ mod tests {
     #[test]
     fn service_selects_only_the_workload_boundary() {
         let names = SandboxRuntimeNames::new("4b67c0d0-1111-2222-3333-444444444444");
-        let service = boundary_service("sandbox", &names, "pair", 5500, owner());
+        let service = boundary_service(
+            "sandbox",
+            &names,
+            "pair",
+            5500,
+            KubernetesControlConnection::SupervisorInitiated,
+            owner(),
+        );
         assert_eq!(
             service.spec.unwrap().selector.unwrap()[BOUNDARY_ROLE_LABEL],
             "workload"

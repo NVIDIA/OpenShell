@@ -58,7 +58,8 @@ rules:
       - watch
   - apiGroups: [""]
     resources: ["services"]
-    verbs: ["create", "get"]
+    # Restart upgrades a legacy control endpoint without replacing its ClusterIP.
+    verbs: ["create", "get", "patch"]
   - apiGroups: [""]
     resources: ["secrets"]
     # Bootstrap Secrets are generation-scoped. Recovery deletes them by exact
