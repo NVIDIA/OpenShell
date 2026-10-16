@@ -67,6 +67,24 @@ use openshell_ocsf::{
 /// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
+/// The sandbox rejected the image working directory while starting the agent.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error("{0}")]
+pub struct WorkspaceValidationFailed(String);
+
+/// Convert an agent start failure into a report.
+///
+/// The sandbox reports errors across the boundary as text, so a workspace
+/// rejection is recognized here, once, and carried as
+/// [`WorkspaceValidationFailed`] from then on.
+pub fn start_agent_error(message: String) -> miette::Report {
+    if message.contains(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT) {
+        miette::Report::new(WorkspaceValidationFailed(message))
+    } else {
+        miette::miette!(message)
+    }
+}
+
 async fn retain_remote_access_plane(
     proxy_exited: impl Future<Output = ()>,
     shutdown_requested: impl Future<Output = ()>,
@@ -103,21 +121,39 @@ enum ReadinessEndpoint {
 }
 
 enum ReadinessListener {
+    #[cfg(unix)]
     Unix(tokio::net::UnixListener),
     Tcp(tokio::net::TcpListener),
 }
 
 impl ReadinessEndpoint {
+    fn prepare(&self) -> Result<()> {
+        match self {
+            Self::Unix(path) => prepare_control_readiness_path(path),
+            Self::Tcp(_) => Ok(()),
+        }
+    }
+
     fn bind(&self) -> Result<ReadinessListener> {
         match self {
             Self::Unix(path) => {
-                prepare_control_readiness_path(path)?;
-                tokio::net::UnixListener::bind(path)
-                    .map(ReadinessListener::Unix)
-                    .into_diagnostic()
-                    .wrap_err_with(|| {
-                        format!("bind supervisor readiness socket on {}", path.display())
-                    })
+                #[cfg(not(unix))]
+                {
+                    let _ = path;
+                    Err(miette::miette!(
+                        "Unix readiness sockets are unsupported on this host"
+                    ))
+                }
+                #[cfg(unix)]
+                {
+                    prepare_control_readiness_path(path)?;
+                    tokio::net::UnixListener::bind(path)
+                        .map(ReadinessListener::Unix)
+                        .into_diagnostic()
+                        .wrap_err_with(|| {
+                            format!("bind supervisor readiness socket on {}", path.display())
+                        })
+                }
             }
             Self::Tcp(port) => bind_readiness_tcp(*port)
                 .and_then(tokio::net::TcpListener::from_std)
@@ -129,7 +165,10 @@ impl ReadinessEndpoint {
 
     fn remove(&self) {
         if let Self::Unix(path) = self {
+            #[cfg(unix)]
             let _ = std::fs::remove_file(path);
+            #[cfg(not(unix))]
+            let _ = path; // Unix endpoints are rejected before binding on this host.
         }
     }
 }
@@ -156,6 +195,7 @@ fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
 impl ReadinessListener {
     async fn accept(&self) -> std::io::Result<()> {
         match self {
+            #[cfg(unix)]
             Self::Unix(listener) => listener.accept().await.map(drop),
             Self::Tcp(listener) => listener.accept().await.map(drop),
         }
@@ -172,9 +212,7 @@ impl ControlReadiness {
         endpoint: ReadinessEndpoint,
         mut session_readiness: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<Self> {
-        if let ReadinessEndpoint::Unix(path) = &endpoint {
-            prepare_control_readiness_path(path)?;
-        }
+        endpoint.prepare()?;
         let listener = if session_readiness
             .as_ref()
             .is_some_and(|readiness| !*readiness.borrow())
@@ -282,6 +320,13 @@ fn prepare_control_readiness_path(path: &std::path::Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_control_readiness_path(_path: &std::path::Path) -> Result<()> {
+    Err(miette::miette!(
+        "Unix readiness sockets are unsupported on this host"
+    ))
 }
 
 impl Drop for ControlReadiness {
@@ -503,6 +548,7 @@ pub async fn run_network_proxy(
     policy_data: String,
     tls_dir: Option<std::path::PathBuf>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
 ) -> Result<i32> {
     if !listen.ip().is_loopback() {
         return Err(miette::miette!(
@@ -570,9 +616,11 @@ pub async fn run_network_proxy(
         AgentProposals::new(initial_agent_proposals_enabled),
         workspace_rx,
         &upstream_proxy_args,
+        additional_ca_bundle.as_deref(),
         Some(&tls_dir.path),
         None,
         #[cfg(target_os = "linux")]
+        None,
         None,
         None,
     )
@@ -635,6 +683,7 @@ pub async fn run_sandbox(
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
@@ -660,6 +709,7 @@ pub async fn run_sandbox(
             ocsf_enabled,
             ocsf_schema_version,
             upstream_proxy_args,
+            additional_ca_bundle,
             backend_descriptor,
             auth_bundle,
             admitted_isolation_backend,
@@ -686,6 +736,7 @@ struct SandboxRunConfig {
     ocsf_enabled: Arc<AtomicBool>,
     ocsf_schema_version: Arc<std::sync::Mutex<String>>,
     upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
+    additional_ca_bundle: Option<String>,
     backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
     admitted_isolation_backend: Option<String>,
@@ -716,11 +767,19 @@ async fn run_sandbox_with_backend(
         ocsf_enabled,
         ocsf_schema_version,
         upstream_proxy_args,
+        additional_ca_bundle,
         backend_descriptor,
         auth_bundle,
         admitted_isolation_backend,
         main_exit_marker,
     } = config;
+    // The current client attachment adapter is SSH; retaining a process's I/O
+    // internally does not make it reachable by a foreground client.
+    if await_main_process_attachment && (!cfg!(unix) || ssh_socket_path.is_none()) {
+        return Err(miette::miette!(
+            "foreground attachment to the main process requires a supported SSH access adapter; create the sandbox with --detach"
+        ));
+    }
     // An empty command is the versioned scratch-sandbox sentinel. The
     // external supervisor cannot inspect the workload filesystem, so preserve
     // it for openshell-sandbox to resolve against the agent image.
@@ -766,11 +825,21 @@ async fn run_sandbox_with_backend(
         &auth_bundle,
     )?;
     let sandbox_bearer = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth_bundle)?;
+    #[cfg(unix)]
     let ssh_host_key = if ssh_socket_path.is_some() {
         Some(openshell_supervisor_process::ssh::parse_host_key(
             auth_bundle.ssh_host_private_key.as_ref(),
         )?)
     } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let ssh_host_key = {
+        if ssh_socket_path.is_some() {
+            return Err(miette::miette!(
+                "SSH access sockets are unsupported on this host"
+            ));
+        }
         None
     };
     // Startup joins the trace that created the sandbox when the driver passes
@@ -922,7 +991,7 @@ async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let bound = selected_backend
+    let (bound, proxy_listener) = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1006,7 +1075,9 @@ async fn run_sandbox_with_backend(
     // API read the current value so proposals target the correct workspace.
     let (workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
 
-    let remote_network_source = remote_boundary.0.network_mediation_source();
+    let remote_network_source = proxy_listener
+        .is_none()
+        .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
     let (remote_ready, backend_name, ca_file_paths) = {
         let (bound, backend_name, ca_file_paths) = remote_boundary;
@@ -1041,11 +1112,13 @@ async fn run_sandbox_with_backend(
             agent_proposals.clone(),
             workspace_rx.clone(),
             &upstream_proxy_args,
+            additional_ca_bundle.as_deref(),
             None,
             remote_host_gateway_ip,
             #[cfg(target_os = "linux")]
             None,
-            Some(remote_network_source),
+            remote_network_source,
+            proxy_listener,
         )
         .await?,
     );
@@ -1243,7 +1316,7 @@ async fn run_sandbox_with_backend(
             .start_agent()
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.start_agent"))
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(|error| start_agent_error(error.to_string()))?;
         workload_started_tx.send_replace(true);
         info!(backend = %backend_name, "Isolation boundary agent started");
         let agent = running.agent();
@@ -1433,7 +1506,11 @@ fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::
     writeln!(file, "exit_code={exit_code}")?;
     file.sync_all()?;
     std::fs::rename(&temporary, path)?;
-    std::fs::File::open(parent)?.sync_all()
+    // Windows cannot open directories through File::open. The marker data is
+    // flushed above and rename still atomically replaces the previous value.
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
@@ -2787,13 +2864,14 @@ fn provider_environment_is_installable(reason: ProviderReadinessReason) -> bool 
 fn prepare_provider_environment(
     provider: &openshell_core::grpc_client::ProviderEnvironmentResult,
 ) -> Result<ProviderCredentialState> {
-    let prepared = ProviderCredentialState::from_bound_environment(
+    let prepared = ProviderCredentialState::from_bound_environment_with_stable_placeholders(
         provider.provider_env_revision,
         provider.environment.clone(),
         provider.credential_expires_at_ms.clone(),
         provider.dynamic_credentials.clone(),
         provider.static_credential_bindings.clone(),
         provider.non_secret_environment_keys.clone(),
+        provider.stable_placeholder_environment_keys.clone(),
     )
     .map_err(|_| miette::miette!("Provider credential bindings are invalid"))?;
     prepared.set_managed_files(provider.files.clone());
@@ -3416,13 +3494,14 @@ fn initial_provider_credentials(
         );
     }
     let dynamic_credentials_fallback = result.dynamic_credentials.clone();
-    match ProviderCredentialState::from_bound_environment(
+    match ProviderCredentialState::from_bound_environment_with_stable_placeholders(
         result.provider_env_revision,
         result.environment,
         result.credential_expires_at_ms,
         result.dynamic_credentials,
         result.static_credential_bindings,
         result.non_secret_environment_keys,
+        result.stable_placeholder_environment_keys,
     ) {
         Ok(credentials) => {
             credentials.set_managed_files(result.files);
@@ -3459,6 +3538,21 @@ fn initial_provider_credentials(
 /// the existing bounded retry, but failures never delay policy enforcement.
 #[tonic::async_trait]
 trait PolicyGatewayClient: Clone + Send + Sync + 'static {
+    /// Refresh credentials while preserving the activated delivery requirement.
+    async fn fetch_provider_environment(
+        &self,
+        endpoint: &str,
+        sandbox_id: &str,
+        requires_stable_placeholders: bool,
+    ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
+        openshell_core::grpc_client::fetch_provider_environment_with_stable_placeholders(
+            endpoint,
+            sandbox_id,
+            requires_stable_placeholders,
+        )
+        .await
+    }
+
     async fn poll_settings(
         &self,
         sandbox: &str,
@@ -3478,15 +3572,6 @@ trait PolicyGatewayClient: Clone + Send + Sync + 'static {
         _snapshot: &openshell_core::endpoint_status::EndpointStatusSnapshot,
     ) -> Result<()> {
         Ok(())
-    }
-
-    /// Fetch the complete provider snapshot through the ordinary static-binding API.
-    async fn fetch_provider_environment(
-        &self,
-        endpoint: &str,
-        sandbox_id: &str,
-    ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
-        openshell_core::grpc_client::fetch_provider_environment(endpoint, sandbox_id).await
     }
 
     async fn refresh_installed_extension_credentials(&self) -> Result<()> {
@@ -4492,7 +4577,11 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 ProviderReadinessReason::WaitingForCredentials,
             );
             let provider = match client
-                .fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id)
+                .fetch_provider_environment(
+                    &ctx.endpoint,
+                    &ctx.sandbox_id,
+                    ctx.provider_credentials.requires_stable_placeholders(),
+                )
                 .await
             {
                 Ok(provider)
@@ -4563,14 +4652,17 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                 );
                 // Repeat the rejected binding validation on the live state to
                 // revoke static material and retain the fetched dynamic grants.
-                let _ = ctx.provider_credentials.install_bound_environment(
-                    provider.provider_env_revision,
-                    provider.environment,
-                    provider.credential_expires_at_ms,
-                    provider.dynamic_credentials,
-                    provider.static_credential_bindings,
-                    provider.non_secret_environment_keys,
-                );
+                let _ = ctx
+                    .provider_credentials
+                    .install_bound_environment_with_stable_placeholders(
+                        provider.provider_env_revision,
+                        provider.environment,
+                        provider.credential_expires_at_ms,
+                        provider.dynamic_credentials,
+                        provider.static_credential_bindings,
+                        provider.non_secret_environment_keys,
+                        provider.stable_placeholder_environment_keys,
+                    );
                 endpoint_status::reset(
                     ctx.endpoint_observation_tx.as_ref(),
                     current_endpoint_policy.as_ref(),
@@ -5105,6 +5197,7 @@ mod tests {
                 .expect("token"),
             sandbox_expires_at: 0,
             ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
         };
         let error = run_sandbox(
             vec!["true".to_string()],
@@ -5123,6 +5216,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(String::new())),
             openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            None,
             openshell_isolation_interface::contract::BackendDescriptor {
                 backend_name: "in-process-test".to_string(),
                 payload: b"in-process-only-launch-data".to_vec(),
@@ -5188,6 +5282,7 @@ mod tests {
         assert!(prepare_network_proxy_tls_dir(Some(writable)).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_exists_only_while_guard_is_live() {
         let root = tempfile::tempdir().unwrap();
@@ -5201,6 +5296,7 @@ mod tests {
         assert!(check_control_readiness(&path).is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn control_readiness_tracks_supervisor_session() {
         let root = tempfile::tempdir().unwrap();
@@ -5267,12 +5363,19 @@ mod tests {
         let (session_tx, session_rx) = tokio::sync::watch::channel(true);
         let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(session_rx))
             .expect("start TCP readiness listener");
-        let connects = || std::net::TcpStream::connect(("127.0.0.1", port)).is_ok();
-        assert!(connects(), "accepted session is ready");
+        let connects = || async {
+            timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        };
+        assert!(connects().await, "accepted session is ready");
 
         session_tx.send_replace(false);
         timeout(Duration::from_secs(1), async {
-            while connects() {
+            while connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -5281,7 +5384,7 @@ mod tests {
 
         session_tx.send_replace(true);
         timeout(Duration::from_secs(1), async {
-            while !connects() {
+            while !connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -5290,7 +5393,7 @@ mod tests {
 
         drop(readiness);
         timeout(Duration::from_secs(1), async {
-            while connects() {
+            while connects().await {
                 tokio::task::yield_now().await;
             }
         })
@@ -5298,7 +5401,61 @@ mod tests {
         .expect("dropped guard closes readiness listener");
     }
 
+    #[tokio::test]
+    async fn tcp_readiness_waits_for_initial_session_acceptance() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let readiness = ControlReadiness::start(ReadinessEndpoint::Tcp(port), Some(rx)).unwrap();
+        assert!(
+            !timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+        );
+        tx.send_replace(true);
+        timeout(Duration::from_secs(2), async {
+            while !timeout(
+                Duration::from_millis(100),
+                tokio::net::TcpStream::connect(("127.0.0.1", port)),
+            )
+            .await
+            .is_ok_and(|result| result.is_ok())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("accepted session opens TCP readiness");
+        drop(readiness);
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unix_readiness_is_rejected_without_disabling_tcp() {
+        let result = ControlReadiness::start(ReadinessEndpoint::Unix("health.sock".into()), None);
+        assert!(
+            result
+                .err()
+                .expect("Unix sockets unsupported")
+                .to_string()
+                .contains("unsupported")
+        );
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        assert!(
+            ControlReadiness::start(ReadinessEndpoint::Unix("health.sock".into()), Some(rx))
+                .is_err(),
+            "invalid adapter must fail even before session acceptance"
+        );
+    }
+
     #[test]
+    #[cfg(unix)]
     fn control_readiness_rejects_relative_path() {
         let error = prepare_control_readiness_path(std::path::Path::new("health.sock"))
             .expect_err("relative readiness path must be rejected");
@@ -6987,6 +7144,7 @@ network_policies:
             dynamic_credentials: std::collections::HashMap::new(),
             static_credential_bindings: std::collections::HashMap::new(),
             non_secret_environment_keys: Vec::new(),
+            stable_placeholder_environment_keys: Vec::new(),
         }
     }
 
@@ -7140,6 +7298,7 @@ network_policies:
             &self,
             _endpoint: &str,
             _sandbox_id: &str,
+            _requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             let identity = self.environment_identity.lock().unwrap().clone();
             let mut provider = startup_provider(identity.revision);
@@ -7187,9 +7346,10 @@ network_policies:
             &self,
             endpoint: &str,
             sandbox_id: &str,
+            requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             self.inner
-                .fetch_provider_environment(endpoint, sandbox_id)
+                .fetch_provider_environment(endpoint, sandbox_id, requires_stable_placeholders)
                 .await
         }
 
@@ -7260,6 +7420,7 @@ network_policies:
             dynamic_credentials: HashMap::new(),
             static_credential_bindings: HashMap::new(),
             non_secret_environment_keys: Vec::new(),
+            stable_placeholder_environment_keys: Vec::new(),
         };
         if let Some(value) = value {
             result
@@ -7318,9 +7479,89 @@ network_policies:
         );
     }
 
-    type ProviderFetchRequest = tokio::sync::oneshot::Sender<
-        Result<openshell_core::grpc_client::ProviderEnvironmentResult>,
-    >;
+    fn stable_provider_environment(
+        revision: u64,
+        value: Option<&str>,
+    ) -> openshell_core::grpc_client::ProviderEnvironmentResult {
+        let mut result = static_provider_environment(revision, value);
+        if let Some(binding) = result.static_credential_bindings.get_mut("EXTERNAL_TOKEN") {
+            binding.workload_credential_handle = "a".repeat(64);
+            result
+                .stable_placeholder_environment_keys
+                .push("EXTERNAL_TOKEN".into());
+        }
+        result
+    }
+
+    #[test]
+    fn initial_provider_credentials_preserve_stable_delivery_requirement() {
+        let readiness = ProviderReadinessTracker::new();
+        let policy = proto_policy_fixture();
+        let mut startup = settings_poll_result(
+            Some(policy.clone()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        startup.provider_env_revision = 1;
+        let (_, _, prepared) = prepare_startup_configuration(
+            &startup,
+            &policy,
+            &stable_provider_environment(1, Some("initial")),
+        )
+        .expect("stable credentials prepare for admitted startup");
+        assert!(prepared.requires_stable_placeholders());
+        let state = initial_provider_credentials(
+            stable_provider_environment(1, Some("initial")),
+            &readiness,
+        );
+        assert!(state.requires_stable_placeholders());
+        assert!(readiness.observation(&state).credentials_installed);
+        let (revision, child_env) = state.child_env_snapshot_with_gcp_resolved().unwrap();
+        assert_eq!(prepared.snapshot().child_env, child_env);
+        let reference = &child_env["EXTERNAL_TOKEN"];
+        assert_eq!(revision, 1);
+        assert_eq!(
+            reference,
+            &format!("openshell:resolve:env:s{}_EXTERNAL_TOKEN", "a".repeat(64))
+        );
+        assert_eq!(
+            state
+                .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                .unwrap()
+                .resolve_placeholder(reference),
+            Some("initial"),
+        );
+        // The remote workload receives the prepared snapshot, with no resolver
+        // authority and no second placeholder transformation at its boundary.
+        let boundary =
+            ProviderCredentialState::from_child_env_snapshot(revision, child_env.clone());
+        assert_eq!(boundary.snapshot().child_env, child_env);
+        assert!(boundary.resolver().is_none());
+
+        let mut invalid = stable_provider_environment(2, Some("invalid"));
+        invalid
+            .static_credential_bindings
+            .get_mut("EXTERNAL_TOKEN")
+            .unwrap()
+            .workload_credential_handle
+            .clear();
+        startup.provider_env_revision = 2;
+        assert!(prepare_startup_configuration(&startup, &policy, &invalid).is_err());
+        let rejected = initial_provider_credentials(invalid, &readiness);
+        assert!(rejected.snapshot().child_env.is_empty());
+        assert!(rejected.resolver().is_none());
+        assert_eq!(
+            readiness.observation(&rejected).reason,
+            i32::from(ProviderReadinessReason::CredentialInstallFailed)
+        );
+    }
+
+    type ProviderFetchRequest = (
+        bool,
+        tokio::sync::oneshot::Sender<
+            Result<openshell_core::grpc_client::ProviderEnvironmentResult>,
+        >,
+    );
 
     #[derive(Clone)]
     struct ScriptedProviderGateway {
@@ -7353,11 +7594,12 @@ network_policies:
             &self,
             _endpoint: &str,
             sandbox_id: &str,
+            requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             assert_eq!(sandbox_id, "sandbox-test");
             let (response, received) = tokio::sync::oneshot::channel();
             self.requests
-                .send(response)
+                .send((requires_stable_placeholders, response))
                 .map_err(|_| miette::miette!("provider request channel closed"))?;
             received
                 .await
@@ -7491,9 +7733,10 @@ network_policies:
             &self,
             endpoint: &str,
             sandbox_id: &str,
+            requires_stable_placeholders: bool,
         ) -> Result<openshell_core::grpc_client::ProviderEnvironmentResult> {
             self.inner
-                .fetch_provider_environment(endpoint, sandbox_id)
+                .fetch_provider_environment(endpoint, sandbox_id, requires_stable_placeholders)
                 .await
         }
 
@@ -7590,7 +7833,7 @@ network_policies:
         expect_policy_report(&mut reports, 1).await;
 
         polls.send(initial.clone()).unwrap();
-        let response = timeout(Duration::from_secs(1), received.recv())
+        let (_, response) = timeout(Duration::from_secs(1), received.recv())
             .await
             .unwrap()
             .unwrap();
@@ -7611,7 +7854,7 @@ network_policies:
         let failed_id = credentials.snapshot().installation_id.clone();
 
         polls.send(initial.clone()).unwrap();
-        let response = timeout(Duration::from_secs(1), received.recv())
+        let (_, response) = timeout(Duration::from_secs(1), received.recv())
             .await
             .unwrap()
             .unwrap();
@@ -7642,7 +7885,7 @@ network_policies:
         changed.config_revision = 200;
         changed.policy_hash = "hash-v2".to_string();
         polls.send(changed).unwrap();
-        let response = timeout(Duration::from_secs(1), received.recv())
+        let (_, response) = timeout(Duration::from_secs(1), received.recv())
             .await
             .unwrap()
             .unwrap();
@@ -7756,7 +7999,7 @@ network_policies:
         );
         changed.provider_env_revision = 1;
         polls.send(changed).unwrap();
-        let response = timeout(Duration::from_secs(1), received.recv())
+        let (_, response) = timeout(Duration::from_secs(1), received.recv())
             .await
             .expect("provider refresh requested")
             .expect("poll loop active");
@@ -7823,7 +8066,7 @@ network_policies:
             let mut poll = initial.clone();
             poll.provider_env_revision = revision;
             polls.send(poll).unwrap();
-            let response = timeout(Duration::from_secs(5), received.recv())
+            let (_, response) = timeout(Duration::from_secs(5), received.recv())
                 .await
                 .expect("provider refresh requested")
                 .expect("poll loop active");
@@ -7865,6 +8108,91 @@ network_policies:
                         Some("initial")
                     );
                 }
+            } else {
+                assert!(state.snapshot().child_env.is_empty());
+                assert!(state.resolver().is_none());
+            }
+        }
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn provider_poll_preserves_stable_delivery_across_rotation_failure_and_detach() {
+        let engine = Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).unwrap());
+        let initial = settings_poll_result(
+            Some(proto_policy_fixture()),
+            1,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let state = ctx.provider_credentials.clone();
+        let tracker = ctx.provider_readiness.clone();
+        let (policy, polls, mut reports) = scripted_policy_gateway();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        // Startup acknowledges the policy already loaded before the refresh
+        // loop consumes later provider revisions.
+        polls.send(initial.clone()).unwrap();
+        let task = tokio::spawn(run_policy_poll_loop_with_client(
+            ctx,
+            ScriptedProviderGateway { policy, requests },
+        ));
+        expect_policy_report(&mut reports, 1).await;
+        let reference = format!("openshell:resolve:env:s{}_EXTERNAL_TOKEN", "a".repeat(64));
+
+        // A failed refresh must remain eligible for retry at the same revision,
+        // carrying the prior support requirement despite revoking its secrets.
+        for (revision, value, fail, required_before, required_after) in [
+            (1, Some("initial"), false, false, true),
+            (2, Some("rotated"), false, true, true),
+            (3, None, true, true, true),
+            (3, Some("recovered"), false, true, true),
+            (4, None, false, true, false),
+            (5, None, false, false, false),
+        ] {
+            let mut poll = initial.clone();
+            poll.provider_env_revision = revision;
+            polls.send(poll).unwrap();
+            let (required, response) = timeout(Duration::from_secs(5), received.recv())
+                .await
+                .expect("provider refresh requested")
+                .expect("poll loop active");
+            assert_eq!(required, required_before, "revision {revision}");
+            let result = if fail {
+                Err(miette::miette!("gateway support acknowledgment missing"))
+            } else {
+                Ok(stable_provider_environment(revision, value))
+            };
+            assert!(response.send(result).is_ok());
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    let resolved = state
+                        .resolver_for_endpoint("tools.example.com", 443, "/v1/chat")
+                        .and_then(|resolver| {
+                            resolver.resolve_placeholder(&reference).map(str::to_owned)
+                        });
+                    let observed = tracker.observation(&state);
+                    if state.revision() == revision
+                        && resolved.as_deref() == value
+                        && (fail || observed.credentials_installed)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("provider snapshot installed or revoked");
+            assert_eq!(state.requires_stable_placeholders(), required_after);
+            if value.is_some() {
+                assert_eq!(state.snapshot().child_env["EXTERNAL_TOKEN"], reference);
             } else {
                 assert!(state.snapshot().child_env.is_empty());
                 assert!(state.resolver().is_none());

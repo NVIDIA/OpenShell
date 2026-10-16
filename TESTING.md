@@ -48,6 +48,28 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### PostgreSQL-backed tests
+
+Tests that need a real PostgreSQL server, such as advisory-lock concurrency
+across two stores, are `#[ignore]`d and named `postgres_*`. Run them with:
+
+```shell
+mise run test:rust:postgres
+```
+
+The task starts a disposable PostgreSQL container with Docker or Podman
+(set `CONTAINER_ENGINE` to choose), runs the tests one at a time, and removes
+the container. Each test works in its own temporary schema, except the replay
+and provider refresh lock tests, which use the default schema. To use your own
+disposable database, set `OPENSHELL_TEST_POSTGRES_URL`. The task overrides
+`OPENSHELL_REPLAY_TEST_DATABASE_URL` so legacy tests use that same database.
+Never point it at a database that a running gateway uses: the tests take
+fleet-wide advisory locks.
+Branch Checks runs them on x86_64 Linux.
+Load-sensitive capacity checks are named `bench_postgres_*` instead, so that
+task skips them. Run them on an idle machine with
+`mise run test:rust:postgres:bench`.
+
 ### Native Windows validation
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
@@ -295,6 +317,11 @@ Run the Podman-backed Rust CLI e2e suite:
 mise run e2e:podman
 ```
 
+`nix run .#build-artifacts` also builds
+`artifacts/packages/openshell.deb` for tmachine's `deb` installer, targeting the
+host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
+override the default package version, `0.0.0-local`.
+
 Run the portable subset in a disposable rootless Podman guest:
 
 ```shell
@@ -314,11 +341,37 @@ Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
-gateway controls, host fixtures, missing guest tools, or nondeterministic relay
-setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
+gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
+guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
 binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
+
+The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
+OCI image identity and working-directory behavior shared by the Docker and
+Podman drivers against installed deb packages on Ubuntu and rpm packages on
+Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+```
+
+The shared suite also runs in the existing ARM64 Docker E2E workflow for
+branch checks and both release workflows. That interim lane compiles the same
+test crate natively and uses the architecture-matched prebuilt candidate CLI
+and gateway plus the candidate multi-architecture sandbox and supervisor
+images through `e2e/with-docker-gateway.sh`. The tmachine lanes still use
+x86_64 artifacts; they do not replace ARM64 image coverage.
+
+Run it against a local Docker or Podman gateway:
+
+```shell
+mise run e2e:oci-image
+mise run e2e:oci-image:podman
+```
+
+Both tasks set `OPENSHELL_TEST_CONTAINER_ENGINE`, the command that builds test
+images into the gateway's image store.
 
 Run the VM-backed Rust CLI e2e suite:
 
@@ -517,7 +570,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test custom_image
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:

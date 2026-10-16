@@ -248,6 +248,15 @@ pub struct KubernetesComputeConfig {
     /// supplies its own export endpoint; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+
+    /// Gateway name passed to supervisors for their telemetry. The gateway
+    /// supplies its own name; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_gateway_name: Option<String>,
     pub ssh_socket_path: String,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
@@ -263,6 +272,19 @@ pub struct KubernetesComputeConfig {
     /// Applied when a `CreateSandbox` request does not specify one.
     /// Empty string (default) = omit the field, using the cluster default.
     pub default_runtime_class_name: String,
+    /// Pod annotation keys that sandbox templates may set. Each entry is an
+    /// exact key (`example.com/team`) or a prefix wildcard (`example.com/*`).
+    /// Empty (default) rejects every caller-supplied pod annotation.
+    ///
+    /// Keys in `openshell.ai` and `agents.x-k8s.io` (and their subdomains)
+    /// are always rejected and cannot be allowlisted. `OpenShell` writes sandbox
+    /// identity under `openshell.ai`, and the Agent Sandbox controller owns
+    /// `agents.x-k8s.io` and strips those keys from pod templates.
+    pub allowed_pod_annotations: Vec<String>,
+    /// Pod label keys that sandbox templates may set, using the same entry
+    /// format and reserved domains as `allowed_pod_annotations`. Empty
+    /// (default) rejects every caller-supplied pod label.
+    pub allowed_pod_labels: Vec<String>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
     /// writes into each sandbox pod. Used only for the one-shot
     /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
@@ -357,6 +379,8 @@ impl Default for KubernetesComputeConfig {
             proxy_ca_bundle: None,
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
@@ -364,6 +388,8 @@ impl Default for KubernetesComputeConfig {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
+            allowed_pod_annotations: Vec::new(),
+            allowed_pod_labels: Vec::new(),
             sa_token_ttl_secs: 3600,
             provider_spiffe_workload_api_socket_path: String::new(),
             sandbox_uid: None,
@@ -379,7 +405,29 @@ impl KubernetesComputeConfig {
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
-        self.validate_upstream_proxy_config()
+        self.validate_upstream_proxy_config()?;
+        self.validate_allowed_pod_annotations()?;
+        self.validate_allowed_pod_labels()
+    }
+
+    pub fn validate_allowed_pod_annotations(&self) -> Result<(), String> {
+        validate_pod_metadata_allowlist("allowed_pod_annotations", &self.allowed_pod_annotations)
+    }
+
+    pub fn validate_allowed_pod_labels(&self) -> Result<(), String> {
+        validate_pod_metadata_allowlist("allowed_pod_labels", &self.allowed_pod_labels)
+    }
+
+    /// Whether a caller-supplied pod annotation key passes the operator allowlist.
+    #[must_use]
+    pub fn pod_annotation_allowed(&self, key: &str) -> bool {
+        pod_metadata_key_allowed(&self.allowed_pod_annotations, key)
+    }
+
+    /// Whether a caller-supplied pod label key passes the operator allowlist.
+    #[must_use]
+    pub fn pod_label_allowed(&self, key: &str) -> bool {
+        pod_metadata_key_allowed(&self.allowed_pod_labels, key)
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
@@ -788,6 +836,87 @@ fn is_dns1123_subdomain(value: &str) -> bool {
         })
 }
 
+/// Validate an `allowed_pod_annotations` or `allowed_pod_labels` list. Each
+/// entry is an exact qualified key or a `<domain>/*` wildcard outside the
+/// reserved domains.
+fn validate_pod_metadata_allowlist(field: &str, entries: &[String]) -> Result<(), String> {
+    for entry in entries {
+        let key = entry.strip_suffix("/*").unwrap_or(entry);
+        let wildcard = key.len() != entry.len();
+        let (prefix, name) = match key.split_once('/') {
+            Some((prefix, name)) if !wildcard => (Some(prefix), Some(name)),
+            Some(_) => {
+                return Err(format!(
+                    "{field} entry {entry:?}: wildcard entries must be `<domain>/*`"
+                ));
+            }
+            None if wildcard => (Some(key), None),
+            None => (None, Some(key)),
+        };
+        if let Some(prefix) = prefix
+            && !is_dns1123_subdomain(prefix)
+        {
+            return Err(format!(
+                "{field} entry {entry:?}: invalid key prefix {prefix:?}"
+            ));
+        }
+        if let Some(name) = name
+            && !is_qualified_name_segment(name)
+        {
+            return Err(format!(
+                "{field} entry {entry:?}: invalid key name {name:?}"
+            ));
+        }
+        if prefix.is_some_and(is_reserved_pod_metadata_domain) {
+            return Err(format!(
+                "{field} entry {entry:?}: domain is reserved for OpenShell and Agent Sandbox"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn pod_metadata_key_allowed(entries: &[String], key: &str) -> bool {
+    let prefix = key.split_once('/').map(|(prefix, _)| prefix);
+    if prefix.is_some_and(is_reserved_pod_metadata_domain) {
+        return false;
+    }
+    entries.iter().any(|entry| {
+        entry
+            .strip_suffix("/*")
+            .map_or_else(|| entry == key, |domain| prefix == Some(domain))
+    })
+}
+
+/// Pod annotation and label domains owned by `OpenShell` (sandbox identity
+/// such as `openshell.ai/sandbox-id` and boundary labels) and the Agent
+/// Sandbox controller (which strips them from pod templates). Sandbox
+/// templates can never set keys in these domains or their subdomains,
+/// regardless of `allowed_pod_annotations` or `allowed_pod_labels`.
+const RESERVED_POD_METADATA_DOMAINS: &[&str] = &["openshell.ai", "agents.x-k8s.io"];
+
+fn is_reserved_pod_metadata_domain(domain: &str) -> bool {
+    RESERVED_POD_METADATA_DOMAINS.iter().any(|reserved| {
+        domain == *reserved
+            || domain
+                .strip_suffix(reserved)
+                .is_some_and(|rest| rest.ends_with('.'))
+    })
+}
+
+/// Kubernetes qualified-name segment: at most 63 alphanumeric, `-`, `_`, or
+/// `.` characters, beginning and ending with an alphanumeric character.
+fn is_qualified_name_segment(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(b))
+}
+
 fn validate_provider_spiffe_workload_api_socket_path_value(
     socket_path: &str,
 ) -> Result<(), String> {
@@ -959,6 +1088,81 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.default_runtime_class_name, "nvidia");
+    }
+
+    fn with_allowed_pod_annotations(entries: &[&str]) -> KubernetesComputeConfig {
+        KubernetesComputeConfig {
+            allowed_pod_annotations: entries.iter().map(ToString::to_string).collect(),
+            ..KubernetesComputeConfig::default()
+        }
+    }
+
+    #[test]
+    fn pod_annotation_allowed_matches_exact_and_domain_entries() {
+        assert!(!KubernetesComputeConfig::default().pod_annotation_allowed("example.com/a"));
+
+        let cfg = with_allowed_pod_annotations(&["example.com/*", "team.org/owner", "owner"]);
+        for (key, allowed) in [
+            ("example.com/a", true),
+            ("sub.example.com/a", false),
+            ("team.org/owner", true),
+            ("team.org/other", false),
+            ("owner", true),
+        ] {
+            assert_eq!(cfg.pod_annotation_allowed(key), allowed, "{key}");
+        }
+
+        // Reserved domains stay blocked even if validation was bypassed.
+        let cfg = with_allowed_pod_annotations(&["openshell.ai/sandbox-id"]);
+        assert!(!cfg.pod_annotation_allowed("openshell.ai/sandbox-id"));
+    }
+
+    #[test]
+    fn validate_allowed_pod_annotations_rejects_malformed_and_reserved_entries() {
+        with_allowed_pod_annotations(&["example.com/*", "team.org/owner", "owner"])
+            .validate_allowed_pod_annotations()
+            .unwrap();
+        for entry in [
+            "*",
+            "",
+            "example.com/",
+            "Example.com/owner",
+            "example.com/a/*",
+            "example.com/*/owner",
+            "-bad",
+            "openshell.ai/*",
+            "agents.x-k8s.io/pod-name",
+            "extensions.agents.x-k8s.io/*",
+        ] {
+            assert!(
+                with_allowed_pod_annotations(&[entry])
+                    .validate_allowed_pod_annotations()
+                    .is_err(),
+                "{entry:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pod_label_allowlist_is_separate_from_annotation_allowlist() {
+        let cfg = KubernetesComputeConfig {
+            allowed_pod_annotations: vec!["annotations.example.com/*".into()],
+            allowed_pod_labels: vec!["app".into(), "labels.example.com/*".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.pod_label_allowed("app"));
+        assert!(cfg.pod_label_allowed("labels.example.com/team"));
+        assert!(!cfg.pod_label_allowed("annotations.example.com/team"));
+        assert!(!cfg.pod_annotation_allowed("labels.example.com/team"));
+        assert!(!KubernetesComputeConfig::default().pod_label_allowed("app"));
+
+        let cfg = KubernetesComputeConfig {
+            allowed_pod_labels: vec!["openshell.ai/managed-by".into()],
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(!cfg.pod_label_allowed("openshell.ai/managed-by"));
+        let err = cfg.validate_allowed_pod_labels().unwrap_err();
+        assert!(err.starts_with("allowed_pod_labels entry"), "{err}");
     }
 
     #[test]

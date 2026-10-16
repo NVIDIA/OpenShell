@@ -446,6 +446,7 @@ mod tests {
                 sandbox_token: SecretJwt::parse("sandbox.token.value").unwrap(),
                 sandbox_expires_at: i64::MAX,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: "gateway-test".to_string(),
             verification_keys: vec![SessionVerificationKey {

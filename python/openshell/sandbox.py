@@ -453,6 +453,15 @@ class ClientCredentialsAuth:
 
 
 @dataclass(frozen=True)
+class SandboxConditionRef:
+    type: str
+    status: str
+    reason: str = ""
+    message: str = ""
+    transition_time_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
@@ -460,6 +469,7 @@ class SandboxStatusRef:
     restart_count: int = 0
     next_restart_at_ms: int | None = None
     main_process_started_at_ms: int | None = None
+    conditions: tuple[SandboxConditionRef, ...] = ()
 
 
 class ServiceAuthorizationMode(IntEnum):
@@ -537,6 +547,10 @@ class SandboxRef:
     @property
     def current_policy_version(self) -> int:
         return self.status.current_policy_version
+
+    @property
+    def conditions(self) -> tuple[SandboxConditionRef, ...]:
+        return self.status.conditions
 
 
 @dataclass(frozen=True)
@@ -1629,7 +1643,7 @@ class Sandbox:
                 "name, labels, and workload_template cannot be set when attaching to an existing sandbox"
             )
 
-        client = SandboxClient.from_active_cluster(
+        self._client = SandboxClient.from_active_cluster(
             cluster=self._cluster,
             timeout=self._timeout,
             auto_refresh=self._auto_refresh,
@@ -1637,8 +1651,17 @@ class Sandbox:
             insecure=self._insecure,
             client_credentials=self._client_credentials,
         )
-        self._client = client
+        try:
+            self._open_session(self._client)
+        except BaseException:
+            # Python skips __exit__ when __enter__ raises, so release here
+            # and keep the original error even if the close fails.
+            with contextlib.suppress(Exception):
+                self._release()
+            raise
+        return self
 
+    def _open_session(self, client: SandboxClient) -> None:
         if self._sandbox_input is None and self._workload_template is not None:
             self._session = client.create_session_from_template(
                 workspace=self._workspace,
@@ -1670,7 +1693,12 @@ class Sandbox:
         )
         self._session = SandboxSession(client, ready)
 
-        return self
+    def _release(self) -> None:
+        client = self._client
+        self._session = None
+        self._client = None
+        if client is not None:
+            client.close()
 
     def __exit__(self, *args: object) -> None:
         try:
@@ -1694,10 +1722,7 @@ class Sandbox:
                         f"unsupported deletion outcome: {result.outcome}"
                     )
         finally:
-            if self._client is not None:
-                self._client.close()
-            self._session = None
-            self._client = None
+            self._release()
 
     def exec(
         self,
@@ -1772,6 +1797,25 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
+def _sandbox_conditions(
+    status: openshell_pb2.SandboxStatus | None,
+) -> tuple[SandboxConditionRef, ...]:
+    if status is None:
+        return ()
+    return tuple(
+        SandboxConditionRef(
+            type=condition.type,
+            status=condition.status,
+            reason=condition.reason,
+            message=condition.message,
+            transition_time_ms=condition.transition_time.ToMilliseconds()
+            if condition.HasField("transition_time")
+            else None,
+        )
+        for condition in status.conditions
+    )
+
+
 def _sandbox_ref(
     sandbox: openshell_pb2.Sandbox,
     service_urls: Mapping[str, str] | None = None,
@@ -1802,6 +1846,7 @@ def _sandbox_ref(
             main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
             if status is not None and status.HasField("main_process_started_time")
             else None,
+            conditions=_sandbox_conditions(status),
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,

@@ -72,6 +72,7 @@ mod tests {
                 sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
                 sandbox_expires_at: 0,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: "gateway".to_string(),
             verification_keys: Vec::new(),
@@ -307,7 +308,7 @@ impl SshIdentityStore {
 
     /// Keep credential staging and publication alive if the calling RPC is
     /// cancelled. The independent identity lock fences parent deletion on
-    /// every replica without nesting the creation cross-object lock.
+    /// every replica without nesting the creation mutation guard.
     pub(crate) async fn prepare(
         &self,
         sandbox: &mut Sandbox,

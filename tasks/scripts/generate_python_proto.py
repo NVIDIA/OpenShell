@@ -3,6 +3,7 @@
 
 """Generate Python protobuf stubs and make their imports package-relative."""
 
+import argparse
 import re
 import subprocess
 import sys
@@ -72,6 +73,17 @@ LINE_REWRITES = {
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-pyi",
+        action="store_true",
+        help=(
+            "Skip .pyi type stubs. Needed with protoc older than 3.20 "
+            "(e.g. Fedora's grpcio-tools 1.48), which has no --pyi_out."
+        ),
+    )
+    args = parser.parse_args()
+
     subprocess.run(
         [
             sys.executable,
@@ -79,7 +91,7 @@ def main() -> None:
             "grpc_tools.protoc",
             "-Iproto",
             "--python_out=python/openshell/_proto",
-            "--pyi_out=python/openshell/_proto",
+            *([] if args.no_pyi else ["--pyi_out=python/openshell/_proto"]),
             "--grpc_python_out=python/openshell/_proto",
             *PROTO_FILES,
         ],

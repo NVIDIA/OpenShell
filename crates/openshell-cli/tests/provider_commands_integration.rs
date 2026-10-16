@@ -79,6 +79,7 @@ fn selected_workspace(scope: &Option<WorkspaceSelector>) -> Option<&str> {
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    supports_stable_placeholder: Arc<AtomicBool>,
     scoped_profiles: Arc<Mutex<HashMap<(String, String), ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
@@ -1031,6 +1032,10 @@ impl OpenShell for TestOpenShell {
             openshell_core::proto::LintProviderProfilesResponse {
                 diagnostics: Vec::new(),
                 valid: true,
+                supports_stable_placeholder: self
+                    .state
+                    .supports_stable_placeholder
+                    .load(Ordering::SeqCst),
             },
         ))
     }
@@ -3427,6 +3432,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "table",
         "default",
@@ -3739,6 +3745,7 @@ async fn provider_list_json_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "json",
         "default",
@@ -3782,6 +3789,7 @@ async fn provider_list_yaml_output() {
         &ts.endpoint,
         100,
         "",
+        "",
         false,
         "yaml",
         "default",
@@ -3809,6 +3817,7 @@ async fn provider_list_json_empty() {
     run::provider_list(
         &ts.endpoint,
         100,
+        "",
         "",
         false,
         "json",
@@ -4056,6 +4065,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     );
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &["team=ml".into()],
         server: &ts.endpoint,
         name: "custom-refresh-provider",
         provider_type: "custom-refresh",
@@ -4072,6 +4082,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     let stored = ts.state.providers.lock().await;
     let provider = stored.get("custom-refresh-provider").expect("provider");
     assert_eq!(provider.r#type, "custom-refresh");
+    assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
     assert!(provider.credentials.is_empty());
 }
 
@@ -4353,6 +4364,73 @@ async fn sandbox_provider_attach_cli_surfaces_server_errors() {
             provider: "missing-provider".to_string(),
         }]
     );
+}
+
+#[tokio::test]
+async fn provider_profile_stable_placeholder_checks_support_before_writing() {
+    let ts = run_server().await;
+    let dir = tempfile::tempdir().expect("profile directory");
+    let path = dir.path().join("external.yaml");
+    let stable = r"
+id: external
+display_name: External
+category: other
+resource_version: 1
+credentials:
+  - name: token
+    env_vars: [EXTERNAL_TOKEN]
+    stable_placeholder: true
+endpoints:
+  - host: api.example.com
+    port: 443
+";
+    std::fs::write(&path, stable).expect("stable profile");
+    let error =
+        run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+            .await
+            .expect_err("legacy gateway cannot import the opt-in");
+    assert!(
+        error
+            .to_string()
+            .contains("does not support stable_placeholder")
+    );
+    assert!(ts.state.profiles.lock().await.is_empty());
+    assert!(
+        run::provider_profile_lint(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+            .await
+            .is_err()
+    );
+
+    // A legacy gateway still accepts ordinary profiles through the old path.
+    std::fs::write(
+        &path,
+        stable.replace("stable_placeholder: true", "stable_placeholder: false"),
+    )
+    .expect("ordinary profile");
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+        .await
+        .expect("ordinary import");
+    let original = ts.state.profiles.lock().await["external"].clone();
+    std::fs::write(&path, stable).expect("enable opt-in");
+    assert!(
+        run::provider_profile_update(&ts.endpoint, "external", &path, "default", &ts.tls)
+            .await
+            .is_err()
+    );
+    assert_eq!(ts.state.profiles.lock().await["external"], original);
+
+    ts.state
+        .supports_stable_placeholder
+        .store(true, Ordering::SeqCst);
+    run::provider_profile_update(&ts.endpoint, "external", &path, "default", &ts.tls)
+        .await
+        .expect("supporting gateway update");
+    assert!(ts.state.profiles.lock().await["external"].credentials[0].stable_placeholder);
+    std::fs::write(&path, stable.replace("id: external", "id: second")).expect("second profile");
+    run::provider_profile_import(&ts.endpoint, Some(&path), None, None, "default", &ts.tls)
+        .await
+        .expect("supporting gateway import");
+    assert!(ts.state.profiles.lock().await["second"].credentials[0].stable_placeholder);
 }
 
 #[tokio::test]
@@ -5305,6 +5383,7 @@ async fn provider_create_sends_inline_credentials() {
     let ts = run_server().await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "openai-inline",
         provider_type: "openai",
@@ -5341,6 +5420,7 @@ async fn provider_create_prefers_exact_imported_alias_profile() {
     install_test_profile(&ts, "gh", "GITHUB_TOKEN").await;
 
     run::provider_create_with_options(run::ProviderCreateOptions {
+        labels: &[],
         server: &ts.endpoint,
         name: "enterprise-github",
         provider_type: "gh",
@@ -5535,17 +5615,18 @@ async fn provider_create_from_gcloud_adc_happy_path() {
 
     Environment::from_pairs(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)])
         .run_async(async {
-            run::provider_create(
-                &ts.endpoint,
-                "my-vertex",
-                "google-vertex-ai",
-                false,
-                &[],  // no explicit credentials; refresh bootstrap covers it
-                true, // from_gcloud_adc
-                &[],
-                "default",
-                &ts.tls,
-            )
+            run::provider_create_with_options(run::ProviderCreateOptions {
+                server: &ts.endpoint,
+                name: "my-vertex",
+                provider_type: "google-vertex-ai",
+                labels: &["team=ml".into()],
+                credentials: &[],
+                credential_source: run::ProviderCreateCredentialSource::GcloudAdc,
+                config: &[],
+                workspace: "default",
+                profile_workspace: "default",
+                tls: &ts.tls,
+            })
             .await
             .expect("provider_create with --from-gcloud-adc should succeed");
 
@@ -5555,6 +5636,7 @@ async fn provider_create_from_gcloud_adc_happy_path() {
                 .get("my-vertex")
                 .expect("provider should be stored after create");
             assert_eq!(provider.r#type, "google-vertex-ai");
+            assert_eq!(provider.metadata.as_ref().unwrap().labels["team"], "ml");
             assert_eq!(
                 provider
                     .credentials

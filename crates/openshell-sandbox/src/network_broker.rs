@@ -677,14 +677,17 @@ fn create_socket(
     if let Err(error) = prepare_registry_for_socket(registry, descriptor_soft_limit) {
         return listener.respond_errno(notification.id, error_to_errno(&error));
     }
+    // The broker's copy must never survive workload exec, even when the
+    // injected descriptor is intentionally inheritable in the workload.
+    let source_kind = raw_kind | libc::SOCK_CLOEXEC;
     // SAFETY: arguments were reduced to the supported native INET matrix. A
     // successful call returns one newly owned descriptor.
-    let mut source = unsafe { libc::socket(domain, raw_kind, protocol) };
+    let mut source = unsafe { libc::socket(domain, source_kind, protocol) };
     if source < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EMFILE) {
         collect_closed_socket_entries(registry)?;
         // SAFETY: same validated native INET socket creation after reclaiming
         // broker-held descriptors for closed workload sockets.
-        source = unsafe { libc::socket(domain, raw_kind, protocol) };
+        source = unsafe { libc::socket(domain, source_kind, protocol) };
     }
     if source < 0 {
         return Err(io::Error::last_os_error());
@@ -842,7 +845,10 @@ fn connect_socket(
                 return listener.respond_value(notification.id, 0);
             }
         }
-        if lock(&registry).resolve(notification.tid, fd).is_ok() {
+        if lock(&registry)
+            .resolve_for_native_fallback(notification.tid, fd)?
+            .is_some()
+        {
             // Every registered descriptor is an injected INET socket. Never
             // CONTINUE based on a mutable workload sockaddr for such an FD.
             return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
@@ -1150,7 +1156,10 @@ fn repeated_connect_outcome(
     destination: SocketAddr,
 ) -> Option<i32> {
     match state {
-        SocketState::Created | SocketState::Bound { .. } | SocketState::Listening { .. } => None,
+        SocketState::Created | SocketState::Bound { .. } => None,
+        // A listening TCP socket cannot be connected, and no longer has a
+        // broker-owned descriptor on which to attempt it.
+        SocketState::Listening { .. } => Some(libc::EISCONN),
         // UDP connect replaces the association; repeating the same one succeeds.
         SocketState::DnsUdp { relay } if *relay == destination => Some(0),
         SocketState::Local { peer } if kind == InetKind::DnsUdp && *peer == destination => Some(0),
@@ -1256,7 +1265,10 @@ fn bind_socket(
 ) -> io::Result<()> {
     let fd = raw_fd(notification.args[0])?;
     if !socket_address_is_inet(notification.tid, notification.args[1], notification.args[2])? {
-        if lock(registry).resolve(notification.tid, fd).is_ok() {
+        if lock(registry)
+            .resolve_for_native_fallback(notification.tid, fd)?
+            .is_some()
+        {
             return Err(io::Error::from_raw_os_error(libc::EAFNOSUPPORT));
         }
         return listener.respond_continue(notification.id);
@@ -1268,6 +1280,9 @@ fn bind_socket(
     let bind_result = {
         let mut registry = lock(registry);
         let entry = registry.resolve_mut(notification.tid, fd)?;
+        if matches!(entry.state(), SocketState::Listening { .. }) {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        }
         // A native bind is never restarted, but a notified one can be after a
         // signal. Report a repeat of the bind the broker completed as success.
         if entry.state() == &(SocketState::Bound { local }) {
@@ -1313,9 +1328,14 @@ fn listen_socket(
     let fd = raw_fd(notification.args[0])?;
     let backlog = i32::try_from(notification.args[1]).unwrap_or(i32::MAX);
     let mut registry = lock(registry);
-    let Ok(entry) = registry.resolve_mut(notification.tid, fd) else {
+    let Some(entry) = registry.resolve_mut_for_native_fallback(notification.tid, fd)? else {
         return listener.respond_continue(notification.id);
     };
+    if matches!(entry.state(), SocketState::Listening { .. }) {
+        // Backlog changes and restarted notifications operate on the workload
+        // descriptor. Confinement is standing kernel state, as for accept.
+        return listener.respond_continue(notification.id);
+    }
     // listen(2) may be repeated natively, so a restart needs no special case.
     listener.validate_id(notification.id)?;
     // SAFETY: retained descriptor is the exact registered socket OFD.
@@ -1343,7 +1363,7 @@ fn classify_send(
     }
     let (state, metadata) = {
         let registry = lock(registry);
-        let Ok(entry) = registry.resolve(notification.tid, fd) else {
+        let Some(entry) = registry.resolve_for_native_fallback(notification.tid, fd)? else {
             // Non-INET sockets are never injected into the registry. Leave
             // their native sendmsg/control-message semantics to the kernel.
             return listener.respond_continue(notification.id);
@@ -1366,9 +1386,9 @@ fn classify_send(
     };
 
     let mut registry = lock(registry);
-    let resolution = registry.resolve(notification.tid, fd);
+    let resolution = registry.resolve_for_native_fallback(notification.tid, fd)?;
     match resolution {
-        Ok(entry)
+        Some(entry)
             if entry.metadata().kind == InetKind::DnsUdp
                 && matches!(entry.state(), SocketState::Local { .. }) =>
         {
@@ -1378,7 +1398,7 @@ fn classify_send(
                 Err(io::Error::from_raw_os_error(libc::EACCES))
             }
         }
-        Ok(entry) if matches!(entry.state(), SocketState::DnsUdp { .. }) => {
+        Some(entry) if matches!(entry.state(), SocketState::DnsUdp { .. }) => {
             let SocketState::DnsUdp { relay } = entry.state() else {
                 unreachable!("guard requires DNS UDP state");
             };
@@ -1399,7 +1419,7 @@ fn classify_send(
                 Err(io::Error::from_raw_os_error(libc::EACCES))
             }
         }
-        Ok(entry)
+        Some(entry)
             if entry.metadata().kind == InetKind::DnsUdp
                 && matches!(
                     entry.state(),
@@ -1430,12 +1450,12 @@ fn classify_send(
             entry.release_preconnect();
             listener.respond_continue(notification.id)
         }
-        Ok(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
+        Some(_) => Err(io::Error::from_raw_os_error(libc::EDESTADDRREQ)),
         // Non-INET sockets and natively accepted sockets were never
         // registered. Accepted sockets inherit their listener's loopback
         // binding, and the mandatory outer fence remains an independent
         // backstop against an external kernel route.
-        Err(_) => listener.respond_continue(notification.id),
+        None => listener.respond_continue(notification.id),
     }
 }
 
@@ -1724,6 +1744,162 @@ mod tests {
     use super::*;
     use crate::linux::socket_confinement;
 
+    fn assert_listener_closed(address: SocketAddr, inode: u64) {
+        let table = if address.is_ipv4() {
+            "/proc/net/tcp"
+        } else {
+            "/proc/net/tcp6"
+        };
+        let inode = inode.to_string();
+        assert!(
+            !std::fs::read_to_string(table).unwrap().lines().any(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                fields.get(3) == Some(&"0A") && fields.get(9) == Some(&inode.as_str())
+            }),
+            "closed listener remains in {table}"
+        );
+        assert_eq!(
+            TcpStream::connect_timeout(&address, Duration::from_secs(1))
+                .expect_err("closed listener accepted a connection")
+                .raw_os_error(),
+            Some(libc::ECONNREFUSED)
+        );
+        // Check disappearance and refusal before bind can trigger collection.
+        let _replacement = TcpListener::bind(address).expect("reuse listener port");
+    }
+
+    #[test]
+    fn listening_socket_lives_only_as_long_as_workload_aliases() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let address: SocketAddr = address.parse().unwrap();
+            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+            let broker = NetworkBroker::start_for_test(listener).unwrap();
+            let (socket, alias, address, inode) = launcher
+                .execute(move || -> io::Result<_> {
+                    let socket = socket2::Socket::new(
+                        socket2::Domain::for_address(address),
+                        socket2::Type::STREAM,
+                        None,
+                    )?;
+                    socket.bind(&address.into())?;
+                    socket.listen(1)?;
+                    socket.listen(8)?;
+                    let address = socket.local_addr()?.as_socket().unwrap();
+                    assert_eq!(
+                        socket.bind(&address.into()).unwrap_err().raw_os_error(),
+                        Some(libc::EINVAL)
+                    );
+                    assert_eq!(
+                        socket.connect(&address.into()).unwrap_err().raw_os_error(),
+                        Some(libc::EISCONN)
+                    );
+                    let inode = crate::linux::proc_fd::socket_inode(
+                        std::process::id(),
+                        socket.as_raw_fd(),
+                    )?;
+                    Ok((socket.try_clone()?, socket, address, inode))
+                })
+                .unwrap()
+                .unwrap();
+            let registry = lock(&broker.registry);
+            let entry = registry
+                .resolve(std::process::id(), socket.as_raw_fd())
+                .unwrap();
+            assert!(matches!(entry.state(), SocketState::Listening { .. }));
+            assert!(entry.retained_preconnect().is_err());
+            drop(registry);
+            drop(socket);
+            let _client = TcpStream::connect_timeout(&address, Duration::from_secs(1)).unwrap();
+            drop(alias);
+            assert_listener_closed(address, inode);
+        }
+    }
+
+    #[test]
+    fn implicit_listen_releases_source_and_failed_listen_retains_it() {
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let broker = NetworkBroker::start_for_test(listener).unwrap();
+        let (address, inode, udp) = launcher
+            .execute(|| -> io::Result<_> {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+                socket.listen(1)?;
+                let address = socket.local_addr()?.as_socket().unwrap();
+                let inode =
+                    crate::linux::proc_fd::socket_inode(std::process::id(), socket.as_raw_fd())?;
+                drop(socket);
+                let udp = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+                assert_eq!(
+                    udp.listen(1).unwrap_err().raw_os_error(),
+                    Some(libc::EOPNOTSUPP)
+                );
+                Ok((address, inode, udp))
+            })
+            .unwrap()
+            .unwrap();
+        let registry = lock(&broker.registry);
+        let entry = registry
+            .resolve(std::process::id(), udp.as_raw_fd())
+            .unwrap();
+        assert_eq!(entry.state(), &SocketState::Created);
+        assert!(entry.retained_preconnect().is_ok());
+        drop(registry);
+        assert_listener_closed(address, inode);
+    }
+
+    #[test]
+    fn source_cloexec_is_independent_of_workload_inheritance() {
+        use rustix::io::{FdFlags, fcntl_getfd};
+        for close_on_exec in [false, true] {
+            let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+            let broker = NetworkBroker::start_for_test(listener).unwrap();
+            let socket = launcher
+                .execute(move || -> io::Result<OwnedFd> {
+                    let kind =
+                        libc::SOCK_STREAM | if close_on_exec { libc::SOCK_CLOEXEC } else { 0 };
+                    // SAFETY: supported socket arguments; a successful result
+                    // transfers one injected descriptor into OwnedFd.
+                    let fd = unsafe { libc::socket(libc::AF_INET, kind, 0) };
+                    if fd < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // SAFETY: the successful call returned one owned descriptor.
+                    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                fcntl_getfd(&socket).unwrap().contains(FdFlags::CLOEXEC),
+                close_on_exec
+            );
+            let registry = lock(&broker.registry);
+            let entry = registry
+                .resolve(std::process::id(), socket.as_raw_fd())
+                .unwrap();
+            assert!(
+                fcntl_getfd(entry.retained_preconnect().unwrap())
+                    .unwrap()
+                    .contains(FdFlags::CLOEXEC)
+            );
+            let inode = entry.identity().inode;
+            drop(registry);
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", "for fd in /proc/$$/fd/*; do readlink \"$fd\"; done"])
+                .output()
+                .unwrap();
+            let inherited = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .filter(|line| *line == format!("socket:[{inode}]"))
+                .count();
+            assert_eq!(
+                inherited,
+                usize::from(!close_on_exec),
+                "broker source leaked across exec"
+            );
+        }
+    }
+
     #[test]
     fn provider_files_are_opened_on_demand_and_replaced() {
         let (launcher, listener) =
@@ -1940,6 +2116,79 @@ mod tests {
         assert!(!retry_notification_receive(&io::Error::from_raw_os_error(
             libc::EBADF
         )));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn unreadable_workload_socket_cannot_use_native_fallback() {
+        const CHILD: &str = "OPENSHELL_UNREADABLE_WORKLOAD_TEST_CHILD";
+        const TARGET: &str = "OPENSHELL_UNREADABLE_WORKLOAD_TEST_TARGET";
+        if std::env::var_os(CHILD).is_some() {
+            let destination: SocketAddr = std::env::var(TARGET).unwrap().parse().unwrap();
+            let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let tcp =
+                socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+            // SAFETY: this disposable subprocess changes only its dumpability.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            assert_eq!(
+                udp.send_to(b"test", destination)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EACCES)
+            );
+            assert_eq!(
+                tcp.listen(1).unwrap_err().raw_os_error(),
+                Some(libc::EACCES)
+            );
+            return;
+        }
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let destination = receiver.local_addr().unwrap();
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let mut child = launcher
+            .execute(move || {
+                std::process::Command::new(executable)
+                    .arg("--exact")
+                    .arg("network_broker::tests::unreadable_workload_socket_cannot_use_native_fallback")
+                    .arg("--nocapture")
+                    .env(CHILD, "1")
+                    .env(TARGET, destination.to_string())
+                    .spawn()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(
+            receiver.recv_from(&mut [0_u8; 4]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn closed_workload_socket_reports_bad_descriptor() {
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let error = launcher
+            .execute(|| {
+                let socket =
+                    socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                        .unwrap();
+                let fd = socket.as_raw_fd();
+                drop(socket);
+                // SAFETY: listen on a closed descriptor is a valid error probe.
+                assert_eq!(unsafe { libc::listen(fd, 1) }, -1);
+                io::Error::last_os_error().raw_os_error()
+            })
+            .unwrap();
+        assert_eq!(error, Some(libc::EBADF));
     }
 
     #[test]
@@ -2272,6 +2521,19 @@ mod tests {
         stream.read_exact(&mut payload).expect("read Unix payload");
         assert_eq!(&payload, b"unix");
         client.join().expect("join client").expect("Unix client");
+    }
+
+    #[test]
+    fn unix_listen_remains_kernel_driven() {
+        let directory = tempfile::tempdir().expect("temporary Unix socket directory");
+        let path = directory.path().join("service.sock");
+        let (launcher, listener) = crate::linux::workload_launcher::start().unwrap();
+        let _broker = NetworkBroker::start_for_test(listener).unwrap();
+        let service = launcher
+            .execute(move || UnixListener::bind(path))
+            .unwrap()
+            .unwrap();
+        assert!(service.local_addr().unwrap().as_pathname().is_some());
     }
 
     #[test]

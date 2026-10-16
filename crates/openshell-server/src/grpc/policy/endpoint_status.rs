@@ -10,17 +10,23 @@ use super::{
     deterministic_policy_hash, load_global_settings, policy_static_credential_endpoint_bindings,
 };
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectWorkspace};
+use crate::compute::MutationScope;
+use crate::persistence::{
+    ObjectCursor, ObjectId, ObjectListQuery, ObjectWorkspace, PersistenceError,
+};
 use crate::policy_store::PolicyStoreExt;
 use crate::provider_profile_sources::EffectiveProviderProfileCatalog;
 use crate::supervisor_owner::{OWNER_TTL, SupervisorOwnerIndex};
 use crate::supervisor_session::EndpointReportCursor;
+use futures::TryStreamExt;
 use openshell_core::GetResourceVersion;
-use openshell_core::endpoint_status::initial_endpoint_status;
+use openshell_core::endpoint_failure::validate_endpoint_failure;
+use openshell_core::endpoint_status::{initial_endpoint_status, valid_token_grant_destination};
 use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::{
     EndpointResult, EndpointStatus, PolicySource, ReportEndpointStatusRequest,
     ReportEndpointStatusResponse, Sandbox, SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
+    TokenGrantStatus,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -30,6 +36,19 @@ use tonic::{Request, Response, Status};
 use tracing::warn;
 
 const ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE: u32 = 100;
+/// Sandboxes reconciled at once. On `PostgreSQL` each holds one mutation lock
+/// connection, so this matches the default lock pool size. With a smaller
+/// configured pool the extra reconciliations wait for a lock connection, and
+/// startup reconciliation does not fill a larger one.
+const ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY: usize = 4;
+/// Guarded attempts per sandbox before repeated write conflicts fail startup.
+/// Lock timeouts usually stop earlier, at the retry window below.
+const ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS: usize = 5;
+/// Retry window for lock timeouts, in mutation lock timeouts from the start of
+/// the scan. No lock-timeout retry starts after it, so a scan stuck behind a
+/// long holder fails at most one lock wait later: about 40 seconds with the
+/// 10-second wait, inside the Helm chart's 60-second startup probe.
+const ENDPOINT_STARTUP_RECONCILIATION_RETRY_LOCK_WAITS: u32 = 3;
 const ENDPOINT_DISCONNECT_RETRY_INITIAL_BACKOFF: std::time::Duration =
     std::time::Duration::from_millis(100);
 const ENDPOINT_DISCONNECT_RETRY_MAX_BACKOFF: std::time::Duration =
@@ -40,8 +59,8 @@ struct ExpectedEndpoint {
     // Credential attribution is derived from the effective policy so a
     // sandbox cannot claim credential failure for an unauthenticated endpoint.
     provider_credentialed: bool,
-    // The public status comes only from the validated policy endpoint,
-    // never from observed request data or supervisor-supplied text.
+    // The public address comes only from the validated policy endpoint, never
+    // from observed request data. Only a validated failure cause is reported.
     status: EndpointStatus,
 }
 
@@ -54,7 +73,9 @@ struct EndpointContext {
 /// Accept the last observed result for each configured tool server endpoint.
 ///
 /// Addresses and identifiers come from the authoritative policy. The supervisor
-/// supplies only typed results, so request data and upstream text cannot enter status.
+/// supplies typed results and, for credential failures, a cause whose codes come
+/// from closed sets and whose names are printable ASCII, so request data and
+/// upstream text cannot enter status.
 pub(in crate::grpc) async fn handle_report_endpoint_status(
     state: &Arc<ServerState>,
     request: Request<ReportEndpointStatusRequest>,
@@ -111,9 +132,19 @@ async fn handle_report_endpoint_status_inner(
     // Session validation, configuration derivation, and persistence share the
     // sandbox mutation boundary. A newly registered supervisor can therefore
     // invalidate its predecessor before any stale report reaches the CAS.
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(&req.sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_endpoint_status_authority(&req.sandbox_id, &req.supervisor_session_id)
@@ -140,6 +171,10 @@ async fn handle_report_endpoint_status_inner(
     let current_cursor = state
         .supervisor_sessions
         .endpoint_report_cursor(&req.sandbox_id, &req.supervisor_session_id);
+    let configuration_changed = current_cursor.as_ref().is_some_and(|cursor| {
+        cursor.policy_hash != req.policy_hash
+            || cursor.provider_env_revision != req.provider_env_revision
+    });
     let report_digest: [u8; 32] = Sha256::digest(req.encode_to_vec()).into();
     if let Some(cursor) = current_cursor.as_ref() {
         if req.report_sequence < cursor.report_sequence {
@@ -166,10 +201,17 @@ async fn handle_report_endpoint_status_inner(
     // newer complete snapshot retires every lower sequence, including an RPC
     // cancelled after dispatch or a report from an earlier equal-valued epoch.
 
+    let attached_providers = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.as_slice())
+        .unwrap_or_default();
+    validate_token_grant_status(req.token_grant_status.as_ref(), attached_providers)?;
     let (reports, observed_endpoint_ids) = validate_endpoint_snapshot(
         &req.observations,
         &req.observed_endpoint_ids,
         &context.endpoints,
+        attached_providers,
     )?;
     validate_endpoint_observation_markers(&sandbox, &reports, &observed_endpoint_ids)?;
     let now = openshell_core::time::timestamp_from_system_time(std::time::SystemTime::now())
@@ -179,6 +221,13 @@ async fn handle_report_endpoint_status_inner(
         .store
         .update_message_cas::<Sandbox, _>(&req.sandbox_id, expected_resource_version, |sandbox| {
             reconcile_endpoint_statuses(sandbox, &reports, &observed_endpoint_ids, &now);
+            let status = sandbox.status.as_mut().expect("status reconciled");
+            if let Some(grant_status) = &req.token_grant_status {
+                status.last_token_grant_failure = grant_status.last_failure.clone().map(Box::new);
+            } else if configuration_changed {
+                // A legacy report cannot retain evidence from another configuration.
+                status.last_token_grant_failure = None;
+            }
         })
         .await
         .map_err(|error| {
@@ -362,9 +411,19 @@ pub async fn reset_endpoint_status_for_supervisor_session(
     sandbox_id: &str,
     supervisor_session_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
     if !state
         .supervisor_sessions
         .is_current_session(sandbox_id, supervisor_session_id)
@@ -387,7 +446,7 @@ pub async fn reset_endpoint_status_for_supervisor_session(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-            reconcile_endpoint_statuses(sandbox, &reports, &HashSet::new(), &now);
+            reset_endpoint_statuses(sandbox, &reports, &now);
         })
         .await
         .map_err(|error| {
@@ -404,22 +463,33 @@ pub async fn reset_endpoint_status_for_supervisor_session(
 /// Reset endpoint observations after the active supervisor stream disconnects.
 ///
 /// A concurrently registered replacement owns its own pre-acknowledgement
-/// reset, so this path leaves that session's cursor alone.
+/// reset, so this path leaves that session's cursor alone. A replacement that
+/// already exists is detected before the mutation guard, so the reset does not
+/// wait behind other mutations of the sandbox.
 pub async fn reset_endpoint_status_after_supervisor_disconnect(
     state: &Arc<ServerState>,
     sandbox_id: &str,
 ) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(error, "acquire endpoint status mutation lock")
-    })?;
-    if state
-        .supervisor_sessions
-        .current_session_id(sandbox_id)
-        .is_some()
-    {
+    if disconnect_reset_is_superseded(state, sandbox_id).await? {
         return Ok(());
     }
-    if has_fresh_shared_owner(state, sandbox_id).await? {
+    let Some(_mutation_guard) = state
+        .compute
+        .sandbox_mutation_guard_by_id(sandbox_id)
+        .await
+        .map_err(|error| {
+            super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status mutation lock",
+            )
+        })?
+    else {
+        return Err(Status::not_found("sandbox not found"));
+    };
+    // Re-check under the guard: a replacement's pre-acknowledgement reset runs
+    // under the same sandbox key, and resetting after it would wipe the
+    // replacement's fresh evidence.
+    if disconnect_reset_is_superseded(state, sandbox_id).await? {
         return Ok(());
     }
     let sandbox = state
@@ -436,7 +506,7 @@ pub async fn reset_endpoint_status_after_supervisor_disconnect(
     let updated = state
         .store
         .update_message_cas::<Sandbox, _>(sandbox_id, expected_resource_version, |sandbox| {
-            reconcile_endpoint_statuses(sandbox, &reports, &HashSet::new(), &now);
+            reset_endpoint_statuses(sandbox, &reports, &now);
         })
         .await
         .map_err(|error| {
@@ -484,68 +554,184 @@ pub async fn retry_endpoint_status_after_supervisor_disconnect(
 /// Supervisor sessions are intentionally process-local. This reconciliation
 /// runs before gateway listeners are bound. A fresh shared owner preserves its
 /// evidence; records without one are reset so stale success is never served.
+///
+/// Each sandbox is reset under its own mutation guard, so other replicas keep
+/// mutating unrelated sandboxes during the scan. Keyset paging keeps the scan
+/// stable when sandboxes are deleted mid-scan.
 pub async fn invalidate_endpoint_status_on_startup(state: &Arc<ServerState>) -> Result<(), Status> {
-    let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await.map_err(|error| {
-        super::super::persistence_error_to_status(
-            error,
-            "acquire endpoint status startup reconciliation lock",
-        )
-    })?;
-    let mut offset = 0;
+    let retry_deadline = tokio::time::Instant::now()
+        + state.compute.mutation_lock_timeout() * ENDPOINT_STARTUP_RECONCILIATION_RETRY_LOCK_WAITS;
+    let mut cursor: Option<ObjectCursor> = None;
     loop {
-        let sandboxes = state
+        let page = state
             .store
-            .list_all_messages::<Sandbox>(ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE, offset)
+            .list_message_page::<Sandbox>(
+                ObjectListQuery::AllWorkspaces,
+                cursor.as_ref(),
+                ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE,
+            )
             .await
             .map_err(|error| {
                 Status::internal(format!(
                     "list sandboxes for tool server endpoint-status startup reconciliation failed: {error}"
                 ))
             })?;
-        if sandboxes.is_empty() {
+        // Each future holds at most its own sandbox guard and never waits on
+        // another, so running them in one task cannot deadlock. Each runs as
+        // its own lock-order branch so the debug-build nesting check agrees.
+        futures::stream::iter(
+            page.messages
+                .iter()
+                .filter(|sandbox| has_endpoint_status(sandbox))
+                .map(Ok::<_, Status>),
+        )
+        .try_for_each_concurrent(ENDPOINT_STARTUP_RECONCILIATION_CONCURRENCY, |candidate| {
+            crate::persistence::lock_order::branch(invalidate_sandbox_endpoint_status_on_startup(
+                state,
+                candidate,
+                retry_deadline,
+            ))
+        })
+        .await?;
+        let Some(next_cursor) = page.next_cursor else {
             return Ok(());
-        }
-
-        for sandbox in &sandboxes {
-            let has_endpoint_status = sandbox
-                .status
-                .as_ref()
-                .is_some_and(|status| !status.endpoint_statuses.is_empty());
-            if !has_endpoint_status {
-                continue;
-            }
-            let sandbox_id = sandbox.object_id();
-            if has_fresh_shared_owner(state, sandbox_id).await? {
-                continue;
-            }
-            let expected_resource_version = sandbox.get_resource_version();
-            let updated = state
-                .store
-                .update_message_cas::<Sandbox, _>(
-                    sandbox_id,
-                    expected_resource_version,
-                    invalidate_endpoint_status_without_session,
-                )
-                .await
-                .map_err(|error| {
-                    super::super::persistence_error_to_status(
-                        error,
-                        "invalidate tool server endpoint status during gateway startup",
-                    )
-                })?;
-            state.sandbox_index.update_from_sandbox(&updated);
-        }
-
-        let page_len = sandboxes.len() as u32;
-        if page_len < ENDPOINT_STARTUP_RECONCILIATION_PAGE_SIZE {
-            return Ok(());
-        }
-        offset = offset.checked_add(page_len).ok_or_else(|| {
-            Status::internal(
-                "sandbox pagination overflow during tool server endpoint-status reconciliation",
-            )
-        })?;
+        };
+        cursor = Some(next_cursor);
     }
+}
+
+async fn invalidate_sandbox_endpoint_status_on_startup(
+    state: &Arc<ServerState>,
+    candidate: &Sandbox,
+    retry_deadline: tokio::time::Instant,
+) -> Result<(), Status> {
+    // A live owner keeps its evidence, so it costs no guard.
+    if has_fresh_shared_owner(state, candidate.object_id()).await? {
+        return Ok(());
+    }
+    retry_startup_reconciliation(retry_deadline, || {
+        invalidate_sandbox_endpoint_status_once(state, candidate)
+    })
+    .await
+    .inspect_err(|status| {
+        warn!(
+            sandbox_id = candidate.object_id(),
+            error = status.message(),
+            "tool server endpoint-status startup reconciliation gave up on a sandbox"
+        );
+    })
+}
+
+/// Outcome of one guarded startup-reconciliation attempt.
+enum StartupAttempt {
+    Done,
+    /// The guard wait timed out behind another holder, or the write hit a
+    /// concurrent change, a row deleted after the re-read, or another database
+    /// error; re-read and try again.
+    Retry(PersistenceError),
+}
+
+/// Run `attempt` until it is done, at most
+/// `ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS` times, and retry no lock timeout
+/// after `retry_deadline`. Write conflicts retry in milliseconds, so they keep
+/// the attempt limit alone. An error from `attempt` is returned without a retry.
+async fn retry_startup_reconciliation<F, Fut>(
+    retry_deadline: tokio::time::Instant,
+    mut attempt: F,
+) -> Result<(), Status>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<StartupAttempt, Status>>,
+{
+    let mut attempts = 1;
+    loop {
+        match attempt().await? {
+            StartupAttempt::Done => return Ok(()),
+            StartupAttempt::Retry(error)
+                if attempts >= ENDPOINT_STARTUP_RECONCILIATION_ATTEMPTS
+                    || (matches!(error, PersistenceError::LockTimeout(_))
+                        && tokio::time::Instant::now() >= retry_deadline) =>
+            {
+                return Err(super::super::persistence_error_to_status(
+                    error,
+                    "invalidate tool server endpoint status during gateway startup",
+                ));
+            }
+            StartupAttempt::Retry(_) => attempts += 1,
+        }
+    }
+}
+
+async fn invalidate_sandbox_endpoint_status_once(
+    state: &Arc<ServerState>,
+    candidate: &Sandbox,
+) -> Result<StartupAttempt, Status> {
+    let sandbox_id = candidate.object_id();
+    let _mutation_guard = match state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            candidate.object_workspace(),
+            sandbox_id,
+        ))
+        .await
+    {
+        Ok(guard) => guard,
+        // A holder of this sandbox, its workspace or the global key that
+        // releases within the retry window must not stop a replica from
+        // starting.
+        Err(error @ PersistenceError::LockTimeout(_)) => return Ok(StartupAttempt::Retry(error)),
+        Err(error) => {
+            return Err(super::super::persistence_error_to_status(
+                error,
+                "acquire endpoint status startup reconciliation lock",
+            ));
+        }
+    };
+    // A supervisor may have connected to another replica while this waited.
+    if has_fresh_shared_owner(state, sandbox_id).await? {
+        return Ok(StartupAttempt::Done);
+    }
+    let Some(current) = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+    else {
+        return Ok(StartupAttempt::Done);
+    };
+    if !has_endpoint_status(&current) {
+        return Ok(StartupAttempt::Done);
+    }
+    match state
+        .store
+        .update_message_cas::<Sandbox, _>(
+            sandbox_id,
+            current.get_resource_version(),
+            invalidate_endpoint_status_without_session,
+        )
+        .await
+    {
+        Ok(updated) => {
+            state.sandbox_index.update_from_sandbox(&updated);
+            Ok(StartupAttempt::Done)
+        }
+        // Lifecycle writers on other replicas take no distributed guard, and a
+        // delete between the re-read and the write surfaces as a database
+        // error. Retry with a fresh read after this guard drops.
+        Err(error @ (PersistenceError::Conflict { .. } | PersistenceError::Database(_))) => {
+            Ok(StartupAttempt::Retry(error))
+        }
+        Err(error) => Err(super::super::persistence_error_to_status(
+            error,
+            "invalidate tool server endpoint status during gateway startup",
+        )),
+    }
+}
+
+fn has_endpoint_status(sandbox: &Sandbox) -> bool {
+    sandbox.status.as_ref().is_some_and(|status| {
+        !status.endpoint_statuses.is_empty() || status.last_token_grant_failure.is_some()
+    })
 }
 
 async fn has_fresh_shared_owner(
@@ -559,15 +745,33 @@ async fn has_fresh_shared_owner(
         .map_err(|error| Status::unavailable(format!("resolve supervisor owner failed: {error}")))
 }
 
-fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
+/// True when a replacement supervisor session (local, or a fresh owner on a
+/// peer) now owns endpoint observation, so a disconnect must not reset.
+async fn disconnect_reset_is_superseded(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+) -> Result<bool, Status> {
+    if state
+        .supervisor_sessions
+        .current_session_id(sandbox_id)
+        .is_some()
+    {
+        return Ok(true);
+    }
+    has_fresh_shared_owner(state, sandbox_id).await
+}
+
+pub fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
     let Some(status) = sandbox.status.as_mut() else {
         return;
     };
     // Losing observation authority clears evidence, while policy-derived identity
     // remains available so callers can still identify the configured endpoint.
+    status.last_token_grant_failure = None;
     for endpoint in &mut status.endpoint_statuses {
         endpoint.last_result = EndpointResult::NoObservedExchange as i32;
         endpoint.last_reported_time = None;
+        endpoint.last_failure = None;
     }
 }
 
@@ -597,6 +801,7 @@ fn validate_endpoint_snapshot(
     reported: &[openshell_core::proto::EndpointObservation],
     reported_observed_endpoint_ids: &[String],
     expected: &BTreeMap<String, ExpectedEndpoint>,
+    attached_providers: &[String],
 ) -> Result<(BTreeMap<String, EndpointStatus>, HashSet<String>), Status> {
     let mut validated = BTreeMap::new();
     for endpoint in reported {
@@ -622,11 +827,15 @@ fn validate_endpoint_snapshot(
                 "credential-unavailable requires a credentialed tool server endpoint",
             ));
         }
+        if let Some(failure) = endpoint.failure.as_ref() {
+            validate_reported_failure("observations.failure", result, failure, attached_providers)?;
+        }
         if validated
             .insert(
                 endpoint.endpoint_id.clone(),
                 EndpointStatus {
                     last_result: result as i32,
+                    last_failure: endpoint.failure.clone(),
                     ..expected_endpoint.status.clone()
                 },
             )
@@ -666,6 +875,63 @@ fn validate_endpoint_snapshot(
     Ok((validated, observed_endpoint_ids))
 }
 
+/// Accept a cause only for a result its domain explains, from the closed sets,
+/// and naming nothing outside the sandbox's own providers.
+///
+/// The credential name is checked for shape only. It is a name the sandbox's
+/// supervisor received with its provider environment, never a credential value.
+fn validate_reported_failure(
+    field: &str,
+    result: EndpointResult,
+    failure: &openshell_core::proto::EndpointFailure,
+    attached_providers: &[String],
+) -> Result<(), Status> {
+    validate_endpoint_failure(failure, result)
+        .map_err(|invalid| openshell_core::rpc_error::invalid_argument(field, invalid.message()))?;
+    if !failure.provider.is_empty() && !attached_providers.contains(&failure.provider) {
+        return Err(openshell_core::rpc_error::failed_precondition(
+            "ENDPOINT_FAILURE_PROVIDER_NOT_ATTACHED",
+            "an endpoint failure names a provider that is not attached to the sandbox",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_grant_status(
+    status: Option<&TokenGrantStatus>,
+    attached_providers: &[String],
+) -> Result<(), Status> {
+    let Some(observation) = status.and_then(|status| status.last_failure.as_ref()) else {
+        return Ok(());
+    };
+    if !valid_token_grant_destination(&observation.destination_host, observation.destination_port)
+        || observation.destination_host != observation.destination_host.to_ascii_lowercase()
+    {
+        return Err(openshell_core::rpc_error::invalid_argument(
+            "token_grant_status.last_failure",
+            "token grant destination is invalid",
+        ));
+    }
+    let failure = observation.failure.as_ref().ok_or_else(|| {
+        openshell_core::rpc_error::invalid_argument(
+            "token_grant_status.last_failure.failure",
+            "token grant failure cause is required",
+        )
+    })?;
+    if failure.domain != i32::from(openshell_core::proto::EndpointFailureDomain::TokenGrant) {
+        return Err(openshell_core::rpc_error::invalid_argument(
+            "token_grant_status.last_failure.failure.domain",
+            "sandbox token grant status requires a token grant failure",
+        ));
+    }
+    validate_reported_failure(
+        "token_grant_status.last_failure.failure",
+        EndpointResult::CredentialUnavailable,
+        failure,
+        attached_providers,
+    )
+}
+
 fn validate_endpoint_observation_markers(
     sandbox: &Sandbox,
     reports: &BTreeMap<String, EndpointStatus>,
@@ -688,7 +954,8 @@ fn validate_endpoint_observation_markers(
             continue;
         }
         // A retained result may reuse its previous report time. New evidence,
-        // including evidence accepted after a reset, must carry a marker.
+        // including evidence accepted after a reset, must carry a marker. A
+        // cause can change without a marker; it then keeps the report time.
         if previous.get(endpoint_id.as_str()) != Some(&report.last_result)
             && !observed_endpoint_ids.contains(endpoint_id)
         {
@@ -759,6 +1026,20 @@ pub(super) async fn endpoint_status_reset_for_loaded_policy(
             })
     };
     Ok((!same_configuration).then(|| unknown_endpoint_reports(&context.endpoints)))
+}
+
+/// Clear all supervised network evidence without changing lifecycle state.
+pub(super) fn reset_endpoint_statuses(
+    sandbox: &mut Sandbox,
+    reports: &BTreeMap<String, EndpointStatus>,
+    now: &prost_types::Timestamp,
+) {
+    reconcile_endpoint_statuses(sandbox, reports, &HashSet::new(), now);
+    sandbox
+        .status
+        .as_mut()
+        .expect("status reconciled")
+        .last_token_grant_failure = None;
 }
 
 /// Replace the endpoint inventory and evidence without changing lifecycle state.

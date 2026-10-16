@@ -286,6 +286,11 @@ The launcher streams image-build and provisioning output to the terminal. Import
   size-limited full-diff endpoint. An unavailable patch ID alone does not block
   the ledger; it disables rebase-equivalence shortcuts. Reviewers should inspect
   oversized changes file-by-file locally.
+- Security regressions introduced or newly exposed by an unmerged PR belong
+  in its normal review findings. Private follow-up under `SECURITY.md` is for
+  pre-existing vulnerabilities independent of the PR; security classification
+  alone is not a private-triage or test-dispatch gate. Gator must not initiate
+  external security reporting without explicit operator authorization.
 
 ### Inspect Active Sandboxes
 

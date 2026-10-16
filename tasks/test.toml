@@ -12,6 +12,7 @@ depends = [
   "test:sbom",
   "test:install-sh",
   "test:build-env",
+  "test:postgres-runner",
   "test:gateway-pull-policy",
   "test:e2e-image-overrides",
   "test:gateway-config",
@@ -120,6 +121,23 @@ run = [
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true
 
+["test:rust:postgres"]
+description = "Run PostgreSQL-backed openshell-server tests against OPENSHELL_TEST_POSTGRES_URL or a disposable Docker/Podman PostgreSQL container"
+run = "tasks/scripts/run-postgres-tests.sh"
+run_windows = "echo Skipping test:rust:postgres: PostgreSQL integration tests need a Linux or macOS container engine."
+
+["test:rust:postgres:bench"]
+description = "Run the load-sensitive bench_postgres_* capacity checks that test:rust:postgres and CI skip"
+env = { OPENSHELL_TEST_POSTGRES_PREFIX = "bench_postgres_" }
+run = "tasks/scripts/run-postgres-tests.sh"
+run_windows = "echo Skipping test:rust:postgres:bench: PostgreSQL integration tests need a Linux or macOS container engine."
+
+["test:postgres-runner"]
+description = "Test PostgreSQL test runner database and prefix selection without a database or container engine"
+run = "tasks/scripts/test-postgres-test-runner.sh"
+run_windows = "echo Skipping test:postgres-runner: the Unix PostgreSQL test runner does not apply on Windows."
+hide = true
+
 ["test:python"]
 description = "Run Python tests"
 depends = ["python:proto"]
@@ -130,6 +148,14 @@ hide = true
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests against a Docker-backed gateway"
 run = "e2e/rust/e2e-docker.sh"
+
+["e2e:oci-image"]
+description = "Run the shared OCI image feature suite against a Docker-backed gateway"
+run = "OPENSHELL_TEST_CONTAINER_ENGINE=docker e2e/with-docker-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1 --nocapture"
+
+["e2e:oci-image:podman"]
+description = "Run the shared OCI image feature suite against a Podman-backed gateway"
+run = "OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1 --nocapture"
 
 ["e2e:workload:build"]
 description = "Build the Docker E2E workload fixture"

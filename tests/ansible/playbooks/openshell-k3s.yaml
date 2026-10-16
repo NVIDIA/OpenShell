@@ -87,6 +87,12 @@
             disableTls: true
             telemetryEnabled: false
 
+    - name: Write OpenShell Helm values overlay
+      ansible.builtin.copy:
+        dest: /var/lib/openshell/artifacts/values-overlay.yaml
+        mode: "0600"
+        content: "{{ openshell_k3s_helm_values_overlay | default('{}') }}"
+
     - name: Install Agent Sandbox
       ansible.builtin.command:
         argv:
@@ -132,6 +138,8 @@
           - --create-namespace
           - --values
           - /var/lib/openshell/artifacts/values.yaml
+          - --values
+          - /var/lib/openshell/artifacts/values-overlay.yaml
           - --wait
           - --timeout=5m
       environment:

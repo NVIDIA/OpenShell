@@ -174,6 +174,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
 | `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
 | `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
+| `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after `/sandbox` ownership fixups. Rejected while resource admission is enabled. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 
@@ -208,6 +209,13 @@ prepared inside the bootstrap VM. The driver checks that a prepared disk
 contains the unpacked rootfs before caching it; on failure it caches nothing
 and reports the image-prep console tail. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
 tune registry layer download parallelism (default `4`, maximum `16`).
+Registry pulls in both caches use the resolved digest as an immutable reference.
+The driver verifies the downloaded manifest against that digest before downloading
+layers. For multi-platform images, it verifies the index and then the selected
+platform manifest. Digest-pinned requests retain the caller's digest.
+Cache keys hash source identities to keep cache and staging filenames bounded.
+Bootstrap cache layout v6 and prepared-image layout v4 rebuild older entries on
+first use; older cache files remain on disk but are not reused for registry images.
 Both caches are scoped by source image identity and OpenShell version, so an
 OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
 embedded supervisor. Host-side bootstrap layer assembly preserves relative

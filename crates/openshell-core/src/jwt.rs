@@ -269,6 +269,48 @@ mod session {
         }
     }
 
+    /// OTLP collector request headers, such as an authorization token, in
+    /// the `OTEL_EXPORTER_OTLP_HEADERS` format. Redacted from diagnostics and
+    /// cleared on drop.
+    #[derive(Clone)]
+    pub struct SecretOtlpHeaders(Zeroizing<String>);
+
+    impl SecretOtlpHeaders {
+        #[must_use]
+        pub fn new(value: String) -> Self {
+            Self(Zeroizing::new(value))
+        }
+
+        #[must_use]
+        pub fn expose_secret(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for SecretOtlpHeaders {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SecretOtlpHeaders([REDACTED])")
+        }
+    }
+
+    impl Serialize for SecretOtlpHeaders {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretOtlpHeaders {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            String::deserialize(deserializer).map(Self::new)
+        }
+    }
+
     /// Trusted launch input delivered only to `openshell-supervisor`.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -287,6 +329,10 @@ mod session {
         /// Never delivered to the workload. Missing only in older bundles.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub ssh_host_private_key: Option<SecretSshHostKey>,
+        /// Headers for the OCSF OTLP collector, present only when the gateway
+        /// has them. Never delivered to the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ocsf_otlp_headers: Option<SecretOtlpHeaders>,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -373,6 +419,7 @@ mod session {
                 .field("sandbox_token", &"[REDACTED]")
                 .field("sandbox_expires_at", &self.sandbox_expires_at)
                 .field("ssh_host_private_key", &self.ssh_host_private_key)
+                .field("ocsf_otlp_headers", &self.ocsf_otlp_headers)
                 .finish()
         }
     }
@@ -1080,6 +1127,7 @@ mod tests {
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             };
             bundle.validate().expect("non-expiring auth bundle");
         }
@@ -1109,6 +1157,9 @@ mod tests {
                 ssh_host_private_key: Some(SecretSshHostKey::new(
                     "private-ssh-host-key".to_string(),
                 )),
+                ocsf_otlp_headers: Some(SecretOtlpHeaders::new(
+                    "authorization=collector-token".to_string(),
+                )),
             };
 
             let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
@@ -1128,18 +1179,23 @@ mod tests {
             assert!(!debug.contains(bundle.gateway_token.expose_secret()));
             assert!(!debug.contains(bundle.sandbox_token.expose_secret()));
             assert!(!debug.contains("private-ssh-host-key"));
-            assert_eq!(debug.matches("[REDACTED]").count(), 3);
+            assert!(!debug.contains("collector-token"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 4);
             assert_eq!(
                 decoded.ssh_host_private_key.unwrap().expose_secret(),
                 "private-ssh-host-key"
             );
+            assert_eq!(
+                decoded.ocsf_otlp_headers.unwrap().expose_secret(),
+                "authorization=collector-token"
+            );
             let mut legacy = serde_json::to_value(&bundle).unwrap();
-            legacy
-                .as_object_mut()
-                .unwrap()
-                .remove("ssh_host_private_key");
+            let fields = legacy.as_object_mut().unwrap();
+            fields.remove("ssh_host_private_key");
+            fields.remove("ocsf_otlp_headers");
             let legacy: SupervisorAuthBundle = serde_json::from_value(legacy).unwrap();
             assert!(legacy.ssh_host_private_key.is_none());
+            assert!(legacy.ocsf_otlp_headers.is_none());
         }
 
         #[derive(Serialize)]

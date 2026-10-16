@@ -14,6 +14,7 @@ use crate::auth::workspace_authz::{
     AuthorizedWorkspaceScope, MinWorkspaceRole, authorize_list_workspace_selector,
     authorize_sandbox_workspace, authorize_workspace,
 };
+use crate::compute::{MutationScope, SandboxDeletePreconditions};
 use crate::pagination::Pagination;
 use crate::persistence::{
     ObjectLabels, ObjectListQuery, ObjectType, WriteCondition, generate_name,
@@ -156,6 +157,37 @@ impl Drop for WatchSandboxStream {
     fn drop(&mut self) {
         let _ = self.stop_producer();
     }
+}
+
+/// Fetch a runtime sandbox ID and authorize its persisted workspace without
+/// revealing whether an inaccessible object exists.
+pub(super) async fn fetch_and_authorize_sandbox(
+    state: &ServerState,
+    principal: &crate::auth::principal::Principal,
+    sandbox_id: &str,
+) -> Result<Sandbox, Status> {
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|error| Status::internal(format!("fetch sandbox failed: {error}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    authorize_sandbox_workspace(
+        &state.store,
+        &state.admin_role,
+        principal,
+        sandbox.object_workspace(),
+        MinWorkspaceRole::User,
+    )
+    .await
+    .map_err(|error| {
+        if error.code() == tonic::Code::PermissionDenied {
+            Status::not_found("sandbox not found")
+        } else {
+            error
+        }
+    })?;
+    Ok(sandbox)
 }
 
 /// Resolve a public sandbox name and authorize its persisted workspace.
@@ -510,9 +542,9 @@ async fn handle_create_sandbox_inner(
     } else {
         request.name.clone()
     };
-    let (sandbox_lifecycle_guard, sandbox_sync_guard) = state
+    let (sandbox_lifecycle_guard, mutation_guard) = state
         .compute
-        .sandbox_create_guards(&id)
+        .sandbox_create_guards(&workspace, &id)
         .await
         .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
 
@@ -638,12 +670,21 @@ async fn handle_create_sandbox_inner(
     )
     .await?;
 
+    // Provider and policy reads must stay under the create mutation guard so
+    // their revisions cannot change before the sandbox's launch is committed.
+    let mut runtime_inputs =
+        super::policy::resolve_sandbox_create_runtime_inputs(state.as_ref(), &sandbox).await?;
+
     state
         .compute
         .validate_launch_signer_configured(state.sandbox_session_jwt_authority.is_some())?;
     state
         .compute
-        .validate_sandbox_create(&sandbox)
+        .validate_sandbox_create_with_runtime_inputs(
+            &sandbox,
+            &runtime_inputs,
+            await_main_process_attachment,
+        )
         .await
         .map_err(|status| {
             warn!(error = %status, "Rejecting sandbox create request");
@@ -673,14 +714,15 @@ async fn handle_create_sandbox_inner(
                 .map_err(|error| Status::internal(format!("encode launch authentication: {error}")))
         })
         .transpose()?;
+    runtime_inputs.launch_authentication = launch_authentication;
 
-    let sandbox = Box::pin(state.compute.create_sandbox_authenticated_with_guards(
+    let sandbox = Box::pin(state.compute.create_sandbox_with_runtime_inputs_and_guards(
         sandbox,
         sandbox_token,
-        launch_authentication,
         await_main_process_attachment,
+        runtime_inputs,
         sandbox_lifecycle_guard,
-        sandbox_sync_guard,
+        mutation_guard,
     ))
     .await?;
 
@@ -1355,10 +1397,14 @@ pub(super) async fn handle_attach_sandbox_provider(
     if let Some(probe) = attach_wait_probe {
         probe.notify_one();
     }
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            sandbox.object_workspace(),
+            sandbox.object_id(),
+        ))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     let provider_record = get_provider_record(state.store.as_ref(), &workspace, &request.provider)
         .await
         .map_err(|err| {
@@ -1527,10 +1573,14 @@ pub(super) async fn handle_detach_sandbox_provider(
         )));
     }
 
-    let _sandbox_sync_guard =
-        state.compute.sandbox_sync_guard().await.map_err(|err| {
-            super::persistence_error_to_status(err, "acquire sandbox mutation lock")
-        })?;
+    let _mutation_guard = state
+        .compute
+        .mutation_guard(MutationScope::sandbox(
+            sandbox.object_workspace(),
+            sandbox.object_id(),
+        ))
+        .await
+        .map_err(|err| super::persistence_error_to_status(err, "acquire sandbox mutation lock"))?;
     let sandbox_name = sandbox.object_name().to_string();
     let sandbox_id = sandbox
         .metadata
@@ -1664,10 +1714,18 @@ async fn handle_delete_sandbox_inner(
     let workspace = super::workspace::resolve_workspace(state.store.as_ref(), &authz.workspace)
         .await?
         .name;
-
+    // Main's canonical public delete request contains no caller-provided
+    // identity/version fields. The compute layer still binds the resolved
+    // object ID and lifecycle guards before committing deletion.
+    let preconditions = SandboxDeletePreconditions::default();
     let result = state
         .compute
-        .delete_sandbox_allow_missing(&workspace, &name, req.allow_missing)
+        .delete_sandbox_allow_missing_with_preconditions(
+            &workspace,
+            &name,
+            req.allow_missing,
+            preconditions,
+        )
         .await?;
     if !result.sandbox_id.is_empty() {
         state.telemetry.end_sandbox_session(&result.sandbox_id);
@@ -2628,8 +2686,8 @@ pub(super) async fn handle_forward_tcp(
     .await
     .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
 
-    let sandbox_id = sandbox.object_id().to_string();
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
+    let sandbox_id = sandbox.object_id().to_string();
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
         let Some(relay_stream) =
@@ -2836,13 +2894,15 @@ fn validate_tcp_target_parts(host: &str, _port: u32) -> Result<String, Status> {
     }
 }
 
-async fn bridge_forward_tcp_stream(
+async fn bridge_forward_tcp_stream<S>(
     mut inbound: tonic::Streaming<TcpForwardFrame>,
-    relay_stream: tokio::io::DuplexStream,
+    relay_stream: S,
     tx: mpsc::Sender<Result<TcpForwardFrame, Status>>,
     sandbox_id: &str,
     channel_id: &str,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
     let (mut relay_read, mut relay_write) = tokio::io::split(relay_stream);
 
     let sandbox_id_in = sandbox_id.to_string();
@@ -5749,8 +5809,13 @@ mod tests {
         state.store.put_message(&original).await.unwrap();
 
         // Hold the global guard so the handler can resolve the original ID and
-        // acquire its delete gate, but cannot yet revalidate or mutate it.
-        let global_guard = state.compute.sandbox_sync_guard().await.unwrap();
+        // acquire its delete gate, but cannot yet take the sandbox's local
+        // lifecycle lock (shared global key) to revalidate or mutate it.
+        let global_guard = state
+            .compute
+            .mutation_guard(MutationScope::Global)
+            .await
+            .unwrap();
         let delete_state = state.clone();
         let delete = tokio::spawn(async move {
             handle_delete_sandbox_inner(
@@ -5800,6 +5865,68 @@ mod tests {
         assert_eq!(
             state.telemetry.ended_sandbox_sessions(),
             [original.object_id().to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_delete_rejects_expected_identity_drift_before_mutation() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("guarded-delete", Vec::new());
+        sandbox.metadata.as_mut().unwrap().id = "sb-current".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = state
+            .compute
+            .delete_sandbox_with_preconditions(
+                "default",
+                "guarded-delete",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: Some("sb-stale".to_string()),
+                    expected_resource_version: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::Aborted);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-current")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_delete_rejects_resource_version_without_immutable_identity() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("guarded-delete", Vec::new());
+        sandbox.metadata.as_mut().unwrap().id = "sb-current".to_string();
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let error = state
+            .compute
+            .delete_sandbox_with_preconditions(
+                "default",
+                "guarded-delete",
+                SandboxDeletePreconditions {
+                    expected_sandbox_id: None,
+                    expected_resource_version: Some(17),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            state
+                .store
+                .get_message::<Sandbox>("sb-current")
+                .await
+                .unwrap()
+                .is_some()
         );
     }
 
@@ -5929,6 +6056,93 @@ mod tests {
             .unwrap()
             .providers;
         assert_eq!(providers, vec!["work-github"]);
+    }
+
+    fn attach_request(sandbox: &str, provider: &str) -> Request<AttachSandboxProviderRequest> {
+        authed_request(AttachSandboxProviderRequest {
+            request_id: String::new(),
+            sandbox: sandbox.to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector(
+                "default".to_string(),
+            )),
+            provider: provider.to_string(),
+            expected_resource_version: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn attach_provider_does_not_wait_for_unrelated_sandbox_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+        let unrelated = test_sandbox("unrelated", Vec::new());
+        state.store.put_message(&unrelated).await.unwrap();
+        let unrelated_guard = crate::persistence::lock_order::branch(
+            state
+                .compute
+                .mutation_guard(MutationScope::sandbox("default", unrelated.object_id())),
+        )
+        .await
+        .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_attach_sandbox_provider(&state, attach_request("work", "work-github")),
+        )
+        .await
+        .expect("attach should not wait for an unrelated sandbox mutation")
+        .expect("attach should succeed")
+        .into_inner();
+        assert!(response.attached);
+        drop(unrelated_guard);
+    }
+
+    #[tokio::test]
+    async fn attach_provider_waits_for_workspace_guard() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+        let workspace_guard = state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
+
+        let task_state = state.clone();
+        let mut attach = tokio::spawn(async move {
+            handle_attach_sandbox_provider(&task_state, attach_request("work", "work-github")).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut attach)
+                .await
+                .is_err(),
+            "attach should wait for a provider writer in its workspace"
+        );
+        drop(workspace_guard);
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), attach)
+            .await
+            .expect("attach should finish after the workspace guard is released")
+            .expect("join attach task")
+            .expect("attach should succeed")
+            .into_inner();
+        assert!(response.attached);
     }
 
     #[tokio::test]
@@ -7439,7 +7653,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_sandbox_with_providers_waits_for_sandbox_sync_guard() {
+    async fn create_sandbox_with_providers_waits_for_workspace_mutation_guard() {
         let state = test_server_state().await;
         state
             .store
@@ -7447,7 +7661,13 @@ mod tests {
             .await
             .unwrap();
 
-        let guard = state.compute.sandbox_sync_guard().await.unwrap();
+        // A provider writer in the workspace excludes creates that validate
+        // against its providers.
+        let guard = state
+            .compute
+            .mutation_guard(MutationScope::Workspace("default"))
+            .await
+            .unwrap();
         let task_state = state.clone();
         let task = tokio::spawn(async move {
             handle_create_sandbox(
@@ -7475,7 +7695,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
             !task.is_finished(),
-            "sandbox create with initial providers should wait for sandbox sync guard"
+            "sandbox create with initial providers should wait for the workspace mutation guard"
         );
         drop(guard);
 

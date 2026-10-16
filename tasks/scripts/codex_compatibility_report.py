@@ -4,6 +4,7 @@
 """Validate agent output and render the advisory compatibility report."""
 
 import json
+import re
 from html import escape
 from pathlib import Path
 
@@ -55,12 +56,52 @@ def validate_review(review: dict) -> None:
         if (
             not isinstance(finding, dict)
             or set(finding)
-            != {"surface", "change", "impact", "evidence", "recommendation"}
-            or any(not isinstance(v, str) or not v.strip() for v in finding.values())
+            != {
+                "surface",
+                "change",
+                "impact",
+                "evidence",
+                "recommendation",
+                "pull_request",
+                "acknowledgement",
+                "acknowledgement_url",
+                "previous_report_url",
+            }
+            or any(not isinstance(v, str) for v in finding.values())
+            or any(
+                not finding[key].strip()
+                for key in (
+                    "change",
+                    "impact",
+                    "evidence",
+                    "recommendation",
+                    "pull_request",
+                )
+            )
             or finding["surface"] not in SURFACES
+            or finding["acknowledgement"] not in ("ACKED", "NOT ACKED", "UNKNOWN")
         ):
             raise ValueError(
-                "Finding is missing its surface, evidence, impact, or recommendation."
+                "Finding has invalid or missing compatibility or acknowledgement fields."
+            )
+        pr_url = finding["pull_request"]
+        for key in ("acknowledgement_url", "previous_report_url"):
+            url = finding[key]
+            if url and (
+                not re.fullmatch(r"https://github\.com/[^/]+/[^/]+/pull/\d+", pr_url)
+                or not re.fullmatch(
+                    re.escape(pr_url)
+                    + r"#(?:issuecomment-\d+|discussion_r\d+|pullrequestreview-\d+)",
+                    url,
+                )
+            ):
+                raise ValueError("Discussion evidence must link to the associated PR.")
+        if finding["acknowledgement"] == "ACKED":
+            if not finding["acknowledgement_url"]:
+                raise ValueError("ACKED requires a direct discussion URL.")
+        elif finding["acknowledgement_url"]:
+            raise ValueError(
+                "Only an explicit acknowledgment may carry acceptance evidence."
             )
     if review["verdict"] == "unaddressed_breaks" and not review["findings"]:
         raise ValueError("A breaking verdict needs supporting findings.")
@@ -70,36 +111,84 @@ def write_report(output: Path, result: dict) -> None:
     output.mkdir(parents=True, exist_ok=True)
     (output / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     context = result["context"]
-    lines = [
+    lines = ["## Compatibility review (advisory)", ""]
+    comment_lines = [
         "## Compatibility review (advisory)",
         "",
-        f"- Execution: **{result['status']}**",
-        "- Publication gate: **unchanged**",
-        f"- Candidate: `{context.get('candidate_tag', 'unresolved')}` "
-        f"(`{context.get('candidate_sha', 'unresolved')}`)",
-        f"- Baseline: `{context.get('baseline_tag', 'unresolved')}` "
-        f"(`{context.get('baseline_sha', 'unresolved')}`)",
+        "New or updated breaking changes; see the full report for all findings.",
         "",
     ]
     if result["error"]:
         lines += [escape(result["error"]), ""]
     review = result["review"]
     if review:
+        assessment = {
+            "no_unaddressed_breaks": "No unaddressed breaking changes",
+            "unaddressed_breaks": "Unaddressed breaking changes",
+            "needs_review": "Needs review",
+        }[review["verdict"]]
         lines += [
-            f"- Assessment: **{review['verdict']}**",
-            f"- Reviewed: {', '.join(review['reviewed_surfaces']) or 'none'}",
-            f"- Unreviewed: {', '.join(review['unreviewed_surfaces']) or 'none'}",
+            f"**{assessment}**",
             "",
             escape(review["summary"]),
             "",
         ]
-        for finding in review["findings"]:
-            lines += [f"### {finding['surface']}", ""]
-            for field in ("change", "impact", "evidence", "recommendation"):
-                lines += [f"- {field.capitalize()}: {escape(finding[field])}"]
-            lines.append("")
-    lines += [
-        "Agent review is advisory and does not prove the absence of compatibility breaks.",
+        if review["unreviewed_surfaces"]:
+            lines += [
+                "**Not inspected:** " + ", ".join(review["unreviewed_surfaces"]),
+                "",
+            ]
+        for number, finding in enumerate(review["findings"], 1):
+            acknowledgement = {
+                "ACKED": "Risk explicitly accepted",
+                "NOT ACKED": "No explicit risk acceptance found",
+                "UNKNOWN": "Risk acceptance could not be verified",
+            }[finding["acknowledgement"]]
+            section = [
+                f"### {number}. {finding['surface']} — {acknowledgement}",
+                "",
+                escape(finding["change"]),
+                "",
+                f"- **Impact:** {escape(finding['impact'])}",
+                f"- **Action:** {escape(finding['recommendation'])}",
+                f"- **PR:** {escape(finding['pull_request'])}",
+                "",
+            ]
+            if finding["acknowledgement"] == "ACKED":
+                section += [
+                    f"- **Acceptance:** [comment]({finding['acknowledgement_url']})",
+                    "",
+                ]
+            if finding["previous_report_url"]:
+                section += [
+                    f"[Previously reported]({finding['previous_report_url']})",
+                    "",
+                ]
+            else:
+                comment_lines += section
+            lines += section
+    else:
+        lines += ["**No assessment available.**", ""]
+    details = [
+        "<details>",
+        "<summary>Review details</summary>",
+        "",
+        f"- Execution: **{result['status']}**",
+        f"- Candidate: `{context.get('candidate_tag', 'unresolved')}` "
+        f"(`{context.get('candidate_sha', 'unresolved')}`)",
+        f"- Baseline: `{context.get('baseline_tag', 'unresolved')}` "
+        f"(`{context.get('baseline_sha', 'unresolved')}`)",
+    ]
+    if review:
+        details.append(
+            f"- Reviewed: {', '.join(review['reviewed_surfaces']) or 'none'}"
+        )
+    details += [
+        "",
+        "</details>",
+        "",
+        "Advisory review; publication gates are unchanged.",
         "",
     ]
-    (output / "report.md").write_text("\n".join(lines))
+    (output / "report.md").write_text("\n".join(lines + details))
+    (output / "comment.md").write_text("\n".join(comment_lines + details))

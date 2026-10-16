@@ -29,6 +29,36 @@ pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 /// OTLP/gRPC collector endpoint for supervisor trace export.
 pub const OTLP_ENDPOINT: &str = "OPENSHELL_OTLP_ENDPOINT";
 
+/// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+pub const OTLP_OCSF_ENDPOINT: &str = "OPENSHELL_OTLP_OCSF_ENDPOINT";
+
+/// OCSF schema version that supervisors downgrade exported events to.
+pub const OTLP_OCSF_SCHEMA_VERSION: &str = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION";
+
+/// Name of the gateway that launched the sandbox, reported as
+/// `openshell.gateway.name` on supervisor telemetry.
+pub const GATEWAY_NAME: &str = "OPENSHELL_GATEWAY_NAME";
+
+/// OCSF event export that a compute driver passes to its supervisors.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OcsfOtlpExport {
+    pub endpoint: String,
+    pub schema_version: Option<String>,
+}
+
+impl OcsfOtlpExport {
+    /// The supervisor environment variables for this export.
+    pub fn environment(&self) -> Vec<(&'static str, String)> {
+        std::iter::once((OTLP_OCSF_ENDPOINT, self.endpoint.clone()))
+            .chain(
+                self.schema_version
+                    .clone()
+                    .map(|version| (OTLP_OCSF_SCHEMA_VERSION, version)),
+            )
+            .collect()
+    }
+}
+
 /// Versioned specification for the exact canonical main process.
 ///
 /// Most drivers use JSON directly. Transports that cannot preserve spaces in
@@ -277,6 +307,26 @@ pub const OCI_IMAGE_USER: &str = "OPENSHELL_OCI_IMAGE_USER";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ocsf_export_environment_carries_the_schema_version_only_when_set() {
+        let mut export = OcsfOtlpExport {
+            endpoint: "http://siem:4317".into(),
+            schema_version: None,
+        };
+        assert_eq!(
+            export.environment(),
+            [(OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string())]
+        );
+        export.schema_version = Some("1.3".into());
+        assert_eq!(
+            export.environment(),
+            [
+                (OTLP_OCSF_ENDPOINT, "http://siem:4317".to_string()),
+                (OTLP_OCSF_SCHEMA_VERSION, "1.3".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn main_process_transport_preserves_argument_boundaries() {

@@ -22,7 +22,9 @@ export type {
   Health,
   HealthStatus,
   ListOptions,
+  LogLine,
   Page,
+  PlatformEvent,
   PolicySourceName,
   ProviderChange,
   ProviderChangeOptions,
@@ -51,6 +53,11 @@ export type {
   UpdateConfigResult,
   WaitDeletedOptions,
   WaitOptions,
+  WatchEvent,
+  WatchLogEvent,
+  WatchOptions,
+  WatchPlatformEvent,
+  WatchWarningEvent,
   WorkspaceListScope,
 } from './client.js';
 export {
