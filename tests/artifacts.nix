@@ -131,11 +131,6 @@ let
     # rootless guest; the other tests in the binary pass. Nextest archive
     # filters cannot select individual tests, so keep the complete binary here.
     "proxy_egress_pipeline"
-    # Conformance covers stop/start workspace preservation and deletion while
-    # stopped. The remaining canonical-main, TTY, attachment replay, and
-    # no-keep cases still need migration. Nextest archive filters cannot select
-    # individual tests, so keep the complete binary in the follow-up bucket.
-    "sandbox_lifecycle"
     # Needs a prebuilt musl DNS probe in guest artifact mode; tracked in #3009.
     "transparent_tcp"
     "workspace_lifecycle"
