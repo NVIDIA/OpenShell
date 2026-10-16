@@ -26,7 +26,7 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 ## Prerequisites
 
 - `openshell` is on the PATH. Follow the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md) when it is not installed.
-- A reachable OpenShell gateway backed by Docker, Podman, Kubernetes, or the experimental VM driver
+- A reachable OpenShell gateway backed by Docker, Podman, Kubernetes, VM, or the experimental native Windows MXC driver
 - Docker is running only when using BYOC local builds or a Docker-backed gateway
 - For Kubernetes deployments: `kubectl` and Helm access to the target cluster
 
@@ -93,6 +93,12 @@ drains, or `--detach` for a long-running service. Combine
 attachment and delete its sandbox after the service exits.
 
 When supplying `--name`, use a portable DNS-1123 label: at most 63 lowercase alphanumeric or `-` characters, beginning and ending with an alphanumeric character. The Kubernetes driver rejects uppercase letters, underscores, dots, and other names that cannot become Kubernetes resource labels.
+
+For native Windows MXC, supply the Windows command and absolute working
+directory through `--driver-config-json` and use `--detach`. The gateway
+administrator must enable caller driver configuration. Foreground attachment
+is rejected before provisioning; `--no-tty` alone does not request detachment.
+See [MXC configuration and limitations](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration#mxc).
 
 Provider attachment is explicit. Name each provider with `--provider`; the
 trailing command does not select or attach one. If the named provider does not
@@ -635,7 +641,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Binary matching patterns
 - Ordered `network_middlewares`, host selection, HTTP request/response and WebSocket bindings, and `fail_open` or `fail_closed` behavior
 
-`network_policies` and `network_middlewares` can be modified at runtime when the selected compute driver supports live policy updates. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. MXC rejects live policy replacement and merge updates; delete and recreate an MXC sandbox instead. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
+`network_policies` and `network_middlewares` can be modified at runtime through the shared supervisor. Use `--wait` to verify that the active runtime loaded the revision; do not infer enforcement from the gateway accepting the update. On MXC, network rules govern explicit-proxy traffic; direct host-loopback access and native live-revocation qualification remain documented limitations. If `filesystem_policy`, `landlock`, `process`, or `ui` need changes, the sandbox must be recreated. Built-in middleware such as `openshell/regex` needs no gateway registration. An operator-run middleware must already be registered under `[[openshell.supervisor.middleware]]`; changing that static registration requires a gateway restart.
 
 Middleware can inspect HTTP requests, HTTP responses, or client WebSocket text
 messages when the implementation advertises the matching binding. The built-in

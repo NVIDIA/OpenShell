@@ -15,7 +15,7 @@ links:
 OpenShell runs natively on Windows 11 by using Microsoft Execution Containers
 (MXC, through `wxc-exec.exe`) as an RFC 0012 isolation backend. The gateway's
 in-process MXC compute driver provisions a host
-`openshell-supervisor --role=isolation-backend` and an `openshell-sandbox`
+`openshell-supervisor --role=isolation-backend` and an `openshell-windows-sandbox`
 boundary inside each ProcessContainer.
 
 The authenticated Sandbox Protocol is the only runtime control and forwarding
@@ -62,7 +62,7 @@ authenticated paths instead of MXC-only side channels.
 flowchart TD
     Gateway[Gateway / in-process MXC driver]
     Supervisor[openshell-supervisor<br/>role=isolation-backend]
-    Sandbox[openshell-sandbox<br/>inside MXC ProcessContainer]
+    Sandbox[openshell-windows-sandbox<br/>inside MXC ProcessContainer]
     Workload[Workload process tree]
 
     Gateway -->|policy + launch authentication| Supervisor
@@ -96,6 +96,12 @@ The boundary terminates owned workload processes if no authenticated supervisor
 recovers within the bounded reconnect deadline. Host auth bundles and runtime
 descriptors are stored beneath an owner-only Windows DACL.
 
+The current Windows development implementation temporarily asserts the
+required no-unmanaged-egress and revocation guarantees for compatibility
+testing. These assertions are not verified enforcement evidence. Broad host
+loopback remains outside exclusive proxy mediation, and passing runtime tests
+does not establish production qualification.
+
 ### Networking and credentials
 
 MXC denies direct Internet egress and permits the loopback route used by the
@@ -109,12 +115,13 @@ children. The supervisor retains private CA keys and provider secrets, applies
 network policy, and refreshes provider state through the ordinary session.
 
 The listener rejects missing, duplicate, malformed, and cross-generation proxy
-authorization before policy evaluation. The initial implementation assigns
-requests to the admitted main workload binary because Windows socket-owner
-identity is not yet carried by the explicit-proxy transport. Policies that rely
-on different network rights for descendant executables are therefore outside
-the initial enforcement contract. The loopback exception also does not isolate
-unrelated services bound to `127.0.0.1`; the gateway host remains trusted.
+authorization before policy evaluation. The Windows backend resolves the
+socket-owning PID with `GetExtendedTcpTable`, obtains its executable path with
+`QueryFullProcessImageNameW`, hashes the executable, and rechecks ownership.
+The proxy denies missing, ambiguous, or changed ownership. Network rules must
+authorize the child executable opening the connection, not only its launcher.
+The loopback exception still does not isolate unrelated services bound to
+`127.0.0.1`; the gateway host remains trusted.
 
 ### Process lifecycle and forwarding
 
@@ -129,9 +136,11 @@ resize is deferred; non-terminal exec and byte-stream I/O are supported first.
 
 ### Configuration and packaging
 
-The Windows release contains `openshell-gateway.exe`, `openshell.exe`,
-`openshell-supervisor.exe`, and `openshell-sandbox.exe`. The runtime binaries
-default to siblings of the gateway and may be overridden for development.
+The Windows source build produces `openshell-gateway.exe`, `openshell.exe`,
+`openshell-supervisor.exe`, and `openshell-windows-sandbox.exe`, and stages the
+matching `libz3.dll` beside them. The Windows workflow does not publish these
+artifacts. The runtime binaries default to siblings of the gateway and may be
+overridden for development.
 Gateway TLS uses the gateway-owned guest certificate bundle.
 
 The MXC driver configuration contains only host/runtime settings. Workload
@@ -208,8 +217,6 @@ diverge by platform.
 
 ## Open questions
 
-- Which Windows API should provide race-resistant socket-owner executable
-  identity for per-descendant binary network policy?
 - Should MXC restart recovery persist enough generation metadata to reconnect,
   or should startup always terminate and recreate orphaned ProcessContainers?
 - What ConPTY surface is required before Windows interactive exec is considered

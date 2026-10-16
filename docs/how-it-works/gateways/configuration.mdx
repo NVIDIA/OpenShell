@@ -993,7 +993,8 @@ or `$XDG_STATE_HOME/openshell/logs` on Unix. Prefer the gateway's configured
 The driver records executable identity in process audit events and omits raw
 command arguments because they can contain credentials or personal data. See
 [OCSF JSON Export](/observability/ocsf-json-export) for durable Windows audit
-output.
+output and the current live ETW attribution limitation. Enabling capture does
+not establish complete sandbox audit coverage.
 
 ### Docker
 
@@ -1250,6 +1251,15 @@ This development branch temporarily asserts MXC outer-fence guarantees for Windo
 
 #### Prepare the Windows host
 
+Build the native binaries from the `windows` branch on a Windows
+MSVC host. Use `mise run --skip-tools windows:build:x64` for x64 or
+`mise run --skip-tools windows:build:arm64` for ARM64. These tasks build
+`openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and
+`openshell-windows-sandbox.exe`, and stage the target-matching `libz3.dll` beside
+them under `target/<target-triple>/release`. Keep these files together when
+copying to a runtime host, and install the matching Visual C++ runtime there.
+The Windows MSVC workflow does not publish Windows release downloads.
+
 Copy `wxc-exec.exe` to a regular directory outside an MSIX or `WindowsApps`
 package directory. Package ACLs can prevent the gateway from starting it.
 If creation fails with `wxc-exec spawn failed: Access is denied. (os error 5)`,
@@ -1312,7 +1322,19 @@ gateway operator. Caller-supplied commands and directories still require
 
 The MXC driver requires MXC 1.0.0 and emits its stable directional network schema. Remove the retired `default_configuration_id` setting before upgrading; the gateway rejects it. The `isolation_session` backend remains unsupported.
 
-Supply the workload command and working directory through `sandbox create --driver-config-json`, for example `{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","echo hello"],"cwd":"C:\\work"}}`. Both are required. Supply workload environment through `sandbox create --env` or `--env-from`; it is not part of gateway configuration.
+Supply the workload command and absolute working directory through
+`sandbox create --driver-config-json`. Both are required. From PowerShell,
+create a detached workload with a policy granting the required Windows paths:
+
+```shell
+$config = '{"mxc":{"command":["C:\\Windows\\System32\\cmd.exe","/d","/c","echo hello"],"cwd":"C:\\work"}}'
+openshell sandbox create --name mxc-demo --detach --policy policy.yaml `
+  --driver-config-json $config
+```
+
+Supply workload environment through `sandbox create --env` or `--env-from`;
+it is not part of gateway configuration. The command runs from host files,
+not an OCI workload image.
 
 Configure UI controls in the sandbox policy, not the `mxc` driver JSON:
 
@@ -1330,15 +1352,27 @@ to change UI settings. MXC advertises `openshell.policy.ui.v1` in its existing
 extension capabilities. The gateway rejects explicit UI policy, including
 `ui: {}`, when the selected driver does not advertise that capability.
 
-The driver assigns distinct Sandbox Protocol and proxy listeners plus fresh credentials to every generation. The host proxy rejects missing, invalid, duplicate, or cross-sandbox proxy credentials before forwarding. MXC denies direct Internet egress and permits only the `127.0.0.1/32` route required by the authenticated transport and proxy. That loopback exception does not isolate unrelated host services. The current explicit-proxy path attributes descendant traffic to the admitted main workload binary rather than resolving each Windows socket owner. Treat the gateway host as trusted and avoid policies that rely on different network rights for child executables.
+The driver assigns distinct Sandbox Protocol and proxy listeners plus fresh
+credentials to every generation. The host proxy rejects missing, invalid,
+duplicate, or cross-sandbox proxy credentials before forwarding. It resolves
+the socket-owning executable from the Windows kernel TCP table, hashes it,
+and rechecks ownership before policy evaluation. Allowing `cmd.exe` does not
+authorize a child `curl.exe`; missing, ambiguous, or changed socket ownership
+denies the request.
+
+MXC denies direct Internet egress and permits the `127.0.0.1/32` route used by
+the authenticated transport and proxy. That exception permits direct access
+to unrelated host-local services outside the proxy. Treat the gateway host
+as trusted; per-binary network rules govern traffic through the proxy.
 
 Attached provider credentials use the ordinary live supervisor refresh path. Static values stay in the host supervisor's endpoint-bound resolver and are injected only for matching requests. Dynamic token grants remain request-time operations in the host proxy.
 
 Main launch and raw exec receive the authenticated proxy and installed CA
-environment. Exec uses the latest provider environment. The proxy identity
-uses the canonical workload command when supplied, falling back to the MXC
-driver command. Expired control credentials close open process and forwarding
-streams; renewed credentials update the connection deadline.
+environment. Exec uses the latest provider environment. A canonical workload
+command takes precedence over the MXC driver command for launch; proxy
+identity is resolved separately for each connection. Expired control
+credentials close open process and forwarding streams; renewed credentials
+update the connection deadline.
 
 ### MicroVM
 

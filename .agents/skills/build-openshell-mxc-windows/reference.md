@@ -50,9 +50,11 @@ The wrapper adds missing rustup targets and preserves an inherited
 the setting. It does not install Visual Studio, Rust, Docker, Kubernetes,
 Podman, WSL, Hyper-V, or VM tooling.
 
-On Windows, `mise run pre-commit` routes `rust:check`, `rust:lint`, and
-`test:rust` through this wrapper for the host-native target. The shared task
-definitions retain their existing Unix commands. Only tests for Linux glibc
+On Windows, `mise run pre-commit` routes its `rust:lint` dependency through
+this wrapper for the host-native target. The separate `rust:check` and
+`test:rust` tasks also use the wrapper; `pre-commit` itself runs formatting
+and lint checks. The shared task definitions retain their existing Unix
+commands. Only tests for Linux glibc
 installer behavior, Linux build-environment shell helpers, and Linux
 service/RPM packaging assets skip on Windows. The Windows Clippy command
 excludes unsupported runtime packages as top-level targets and allows only
@@ -68,8 +70,10 @@ For ARM64, verify the Visual Studio instance contains the ARM64 MSVC tools,
 ARM64 Spectre-mitigated libraries, Clang tools, CMake tools, and a Windows SDK.
 Clang supplies host-native `libclang.dll` for `bindgen` and `clang-cl.exe` for
 ARM64 crypto dependencies such as `aws-lc-sys`. Native and
-x64-to-ARM64 builds use the official prebuilt Z3 5.1.0 static library for the
-target architecture. An x64-to-ARM64 check/build discovers and adds host-native
+x64-to-ARM64 builds use the official prebuilt Z3 5.1.0 import library and
+`libz3.dll` for the target architecture. Release build tasks stage that DLL
+beside the four executables; copy it with them to the runtime host.
+An x64-to-ARM64 check/build discovers and adds host-native
 Ninja to `PATH`, while the crypto crates select `clang-cl`. Use a short
 `CARGO_TARGET_DIR` if Windows path-length limits are reached.
 
@@ -94,9 +98,12 @@ Current focused unsupported-contract tests:
 
 ```text
 windows_builtin_compute_drivers_report_unsupported
+default_registry_contains_exactly_the_enabled_compute_drivers
 ```
 
 Run them with the architecture-specific focused task on the native host.
+That task also tests gateway library builds with no compute driver, MXC only,
+the Docker stub only, and MXC plus the Docker stub.
 
 ## Cargo Excludes
 
@@ -123,7 +130,7 @@ package-level tests are excluded as top-level targets.
 
 The supervisor and supervisor-process packages now participate as top-level
 native check/test targets. Their portable session, attachment, and TCP readiness
-coverage does not enable a Windows isolation runtime.
+coverage does not qualify MXC isolation enforcement.
 
 ## Common Errors
 
@@ -181,20 +188,29 @@ blocked dependency.
 
 ### Focused tests report many filtered-out tests
 
-This is expected for `windows:test:unsupported:x64`. Cargo runs one named test
-and filters the other `openshell-gateway` tests. Report these as filtered, not
-ignored.
+This is expected for `windows:test:unsupported:x64`. Each focused Cargo
+invocation runs one named contract and filters the other `openshell-gateway`
+tests. The task also runs four selective-feature library suites. Report
+filtered tests separately from ignored tests.
 
 ## Reporting Counts
+
+`windows:test:x64`, `windows:test:arm64`, and the workspace test step in
+`windows:ci` use `cargo nextest run --profile ci --workspace` with
+`openshell-server/test-support` and the selected Z3 features. The CI profile
+disables fail-fast. Nextest does not run doc tests. Install the pinned
+Nextest tool with `mise install --locked github:nextest-rs/nextest` before
+running these tasks with `--skip-tools`.
 
 Use the log summaries from:
 
 | Log | Count source |
 |---|---|
-| `test-x86_64-pc-windows-msvc.log` | Full x64 workspace test pass. |
-| `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test pass. |
+| `test-x86_64-pc-windows-msvc-precommit.log` | Native x64 workspace Nextest run with server test support. |
+| `test-aarch64-pc-windows-msvc-precommit.log` | Native ARM64 workspace Nextest run with server test support. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-contract re-runs and filtered counts. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 re-runs and filtered counts. |
+| `test-<target>-selective-*.log` | Gateway library tests for each selective compute-driver feature set. |
 
 Separate:
 

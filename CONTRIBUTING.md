@@ -223,9 +223,14 @@ cargo build -p openshell-prover --target x86_64-pc-windows-msvc --features prebu
 
 ### Windows full build
 
-To build the full set of Windows binaries, including `openshell-gateway.exe`
-and `openshell.exe`, use the `windows:build:x64` mise task instead of a
-single-crate `cargo build`. It downloads the pinned prebuilt Z3 release by default. A
+To build `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`,
+and `openshell-windows-sandbox.exe`, use `windows:build:x64` or
+`windows:build:arm64` instead of a single-crate `cargo build`. These tasks
+download the pinned prebuilt Z3 release by default and stage the matching
+`libz3.dll` beside the binaries in `target/<target-triple>/release`. Copy that
+DLL with the binaries when deploying to another Windows host; the target also
+needs the matching Visual C++ runtime. The Windows MSVC workflow builds these
+files but does not upload or publish them. A
 full build also compiles crates that use `bindgen` (e.g. the MXC driver on
 Windows), so it requires `libclang.dll`; if LLVM is not on the default search
 path, set `LIBCLANG_PATH` to the directory containing `libclang.dll`:

@@ -56,7 +56,7 @@ the gateway into durable JSONL output:
 etw_audit = true
 ```
 
-```powershell
+```shell
 $env:OPENSHELL_OCSF_JSON = "1"
 # Optional; defaults to %PROGRAMDATA%\OpenShell\logs.
 $env:OPENSHELL_OCSF_LOG_DIR = "D:\OpenShell\audit"
@@ -70,6 +70,14 @@ daily and retains the three most recent files. Diagnostic `--log-level` values
 do not suppress records in this explicitly enabled audit sink.
 Prefer the `gateway.toml` output above for configured retention and loss metrics;
 enabling both sinks writes to both independently.
+
+The ETW consumer requires an administrator account or membership in Windows
+Performance Log Users. Live sandbox attribution remains unqualified. On the
+tested ARM64 host, Windows Sandboxing events originate from the shared Appinfo
+broker, and the consumer cannot correlate them with the executor's PID and
+process generation. Enabling ETW and JSONL output does not guarantee complete
+per-sandbox events. Use the separate `windows:test:mxc-audit` qualification
+task on a native Windows development host to check live coverage.
 
 ## Output Location
 

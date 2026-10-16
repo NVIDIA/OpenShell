@@ -31,6 +31,8 @@ See [Architecture](https://docs.nvidia.com/openshell/latest/about/architecture) 
 
 You need Linux, macOS on Apple Silicon, or Windows with WSL 2 (experimental), plus Docker, Podman, or host virtualization. See the [Support Matrix](https://docs.nvidia.com/openshell/latest/about/support-matrix) for details.
 
+The `windows` branch also provides an experimental native Windows MXC runtime for x64 and ARM64. It requires a source build and a host with native ProcessContainer networking. See [MXC configuration and current limitations](docs/how-it-works/gateways/configuration.mdx#mxc).
+
 ```shell
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 openshell sandbox create --name demo

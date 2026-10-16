@@ -57,6 +57,22 @@ OpenShell publishes multi-architecture gateway images for `linux/amd64` and `lin
 
 On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
 
+### Native Windows development builds
+
+The `windows` branch also builds native x64 and ARM64 binaries for
+the experimental MXC runtime. Its Windows MSVC workflow validates and builds
+the binaries but does not upload or publish Windows release artifacts. Build
+from source on a Windows MSVC host and deploy `openshell-gateway.exe`,
+`openshell.exe`, `openshell-supervisor.exe`, `openshell-windows-sandbox.exe`,
+and the matching `libz3.dll` together. The runtime host also needs the native
+Visual C++ runtime and MXC 1.0.0 with ProcessContainer host-loopback support.
+
+Native Windows gateways use MXC. Docker, Podman, Kubernetes, and MicroVM compute
+drivers return unsupported errors on native Windows. See [MXC
+configuration](/how-it-works/gateways/configuration#mxc) for host preparation
+and the current enforcement and qualification limits. This development path
+is not production-qualified.
+
 ## Standalone Gateway Binary
 
 OpenShell publishes standalone `openshell-gateway` release assets for manual download on these platforms:
@@ -127,6 +143,7 @@ The gateway can manage sandboxes through several runtimes.
 | Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
 | Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
 | MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
+| Windows MXC | Experimental on the `windows` branch. | Native Windows commands in ProcessContainers; source build only. See [MXC configuration](/how-it-works/gateways/configuration#mxc). |
 
 ## Software Prerequisites
 
@@ -143,10 +160,14 @@ Install the software for the compute driver you use:
 
 ## Workload Images
 
-OpenShell accepts standard Linux OCI images. The built-in default workload is
+Docker, Podman, Kubernetes, and MicroVM accept standard Linux OCI images. The built-in default workload is
 `nvcr.io/nvidia/base/ubuntu:24.04` for `linux/amd64` and `linux/arm64`. It is a
 minimal Ubuntu Noble userspace and does not bundle agent CLIs. Operators can
 change the default, and users can select an explicit image with `--from`.
+
+Native Windows MXC launches a Windows command with an absolute working
+directory supplied through `--driver-config-json`; it does not start workloads
+from OCI images. See [MXC configuration](/how-it-works/gateways/configuration#mxc).
 
 ## Container Images
 

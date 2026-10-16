@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 title: "Sandbox Runtimes"
 sidebar-title: "Runtimes"
-description: "Configure the Docker, Podman, MicroVM, or Kubernetes runtime that runs OpenShell sandboxes."
+description: "Configure the Docker, Podman, MicroVM, Kubernetes, or experimental Windows MXC runtime that runs OpenShell sandboxes."
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, MicroVM, Kubernetes, MXC, Reference"
 position: 4
 ---
@@ -21,7 +21,7 @@ the sandbox record and driver-supported persistent storage.
 | [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
 | [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
-| Windows MXC | `mxc` | Coming soon. |
+| [Windows MXC](/how-it-works/gateways/configuration#mxc) | `mxc` | Experimental native Windows commands in ProcessContainers on the `windows` branch. |
 
 ## Select a Compute Driver
 
@@ -37,7 +37,7 @@ compute_driver = "docker"
 
 Every gateway TOML file must start with the `[openshell]` table and `version = 2`, or `openshell-gateway config preflight` rejects it with `missing_version`. The remaining examples on this page show only the tables they change.
 
-When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected.
+When `compute_driver` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM and MXC drivers are never auto-detected. Native Windows gateways must explicitly select `mxc`; the other built-in compute drivers are unsupported on native Windows.
 
 Configure driver-specific values, such as images, endpoints, and sizing, under `[openshell.drivers.<name>]`. See the [Gateway Configuration File](/how-it-works/gateways/configuration) reference for every option.
 

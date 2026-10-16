@@ -33,6 +33,14 @@ specific time:
 | `network_policies` | Destinations each binary can reach, and the requests it can send. | Sandbox network proxy. | While the sandbox runs. |
 | `network_middlewares` | Additional inspection, transformation, or blocking of traffic that network rules allow. | Sandbox network proxy. | While the sandbox runs. |
 
+Native Windows MXC maps filesystem grants to its ProcessContainer fence rather
+than Linux Landlock. Its explicit proxy checks the executable that owns each
+TCP connection. The current Windows development path permits direct access
+to host-loopback services outside that proxy and has unverified outer-fence
+and live-revocation assertions. See [MXC configuration and
+limitations](/how-it-works/gateways/configuration#mxc) before relying on these
+policy controls.
+
 Filesystem, Landlock, process, and UI settings are fixed once the sandbox starts.
 Network rules and middleware can change while it runs, as described in [How
 Changes Take

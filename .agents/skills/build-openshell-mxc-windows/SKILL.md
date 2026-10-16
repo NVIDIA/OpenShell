@@ -7,10 +7,10 @@ metadata:
 
 # Build OpenShell-MXC for Windows
 
-This skill maintains the existing native Windows MSVC build lane in the
-OpenShell repository. The Windows lane is already present in `main`; do not
-treat this skill as a first-time porting recipe unless the user explicitly asks
-for a new fork or a from-scratch bring-up.
+This skill maintains the existing native Windows MSVC and MXC runtime lane in
+the OpenShell repository's `windows` branch. Use that branch for
+MXC runtime work; do not treat this skill as a first-time porting recipe unless
+the user explicitly asks for a new fork or a from-scratch bring-up.
 
 The lane validates that OpenShell can compile and test on Windows MSVC for the
 supported deliverables:
@@ -107,7 +107,7 @@ did not request.
 
 In scope:
 
-- Refreshing a local checkout to the latest upstream GitHub `main`.
+- Refreshing a local checkout to the latest upstream GitHub `windows` branch.
 - Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
 - Running x64 and ARM64 MSVC checks.
 - Building x64 and ARM64 release binaries for `openshell-gateway`, `openshell`,
@@ -150,13 +150,13 @@ Out of scope:
 ## Recommended Checkout Flow
 
 From a fork checkout where `upstream` points to the official
-`NVIDIA/OpenShell` GitHub repository, use:
+`NVIDIA/OpenShell` GitHub repository, refresh the Windows branch:
 
 ```powershell
-git fetch upstream main
-git switch main
-git merge --ff-only upstream/main
-git branch --set-upstream-to=upstream/main main
+git fetch upstream windows
+git switch windows
+git merge --ff-only upstream/windows
+git branch --set-upstream-to=upstream/windows windows
 git status --short --branch
 ```
 
@@ -181,6 +181,7 @@ The lane targets a Windows host with Visual Studio Build Tools and rustup.
 | Windows SDK | `where.exe rc.exe` from a Developer PowerShell | Install an SDK containing target libraries and ARM64 tools. |
 | Rust via rustup | `rustc --version` | Add each target being validated: `x86_64-pc-windows-msvc` and/or `aarch64-pc-windows-msvc`. The wrapper also adds the selected target. |
 | mise | `mise --version` | Used as a task runner only. |
+| cargo-nextest | `cargo nextest --version` | Required by `windows:test:x64`, `windows:test:arm64`, and `windows:ci`. Install the pinned tool with `mise install --locked github:nextest-rs/nextest` before using `--skip-tools`, as the Windows workflow does. |
 | Git | `git --version` | Needed for checkout and sync work. |
 | PowerShell | `$PSVersionTable.PSVersion` | Windows PowerShell 5.1 works; PowerShell 7 is quieter with mise shell hooks. |
 
@@ -195,7 +196,7 @@ from this skill.
 | `OPENSHELL_MXC_SKIP_ARM64` | `0` | Set to `1` to skip ARM64 when using `all` tasks. |
 | `OPENSHELL_WINDOWS_BUILD_JOBS` | `CARGO_BUILD_JOBS`, then `4` | Positive Cargo job limit used by the wrapper. |
 | `CARGO_TARGET_DIR` | `target` under repo root | Override Cargo output location. Use a short absolute path when x64-to-ARM64 builds approach Windows path-length limits. |
-| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing an x64 system `libz3.lib`; not valid for ARM64. |
+| `Z3_LIBRARY_PATH_OVERRIDE` | unset | Directory containing target-compatible system `libz3.lib` and `libz3.dll`, used instead of the prebuilt download. |
 | `Z3_SYS_Z3_HEADER` | unset | Full `z3.h` path required with a system Z3 library. |
 | `Z3_SYS_Z3_VERSION` | `5.1.0` | Pinned official prebuilt Z3 release selected by the wrapper. |
 | `READ_ONLY_GITHUB_TOKEN` | unset | Optional token for the Z3 release lookup; GitHub Actions supplies `github.token`. |
@@ -260,7 +261,7 @@ order:
 2. ARM64 check, unless `OPENSHELL_MXC_SKIP_ARM64=1`.
 3. x64 release build.
 4. ARM64 release build, unless skipped.
-5. Native x64 workspace tests.
+5. Native x64 workspace tests through Nextest's `ci` profile with `openshell-server/test-support` enabled.
 6. Focused unsupported-driver contract tests.
 7. Artifact reporting.
 
@@ -294,9 +295,10 @@ Run `rust:lockfiles:check`, `sdk:ts:ci`, and `go:ci` through the Windows-aware
 tasks when validating those surfaces. Do not count the Go
 Windows ARM64 race-detector exclusion or POSIX permission-bit skips as security
 coverage. SDK test dependencies must remain at their lockfile versions.
-Its Rust check, Clippy, and test dependencies enter the same MSVC environment
-for the native host target and use an inherited compiler wrapper when it is
-available. Linux glibc
+Its Clippy dependency enters the MSVC environment for the native host target
+and uses an inherited compiler wrapper when it is available. The separate
+`rust:check` and `test:rust` tasks use the same wrapper; `pre-commit` runs
+formatting and lint checks, not those compile and test tasks. Linux glibc
 installer tests and Linux service/RPM packaging-asset tests skip explicitly;
 the Linux build-environment shell-helper test also skips; cross-platform checks
 continue to run. The blocking Windows Clippy pass excludes unsupported
@@ -318,8 +320,8 @@ crypto dependency builds.
 | `windows:check:arm64` | `cargo check --workspace` for `aarch64-pc-windows-msvc`, with the same top-level exclusions. |
 | `windows:build:x64` | Release-builds `openshell-gateway.exe`, `openshell.exe`, `openshell-supervisor.exe`, and `openshell-windows-sandbox.exe` for x64. |
 | `windows:build:arm64` | Release-builds the same four binaries for ARM64. |
-| `windows:test:x64` | Runs native x64 workspace tests with `--no-fail-fast`, excluding unsupported Windows packages as top-level workspace targets. |
-| `windows:test:arm64` | Runs native ARM64 workspace tests with `--no-fail-fast` and the same package exclusions. Rejects non-ARM64 hosts. |
+| `windows:test:x64` | Runs `cargo nextest run --profile ci --workspace` natively on x64 with `openshell-server/test-support` and the selected Z3 features; excludes unsupported Windows packages as top-level workspace targets. The profile disables fail-fast. |
+| `windows:test:arm64` | Runs the same Nextest CI profile and test-support features natively on ARM64, with the same package exclusions. Rejects non-ARM64 hosts. |
 | `windows:test:unsupported:x64` | Re-runs focused `openshell-gateway` tests for unsupported Windows driver behavior. |
 | `windows:test:unsupported:arm64` | Re-runs the same focused contracts natively on ARM64. Rejects non-ARM64 hosts. |
 | `windows:test:mxc-real:x64` | Runs the serial, ignored real-`wxc-exec` integration suite natively on x64 through the MSVC wrapper. Rejects non-x64 hosts. |
@@ -469,7 +471,7 @@ When reporting `windows:ci`, distinguish these categories:
 - Passed tests from the full ARM64 workspace test log when run on a native
   ARM64 host.
 - The focused unsupported-contract re-run.
-- Explicit Cargo ignored tests, usually ignored doc examples.
+- Nextest skipped tests, including ignored real-MXC tests. Nextest does not run doc tests.
 - Tests hidden by `#[cfg(not(target_os = "windows"))]`; these often appear as
   `running 0 tests`, not as ignored tests.
 - Test-name `filtered out` counts from focused `cargo test` invocations.
@@ -484,8 +486,8 @@ Useful log files:
 | `build-aarch64-pc-windows-msvc-check.log` | ARM64 check output. |
 | `build-x86_64-pc-windows-msvc-release.log` | x64 release build output. |
 | `build-aarch64-pc-windows-msvc-release.log` | ARM64 release build output. |
-| `test-x86_64-pc-windows-msvc.log` | Full native x64 workspace test output. |
-| `test-aarch64-pc-windows-msvc.log` | Full native ARM64 workspace test output. |
+| `test-x86_64-pc-windows-msvc-precommit.log` | Native x64 workspace Nextest output from `windows:test:x64` or `windows:ci`, with server test support. |
+| `test-aarch64-pc-windows-msvc-precommit.log` | Native ARM64 workspace Nextest output from `windows:test:arm64`, with server test support. |
 | `test-x86_64-pc-windows-msvc-unsupported-*.log` | Focused unsupported-driver contract output. |
 | `test-aarch64-pc-windows-msvc-unsupported-*.log` | Focused native ARM64 contract output. |
 | `test-x86_64-pc-windows-msvc-mxc-real.log` | Native x64 real-MXC integration output. |
