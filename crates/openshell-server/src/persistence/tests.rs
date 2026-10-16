@@ -8,6 +8,75 @@ use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
 use prost::Message;
 use std::collections::HashMap as StdHashMap;
 
+async fn verify_atomic_object_transactions(store: &Store) {
+    use super::AtomicObjectWrite;
+    let prefix = uuid::Uuid::new_v4().to_string();
+    let write = |suffix: &str| AtomicObjectWrite {
+        object_type: "atomic-test".into(),
+        id: format!("{prefix}-{suffix}"),
+        name: format!("{prefix}-{suffix}"),
+        workspace: "default".into(),
+        scope: Some(prefix.clone()),
+        payload: b"original".to_vec(),
+        labels: Some(r#"{"test":"atomic"}"#.into()),
+        expected_version: None,
+    };
+    let first = write("a");
+    let second = write("b");
+    store
+        .put_objects_atomic(&[first.clone(), second.clone()])
+        .await
+        .unwrap();
+    let mut update_first = first.clone();
+    update_first.expected_version = Some(1);
+    update_first.payload = b"replacement".to_vec();
+    let mut stale_second = second.clone();
+    stale_second.expected_version = Some(99);
+    assert!(matches!(
+        store
+            .put_objects_atomic(&[update_first.clone(), stale_second])
+            .await,
+        Err(PersistenceError::Conflict { .. })
+    ));
+    let retained = store.get("atomic-test", &first.id).await.unwrap().unwrap();
+    assert_eq!(retained.payload, b"original");
+    assert_eq!(retained.resource_version, 1);
+    let left = [update_first.clone()];
+    let right = [update_first];
+    let (left, right) = tokio::join!(
+        store.put_objects_atomic(&left),
+        store.put_objects_atomic(&right)
+    );
+    assert_ne!(
+        left.is_ok(),
+        right.is_ok(),
+        "exactly one version-fenced writer wins"
+    );
+    assert_eq!(
+        store
+            .get("atomic-test", &first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .resource_version,
+        2
+    );
+    store.delete("atomic-test", &first.id).await.unwrap();
+    store.delete("atomic-test", &second.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn atomic_objects_sqlite_roll_back_and_serialize_writers() {
+    verify_atomic_object_transactions(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable database in OPENSHELL_TEST_POSTGRES_URL"]
+async fn atomic_objects_postgres_roll_back_and_serialize_writers() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("Postgres test URL");
+    verify_atomic_object_transactions(&Store::connect(&url).await.unwrap()).await;
+}
+
 /// A failed store call must be visible as a failure in the trace, not as a
 /// span that merely happened to return nothing.
 #[tokio::test]

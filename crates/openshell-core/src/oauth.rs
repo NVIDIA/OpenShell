@@ -12,6 +12,7 @@ use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use miette::{IntoDiagnostic, WrapErr};
 use serde::Deserialize;
 
 use crate::token_grant_failure::{
@@ -83,6 +84,15 @@ impl fmt::Debug for OAuthTokenResponse {
     }
 }
 
+/// `OAuth2` refresh-token response.
+#[derive(Debug, Clone)]
+pub struct OAuthRefreshTokenResponse {
+    pub access_token: String,
+    pub refresh_token: Option<String>,
+    pub expires_in: i64,
+    pub token_type: String,
+}
+
 #[derive(Deserialize)]
 struct RawTokenResponse {
     access_token: String,
@@ -90,6 +100,8 @@ struct RawTokenResponse {
     expires_in: i64,
     #[serde(default)]
     token_type: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +259,76 @@ pub async fn post_oauth_token_exchange(
     .await
 }
 
+/// Refresh-token grant form fields.
+pub struct RefreshTokenParams<'a> {
+    pub refresh_token: &'a str,
+    pub client_id: &'a str,
+    pub scopes: &'a [String],
+    pub allow_insecure_http: bool,
+}
+
+/// POST an `OAuth2` refresh-token request to a token endpoint.
+pub async fn post_oauth_refresh_token(
+    client: &reqwest::Client,
+    token_endpoint: &str,
+    params: &RefreshTokenParams<'_>,
+) -> miette::Result<OAuthRefreshTokenResponse> {
+    let token_endpoint_url =
+        parse_token_endpoint_url_with_policy(token_endpoint, params.allow_insecure_http)?;
+    let mut form_params = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", params.refresh_token),
+        ("client_id", params.client_id),
+    ];
+
+    let scope_param;
+    if !params.scopes.is_empty() {
+        scope_param = params.scopes.join(" ");
+        form_params.push(("scope", &scope_param));
+    }
+
+    let response = client
+        .post(token_endpoint_url)
+        .form(&form_params)
+        .send()
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to POST to token endpoint {token_endpoint}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = read_bounded_body(response)
+            .await
+            .map_err(|_| miette::miette!("token endpoint returned HTTP {status}"))?;
+        if status == reqwest::StatusCode::BAD_REQUEST
+            && serde_json::from_slice::<OAuthErrorResponse>(&body)
+                .ok()
+                .and_then(|error| error.error)
+                .as_deref()
+                == Some("invalid_grant")
+        {
+            return Err(miette::miette!(
+                "token endpoint returned HTTP {status}: error=invalid_grant"
+            ));
+        }
+        return Err(miette::miette!("token endpoint returned HTTP {status}"));
+    }
+
+    let raw = response
+        .json::<RawTokenResponse>()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to parse token response as JSON")?;
+    validate_access_token(&raw.access_token)
+        .map_err(|_| miette::miette!("token endpoint returned an invalid access token"))?;
+    Ok(OAuthRefreshTokenResponse {
+        access_token: raw.access_token,
+        refresh_token: raw.refresh_token,
+        expires_in: raw.expires_in,
+        token_type: raw.token_type,
+    })
+}
+
 pub fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
     if client_assertion_type.trim().is_empty() {
         DEFAULT_CLIENT_ASSERTION_TYPE
@@ -268,11 +350,21 @@ pub fn effective_token_type(token_type: &str) -> &str {
 /// HTTPS is accepted; plain HTTP is limited to loopback and Kubernetes service
 /// hosts and never authenticates a precise token-service error classification.
 pub fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url, TokenGrantFailure> {
+    parse_token_endpoint_url_with_policy(token_endpoint, false)
+}
+
+fn parse_token_endpoint_url_with_policy(
+    token_endpoint: &str,
+    allow_insecure_http: bool,
+) -> Result<reqwest::Url, TokenGrantFailure> {
     let invalid = TokenGrantFailure::new(
         TokenGrantFailureKind::Configuration,
         TokenGrantStage::Configuration,
     );
     let url = reqwest::Url::parse(token_endpoint).map_err(|_| invalid)?;
+    if allow_insecure_http && matches!(url.scheme(), "http" | "https") {
+        return Ok(url);
+    }
     if token_endpoint_transport_allowed(&url) {
         return Ok(url);
     }
@@ -987,6 +1079,20 @@ mod tests {
                 "should be rejected: {endpoint}"
             );
         }
+    }
+
+    #[test]
+    fn token_endpoint_url_can_explicitly_allow_plain_http_for_refresh() {
+        parse_token_endpoint_url("http://auth.example.com/token")
+            .expect_err("strict validation should reject arbitrary plain HTTP");
+
+        parse_token_endpoint_url_with_policy("http://auth.example.com/token", true)
+            .expect("explicit insecure refresh policy should allow HTTP");
+        parse_token_endpoint_url_with_policy("https://auth.example.com/token", true)
+            .expect("explicit insecure refresh policy should allow HTTPS");
+
+        parse_token_endpoint_url_with_policy("ftp://auth.example.com/token", true)
+            .expect_err("non-HTTP token endpoints must still be rejected");
     }
 
     #[test]

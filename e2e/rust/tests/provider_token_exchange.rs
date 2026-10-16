@@ -339,7 +339,23 @@ async fn start_spiffe_workload_api(path: &Path, subject: &str) -> FixtureHandle 
                 eprintln!("SPIFFE Workload API fixture failed: {err}");
             }
         });
-        return FixtureHandle { task };
+        let fixture = FixtureHandle { task };
+        // This lane uses a host-networked supervisor. Check its advertised
+        // fixture address before creating a sandbox, so a stale network alias
+        // fails here instead of timing out repeatedly during token injection.
+        let address = endpoint.strip_prefix("tcp:").expect("TCP fixture endpoint");
+        let probe = tokio::time::timeout(Duration::from_secs(2), TcpStream::connect(address))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("SPIFFE fixture endpoint {endpoint} timed out; listener is {listen}")
+            })
+            .unwrap_or_else(|err| {
+                panic!(
+                    "SPIFFE fixture endpoint {endpoint} is unreachable (listener {listen}): {err}"
+                )
+            });
+        drop(probe);
+        return fixture;
     }
     let _ = fs::remove_file(path);
     let listener = UnixListener::bind(path).expect("bind SPIFFE Workload API socket");

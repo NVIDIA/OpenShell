@@ -222,8 +222,17 @@ async fn repeated_revocation_completes_without_another_write() {
     let state = test_server_state().await;
     state
         .store
+        .put_message(&Sandbox {
+            metadata: Some(metadata("sandbox-session")),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    state
+        .store
         .put_message(&SshSession {
             metadata: Some(metadata("session-token")),
+            sandbox_id: "sandbox-session".into(),
             token: "session-token".into(),
             ..Default::default()
         })

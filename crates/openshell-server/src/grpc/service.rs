@@ -46,6 +46,8 @@ pub(super) async fn handle_expose_service(
         MinWorkspaceRole::User,
     )
     .await?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
     let workspace =
         super::workspace::resolve_workspace(state.store.as_ref(), sandbox.object_workspace())
             .await?
@@ -321,6 +323,14 @@ pub(super) async fn handle_delete_service(
             outcome: super::deletion_outcome(false, req.allow_missing, "service endpoint")?,
         }));
     };
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&endpoint.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    crate::delegated_identity::ensure_delegated_identity_sandbox_user(state, &principal, &sandbox)
+        .await?;
 
     #[cfg(test)]
     if let Some(probe) = probe {

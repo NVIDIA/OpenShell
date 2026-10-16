@@ -22,7 +22,11 @@ or require `CAP_NET_ADMIN`.
 
 TCP opens, TCP byte streams, DNS requests/replies, and lifecycle operations
 share the authenticated gRPC channel. DNS is resolved and authorized by the
-supervisor. General UDP is unsupported.
+supervisor. The driver writes the sandbox-local policy DNS relay
+(`127.0.0.53`) into `/etc/resolv.conf` before workload start and restart.
+Podman resolver generation is disabled for the workload because `network=none`
+skips DNS configuration, including explicit DNS servers. The host-networked
+supervisor keeps the host resolver. General UDP is unsupported.
 
 The driver mounts a read-only, driver-owned `/etc/resolv.conf` into the
 workload with `nameserver 127.0.0.53`. This prevents the disconnected Podman
@@ -39,6 +43,15 @@ the gateway's primary loopback endpoint. On macOS, Podman Machine provides the
 host-loopback route. The upstream corporate proxy applies only to the
 supervisor. The gateway's SSH tunnel uses the supervisor relay over its private
 Unix socket, so the driver does not publish a supervisor port.
+
+On native Linux, host-side SPIFFE Workload API TCP fixtures must advertise
+host loopback to the supervisor, not a workload-side link-local gateway address.
+The Podman E2E wrapper binds its provider SPIFFE fixture to `127.0.0.1`.
+
+Reserved host aliases such as `host.openshell.internal` resolve through
+mediated DNS to supervisor loopback on Linux. When `host_gateway_ip` is set,
+including the Podman Machine default on macOS, mediated DNS pins those aliases
+to that configured address instead.
 
 These runtime-managed network helpers are outside the workload trust boundary.
 Sharing the workload's user namespace preserves volume UID/GID mapping; it

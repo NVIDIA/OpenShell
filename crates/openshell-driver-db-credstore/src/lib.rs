@@ -142,6 +142,15 @@ struct EncryptedBytes {
 }
 
 impl DbCredstoreCredentialDriver {
+    pub fn prepare_credential(
+        &self,
+        request: openshell_core::proto::credentials::v1::PrepareCredentialRequest,
+    ) -> Result<CredentialHandle, Status> {
+        EncryptedGatewayCredentialStoreCrypto::validate_credential_key(&request.credential_key)?;
+        EncryptedGatewayCredentialStoreCrypto::validate_provider_name(&request.provider)?;
+        self.crypto
+            .credential_handle(&EncryptedGatewayCredentialStoreCrypto::new_handle_id()?)
+    }
     pub const NAME: &'static str = DRIVER_NAME;
     pub const OBJECT_TYPE: &'static str = OBJECT_TYPE;
 
@@ -1091,6 +1100,52 @@ mod tests {
             workspace: "test-workspace".to_string(),
             provider_id: "test-provider-id".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn prepared_handle_is_recoverable_before_secret_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = driver_config_for_key_encryption_key_path(
+            &tmp.path().join(DEFAULT_KEY_ENCRYPTION_KEY_FILE),
+        );
+        let store = Arc::new(MemoryObjectStore::default());
+        let driver = DbCredstoreCredentialDriver::from_config(store.clone(), &config).unwrap();
+        let handle = driver
+            .prepare_credential(
+                openshell_core::proto::credentials::v1::PrepareCredentialRequest {
+                    provider: "owner".into(),
+                    credential_key: "token".into(),
+                    workspace: "test-workspace".into(),
+                    provider_id: "test-provider-id".into(),
+                    object_id: "staged-operation".into(),
+                },
+            )
+            .unwrap();
+        assert!(store.objects.lock().unwrap().is_empty());
+        let deletion = DeleteCredentialRequest {
+            provider: "owner".into(),
+            credential_key: "token".into(),
+            handle: Some(handle.clone()),
+            workspace: "test-workspace".into(),
+            provider_id: "test-provider-id".into(),
+        };
+        driver.delete_credential(deletion.clone()).await.unwrap();
+        let stored = driver
+            .store_credential(request("owner", "token", "secret", Some(handle.clone())))
+            .await
+            .unwrap();
+        assert_eq!(stored.handle, handle.handle);
+        assert_eq!(
+            driver
+                .resolve_credentials(vec![resolve_request("token", "owner", "token", handle)])
+                .await
+                .unwrap()[0]
+                .value,
+            "secret"
+        );
+        driver.delete_credential(deletion.clone()).await.unwrap();
+        driver.delete_credential(deletion).await.unwrap();
+        assert!(store.objects.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

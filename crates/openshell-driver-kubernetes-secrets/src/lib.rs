@@ -85,6 +85,31 @@ struct KubernetesSecretReference {
 }
 
 impl KubernetesSecretsCredentialDriver {
+    pub fn prepare_credential(
+        &self,
+        request: openshell_core::proto::credentials::v1::PrepareCredentialRequest,
+    ) -> Result<CredentialHandle, Status> {
+        let object_id = requested_object_id(&request.object_id, &request.provider_id)?;
+        if !is_secret_data_key(&request.credential_key) {
+            return Err(Status::invalid_argument("invalid credential key"));
+        }
+        let namespace = self.settings.namespace.clone();
+        let name = managed_secret_name(
+            &request.workspace,
+            &request.provider_id,
+            &request.provider,
+            &request.credential_key,
+            object_id,
+        );
+        Ok(CredentialHandle {
+            driver: Self::NAME.into(),
+            handle: format!("{HANDLE_VERSION}:{namespace}:{name}"),
+            metadata: std::collections::HashMap::from([(
+                OBJECT_ID_METADATA_KEY.into(),
+                object_id.into(),
+            )]),
+        })
+    }
     pub const NAME: &'static str = "kubernetes-secrets";
 
     pub async fn from_config(config: &toml::Table) -> CoreResult<Self> {
@@ -436,6 +461,14 @@ impl Clone for KubernetesSecretsCredentialDriver {
 
 #[tonic::async_trait]
 impl CredentialDriver for CredentialDriverService {
+    async fn prepare_credential(
+        &self,
+        request: Request<openshell_core::proto::credentials::v1::PrepareCredentialRequest>,
+    ) -> Result<Response<StoreCredentialResponse>, Status> {
+        Ok(Response::new(StoreCredentialResponse {
+            handle: Some(self.driver.prepare_credential(request.into_inner())?),
+        }))
+    }
     async fn get_capabilities(
         &self,
         request: Request<GetCredentialDriverCapabilitiesRequest>,

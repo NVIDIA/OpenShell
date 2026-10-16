@@ -107,6 +107,90 @@ impl ObjectWorkspace for StoredProviderCredentialRefreshStateV2 {
     }
 }
 
+impl ObjectId for DelegatedIdentityCredential {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for DelegatedIdentityCredential {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for DelegatedIdentityCredential {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for DelegatedIdentityCredential {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for DelegatedIdentityCredential {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for DelegatedIdentityCredential {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        false
+    }
+}
+
+impl ObjectId for SandboxDelegatedIdentityRecord {
+    fn object_id(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.id.as_str())
+    }
+}
+
+impl ObjectName for SandboxDelegatedIdentityRecord {
+    fn object_name(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.name.as_str())
+    }
+}
+
+impl ObjectLabels for SandboxDelegatedIdentityRecord {
+    fn object_labels(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_ref().map(|m| m.labels.clone())
+    }
+}
+
+impl SetResourceVersion for SandboxDelegatedIdentityRecord {
+    fn set_resource_version(&mut self, version: u64) {
+        if let Some(meta) = self.metadata.as_mut() {
+            meta.resource_version = version;
+        }
+    }
+}
+
+impl GetResourceVersion for SandboxDelegatedIdentityRecord {
+    fn get_resource_version(&self) -> u64 {
+        self.metadata.as_ref().map_or(0, |m| m.resource_version)
+    }
+}
+
+impl ObjectWorkspace for SandboxDelegatedIdentityRecord {
+    fn object_workspace(&self) -> &str {
+        self.metadata.as_ref().map_or("", |m| m.workspace.as_str())
+    }
+
+    fn requires_workspace() -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,7 +201,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STORAGE_V1_SCHEMA_SHA256: &str =
-        "d68401809d8cea445c35233ef32412bbd041cb2ac5acaf368a0d0bf74d2ddf17";
+        "e7ac6ea301c0a676152903b6de3cccebbca8126bb33eacd89fda817b29777281";
     // Restart policy is stored in SandboxSpec, and the count and well-known
     // timestamps are stored in SandboxStatus. Legacy payloads decode with
     // Unspecified (treated as Never), zero count, and absent timestamps.
@@ -125,7 +209,9 @@ mod tests {
     // additive declaration changes the durable and public/durable overlap
     // inventories; the provider-environment file map is public-only. The
     // request has no provider-file capability field: older supervisors ignore
-    // the additive file map while retaining the rest of the response.
+    // the additive file map while retaining the rest of the response. Delegated
+    // identity is stored alongside the existing durable sandbox and credential
+    // state while public lifecycle messages remain wire-compatible.
     // Preparation timing adds two optional timestamps to SandboxProvisioning.
     // Existing rows decode with both absent and retain their active deadline;
     // no stored attempt gains another phase or time budget on upgrade.
@@ -155,11 +241,11 @@ mod tests {
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
+        "cfb2613ea2e9ca04b267bd85f66621792583bf5deed7db662764e7f64663faea";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "53a333ea5357449db393d47d7cab53a45772916c3193bd161d77fe80794c4947";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
-        "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
+        "c1c2a0aed64f3ce8544ca4a092856b19e1d3f6010036f3ad78acff7351be9bd1";
     // Encoded with the schema that omitted stable_placeholder. Keep these
     // bytes fixed so the current encoder cannot hide a compatibility change.
     const LEGACY_STATIC_PROFILE: &str = "0a240a116c65676163792d70726f66696c652d6964120d6c65676163792d737461746963280712510a0d6c65676163792d73746174696312184c6567616379207374617469632063726564656e7469616c2a260a076170695f6b65791a1153594e5448455449435f4150495f4b455920012a06626561726572";
@@ -184,9 +270,12 @@ mod tests {
     // Field 1 is ignored while the remaining durable status fields retain their tags.
     const PRE_CANONICAL_SANDBOX_REFERENCE_STATUS: &str =
         "0a0b6c65676163792d6e616d6512056167656e7430023807";
-    const STORAGE_MESSAGE_NAMES: [&str; 9] = [
+    const STORAGE_MESSAGE_NAMES: [&str; 12] = [
+        "DelegatedIdentityCredential",
+        "DelegatedIdentityRefreshLease",
         "DraftChunkPayload",
         "PolicyRevisionPayload",
+        "SandboxDelegatedIdentityRecord",
         "StoredConfigUpdateOperation",
         "StoredDraftChunk",
         "StoredPolicyRevision",
@@ -213,11 +302,13 @@ mod tests {
         ".openshell.datamodel.v1.Workspace",
         ".openshell.sandbox.v1.SandboxPolicy",
         ".openshell.storage.v1.DraftChunkPayload",
+        ".openshell.storage.v1.DelegatedIdentityCredential",
         ".openshell.storage.v1.PolicyRevisionPayload",
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
         ".openshell.v1.Sandbox",
+        ".openshell.storage.v1.SandboxDelegatedIdentityRecord",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
         ".openshell.v1.SshSession",
@@ -455,6 +546,53 @@ mod tests {
     }
 
     #[test]
+    fn delegated_identity_storage_reserves_inline_token_fields() {
+        let descriptor = FileDescriptorSet::decode(STORAGE_FILE_DESCRIPTOR_SET)
+            .expect("storage descriptor set must decode");
+        let message = descriptor
+            .file
+            .iter()
+            .find(|file| file.package.as_deref() == Some("openshell.storage.v1"))
+            .and_then(|file| {
+                file.message_type
+                    .iter()
+                    .find(|message| message.name.as_deref() == Some("DelegatedIdentityCredential"))
+            })
+            .expect("delegated identity credential descriptor");
+
+        assert!(
+            message
+                .reserved_name
+                .iter()
+                .any(|name| name == "refresh_token")
+        );
+        assert!(
+            message
+                .reserved_name
+                .iter()
+                .any(|name| name == "access_token")
+        );
+        for field_number in [5, 6] {
+            assert!(message.reserved_range.iter().any(|range| {
+                range.start.is_some_and(|start| start <= field_number)
+                    && range.end.is_some_and(|end| end > field_number)
+            }));
+        }
+        assert!(
+            message
+                .field
+                .iter()
+                .any(|field| field.name.as_deref() == Some("secret_material_handles"))
+        );
+        assert!(
+            message
+                .field
+                .iter()
+                .any(|field| field.name.as_deref() == Some("pending_secret_deletions"))
+        );
+    }
+
+    #[test]
     fn storage_types_are_absent_from_public_descriptor() {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
@@ -570,12 +708,12 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            113 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            87 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -583,7 +721,7 @@ mod tests {
                 .iter()
                 .filter(|method| method.starts_with("openshell.v1.OpenShell/"))
                 .count(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
+            87 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
 
@@ -627,9 +765,9 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (314, 28),
-                (95, 22),
-                (83, 22),
+                (336, 28),
+                (100, 22),
+                (84, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
                 PUBLIC_DURABLE_OVERLAP_SHA256

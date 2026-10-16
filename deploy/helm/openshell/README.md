@@ -534,6 +534,7 @@ discovery endpoint or its TLS CA.
 | server.grpcRateLimit.windowSeconds | int | `0` | gRPC rate-limit window length in seconds. Must be positive (alongside requests) to enable rate limiting; 0 (default) disables it. |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
+| server.maxDelegatedIdentityDurationSecs | int | `86400` | Maximum delegated identity authorization window for one sandbox, in seconds. |
 | server.name | string | `""` | Operator-facing gateway name. Defaults to the chart fullname so all replicas in one installation share an identity. Set explicitly when one telemetry collector receives spans from multiple namespaces or clusters. |
 | server.ocsfLog.enabled | bool | `false` | Write gateway OCSF events as JSONL. |
 | server.ocsfLog.maxFiles | int | `7` | Rotated files retained when rotation is daily. |

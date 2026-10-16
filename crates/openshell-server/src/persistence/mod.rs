@@ -3,9 +3,11 @@
 
 //! Persistence layer for `OpenShell` Server.
 
+mod atomic;
 mod legacy_time_wire;
 pub mod lock_order;
 pub mod mutation_lock;
+pub use atomic::AtomicObjectWrite;
 mod postgres;
 #[cfg(test)]
 mod refresh_lock_tests;
@@ -310,6 +312,12 @@ macro_rules! store_dispatch_traced {
 }
 
 impl Store {
+    /// Commit a bounded group of conditional object writes together. Every
+    /// condition must hold; cancellation before commit rolls back all writes.
+    pub async fn put_objects_atomic(&self, writes: &[AtomicObjectWrite]) -> PersistenceResult<()> {
+        atomic::validate(writes)?;
+        store_dispatch!(self.put_objects_atomic(writes))
+    }
     /// Returns `true` for single-replica backends (`SQLite`) where no lease
     /// coordination is needed, `false` for multi-replica backends (`Postgres`).
     pub fn is_single_replica(&self) -> bool {

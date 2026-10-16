@@ -130,6 +130,7 @@ async fn postgres_concurrent_sandbox_creates_with_ssh_identity_do_not_exhaust_lo
                 None,
                 Some(encoded),
                 false,
+                None,
                 lifecycle_guard,
                 mutation_guard,
             ))
