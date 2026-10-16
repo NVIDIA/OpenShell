@@ -1,0 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+openshell_client_config_dir: >-
+  /home/{{ ansible_user }}/.config/openshell/gateways/{{ openshell_client_gateway_name | default('tmachine') }}

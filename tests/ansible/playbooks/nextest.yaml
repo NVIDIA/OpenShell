@@ -50,3 +50,11 @@
     - name: Verify cargo-nextest
       ansible.builtin.command: cargo-nextest --version
       changed_when: false
+
+    # The CLI's upload runs git to apply .gitignore rules, and the
+    # file-transfer tests create Git work trees. Fedora cloud images lack git.
+    - name: Install test dependencies
+      ansible.builtin.package:
+        name:
+          - git
+        state: present

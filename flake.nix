@@ -127,7 +127,7 @@
           firmwarePkgs = testGuestPkgs;
         };
         testMachines = import ./tests/config.nix {
-          inherit pkgs toolchains;
+          inherit pkgs toolchains rustToolchain;
           qemuPkgs = tmachineRuntimePkgs;
           firmwarePkgs = tmachineRuntimePkgs;
         };
@@ -199,6 +199,7 @@
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;
           tmachine-unwrapped = testMachines.unwrapped;
+          test-runner = testMachines.testRunner;
         };
 
         devShells = {

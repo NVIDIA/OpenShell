@@ -12,3 +12,48 @@
       - --local
       - --name
       - "{{ openshell_client_gateway_name | default('tmachine') }}"
+
+# Describe the registered gateway for conformance tests. The test runner
+# combines this with the environment's capabilities into the target file
+# that tests read through OPENSHELL_TEST_TARGET.
+- name: Read registered gateway metadata
+  ansible.builtin.slurp:
+    src: "{{ openshell_client_config_dir }}/metadata.json"
+  register: openshell_client_metadata
+
+- name: Check for registered mTLS client credentials
+  ansible.builtin.stat:
+    path: "{{ openshell_client_config_dir }}/mtls/tls.crt"
+  register: openshell_client_mtls
+
+- name: Find the installed OpenShell CLI
+  ansible.builtin.shell: command -v openshell
+  changed_when: false
+  register: openshell_client_binary
+
+- name: Create test target directory
+  become: true
+  ansible.builtin.file:
+    path: /etc/openshell-test
+    state: directory
+    mode: "0755"
+
+- name: Write gateway and CLI sections of the test target
+  become: true
+  ansible.builtin.copy:
+    dest: /etc/openshell-test/gateway.yaml
+    mode: "0644"
+    content: |
+      # Written by the openshell_client role.
+      {{ {'gateway': openshell_client_target_gateway, 'cli': openshell_client_target_cli} | to_nice_yaml(indent=2) }}
+  vars:
+    openshell_client_target_cli:
+      binary: "{{ openshell_client_binary.stdout | trim }}"
+      gateway: "{{ openshell_client_gateway_name | default('tmachine') }}"
+    openshell_client_target_tls:
+      ca: "{{ openshell_client_config_dir }}/mtls/ca.crt"
+      client_cert: "{{ openshell_client_config_dir }}/mtls/tls.crt"
+      client_key: "{{ openshell_client_config_dir }}/mtls/tls.key"
+    openshell_client_target_gateway: >-
+      {{ {'endpoint': (openshell_client_metadata.content | b64decode | from_json).gateway_endpoint}
+         | combine({'tls': openshell_client_target_tls} if openshell_client_mtls.stat.exists else {}) }}

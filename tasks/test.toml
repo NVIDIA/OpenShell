@@ -23,6 +23,7 @@ depends = [
   "test:docs-website",
   "test:docs-nav",
   "test:maintainer-approval",
+  "test:cargo-lockfile-alignment",
 ]
 
 ["test:docs-website"]
@@ -30,6 +31,10 @@ description = "Test the docs-website sync script"
 # --no-project skips installing the OpenShell package; --with supplies the test
 # dependencies and the script's runtime dependency, which live outside the project env.
 run = "uv run --no-project --with pytest --with pytest-asyncio --with pyyaml pytest tasks/scripts/sync_docs_website_test.py"
+
+["test:cargo-lockfile-alignment"]
+description = "Test the Cargo lockfile alignment check"
+run = "uv run --no-project --with pytest pytest tasks/scripts/check_cargo_lockfile_alignment_test.py"
 
 ["test:docs-nav"]
 description = "Test the docs navigation check"
@@ -117,6 +122,9 @@ run = [
   "cargo test --workspace --exclude openshell-server",
   "cargo test -p openshell-server --features test-support",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/testkit/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/runner/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/tmachine/Cargo.toml",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true

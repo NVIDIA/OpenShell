@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Known bugs that skip a test in some environments. See TESTING.md.
+#
+# waivers:
+#   - test: t-xxxxxxxx                     # the test's stable ID
+#     environments: { runtime: podman-rootless }   # omit for all environments
+#     issue: https://github.com/NVIDIA/OpenShell/issues/NNNN
+#     reason: what fails and why
+waivers: []

@@ -157,6 +157,10 @@ ocsf_emit!(event);
 
 - If you change sandbox infrastructure, ensure the relevant sandbox e2e path succeeds.
 
+## End-to-End Tests
+
+- Add new end-to-end tests under `tests/suites/`, following [TESTING.md](TESTING.md). `e2e/` is being migrated to `tests/` and only takes fixes.
+
 ## Network Sockets
 
 - On latency-sensitive TCP streams, disable Nagle's algorithm so small

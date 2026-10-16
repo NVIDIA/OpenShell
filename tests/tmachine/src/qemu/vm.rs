@@ -38,6 +38,11 @@ impl QemuVm {
         Self { child, runtime_dir }
     }
 
+    /// The exit status, if QEMU has already exited.
+    pub(super) fn try_wait(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+
     pub(super) async fn wait(mut self) {
         let status = self.child.wait().await.unwrap();
         assert!(status.success());
@@ -117,8 +122,10 @@ fn command(image: &QemuImage, qmp_socket: &Path, firmware_vars: Option<&Path>) -
         .arg(format!("unix:{},server=on,wait=off", qmp_socket.display()));
 
     if let Some(firmware_vars) = firmware_vars {
-        let firmware_code = option_env!("TMACHINE_FIRMWARE_CODE")
-            .expect("TMACHINE_FIRMWARE_CODE must be set for ARM builds");
+        let firmware_code = firmware_path(
+            "TMACHINE_FIRMWARE_CODE",
+            option_env!("TMACHINE_FIRMWARE_CODE"),
+        );
         command
             .arg("-drive")
             .arg(format!(
@@ -154,11 +161,23 @@ fn command(image: &QemuImage, qmp_socket: &Path, firmware_vars: Option<&Path>) -
     command
 }
 
+/// A firmware path from the runtime environment, falling back to the value
+/// compiled in. The fallback lets library users built outside Nix (such as
+/// the test runner) supply firmware at runtime.
+fn firmware_path(name: &str, compiled: Option<&'static str>) -> String {
+    std::env::var(name)
+        .ok()
+        .or_else(|| compiled.map(str::to_string))
+        .unwrap_or_else(|| panic!("{name} must be set for ARM builds"))
+}
+
 fn prepare_firmware(runtime_dir: &Path) -> Option<PathBuf> {
     #[cfg(target_arch = "aarch64")]
     {
-        let template = option_env!("TMACHINE_FIRMWARE_VARS")
-            .expect("TMACHINE_FIRMWARE_VARS must be set for ARM builds");
+        let template = firmware_path(
+            "TMACHINE_FIRMWARE_VARS",
+            option_env!("TMACHINE_FIRMWARE_VARS"),
+        );
         let firmware_vars = runtime_dir.join("firmware-vars.fd");
         fs::copy(template, &firmware_vars).unwrap();
         fs::set_permissions(&firmware_vars, fs::Permissions::from_mode(0o600)).unwrap();

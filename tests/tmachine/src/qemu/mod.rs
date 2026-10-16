@@ -5,10 +5,12 @@ mod ansible_hash;
 mod img;
 mod install;
 mod layer;
+mod session;
 mod setup;
 mod test;
 mod vm;
 
 pub use install::install;
+pub use session::Session;
 pub use setup::setup;
 pub use test::test;

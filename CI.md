@@ -156,6 +156,17 @@ retain the binary installer because their fixtures configure its system service,
 local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
 to the package installers and downloads the packages selected by its matrix.
 
+The conformance lanes (`conformance-integration`) run the e2e suites through
+`e2e-suites.yml` on the same prepared inputs. Each matrix entry pairs a plan
+from `tests/plans/`, which selects the suites and environments, with a runner,
+and optionally narrows it to one environment so environments run as parallel
+jobs. The test runner builds the suites for the guest itself, and each entry
+uploads JUnit reports and failure diagnostics as
+`e2e-results-<plan>-<environment>`. Branch E2E, Release Dev, and Release
+Qualification run the `cpu-tests` plan on the five amd64 environments: Ubuntu
+with Docker (deb), K3s and HA K3s, and Fedora with rootful and rootless Podman
+(rpm).
+
 Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the Docker, rootless Podman, Kubernetes, and VM E2E suites
@@ -554,6 +565,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
 | `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
+| `.github/workflows/e2e-suites.yml` | Reusable matrix job that runs the e2e suites selected by plans in `tests/plans/` on the given runners, optionally one environment per job, and uploads `e2e-results-<plan>-<environment or runner>`. Used by the conformance lanes. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |

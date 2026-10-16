@@ -16,7 +16,14 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
+tests/suites/          # End-to-end suites, run by test plans
+tests/testkit/         # Shared support for the suites
+tests/runner/          # Test plan runner, with tests/{plans,environments}
+tests/tmachine/        # VM environments, provisioned with tests/ansible
 ```
+
+New end-to-end tests go under `tests/`. The suites in `e2e/` are being
+migrated there; `e2e/` only takes fixes until it is empty.
 
 ## Rust Tests
 
@@ -47,6 +54,17 @@ mise run test:rust     # cargo test --workspace
 ```
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
+
+Workspaces that build root crates through path dependencies keep their own
+lockfiles, which `--locked` does not compare with the root's. The check also
+requires the workspaces listed in
+`tasks/scripts/check_cargo_lockfile_alignment.py` to lock shared crates at the
+root's versions. If it fails, re-lock them from the root lockfile and commit the
+result:
+
+```shell
+uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix
+```
 
 ### PostgreSQL-backed tests
 
@@ -386,6 +404,137 @@ Secrets and Vault storage backends one at a time:
 ```shell
 mise run e2e:kubernetes:credential-drivers
 ```
+
+### Test plans (`tests/plans/`)
+
+A test plan selects suites and the environments to run them in. The runner
+(`tests/runner`) builds each family's suites for the guest, boots each
+environment in a tmachine VM, runs the suites inside it, and copies the
+results back:
+
+```shell
+nix run .#build-artifacts
+nix run .#test-runner -- test --plan tests/plans/cpu-tests.yaml
+```
+
+```yaml
+matrix:
+  - type: conformance              # family: a workspace under tests/suites/
+    suites: [sandbox-lifecycle]    # omit to run every suite in the family
+    environments: [tmachine.ubuntu2404-arm64.docker-rootful.deb]
+```
+
+Add `--dry-run` to print the resolved jobs and nextest filtersets without
+building or booting anything, `--env` or `--suite` to narrow a plan, and
+`--keep` to leave each VM running after its tests. Results, including JUnit
+reports and gateway logs for failures, go to
+`artifacts/test-results/<plan>/<environment>/<family>/`.
+
+Before running an environment's suites, the runner waits up to five minutes for
+its gateway to report healthy and for the environment's CLI to reach it
+(`testkit-ready`, shipped in each bundle). Failing either is reported as an
+environment error, not as test failures.
+
+Environments are defined in `tests/environments/*.yaml`. tmachine boots guests
+of the host's architecture only, so the runner reports environments for other
+architectures as unsupported instead of failing.
+
+Nobody lists which tests run where. A test is expected in every environment
+whose capabilities include everything the test `requires`; plans only choose
+which of those to run. To see where each test runs, or why it doesn't, run:
+
+```shell
+nix run .#test-runner -- matrix          # add --host to apply this machine's limits
+```
+
+`matrix` and `test` fail if a test runs in no defined environment, or if tests
+require a capability that no environment declares. When you add a capability,
+declare it in every environment that provides it in the same change. If you
+are unsure whether an environment provides it, declare it: a wrong claim shows
+up as a test failure, while a wrong omission silently drops coverage.
+
+To skip a test where it fails because of a known bug, add a waiver to
+`tests/waivers.yaml` with the test's ID, an environment selector, the issue
+tracking the bug, and a reason:
+
+```yaml
+waivers:
+  - test: t-3tfdx240
+    environments: { runtime: podman-rootless }   # fields of the environment; omit for all
+    issue: https://github.com/NVIDIA/OpenShell/issues/NNNN
+    reason: what fails, and where
+```
+
+Waived tests are skipped in every plan and listed in the run summary. Run with
+`--ignore-waivers` to check whether a fix landed, and remove the waiver when
+it has. Use waivers only for bugs: a feature an environment lacks is a missing
+capability, and running less on a given occasion is a choice of plan.
+
+Conformance suites (`tests/suites/conformance/`) are black-box tests of the
+public client interfaces: the gateway API through the Rust SDK, and the
+`openshell` CLI the environment installed. The suites are `sandbox-lifecycle`,
+`file-transfer`, and `policy-advisor`. Each suite is one test binary of
+`#[testkit::test]` functions. `testkit` (`tests/testkit/`) is the support
+library shared by every family: it reads the target, connects to the gateway,
+creates and cleans up sandboxes, and provides the attribute. The runner parses
+tests with the same `testkit-spec` crate as the attribute.
+
+```rust
+/// A long-running sandbox becomes ready, runs a command with exec, and is gone
+/// from get and list after delete.
+#[testkit::test(id = "t-3tfdx240")]
+async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
+    // ...
+}
+```
+
+Every test needs a stable `id`: `t-` followed by eight random lowercase letters
+or digits. Results, waivers, and coverage records refer to tests by this ID, so
+never change or reuse it, including when you rename the test or move it to
+another suite or family. Omit `id` when you write a new test; the compile error
+suggests a fresh one. IDs must be unique across all families, which the runner
+checks, and the runner adds each test's ID to its JUnit test case as the
+`test_id` property.
+
+A conformance test asserts only what the public contract promises: the
+comments in `proto/` and the published docs, such as the sandbox lifecycle in
+`docs/how-it-works/sandboxes/overview.mdx`. Do not encode current gateway
+behavior the contract doesn't state; file an issue to document it instead.
+Assert on a sandbox's `phase` and `exit_code` rather than condition reasons,
+which the API leaves to the platform. Check that something did not happen
+(for example, `restart_count` is 0 and a second read shows the same phase)
+instead of sleeping and watching. Behavior the docs leave to the compute
+driver needs a capability in `requires`.
+
+Act through the interface that makes the promise. Upload, download, connect,
+and port forwarding exist only in the CLI, so those tests call `cx.cli([...])`
+and assert through the SDK where they can; rely on the CLI's exit code and
+`--output json`, not its table text. For API calls the SDK does not wrap yet,
+such as settings and draft policy, add a testkit helper over the generated gRPC
+client rather than calling it from tests.
+
+Every environment provides its CLI: the installer's `openshell_client` role
+writes a `cli:` section (binary and gateway name) next to `gateway:` in the
+target, and `testkit-ready` checks that `openshell status` reports the gateway
+connected. The CLI is part of the target, not a capability, so CLI-driven tests
+run everywhere.
+
+The function name is the nextest test name and is what nextest filters
+select. Rename it when a clearer name helps; the ID keeps the history.
+The doc comment is the required description. Declare capabilities a test needs with
+`#[testkit::test(requires = [service_exposure])]`; the runner excludes the test
+in environments without them and reports it as unsupported. Tests read the
+system under test from the target file named by `OPENSHELL_TEST_TARGET`, so you
+can also run a suite directly against a gateway you already have:
+
+```shell
+OPENSHELL_TEST_TARGET=target.yaml cargo nextest run \
+  --manifest-path tests/suites/conformance/Cargo.toml \
+  -p openshell-conformance-sandbox-lifecycle
+```
+
+`cargo run --manifest-path tests/runner/Cargo.toml --bin openshell-test -- catalog`
+prints every suite and test with its description and requirements.
 
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
 

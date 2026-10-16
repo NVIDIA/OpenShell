@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+environments:
+  - id: tmachine.fedora44-amd64.podman-rootful.rpm
+    backend: tmachine
+    machine: { os: fedora, version: "44", arch: amd64 }
+    runtime: podman-rootful
+    installer: rpm
+    tmachine: { environment: fedora-podman-rootful, installer: rpm }
+    capabilities: { compute_driver: podman, rootless: false, gpu: false, persistent_workspace: true }
+  - id: tmachine.fedora44-arm64.podman-rootful.rpm
+    backend: tmachine
+    machine: { os: fedora, version: "44", arch: arm64 }
+    runtime: podman-rootful
+    installer: rpm
+    tmachine: { environment: fedora-podman-rootful, installer: rpm }
+    capabilities: { compute_driver: podman, rootless: false, gpu: false, persistent_workspace: true }
+  - id: tmachine.fedora44-amd64.podman-rootless.rpm
+    backend: tmachine
+    machine: { os: fedora, version: "44", arch: amd64 }
+    runtime: podman-rootless
+    installer: rpm
+    tmachine: { environment: fedora-podman-rootless, installer: rpm }
+    capabilities: { compute_driver: podman, rootless: true, gpu: false, persistent_workspace: true }
+  - id: tmachine.fedora44-arm64.podman-rootless.rpm
+    backend: tmachine
+    machine: { os: fedora, version: "44", arch: arm64 }
+    runtime: podman-rootless
+    installer: rpm
+    tmachine: { environment: fedora-podman-rootless, installer: rpm }
+    capabilities: { compute_driver: podman, rootless: true, gpu: false, persistent_workspace: true }

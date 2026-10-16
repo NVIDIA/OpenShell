@@ -58,6 +58,7 @@ let
         mkdir -p "$(dirname "$output")"
         cd "$root"
         cargo nextest archive \
+          --locked \
           --manifest-path "$manifest_path" \
           --target ${target} \
           -p ${package} \

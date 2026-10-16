@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Docker-backed environments. The ID must equal
+# <backend>.<os><version without dots>-<arch>.<runtime>.<installer>.
+environments:
+  - id: tmachine.ubuntu2404-amd64.docker-rootful.deb
+    backend: tmachine
+    machine: { os: ubuntu, version: "24.04", arch: amd64 }
+    runtime: docker-rootful
+    installer: deb
+    tmachine: { environment: ubuntu-docker-rootful, installer: deb }
+    capabilities: { compute_driver: docker, rootless: false, gpu: false, persistent_workspace: true }
+  - id: tmachine.ubuntu2404-arm64.docker-rootful.deb
+    backend: tmachine
+    machine: { os: ubuntu, version: "24.04", arch: arm64 }
+    runtime: docker-rootful
+    installer: deb
+    tmachine: { environment: ubuntu-docker-rootful, installer: deb }
+    capabilities: { compute_driver: docker, rootless: false, gpu: false, persistent_workspace: true }
