@@ -240,10 +240,7 @@ run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:kubernetes"]
 description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
-# The reusable CI workflow exports an empty feature input by default. Restore
-# the normal Rust suite here, not in the runner: the external-driver task
-# intentionally passes an empty feature set for conformance-only coverage.
-run = 'OPENSHELL_E2E_KUBERNETES_FEATURES="${OPENSHELL_E2E_KUBERNETES_FEATURES:-e2e,e2e-host-gateway,e2e-kubernetes}" e2e/rust/e2e-kubernetes.sh'
+run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:v1alpha1"]
 description = "Run Kubernetes e2e against Agent Sandbox v1alpha1"
