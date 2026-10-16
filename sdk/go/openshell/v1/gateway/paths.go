@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode"
 )
 
 const (
@@ -91,32 +90,21 @@ func resolveGatewayDir(name string) (string, ConfigSource, error) {
 	return "", "", fmt.Errorf("%w: %q", ErrGatewayNotFound, name)
 }
 
-// validateGatewayName checks that a gateway name is safe for use as a
-// directory component. It rejects:
-//   - empty names
-//   - names containing path separators (/ or \)
-//   - names that are "." or ".." (directory traversal)
-//   - names containing "." (prevents hidden files and extension confusion)
-//   - names with characters outside ASCII alphanumerics, dashes, underscores
+// validateGatewayName accepts a single safe path component,
+// matching the Rust CLI's gateway-name rules.
 func validateGatewayName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: name must not be empty", ErrInvalidGatewayName)
 	}
-
-	if strings.ContainsAny(name, "/\\") {
+	if name == "." || name == ".." {
+		return fmt.Errorf("%w: invalid path component", ErrInvalidGatewayName)
+	}
+	if strings.ContainsAny(name, `/\`) {
 		return fmt.Errorf("%w: name must not contain path separators", ErrInvalidGatewayName)
 	}
-
-	if strings.Contains(name, ".") {
-		return fmt.Errorf("%w: name must not contain dots", ErrInvalidGatewayName)
+	if strings.ContainsRune(name, '\x00') {
+		return fmt.Errorf("%w: name must not contain NUL", ErrInvalidGatewayName)
 	}
-
-	for _, r := range name {
-		if !isValidNameRune(r) {
-			return fmt.Errorf("%w: name contains invalid character %q", ErrInvalidGatewayName, string(r))
-		}
-	}
-
 	return nil
 }
 
@@ -166,16 +154,4 @@ func listGatewayDirs(base string) ([]string, error) {
 		}
 	}
 	return names, nil
-}
-
-// isValidNameRune returns true if the rune is an ASCII letter, digit,
-// dash, or underscore.
-func isValidNameRune(r rune) bool {
-	if r > unicode.MaxASCII {
-		return false
-	}
-	return (r >= 'a' && r <= 'z') ||
-		(r >= 'A' && r <= 'Z') ||
-		(r >= '0' && r <= '9') ||
-		r == '-' || r == '_'
 }
