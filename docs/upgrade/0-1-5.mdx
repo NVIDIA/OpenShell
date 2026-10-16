@@ -1,0 +1,18 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Upgrade to NVIDIA OpenShell 0.1.5"
+sidebar-title: "0.1.5"
+description: "Prepare OpenShell operators and users for the changes in version 0.1.5."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Upgrade, Migration"
+---
+
+Review the changes that apply to your role before upgrading from 0.1.4. The [0.1.0 upgrade guide](/upgrade/0-1-0) covers upgrades from 0.0.x.
+
+## Operators
+
+- **Allowlist sandbox template pod annotations and labels.** The Kubernetes driver rejects sandbox template annotations and labels unless their keys are listed in `allowed_pod_annotations` or `allowed_pod_labels`. Both lists are empty by default. If API or SDK clients set `SandboxTemplate.annotations` or `SandboxTemplate.labels`, add those keys before upgrading. See [Kubernetes Driver](/how-it-works/sandboxes/runtimes#kubernetes-driver) and [PR #4497](https://github.com/NVIDIA/OpenShell/pull/4497).
+
+## End users
+
+- **Expect rejected template metadata on Kubernetes.** Sandbox creation fails with `InvalidArgument` when a template sets an annotation or label key that the gateway does not allow. The error lists the rejected keys. Ask your gateway administrator to allow the keys you need. The `openshell` CLI does not set template annotations or labels ([PR #4497](https://github.com/NVIDIA/OpenShell/pull/4497)).
