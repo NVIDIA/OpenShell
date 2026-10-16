@@ -1234,6 +1234,12 @@ helm_extra_args=()
 helm_post_renderer_args=()
 helm_extra_args+=(--set "server.telemetryEnabled=${OPENSHELL_TELEMETRY_ENABLED}")
 helm_extra_args+=(--set supervisor.sandboxRuntime.networkPolicyEnforced=true)
+# This wrapper installs an isolated, uniformly built test gateway, not a
+# production rolling upgrade. Explicitly activate the image-update scenario;
+# callers can keep activation disabled for negative coverage.
+if [ "${OPENSHELL_E2E_KUBE_IMAGE_UPDATES:-1}" = "1" ]; then
+  helm_extra_args+=(--set 'gatewayConfig.openshell\.gateway.enable_sandbox_image_updates=true')
+fi
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" != "1" ]; then
     echo "ERROR: external Kubernetes driver e2e requires OPENSHELL_E2E_KUBE_BUILD_IMAGES=1." >&2

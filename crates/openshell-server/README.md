@@ -18,6 +18,19 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Optional in-process image updates
+
+`SharedComputeDriver` retains the generated baseline compute-driver trait, and
+`ComputeDriverInstance` retains its existing variants. Existing compiled drivers
+and factories need no new trait implementation or registration method.
+
+A supporting factory overrides `ComputeDriverFactory::build_with_image_updates`
+to return its ordinary instance plus a separately registered image updater. The
+default calls the existing `build` method and returns no updater. The gateway
+requires both this opt-in and the negotiated capability before recording image
+intent. Remote drivers register the separate `ComputeDriverImageUpdates` service
+on their existing endpoint instead.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

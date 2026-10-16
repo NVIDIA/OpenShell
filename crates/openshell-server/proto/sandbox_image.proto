@@ -1,0 +1,25 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+syntax = "proto3";
+
+// A new private format; frozen openshell.storage.v1 remains unchanged.
+package openshell.storage.image.v1;
+import "openshell.proto";
+
+// Gateway-private image mutation state. Never embed this in public SandboxStatus:
+// older gateways may rewrite public protobufs without retaining unknown fields.
+message StoredSandboxImageUpdate {
+  string operation_id = 1;
+  string previous_image = 2;
+  string image = 3;
+  uint64 revision = 4;
+}
+
+message StoredSandboxImageState {
+  string sandbox_id = 1;
+  uint64 revision = 2;
+  StoredSandboxImageUpdate pending = 3;
+  // Original presence and attempt identity while the interlock is held.
+  // Completion preserves newer diagnostics and clock edits on the live record.
+  openshell.v1.SandboxProvisioning previous_provisioning = 4;
+}

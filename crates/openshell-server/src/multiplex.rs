@@ -18,6 +18,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::proto::sandbox_updates_server::SandboxUpdatesServer;
 use openshell_core::{
     Config,
     proto::{Provider, UpdateProviderRequest},
@@ -289,6 +290,13 @@ impl MultiplexService {
             Some(self.state.clone()),
         );
         let reflection = self.state.reflection_service.clone();
+        let sandbox_updates = SandboxUpdatesServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let sandbox_updates = GatewayInterceptorGrpcService::new(
+            sandbox_updates,
+            self.state.gateway_interceptors.clone(),
+            Some(self.state.clone()),
+        );
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
@@ -296,7 +304,7 @@ impl MultiplexService {
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
-            GrpcRouter::new(openshell, reflection),
+            GrpcRouter::new(openshell, reflection).with_sandbox_updates(sandbox_updates),
             authenticator_chain,
             authz_policy,
             self.state
@@ -912,11 +920,12 @@ where
     }
 }
 
-/// Combined gRPC service that routes between `OpenShell` and reflection.
+/// Combined gRPC service for public gateway services and reflection.
 #[derive(Clone)]
-pub struct GrpcRouter<N, R> {
+pub struct GrpcRouter<N, R, U = N> {
     openshell: N,
     reflection: R,
+    sandbox_updates: Option<U>,
 }
 
 impl<N, R> GrpcRouter<N, R> {
@@ -924,13 +933,22 @@ impl<N, R> GrpcRouter<N, R> {
         Self {
             openshell,
             reflection,
+            sandbox_updates: None,
+        }
+    }
+
+    fn with_sandbox_updates<U>(self, sandbox_updates: U) -> GrpcRouter<N, R, U> {
+        GrpcRouter {
+            openshell: self.openshell,
+            reflection: self.reflection,
+            sandbox_updates: Some(sandbox_updates),
         }
     }
 }
 
 pub const REFLECTION_PATH_PREFIX: &str = "/grpc.reflection.v1.";
 
-impl<N, R, B> tower::Service<Request<B>> for GrpcRouter<N, R>
+impl<N, R, U, B> tower::Service<Request<B>> for GrpcRouter<N, R, U>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -941,6 +959,11 @@ where
         + Send
         + 'static,
     R::Future: Send,
+    U: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    U::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -954,6 +977,13 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         if req.uri().path().starts_with(REFLECTION_PATH_PREFIX) {
             let mut svc = self.reflection.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if req
+            .uri()
+            .path()
+            .starts_with("/openshell.v1.SandboxUpdates/")
+            && let Some(mut svc) = self.sandbox_updates.clone()
+        {
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
             let mut svc = self.openshell.clone();
@@ -2678,6 +2708,13 @@ mod tests {
             otel_span_name(&http::Method::POST, "/openshell.v1.OpenShell/CreateSandbox"),
             "openshell.v1.OpenShell/CreateSandbox"
         );
+        assert_eq!(
+            otel_span_name(
+                &http::Method::POST,
+                "/openshell.v1.SandboxUpdates/UpdateSandbox"
+            ),
+            "openshell.v1.SandboxUpdates/UpdateSandbox"
+        );
     }
 
     /// Non-RPC paths use a low-cardinality method-only name because sandbox
@@ -2747,10 +2784,12 @@ mod tests {
             name,
             calls: calls.clone(),
         };
-        let mut router = GrpcRouter::new(service("openshell"), service("reflection"));
+        let mut router = GrpcRouter::new(service("openshell"), service("reflection"))
+            .with_sandbox_updates(service("sandbox_updates"));
 
         for path in [
             "/openshell.v1.OpenShell/Health",
+            "/openshell.v1.SandboxUpdates/UpdateSandbox",
             "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo",
         ] {
             router
@@ -2764,7 +2803,10 @@ mod tests {
                 .unwrap();
         }
 
-        assert_eq!(*calls.lock().unwrap(), vec!["openshell", "reflection"]);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["openshell", "sandbox_updates", "reflection"]
+        );
     }
 
     #[tokio::test]
@@ -2856,7 +2898,10 @@ mod tests {
             .collect();
         names.sort();
 
-        assert_eq!(names, vec!["openshell.v1.OpenShell"]);
+        assert_eq!(
+            names,
+            vec!["openshell.v1.OpenShell", "openshell.v1.SandboxUpdates"]
+        );
 
         let descriptor_response = responses.message().await.unwrap().unwrap();
         let Some(MessageResponse::FileDescriptorResponse(response)) =
@@ -2875,6 +2920,11 @@ mod tests {
                 .get_service_by_name("openshell.v1.OpenShell")
                 .is_some(),
             "a fresh descriptor pool must resolve the advertised service"
+        );
+        assert!(
+            reflected_pool
+                .get_service_by_name("openshell.v1.SandboxUpdates")
+                .is_some()
         );
         assert!(
             reflected_pool

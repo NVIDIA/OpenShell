@@ -65,6 +65,19 @@ service ComputeDriver {
   rpc DeleteWorkspace(DeleteWorkspaceRequest) returns (DeleteWorkspaceResponse);
 }
 
+// Optional image-update extension, served on the same endpoint as ComputeDriver.
+// Keeping this separate preserves the baseline generated server trait for
+// independently versioned external drivers. Drivers advertise
+// openshell.compute.update-sandbox-image only when they serve this service;
+// gateways must negotiate that capability before calling it.
+service ComputeDriverImageUpdates {
+  // Idempotently replace only the workload image of a stopped sandbox, retaining
+  // its stable resource and storage. Unsupported drivers omit this service and
+  // return UNIMPLEMENTED without changing any resource.
+  rpc UpdateSandboxImage(UpdateSandboxImageRequest)
+      returns (UpdateSandboxImageResponse);
+}
+
 message GetCapabilitiesRequest {
   // Gateway protocol metadata. Drivers must reject unmet requirements.
   openshell.extension.v1.PeerMetadata gateway = 1;
@@ -431,6 +444,27 @@ message CreateSandboxResponse {
   // Required when the driver advertises sandbox authentication support.
   string runtime_identity = 1;
 }
+
+message UpdateSandboxImageRequest {
+  string sandbox_id = 1;
+  string name = 2;
+  string image = 3;
+  // Pre-update image. A different current image conflicts unless durable driver
+  // evidence identifies this exact operation as already applied.
+  string expected_image = 4;
+  // Never adopt a same-name replacement resource.
+  string expected_runtime_identity = 5;
+  // Stable UUID across retries, recorded atomically with the image change.
+  string operation_id = 6;
+  // Perform all admission and state checks without writing any resource. The
+  // gateway uses this before recording durable intent; apply rechecks them.
+  bool validate_only = 7;
+  // Monotonic sandbox image revision. The driver atomically records it with
+  // the image and rejects earlier revisions even if expected_image matches.
+  uint64 revision = 8;
+}
+
+message UpdateSandboxImageResponse {}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

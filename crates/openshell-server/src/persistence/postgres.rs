@@ -20,13 +20,22 @@ use openshell_core::SetResourceVersion;
 use openshell_core::proto::Sandbox;
 use prost::Message;
 use sqlx::pool::PoolConnection;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
+
+/// A protocol capability, not an exact build version or an authorization
+/// credential. Identify every pool connection, including after reconnect.
+async fn identify_image_update_writer(connection: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT set_config('application_name', 'openshell-image-update-v1', false)")
+        .execute(connection)
+        .await?;
+    Ok(())
+}
 
 #[cfg(test)]
 pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
@@ -40,7 +49,7 @@ use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE}
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {
-    pool: PgPool,
+    pub(super) pool: PgPool,
     /// Dedicated connections for session-level mutation advisory locks.
     lock_pool: PgPool,
     /// How acquisitions and guards use the lock pool's connections.
@@ -304,6 +313,7 @@ impl PostgresStore {
         );
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
+            .after_connect(|connection, _| Box::pin(identify_image_update_writer(connection)))
             .connect(url)
             .await
             .map_err(|e| map_db_error(&e))?;
@@ -320,6 +330,7 @@ impl PostgresStore {
                         .bind(MUTATION_LOCK_TIMEOUT_SETTING)
                         .execute(&mut *connection)
                         .await?;
+                    identify_image_update_writer(connection).await?;
                     Ok(())
                 })
             })

@@ -102,6 +102,9 @@ struct AuthorizationBarrier {
 pub(super) trait Mutation: Message + Default + Send + Sync + 'static {
     type Output: Send + 'static;
     const METHOD: &'static str;
+    /// Preserve legacy replay keys while allowing independent services to use
+    /// fully qualified identities for newly introduced methods.
+    const REPLAY_METHOD: &'static str = Self::METHOD;
     const PROTECTED: bool = false;
     // Streaming producers, not returned stream handles, confirm completion.
     const DEFERRED: bool = false;
@@ -215,7 +218,7 @@ pub(super) async fn run<M: Mutation>(
     let bucket = format!("_mutation/{caller}");
     let key = hash_json(&serde_json::json!([
         caller,
-        M::METHOD,
+        M::REPLAY_METHOD,
         scope.name,
         request_id
     ]))?;

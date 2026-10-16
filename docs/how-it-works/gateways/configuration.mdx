@@ -163,6 +163,9 @@ metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
 
+# Activate only after retiring incompatible gateways and outstanding driver work.
+enable_sandbox_image_updates = false
+
 # Connection ceiling for the gateway's database pool. Omit to use the backend
 # default: 10 for Postgres, 5 for on-disk SQLite.
 database_max_connections = 10
@@ -335,6 +338,41 @@ The gateway rejects partial or invalid signing bundles at startup, including pri
 External compute drivers declare this requirement by adding `openshell.compute.launch-authentication` to their extension metadata's `required_capabilities`. This requires a gateway that understands the launch-signing preflight and supplies `SandboxLaunchAuthentication` on creation. Drivers that use another launch mechanism can omit the requirement. The separate `supports_sandbox_authentication` capability describes the `AuthenticateSandbox` RPC and does not require launch signing.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
+
+## Sandbox Image Updates
+
+`[openshell.gateway] enable_sandbox_image_updates` defaults to `false`. It gates
+the separate `openshell.v1.SandboxUpdates/UpdateSandbox` RPC on the existing
+gateway listener. The equivalent gateway process flag and environment variable
+are `--enable-sandbox-image-updates true` and
+`OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES=true`.
+
+Enable it only after completing the
+[activation checklist](/kubernetes/high-availability#activate-sandbox-image-updates).
+Setting it to `true` attests that every gateway that can write the database is
+compatible and incompatible gateways cannot return. Keep it false throughout a
+rolling upgrade, including while outstanding operations from retired gateways
+settle. Database and membership checks fail closed but do not prove retirement.
+
+For a schema-v2 file, set:
+
+```toml
+[openshell.gateway]
+enable_sandbox_image_updates = true
+```
+
+The canonical Helm values form uses a dotted table key:
+
+```yaml
+gatewayConfig:
+  "openshell.gateway":
+    enable_sandbox_image_updates: true
+```
+
+This is not an automatic mixed-version migration switch. Do not downgrade while
+an image update is pending or retained sandboxes require the private image
+revision protocol. SQLite supports one gateway process only; activation attests
+that the previous process has stopped, not that sharing a SQLite file enables HA.
 
 ## Database Pool
 
@@ -1458,7 +1496,7 @@ compute_driver = "kyma"
 socket_path = "/run/openshell/kyma-compute-driver.sock"
 ```
 
-## Preflight package configuration {#gateway-config-preflight}
+<h2 id="gateway-config-preflight">Preflight package configuration</h2>
 
 Before starting a package-managed gateway, validate the selected file without
 changing it:

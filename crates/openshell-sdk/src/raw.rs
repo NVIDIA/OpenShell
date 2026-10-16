@@ -20,6 +20,7 @@
 
 pub use openshell_core::proto;
 pub use openshell_core::proto::open_shell_client::OpenShellClient as GrpcClient;
+pub use openshell_core::proto::sandbox_updates_client::SandboxUpdatesClient;
 pub use openshell_core::proto::{
     CreateSandboxRequest, CreateSandboxTemplateRequest, CreateWorkspaceRequest,
     DeleteSandboxRequest, DeleteSandboxTemplateRequest, DeleteWorkspaceRequest, ExecSandboxRequest,
@@ -32,11 +33,21 @@ pub use openshell_core::proto::{
     SandboxServiceLevel, SandboxSpec as ProtoSandboxSpec, SandboxStartup, SandboxTemplate,
     SandboxTemplateResponse, SandboxWorkloadConfig, SandboxWorkloadTemplate,
     SandboxWorkloadTemplateProvenance, SandboxWorkloadTemplateSpec,
-    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest, Workspace,
+    ServiceStatus as ProtoServiceStatus, StartSandboxRequest, StopSandboxRequest,
+    UpdateSandboxRequest, Workspace,
 };
 
 /// Type alias for the gRPC client wrapped in the SDK's auth interceptor.
 pub type AuthedGrpcClient = GrpcClient<
+    tonic::service::interceptor::InterceptedService<
+        tonic::transport::Channel,
+        crate::EdgeAuthInterceptor,
+    >,
+>;
+
+/// Sandbox-updates client using the same live auth slot and transport as the
+/// main service client.
+pub type AuthedSandboxUpdatesClient = SandboxUpdatesClient<
     tonic::service::interceptor::InterceptedService<
         tonic::transport::Channel,
         crate::EdgeAuthInterceptor,

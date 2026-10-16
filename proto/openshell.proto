@@ -823,6 +823,21 @@ service OpenShell {
   }
 }
 
+// Optional sandbox mutations are separate from OpenShell so existing generated
+// OpenShell server implementations remain source-compatible.
+service SandboxUpdates {
+  // Update only the workload image of a stopped sandbox without deleting its
+  // identity or retained storage. Requires compute-driver image-update support
+  // and explicit gateway activation of sandbox image updates.
+  rpc UpdateSandbox(UpdateSandboxRequest) returns (SandboxResponse) {
+    option (openshell.options.v1.authorization) = {
+      auth_mode: "bearer"
+      scope: "sandbox:write"
+      workspace_role: "user"
+    };
+  }
+}
+
 // IssueSandboxToken request. Empty body; identity is established by the
 // authentication credentials carried in the request headers (a projected
 // Kubernetes ServiceAccount JWT in the K8s driver path).
@@ -1287,6 +1302,22 @@ message CreateSandboxRequest {
   // registered after the sandbox has been persisted and route only while the
   // sandbox is ready.
   repeated SandboxServiceExposure service_exposures = 9;
+}
+
+// Image-only update. Other create-time configuration is not mutable through
+// this RPC. Stop before updating; start explicitly after a successful update.
+message UpdateSandboxRequest {
+  // Workspace scope. Only a named workspace selection is accepted.
+  openshell.datamodel.v1.WorkspaceSelector workspace_scope = 1;
+  // Canonical name of the existing sandbox; this is not a rename or upsert.
+  string name = 2;
+  // Nonempty OCI workload image reference. This does not change trusted runtime
+  // images or reseed an existing workspace.
+  string image = 3;
+  // Required nonzero resource version read by the caller.
+  uint64 expected_resource_version = 4;
+  // Optional nonzero UUID for durable at-most-once admission.
+  string request_id = 5;
 }
 
 message CreateSandboxTemplateRequest {

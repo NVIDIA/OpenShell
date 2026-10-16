@@ -4433,6 +4433,7 @@ dependencies = [
  "prost-types",
  "rand 0.9.4",
  "rcgen",
+ "regex",
  "serde",
  "serde_json",
  "temp-env",

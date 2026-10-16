@@ -29,7 +29,7 @@ e2e-local-container-driver = ["e2e"]
 e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
-e2e-kubernetes = ["e2e"]
+e2e-kubernetes = ["e2e", "dep:openshell-bootstrap", "dep:openshell-sdk"]
 e2e-kubernetes-ha = ["e2e-kubernetes"]
 e2e-kubernetes-credential-drivers = ["e2e-kubernetes"]
 e2e-kubernetes-workspace-managed = ["e2e-kubernetes"]
@@ -170,6 +170,11 @@ path = "tests/kubernetes_runtime_reconcile.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "kubernetes_image_update"
+path = "tests/kubernetes_image_update.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "credential_drivers"
 path = "tests/credential_drivers.rs"
 required-features = ["e2e-kubernetes-credential-drivers"]
@@ -240,6 +245,8 @@ path = "tests/gpu.rs"
 required-features = ["e2e-gpu"]
 
 [dependencies]
+openshell-bootstrap = { path = "../../crates/openshell-bootstrap", optional = true }
+openshell-sdk = { path = "../../crates/openshell-sdk", optional = true }
 base64 = "0.22"
 bollard = "0.20"
 bytes = "1"

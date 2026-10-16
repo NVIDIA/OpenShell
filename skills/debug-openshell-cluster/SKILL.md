@@ -1139,6 +1139,46 @@ network supervisor logs for CONNECT and upstream-proxy decisions:
 kubectl -n <sandbox-namespace> logs pod/<supervisor-pod> --tail=200 | grep -Ei 'upstream|connect|proxy'
 ```
 
+#### Sandbox image-update activation and recovery
+
+`openshell.v1.SandboxUpdates/UpdateSandbox` uses the existing authenticated
+gateway listener and defaults to disabled. Check the effective
+`[openshell.gateway] enable_sandbox_image_updates` value and its overrides,
+`--enable-sandbox-image-updates true` or
+`OPENSHELL_ENABLE_SANDBOX_IMAGE_UPDATES=true`. Canonical Helm values use:
+
+```yaml
+gatewayConfig:
+  "openshell.gateway":
+    enable_sandbox_image_updates: true
+```
+
+Do not enable the flag to work around an error. It attests that all incompatible
+gateways, including unregistered processes and Jobs, have been drained and
+retired, their outstanding driver operations have settled, and old binaries
+cannot return through rollout or rollback configurations. Keep it false during
+a rolling upgrade. SQLite supports one gateway process, not shared-file HA.
+
+On PostgreSQL, an unmarked client backend in the same database blocks updates,
+including an administrative session. The new binary sets every pool
+connection's `application_name` to `openshell-image-update-v1`; close unmarked
+sessions or use a dedicated database, rather than relabeling old clients. Live
+gateway membership must advertise image-update protocol 1; malformed or
+truncated membership reads fail closed. Neither these observations nor an
+expired membership TTL proves old gateways and their work have stopped. Follow
+the published
+[activation checklist](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability#activate-sandbox-image-updates),
+and do not downgrade while updates are pending or retained sandboxes require
+the private revision protocol.
+
+For an operation-pending error, use the original requested image and a fresh
+sandbox resource version to reconcile through `SandboxUpdates`. Intent and
+revision are private, not new public status fields. Start, stop, provisioning
+retry, and delete do not bypass the barrier. Preserve request-admission semantics:
+never change the payload under an existing ID or blindly switch IDs after a
+timeout. See the published
+[recovery contract](https://docs.nvidia.com/openshell/latest/sdk/api-errors#sandbox-image-update-recovery).
+
 ### Step 7: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:

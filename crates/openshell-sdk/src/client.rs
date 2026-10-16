@@ -12,7 +12,7 @@ use crate::auth::{BearerSlot, EdgeAuthInterceptor, bearer_metadata};
 use crate::config::{AuthConfig, ClientConfig};
 use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
-use crate::raw::AuthedGrpcClient;
+use crate::raw::{AuthedGrpcClient, AuthedSandboxUpdatesClient};
 use crate::refresh::{RefreshedToken, TokenSource};
 use crate::types::{
     DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
@@ -114,6 +114,23 @@ impl OpenShellClient {
     pub async fn raw_grpc_fresh(&self) -> Result<AuthedGrpcClient> {
         self.ensure_fresh().await?;
         Ok(self.raw_grpc())
+    }
+
+    /// Authenticated client for the optional `SandboxUpdates` service, sharing
+    /// this client's channel and live bearer slot. Like [`Self::raw_grpc`], this
+    /// does not refresh or retry OIDC credentials by itself.
+    pub fn raw_sandbox_updates(&self) -> AuthedSandboxUpdatesClient {
+        proto::sandbox_updates_client::SandboxUpdatesClient::with_interceptor(
+            self.channel.clone(),
+            self.interceptor.clone(),
+        )
+    }
+
+    /// Like [`Self::raw_sandbox_updates`], but refreshes the bearer token first
+    /// when needed. Reactive retry remains the raw caller's responsibility.
+    pub async fn raw_sandbox_updates_fresh(&self) -> Result<AuthedSandboxUpdatesClient> {
+        self.ensure_fresh().await?;
+        Ok(self.raw_sandbox_updates())
     }
 
     /// Force an OIDC refresh and write the new token into the live bearer

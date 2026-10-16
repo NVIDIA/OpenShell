@@ -43,6 +43,9 @@ fn member_object_id(replica_id: &str) -> String {
 struct MemberPayload {
     replica_id: String,
     peer_endpoint: String,
+    /// Binary capability, not feature activation. Missing denotes old replicas.
+    #[serde(default)]
+    image_update_protocol: u32,
 }
 
 /// A gateway replica that was alive as of its last refresh.
@@ -71,6 +74,7 @@ impl GatewayMemberIndex {
         let payload = MemberPayload {
             replica_id: replica_id.to_string(),
             peer_endpoint: peer_endpoint.to_string(),
+            image_update_protocol: 1,
         };
         let bytes = serde_json::to_vec(&payload)
             .map_err(|err| PersistenceError::Encode(err.to_string()))?;

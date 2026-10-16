@@ -41,6 +41,7 @@ thiserror = { workspace = true }
 miette = { workspace = true }
 notify = "8"
 rand = { workspace = true }
+regex = { workspace = true }
 rcgen = { workspace = true }
 
 [dev-dependencies]

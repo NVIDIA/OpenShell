@@ -65,6 +65,21 @@ configuration validation live in `openshell_core::middleware`. Policy admission
 and the supervisor runtime consume the same contract without introducing a
 dependency from the policy crate to the supervisor implementation.
 
+## Optional Compute Image Updates
+
+The generated `proto::compute::v1::compute_driver_server::ComputeDriver` trait
+retains its baseline methods and streaming associated type. External drivers
+that support image updates additionally serve `ComputeDriverImageUpdates` on
+the same endpoint and advertise `openshell.compute.update-sandbox-image`.
+Drivers without that capability need no new generated-trait method.
+
+Existing linked in-process drivers and factories need no new trait or hook.
+Only drivers opting into image updates implement
+`openshell_core::compute::ComputeDriver` and register that implementation through
+`ComputeDriverFactory::build_with_image_updates`. The default factory hook calls
+the existing `build` method without an updater. The gateway requires both this
+separate registration and the negotiated capability before invoking updates.
+
 ## Protobuf Struct Conversion
 
 Use `openshell_core::proto_struct` when crossing between `serde_json` values and

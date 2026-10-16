@@ -4814,6 +4814,9 @@ fn configure_main_exit_marker(command: &mut Command, state_dir: &Path) {
 }
 
 #[tonic::async_trait]
+impl openshell_core::compute::ComputeDriver for VmDriver {}
+
+#[tonic::async_trait]
 impl ComputeDriver for VmDriver {
     async fn authenticate_sandbox(
         &self,

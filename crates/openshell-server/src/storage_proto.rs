@@ -15,6 +15,11 @@
 
 include!(concat!(env!("OUT_DIR"), "/openshell.storage.v1.rs"));
 
+mod sandbox_image {
+    include!(concat!(env!("OUT_DIR"), "/openshell.storage.image.v1.rs"));
+}
+pub(crate) use sandbox_image::{StoredSandboxImageState, StoredSandboxImageUpdate};
+
 pub(crate) const STORAGE_FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/storage_descriptor.bin"));
 
@@ -154,10 +159,13 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Image updates add a separate public service/request and a new private
+    // image-state format. Existing public status and frozen storage.v1 stay
+    // unchanged; only the private durable closure grows.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "cc06b38c9ecb4c6518e0d4963f40c4f16f992483ce111c7b23cbcb729db946ea";
+        "bd5e8f61deb90301db8a6fdc93cb8d74d0c53093997113207c9e49fd5e479635";
     const DURABLE_SCHEMA_SHA256: &str =
-        "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
+        "7d37474cd3c516f109cc448249abd8a583d1e1b3d5a584e34394e394e639af14";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
         "ac1ffc4b5b81467de27270a4e33f6db1e31eeb2c52f79750dbaaf19515eadbb2";
     // Encoded with the schema that omitted stable_placeholder. Keep these
@@ -217,6 +225,7 @@ mod tests {
         ".openshell.storage.v1.StoredConfigUpdateOperation",
         ".openshell.storage.v1.StoredProviderCredentialRefreshStateV2",
         ".openshell.storage.v1.StoredProviderProfile",
+        ".openshell.storage.image.v1.StoredSandboxImageState",
         ".openshell.v1.Sandbox",
         ".openshell.v1.SandboxWorkloadTemplate",
         ".openshell.v1.ServiceEndpoint",
@@ -459,7 +468,12 @@ mod tests {
         let public = FileDescriptorSet::decode(openshell_core::FILE_DESCRIPTOR_SET)
             .expect("public descriptor set must decode");
         for file in public.file {
-            assert_ne!(file.package.as_deref(), Some("openshell.storage.v1"));
+            assert!(
+                !file
+                    .package
+                    .as_deref()
+                    .is_some_and(|package| package.starts_with("openshell.storage."))
+            );
             for message in file.message_type {
                 let name = message.name.expect("message name");
                 assert!(
@@ -555,7 +569,8 @@ mod tests {
                 }
                 if !matches!(
                     (package, service_name),
-                    ("openshell.v1", "OpenShell") | ("openshell.inference.v1", "Inference")
+                    ("openshell.v1", "OpenShell" | "SandboxUpdates")
+                        | ("openshell.inference.v1", "Inference")
                 ) {
                     continue;
                 }
@@ -603,7 +618,7 @@ mod tests {
         }
         assert_eq!(
             compiled_method_count,
-            103 + PROVIDER_READINESS_RPC_SIGNATURES.len()
+            105 + PROVIDER_READINESS_RPC_SIGNATURES.len()
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + isolation_methods.len()
                 + sandbox_protocol_methods.len(),
@@ -611,7 +626,7 @@ mod tests {
         );
         assert_eq!(
             methods.len(),
-            78 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
+            79 + PROVIDER_READINESS_RPC_SIGNATURES.len() + PEER_OWNER_RPC_SIGNATURES.len(),
             "inventory every public gateway RPC"
         );
         assert_eq!(
@@ -663,8 +678,8 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (314, 28),
-                (95, 22),
+                (315, 28),
+                (97, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,
                 DURABLE_SCHEMA_SHA256,
