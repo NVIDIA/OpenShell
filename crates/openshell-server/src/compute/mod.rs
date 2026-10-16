@@ -2061,24 +2061,16 @@ impl ComputeRuntime {
             }
 
             let previous = current.clone();
-            let next_identity = if authority.is_some()
-                && matches!(phase, SandboxPhase::Stopped | SandboxPhase::Completed)
-            {
-                Some(next_runtime_identity(&current)?)
+            let next_identity = next_runtime_identity(&current)?;
+            let launch_authentication = if let Some(authority) = authority {
+                self.encode_launch_authentication(
+                    &current,
+                    authority.mint_persisted_launch(current.object_id(), &next_identity)?,
+                )
+                .await?
             } else {
-                None
+                Vec::new()
             };
-            let launch_authentication =
-                if let (Some(authority), Some(identity)) = (authority, next_identity.as_ref()) {
-                    self.encode_launch_authentication(
-                        &current,
-                        authority.mint_persisted_launch(current.object_id(), identity)?,
-                    )
-                    .await?
-                } else {
-                    self.encode_persisted_launch_authentication(authority, &current)
-                        .await?
-                };
             let expected_resource_version = sandbox_resource_version(&current);
             let next_identity_for_update = next_identity.clone();
             match self
@@ -2087,10 +2079,8 @@ impl ComputeRuntime {
                     &sandbox_id,
                     expected_resource_version,
                     move |sandbox| {
-                        if let Some(identity) = &next_identity_for_update
-                            && let Some(metadata) = sandbox.metadata.as_mut()
-                        {
-                            identity.write(&mut metadata.annotations);
+                        if let Some(metadata) = sandbox.metadata.as_mut() {
+                            next_identity_for_update.write(&mut metadata.annotations);
                         }
                         apply_lifecycle_phase(
                             sandbox,
@@ -4406,7 +4396,6 @@ impl ComputeRuntime {
         let sandbox_name = current.object_name().to_string();
         self.validate_isolation_backend_binding(&current)
             .map_err(|error| error.to_string())?;
-        let authority = self.restart_authority.get().and_then(Option::as_deref);
         let already_claimed = current
             .status
             .as_ref()
@@ -4414,10 +4403,7 @@ impl ComputeRuntime {
         let next_identity = if already_claimed {
             None
         } else {
-            authority
-                .map(|_| next_runtime_identity(&current))
-                .transpose()
-                .map_err(|status| status.to_string())?
+            Some(next_runtime_identity(&current).map_err(|status| status.to_string())?)
         };
         let claimed = if already_claimed && sandbox_provisioning_attempt_id(&current).is_none() {
             current.clone()
@@ -7398,12 +7384,10 @@ fn next_runtime_identity(
         .checked_add(1)
         .and_then(|epoch| openshell_core::jwt::CredentialEpoch::new(epoch).ok())
         .ok_or_else(|| Status::internal("sandbox authorization epoch overflow"))?;
-    Ok(crate::auth::sandbox_session::PersistedSandboxIdentity {
-        runtime_generation: current.runtime_generation,
-        auth_epoch: next_epoch,
-        gateway_token_id: uuid::Uuid::new_v4(),
-        refresh_replay: None,
-    })
+    let mut next = crate::auth::sandbox_session::PersistedSandboxIdentity::new()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    next.auth_epoch = next_epoch;
+    Ok(next)
 }
 
 fn serialize_launch_authentication(
@@ -8344,6 +8328,7 @@ mod tests {
         start_calls: AtomicUsize,
         start_requests: TestMutex<Vec<(String, String)>>,
         start_authentications: TestMutex<Vec<Vec<u8>>>,
+        start_generations: TestMutex<Vec<String>>,
         start_expected_runtime_identities: TestMutex<Vec<String>>,
         start_outcome: TestMutex<ControlledLifecycleOutcome>,
         runtime_identity: TestMutex<String>,
@@ -8388,6 +8373,7 @@ mod tests {
                 start_calls: AtomicUsize::new(0),
                 start_requests: TestMutex::new(Vec::new()),
                 start_authentications: TestMutex::new(Vec::new()),
+                start_generations: TestMutex::new(Vec::new()),
                 start_expected_runtime_identities: TestMutex::new(Vec::new()),
                 start_outcome: TestMutex::new(ControlledLifecycleOutcome::Ok),
                 runtime_identity: TestMutex::new(String::new()),
@@ -8699,6 +8685,10 @@ mod tests {
                 .lock()
                 .expect("start requests lock poisoned")
                 .push((request.sandbox_id, request.name));
+            self.start_generations
+                .lock()
+                .expect("start generations lock poisoned")
+                .push(request.generation_id);
             self.start_authentications
                 .lock()
                 .expect("start authentications lock poisoned")
@@ -12443,79 +12433,198 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_start_commits_identity_with_starting_phase() {
-        let driver = ControlledDriver::new();
-        let runtime = test_runtime(driver.clone()).await;
-        let sandbox = sandbox_record("sb-auth-start", "sandbox-auth-start", SandboxPhase::Stopped);
-        runtime.store.put_message(&sandbox).await.unwrap();
-        let before = runtime
-            .store
-            .get_message::<Sandbox>(sandbox.object_id())
-            .await
-            .unwrap()
-            .unwrap();
-        let authority = test_session_authority();
-
-        runtime
-            .start_sandbox_authenticated(
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-                Some(&authority),
+        for phase in [
+            SandboxPhase::Stopped,
+            SandboxPhase::Completed,
+            SandboxPhase::Error,
+        ] {
+            let driver = ControlledDriver::new();
+            let runtime = test_runtime(driver.clone()).await;
+            let mut sandbox = sandbox_record("sb-auth-start", "sandbox-auth-start", phase);
+            if phase == SandboxPhase::Error {
+                sandbox.set_phase(SandboxPhase::Ready.into());
+                apply_main_process_exit(&mut sandbox, "previous-instance", 9);
+            }
+            runtime.store.put_message(&sandbox).await.unwrap();
+            let before = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            let authority = test_session_authority();
+            let before_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                &before.metadata.as_ref().unwrap().annotations,
             )
-            .await
             .unwrap();
+            let previous_launch = authority
+                .mint_persisted_launch(sandbox.object_id(), &before_identity)
+                .unwrap();
+            let previous_principal = authority
+                .verify_gateway_token(previous_launch.supervisor.gateway_token.expose_secret())
+                .unwrap();
 
-        let stored = runtime
-            .store
-            .get_message::<Sandbox>(sandbox.object_id())
-            .await
-            .unwrap()
-            .unwrap();
-        let stored_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
-            &stored.metadata.as_ref().unwrap().annotations,
-        )
-        .unwrap();
-        assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
-        assert_eq!(stored_identity.auth_epoch.get(), 2);
-        assert_eq!(
-            sandbox_resource_version(&stored),
-            sandbox_resource_version(&before) + 3,
-            "identity/Starting transition, operation claim, and settlement are separate CAS writes"
-        );
+            runtime
+                .start_sandbox_authenticated(
+                    sandbox.object_workspace(),
+                    sandbox.object_name(),
+                    Some(&authority),
+                )
+                .await
+                .unwrap();
 
-        runtime
-            .start_sandbox_authenticated(
-                sandbox.object_workspace(),
-                sandbox.object_name(),
-                Some(&authority),
+            let stored = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            let stored_identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+                &stored.metadata.as_ref().unwrap().annotations,
             )
-            .await
             .unwrap();
-
-        let authentications = driver.start_authentications();
-        assert_eq!(authentications.len(), 2);
-        for encoded in authentications {
-            let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
-                serde_json::from_slice(&encoded).unwrap();
-            assert_eq!(
-                authentication.supervisor.auth_epoch,
-                stored_identity.auth_epoch
+            assert_eq!(stored.phase(), SandboxPhase::Starting as i32);
+            assert_eq!(stored_identity.auth_epoch.get(), 2);
+            assert_ne!(
+                stored_identity.runtime_generation,
+                before_identity.runtime_generation
+            );
+            assert_ne!(
+                stored_identity.gateway_token_id,
+                before_identity.gateway_token_id
             );
             assert_eq!(
-                authentication.supervisor.runtime_generation,
-                stored_identity.runtime_generation
+                crate::auth::sandbox_session::authorize_persisted(
+                    &runtime.store,
+                    &previous_principal
+                )
+                .await
+                .unwrap_err()
+                .code(),
+                Code::Unauthenticated,
+            );
+            assert_eq!(
+                sandbox_resource_version(&stored),
+                sandbox_resource_version(&before) + 3,
+                "identity/Starting transition, operation claim, and settlement are separate CAS writes"
+            );
+
+            runtime
+                .start_sandbox_authenticated(
+                    sandbox.object_workspace(),
+                    sandbox.object_name(),
+                    Some(&authority),
+                )
+                .await
+                .unwrap();
+
+            let authentications = driver.start_authentications();
+            assert_eq!(authentications.len(), 2);
+            let mut launch_session = None;
+            for encoded in authentications {
+                let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+                    serde_json::from_slice(&encoded).unwrap();
+                assert_ne!(
+                    authentication.supervisor.session_id,
+                    previous_launch.supervisor.session_id
+                );
+                assert_eq!(
+                    *launch_session.get_or_insert(authentication.supervisor.session_id),
+                    authentication.supervisor.session_id
+                );
+                assert_eq!(
+                    authentication.supervisor.auth_epoch,
+                    stored_identity.auth_epoch
+                );
+                assert_eq!(
+                    authentication.supervisor.runtime_generation,
+                    stored_identity.runtime_generation
+                );
+            }
+            assert!(
+                driver
+                    .start_generations
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|generation| generation == stored_identity.runtime_generation.as_str())
+            );
+            let after_retry = runtime
+                .store
+                .get_message::<Sandbox>(sandbox.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sandbox_resource_version(&after_retry),
+                sandbox_resource_version(&stored) + 2,
+                "Starting retry claims and settles another operation without rotating identity"
             );
         }
-        let after_retry = runtime
+    }
+
+    #[tokio::test]
+    async fn concurrent_authenticated_start_keeps_the_claimed_launch_identity() {
+        let driver = ControlledDriver::new();
+        driver.block_start();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut other = runtime.clone();
+        other.mutation_locks = Arc::new(LocalMutationLocks::new());
+        other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
+        let sandbox = sandbox_record("sb-start-identity", "start-identity", SandboxPhase::Stopped);
+        let old_generation = sandbox_runtime_generation(&sandbox).unwrap();
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let authority = Arc::new(test_session_authority());
+        let starting = runtime.clone();
+        let signer = authority.clone();
+        let start = tokio::spawn(async move {
+            starting
+                .start_sandbox_authenticated("default", "start-identity", Some(&signer))
+                .await
+        });
+        driver.start_started.notified().await;
+        let claimed = wait_driver_pending(&other, sandbox.object_id(), true).await;
+        let generation = sandbox_runtime_generation(&claimed).unwrap();
+        assert_ne!(old_generation, generation);
+        let error = other
+            .start_sandbox_authenticated("default", "start-identity", Some(&authority))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert_eq!(driver.start_calls(), 1);
+        let retained = runtime
             .store
             .get_message::<Sandbox>(sandbox.object_id())
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(
-            sandbox_resource_version(&after_retry),
-            sandbox_resource_version(&stored) + 2,
-            "Starting retry claims and settles another operation without rotating identity"
+        assert_eq!(sandbox_runtime_generation(&retained).unwrap(), generation);
+        driver.release_start();
+        start.await.unwrap().unwrap();
+        driver.start_blocked.store(false, Ordering::SeqCst);
+        other
+            .start_sandbox_authenticated("default", "start-identity", Some(&authority))
+            .await
+            .unwrap();
+        assert!(
+            driver
+                .start_generations
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|value| value == generation.as_str())
         );
+        let authentications = driver.start_authentications();
+        assert_eq!(authentications.len(), 2);
+        let sessions: Vec<_> = authentications
+            .iter()
+            .map(|encoded| {
+                let auth: openshell_core::jwt::SandboxLaunchAuthentication =
+                    serde_json::from_slice(encoded).unwrap();
+                auth.supervisor.session_id
+            })
+            .collect();
+        assert_eq!(sessions[0], sessions[1]);
     }
 
     #[tokio::test]
@@ -17814,6 +17923,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         let driver = ControlledDriver::new();
         driver.block_start();
         let runtime = test_runtime(driver.clone()).await;
+        runtime
+            .restart_authority
+            .set(Some(Arc::new(test_session_authority())))
+            .unwrap();
         let mut other = runtime.clone();
         other.mutation_locks = Arc::new(LocalMutationLocks::new());
         other.lifecycle_gates = Arc::new(LifecycleGateRegistry::default());
@@ -17827,6 +17940,7 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         status.provisioning = Some(provisioning_deadline::new_record(
             openshell_core::time::now_ms(),
         ));
+        let old_generation = sandbox_runtime_generation(&sandbox).unwrap();
         runtime.store.put_message(&sandbox).await.unwrap();
         runtime
             .main_process_exited(sandbox.object_id(), "instance-1", 9)
@@ -17841,6 +17955,32 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
             tokio::spawn(async move { restarting.restart_sandbox_runtime("sb-auto-owned").await });
         driver.start_started.notified().await;
         let owned = wait_driver_pending(&other, sandbox.object_id(), true).await;
+        let identity = crate::auth::sandbox_session::PersistedSandboxIdentity::read(
+            &owned.metadata.as_ref().unwrap().annotations,
+        )
+        .unwrap();
+        assert_ne!(identity.runtime_generation, old_generation);
+        assert_eq!(identity.auth_epoch.get(), 2);
+        let encoded = driver.start_authentications();
+        let authentication: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&encoded[0]).unwrap();
+        assert_eq!(
+            authentication.supervisor.runtime_generation,
+            identity.runtime_generation
+        );
+        let retry = runtime
+            .encode_persisted_launch_authentication(
+                runtime.restart_authority.get().unwrap().as_deref(),
+                &owned,
+            )
+            .await
+            .unwrap();
+        let retry: openshell_core::jwt::SandboxLaunchAuthentication =
+            serde_json::from_slice(&retry).unwrap();
+        assert_eq!(
+            authentication.supervisor.session_id,
+            retry.supervisor.session_id
+        );
         restart.abort();
         assert!(restart.await.unwrap_err().is_cancelled());
         let error = other
@@ -17857,6 +17997,10 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         driver.release_start();
         let settled = wait_driver_pending(&other, sandbox.object_id(), false).await;
         assert!(provisioning_operation::same_operation(&owned, &settled));
+        assert_eq!(
+            sandbox_runtime_generation(&settled).unwrap(),
+            identity.runtime_generation
+        );
     }
 
     #[tokio::test]
