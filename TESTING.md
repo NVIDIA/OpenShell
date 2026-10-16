@@ -322,6 +322,21 @@ mise run e2e:podman
 host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
 override the default package version, `0.0.0-local`.
 
+It also builds `artifacts/packages/rpm/openshell.rpm` and
+`artifacts/packages/rpm/openshell-gateway.rpm` for tmachine's `rpm` installer.
+The RPM step runs `packit build locally` with `openshell.spec` in the Fedora
+container that CI uses, so it needs a Docker daemon that runs Linux containers
+for the host's architecture (`aarch64` or `x86_64`), such as Docker Desktop on
+macOS. The package version defaults to the development version that branch CI
+computes; set `OPENSHELL_RPM_VERSION` and `OPENSHELL_RPM_RELEASE` to override
+it. After `nix run .#build-artifacts-binaries`, `nix run .#build-artifacts-rpm`
+rebuilds only the RPMs. Run conformance against the installed RPMs:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test fedora-podman-rootful rpm conformance
+```
+
 Run the portable subset in a disposable rootless Podman guest:
 
 ```shell

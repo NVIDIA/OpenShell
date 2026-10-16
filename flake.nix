@@ -165,6 +165,10 @@
             type = "app";
             program = "${artifacts.deb}/bin/build-artifacts-deb";
           };
+          build-artifacts-rpm = {
+            type = "app";
+            program = "${artifacts.rpm}/bin/build-artifacts-rpm";
+          };
           build-artifacts-test-archives = {
             type = "app";
             program = "${artifacts.testArchives}/bin/build-artifacts-test-archives";
