@@ -13,13 +13,13 @@ struct RenewingGrpcBoundary {
 }
 
 #[tonic::async_trait]
-impl SandboxBoundary for RenewingGrpcBoundary {
+impl SandboxProtocol for RenewingGrpcBoundary {
     type ExchangeStream = TestGrpcStream;
     type MediateStream = TestGrpcStream;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<SandboxFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if self
             .failures
@@ -40,7 +40,7 @@ impl SandboxBoundary for RenewingGrpcBoundary {
 
     async fn mediate(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<SandboxFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         self.exchange(request).await
     }
@@ -88,7 +88,7 @@ async fn renewing_boundary_client(
             connections.spawn(async move {
                 tonic::transport::Server::builder()
                     .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                    .add_service(SandboxBoundaryServer::new(service))
+                    .add_service(SandboxProtocolServer::new(service))
                     .serve_with_incoming(
                         tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(Box::new(stream)))])
                             .chain(tokio_stream::pending()),

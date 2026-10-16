@@ -14,10 +14,10 @@ use crate::backend_proto::{
     DescribeIsolationBackendRequest, OpenBoundaryRequest,
     isolation_backend_client::IsolationBackendClient, open_boundary_response::LaunchOutcome,
 };
-use crate::isolation_protocol::boundary_chunk;
+use crate::isolation_protocol::sandbox_frame;
 #[cfg(test)]
 use crate::isolation_protocol::{chunk_data, data_chunk};
-use crate::proto::{BoundaryChunk, sandbox_boundary_client::SandboxBoundaryClient};
+use crate::proto::{SandboxFrame, sandbox_protocol_client::SandboxProtocolClient};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use openshell_isolation_interface::AgentSpec;
@@ -833,8 +833,8 @@ impl BoundaryLoopbackConnector {
             })
             .await?;
         match response {
-            Response::PortConnected => Ok(stream),
-            response => Err(unexpected_response("port_connected", &response)),
+            Response::LoopbackConnected => Ok(stream),
+            response => Err(unexpected_response("loopback_connected", &response)),
         }
     }
 }
@@ -2214,13 +2214,13 @@ async fn open_grpc_client_stream_with_authorization(
 ) -> Result<BoundaryDuplexStream, BackendError> {
     let (application, bridge) = tokio::io::duplex(256 * 1024);
     let (reader, writer) = tokio::io::split(bridge);
-    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<BoundaryChunk>(64);
+    let (outbound, outbound_rx) = tokio::sync::mpsc::channel::<SandboxFrame>(64);
     outbound
-        .send(boundary_chunk(boundary_id))
+        .send(sandbox_frame(boundary_id))
         .await
         .map_err(|_| BackendError::Unavailable("queue boundary binding frame".to_string()))?;
     tokio::spawn(pump_to_grpc(reader, outbound));
-    let mut client = SandboxBoundaryClient::new(channel)
+    let mut client = SandboxProtocolClient::new(channel)
         .max_decoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES)
         .max_encoding_message_size(crate::stream_adapter::MAX_MESSAGE_BYTES);
     let mut request = tonic::Request::new(ReceiverStream::new(outbound_rx));
@@ -2246,7 +2246,7 @@ async fn open_grpc_client_stream_with_authorization(
     Ok(Box::new(application))
 }
 
-async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<BoundaryChunk>)
+async fn pump_to_grpc<R>(mut reader: R, sender: tokio::sync::mpsc::Sender<SandboxFrame>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -2268,7 +2268,7 @@ where
 }
 
 async fn pump_from_grpc<W>(
-    mut stream: tonic::Streaming<BoundaryChunk>,
+    mut stream: tonic::Streaming<SandboxFrame>,
     mut writer: W,
     mut mode: crate::stream_adapter::Mode,
 ) where
@@ -2466,8 +2466,8 @@ mod tests {
     };
     use crate::boundary_protocol::{ExitStatusWire, generate_sandbox_tls_material};
     use crate::proto::{
-        BoundaryChunk,
-        sandbox_boundary_server::{SandboxBoundary, SandboxBoundaryServer},
+        SandboxFrame,
+        sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
     };
     use openshell_core::jwt::{SecretJwt, SessionBearerTokenSlot};
     use openshell_core::policy::{
@@ -2550,10 +2550,10 @@ mod tests {
         }
     }
 
-    async fn test_bind(inbound: &mut tonic::Streaming<BoundaryChunk>) {
+    async fn test_bind(inbound: &mut tonic::Streaming<SandboxFrame>) {
         assert_eq!(
             inbound.message().await.unwrap().unwrap(),
-            boundary_chunk(TEST_BOUNDARY_HANDLE)
+            sandbox_frame(TEST_BOUNDARY_HANDLE)
         );
     }
 
@@ -2696,17 +2696,17 @@ mod tests {
     }
 
     type TestGrpcStream = Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<BoundaryChunk, tonic::Status>> + Send + 'static>,
+        Box<dyn tokio_stream::Stream<Item = Result<SandboxFrame, tonic::Status>> + Send + 'static>,
     >;
 
     #[tonic::async_trait]
-    impl SandboxBoundary for TestGrpcBoundary {
+    impl SandboxProtocol for TestGrpcBoundary {
         type ExchangeStream = TestGrpcStream;
         type MediateStream = TestGrpcStream;
 
         async fn exchange(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
         ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
             let authorization = request
                 .metadata()
@@ -2800,7 +2800,7 @@ mod tests {
                                 applied: generation > provider_environment_generation,
                             },
                             Request::Resize { .. } => Response::Resized,
-                            Request::LoopbackConnect { .. } => Response::PortConnected,
+                            Request::LoopbackConnect { .. } => Response::LoopbackConnected,
                             Request::StartAgent {
                                 provider_env_revision,
                                 ..
@@ -2835,7 +2835,7 @@ mod tests {
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
             if self
                 .mediation_failures
@@ -2852,7 +2852,7 @@ mod tests {
         }
     }
 
-    fn test_response_chunk(bytes: Vec<u8>) -> BoundaryChunk {
+    fn test_response_chunk(bytes: Vec<u8>) -> SandboxFrame {
         let response: ResponseEnvelope = decode_frame(&bytes).unwrap();
         crate::isolation_protocol::response_chunk(&response).unwrap()
     }
@@ -2884,7 +2884,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             tonic::transport::Server::builder()
                 .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                .add_service(SandboxBoundaryServer::new(service))
+                .add_service(SandboxProtocolServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
                 .await
                 .unwrap();
@@ -2957,7 +2957,7 @@ mod tests {
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
                         .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(SandboxBoundaryServer::new(service))
+                        .add_service(SandboxProtocolServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3069,7 +3069,7 @@ mod tests {
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
                         .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(SandboxBoundaryServer::new(service))
+                        .add_service(SandboxProtocolServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3126,7 +3126,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             tonic::transport::Server::builder()
                 .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                .add_service(SandboxBoundaryServer::new(service))
+                .add_service(SandboxProtocolServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(stream)]))
                 .await
                 .unwrap();
@@ -3323,7 +3323,7 @@ mod tests {
         };
         tonic::transport::Server::builder()
             .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-            .add_service(SandboxBoundaryServer::new(service))
+            .add_service(SandboxProtocolServer::new(service))
             .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                 stream,
             ))]))
@@ -3873,7 +3873,7 @@ mod tests {
                 tokio::spawn(async move {
                     tonic::transport::Server::builder()
                         .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(SandboxBoundaryServer::new(service))
+                        .add_service(SandboxProtocolServer::new(service))
                         .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(
                             TestTlsIo(Box::new(stream)),
                         )]))
@@ -3942,7 +3942,7 @@ mod tests {
                 .unwrap();
             tonic::transport::Server::builder()
                 .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                .add_service(SandboxBoundaryServer::new(service))
+                .add_service(SandboxProtocolServer::new(service))
                 .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                     Box::new(stream),
                 ))]))

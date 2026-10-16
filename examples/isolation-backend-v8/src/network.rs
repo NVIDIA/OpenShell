@@ -11,7 +11,7 @@ use openshell_isolation_interface::contract::{TcpOpenDecision, TcpOpenDenial};
 use tokio::sync::{mpsc, oneshot, watch};
 use tonic::{Status, Streaming};
 
-use crate::protocol::boundary::{BoundaryChunk, boundary_chunk};
+use crate::protocol::boundary::{SandboxFrame, sandbox_frame};
 
 pub const POLICY_DENIED: i32 = -1;
 pub const UNAVAILABLE: i32 = -2;
@@ -103,9 +103,9 @@ fn parse_request(url: &str) -> Option<(SocketAddr, Vec<u8>)> {
     ))
 }
 
-async fn data(input: &mut Streaming<BoundaryChunk>) -> Result<Vec<u8>, Status> {
+async fn data(input: &mut Streaming<SandboxFrame>) -> Result<Vec<u8>, Status> {
     match input.message().await?.and_then(|chunk| chunk.payload) {
-        Some(boundary_chunk::Payload::RelayData(bytes))
+        Some(sandbox_frame::Payload::RelayData(bytes))
             if !bytes.is_empty()
                 && bytes.len()
                     <= openshell_sandbox_backend::boundary_protocol::MAX_STREAM_FRAME_BYTES =>
@@ -116,16 +116,16 @@ async fn data(input: &mut Streaming<BoundaryChunk>) -> Result<Vec<u8>, Status> {
     }
 }
 
-pub async fn decision(input: &mut Streaming<BoundaryChunk>) -> Result<TcpOpenDecision, Status> {
+pub async fn decision(input: &mut Streaming<SandboxFrame>) -> Result<TcpOpenDecision, Status> {
     match input.message().await?.and_then(|chunk| chunk.payload) {
-        Some(boundary_chunk::Payload::NetworkDecision(value)) => {
-            crate::protocol::network_decision(value)
+        Some(sandbox_frame::Payload::TcpOpenDecision(value)) => {
+            crate::protocol::tcp_open_decision(value)
         }
         _ => Err(Status::invalid_argument("network decision required")),
     }
 }
 
-pub async fn http_status(input: &mut Streaming<BoundaryChunk>) -> Result<i32, Status> {
+pub async fn http_status(input: &mut Streaming<SandboxFrame>) -> Result<i32, Status> {
     let mut bytes = Vec::new();
     loop {
         let data = data(input).await?;

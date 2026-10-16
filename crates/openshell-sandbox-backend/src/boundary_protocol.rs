@@ -612,7 +612,7 @@ pub struct RequestEnvelope {
     /// Absolute exec admission deadline, preserved across retries and bound to
     /// the payload digest. Other request kinds do not expire through this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exec_expires_at_unix_ms: Option<u64>,
+    pub exec_admission_deadline_unix_ms: Option<u64>,
     pub request: Request,
 }
 
@@ -620,18 +620,18 @@ impl RequestEnvelope {
     /// Build a request envelope with a fresh idempotency key and normalized
     /// payload digest.
     pub fn new(request: Request) -> Result<Self, FrameError> {
-        let exec_expires_at_unix_ms = if matches!(request, Request::Exec { .. }) {
+        let exec_admission_deadline_unix_ms = if matches!(request, Request::Exec { .. }) {
             let window_ms =
                 u64::try_from(EXEC_REQUEST_RETRY_WINDOW.as_millis()).map_err(io::Error::other)?;
             Some(unix_time_millis()?.saturating_add(window_ms))
         } else {
             None
         };
-        let payload_digest = request_envelope_digest(&request, exec_expires_at_unix_ms)?;
+        let payload_digest = request_envelope_digest(&request, exec_admission_deadline_unix_ms)?;
         Ok(Self {
             request_id: uuid::Uuid::new_v4().to_string(),
             payload_digest,
-            exec_expires_at_unix_ms,
+            exec_admission_deadline_unix_ms,
             request,
         })
     }
@@ -639,7 +639,7 @@ impl RequestEnvelope {
     /// Verify that the request body still matches the immutable digest bound
     /// to this idempotency key.
     pub fn validate_payload_digest(&self) -> Result<(), FrameError> {
-        let actual = request_envelope_digest(&self.request, self.exec_expires_at_unix_ms)?;
+        let actual = request_envelope_digest(&self.request, self.exec_admission_deadline_unix_ms)?;
         if actual == self.payload_digest {
             Ok(())
         } else {
@@ -658,14 +658,14 @@ pub fn unix_time_millis() -> Result<u64, FrameError> {
 
 pub(crate) fn request_envelope_digest(
     request: &Request,
-    exec_expires_at_unix_ms: Option<u64>,
+    exec_admission_deadline_unix_ms: Option<u64>,
 ) -> Result<String, FrameError> {
     // Stable local replay fingerprint of decoded protobuf fields. Maps use
     // BTreeMap in generated messages; neither clients nor the wire carry this.
     let envelope = RequestEnvelope {
         request_id: String::new(),
         payload_digest: String::new(),
-        exec_expires_at_unix_ms,
+        exec_admission_deadline_unix_ms,
         request: request.clone(),
     };
     let payload = crate::protobuf::encode(&envelope)?;
@@ -919,7 +919,7 @@ pub enum Response {
         pty: bool,
     },
     Resized,
-    PortConnected,
+    LoopbackConnected,
     MediationReady,
     NetworkConnected {
         identity: BinaryIdentityWire,
@@ -1591,7 +1591,7 @@ mod tests {
         let request = RequestEnvelope {
             request_id: "4e94636d-54f8-4d85-8e4e-58954fb5af0a".to_string(),
             payload_digest: String::new(),
-            exec_expires_at_unix_ms: None,
+            exec_admission_deadline_unix_ms: None,
             request: Request::StartAgent {
                 provider_files: std::collections::HashMap::new(),
                 sandbox_id: "sandbox-1".to_string(),
@@ -1652,18 +1652,18 @@ mod tests {
         .unwrap();
         let after = unix_time_millis().unwrap();
         let window_ms = u64::try_from(EXEC_REQUEST_RETRY_WINDOW.as_millis()).unwrap();
-        let deadline = request.exec_expires_at_unix_ms.unwrap();
+        let deadline = request.exec_admission_deadline_unix_ms.unwrap();
         assert!((before + window_ms..=after + window_ms).contains(&deadline));
         let frame = encode_frame(&request).unwrap();
         let mut retry: RequestEnvelope = decode_frame(&frame).unwrap();
         assert_eq!(retry, request);
         retry.validate_payload_digest().unwrap();
-        retry.exec_expires_at_unix_ms = Some(deadline + 1);
+        retry.exec_admission_deadline_unix_ms = Some(deadline + 1);
         assert!(matches!(
             retry.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
         ));
-        retry.exec_expires_at_unix_ms = None;
+        retry.exec_admission_deadline_unix_ms = None;
         assert!(matches!(
             retry.validate_payload_digest(),
             Err(FrameError::PayloadDigestMismatch)
@@ -1673,9 +1673,9 @@ mod tests {
     #[test]
     fn non_exec_requests_have_no_deadline() {
         let envelope = RequestEnvelope::new(Request::Confirm).unwrap();
-        assert!(envelope.exec_expires_at_unix_ms.is_none());
+        assert!(envelope.exec_admission_deadline_unix_ms.is_none());
         let encoded = serde_json::to_value(&envelope).unwrap();
-        assert!(encoded.get("exec_expires_at_unix_ms").is_none());
+        assert!(encoded.get("exec_admission_deadline_unix_ms").is_none());
         let decoded: RequestEnvelope = serde_json::from_value(encoded).unwrap();
         decoded.validate_payload_digest().unwrap();
     }

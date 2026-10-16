@@ -24,7 +24,7 @@ use tokio::sync::{Mutex, watch};
 use tonic::{Request, Response, Status, Streaming};
 
 type Chunks =
-    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<BoundaryChunk, Status>> + Send>>;
+    std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<SandboxFrame, Status>> + Send>>;
 struct State {
     policy: Option<wire::SandboxPolicyWire>,
     ledger: HashMap<String, (String, wire::Response)>,
@@ -133,8 +133,8 @@ impl Runtime {
     }
     async fn route(
         &self,
-        mut request: Request<Streaming<BoundaryChunk>>,
-    ) -> Result<(SandboxProtocolPrincipal, Streaming<BoundaryChunk>), Status> {
+        mut request: Request<Streaming<SandboxFrame>>,
+    ) -> Result<(SandboxProtocolPrincipal, Streaming<SandboxFrame>), Status> {
         let principal = self.authenticate(&request)?;
         if !self
             .opened
@@ -148,7 +148,7 @@ impl Runtime {
         }
         let first = request.get_mut().message().await?;
         if first.and_then(|f| f.payload)
-            != Some(boundary_chunk::Payload::BoundaryId(
+            != Some(sandbox_frame::Payload::BoundaryId(
                 self.launch.boundary.generation.clone(),
             ))
         {
@@ -589,18 +589,18 @@ impl isolation_backend_server::IsolationBackend for Arc<Runtime> {
 }
 
 #[tonic::async_trait]
-impl sandbox_boundary_server::SandboxBoundary for Arc<Runtime> {
+impl sandbox_protocol_server::SandboxProtocol for Arc<Runtime> {
     type ExchangeStream = Chunks;
     type MediateStream = Chunks;
     async fn mediate(
         &self,
-        request: Request<Streaming<BoundaryChunk>>,
+        request: Request<Streaming<SandboxFrame>>,
     ) -> Result<Response<Chunks>, Status> {
         self.exchange(request).await
     }
     async fn exchange(
         &self,
-        request: Request<Streaming<BoundaryChunk>>,
+        request: Request<Streaming<SandboxFrame>>,
     ) -> Result<Response<Chunks>, Status> {
         let (principal, mut input) = self.route(request).await?;
         let runtime = self.clone();
@@ -747,7 +747,7 @@ pub async fn serve(state_dir: PathBuf) -> Result<()> {
                     .max_encoding_message_size(64 * 1024),
             )
             .add_service(
-                sandbox_boundary_server::SandboxBoundaryServer::new(runtime.clone())
+                sandbox_protocol_server::SandboxProtocolServer::new(runtime.clone())
                     .max_decoding_message_size(
                         openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
                     )

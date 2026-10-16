@@ -51,13 +51,13 @@ struct NetworkPeer {
 }
 
 #[tonic::async_trait]
-impl SandboxBoundary for NetworkPeer {
+impl SandboxProtocol for NetworkPeer {
     type ExchangeStream = TestGrpcStream;
     type MediateStream = TestGrpcStream;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<SandboxFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if request.metadata().get("authorization").unwrap()
             != format!("Bearer {}", "a".repeat(32)).as_str()
@@ -80,7 +80,7 @@ impl SandboxBoundary for NetworkPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        _request: tonic::Request<tonic::Streaming<SandboxFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("TCP fixture"))
     }
@@ -89,8 +89,8 @@ impl SandboxBoundary for NetworkPeer {
 impl NetworkPeer {
     async fn respond(
         &self,
-        mut inbound: tonic::Streaming<BoundaryChunk>,
-        outbound: tokio::sync::mpsc::Sender<Result<BoundaryChunk, tonic::Status>>,
+        mut inbound: tonic::Streaming<SandboxFrame>,
+        outbound: tokio::sync::mpsc::Sender<Result<SandboxFrame, tonic::Status>>,
     ) -> Result<(), tonic::Status> {
         test_bind(&mut inbound).await;
         let mut frame = Vec::new();
@@ -305,7 +305,7 @@ impl Fixture {
                     .chain(tokio_stream::pending());
                     let serving = tonic::transport::Server::builder()
                         .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-                        .add_service(SandboxBoundaryServer::new(peer))
+                        .add_service(SandboxProtocolServer::new(peer))
                         .serve_with_incoming(incoming);
                     tokio::select! {
                         result = serving => result.unwrap(),

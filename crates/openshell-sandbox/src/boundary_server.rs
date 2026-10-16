@@ -54,11 +54,11 @@ mod linux {
         self, DnsQueryWire, MediationFrame, MediationFrameKind,
     };
     #[cfg(test)]
-    use openshell_sandbox_backend::proto::sandbox_boundary_client::SandboxBoundaryClient;
+    use openshell_sandbox_backend::proto::sandbox_protocol_client::SandboxProtocolClient;
     use openshell_sandbox_backend::proto::{
-        BoundaryChunk,
-        boundary_chunk::Payload,
-        sandbox_boundary_server::{SandboxBoundary, SandboxBoundaryServer},
+        SandboxFrame,
+        sandbox_frame::Payload,
+        sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
     };
     use openshell_sandbox_backend::sandbox_auth::{
         SandboxAuthError, SandboxConnectionId, SandboxConnectionRegistry,
@@ -622,7 +622,7 @@ mod linux {
                     .max_encoding_message_size(64 * 1024),
             )
             .add_service(
-                SandboxBoundaryServer::new(service)
+                SandboxProtocolServer::new(service)
                     .max_decoding_message_size(
                         openshell_sandbox_backend::stream_adapter::MAX_MESSAGE_BYTES,
                     )
@@ -851,8 +851,8 @@ mod linux {
     impl GrpcBoundaryService {
         async fn bind_stream(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
-        ) -> Result<(tonic::Streaming<BoundaryChunk>, SandboxProtocolPrincipal), tonic::Status>
+            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
+        ) -> Result<(tonic::Streaming<SandboxFrame>, SandboxProtocolPrincipal), tonic::Status>
         {
             let principal = self
                 .runtime
@@ -887,16 +887,16 @@ mod linux {
         }
     }
 
-    type GrpcResponseStream = ReceiverStream<Result<BoundaryChunk, tonic::Status>>;
+    type GrpcResponseStream = ReceiverStream<Result<SandboxFrame, tonic::Status>>;
 
     #[tonic::async_trait]
-    impl SandboxBoundary for GrpcBoundaryService {
+    impl SandboxProtocol for GrpcBoundaryService {
         type ExchangeStream = GrpcResponseStream;
         type MediateStream = GrpcResponseStream;
 
         async fn exchange(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
         ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
             let (inbound, principal) = self.bind_stream(request).await?;
             let (stream, response) =
@@ -916,7 +916,7 @@ mod linux {
 
         async fn mediate(
             &self,
-            request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+            request: tonic::Request<tonic::Streaming<SandboxFrame>>,
         ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
             let (inbound, principal) = self.bind_stream(request).await?;
             let (stream, response) =
@@ -932,13 +932,13 @@ mod linux {
     }
 
     fn bridge_grpc_server_stream(
-        mut inbound: tonic::Streaming<BoundaryChunk>,
+        mut inbound: tonic::Streaming<SandboxFrame>,
         connection_closed: tokio::sync::watch::Receiver<()>,
     ) -> (tokio::io::DuplexStream, GrpcResponseStream) {
         let (application, bridge) = tokio::io::duplex(256 * 1024);
         let (mut reader, mut writer) = tokio::io::split(bridge);
         let (outbound, outbound_rx) =
-            tokio::sync::mpsc::channel::<Result<BoundaryChunk, tonic::Status>>(64);
+            tokio::sync::mpsc::channel::<Result<SandboxFrame, tonic::Status>>(64);
         // Do not retain the response sender while the client request direction
         // stays open: finite exchanges must still observe the server's EOF.
         let invalid_frames = outbound.downgrade();
@@ -1232,7 +1232,7 @@ mod linux {
                 let started = match runtime.start_exec(
                     &request.request_id,
                     &request.payload_digest,
-                    request.exec_expires_at_unix_ms,
+                    request.exec_admission_deadline_unix_ms,
                     spec,
                 ) {
                     Ok(started) => started,
@@ -1311,7 +1311,7 @@ mod linux {
                     &mut stream,
                     &ResponseEnvelope {
                         request_id: request.request_id,
-                        response: Response::PortConnected,
+                        response: Response::LoopbackConnected,
                     },
                 )
                 .map_err(|error| format!("write port-forward response: {error}"))?;
@@ -4650,7 +4650,7 @@ mod linux {
                 test_open_boundary(channel.clone(), test_open_request(&runtime.config), &token)
                     .await;
             sender
-                .send(openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle))
+                .send(openshell_sandbox_backend::isolation_protocol::sandbox_frame(&handle))
                 .await
                 .unwrap();
             let request = RequestEnvelope::new(Request::OpenMediation).unwrap();
@@ -4660,7 +4660,7 @@ mod linux {
                 )
                 .await
                 .unwrap();
-            let mut response = SandboxBoundaryClient::new(channel)
+            let mut response = SandboxProtocolClient::new(channel)
                 .mediate(bearer_request(ReceiverStream::new(receiver), &token))
                 .await
                 .unwrap()
@@ -5276,7 +5276,7 @@ mod linux {
                 .await
                 .unwrap();
             let mut control = openshell_sandbox_backend::backend_proto::isolation_backend_client::IsolationBackendClient::new(channel.clone());
-            let mut streams = SandboxBoundaryClient::new(channel.clone());
+            let mut streams = SandboxProtocolClient::new(channel.clone());
             let before_open = streams
                 .exchange(bearer_request(
                     tokio_stream::iter([data_chunk(Vec::new())]),
@@ -5396,8 +5396,8 @@ mod linux {
                 .connect()
                 .await
                 .unwrap();
-            let binding = openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle);
-            let mut replacement_streams = SandboxBoundaryClient::new(replacement.clone());
+            let binding = openshell_sandbox_backend::isolation_protocol::sandbox_frame(&handle);
+            let mut replacement_streams = SandboxProtocolClient::new(replacement.clone());
             assert_eq!(
                 replacement_streams
                     .exchange(bearer_request(
@@ -5442,10 +5442,10 @@ mod linux {
             for frames in [
                 vec![],
                 vec![data_chunk(Vec::new())],
-                vec![BoundaryChunk { payload: None }],
-                vec![openshell_sandbox_backend::isolation_protocol::boundary_chunk("")],
+                vec![SandboxFrame { payload: None }],
+                vec![openshell_sandbox_backend::isolation_protocol::sandbox_frame("")],
                 vec![
-                    openshell_sandbox_backend::isolation_protocol::boundary_chunk("other-boundary"),
+                    openshell_sandbox_backend::isolation_protocol::sandbox_frame("other-boundary"),
                 ],
             ] {
                 let expected = if frames
@@ -5475,7 +5475,7 @@ mod linux {
                     expected
                 );
             }
-            let binding = openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle);
+            let binding = openshell_sandbox_backend::isolation_protocol::sandbox_frame(&handle);
             let mut response = streams
                 .exchange(bearer_request(
                     tokio_stream::iter([binding.clone(), binding]),
@@ -5561,11 +5561,11 @@ mod linux {
             .expect("encode attach request");
             let handle = test_open_boundary(channel.clone(), opening, &token).await;
             let request_stream = tokio_stream::iter([
-                openshell_sandbox_backend::isolation_protocol::boundary_chunk(&handle),
+                openshell_sandbox_backend::isolation_protocol::sandbox_frame(&handle),
                 openshell_sandbox_backend::isolation_protocol::request_chunk(&request)
                     .expect("typed logical request"),
             ]);
-            let mut body = SandboxBoundaryClient::new(channel)
+            let mut body = SandboxProtocolClient::new(channel)
                 .exchange(bearer_request(request_stream, &token))
                 .await
                 .expect("exchange logical request")
@@ -6035,7 +6035,7 @@ mod linux {
                 .start_exec(
                     &exec_request.request_id,
                     &exec_request.payload_digest,
-                    exec_request.exec_expires_at_unix_ms,
+                    exec_request.exec_admission_deadline_unix_ms,
                     exec_spec,
                 )
                 .expect("exec after reconnect");
@@ -6352,7 +6352,7 @@ mod linux {
                     requests
                         .reserve(
                             &format!("completed-request-{index}"),
-                            sleep_request.exec_expires_at_unix_ms.unwrap(),
+                            sleep_request.exec_admission_deadline_unix_ms.unwrap(),
                         )
                         .unwrap();
                 }
@@ -6361,7 +6361,7 @@ mod linux {
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
-                    sleep_request.exec_expires_at_unix_ms,
+                    sleep_request.exec_admission_deadline_unix_ms,
                     sleep_spec.clone(),
                 )
                 .expect("start exec whose response is disconnected");
@@ -6371,7 +6371,7 @@ mod linux {
                 .start_exec(
                     &sleep_request.request_id,
                     &sleep_request.payload_digest,
-                    sleep_request.exec_expires_at_unix_ms,
+                    sleep_request.exec_admission_deadline_unix_ms,
                     sleep_spec.clone(),
                 )
                 .expect("reattach exec after response loss");
@@ -6397,7 +6397,7 @@ mod linux {
                     .start_exec(
                         &sleep_request.request_id,
                         &sleep_request.payload_digest,
-                        sleep_request.exec_expires_at_unix_ms,
+                        sleep_request.exec_admission_deadline_unix_ms,
                         sleep_spec,
                     )
                     .is_err(),
@@ -6431,7 +6431,7 @@ mod linux {
                     .start_exec(
                         &request.request_id,
                         &request.payload_digest,
-                        request.exec_expires_at_unix_ms,
+                        request.exec_admission_deadline_unix_ms,
                         spec,
                     )
                     .expect("start exec after canonical exit");

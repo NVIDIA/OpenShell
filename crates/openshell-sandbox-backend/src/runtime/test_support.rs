@@ -6,8 +6,8 @@
 use crate::boundary_protocol::{self as w, Request, RequestEnvelope, Response, ResponseEnvelope};
 use crate::proto::{
     self as p,
-    boundary_chunk::Payload,
-    sandbox_boundary_server::{SandboxBoundary, SandboxBoundaryServer},
+    sandbox_frame::Payload,
+    sandbox_protocol_server::{SandboxProtocol, SandboxProtocolServer},
 };
 use crate::protobuf::WireMessage as _;
 use crate::runtime::BoundaryClient;
@@ -111,11 +111,11 @@ struct Peer {
 }
 
 type Stream =
-    Pin<Box<dyn tokio_stream::Stream<Item = Result<p::BoundaryChunk, tonic::Status>> + Send>>;
-type Sender = mpsc::Sender<Result<p::BoundaryChunk, tonic::Status>>;
+    Pin<Box<dyn tokio_stream::Stream<Item = Result<p::SandboxFrame, tonic::Status>> + Send>>;
+type Sender = mpsc::Sender<Result<p::SandboxFrame, tonic::Status>>;
 
-fn chunk(payload: Payload) -> p::BoundaryChunk {
-    p::BoundaryChunk {
+fn chunk(payload: Payload) -> p::SandboxFrame {
+    p::SandboxFrame {
         payload: Some(payload),
     }
 }
@@ -137,7 +137,7 @@ impl Peer {
     }
     async fn exchange(
         self: Arc<Self>,
-        mut input: tonic::Streaming<p::BoundaryChunk>,
+        mut input: tonic::Streaming<p::SandboxFrame>,
         out: Sender,
         request: RequestEnvelope,
     ) -> Result<(), BackendError> {
@@ -264,7 +264,7 @@ impl Peer {
                         .connect(LoopbackTarget::new(host, port)?)
                         .await?,
                 );
-                Response::PortConnected
+                Response::LoopbackConnected
             }
             Request::AcceptNetwork => {
                 let open = self
@@ -300,7 +300,7 @@ impl Peer {
         if let Some((stdin, stdout, stderr, process, completion)) = io {
             process_io(input, out, stdin, stdout, stderr, process, completion).await;
         } else if let Some(open) = network {
-            if let Some(Payload::NetworkDecision(decision)) =
+            if let Some(Payload::TcpOpenDecision(decision)) =
                 input.message().await.ok().flatten().and_then(|c| c.payload)
             {
                 let decision = TcpOpenDecision::from_proto(decision).unwrap();
@@ -318,12 +318,12 @@ impl Peer {
 #[derive(Clone)]
 struct Service(Arc<Peer>);
 #[tonic::async_trait]
-impl SandboxBoundary for Service {
+impl SandboxProtocol for Service {
     type ExchangeStream = Stream;
     type MediateStream = Stream;
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<p::BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<p::SandboxFrame>>,
     ) -> Result<tonic::Response<Stream>, tonic::Status> {
         let (out, rx) = mpsc::channel(8);
         let peer = self.0.clone();
@@ -348,7 +348,7 @@ impl SandboxBoundary for Service {
     }
     async fn mediate(
         &self,
-        request: tonic::Request<tonic::Streaming<p::BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<p::SandboxFrame>>,
     ) -> Result<tonic::Response<Stream>, tonic::Status> {
         let (out, rx) = mpsc::channel(8);
         let source = self.0.network.clone();
@@ -399,7 +399,7 @@ impl SandboxBoundary for Service {
                         match query {Ok(q)=>next=Some(q),Err(_)=>break}
                     },
                     response=input.message()=>{
-                        if let Ok(Some(p::BoundaryChunk{payload:Some(Payload::DnsResponse(r))}))=response {
+                        if let Ok(Some(p::SandboxFrame{payload:Some(Payload::DnsResponse(r))}))=response {
                             if let Some(sender)=pending.remove(&r.stream_id){
                                 let result=match r.result {Some(p::dns_response::Result::Response(v))=>Ok(v),_=>Err(unsupported())};
                                 let _=sender.send(result);
@@ -413,7 +413,7 @@ impl SandboxBoundary for Service {
     }
 }
 async fn read_request(
-    input: &mut tonic::Streaming<p::BoundaryChunk>,
+    input: &mut tonic::Streaming<p::SandboxFrame>,
 ) -> Result<RequestEnvelope, tonic::Status> {
     let first = input
         .message()
@@ -480,7 +480,7 @@ async fn output(mut reader: BoundaryOutput, out: Sender, stderr: bool) {
     }
 }
 async fn process_io(
-    mut input: tonic::Streaming<p::BoundaryChunk>,
+    mut input: tonic::Streaming<p::SandboxFrame>,
     out: Sender,
     stdin: Option<BoundaryInput>,
     stdout: BoundaryOutput,
@@ -550,7 +550,7 @@ async fn process_io(
     read.abort();
 }
 async fn relay_io(
-    mut input: tonic::Streaming<p::BoundaryChunk>,
+    mut input: tonic::Streaming<p::SandboxFrame>,
     out: Sender,
     stream: BoundaryDuplexStream,
 ) {
@@ -690,7 +690,7 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
                     Service(Arc::new(Peer::default())),
                 ),
             )
-            .add_service(SandboxBoundaryServer::new(Service(server_peer)))
+            .add_service(SandboxProtocolServer::new(Service(server_peer)))
             .serve_with_incoming(incoming)
             .await
             .unwrap();

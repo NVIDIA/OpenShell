@@ -17,16 +17,16 @@ import "options.proto";
 // Mediate handles OpenMediation followed by correlated DNS queries/responses.
 // Admission remains Attach -> Confirm -> StartAgent; no untrusted instruction
 // may execute before StartAgent. Exec and forwarding require Running.
-service SandboxBoundary {
-  rpc Exchange(stream BoundaryChunk) returns (stream BoundaryChunk);
-  rpc Mediate(stream BoundaryChunk) returns (stream BoundaryChunk);
+service SandboxProtocol {
+  rpc Exchange(stream SandboxFrame) returns (stream SandboxFrame);
+  rpc Mediate(stream SandboxFrame) returns (stream SandboxFrame);
 }
 
 // The first client frame contains boundary_id, never repeated on that stream.
 // Control messages are bounded to 1 MiB; each I/O payload is at most 64 KiB.
 // Process stdin closes explicitly; ending a gRPC request stream does not end
 // the independent response stream. Exit follows all retained process output.
-message BoundaryChunk {
+message SandboxFrame {
   oneof payload {
     string boundary_id = 1;
     RequestEnvelope request = 3;
@@ -36,7 +36,7 @@ message BoundaryChunk {
     bytes stderr = 7;
     ExitStatus exit = 8;
     StdinClosed stdin_closed = 9;
-    TcpOpenDecision network_decision = 10;
+    TcpOpenDecision tcp_open_decision = 10;
     bytes relay_data = 11;
     DnsQuery dns_query = 12;
     DnsResponse dns_response = 13;
@@ -57,7 +57,7 @@ message RequestEnvelope {
   string request_id = 1;
   // Required only for Exec. An absolute admission/retry deadline, not a process
   // runtime limit; it remains unchanged on retries and transport recovery.
-  google.protobuf.Timestamp exec_expires_at = 2;
+  google.protobuf.Timestamp exec_admission_deadline = 2;
   oneof request {
     DiscoverPolicy discover_policy = 10;
     Attach attach = 11;
@@ -94,7 +94,7 @@ message ResponseEnvelope {
     BoundaryTerminated boundary_terminated = 20;
     ExecStarted exec_started = 21;
     Resized resized = 22;
-    PortConnected port_connected = 23;
+    LoopbackConnected loopback_connected = 23;
     MediationReady mediation_ready = 24;
     NetworkConnected network_connected = 25;
     Error error = 26;
@@ -193,7 +193,7 @@ message ExecStarted {
   bool pty = 2;
 }
 message Resized {}
-message PortConnected {}
+message LoopbackConnected {}
 message MediationReady {}
 message NetworkConnected {
   BinaryIdentity identity = 1;

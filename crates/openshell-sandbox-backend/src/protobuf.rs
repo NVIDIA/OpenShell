@@ -557,7 +557,10 @@ impl WireMessage for w::RequestEnvelope {
         };
         Ok(p::RequestEnvelope {
             request_id: self.request_id.clone(),
-            exec_expires_at: self.exec_expires_at_unix_ms.map(timestamp).transpose()?,
+            exec_admission_deadline: self
+                .exec_admission_deadline_unix_ms
+                .map(timestamp)
+                .transpose()?,
             request: Some(request),
         })
     }
@@ -625,14 +628,14 @@ impl WireMessage for w::RequestEnvelope {
         // The server derives a fingerprint from decoded typed fields. Clients
         // supply only the random ID; protobuf map order never changes a replay.
         parse::<uuid::Uuid>(&v.request_id)?;
-        let expires = v.exec_expires_at.map(millis).transpose()?;
+        let expires = v.exec_admission_deadline.map(millis).transpose()?;
         if matches!(request, W::Exec { .. }) != expires.is_some() {
             return Err(invalid("exec deadline presence does not match operation"));
         }
         let mut envelope = Self {
             request_id: v.request_id,
             payload_digest: String::new(),
-            exec_expires_at_unix_ms: expires,
+            exec_admission_deadline_unix_ms: expires,
             request,
         };
         envelope.payload_digest = w::request_envelope_digest(&envelope.request, expires)?;
@@ -688,7 +691,7 @@ impl WireMessage for w::ResponseEnvelope {
                 pty: *pty,
             }),
             W::Resized => P::Resized(p::Resized {}),
-            W::PortConnected => P::PortConnected(p::PortConnected {}),
+            W::LoopbackConnected => P::LoopbackConnected(p::LoopbackConnected {}),
             W::MediationReady => P::MediationReady(p::MediationReady {}),
             W::NetworkConnected {
                 identity,
@@ -758,7 +761,7 @@ impl WireMessage for w::ResponseEnvelope {
                 pty: v.pty,
             },
             P::Resized(_) => W::Resized,
-            P::PortConnected(_) => W::PortConnected,
+            P::LoopbackConnected(_) => W::LoopbackConnected,
             P::MediationReady(_) => W::MediationReady,
             P::NetworkConnected(v) => W::NetworkConnected {
                 identity: w::BinaryIdentityWire::from_proto(required(v.identity)?)?,
@@ -845,7 +848,7 @@ mod tests {
         let id = uuid::Uuid::new_v4().to_string();
         let attach = p::RequestEnvelope {
             request_id: id.clone(),
-            exec_expires_at: None,
+            exec_admission_deadline: None,
             request: Some(p::request_envelope::Request::Attach(p::Attach {
                 supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
                 policy: None,
@@ -855,7 +858,7 @@ mod tests {
         assert!(w::RequestEnvelope::from_proto(attach).is_err());
         let signal = p::RequestEnvelope {
             request_id: id,
-            exec_expires_at: None,
+            exec_admission_deadline: None,
             request: Some(p::request_envelope::Request::Signal(p::Signal {
                 process_id: "main".into(),
                 signal: 99,
@@ -879,13 +882,13 @@ mod tests {
         })
         .unwrap();
         let mut value = request.to_proto().unwrap();
-        value.exec_expires_at = None;
+        value.exec_admission_deadline = None;
         assert!(w::RequestEnvelope::from_proto(value).is_err());
         let mut value = request.to_proto().unwrap();
-        value.exec_expires_at.as_mut().unwrap().nanos = -1;
+        value.exec_admission_deadline.as_mut().unwrap().nanos = -1;
         assert!(w::RequestEnvelope::from_proto(value).is_err());
         let mut value = request.to_proto().unwrap();
-        value.exec_expires_at.as_mut().unwrap().seconds += 1;
+        value.exec_admission_deadline.as_mut().unwrap().seconds += 1;
         let changed = w::RequestEnvelope::from_proto(value).unwrap();
         assert_eq!(changed.request_id, request.request_id);
         assert_ne!(changed.payload_digest, request.payload_digest);
@@ -895,7 +898,7 @@ mod tests {
     fn resize_rejects_values_outside_the_rust_contract() {
         let value = p::RequestEnvelope {
             request_id: uuid::Uuid::new_v4().to_string(),
-            exec_expires_at: None,
+            exec_admission_deadline: None,
             request: Some(p::request_envelope::Request::Resize(p::Resize {
                 process_id: "main".into(),
                 cols: 65_536,

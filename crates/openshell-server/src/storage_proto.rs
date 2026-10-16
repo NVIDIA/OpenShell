@@ -545,7 +545,7 @@ mod tests {
                     );
                 }
                 if package == "openshell.sandbox.protocol.v1" {
-                    assert_eq!(service_name, "SandboxBoundary");
+                    assert_eq!(service_name, "SandboxProtocol");
                     sandbox_protocol_methods.extend(service.method.iter().map(|method| {
                         method
                             .name

@@ -8,17 +8,17 @@ use tokio_stream::StreamExt as _;
 /// workload stops reading a relayed download. Other streams echo one chunk.
 #[derive(Clone)]
 struct StallingPeer {
-    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<BoundaryChunk>>>>,
+    stalled: Arc<std::sync::Mutex<Vec<tonic::Streaming<SandboxFrame>>>>,
 }
 
 #[tonic::async_trait]
-impl SandboxBoundary for StallingPeer {
+impl SandboxProtocol for StallingPeer {
     type ExchangeStream = TestGrpcStream;
     type MediateStream = TestGrpcStream;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<SandboxFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         let stall = request.metadata().get("x-stall").is_some();
         let mut inbound = request.into_inner();
@@ -52,7 +52,7 @@ impl SandboxBoundary for StallingPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        _request: tonic::Request<tonic::Streaming<SandboxFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("flow-control fixture"))
     }
@@ -79,7 +79,7 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
                 crate::boundary_protocol::BOUNDARY_CONNECTION_WINDOW_BYTES,
             )
             .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
-            .add_service(SandboxBoundaryServer::new(peer))
+            .add_service(SandboxProtocolServer::new(peer))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
@@ -96,17 +96,17 @@ async fn start_boundary(peer: StallingPeer) -> tonic::transport::Channel {
 }
 
 /// Push into one stalled stream until the peer stops granting credit.
-async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<BoundaryChunk> {
+async fn saturate(channel: tonic::transport::Channel) -> tokio::sync::mpsc::Sender<SandboxFrame> {
     let (sender, receiver) = tokio::sync::mpsc::channel(1);
     sender
-        .send(boundary_chunk(TEST_BOUNDARY_HANDLE))
+        .send(sandbox_frame(TEST_BOUNDARY_HANDLE))
         .await
         .unwrap();
     let mut request = tonic::Request::new(ReceiverStream::new(receiver));
     request
         .metadata_mut()
         .insert("x-stall", "1".parse().unwrap());
-    let mut client = SandboxBoundaryClient::new(channel);
+    let mut client = SandboxProtocolClient::new(channel);
     tokio::spawn(async move {
         let _response = client.exchange(request).await;
         std::future::pending::<()>().await;

@@ -3,11 +3,11 @@
 
 //! Private adapter for Rust `AsyncRead`/`AsyncWrite` handles.
 //!
-//! Length/channel markers exist only on these in-process pipes; gRPC carries typed `BoundaryChunk` values.
+//! Length/channel markers exist only on these in-process pipes; gRPC carries typed `SandboxFrame` values.
 //! Both directions check the operation's expected frame kind before forwarding.
 use crate::{
     boundary_protocol as w, mediation as m,
-    proto::{self as p, boundary_chunk::Payload},
+    proto::{self as p, sandbox_frame::Payload},
     protobuf::{self, WireMessage},
 };
 use std::io;
@@ -29,8 +29,8 @@ pub enum Mode {
 fn bad(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
-fn chunk(payload: Payload) -> p::BoundaryChunk {
-    p::BoundaryChunk {
+fn chunk(payload: Payload) -> p::SandboxFrame {
+    p::SandboxFrame {
         payload: Some(payload),
     }
 }
@@ -46,7 +46,7 @@ fn request_mode(v: &w::Request) -> Mode {
 fn response_mode(v: &w::Response) -> Mode {
     match v {
         w::Response::ProcessAttached { .. } | w::Response::ExecStarted { .. } => Mode::Output,
-        w::Response::NetworkConnected { .. } | w::Response::PortConnected => Mode::Relay,
+        w::Response::NetworkConnected { .. } | w::Response::LoopbackConnected => Mode::Relay,
         w::Response::MediationReady => Mode::DnsQueries,
         _ => Mode::Done,
     }
@@ -71,7 +71,7 @@ fn dns_bytes(kind: m::MediationFrameKind, id: u64, payload: &[u8]) -> io::Result
     Ok(bytes)
 }
 /// Convert a checked typed frame to the local stream interface.
-pub fn receive(mode: &mut Mode, value: p::BoundaryChunk) -> io::Result<Vec<u8>> {
+pub fn receive(mode: &mut Mode, value: p::SandboxFrame) -> io::Result<Vec<u8>> {
     use prost::Message;
     if value.encoded_len() > MAX_MESSAGE_BYTES {
         return Err(bad("protocol message exceeds limit"));
@@ -100,7 +100,7 @@ pub fn receive(mode: &mut Mode, value: p::BoundaryChunk) -> io::Result<Vec<u8>> 
             let v = w::ExitStatusWire::from_proto(v).map_err(bad)?;
             stream_bytes(w::STREAM_EXIT, &protobuf::encode(&v).map_err(bad)?)
         }
-        (Mode::Decision, Payload::NetworkDecision(v)) => {
+        (Mode::Decision, Payload::TcpOpenDecision(v)) => {
             let v = openshell_isolation_interface::contract::TcpOpenDecision::from_proto(v)
                 .map_err(bad)?;
             *mode = if matches!(
@@ -161,7 +161,7 @@ async fn control<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Option<Vec<
 pub async fn send<R: AsyncRead + Unpin>(
     reader: &mut R,
     mode: &mut Mode,
-) -> io::Result<Option<p::BoundaryChunk>> {
+) -> io::Result<Option<p::SandboxFrame>> {
     let payload = match *mode {
         Mode::Request => {
             let Some(bytes) = control(reader).await? else {
@@ -213,7 +213,7 @@ pub async fn send<R: AsyncRead + Unpin>(
                     } else {
                         Mode::Done
                     };
-                    Payload::NetworkDecision(v.to_proto().map_err(bad)?)
+                    Payload::TcpOpenDecision(v.to_proto().map_err(bad)?)
                 }
                 _ => return Err(bad("invalid local stream channel")),
             }

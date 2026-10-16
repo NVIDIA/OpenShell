@@ -8,7 +8,7 @@ use openshell_core::proto::extension::v1::{PeerMetadata, ProtocolVersion};
 
 use crate::backend_proto::OpenBoundaryRequest;
 use crate::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
-use crate::proto::{BoundaryChunk, boundary_chunk::Payload};
+use crate::proto::{SandboxFrame, sandbox_frame::Payload};
 
 pub const SANDBOX_PROTOCOL_CAPABILITY: &str = "openshell.sandbox.protocol";
 const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
@@ -66,21 +66,21 @@ pub fn validate_open(
 }
 
 #[must_use]
-pub fn data_chunk(data: Vec<u8>) -> BoundaryChunk {
-    BoundaryChunk {
+pub fn data_chunk(data: Vec<u8>) -> SandboxFrame {
+    SandboxFrame {
         payload: Some(Payload::RelayData(data)),
     }
 }
 
 #[must_use]
-pub fn boundary_chunk(boundary_id: &str) -> BoundaryChunk {
-    BoundaryChunk {
+pub fn sandbox_frame(boundary_id: &str) -> SandboxFrame {
+    SandboxFrame {
         payload: Some(Payload::BoundaryId(boundary_id.to_string())),
     }
 }
 
 /// Adapt a single typed frame for callers inspecting a local response.
-pub fn chunk_data(chunk: BoundaryChunk) -> Result<Vec<u8>, tonic::Status> {
+pub fn chunk_data(chunk: SandboxFrame) -> Result<Vec<u8>, tonic::Status> {
     let mut mode = match chunk.payload.as_ref() {
         Some(Payload::Request(_)) => crate::stream_adapter::Mode::Request,
         Some(Payload::Response(_)) => crate::stream_adapter::Mode::Response,
@@ -88,7 +88,7 @@ pub fn chunk_data(chunk: BoundaryChunk) -> Result<Vec<u8>, tonic::Status> {
         Some(Payload::Stdout(_) | Payload::Stderr(_) | Payload::Exit(_)) => {
             crate::stream_adapter::Mode::Output
         }
-        Some(Payload::NetworkDecision(_)) => crate::stream_adapter::Mode::Decision,
+        Some(Payload::TcpOpenDecision(_)) => crate::stream_adapter::Mode::Decision,
         Some(Payload::DnsQuery(_)) => crate::stream_adapter::Mode::DnsQueries,
         Some(Payload::DnsResponse(_)) => crate::stream_adapter::Mode::DnsResponses,
         _ => crate::stream_adapter::Mode::Relay,
@@ -100,9 +100,9 @@ pub fn chunk_data(chunk: BoundaryChunk) -> Result<Vec<u8>, tonic::Status> {
 /// A typed control request after the stream's boundary-binding frame.
 pub fn request_chunk(
     request: &crate::boundary_protocol::RequestEnvelope,
-) -> Result<BoundaryChunk, crate::boundary_protocol::FrameError> {
+) -> Result<SandboxFrame, crate::boundary_protocol::FrameError> {
     use crate::protobuf::WireMessage;
-    Ok(BoundaryChunk {
+    Ok(SandboxFrame {
         payload: Some(Payload::Request(request.to_proto()?)),
     })
 }
@@ -110,9 +110,9 @@ pub fn request_chunk(
 /// A typed control response, preserving the request's correlation ID.
 pub fn response_chunk(
     response: &crate::boundary_protocol::ResponseEnvelope,
-) -> Result<BoundaryChunk, crate::boundary_protocol::FrameError> {
+) -> Result<SandboxFrame, crate::boundary_protocol::FrameError> {
     use crate::protobuf::WireMessage;
-    Ok(BoundaryChunk {
+    Ok(SandboxFrame {
         payload: Some(Payload::Response(response.to_proto()?)),
     })
 }

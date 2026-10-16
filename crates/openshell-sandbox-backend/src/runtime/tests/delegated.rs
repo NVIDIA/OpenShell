@@ -41,7 +41,7 @@ async fn external_backend(
                         driver_descriptor: Some(OPAQUE_PAYLOAD.to_vec()),
                         ..TestIsolationBackend::default()
                     }))
-                    .add_service(SandboxBoundaryServer::new(service))
+                    .add_service(SandboxProtocolServer::new(service))
                     .serve_with_incoming(tokio_stream::iter([Ok::<_, std::io::Error>(TestTlsIo(
                         Box::new(stream),
                     ))]))

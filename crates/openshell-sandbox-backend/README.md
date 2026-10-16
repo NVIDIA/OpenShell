@@ -26,7 +26,7 @@ negotiator checks major versions and each peer's required capabilities. The
 built-in runtime does not advertise `openshell.sandbox.suspend-resume` and
 returns `UNIMPLEMENTED` for those optional RPCs.
 
-`SandboxBoundary.Exchange` and `.Mediate` begin with the handle from
+`SandboxProtocol.Exchange` and `.Mediate` begin with the handle from
 `OpenBoundary`. The server authenticates the stream's bearer, checks the handle
 against its provisioned sandbox and generation, then accepts typed protobuf
 requests, responses, process I/O, network decisions, relay data, and DNS messages.
