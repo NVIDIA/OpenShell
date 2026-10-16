@@ -16,7 +16,8 @@ to alert on saturation, to follow rollouts, and to choose autoscaling signals.
 
 The gateway serves `GET /metrics` in the Prometheus text format on its own
 listener, separate from the API and health ports. When the listener is
-disabled, the gateway records no metrics. Enable it in one of these ways:
+disabled and OTLP push is off, the gateway records no metrics. Enable it in one
+of these ways:
 
 - In `gateway.toml`, set `metrics_bind_address` under `[openshell.gateway]`,
   for example `metrics_bind_address = "0.0.0.0:9090"`. Refer to
@@ -136,6 +137,25 @@ Then read the metrics from another terminal:
 ```shell
 curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessions'
 ```
+
+## Push Metrics over OTLP
+
+The gateway can also push the same metrics to an OTLP collector over gRPC. It
+is off by default and does not replace the scrape endpoint. Enable it in
+`gateway.toml`:
+
+```toml
+[openshell.gateway.otlp]
+endpoint = "http://otel-collector.observability.svc:4317"
+metrics  = true
+```
+
+`metrics = true` sends metrics to the `endpoint`. To send them to another
+collector, use a `[openshell.gateway.otlp.metrics]` table with `enabled = true`
+and its own `endpoint`. Counters, gauges, and histograms keep their names and
+labels, and histograms use the latency buckets in seconds. The gateway pushes
+every 60 seconds. For the interval and other export tuning, refer to
+[Tuning](/how-it-works/gateways/configuration#tuning).
 
 ## Metric Names
 

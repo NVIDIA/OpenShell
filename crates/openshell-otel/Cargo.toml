@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-otel"
-description = "Shared OpenTelemetry trace and log export support for OpenShell services"
+description = "Shared OpenTelemetry trace, log, and metric export support for OpenShell services"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,10 +14,11 @@ repository.workspace = true
 futures = { workspace = true }
 http = { workspace = true }
 metrics = { workspace = true }
+metrics-util = { workspace = true }
 openshell-ocsf = { path = "../openshell-ocsf" }
 opentelemetry = { workspace = true }
-opentelemetry_sdk = { workspace = true, features = ["logs"] }
-opentelemetry-otlp = { workspace = true, features = ["logs"] }
+opentelemetry_sdk = { workspace = true, features = ["logs", "metrics"] }
+opentelemetry-otlp = { workspace = true, features = ["logs", "metrics"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

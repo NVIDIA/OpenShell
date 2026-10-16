@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-otel-test-support"
-description = "Shared OTLP collector fixture for OpenShell tracing tests"
+description = "Shared OTLP collector fixture for OpenShell telemetry tests"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ repository.workspace = true
 
 [dependencies]
 openshell-otel = { path = "../openshell-otel" }
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "trace"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace"] }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "tls-aws-lc"] }
