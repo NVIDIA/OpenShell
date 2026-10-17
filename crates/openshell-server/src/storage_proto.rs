@@ -156,8 +156,10 @@ mod tests {
     // Sandbox-wide grant reporting adds TokenGrantFailureObservation to both
     // closures and TokenGrantStatus to public reports. Older rows have no grant
     // record; absent report extensions retain compatibility without a rewrite.
+    // Supervisor middleware binding policy and selectors are public-only. An
+    // absent policy preserves dynamic discovery; older supervisors ignore both fields.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "a91e2244a2c1a8e369efe85bd0e4f2769f0f29f6263137280fe38e8a8da3cc6e";
+        "5ae09053b7d6a114971edc32770918d63ae5848bb9670135b67d7891dec1ccd5";
     const DURABLE_SCHEMA_SHA256: &str =
         "d4dc7abdb91b919db1f7be0d4652e30cbfda86f3b2ed9b59d5de1f76a2bf691d";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -679,7 +681,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (328, 29),
+                (328, 31),
                 (95, 22),
                 (83, 22),
                 PUBLIC_RPC_SCHEMA_SHA256,

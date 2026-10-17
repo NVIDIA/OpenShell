@@ -541,20 +541,21 @@ impl GatewayInterceptorConfig {
     }
 }
 
-/// Operator policy for authorizing interceptor manifest bindings.
+/// Operator policy for authorizing bindings advertised by an extension.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GatewayInterceptorBindingPolicy {
-    /// Preserve manifest-controlled binding discovery. Configured bindings
-    /// may narrow or disable manifest declarations.
+    /// Preserve manifest-controlled binding discovery.
     #[default]
     Dynamic,
-    /// Enable only configured RPC selectors and phases. Extra manifest
-    /// declarations are ignored.
+    /// Require and enable only configured bindings. Ignore extra declarations.
     Allowlist,
-    /// Require configured and manifest RPC selectors and phases to match.
+    /// Require configured and manifest bindings to match exactly.
     Exact,
 }
+
+/// The binding policy shared by gateway interceptors and supervisor middleware.
+pub use GatewayInterceptorBindingPolicy as ExtensionBindingPolicy;
 
 /// One configured source in the gateway's effective provider-profile catalog.
 ///

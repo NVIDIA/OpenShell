@@ -543,13 +543,30 @@ max_payload_bytes = 262144
 timeout = "500ms"
 ```
 
-Each service implements the supervisor middleware gRPC contract and exposes bindings through `Describe`. Policies reference the operator-owned registration `name`, attaching the complete middleware and all of its bindings. Bindings are identified by operation and phase. A manifest may expose at most one binding for each operation and phase pair. V1 supports `HttpRequest/pre_credentials`, `HttpResponse/pre_return`, and `WebSocketMessage/pre_credentials`. Registration names must be unique, and operator-run registrations cannot claim the reserved `openshell/` namespace. The service-reported manifest name is diagnostic metadata and does not need to match the registration name.
+Each service advertises operation and phase pairs through `Describe`. A sandbox policy attaches the service by its registration `name`; the gateway operator controls which bindings that attachment can use. Registration names must be unique and cannot start with the reserved `openshell/` namespace. The name in the service manifest is for diagnostics only.
+
+| `binding_policy` | What the gateway and supervisor require |
+| --- | --- |
+| `dynamic` (default) | Use all valid advertised bindings. Omit `bindings`. A service update can change which hooks run. |
+| `allowlist` | Require every entry in `bindings`. Ignore additional valid bindings the service advertises. |
+| `exact` | Require the service to advertise exactly the entries in `bindings`. |
+
+For example, add the following lines to the registration above to require a request hook even if the service also offers a response hook:
+
+```toml
+binding_policy = "allowlist"
+bindings = ["http_request_pre_credentials"]
+```
+
+The other supported bindings are `http_response_pre_return` and `websocket_message_pre_credentials`. Use each binding at most once. To require the check on matching traffic, attach the service in sandbox policy and keep the default `on_error: fail_closed` behavior.
+
+Upgrade the gateway and all supervisors before relying on `allowlist` or `exact`. Older supervisors ignore these fields. A running supervisor that rejects a configuration update keeps its last accepted configuration; confirm the new configuration is active before depending on the change.
 
 The gateway connects to every registered service and validates `Describe` before it starts. The service must therefore be running before the gateway. Policy creation and full policy updates call `ValidateConfig`; an unavailable service or invalid middleware configuration rejects the policy before persistence.
 
 Startup also requires compatible [extension protocol metadata](/extensibility/overview#protocol-negotiation). Upgrade legacy gateways and operator-run services together during a coordinated outage; neither mixed legacy/current pairing is supported. A service rejects a gateway that omits peer metadata, and a gateway rejects a service that omits metadata, uses another protocol major, or requires unsupported gateway capabilities. Protected `GetGatewayInfo` and `openshell gateway info` report the resulting non-secret snapshot.
 
-`max_payload_bytes` is the shared operator limit for inspectable logical payloads across every binding exposed by the service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
+`max_payload_bytes` is the shared operator limit for inspectable logical payloads across the bindings authorized for this service. It caps HTTP request and response units, replacement bodies, and complete WebSocket text messages and replacements. Whole-response inspection uses it as the stage's total body limit. Streaming response inspection applies it to each unit. The value must be greater than zero, no larger than each binding's advertised `max_payload_bytes` capability, and no larger than the 4 MiB platform maximum. OpenShell rejects oversized values instead of silently clamping them. Binary WebSocket messages are not exposed to V1 middleware, so this field does not limit binary pass-through. Middleware gRPC servers should allow messages of at least 4 MiB plus 293 KiB so a maximum-size payload and its protobuf envelope fit on the transport.
 
 `timeout` is the operator-configured service-wide RPC timeout. It accepts the same compact duration syntax as gateway interceptors: an integer followed by `ms` or `s`, such as `500ms` or `2s`. Values must be between `10ms` and `30s`, inclusive. Omit the field to use the 500 ms platform default. A binding may advertise a shorter `timeout` in the `Describe` manifest, but it cannot extend the operator-configured deadline; OpenShell uses the smaller value. OpenShell validates both levels before accepting the service. The operator-configured service timeout applies to `Describe` and `ValidateConfig`. The effective binding timeout applies to HTTP request evaluation, HTTP response preflight and unit exchanges, WebSocket preflight, and each WebSocket message. Accepted streaming protocols have no connection-wide RPC deadline.
 
