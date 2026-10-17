@@ -1848,6 +1848,7 @@ dependencies = [
  "nix",
  "noyalib",
  "openshell-crypto",
+ "openshell-ocsf",
  "openshell-otel-test-support",
  "opentelemetry-proto",
  "prost",

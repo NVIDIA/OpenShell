@@ -147,7 +147,13 @@ For gateway-produced records, `device.os.name` and `device.os.type_id` identify 
 
 `metadata.uid` uniquely identifies an event and stays unchanged when that record is serialized again. Use `container.uid` to associate the event with its sandbox, not `metadata.uid`. Records without a sandbox association omit the container; unknown images are omitted rather than represented by an empty image name.
 
-Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object when no downgrade is configured. Here is an example of a network connection event:
+Some fields depend on the event class:
+
+- SSH Activity records name the supervisor's SSH server as `dst_endpoint`, with `svc_name: "ssh"` and the listen socket path in `name`, because the server listens on a Unix socket rather than a network address.
+- Process Activity records from the sandbox name the `openshell-sandbox` launcher as `actor.process`.
+- `connection_info` carries `direction_id` and `direction`. OpenShell reports Unknown (`0`) where it does not track the direction.
+
+Each JSONL file line, or the payload after the stderr marker, is a complete OCSF v1.8.0 JSON object when no downgrade is configured. Records validate against OCSF v1.8.0 except for the top-level `container` object, which OCSF does not define at the event level. Here is an example of a network connection event:
 
 ```json
 {
