@@ -26,7 +26,9 @@
 # (ci/values-openshift-e2e.yaml).
 #
 # Every OpenShift-specific branch below is gated on OPENSHIFT_DETECTED, so the
-# vanilla-Kubernetes path stays exactly the same.
+# vanilla-Kubernetes path stays exactly the same. Detection probes the cluster
+# and aborts if it cannot answer conclusively; set OPENSHELL_E2E_OPENSHIFT to
+# 1 or 0 to force the answer and skip the probe.
 #
 # Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
 # files, relative to the repository root or absolute, to layer additional chart
@@ -1215,9 +1217,14 @@ AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION}" \
   bash "${ROOT}/e2e/support/install-agent-sandbox.sh" --context "${KUBE_CONTEXT}"
 
 # Detect OpenShift up front so fixtures deployed below can apply SCC-compatible
-# handling; the gateway setup further down reuses this flag.
-if kctl api-resources --api-group=route.openshift.io --no-headers 2>/dev/null | grep -q .; then
-  OPENSHIFT_DETECTED=1
+# handling; the gateway setup further down reuses this flag. A probe that cannot
+# reach a conclusive answer aborts the run: silently assuming vanilla Kubernetes
+# would reconfigure every OpenShift-gated branch below.
+if ! OPENSHIFT_DETECTED="$(e2e_detect_openshift "${KUBE_CONTEXT}")"; then
+  exit 2
+fi
+
+if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   if ! command -v oc >/dev/null 2>&1; then
     echo "ERROR: oc CLI is required for OpenShift SCC management but was not found." >&2
     exit 2

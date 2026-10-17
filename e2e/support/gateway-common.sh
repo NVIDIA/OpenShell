@@ -566,3 +566,91 @@ e2e_print_gateway_log_on_failure() {
     echo "=== end gateway log ==="
   fi
 }
+
+# Single API path used to decide whether a cluster is OpenShift. Reading one
+# group version asks the API server about `route.openshift.io` alone, so an
+# unrelated unavailable aggregated APIService cannot make an OpenShift cluster
+# look like vanilla Kubernetes the way `kubectl api-resources` can.
+E2E_OPENSHIFT_PROBE_PATH="/apis/route.openshift.io/v1"
+
+# True when a failed probe proves the API group is genuinely absent rather than
+# momentarily unreachable. Only a NotFound answer from the API server is
+# conclusive; connection, authentication, and throttling errors are not.
+e2e_openshift_probe_output_is_absent() {
+  local output=$1
+
+  [[ "${output}" == *"(NotFound)"* ]] \
+    || [[ "${output}" == *"could not find the requested resource"* ]]
+}
+
+# Decide whether the cluster behind a kubectl context is OpenShift.
+#
+# Prints `1` or `0` on stdout and returns 0 only when the answer is conclusive.
+# Returns non-zero after logging the probe and the underlying error when it is
+# not, so callers fail fast instead of silently taking the vanilla-Kubernetes
+# path on a transient discovery failure. The outcome is always logged to stderr.
+#
+# Overrides:
+#   OPENSHELL_E2E_OPENSHIFT                 1/true/yes or 0/false/no to skip the probe
+#   OPENSHELL_E2E_OPENSHIFT_PROBE_ATTEMPTS  probe attempts before giving up (default 5)
+#   OPENSHELL_E2E_OPENSHIFT_PROBE_DELAY     seconds before the first retry, doubling (default 2)
+e2e_detect_openshift() {
+  local context=$1
+  local override="${OPENSHELL_E2E_OPENSHIFT:-}"
+  local attempts="${OPENSHELL_E2E_OPENSHIFT_PROBE_ATTEMPTS:-5}"
+  local delay="${OPENSHELL_E2E_OPENSHIFT_PROBE_DELAY:-2}"
+  local probe="kubectl --context ${context} get --raw ${E2E_OPENSHIFT_PROBE_PATH}"
+  local attempt=1
+  local status=0
+  local output=""
+
+  case "${override}" in
+    "") ;;
+    1 | true | TRUE | yes | YES)
+      echo "OpenShift detection: cluster is OpenShift (forced by OPENSHELL_E2E_OPENSHIFT=${override})." >&2
+      printf '1\n'
+      return 0
+      ;;
+    0 | false | FALSE | no | NO)
+      echo "OpenShift detection: cluster is not OpenShift (forced by OPENSHELL_E2E_OPENSHIFT=${override})." >&2
+      printf '0\n'
+      return 0
+      ;;
+    *)
+      echo "ERROR: OPENSHELL_E2E_OPENSHIFT must be 1/true/yes or 0/false/no, got '${override}'." >&2
+      return 2
+      ;;
+  esac
+
+  while :; do
+    status=0
+    output="$(kubectl --context "${context}" get --raw "${E2E_OPENSHIFT_PROBE_PATH}" 2>&1)" || status=$?
+
+    if [ "${status}" -eq 0 ]; then
+      echo "OpenShift detection: cluster is OpenShift (probe: ${probe})." >&2
+      printf '1\n'
+      return 0
+    fi
+
+    if e2e_openshift_probe_output_is_absent "${output}"; then
+      echo "OpenShift detection: cluster is not OpenShift (probe: ${probe} reports the API group is absent)." >&2
+      printf '0\n'
+      return 0
+    fi
+
+    if [ "${attempt}" -ge "${attempts}" ]; then
+      break
+    fi
+
+    echo "WARNING: OpenShift detection probe failed (attempt ${attempt}/${attempts}, exit ${status}), retrying in ${delay}s: ${output}" >&2
+    sleep "${delay}"
+    delay=$((delay * 2))
+    attempt=$((attempt + 1))
+  done
+
+  echo "ERROR: could not determine whether context '${context}' is OpenShift after ${attempts} attempt(s)." >&2
+  echo "ERROR: probe: ${probe}" >&2
+  echo "ERROR: last failure (exit ${status}): ${output}" >&2
+  echo "ERROR: set OPENSHELL_E2E_OPENSHIFT=1 or OPENSHELL_E2E_OPENSHIFT=0 to bypass detection." >&2
+  return 1
+}
