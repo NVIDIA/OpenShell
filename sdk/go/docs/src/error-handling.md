@@ -42,6 +42,7 @@ Use these top-level functions to check error types. They work with wrapped error
 | `v1.IsInvalidArgument` | `ErrorInvalidArgument` | Invalid request parameters                  |
 | `v1.IsDeadlineExceeded` | `ErrorDeadlineExceeded` | Operation timed out                       |
 | `v1.IsCancelled`     | `ErrorCancelled`     | Operation was cancelled (context cancellation)   |
+| `v1.IsOutOfRange`    | `ErrorOutOfRange`    | A stream resume cursor is gone and the events after it are unrecoverable |
 
 For `ErrorInternal` (server-side errors), no convenience predicate exists. Match it directly via the `Code` field:
 
