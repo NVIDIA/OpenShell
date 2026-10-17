@@ -1245,6 +1245,30 @@ mod tests {
     {
         type EvaluateWebSocketSessionStream = super::super::WebSocketResponseStream;
 
+        type EvaluateHttpRequestSessionStream = super::super::HttpRequestSessionResultStream;
+
+        async fn evaluate_http_request_session(
+            &self,
+            _request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::HttpRequestSessionEvent>,
+            >,
+        ) -> Result<tonic::Response<Self::EvaluateHttpRequestSessionStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
+        }
+
+        type EvaluateHttpResponseSessionStream = super::super::HttpResponseSessionResultStream;
+
+        async fn evaluate_http_response_session(
+            &self,
+            _request: tonic::Request<
+                tonic::Streaming<openshell_core::proto::HttpResponseSessionEvent>,
+            >,
+        ) -> Result<tonic::Response<Self::EvaluateHttpResponseSessionStream>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("v1 HTTP hook test service"))
+        }
+
         async fn describe(
             &self,
             _request: tonic::Request<openshell_core::proto::MiddlewareDescribeRequest>,
@@ -1914,6 +1938,7 @@ mod tests {
             binding: None,
             max_payload_bytes: 1,
             timeout: Duration::from_millis(500),
+            http_hook_version: None,
         };
 
         let modes = permitted_body_modes(&input(200), &described, None);
