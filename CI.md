@@ -325,6 +325,11 @@ Set `needs: security` on a downstream promotion job to require successful scans.
 `Release` and `Pre-release` share `release-build.yml`, `release-publish.yml`, and
 `release-qualification.yml`. Release builds, qualifies, then publishes. Pre-release
 builds, then publishes and qualifies in parallel within the same run, using native job dependencies.
+Stable GitHub Release notes are written by the Claude Code GitHub Action with
+Claude Opus 5.5. The build passes a compare link from the previous stable tag
+to the new tag; Claude uses it to read merged PR descriptions and writes the
+release body to an artifact. The `ANTHROPIC_API_KEY` repository secret is required
+for stable publication; an action failure stops publication.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014

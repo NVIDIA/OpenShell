@@ -399,6 +399,8 @@ Issues and pull requests receive `state:stale` after 14 days without activity. O
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
+For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
+
 Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
 Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.

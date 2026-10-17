@@ -53,6 +53,7 @@ jobs:
     permissions:
       actions: read
       contents: write
+      pull-requests: read
       packages: write
       id-token: write
       attestations: write
@@ -61,6 +62,7 @@ jobs:
     with:
       release-tag: ${{ inputs.tag || github.ref_name }}
       source-sha: ${{ needs.build.outputs.source_sha }}
+      previous-stable-tag: ${{ needs.build.outputs.previous_stable_tag }}
       semver: ${{ needs.build.outputs.semver }}
       python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
@@ -70,3 +72,4 @@ jobs:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
       GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
       GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
