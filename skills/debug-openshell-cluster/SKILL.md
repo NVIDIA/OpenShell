@@ -538,7 +538,9 @@ workspace-profile, and other replicas' global changes delay them only while
 another operation on the same sandbox waits behind the change, holding that
 sandbox's key. Provisioning-deadline expiry also takes
 its workspace key locally, so provider and workspace-profile changes on the
-same replica can delay it. Each
+same replica can delay it;
+`openshell_server_provisioning_deadline_skips_total{overdue="true"}` counts
+the checks that skipped an overdue sandbox. Each
 replica takes its advisory locks on a dedicated lock pool of PostgreSQL
 connections, one per guard, 4 by default (gateway config
 `database_lock_max_connections`), so at most that many guarded
