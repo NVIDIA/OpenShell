@@ -3573,7 +3573,8 @@ type CreateSandboxRequest struct {
 	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
 	// Optional labels for the sandbox (key-value metadata).
 	Labels map[string]string `protobuf:"bytes,3,rep,name=labels,proto3" json:"labels,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Optional annotations for the sandbox (non-selector metadata).
+	// Optional annotations for the sandbox (non-selector metadata). Keys under
+	// the `internal.openshell.ai/` prefix are reserved for the gateway.
 	Annotations map[string]string `protobuf:"bytes,4,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// One-shot launch hint indicating that the creating client will attach to
 	// the canonical main process. The supervisor keeps the terminal transport
@@ -12036,7 +12037,8 @@ type UpdateConfigRequest struct {
 	// not interpret or verify their semantics. For policy updates, the gateway
 	// stores the annotations immutably with the revision and merges them into
 	// sandbox metadata as a convenience projection. For setting-only updates, it
-	// only merges them into sandbox metadata.
+	// only merges them into sandbox metadata. Keys under the
+	// `internal.openshell.ai/` prefix are reserved for the gateway.
 	Annotations map[string]string `protobuf:"bytes,9,rep,name=annotations,proto3" json:"annotations,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	// Required for sandbox-scoped updates and empty for global updates.
 	Sandbox string `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
