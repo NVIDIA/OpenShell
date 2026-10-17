@@ -265,6 +265,10 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -288,6 +292,7 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
+            context.network_trust_bundle().cloned(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -332,6 +337,10 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -357,6 +366,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             context.gateway_bind_address(),
             context.gateway_log_level(),
             &config,
+            context.network_trust_bundle().cloned(),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -398,6 +408,10 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         true
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -420,9 +434,12 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
-        let driver = openshell_driver_podman::PodmanComputeDriver::new(config)
-            .await
-            .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        let driver = openshell_driver_podman::PodmanComputeDriver::new(
+            config,
+            context.network_trust_bundle().cloned(),
+        )
+        .await
+        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
         let driver = openshell_driver_podman::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
@@ -470,6 +487,10 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             .map_err(openshell_core::Error::config)
     }
 
+    fn supports_network_supervisor_trust(&self) -> bool {
+        true
+    }
+
     fn validate_config(
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
@@ -508,6 +529,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             context.gateway_name(),
             &config,
             context.otlp_config(),
+            context.network_trust_bundle(),
         )
         .await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
@@ -691,5 +713,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn first_party_network_supervisor_drivers_opt_into_trust_propagation() {
+        #[cfg(feature = "compute-driver-docker")]
+        assert!(<DockerFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&DockerFactory));
+        #[cfg(feature = "compute-driver-kubernetes")]
+        assert!(<KubernetesFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&KubernetesFactory));
+        #[cfg(feature = "compute-driver-podman")]
+        assert!(<PodmanFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&PodmanFactory));
+        #[cfg(feature = "compute-driver-vm")]
+        assert!(<VmFactory as openshell_server::ComputeDriverFactory>::supports_network_supervisor_trust(&VmFactory));
     }
 }
