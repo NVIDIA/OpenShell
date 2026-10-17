@@ -8,8 +8,7 @@ use crate::opa::PolicyGenerationGuard;
 use miette::{Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
-    ocsf_emit,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -915,10 +914,7 @@ pub(super) fn middleware_events(
             } else {
                 SeverityId::Medium
             })
-            .http_request(HttpRequest::new(
-                &req.action,
-                OcsfUrl::new("http", &ctx.host, &req.target, ctx.port),
-            ))
+            .http_request(HttpRequest::new(&req.action, ctx.ocsf_url(&req.target)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .firewall_rule(&ctx.policy_name, "middleware")
             .unmapped("transformed", invocation.transformed)

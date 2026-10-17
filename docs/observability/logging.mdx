@@ -146,7 +146,7 @@ OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy
 A supervisor middleware HTTP event records whether it transformed the request. If the middleware also emits a finding, that remains a separate event:
 
 ```text
-OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware] [failed:false transformed:true]
+OCSF HTTP:POST [INFO] ALLOWED POST https://httpbin.org/anything [policy:httpbin engine:middleware] [failed:false transformed:true]
 OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match count:1 middleware:prototype-content-guard]
 ```
 

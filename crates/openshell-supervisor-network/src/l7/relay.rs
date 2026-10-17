@@ -102,6 +102,11 @@ impl L7EvalContext {
     pub(crate) fn websocket_scheme(&self) -> &'static str {
         if self.is_plaintext() { "ws" } else { "wss" }
     }
+
+    /// OCSF URL for `target` on the inspected transport.
+    pub(crate) fn ocsf_url(&self, target: &str) -> OcsfUrl {
+        OcsfUrl::new(self.request_scheme(), &self.host, target, self.port)
+    }
 }
 
 fn request_default_port(ctx: &L7EvalContext) -> Option<u16> {
@@ -1696,10 +1701,7 @@ fn build_l7_request_event(
         .action(action_id)
         .disposition(disposition_id)
         .severity(severity)
-        .http_request(HttpRequest::new(
-            action,
-            OcsfUrl::new("http", &ctx.host, redacted_target, ctx.port),
-        ))
+        .http_request(HttpRequest::new(action, ctx.ocsf_url(redacted_target)))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, engine_type)
         .message(message)
@@ -2158,7 +2160,7 @@ where
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, "l7")
@@ -2582,7 +2584,7 @@ where
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, jsonrpc_engine_type(config.protocol))
@@ -2868,7 +2870,7 @@ where
                 .severity(severity)
                 .http_request(HttpRequest::new(
                     &request_info.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, "l7-graphql")
@@ -3339,7 +3341,7 @@ fn emit_transformed_body_decision(
         .severity(severity)
         .http_request(HttpRequest::new(
             &request_info.action,
-            OcsfUrl::new("http", &ctx.host, &request_info.target, ctx.port),
+            ctx.ocsf_url(&request_info.target),
         ))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
         .firewall_rule(&ctx.policy_name, engine_type)
@@ -3573,7 +3575,7 @@ where
                 .severity(SeverityId::Informational)
                 .http_request(HttpRequest::new(
                     &req.action,
-                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                    ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .message(format!(
@@ -7814,7 +7816,7 @@ network_policies:
         assert_eq!(denied_json["unmapped"]["failed"], false);
         assert_eq!(
             denied_http.format_shorthand(),
-            "HTTP:POST [MED] DENIED POST http://api.example.test:443/v1/messages \
+            "HTTP:POST [MED] DENIED POST https://api.example.test/v1/messages \
              [policy:rest_api engine:middleware] \
              [failed:false transformed:false \
              reason:middleware_denied:content-guard:content_match]"
@@ -9023,6 +9025,7 @@ network_policies:
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
             port: 443,
+            request_default_port: Some(443),
             policy_name: "route_api".into(),
             ..Default::default()
         };
@@ -9041,8 +9044,26 @@ network_policies:
         assert_eq!(event.base().severity, SeverityId::Medium);
         assert_eq!(
             event.format_shorthand(),
-            "HTTP:GET [MED] DENIED GET http://gateway.example.test:443/other [policy:route_api engine:l7] [reason:L7_REQUEST deny GET gateway.example.test:443/other reason=no L7 endpoint path matched request]"
+            "HTTP:GET [MED] DENIED GET https://gateway.example.test/other [policy:route_api engine:l7] [reason:L7_REQUEST deny GET gateway.example.test:443/other reason=no L7 endpoint path matched request]"
         );
+    }
+
+    #[test]
+    fn request_event_url_scheme_follows_transport() {
+        for (port, scheme) in [(80, "http"), (443, "https")] {
+            let ctx = L7EvalContext {
+                host: "api.example.test".into(),
+                port,
+                request_default_port: Some(port),
+                policy_name: "api".into(),
+                ..Default::default()
+            };
+
+            let event = build_l7_request_event(&ctx, "GET", "/v1", "allow", "l7", "ok", None);
+
+            let json = event.to_json().unwrap();
+            assert_eq!(json["http_request"]["url"]["scheme"], scheme);
+        }
     }
 
     #[tokio::test]
