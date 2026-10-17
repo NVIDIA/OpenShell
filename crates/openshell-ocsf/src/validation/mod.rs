@@ -6,6 +6,9 @@
 //! Available in this crate's tests or through the `test-support` feature for
 //! producer regression tests.
 
+mod embedded;
 pub mod schema;
 
-pub use schema::{load_class_schema, validate_enum_value, validate_required_fields};
+pub use schema::{
+    load_class_schema, load_class_schema_for_version, validate_enum_value, validate_required_fields,
+};

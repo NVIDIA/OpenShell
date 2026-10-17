@@ -37,6 +37,7 @@ PODMAN_CI_TESTS=(
   live_policy_update
   local_driver_token_restart
   no_proxy
+  ocsf_jsonl_conformance
   podman_corporate_proxy
   podman_gateway_start
   podman_host_gateway
