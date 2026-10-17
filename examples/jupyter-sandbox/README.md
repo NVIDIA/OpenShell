@@ -39,6 +39,9 @@ openshell sandbox create \
     --IdentityProvider.token="$JUPYTER_TOKEN"
 ```
 
+To use Cedar, pass `--policy policy.cedar`. A Cedar policy has no process
+section, so the server runs as the image user, `jovyan`.
+
 The CLI prints the service URL after the sandbox is ready. Jupyter starts as
 the sandbox's main process and listens on its loopback port. Keep the token in
 this shell for step 3.

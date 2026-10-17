@@ -22,7 +22,6 @@ use futures::TryStreamExt;
 use openshell_core::GetResourceVersion;
 use openshell_core::endpoint_failure::validate_endpoint_failure;
 use openshell_core::endpoint_status::{initial_endpoint_status, valid_token_grant_destination};
-use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::proto::{
     EndpointResult, EndpointStatus, PolicySource, ReportEndpointStatusRequest,
     ReportEndpointStatusResponse, Sandbox, SandboxPolicy as ProtoSandboxPolicy, SandboxStatus,
@@ -796,13 +795,13 @@ pub fn invalidate_endpoint_status_without_session(sandbox: &mut Sandbox) {
 
 fn expected_endpoint_statuses(policy: &ProtoSandboxPolicy) -> BTreeMap<String, ExpectedEndpoint> {
     let mut endpoints = BTreeMap::new();
-    for endpoint in policy
-        .network_policies
-        .values()
-        .flat_map(|rule| &rule.endpoints)
-        .filter(|endpoint| is_mcp_protocol(&endpoint.protocol))
+    for endpoint in openshell_policy::endpoint_status::configured_mcp_endpoints(policy)
+        .unwrap_or_else(|_| {
+            tracing::warn!("invalid policy has no endpoint status inventory");
+            Vec::new()
+        })
     {
-        let status = initial_endpoint_status(endpoint);
+        let status = initial_endpoint_status(&endpoint);
         endpoints
             .entry(status.endpoint_id.clone())
             .and_modify(|expected: &mut ExpectedEndpoint| {

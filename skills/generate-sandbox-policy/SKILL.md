@@ -1,17 +1,33 @@
 ---
 name: generate-sandbox-policy
-description: Generate sandbox security policies from plain-language requirements and optional REST API documentation. Produces L4 or fine-grained L7 network policies and ordered network middleware configuration. Use for API access rules, middleware host selection, failure behavior, or built-in and operator-run middleware attachment. Trigger keywords - generate policy, create policy, update policy, change policy, sandbox policy, network policy, API policy, security policy, allow API, restrict API, network middleware, supervisor middleware.
+description: Generate or edit YAML and Cedar sandbox security policies from plain-language requirements and optional REST API documentation, preserving the authored format and separate Cedar middleware configuration. Use for L4 or L7 API access rules, middleware host selection, failure behavior, or built-in and operator-run middleware attachment. Trigger keywords - generate policy, create policy, update policy, change policy, sandbox policy, network policy, API policy, security policy, allow API, restrict API, network middleware, supervisor middleware.
 ---
 
 # Generate Sandbox Policy
 
-Generate YAML sandbox network policies and network middleware configuration from API documentation and natural-language user requirements.
+Generate sandbox policies and network middleware configuration from API documentation and natural-language user requirements. Preserve YAML or Cedar when editing an existing policy.
 
 ## Overview
 
 This skill translates a user's plain-language policy intent into a valid sandbox policy. The amount of detail the user provides determines the granularity of the generated policy — from broad L4 or preset-based policies (just a host:port) up to fine-grained per-endpoint L7 rules (full API docs).
 
-The output is a `network_policies` YAML block, an optional `network_middlewares` block, and optionally a full policy file that conforms to the sandbox policy schema.
+For YAML, the output is a `network_policies` block, an optional `network_middlewares` block, and optionally a full policy file. For Cedar, the output is `.cedar` source plus a separate configuration file when needed.
+
+## Choose and Preserve the Policy Format
+
+Read the existing file before choosing an authoring workflow. A `.cedar` extension selects Cedar; other extensions select YAML. For a running sandbox, use `openshell policy get <name> --base --output json` and inspect `policy.cedar_policy_source`: a nonempty value identifies Cedar. The `openshell-cli` skill's policy iteration workflow shows how to extract the source and its separate configuration without mixing sections from table output.
+
+A sandbox cannot switch formats after creation. Keep Cedar source in `.cedar`; do not convert an existing Cedar policy to YAML or append YAML to it. Global policies must be YAML. For new policies, honor the requested format; use YAML when none is specified.
+
+### Cedar Authoring
+
+Use the published [Cedar policy guide](https://docs.nvidia.com/openshell/latest/how-it-works/policies/cedar) as the authority for accepted policy shapes, schema fields, and examples. Confirm the installed CLI's `sandbox create --help` and `policy set --help` before applying changes. The remaining numbered steps and YAML templates in this skill apply to YAML policies only; do not insert `network_policies`, access presets, or YAML rules into Cedar source.
+
+1. Preserve the existing filesystem grants, process configuration, endpoint settings, middleware, and unrelated Cedar policies. For a new policy, use the guide's complete Cedar examples to include the filesystem permissions the workload needs.
+2. Translate the requested scope into Cedar `permit` and `forbid` policies. `NetworkConnect` controls connections; `HttpRequest` controls inspected requests. An HTTP-only permit does not grant its connection. Restrict binary identity, hosts, ports, methods, and paths to the requested scope, and retain forbids. A provider attached to a Cedar sandbox supplies credentials and never grants access; explicitly permit only the intended provider endpoints and requests.
+3. Keep `network_middlewares`, `endpoint_settings`, and `process` in the separate YAML configuration file passed with `--middleware`. Preserve all three sections when replacing the policy, even if only the Cedar source changes. Process identity remains static after activation.
+4. Apply the complete source with `openshell policy set <name> --policy policy.cedar --middleware middleware.yaml --wait`, omitting `--middleware` only when the policy has no separate configuration to retain. Incremental `policy update` and YAML access presets do not author Cedar policies.
+5. Verify the requested allow and deny behavior and the loaded revision. Report the scope and relevant breadth concerns in plain language. Cedar staged policies are observational; use enforce mode for a required restriction.
 
 ## Step 1: Gather Inputs
 

@@ -85,6 +85,16 @@ The included policy allows `curl` to POST to `https://httpbin.org/anything` and 
 openshell sandbox create --policy examples/supervisor-middleware-content-guard/policy.yaml
 ```
 
+To use the Cedar version, pass the middleware separately, since a Cedar policy carries none:
+
+```shell
+openshell sandbox create \
+  --policy examples/supervisor-middleware-content-guard/policy.cedar \
+  --middleware examples/supervisor-middleware-content-guard/middleware.yaml
+```
+
+Set `POLICY_FORMAT=cedar` to run `smoke.sh` with these files.
+
 From the sandbox, send a matching request:
 
 ```shell

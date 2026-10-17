@@ -1,0 +1,145 @@
+namespace Sandbox {
+
+  // ── Principals ──────────────────────────────────────────────────────────
+
+  entity User {};
+  entity Group {};
+
+  // The principal of every action. It carries only the identity the
+  // supervisor knows at request time; it has no working directory.
+  entity Process {
+    user:     User,
+    group:    Group,
+  };
+
+  // ── Filesystem resources ─────────────────────────────────────────────────
+  // Parent-child hierarchy: FilesystemPath::"/usr/bin" in FilesystemPath::"/usr"
+  // enables `resource in FilesystemPath::"/usr"` to match any descendant.
+
+  entity FilesystemPath in [FilesystemPath] {};
+
+  // ── Network resources ────────────────────────────────────────────────────
+
+  entity NetworkEndpoint {
+    host:      String,
+    port:      Long,
+    protocol:  String,     // "rest", "grpc", etc.
+    // Precomputed "{host}:{port}", with the lowercase host. A NetworkConnect
+    // permit whose `when` conditions require `resource.host_port == "h:p"`,
+    // or `["h:p"].contains(resource.host_port)` with one element, names that
+    // endpoint for policy DNS as a scope literal does, and the literal must
+    // pass the same checks. A set with several elements grants no
+    // eligibility.
+    host_port: String,
+  };
+
+  // The decoded query parameters of one HttpRequest: one tag per key, holding
+  // one of that key's values. A request whose keys repeat is evaluated once
+  // per combination of values (see the HttpRequest action).
+  entity HttpQuery tags String;
+
+  // ── Actions ──────────────────────────────────────────────────────────────
+
+  action "ReadFile"
+    appliesTo {
+      principal: [Process],
+      resource:  [FilesystemPath],
+      context:   {}
+    };
+
+  action "WriteFile"
+    appliesTo {
+      principal: [Process],
+      resource:  [FilesystemPath],
+      context:   {}
+    };
+
+  // binary_path: absolute path of the executable making the call (plain
+  //              string, not a FilesystemPath entity - matching is
+  //              Set.contains()/like, not hierarchy traversal)
+  // ancestors:   absolute paths of the calling process's ancestors, from
+  //              /proc/<pid>/exe walks; excludes cmdline/argv0 (spoofable)
+  // binary_aliases: the exact binary paths policies name in
+  //              `context.binary_aliases.contains("...")` that are symlinks
+  //              in the sandbox resolving to binary_path or an ancestor, as
+  //              YAML expands a symlinked binary path. Empty until the
+  //              sandbox's entrypoint process is known.
+  // binary_globs: the binary glob patterns policies name in
+  //              `context.binary_globs.contains("...")` that match binary_path
+  //              or an ancestor with the YAML binary glob matcher (`*` within
+  //              one path segment, `**` as a whole segment across segments),
+  //              as a YAML binary glob matches the binary or any ancestor.
+  // There is no method, path, or command: CONNECT happens before any
+  //              request is read, so a policy that conditions a connection
+  //              on them fails strict validation. Gate per-request method
+  //              and path on the HttpRequest action, and give a policy that
+  //              reads them exactly that action in its scope.
+  // destination_ip: one resolved address of the destination, present only
+  //              once the host has been resolved. A connection is decided
+  //              first without it, then once per resolved address, so a
+  //              permit can require `context has destination_ip &&
+  //              context.destination_ip.isInRange(ip("10.0.5.0/24"))`. A
+  //              forbid that reads it is evaluated both times; before
+  //              resolution the `context has destination_ip` guard is false.
+  action "NetworkConnect"
+    appliesTo {
+      principal: [Process],
+      resource:  [NetworkEndpoint],
+      context: {
+        binary_path:     String,
+        ancestors:       Set<String>,
+        binary_aliases:  Set<String>,
+        binary_globs:    Set<String>,
+        destination_ip?: ipaddr,
+      }
+    };
+
+  // Per-request L7 enforcement within an already-permitted NetworkConnect
+  // tunnel. binary_path/ancestors/binary_aliases/binary_globs mirror
+  // NetworkConnect's fields (binary identity is re-checked per request,
+  // matching Rego's stateless per-call evaluation). method, path, and
+  // command are "" when they do not apply to the request's protocol.
+  //
+  // JSON-RPC and MCP (one request per call; batches are split):
+  //   jsonrpc_method          the call's method, "" when there is no call
+  //   jsonrpc_receive_stream  an MCP GET that opens the server-to-client stream
+  //   jsonrpc_response        the body carries client-to-server response frames
+  //   mcp_tool                tools/call params.name, "" otherwise
+  //   mcp_method_class        "available" (core method of the selected MCP
+  //                           revision), "extension", or "" for non-MCP
+  // Query parameters (every protocol):
+  //   query                   the decoded query parameters, as HttpQuery tags;
+  //                           read with context.query.hasTag("k") and
+  //                           context.query.getTag("k"). When a key repeats,
+  //                           the request is evaluated once per combination
+  //                           of values, and allowed only if no evaluation is
+  //                           denied and one permit allows every evaluation.
+  // GraphQL (one request per operation; a batch is denied if any is):
+  //   graphql_operation_type  "query", "mutation", "subscription", or "" for a
+  //                           hash-only persisted query
+  //   graphql_operation_name  the operation name, "" when anonymous
+  //   graphql_fields          the operation's top-level fields
+  action "HttpRequest"
+    appliesTo {
+      principal: [Process],
+      resource:  [NetworkEndpoint],
+      context: {
+        binary_path:            String,
+        ancestors:              Set<String>,
+        binary_aliases:         Set<String>,
+        binary_globs:           Set<String>,
+        method:                 String,
+        path:                   String,
+        command:                String,
+        jsonrpc_method:         String,
+        jsonrpc_receive_stream: Bool,
+        jsonrpc_response:       Bool,
+        mcp_tool:               String,
+        mcp_method_class:       String,
+        graphql_operation_type: String,
+        graphql_operation_name: String,
+        graphql_fields:         Set<String>,
+        query:                  HttpQuery,
+      }
+    };
+}

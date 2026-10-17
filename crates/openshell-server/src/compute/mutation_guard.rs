@@ -1156,15 +1156,19 @@ mod tests {
         }
     }
 
-    /// Enter `op`'s keys, keep them for `hold`, then leave them in reverse
+    /// Enter `op`'s keys, yield `yield_count` times, then leave them in reverse
     /// order. `local` is the occupancy of the replica that runs `op`; mutation
     /// guards also enter `fleet`. The caller holds `op`'s guards throughout.
-    async fn occupy(local: &Occupancy, fleet: &Occupancy, op: MixOp, hold: Duration) {
+    async fn occupy(local: &Occupancy, fleet: &Occupancy, op: MixOp, yield_count: u64) {
         local.enter(op);
         if op.is_distributed() {
             fleet.enter(op);
         }
-        tokio::time::sleep(hold).await;
+        // Exercise scheduling under contention without depending on the
+        // platform's timer resolution for thousands of lock-held sleeps.
+        for _ in 0..yield_count {
+            tokio::task::yield_now().await;
+        }
         if op.is_distributed() {
             fleet.leave(op);
         }
@@ -1172,7 +1176,7 @@ mod tests {
     }
 
     /// Run `tasks` tasks of `iterations` random operations each, spread
-    /// round-robin over `replicas`, holding each operation's locks for 0-2 ms.
+    /// round-robin over `replicas`, yielding 1-3 times under each operation's locks.
     /// Every operation must acquire its locks and finish `within`.
     async fn run_random_scope_mix(
         replicas: &[ComputeRuntime],
@@ -1190,7 +1194,7 @@ mod tests {
             let plan: Vec<(MixOp, u64)> = (0..iterations)
                 .map(|_| {
                     let op = MixOp::random(&mut rng);
-                    (op, rng.random_range(0..=2))
+                    (op, rng.random_range(1..=3))
                 })
                 .collect();
             let replica = task % replicas.len();
@@ -1199,20 +1203,19 @@ mod tests {
             let fleet = Arc::clone(&fleet);
             let local = Arc::clone(&locals[replica]);
             handles.push(tokio::spawn(async move {
-                for (op, hold_ms) in plan {
-                    let hold = Duration::from_millis(hold_ms);
+                for (op, yield_count) in plan {
                     match op {
                         MixOp::Global => {
                             let _guard = runtime
                                 .mutation_guard(MutationScope::Global)
                                 .await
                                 .expect("guard");
-                            occupy(&local, &fleet, op, hold).await;
+                            occupy(&local, &fleet, op, yield_count).await;
                         }
                         MixOp::Workspace(workspace) => {
                             let scope = MutationScope::Workspace(&names.workspaces[workspace]);
                             let _guard = runtime.mutation_guard(scope).await.expect("guard");
-                            occupy(&local, &fleet, op, hold).await;
+                            occupy(&local, &fleet, op, yield_count).await;
                         }
                         MixOp::Sandbox(workspace, sandbox) => {
                             let scope = MutationScope::sandbox(
@@ -1220,12 +1223,12 @@ mod tests {
                                 &names.sandboxes[sandbox],
                             );
                             let _guard = runtime.mutation_guard(scope).await.expect("guard");
-                            occupy(&local, &fleet, op, hold).await;
+                            occupy(&local, &fleet, op, yield_count).await;
                         }
                         MixOp::Lifecycle(sandbox) => {
                             let _guard =
                                 runtime.lock_sandbox_local(&names.sandboxes[sandbox]).await;
-                            occupy(&local, &fleet, op, hold).await;
+                            occupy(&local, &fleet, op, yield_count).await;
                         }
                         MixOp::GatedLifecycle(sandbox) => {
                             let gate = runtime
@@ -1233,7 +1236,7 @@ mod tests {
                                 .lock_for(&names.sandboxes[sandbox])
                                 .await;
                             let _guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
-                            occupy(&local, &fleet, op, hold).await;
+                            occupy(&local, &fleet, op, yield_count).await;
                         }
                     }
                 }

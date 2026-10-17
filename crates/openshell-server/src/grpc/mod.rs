@@ -248,6 +248,7 @@ impl OpenShell for OpenShellService {
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
+            supports_cedar_policy: true,
             status: ServiceStatus::Healthy.into(),
             version: openshell_core::VERSION.to_string(),
         }))
@@ -731,7 +732,7 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<ApproveDraftChunkRequest>,
     ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
-        mutation_replay::run(&self.state, request).await
+        Box::pin(mutation_replay::run(&self.state, request)).await
     }
 
     async fn reject_draft_chunk(

@@ -16,7 +16,7 @@ use openshell_core::proto::{
     ProviderReadinessReason, SandboxConfigurationAdmission,
 };
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
-use openshell_supervisor_network::opa::PolicyGenerationGuard;
+use openshell_supervisor_network::policy_types::PolicyGenerationGuard;
 use openshell_supervisor_process::skills;
 use openshell_supervisor_process::supervisor_session::{
     ConfigApplyRequest, config_admission, config_apply_failure, sandbox_config_revision,
@@ -247,7 +247,7 @@ impl ConfigRuntime {
 
         if reloads_gateway_policy && !result.configuration_admitted {
             let disposition = apply_policy_validation_failure(
-                &ctx.opa_engine,
+                &ctx.engine,
                 result.policy_validation_failure_mode,
                 self.has_last_valid_policy,
                 result.version,
@@ -331,7 +331,7 @@ impl ConfigRuntime {
         // as one generation below.
         if !reloads_gateway_policy {
             reconcile_middleware_registry(
-                &ctx.opa_engine,
+                &ctx.engine,
                 &ctx.middleware_connector,
                 MiddlewareRegistryReconciliation {
                     desired_services: &result.supervisor_middleware_services,
@@ -374,7 +374,7 @@ impl ConfigRuntime {
                 let mode = result.policy_validation_failure_mode;
                 if mode != rejected.configured_mode {
                     let disposition = apply_policy_validation_failure(
-                        &ctx.opa_engine,
+                        &ctx.engine,
                         mode,
                         self.has_last_valid_policy,
                         rejected.version,
@@ -431,7 +431,7 @@ impl ConfigRuntime {
         if policy_runtime_changed {
             let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
             let runtime_result = reload_gateway_configuration_runtime(
-                &ctx.opa_engine,
+                &ctx.engine,
                 result.policy.as_ref(),
                 pid,
                 MiddlewareReloadContext {
@@ -571,7 +571,7 @@ impl ConfigRuntime {
                     if self.last_failed_runtime_revision.as_ref() != Some(&failed_revision) {
                         let failure_mode = result.policy_validation_failure_mode;
                         match apply_gateway_runtime_reload_failure(
-                            &ctx.opa_engine,
+                            &ctx.engine,
                             failure,
                             failure_mode,
                             self.has_last_valid_policy,
@@ -1017,7 +1017,7 @@ impl ConfigRuntime {
         let retained_revision = self
             .applied_revision
             .clone()
-            .filter(|_| ctx.opa_engine.fail_closed_reason().is_none());
+            .filter(|_| ctx.engine.fail_closed_reason().is_none());
         let outcome = match retained_revision.as_ref() {
             // The requested configuration is still the enforced one, so only
             // its runtime upgrade failed.
@@ -1245,10 +1245,7 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
     let mut pending_result = None;
     // Bind startup evidence before awaiting the gateway. A generation changed
     // during that request no longer proves which policy startup installed.
-    let initial_generation = ctx
-        .opa_engine
-        .generation_guard(ctx.opa_engine.current_generation())
-        .ok();
+    let initial_generation = ctx.engine.configuration_generation_guard().ok();
 
     // Initialize revision from the first poll and acknowledge the initial
     // policy revision the supervisor actually loaded. A mismatched result is
@@ -2684,7 +2681,7 @@ mod tests {
     }
 
     fn policy_poll_test_context(
-        opa_engine: Arc<OpaEngine>,
+        engine: impl Into<PolicyEngine>,
         loaded_policy_origin: LoadedPolicyOrigin,
         middleware_connector: MiddlewareConnector,
     ) -> PolicyPollLoopContext {
@@ -2712,7 +2709,7 @@ mod tests {
             endpoint: String::new(),
             sandbox_id: "sandbox-test".to_string(),
             sandbox: "sandbox-test-name".to_string(),
-            opa_engine,
+            engine: engine.into(),
             loaded_policy_origin,
             vm_identity: None,
             entrypoint_pid: Arc::new(AtomicU32::new(0)),
@@ -3249,7 +3246,7 @@ mod tests {
             }];
         let engine =
             Arc::new(OpaEngine::from_proto(&proto_policy_fixture()).expect("build OPA engine"));
-        install_builtin_middleware_registry(&engine)
+        install_builtin_middleware_registry(&PolicyEngine::from(Arc::clone(&engine)))
             .await
             .expect("install built-in middleware registry");
         let ctx = policy_poll_test_context(
@@ -3527,7 +3524,7 @@ mod tests {
         let (mut ctx, config_apply_tx, _push_tx) = push_session_poll_loop(&initial);
         let (session_tx, session_rx) = tokio::sync::watch::channel(Some("session-1".to_string()));
         ctx.supervisor_session_id = session_rx;
-        let engine = Arc::clone(&ctx.opa_engine);
+        let engine = ctx.engine.clone();
         let (client, polls, mut reports) = scripted_policy_gateway();
         let poll_calls = Arc::clone(&client.poll_calls);
         polls.send(initial.clone()).unwrap();
@@ -3592,6 +3589,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_provider_rotation_rebinds_cedar_configuration_generation() {
+        use crate::tests::{CEDAR_RELOAD_POLICY, cedar_engine, cedar_proto_policy};
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(
+            Some(cedar_proto_policy(CEDAR_RELOAD_POLICY)),
+            1,
+            PolicySource::Sandbox,
+        );
+        let mut desired = initial.clone();
+        desired.config_revision = 200;
+        desired.provider_env_revision = 19;
+        desired.provider_attachment_epoch = "epoch-19".to_string();
+        let cedar = cedar_engine();
+        let engine = PolicyEngine::from(Arc::clone(&cedar));
+        let initial_guard = engine.configuration_generation_guard().unwrap();
+        let initial_generation = cedar.current_generation();
+        let ctx = policy_poll_test_context(
+            engine,
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+
+        let applied = apply_with_provider(&mut runtime, &ctx, &client, &desired).await;
+
+        assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
+        assert!(initial_guard.is_stale());
+        assert_eq!(cedar.current_generation(), initial_generation);
+        let observed = ctx
+            .provider_readiness
+            .observation(&ctx.provider_credentials);
+        assert!(observed.credentials_installed);
+        assert!(observed.policy_active);
+        assert_eq!(observed.provider_env_revision, 19);
+        assert_eq!(observed.config_revision, 200);
+    }
+
+    #[tokio::test]
+    async fn stream_format_switch_quarantines_cedar_and_restoration_recovers() {
+        use crate::tests::{CEDAR_RELOAD_POLICY, cedar_engine, cedar_proto_policy};
+        use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
+
+        let initial = settings_poll_result(
+            Some(cedar_proto_policy(CEDAR_RELOAD_POLICY)),
+            1,
+            PolicySource::Sandbox,
+        );
+        let mut rejected =
+            settings_poll_result(Some(proto_policy_fixture()), 2, PolicySource::Sandbox);
+        rejected.policy_validation_failure_mode = PolicyValidationFailureMode::FailClosed;
+        let cedar = cedar_engine();
+        let ctx = policy_poll_test_context(
+            PolicyEngine::from(Arc::clone(&cedar)),
+            LoadedPolicyOrigin::Gateway {
+                revision: Some(LoadedPolicyRevision::from_snapshot(&initial)),
+                has_last_valid_policy: true,
+            },
+            default_middleware_connector(),
+        );
+        let (client, _polls, _reports) = scripted_policy_gateway();
+        let mut runtime = started_runtime(&ctx, &initial);
+
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
+        assert!(cedar.fail_closed_reason().is_some());
+        assert!(result.policy_load.is_some_and(|status| !status.loaded));
+
+        let mut restored = initial.clone();
+        restored.config_revision = 300;
+        let result = apply_with_provider(&mut runtime, &ctx, &client, &restored).await;
+        assert_eq!(result.outcome, ConfigApplyOutcome::Applied);
+        assert!(cedar.fail_closed_reason().is_none());
+        assert!(
+            ctx.provider_readiness
+                .observation(&ctx.provider_credentials)
+                .policy_active
+        );
+    }
+
+    #[tokio::test]
     async fn stream_provider_rotation_rebinds_policy_generation() {
         use openshell_core::proto::{ConfigApplyOutcome, PolicySource};
 
@@ -3619,7 +3701,7 @@ mod tests {
         assert_eq!(applied.outcome, ConfigApplyOutcome::Applied);
         // As with polling, the credentials install with a fresh generation of
         // the unchanged policy, and readiness binds to that generation.
-        assert!(ctx.opa_engine.current_generation() > initial_generation);
+        assert!(ctx.engine.current_generation() > initial_generation);
         let observed = ctx
             .provider_readiness
             .observation(&ctx.provider_credentials);
@@ -3887,7 +3969,7 @@ mod tests {
         let result = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
 
         assert_eq!(result.outcome, ConfigApplyOutcome::FailedClosed);
-        let rejected_generation = ctx.opa_engine.current_generation();
+        let rejected_generation = ctx.engine.current_generation();
         assert!(rejected_generation > initial_generation);
 
         let duplicate = apply_with_provider(&mut runtime, &ctx, &client, &rejected).await;
@@ -3896,7 +3978,7 @@ mod tests {
             (duplicate.outcome, duplicate.failure, duplicate.admission),
             (result.outcome, result.failure, result.admission)
         );
-        assert_eq!(ctx.opa_engine.current_generation(), rejected_generation);
+        assert_eq!(ctx.engine.current_generation(), rejected_generation);
     }
 
     #[tokio::test]

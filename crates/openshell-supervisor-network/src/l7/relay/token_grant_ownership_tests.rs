@@ -279,7 +279,7 @@ impl Fixture {
         body_pending: Option<Arc<Notify>>,
     ) -> Connection {
         let configs = self.configs.clone();
-        let middleware_engine = self.engine.clone();
+        let middleware_engine = PolicyEngine::from(self.engine.clone());
         let engine = self
             .engine
             .clone_engine_for_tunnel(self.generation)

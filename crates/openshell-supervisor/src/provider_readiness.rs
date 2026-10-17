@@ -19,7 +19,7 @@ use openshell_core::proto::{
 };
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_isolation_interface::contract::ProviderEnvironmentInstallation;
-use openshell_supervisor_network::opa::PolicyGenerationGuard;
+use openshell_supervisor_network::policy_types::PolicyGenerationGuard;
 use tokio::sync::watch;
 
 /// Authority captured before consuming a provider response's credential fields.
@@ -821,6 +821,44 @@ mod tests {
         assert_eq!(observed.policy_hash, "rejected");
         assert!(!observed.credentials_installed);
         assert!(!observed.launch_environment_installed);
+    }
+
+    /// A Cedar sandbox's configuration guard is pinned to the middleware
+    /// generation; a quarantine must stale it as it stales a YAML guard.
+    #[test]
+    fn cedar_quarantine_invalidates_installed_policy_evidence() {
+        use openshell_supervisor_network::cedar_only::CedarOnlyEngine;
+        use openshell_supervisor_network::policy_engine::PolicyEngine;
+
+        let tracker = Tracker::new();
+        let credentials = ProviderCredentialState::from_child_env_snapshot(6, HashMap::new());
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            cedar_policy_source: r#"permit (principal, action == Sandbox::Action::"NetworkConnect",
+        resource == Sandbox::NetworkEndpoint::"pypi.org:443");"#
+                .to_string(),
+            ..Default::default()
+        };
+        let engine = PolicyEngine::from(Arc::new(CedarOnlyEngine::from_proto(&policy).unwrap()));
+        tracker.credentials_installed(identity(), &credentials, None);
+        tracker.policy_activated(
+            &identity(),
+            12,
+            engine.configuration_generation_guard().unwrap(),
+        );
+        assert!(tracker.observation(&credentials).policy_active);
+
+        engine.enter_fail_closed("test quarantine").unwrap();
+        assert!(!tracker.observation(&credentials).policy_active);
+
+        tracker.policy_activated(
+            &identity(),
+            12,
+            engine.configuration_generation_guard().unwrap(),
+        );
+        assert!(tracker.observation(&credentials).policy_active);
+        engine.exit_fail_closed().unwrap();
+        assert!(!tracker.observation(&credentials).policy_active);
     }
 
     #[test]

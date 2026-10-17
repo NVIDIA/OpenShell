@@ -12,6 +12,7 @@ model, request shape, timeout, and streaming behavior.
 | `nvidia-inference.yaml` | Example profile for the endpoint, credential, and allowed Python binaries |
 | `inference.py` | Native endpoint streaming and non-streaming client |
 | `sandbox-policy.yaml` | Minimal policy that lets Python install the OpenAI client from PyPI |
+| `sandbox-policy.cedar` | Cedar version of the policy, which also grants the NVIDIA endpoint |
 
 ## Run the Example
 
@@ -41,6 +42,10 @@ openshell sandbox create \
   --upload examples/local-inference/inference.py \
   -- python3 /sandbox/inference.py
 ```
+
+To use Cedar, pass `--policy examples/local-inference/sandbox-policy.cedar`
+instead. Providers attached to a Cedar sandbox supply credentials but grant no
+access, so the Cedar policy permits the NVIDIA endpoint itself.
 
 The profile contributes the NVIDIA endpoint to the effective network policy and
 injects an opaque `NVIDIA_API_KEY` placeholder. The proxy substitutes the real

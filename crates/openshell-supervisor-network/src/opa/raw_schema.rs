@@ -352,10 +352,9 @@ mod tests {
         assert_eq!(data, original);
         let engine = OpaEngine::from_strings(BAKED_POLICY_RULES, &data.to_string()).unwrap();
         let endpoint = engine
-            .query_endpoint_config(&input("private-policy-host.test"))
+            .query_endpoint_config_json(&input("private-policy-host.test"))
             .unwrap()
             .unwrap();
-        let endpoint: Value = serde_json::from_str(&endpoint.to_string()).unwrap();
         assert_eq!(endpoint["allow_encoded_slash"], true);
         assert_eq!(endpoint["provider_credentialed"], true);
         assert_eq!(endpoint["policy_hash"], "private-hash");

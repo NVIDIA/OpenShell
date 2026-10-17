@@ -6,7 +6,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
+# POLICY_FORMAT=cedar renders policy.template.cedar instead of
+# policy.template.yaml.
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+  yaml | cedar) ;;
+  *)
+    printf 'error: POLICY_FORMAT must be yaml or cedar\n' >&2
+    exit 2
+    ;;
+esac
+POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.${POLICY_FORMAT}"
 PROMPTS_DIR="${SCRIPT_DIR}/prompts"
 
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
@@ -24,7 +34,7 @@ DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-oauth-${DEMO_RUN_ID}
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-memory-${DEMO_RUN_ID}}"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-codex-github.XXXXXX")"
-POLICY_FILE="${TMP_DIR}/policy.yaml"
+POLICY_FILE="${TMP_DIR}/policy.${POLICY_FORMAT}"
 PAYLOAD_DIR="${TMP_DIR}/payload"
 RUNNER_FILE="${PAYLOAD_DIR}/demo-runner.sh"
 PROMPTS_UPLOAD_DIR="${PAYLOAD_DIR}/prompts"

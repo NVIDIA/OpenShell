@@ -34,6 +34,9 @@ use openshell_policy::{
 use std::sync::{Arc, Mutex};
 
 use crate::opa::PolicyGenerationGuard;
+use crate::policy_types::{
+    AccessSetting, EndpointConfig, EndpointProtocol, EnforcementSetting, TlsSetting,
+};
 
 pub(crate) fn build_credential_endpoint_mismatch_finding(
     policy_name: &str,
@@ -317,67 +320,61 @@ pub struct L7RequestInfo {
     pub jsonrpc: Option<jsonrpc::JsonRpcRequestInfo>,
 }
 
-/// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
+/// Parse an L7 endpoint config from a policy endpoint config.
 ///
-/// The value is expected to be the raw endpoint object from the Rego data,
-/// containing fields: `protocol`, optionally `tls`, `enforcement`, and the
-/// canonical `mcp_versions` array for MCP endpoints.
-pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
-    let protocol_val = get_object_str(val, "protocol")?;
-    let protocol = L7Protocol::parse(&protocol_val)?;
+/// Returns `None` for an endpoint without an inspected L7 protocol, or
+/// whose settings the runtime rejects: an unknown `tls`, `enforcement`,
+/// `access`, or `credential_signing` value, a signing mode without its
+/// service, or an MCP endpoint without a canonical revision list.
+pub fn parse_l7_config(config: &EndpointConfig) -> Option<L7EndpointConfig> {
+    let protocol = config.protocol.l7()?;
 
-    let tls_value = get_object_str(val, "tls").unwrap_or_default();
-    let enforcement_value = get_object_str(val, "enforcement").unwrap_or_default();
-    let access_value = get_object_str(val, "access").unwrap_or_default();
-    if !validate_endpoint_modes(&tls_value, &enforcement_value, &access_value).is_empty() {
+    if config.tls == TlsSetting::Unknown
+        || config.enforcement == EnforcementSetting::Unknown
+        || config.access == AccessSetting::Unknown
+    {
         return None;
     }
 
-    let tls = match tls_value.as_str() {
-        "skip" => TlsMode::Skip,
-        "" => TlsMode::Auto,
-        _ => unreachable!("endpoint modes were validated above"),
+    let tls = match config.tls {
+        TlsSetting::Skip => TlsMode::Skip,
+        TlsSetting::Auto => TlsMode::Auto,
+        TlsSetting::Unknown => unreachable!("endpoint modes were validated above"),
     };
 
-    let enforcement = match enforcement_value.as_str() {
-        "enforce" => EnforcementMode::Enforce,
-        "" | "audit" => EnforcementMode::Audit,
-        _ => unreachable!("endpoint modes were validated above"),
+    let enforcement = match config.enforcement {
+        EnforcementSetting::Enforce => EnforcementMode::Enforce,
+        EnforcementSetting::Default | EnforcementSetting::Audit => EnforcementMode::Audit,
+        EnforcementSetting::Unknown => unreachable!("endpoint modes were validated above"),
     };
 
-    let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
-    let websocket_credential_rewrite =
-        get_object_bool(val, "websocket_credential_rewrite").unwrap_or(false);
-    let request_body_credential_rewrite =
-        get_object_bool(val, "request_body_credential_rewrite").unwrap_or(false);
-    let allow_uninspected_credentials =
-        get_object_bool(val, "allow_uninspected_credentials").unwrap_or(false);
-    let provider_credentialed = get_object_bool(val, "provider_credentialed").unwrap_or(false);
-    let endpoint_id = get_object_str(val, "endpoint_id").unwrap_or_default();
-    let policy_hash = get_object_str(val, "policy_hash").unwrap_or_default();
-    let websocket_graphql_policy =
-        protocol == L7Protocol::Websocket && endpoint_has_graphql_policy(val);
-    let graphql_max_body_bytes = get_object_u64(val, "graphql_max_body_bytes")
-        .and_then(|v| usize::try_from(v).ok())
+    // A YAML endpoint opts in through its GraphQL rules or persisted-query
+    // settings. A Cedar endpoint carries no rules, so the Cedar engine sets
+    // the flag for a `websocket-graphql` endpoint.
+    let websocket_graphql_policy = protocol == L7Protocol::Websocket
+        && (config.websocket_graphql_policy || endpoint_has_graphql_policy(config));
+    let graphql_max_body_bytes = usize::try_from(config.graphql_max_body_bytes)
+        .ok()
         .filter(|v| *v > 0)
         .unwrap_or(graphql::DEFAULT_MAX_BODY_BYTES);
-    let json_rpc_max_body_bytes = get_object_u64(val, "json_rpc_max_body_bytes")
-        .and_then(|v| usize::try_from(v).ok())
+    let json_rpc_max_body_bytes = usize::try_from(config.json_rpc_max_body_bytes)
+        .ok()
         .filter(|v| *v > 0)
         .unwrap_or(jsonrpc::DEFAULT_MAX_BODY_BYTES);
-    let mcp_strict_tool_names = protocol == L7Protocol::Mcp
-        && get_object_bool(val, "mcp_strict_tool_names").unwrap_or(true);
+    let mcp_strict_tool_names =
+        protocol == L7Protocol::Mcp && config.mcp_strict_tool_names.unwrap_or(true);
     let mcp_versions = if protocol == L7Protocol::Mcp {
-        parse_canonical_mcp_versions(val)?
+        parse_canonical_mcp_versions(&config.mcp_versions)?
     } else {
         Vec::new()
     };
 
-    let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
-        Some("sigv4") => CredentialSigning::SigV4,
-        Some("sigv4:body") => CredentialSigning::SigV4Body,
-        Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
-        Some(other) if !other.is_empty() => {
+    let credential_signing = match config.credential_signing.as_str() {
+        "sigv4" => CredentialSigning::SigV4,
+        "sigv4:body" => CredentialSigning::SigV4Body,
+        "sigv4:no_body" => CredentialSigning::SigV4NoBody,
+        "" => CredentialSigning::None,
+        other => {
             let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::High)
                 .status(openshell_ocsf::StatusId::Failure)
@@ -389,13 +386,9 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             openshell_ocsf::ocsf_emit!(event);
             return None;
         }
-        _ => CredentialSigning::None,
     };
 
-    let signing_service = get_object_str(val, "signing_service").unwrap_or_default();
-    let signing_region = get_object_str(val, "signing_region").unwrap_or_default();
-
-    if credential_signing.is_sigv4() && signing_service.is_empty() {
+    if credential_signing.is_sigv4() && config.signing_service.is_empty() {
         let event = openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::High)
             .status(openshell_ocsf::StatusId::Failure)
@@ -408,24 +401,24 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     Some(L7EndpointConfig {
         protocol,
-        endpoint_id,
-        policy_hash,
-        path: get_object_str(val, "path").unwrap_or_default(),
+        endpoint_id: config.endpoint_id.clone(),
+        policy_hash: config.policy_hash.clone(),
+        path: config.path.clone(),
         tls,
         enforcement,
         graphql_max_body_bytes,
         json_rpc_max_body_bytes,
         mcp_strict_tool_names,
         mcp_versions,
-        allow_encoded_slash,
-        websocket_credential_rewrite,
-        request_body_credential_rewrite,
-        allow_uninspected_credentials,
-        provider_credentialed,
+        allow_encoded_slash: config.allow_encoded_slash,
+        websocket_credential_rewrite: config.websocket_credential_rewrite,
+        request_body_credential_rewrite: config.request_body_credential_rewrite,
+        allow_uninspected_credentials: config.allow_uninspected_credentials,
+        provider_credentialed: config.provider_credentialed,
         websocket_graphql_policy,
         credential_signing,
-        signing_service,
-        signing_region,
+        signing_service: config.signing_service.clone(),
+        signing_region: config.signing_region.clone(),
     })
 }
 
@@ -473,10 +466,10 @@ pub fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
 ///
 /// Used to check for `tls: skip` even on L4-only endpoints (no `protocol`
 /// field) that explicitly opt out of TLS auto-detection.
-pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
-    match get_object_str(val, "tls").as_deref() {
-        Some("skip") => TlsMode::Skip,
-        _ => TlsMode::Auto,
+pub fn parse_tls_mode(config: &EndpointConfig) -> TlsMode {
+    match config.tls {
+        TlsSetting::Skip => TlsMode::Skip,
+        TlsSetting::Auto | TlsSetting::Unknown => TlsMode::Auto,
     }
 }
 
@@ -498,65 +491,20 @@ impl EndpointCredentialGuard {
     }
 }
 
-pub fn parse_endpoint_credential_guard(val: &regorus::Value) -> EndpointCredentialGuard {
+pub fn parse_endpoint_credential_guard(config: &EndpointConfig) -> EndpointCredentialGuard {
     EndpointCredentialGuard {
-        provider_credentialed: get_object_bool(val, "provider_credentialed").unwrap_or(false),
-        allow_uninspected_credentials: get_object_bool(val, "allow_uninspected_credentials")
-            .unwrap_or(false),
-        has_l7_protocol: get_object_str(val, "protocol").is_some(),
-        tls: parse_tls_mode(val),
+        provider_credentialed: config.provider_credentialed,
+        allow_uninspected_credentials: config.allow_uninspected_credentials,
+        // Any declared protocol counts, including explicit TCP.
+        has_l7_protocol: config.protocol != EndpointProtocol::None,
+        tls: parse_tls_mode(config),
     }
 }
 
-/// Extract a bool value from a regorus object. Returns `None` when the key
-/// is absent or not a boolean.
-fn get_object_bool(val: &regorus::Value, key: &str) -> Option<bool> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => match map.get(&key_val) {
-            Some(regorus::Value::Bool(b)) => Some(*b),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn get_object_u64(val: &regorus::Value, key: &str) -> Option<u64> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => match map.get(&key_val) {
-            Some(regorus::Value::Number(n)) => n.as_u64(),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Extract a string value from a regorus object.
-fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => match map.get(&key_val) {
-            Some(regorus::Value::String(s)) => {
-                let s = s.to_string();
-                if s.is_empty() { None } else { Some(s) }
-            }
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn parse_canonical_mcp_versions(val: &regorus::Value) -> Option<Vec<McpProtocolVersion>> {
-    let regorus::Value::Array(values) = get_object_value(val, "mcp_versions")? else {
-        return None;
-    };
-    let versions = values
+fn parse_canonical_mcp_versions(labels: &[String]) -> Option<Vec<McpProtocolVersion>> {
+    let versions = labels
         .iter()
-        .map(|value| match value {
-            regorus::Value::String(value) => value.parse::<McpProtocolVersion>().ok(),
-            _ => None,
-        })
+        .map(|label| label.parse::<McpProtocolVersion>().ok())
         .collect::<Option<Vec<_>>>()?;
 
     // Both policy ingress paths promise a non-empty, strictly ordered list.
@@ -568,58 +516,18 @@ fn parse_canonical_mcp_versions(val: &regorus::Value) -> Option<Vec<McpProtocolV
     Some(versions)
 }
 
-fn endpoint_has_graphql_policy(val: &regorus::Value) -> bool {
-    has_non_empty_object_field(val, "graphql_persisted_queries")
-        || has_graphql_persisted_query_mode(val)
-        || rules_have_graphql_policy(val, "rules", true)
-        || rules_have_graphql_policy(val, "deny_rules", false)
+fn endpoint_has_graphql_policy(config: &EndpointConfig) -> bool {
+    !config.graphql_persisted_queries.is_empty()
+        || has_graphql_persisted_query_mode(config)
+        || config
+            .rules
+            .iter()
+            .any(|rule| rule.graphql_selectors().is_set())
+        || config.deny_rules.iter().any(|rule| rule.selectors.is_set())
 }
 
-fn rules_have_graphql_policy(val: &regorus::Value, key: &str, allow_wrapped: bool) -> bool {
-    let Some(regorus::Value::Array(rules)) = get_object_value(val, key) else {
-        return false;
-    };
-    rules.iter().any(|rule| {
-        let rule = if allow_wrapped {
-            get_object_value(rule, "allow").unwrap_or(rule)
-        } else {
-            rule
-        };
-        has_graphql_rule_fields(rule)
-    })
-}
-
-fn has_graphql_rule_fields(val: &regorus::Value) -> bool {
-    has_non_empty_string_field(val, "operation_type")
-        || has_non_empty_string_field(val, "operation_name")
-        || has_non_empty_array_field(val, "fields")
-}
-
-fn has_non_empty_string_field(val: &regorus::Value, key: &str) -> bool {
-    matches!(get_object_value(val, key), Some(regorus::Value::String(s)) if !s.is_empty())
-}
-
-fn has_non_empty_array_field(val: &regorus::Value, key: &str) -> bool {
-    matches!(get_object_value(val, key), Some(regorus::Value::Array(values)) if !values.is_empty())
-}
-
-fn has_non_empty_object_field(val: &regorus::Value, key: &str) -> bool {
-    matches!(get_object_value(val, key), Some(regorus::Value::Object(values)) if !values.is_empty())
-}
-
-fn has_graphql_persisted_query_mode(val: &regorus::Value) -> bool {
-    matches!(
-        get_object_value(val, "persisted_queries"),
-        Some(regorus::Value::String(mode)) if !mode.is_empty() && mode.as_ref() != "deny"
-    )
-}
-
-fn get_object_value<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => map.get(&key_val),
-        _ => None,
-    }
+fn has_graphql_persisted_query_mode(config: &EndpointConfig) -> bool {
+    !config.persisted_queries.is_empty() && config.persisted_queries != "deny"
 }
 
 /// Check a glob pattern for obvious syntax issues.
@@ -1952,7 +1860,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_rest_enforce() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "enforcement": "enforce", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
@@ -1964,7 +1872,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_defaults() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "api.example.com", "port": 80}"#,
         )
         .unwrap();
@@ -1997,7 +1905,7 @@ mod tests {
             .await
             .expect("install MCP test inventory");
         let _reset = receiver.recv().await.expect("inventory reset");
-        let value = regorus::Value::from_json_str(&format!(
+        let value = serde_json::from_str::<EndpointConfig>(&format!(
             r#"{{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"{endpoint_id}","policy_hash":"policy","provider_credentialed":true}}"#
         ))
         .expect("parse MCP config JSON");
@@ -2039,7 +1947,7 @@ mod tests {
             .await
             .expect("install first policy inventory");
         assert!(tracker.apply(receiver.recv().await.expect("first inventory reset")));
-        let value = regorus::Value::from_json_str(
+        let value = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy-a"}"#,
         )
         .expect("parse first policy selection");
@@ -2100,7 +2008,7 @@ mod tests {
         assert!(tracker.apply(receiver.recv().await.expect("first inventory reset")));
         // The runtime can install the new policy before its inventory reset.
         // The new policy's result must not be attributed to the old inventory.
-        let value = regorus::Value::from_json_str(
+        let value = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy-b"}"#,
         )
         .expect("parse replacement policy selection");
@@ -2148,7 +2056,7 @@ mod tests {
             .expect("install test inventory");
         assert!(tracker.apply(receiver.recv().await.expect("inventory reset")));
         let context = sender.capture().expect("capture installed authority");
-        let value = regorus::Value::from_json_str(
+        let value = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol":"mcp","mcp_versions":["2025-11-25"],"endpoint_id":"endpoint:v1:shared","policy_hash":"policy"}"#,
         )
         .expect("parse selected MCP policy");
@@ -2231,7 +2139,7 @@ mod tests {
             )
             .await
             .expect("install MCP test configuration");
-        let value = regorus::Value::from_json_str(
+        let value = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol":"rest","endpoint_id":"endpoint:v1:not-mcp"}"#,
         )
         .expect("parse REST config JSON");
@@ -2241,7 +2149,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_rejects_unknown_enforcement() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "enforcement": "enforc", "access": "read-only", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
@@ -2251,7 +2159,7 @@ mod tests {
 
     #[test]
     fn parse_credential_signing_sigv4() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "credential_signing": "sigv4", "signing_service": "bedrock", "host": "bedrock.us-east-1.amazonaws.com", "port": 443}"#,
         ).unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -2261,7 +2169,7 @@ mod tests {
 
     #[test]
     fn parse_credential_signing_sigv4_body() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "credential_signing": "sigv4:body", "signing_service": "bedrock", "host": "bedrock.us-east-1.amazonaws.com", "port": 443}"#,
         ).unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -2271,7 +2179,7 @@ mod tests {
 
     #[test]
     fn parse_credential_signing_sigv4_no_body() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "credential_signing": "sigv4:no_body", "signing_service": "s3", "host": "s3.us-east-1.amazonaws.com", "port": 443}"#,
         ).unwrap();
         let config = parse_l7_config(&val).unwrap();
@@ -2286,7 +2194,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_websocket_protocol() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443}"#,
         )
         .unwrap();
@@ -2296,7 +2204,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_skip() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "tls": "skip", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
@@ -2307,20 +2215,21 @@ mod tests {
     #[test]
     fn parse_l7_config_no_protocol() {
         let val =
-            regorus::Value::from_json_str(r#"{"host": "api.example.com", "port": 443}"#).unwrap();
+            serde_json::from_str::<EndpointConfig>(r#"{"host": "api.example.com", "port": 443}"#)
+                .unwrap();
         assert!(parse_l7_config(&val).is_none());
     }
 
     #[test]
     fn parse_endpoint_credential_guard_handles_l4_and_opt_in() {
-        let guarded = regorus::Value::from_json_str(
+        let guarded = serde_json::from_str::<EndpointConfig>(
             r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true}"#,
         )
         .unwrap();
         let guard = parse_endpoint_credential_guard(&guarded);
         assert!(guard.blocks_connect());
 
-        let opted_in = regorus::Value::from_json_str(
+        let opted_in = serde_json::from_str::<EndpointConfig>(
             r#"{"host":"api.example.com","ports":[443],"provider_credentialed":true,"allow_uninspected_credentials":true}"#,
         )
         .unwrap();
@@ -2329,7 +2238,7 @@ mod tests {
 
     #[test]
     fn generic_resolver_enables_rest_body_backstop_without_provider_marker() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol":"rest","host":"api.example.com","ports":[443]}"#,
         )
         .unwrap();
@@ -2337,7 +2246,7 @@ mod tests {
         assert!(!config.deny_uninspected_body_credentials(false));
         assert!(config.deny_uninspected_body_credentials(true));
 
-        let opted_in = regorus::Value::from_json_str(
+        let opted_in = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol":"rest","host":"api.example.com","ports":[443],"allow_uninspected_credentials":true}"#,
         )
         .unwrap();
@@ -2350,7 +2259,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_allow_encoded_slash_defaults_false() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "api.example.com", "port": 443}"#,
         )
         .unwrap();
@@ -2360,7 +2269,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_allow_encoded_slash_opt_in() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "gitlab.example.com", "port": 443, "allow_encoded_slash": true}"#,
         )
         .unwrap();
@@ -2370,7 +2279,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_defaults_true() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
@@ -2380,7 +2289,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_mcp_strict_tool_names_can_disable() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "mcp", "host": "mcp.example.com", "port": 443, "mcp_strict_tool_names": false, "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
@@ -2390,7 +2299,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_requires_canonical_mcp_versions() {
-        let explicit = regorus::Value::from_json_str(
+        let explicit = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "mcp", "mcp_versions": ["2025-03-26", "2025-11-25"]}"#,
         )
         .unwrap();
@@ -2406,21 +2315,25 @@ mod tests {
             r#"{"protocol": "mcp"}"#,
             r#"{"protocol": "mcp", "mcp_versions": []}"#,
             r#"{"protocol": "mcp", "mcp_versions": ["2026-01-01"]}"#,
-            r#"{"protocol": "mcp", "mcp_versions": [1]}"#,
             r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-11-25"]}"#,
             r#"{"protocol": "mcp", "mcp_versions": ["2025-11-25", "2025-03-26"]}"#,
         ] {
-            let value = regorus::Value::from_json_str(invalid).unwrap();
+            let value = serde_json::from_str::<EndpointConfig>(invalid).unwrap();
             assert!(
                 parse_l7_config(&value).is_none(),
                 "non-canonical MCP runtime config must be rejected: {invalid}"
             );
         }
+        // A non-string revision is not an endpoint config at all.
+        assert!(
+            serde_json::from_str::<EndpointConfig>(r#"{"protocol": "mcp", "mcp_versions": [1]}"#)
+                .is_err()
+        );
     }
 
     #[test]
     fn parse_l7_config_keeps_mcp_versions_off_other_protocols() {
-        let value = regorus::Value::from_json_str(
+        let value = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "json-rpc", "mcp_versions": ["2025-11-25"]}"#,
         )
         .unwrap();
@@ -2430,7 +2343,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_websocket_credential_rewrite_defaults_false() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "gateway.example.com", "port": 443}"#,
         )
         .unwrap();
@@ -2440,7 +2353,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_websocket_credential_rewrite_opt_in() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "gateway.example.com", "port": 443, "websocket_credential_rewrite": true}"#,
         )
         .unwrap();
@@ -2450,7 +2363,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_request_body_credential_rewrite_defaults_false() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "slack.com", "port": 443}"#,
         )
         .unwrap();
@@ -2460,7 +2373,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_request_body_credential_rewrite_opt_in() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "rest", "host": "slack.com", "port": 443, "request_body_credential_rewrite": true}"#,
         )
         .unwrap();
@@ -2470,7 +2383,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_websocket_graphql_policy_defaults_false() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "rules": [{"allow": {"method": "GET", "path": "/graphql"}}, {"allow": {"method": "WEBSOCKET_TEXT", "path": "/graphql"}}]}"#,
         )
         .unwrap();
@@ -2480,7 +2393,7 @@ mod tests {
 
     #[test]
     fn parse_l7_config_websocket_graphql_policy_detects_operation_rules() {
-        let val = regorus::Value::from_json_str(
+        let val = serde_json::from_str::<EndpointConfig>(
             r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443, "rules": [{"allow": {"method": "GET", "path": "/graphql"}}, {"allow": {"operation_type": "subscription", "fields": ["messageAdded"]}}]}"#,
         )
         .unwrap();

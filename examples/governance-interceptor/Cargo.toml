@@ -13,7 +13,7 @@ license = "Apache-2.0"
 [dependencies]
 jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
 openshell-core = { path = "../../crates/openshell-core", default-features = false }
-openshell-policy = { path = "../../crates/openshell-policy" }
+openshell-policy = { path = "../../crates/openshell-policy", default-features = false }
 openshell-providers = { path = "../../crates/openshell-providers" }
 prost = "0.14"
 prost-reflect = { version = "0.16.5", features = ["serde"] }

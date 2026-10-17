@@ -44,7 +44,7 @@ fn registered_backend_selects_operator_endpoint_and_preserves_opaque_payload() {
     )
     .unwrap();
     let registrations: BackendRegistrations = serde_json::from_str(
-        r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#,
+        r#"{"backends":[{"name":"external","endpoint":{"kind":"tcp","authority":"backend.example:443","addresses":["127.0.0.1:47000"]}}]}"#,
     ).unwrap();
     let launch = DelegatedLaunch {
         backend_name: "external".into(),

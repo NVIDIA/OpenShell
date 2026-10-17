@@ -900,6 +900,10 @@ message HealthResponse {
 
   // Service version.
   string version = 2;
+
+  // Clients must check this before sending Cedar policies. Older gateways
+  // silently discard Cedar fields and would interpret them as empty YAML.
+  bool supports_cedar_policy = 3;
 }
 
 // Current-user request. The identity comes from the authenticated request.
@@ -2816,8 +2820,8 @@ message UpdateConfigRequest {
   // The new policy to apply.
   //
   // Sandbox scope (`global=false`):
-  // - only network_policies may differ from create-time
-  //   policy; static fields must match version 1.
+  // - only network_policies and cedar_policy_source may differ from
+  //   create-time policy; static fields must match version 1.
   //
   // Global scope (`global=true`):
   // - applies to all sandboxes in full (no merge).

@@ -2078,7 +2078,7 @@ mod tests {
         isolation_backend = "agent-substrate"
         [[openshell.supervisor.isolation_backends]]
         name = "agent-substrate"
-        endpoint = { kind = "unix", socket_path = "/run/isolation.sock" }
+        endpoint = { kind = "tcp", authority = "backend.example:443", addresses = ["127.0.0.1:47000"] }
         "#,
                 )
                 .unwrap();

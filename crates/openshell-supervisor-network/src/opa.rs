@@ -10,15 +10,25 @@
 //! The baked policy uses the `openshell.endpoint_path_matches` native builtin
 //! registered here to share endpoint selector semantics with Rust route selection.
 
+use crate::binary_resolution::resolve_policy_binary;
+use crate::network_middleware::MiddlewareConfigs;
+use crate::policy_data::{
+    endpoint_policy_value, normalize_endpoint_protocols, normalize_l7_policy_rule_aliases,
+};
+use crate::policy_types::{
+    EndpointConfig, MiddlewareConfig, MiddlewareEndpointSelector, generation_guard_for,
+};
+use crate::policy_validation::{
+    redacted_policy_violation_category, render_bounded_validation_diagnostics,
+    render_repeated_validation_diagnostic,
+};
 use miette::Result;
-use openshell_core::host_pattern::HostSelector;
-use openshell_core::mcp::is_mcp_protocol;
 use openshell_core::policy::{
     FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy,
 };
 use openshell_core::policy_identity::deterministic_policy_hash;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
-use openshell_policy::{L7ConfigStanza, L7Protocol as PolicyL7Protocol, PolicyViolation};
+use openshell_policy::L7ConfigStanza;
 use openshell_policy_schema::{
     FilesystemPolicy as AuthoredFilesystemPolicy, LandlockPolicy as AuthoredLandlockPolicy,
     ProcessPolicy as AuthoredProcessPolicy,
@@ -57,11 +67,6 @@ fn new_regorus_engine() -> Result<regorus::Engine> {
     Ok(engine)
 }
 
-/// Maximum number of fixed categories in one policy-load error.
-const POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS: usize = 8;
-/// Maximum byte length of one policy-load error, including its omission marker.
-const POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES: usize = 512;
-
 /// Implementation-owned middleware config validation supplied by the active
 /// in-process catalog for local policy files.
 pub type MiddlewareConfigValidator =
@@ -74,59 +79,11 @@ pub struct PolicyDecision {
     pub matched_policy: Option<String>,
 }
 
-/// Network action returned by OPA `network_action` rule.
-///
-/// - `Allow`: endpoint + binary explicitly matched in a network policy
-/// - `Deny`: no matching policy
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NetworkAction {
-    Allow { matched_policy: Option<String> },
-    Deny { reason: String },
-}
-
-/// Endpoint identity and metadata captured with one policy generation.
-#[derive(Debug, Clone)]
-pub struct MatchedEndpoint {
-    pub policy_name: String,
-    pub endpoint_index: usize,
-    pub endpoint: regorus::Value,
-}
-
-/// Policy-DNS eligible endpoint metadata captured from one policy generation.
-///
-/// This is policy data only. It deliberately contains no process identity or
-/// network authorization decision.
-#[derive(Debug, Clone)]
-pub struct PolicyDnsEligibilitySnapshot {
-    pub endpoints: Vec<MatchedEndpoint>,
-    pub generation: u64,
-    /// The generation is a fail-closed quarantine, so every name is refused.
-    pub fail_closed: bool,
-}
-
-/// Atomic policy result used to authorize and materialize one egress request.
-#[derive(Debug, Clone)]
-pub struct EgressAuthorization {
-    pub action: NetworkAction,
-    pub endpoint_configs: Vec<regorus::Value>,
-    pub matched_endpoints: Vec<MatchedEndpoint>,
-    pub exact_declared_endpoint_host: bool,
-    pub generation: u64,
-}
-
-/// Input for a network access policy evaluation.
-pub struct NetworkInput {
-    pub host: String,
-    pub port: u16,
-    pub binary_path: PathBuf,
-    pub binary_sha256: String,
-    /// Ancestor binary paths from process tree walk (parent, grandparent, ...).
-    pub ancestors: Vec<PathBuf>,
-    /// Absolute paths extracted from `/proc/<pid>/cmdline` of the socket-owning
-    /// process and its ancestors. Captures script paths (e.g. `/usr/local/bin/claude`)
-    /// that don't appear in `/proc/<pid>/exe` because the interpreter (node) is the exe.
-    pub cmdline_paths: Vec<PathBuf>,
-}
+pub use crate::policy_engine::TunnelPolicyEngine;
+pub use crate::policy_types::{
+    EgressAuthorization, MatchedEndpoint, NetworkAction, NetworkInput,
+    PolicyDnsEligibilitySnapshot, PolicyGenerationGuard,
+};
 
 fn inject_runtime_policy_data(data: &mut serde_json::Value, require_binary_identity: bool) {
     let Some(obj) = data.as_object_mut() else {
@@ -203,100 +160,111 @@ pub(crate) fn test_opa_query_count() -> u64 {
     TEST_OPA_QUERY_COUNT.load(Ordering::SeqCst)
 }
 
-/// Generation guard captured when an HTTP tunnel or request path starts.
-#[derive(Clone, Debug)]
-pub struct PolicyGenerationGuard {
-    captured_generation: u64,
-    current_generation: Arc<AtomicU64>,
-    generation_rx: watch::Receiver<u64>,
-}
-
-impl PolicyGenerationGuard {
-    pub fn captured_generation(&self) -> u64 {
-        self.captured_generation
-    }
-
-    pub fn current_generation(&self) -> u64 {
-        self.current_generation.load(Ordering::Acquire)
-    }
-
-    pub fn is_stale(&self) -> bool {
-        self.current_generation() != self.captured_generation
-    }
-
-    pub fn ensure_current(&self) -> Result<()> {
-        if self.is_stale() {
-            return Err(miette::miette!(
-                "policy generation is stale [captured_generation:{} current_generation:{}]",
-                self.captured_generation(),
-                self.current_generation(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Wait until the policy generation changes.
-    ///
-    /// Relay boundaries use this to close even an idle or raw stream as soon
-    /// as a new generation (including fail-closed quarantine) is published.
-    pub async fn wait_until_stale(&self) {
-        let mut receiver = self.generation_rx.clone();
-        while !self.is_stale() {
-            if receiver.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-/// Per-tunnel L7 policy evaluator bound to the engine generation captured when
-/// the tunnel was established.
-pub struct TunnelPolicyEngine {
+/// The Rego evaluator of a YAML sandbox's per-tunnel policy engine.
+///
+/// Holds a clone of the engine's compiled policy, so a tunnel evaluates
+/// without contending for the engine lock. The owning
+/// [`TunnelPolicyEngine`] checks staleness before calling it.
+pub(crate) struct RegoTunnelEvaluator {
     engine: Mutex<regorus::Engine>,
-    generation_guard: PolicyGenerationGuard,
-    middleware_runner: ChainRunner,
-    websocket_assembly_budget: crate::l7::websocket::WebSocketAssemblyBudget,
 }
 
-impl TunnelPolicyEngine {
-    pub fn captured_generation(&self) -> u64 {
-        self.generation_guard.captured_generation()
-    }
-
-    pub fn current_generation(&self) -> u64 {
-        self.generation_guard.current_generation()
-    }
-
-    pub fn is_stale(&self) -> bool {
-        self.generation_guard.is_stale()
-    }
-
-    pub fn generation_guard(&self) -> &PolicyGenerationGuard {
-        &self.generation_guard
-    }
-
-    pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
-        &self.engine
-    }
-
-    pub(crate) fn middleware_runner(&self) -> &ChainRunner {
-        &self.middleware_runner
-    }
-
-    pub(crate) fn websocket_assembly_budget(
-        &self,
-    ) -> crate::l7::websocket::WebSocketAssemblyBudget {
-        self.websocket_assembly_budget.clone()
-    }
-
-    /// Query the ordered middleware chain for a destination within this tunnel.
-    pub fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
-        let mut engine = self
-            .engine
+impl RegoTunnelEvaluator {
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, regorus::Engine>> {
+        self.engine
             .lock()
-            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        query_middleware_chain_locked(&mut engine, input)
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))
     }
+
+    /// Test-only: the tunnel's Rego engine, for evaluating rules directly.
+    #[cfg(test)]
+    pub(crate) fn engine_for_tests(&self) -> std::sync::MutexGuard<'_, regorus::Engine> {
+        self.lock().expect("OPA engine lock")
+    }
+
+    /// Queries the ordered middleware chain for a destination within this tunnel.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the evaluation fails or the middleware data is malformed.
+    pub(crate) fn query_middleware_chain(&self, input: &NetworkInput) -> Result<Vec<ChainEntry>> {
+        query_middleware_chain_locked(&mut *self.lock()?, input)
+    }
+
+    /// Evaluates one L7 request and returns `(allowed, deny_reason)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the evaluation fails. Callers treat an error as a denial.
+    pub(crate) fn evaluate_request(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<(bool, String)> {
+        let input = crate::l7::relay::l7_request_policy_input(ctx, request);
+
+        let mut engine = self.lock()?;
+
+        set_regorus_input(&mut engine, input)?;
+
+        let allowed = engine
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        let allowed = allowed == regorus::Value::from(true);
+
+        let reason = if allowed {
+            String::new()
+        } else {
+            let val = engine
+                .eval_rule("data.openshell.sandbox.request_deny_reason".into())
+                .map_err(|e| miette::miette!("{e}"))?;
+            match val {
+                regorus::Value::String(s) => s.to_string(),
+                regorus::Value::Undefined => "request denied by policy".to_string(),
+                other => other.to_string(),
+            }
+        };
+
+        Ok((allowed, reason))
+    }
+
+    /// Returns the token-grant owners whose own endpoint admits one request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the evaluation fails. Callers inject no token on error.
+    pub(crate) fn admitted_token_grant_owners(
+        &self,
+        ctx: &crate::l7::relay::L7EvalContext,
+        request: &crate::l7::L7RequestInfo,
+    ) -> Result<std::collections::HashSet<String>> {
+        eval_admitted_token_grant_owners(&mut *self.lock()?, ctx, request)
+    }
+}
+
+/// Evaluates `allowed_token_grant_owners` for one L7 request.
+fn eval_admitted_token_grant_owners(
+    engine: &mut regorus::Engine,
+    ctx: &crate::l7::relay::L7EvalContext,
+    request: &crate::l7::L7RequestInfo,
+) -> Result<std::collections::HashSet<String>> {
+    set_regorus_input(
+        engine,
+        crate::l7::relay::l7_request_policy_input(ctx, request),
+    )?;
+    let owners = engine
+        .eval_rule("data.openshell.sandbox.allowed_token_grant_owners".into())
+        .map_err(|error| miette::miette!("{error}"))?;
+    let regorus::Value::Array(owners) = owners else {
+        return Err(miette::miette!("invalid credential owner admission result"));
+    };
+    owners
+        .iter()
+        .map(|owner| match owner {
+            regorus::Value::String(owner) => Ok(owner.to_string()),
+            _ => Err(miette::miette!("invalid credential owner identity")),
+        })
+        .collect()
 }
 
 impl OpaEngine {
@@ -318,6 +286,25 @@ impl OpaEngine {
             generation_tx,
             fail_closed_reason: RwLock::new(None),
         }
+    }
+
+    /// Loads YAML policy data as written, skipping the validation and
+    /// normalization [`Self::from_strings`] applies.
+    ///
+    /// For tests of the Rego rules' defense in depth against policies that
+    /// validation would reject.
+    #[cfg(test)]
+    pub(crate) fn from_strings_unvalidated(policy: &str, data_yaml: &str) -> Result<Self> {
+        let data: serde_json::Value = serde_yml::from_str(data_yaml)
+            .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+        let mut engine = new_regorus_engine()?;
+        engine
+            .add_policy("policy.rego".into(), policy.into())
+            .map_err(|_| miette::miette!("failed to load Rego policy"))?;
+        engine
+            .add_data_json(&data.to_string())
+            .map_err(|_| miette::miette!("failed to load OPA policy data"))?;
+        Ok(Self::with_engine(engine, true))
     }
 
     /// Whether network authorization requires a workload binary identity.
@@ -472,25 +459,7 @@ impl OpaEngine {
         // Protobuf cannot distinguish an omitted repeated MCP version field
         // from an empty one. Canonicalize before any runtime consumer reads
         // the policy so both representations select the pinned default.
-        let proto = openshell_policy::validate_and_canonicalize_sandbox_policy(proto.clone())
-            .map_err(|error| {
-                miette::miette!(render_bounded_validation_diagnostics(
-                    "policy validation failed",
-                    error
-                        .violations()
-                        .iter()
-                        .map(redacted_policy_violation_category),
-                ))
-            })?;
-
-        let ambiguities = openshell_policy::find_endpoint_ambiguities(&proto);
-        if !ambiguities.is_empty() {
-            return Err(miette::miette!(render_repeated_validation_diagnostic(
-                "network endpoint ambiguity validation failed",
-                ambiguities.len(),
-                "ambiguous network endpoint selectors",
-            )));
-        }
+        let proto = crate::policy_validation::validate_sandbox_policy(proto)?;
 
         emit_binary_identity_mode(require_binary_identity, "proto");
         let data_json_str = proto_to_opa_data_json(&proto, entrypoint_pid);
@@ -627,6 +596,7 @@ impl OpaEngine {
                 matched_endpoints: Vec::new(),
                 exact_declared_endpoint_host: false,
                 generation,
+                cedar_destination: None,
             });
         }
 
@@ -637,16 +607,10 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         let action_str = get_str(&result, "action").unwrap_or_default();
         let matched_policy = get_str(&result, "matched_policy").filter(|name| !name.is_empty());
-        let endpoint_configs = match get_field(&result, "endpoint_configs") {
-            Some(regorus::Value::Array(values)) => values.to_vec(),
-            _ => Vec::new(),
-        };
-        let matched_endpoints = match get_field(&result, "matched_endpoints") {
-            Some(regorus::Value::Array(values)) => {
-                values.iter().filter_map(parse_matched_endpoint).collect()
-            }
-            _ => Vec::new(),
-        };
+        let endpoint_configs = get_field(&result, "endpoint_configs")
+            .map_or_else(|| Ok(Vec::new()), |v| list_from_rego(v, "endpoint config"))?;
+        let matched_endpoints = get_field(&result, "matched_endpoints")
+            .map_or_else(|| Ok(Vec::new()), |v| list_from_rego(v, "matched endpoint"))?;
         let exact_declared_endpoint_host =
             get_bool(&result, "exact_declared_endpoint_host").unwrap_or(false);
 
@@ -666,6 +630,7 @@ impl OpaEngine {
             matched_endpoints,
             exact_declared_endpoint_host,
             generation,
+            cedar_destination: None,
         })
     }
 
@@ -698,13 +663,7 @@ impl OpaEngine {
         let value = engine
             .eval_rule("data.openshell.sandbox.policy_dns_eligible_endpoint_records".into())
             .map_err(|error| miette::miette!("{error}"))?;
-        let endpoints = match value {
-            regorus::Value::Array(values) => {
-                values.iter().filter_map(parse_matched_endpoint).collect()
-            }
-            regorus::Value::Undefined => Vec::new(),
-            other => parse_matched_endpoint(&other).into_iter().collect(),
-        };
+        let endpoints = list_from_rego(&value, "policy DNS record")?;
 
         Ok(PolicyDnsEligibilitySnapshot {
             endpoints,
@@ -873,7 +832,6 @@ impl OpaEngine {
     /// generation comparison and callback linearizes state derived from an OPA
     /// snapshot with every policy reload and fail-closed transition. Callers
     /// must not perform I/O or other long-running work in `operation`.
-    #[allow(dead_code)]
     pub(crate) fn with_current_generation<T>(
         &self,
         expected_generation: u64,
@@ -928,17 +886,12 @@ impl OpaEngine {
 
     /// Return a guard for a previously captured policy generation.
     pub fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
-        let generation = self.current_generation();
-        if generation != expected_generation {
-            return Err(miette::miette!(
-                "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{generation}]"
-            ));
-        }
-        Ok(PolicyGenerationGuard {
-            captured_generation: generation,
-            current_generation: Arc::clone(&self.generation),
-            generation_rx: self.generation_tx.subscribe(),
-        })
+        generation_guard_for(
+            expected_generation,
+            self.current_generation(),
+            &self.generation,
+            &self.generation_tx,
+        )
     }
 
     /// Query static sandbox configuration from the OPA data module.
@@ -982,9 +935,9 @@ impl OpaEngine {
     /// Query the L7 endpoint config for a matched policy and host:port.
     ///
     /// After L4 evaluation allows a CONNECT, this method queries the Rego data
-    /// to get the full endpoint object for the matched policy. Returns the raw
-    /// `regorus::Value` which can be parsed by `l7::parse_l7_config()`.
-    pub fn query_endpoint_config(&self, input: &NetworkInput) -> Result<Option<regorus::Value>> {
+    /// to get the full endpoint object for the matched policy. Returns the
+    /// typed config, which `l7::parse_l7_config()` validates.
+    pub fn query_endpoint_config(&self, input: &NetworkInput) -> Result<Option<EndpointConfig>> {
         Ok(self.query_endpoint_config_with_generation(input)?.0)
     }
 
@@ -992,7 +945,7 @@ impl OpaEngine {
     pub fn query_endpoint_config_with_generation(
         &self,
         input: &NetworkInput,
-    ) -> Result<(Option<regorus::Value>, u64)> {
+    ) -> Result<(Option<EndpointConfig>, u64)> {
         let (configs, generation) = self.query_endpoint_configs_with_generation(input)?;
         Ok((configs.into_iter().next(), generation))
     }
@@ -1001,7 +954,36 @@ impl OpaEngine {
     pub fn query_endpoint_configs_with_generation(
         &self,
         input: &NetworkInput,
-    ) -> Result<(Vec<regorus::Value>, u64)> {
+    ) -> Result<(Vec<EndpointConfig>, u64)> {
+        let (val, generation) = self.query_endpoint_config_values(input)?;
+        Ok((list_from_rego(&val, "endpoint config")?, generation))
+    }
+
+    /// Returns the first matching endpoint object as the Rego data holds it.
+    ///
+    /// For diagnostics and tests of the Rego data shaping only; decisions
+    /// read the typed [`EndpointConfig`] from [`Self::query_endpoint_config`].
+    #[doc(hidden)]
+    pub fn query_endpoint_config_json(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<Option<serde_json::Value>> {
+        let (val, _) = self.query_endpoint_config_values(input)?;
+        let first = match val {
+            regorus::Value::Undefined => return Ok(None),
+            regorus::Value::Array(values) => match values.first() {
+                Some(first) => first.clone(),
+                None => return Ok(None),
+            },
+            other => other,
+        };
+        serde_json::to_value(first)
+            .map(Some)
+            .map_err(|e| miette::miette!("{e}"))
+    }
+
+    /// Evaluates the matching endpoint configs rule for `input`.
+    fn query_endpoint_config_values(&self, input: &NetworkInput) -> Result<(regorus::Value, u64)> {
         #[cfg(test)]
         record_test_opa_query();
 
@@ -1018,12 +1000,7 @@ impl OpaEngine {
         let val = engine
             .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
             .map_err(|e| miette::miette!("{e}"))?;
-
-        match val {
-            regorus::Value::Undefined => Ok((Vec::new(), generation)),
-            regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
-            other => Ok((vec![other], generation)),
-        }
+        Ok((val, generation))
     }
 
     /// Query every matching endpoint for credential-provenance gating.
@@ -1035,7 +1012,7 @@ impl OpaEngine {
     pub fn query_endpoint_credential_guards(
         &self,
         input: &NetworkInput,
-    ) -> Result<Vec<regorus::Value>> {
+    ) -> Result<Vec<EndpointConfig>> {
         let input_json = network_input_json(input);
 
         let mut engine = self
@@ -1051,11 +1028,7 @@ impl OpaEngine {
             .eval_rule("data.openshell.sandbox.endpoint_credential_guards".into())
             .map_err(|e| miette::miette!("{e}"))?;
 
-        match val {
-            regorus::Value::Undefined => Ok(Vec::new()),
-            regorus::Value::Array(values) => Ok(values.to_vec()),
-            other => Ok(vec![other]),
-        }
+        list_from_rego(&val, "endpoint credential guard")
     }
 
     /// Query the ordered middleware chain for an admitted destination.
@@ -1081,7 +1054,7 @@ impl OpaEngine {
     pub fn query_allowed_ips(&self, input: &NetworkInput) -> Result<Vec<String>> {
         Ok(self
             .query_endpoint_config(input)?
-            .map(|val| get_str_array(&val, "allowed_ips"))
+            .map(|config| config.allowed_ips)
             .unwrap_or_default())
     }
 
@@ -1128,16 +1101,19 @@ impl OpaEngine {
                 "policy changed before L7 tunnel started [expected_generation:{expected_generation} current_generation:{generation}]"
             ));
         }
-        Ok(TunnelPolicyEngine {
-            engine: Mutex::new(engine.clone()),
-            generation_guard: PolicyGenerationGuard {
-                captured_generation: generation,
-                current_generation: Arc::clone(&self.generation),
-                generation_rx: self.generation_tx.subscribe(),
+        Ok(TunnelPolicyEngine::rego(
+            generation_guard_for(
+                expected_generation,
+                generation,
+                &self.generation,
+                &self.generation_tx,
+            )?,
+            self.middleware_runner()?,
+            self.websocket_assembly_budget(),
+            RegoTunnelEvaluator {
+                engine: Mutex::new(engine.clone()),
             },
-            middleware_runner: self.middleware_runner()?,
-            websocket_assembly_budget: self.websocket_assembly_budget(),
-        })
+        ))
     }
 }
 
@@ -1147,51 +1123,6 @@ fn value_to_string(val: &regorus::Value) -> String {
         regorus::Value::String(s) => s.to_string(),
         regorus::Value::Undefined => String::new(),
         other => other.to_string(),
-    }
-}
-
-/// Extract a string from a `regorus::Value` object field.
-fn get_str(val: &regorus::Value, key: &str) -> Option<String> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => match map.get(&key_val) {
-            Some(regorus::Value::String(s)) => Some(s.to_string()),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Extract a bool from a `regorus::Value` object field.
-fn get_bool(val: &regorus::Value, key: &str) -> Option<bool> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => match map.get(&key_val) {
-            Some(regorus::Value::Bool(b)) => Some(*b),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Extract a string array from a `regorus::Value` object field.
-fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => match map.get(&key_val) {
-            Some(regorus::Value::Array(arr)) => arr
-                .iter()
-                .filter_map(|v| {
-                    if let regorus::Value::String(s) = v {
-                        Some(s.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-            _ => vec![],
-        },
-        _ => vec![],
     }
 }
 
@@ -1237,159 +1168,124 @@ fn query_middleware_chain_locked(
     engine: &mut regorus::Engine,
     input: &NetworkInput,
 ) -> Result<Vec<ChainEntry>> {
-    let configs_val = engine
+    let configs = engine
         .eval_rule("data.openshell.sandbox.network_middlewares".into())
         .map_err(|e| miette::miette!("{e}"))?;
-    let configs = parse_middleware_configs(&configs_val)?;
-    if configs.is_empty() {
-        return Ok(Vec::new());
-    }
-    global_middleware_entries(&configs, &input.host)
+    middleware_configs_from_rego(&configs)?.select(&input.host)
 }
 
-fn parse_middleware_configs(value: &regorus::Value) -> Result<Vec<regorus::Value>> {
+// ---------------------------------------------------------------------------
+// Rego result conversion
+//
+// The only place Rego data becomes the engine-neutral types of
+// `crate::policy_types`. Everything downstream of the OPA engine reads those
+// types, so a malformed Rego result fails here, closed, instead of being read
+// as defaults later.
+// ---------------------------------------------------------------------------
+
+/// Converts one Rego value into typed policy data.
+fn from_rego<T: serde::de::DeserializeOwned>(value: &regorus::Value, what: &str) -> Result<T> {
+    serde_json::to_value(value)
+        .and_then(serde_json::from_value)
+        .map_err(|error| {
+            // The detail may quote authored policy values; keep it out of the
+            // returned diagnostic.
+            tracing::debug!(%error, what, "Rego result has an unexpected shape");
+            miette::miette!("{what} from Rego has an unexpected shape")
+        })
+}
+
+/// Converts a Rego list result, reading an undefined result as empty and a
+/// single object as a one-element list.
+fn list_from_rego<T: serde::de::DeserializeOwned>(
+    value: &regorus::Value,
+    what: &str,
+) -> Result<Vec<T>> {
     match value {
         regorus::Value::Undefined => Ok(Vec::new()),
-        regorus::Value::Object(configs) => configs
-            .iter()
-            .map(|(name, config)| {
-                let regorus::Value::String(_) = name else {
-                    return Err(miette::miette!("network_middlewares keys must be strings"));
-                };
-                let regorus::Value::Object(fields) = config else {
-                    return Err(miette::miette!(
-                        "network middleware config {name:?} must be an object"
-                    ));
-                };
-                let fields = fields
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .chain(std::iter::once((
-                        regorus::Value::String("__openshell_policy_key".into()),
-                        name.clone(),
-                    )))
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                Ok(fields.into())
-            })
-            .collect(),
-        other => Err(miette::miette!(
-            "network_middlewares must be an object, got {other:?}"
-        )),
+        regorus::Value::Array(values) => values.iter().map(|v| from_rego(v, what)).collect(),
+        other => Ok(vec![from_rego(other, what)?]),
     }
 }
 
-fn global_middleware_entries(configs: &[regorus::Value], host: &str) -> Result<Vec<ChainEntry>> {
-    let mut entries = Vec::new();
-    for config in configs {
-        if middleware_selector_matches(config, host)? {
-            if entries.len() >= openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES {
-                return Err(miette::miette!(
-                    "selected middleware stage count exceeds platform maximum {}",
-                    openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
-                ));
-            }
-            entries.push(chain_entry_from_value(config)?);
-        }
+/// One `network_middlewares` entry as the Rego data carries it.
+#[derive(Default, serde::Deserialize)]
+#[serde(default)]
+struct RegoMiddlewareConfig {
+    middleware: String,
+    order: i32,
+    config: serde_json::Value,
+    on_error: String,
+    endpoints: Option<MiddlewareEndpointSelector>,
+}
+
+/// Converts the `network_middlewares` object of the Rego data, keyed by
+/// config name in sorted order.
+fn middleware_configs_from_rego(value: &regorus::Value) -> Result<MiddlewareConfigs> {
+    if matches!(value, regorus::Value::Undefined) {
+        return Ok(MiddlewareConfigs::default());
     }
-    openshell_supervisor_middleware::sort_chain_entries(&mut entries);
-    Ok(entries)
-}
-
-fn middleware_selector_matches(config: &regorus::Value, host: &str) -> Result<bool> {
-    let Some(selector) = get_field(config, "endpoints") else {
-        return Ok(false);
-    };
-    let include = get_str_array(selector, "include");
-    let exclude = get_str_array(selector, "exclude");
-    let selector = HostSelector::new(&include, &exclude).map_err(|error| miette::miette!(error))?;
-    Ok(selector.matches(host))
-}
-
-fn chain_entry_from_value(value: &regorus::Value) -> Result<ChainEntry> {
-    let name = get_str(value, "__openshell_policy_key").unwrap_or_default();
-    let implementation = get_str(value, "middleware").unwrap_or_default();
-    Ok(ChainEntry {
-        name,
-        implementation,
-        order: get_field(value, "order")
-            .and_then(|value| match value {
-                regorus::Value::Number(number) => number.as_i64(),
-                _ => None,
+    let entries: std::collections::BTreeMap<String, RegoMiddlewareConfig> =
+        from_rego(value, "network_middlewares")?;
+    let configs = entries
+        .into_iter()
+        .map(|(policy_key, entry)| {
+            let config = match entry.config {
+                serde_json::Value::Object(fields) => {
+                    openshell_core::proto_struct::json_object_to_struct(fields).map_err(|_| {
+                        miette::miette!("network middleware config {policy_key:?} is invalid")
+                    })?
+                }
+                _ => prost_types::Struct::default(),
+            };
+            Ok(MiddlewareConfig {
+                policy_key,
+                middleware: entry.middleware,
+                order: entry.order,
+                config,
+                on_error: entry.on_error,
+                endpoints: entry.endpoints,
             })
-            .and_then(|value| i32::try_from(value).ok())
-            .unwrap_or_default(),
-        config: get_field(value, "config")
-            .map(regorus_value_to_struct)
-            .unwrap_or_default(),
-        on_error: openshell_supervisor_middleware::OnError::parse(
-            get_str(value, "on_error").as_deref().unwrap_or_default(),
-        )?,
-    })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MiddlewareConfigs::new(configs))
 }
 
-fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
-    let key_val = regorus::Value::String(key.into());
-    match val {
-        regorus::Value::Object(map) => map.get(&key_val),
+/// Extracts a string from a `regorus::Value` object field.
+fn get_str(val: &regorus::Value, key: &str) -> Option<String> {
+    match get_field(val, key) {
+        Some(regorus::Value::String(s)) => Some(s.to_string()),
         _ => None,
     }
 }
 
-fn parse_matched_endpoint(value: &regorus::Value) -> Option<MatchedEndpoint> {
-    let policy_name = get_str(value, "policy_name")?;
-    let endpoint_index = match get_field(value, "endpoint_index")? {
-        regorus::Value::Number(number) => usize::try_from(number.as_i64()?).ok()?,
-        _ => return None,
-    };
-    let endpoint = get_field(value, "endpoint")?.clone();
-
-    Some(MatchedEndpoint {
-        policy_name,
-        endpoint_index,
-        endpoint,
-    })
-}
-
-fn regorus_value_to_struct(value: &regorus::Value) -> prost_types::Struct {
-    let regorus::Value::Object(map) = value else {
-        return prost_types::Struct::default();
-    };
-    prost_types::Struct {
-        fields: map
-            .iter()
-            .filter_map(|(key, value)| match key {
-                regorus::Value::String(key) => {
-                    Some((key.to_string(), regorus_value_to_prost(value)))
-                }
-                _ => None,
-            })
-            .collect(),
+/// Extracts a bool from a `regorus::Value` object field.
+fn get_bool(val: &regorus::Value, key: &str) -> Option<bool> {
+    match get_field(val, key) {
+        Some(regorus::Value::Bool(b)) => Some(*b),
+        _ => None,
     }
 }
 
-fn regorus_value_to_prost(value: &regorus::Value) -> prost_types::Value {
-    use prost_types::{ListValue, Struct, Value, value::Kind};
-    Value {
-        kind: Some(match value {
-            regorus::Value::Bool(value) => Kind::BoolValue(*value),
-            regorus::Value::Number(value) => Kind::NumberValue(value.as_f64().unwrap_or_default()),
-            regorus::Value::String(value) => Kind::StringValue(value.to_string()),
-            regorus::Value::Array(values) => Kind::ListValue(ListValue {
-                values: values.iter().map(regorus_value_to_prost).collect(),
-            }),
-            regorus::Value::Object(values) => Kind::StructValue(Struct {
-                fields: values
-                    .iter()
-                    .filter_map(|(key, value)| match key {
-                        regorus::Value::String(key) => {
-                            Some((key.to_string(), regorus_value_to_prost(value)))
-                        }
-                        _ => None,
-                    })
-                    .collect(),
-            }),
-            _ => Kind::NullValue(0),
-        }),
+/// Extracts a string array from a `regorus::Value` object field.
+fn get_str_array(val: &regorus::Value, key: &str) -> Vec<String> {
+    match get_field(val, key) {
+        Some(regorus::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| match v {
+                regorus::Value::String(s) => Some(s.to_string()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Returns a field of a `regorus::Value` object.
+fn get_field<'a>(val: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
+    match val {
+        regorus::Value::Object(map) => map.get(&regorus::Value::String(key.into())),
+        _ => None,
     }
 }
 
@@ -1553,88 +1449,6 @@ fn validate_opa_static_settings(data: &mut serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// Select a fixed category without formatting authored fields or nested reasons.
-/// Keep this match exhaustive so new validator variants require an explicit
-/// decision before their diagnostics can cross the supervisor load boundary.
-fn redacted_policy_violation_category(violation: &PolicyViolation) -> &'static str {
-    match violation {
-        PolicyViolation::InvalidProcessIdentity { .. } => "invalid process identity",
-        PolicyViolation::InvalidLandlockCompatibility { .. } => "invalid Landlock compatibility",
-        PolicyViolation::PathTraversal { .. }
-        | PolicyViolation::RelativePath { .. }
-        | PolicyViolation::OverlyBroadPath { .. }
-        | PolicyViolation::FieldTooLong { .. } => "invalid filesystem path",
-        PolicyViolation::TooManyPaths { .. } => "filesystem path limit exceeded",
-        PolicyViolation::TldWildcard { .. }
-        | PolicyViolation::TcpEndpointIpLiteral { .. }
-        | PolicyViolation::InvalidTcpEndpointHost { .. }
-        | PolicyViolation::InvalidHostWildcard { .. } => "invalid network endpoint host",
-        PolicyViolation::MissingEndpointHost { .. }
-        | PolicyViolation::MissingTcpEndpointHost { .. } => "missing network endpoint host",
-        PolicyViolation::MissingEndpointPort { .. }
-        | PolicyViolation::InvalidEndpointPort { .. } => "invalid network endpoint port",
-        PolicyViolation::MissingSigningService { .. } => {
-            "incomplete credential signing configuration"
-        }
-        PolicyViolation::UnknownCredentialSigning { .. } => {
-            "invalid credential signing configuration"
-        }
-        PolicyViolation::CredentialSigningWithBodyRewrite { .. } => {
-            "conflicting credential rewrite configuration"
-        }
-        PolicyViolation::InvalidL7Endpoint { .. } => "invalid L7 endpoint configuration",
-        PolicyViolation::InvalidMiddlewareConfig { .. } => "invalid middleware configuration",
-        PolicyViolation::TooManyMiddlewareConfigs { .. } => {
-            "middleware configuration limit exceeded"
-        }
-        PolicyViolation::DuplicateMiddlewareOrder { .. } => "duplicate middleware order",
-        PolicyViolation::TooManyMiddlewareSelectorPatterns { .. } => {
-            "middleware selector limit exceeded"
-        }
-        PolicyViolation::MiddlewareTlsSkipConflict { .. } => {
-            "middleware conflicts with TLS inspection"
-        }
-        PolicyViolation::MissingMcpVersions { .. } => "missing MCP protocol version",
-        PolicyViolation::McpOptionsOnNonMcpEndpoint { .. } => "MCP options require MCP protocol",
-        PolicyViolation::UnsupportedMcpVersion { .. } => "unsupported MCP protocol version",
-        PolicyViolation::DuplicateMcpVersion { .. } => "duplicate MCP protocol version",
-    }
-}
-
-/// Render only fixed, implementation-owned headings and categories. Reserve
-/// space for the omission marker before adding each complete item; never copy
-/// or truncate a validator's payload-bearing Display, Debug, or source chain.
-fn render_bounded_validation_diagnostics(
-    heading: &'static str,
-    diagnostics: impl Iterator<Item = &'static str>,
-) -> String {
-    const OMITTED_SUFFIX: &str = "; additional violations omitted";
-    let mut rendered = heading.to_string();
-    for (index, category) in diagnostics.enumerate() {
-        let separator = if index == 0 { ": " } else { "; " };
-        if index == POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS
-            || rendered.len() + separator.len() + category.len() + OMITTED_SUFFIX.len()
-                > POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES
-        {
-            rendered.push_str(OMITTED_SUFFIX);
-            break;
-        }
-        rendered.push_str(separator);
-        rendered.push_str(category);
-    }
-    rendered
-}
-
-/// String-only validators have no safe fields to expose; retain their stage
-/// and bounded item count without inspecting their authored error text.
-fn render_repeated_validation_diagnostic(
-    heading: &'static str,
-    count: usize,
-    category: &'static str,
-) -> String {
-    render_bounded_validation_diagnostics(heading, std::iter::repeat_n(category, count))
-}
-
 /// Preprocess YAML policy data: parse, validate shapes, normalize, expand presets, return JSON.
 fn preprocess_yaml_data(
     yaml_str: &str,
@@ -1722,57 +1536,6 @@ fn preprocess_yaml_data(
     emit_l7_config_warnings(&expansion_warnings, "L7 access preset expansion warning");
 
     serde_json::to_string(&data).map_err(|_| miette::miette!("failed to serialize OPA policy data"))
-}
-
-/// Canonicalize recognized protocol spellings before L7 validation or Rego use.
-///
-/// Rust parses protocol names case-insensitively, while Rego compares stable
-/// wire keys. Publishing one canonical spelling keeps rule validation, typed
-/// routing, and authorization on the same protocol branch.
-fn normalize_endpoint_protocols(data: &mut serde_json::Value) {
-    let Some(policies) = data
-        .get_mut("network_policies")
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-
-    for policy in policies.values_mut() {
-        let Some(endpoints) = policy
-            .get_mut("endpoints")
-            .and_then(serde_json::Value::as_array_mut)
-        else {
-            continue;
-        };
-
-        for endpoint in endpoints {
-            let Some(endpoint) = endpoint.as_object_mut() else {
-                continue;
-            };
-            let Some(protocol) = endpoint.get("protocol").and_then(serde_json::Value::as_str)
-            else {
-                continue;
-            };
-            let canonical = if protocol.eq_ignore_ascii_case("tcp") {
-                Some("tcp")
-            } else {
-                PolicyL7Protocol::parse(protocol).map(|protocol| match protocol {
-                    PolicyL7Protocol::Rest => "rest",
-                    PolicyL7Protocol::Websocket => "websocket",
-                    PolicyL7Protocol::Graphql => "graphql",
-                    PolicyL7Protocol::Sql => "sql",
-                    PolicyL7Protocol::JsonRpc => "json-rpc",
-                    PolicyL7Protocol::Mcp => "mcp",
-                })
-            };
-            if let Some(canonical) = canonical {
-                endpoint.insert(
-                    "protocol".to_string(),
-                    serde_json::Value::String(canonical.to_string()),
-                );
-            }
-        }
-    }
 }
 
 /// Normalize endpoint port/ports in JSON data.
@@ -1906,337 +1669,6 @@ fn normalize_l7_config_alias(
     }
 }
 
-fn normalize_l7_policy_rule_aliases(data: &mut serde_json::Value) {
-    let Some(policies) = data
-        .get_mut("network_policies")
-        .and_then(|v| v.as_object_mut())
-    else {
-        return;
-    };
-
-    for (_name, policy) in policies.iter_mut() {
-        let Some(endpoints) = policy.get_mut("endpoints").and_then(|v| v.as_array_mut()) else {
-            continue;
-        };
-
-        for ep in endpoints.iter_mut() {
-            let Some(ep_obj) = ep.as_object_mut() else {
-                continue;
-            };
-            normalize_l7_rules_aliases(ep_obj);
-        }
-    }
-}
-
-fn normalize_l7_rules_aliases(ep: &mut serde_json::Map<String, serde_json::Value>) {
-    let protocol = ep
-        .get("protocol")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let mcp_allow_all_known_mcp_methods = ep
-        .get("mcp_allow_all_known_mcp_methods")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if let Some(rules) = ep.get_mut("rules").and_then(|v| v.as_array_mut()) {
-        for rule in rules {
-            if let Some(allow) = rule
-                .get_mut("allow")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                normalize_l7_rule_aliases(allow, &protocol, mcp_allow_all_known_mcp_methods);
-            } else if let Some(allow) = rule.as_object_mut() {
-                normalize_l7_rule_aliases(allow, &protocol, mcp_allow_all_known_mcp_methods);
-            }
-        }
-    }
-
-    if let Some(denies) = ep.get_mut("deny_rules").and_then(|v| v.as_array_mut()) {
-        for deny in denies {
-            if let Some(deny_obj) = deny.as_object_mut() {
-                normalize_l7_rule_aliases(deny_obj, &protocol, mcp_allow_all_known_mcp_methods);
-            }
-        }
-    }
-}
-
-fn normalize_l7_rule_aliases(
-    rule: &mut serde_json::Map<String, serde_json::Value>,
-    protocol: &str,
-    mcp_allow_all_known_mcp_methods: bool,
-) {
-    if protocol == "mcp" {
-        let mut has_tool_selector = rule
-            .get("params")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|params| params.get("name"))
-            .is_some_and(|v| !v.is_null());
-        if let Some(tool) = rule.remove("tool").filter(|v| !v.is_null()) {
-            let params = rule
-                .entry("params".to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-            if let Some(params) = params.as_object_mut() {
-                params.entry("name".to_string()).or_insert(tool);
-                has_tool_selector = true;
-            }
-        }
-
-        if mcp_allow_all_known_mcp_methods
-            && rule
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("")
-                .is_empty()
-        {
-            let method = if has_tool_selector { "tools/call" } else { "*" };
-            rule.insert(
-                "method".to_string(),
-                serde_json::Value::String(method.to_string()),
-            );
-        }
-    }
-
-    // MCP tool aliases must move into params before matcher normalization so
-    // both authored forms produce the same endpoint configuration as protobuf.
-    normalize_l7_matcher_map(rule, "query");
-    normalize_l7_matcher_map(rule, "params");
-}
-
-/// Normalize nonempty matcher leaves to the protobuf runtime representation.
-///
-/// OPA data also accepts explicit `glob` and `any` objects. Keeping those intact
-/// makes normalization idempotent for already lowered data and protobuf reloads.
-fn normalize_l7_matcher_map(rule: &mut serde_json::Map<String, serde_json::Value>, field: &str) {
-    let Some(matchers) = rule
-        .get_mut(field)
-        .and_then(serde_json::Value::as_object_mut)
-    else {
-        return;
-    };
-    for matcher in matchers.values_mut() {
-        // Rego permits an empty scalar to match an empty query value, whereas
-        // an empty glob object never matches. Preserve this OPA-only form.
-        if matcher.as_str().is_some_and(|glob| !glob.is_empty()) {
-            *matcher = serde_json::json!({ "glob": matcher.take() });
-        }
-    }
-}
-
-/// Normalize a path by resolving `.` and `..` components without touching
-/// the filesystem. Only works correctly for absolute paths.
-#[cfg(any(target_os = "linux", test))]
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => result.push(other),
-        }
-    }
-    result
-}
-
-// Only the Linux resolver constructs the non-`Literal` variants; on other
-// platforms the stub returns `Literal`, so the rest look dead there.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-#[derive(Debug, PartialEq, Eq)]
-enum BinaryResolution {
-    /// Symlink resolved to a different canonical target — add it to policy.
-    Resolved(String),
-    /// Nothing to add: glob, pid 0, not a symlink, or already canonical.
-    Literal,
-    /// Candidate absent under an accessible process root — expected, quiet.
-    Absent,
-    /// The process root `/proc/<pid>/root` itself is unreachable (pid gone or
-    /// denied) — actionable, and `CAP_SYS_PTRACE` guidance is relevant.
-    Inaccessible(std::io::ErrorKind),
-    /// The process root is reachable but the candidate path itself failed for a
-    /// non-NotFound reason (a parent component is permission-denied, or the path
-    /// forms a symlink loop) — actionable, but a target-path problem rather than
-    /// a process-root one, so `CAP_SYS_PTRACE` guidance does not apply.
-    CandidateInaccessible(std::io::ErrorKind),
-    /// A component mid symlink-chain failed to resolve.
-    ChainBroken(std::io::ErrorKind),
-}
-
-impl BinaryResolution {
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    const fn classify_first_probe_error(kind: std::io::ErrorKind) -> Self {
-        // Callers reach this only after confirming the process root is
-        // reachable, so a non-NotFound failure here is specific to the
-        // candidate path, not the process root.
-        match kind {
-            std::io::ErrorKind::NotFound => Self::Absent,
-            _ => Self::CandidateInaccessible(kind),
-        }
-    }
-}
-
-/// Resolve a policy binary path through the container's root filesystem.
-///
-/// On Linux, `/proc/<pid>/root/` provides access to the container's mount
-/// namespace. If the policy path is a symlink inside the container
-/// (e.g., `/usr/bin/python3` → `/usr/bin/python3.11`), the canonical target is
-/// returned as [`BinaryResolution::Resolved`]. The outcome is classified as:
-/// - [`BinaryResolution::Literal`] — not on Linux, `entrypoint_pid` is 0
-///   (container not yet started), the path contains glob characters, it is not
-///   a symlink, or the resolved path equals the original.
-/// - [`BinaryResolution::Absent`] — the candidate does not exist under an
-///   otherwise reachable process root (expected; the caller logs it quietly).
-/// - [`BinaryResolution::Inaccessible`] — `/proc/<pid>/root` itself is
-///   unreachable (pid gone or access denied).
-/// - [`BinaryResolution::CandidateInaccessible`] — the process root is
-///   reachable but the candidate path failed for a non-NotFound reason.
-/// - [`BinaryResolution::ChainBroken`] — a component mid symlink-chain failed,
-///   or the chain forms a cycle / exceeds the kernel symlink limit.
-#[cfg(target_os = "linux")]
-fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> BinaryResolution {
-    if policy_path.contains('*') || entrypoint_pid == 0 {
-        return BinaryResolution::Literal;
-    }
-
-    // Confirm the process root itself is reachable before probing candidates.
-    // A leaf `ENOENT` (absent candidate) and an unreachable process root
-    // (pid gone -> `ENOENT`, or denied -> `EACCES`) are indistinguishable at
-    // the leaf path, so check the root first. Any failure here is an access
-    // problem, not an absent candidate, and must stay actionable.
-    if let Err(e) = std::fs::metadata(format!("/proc/{entrypoint_pid}/root")) {
-        return BinaryResolution::Inaccessible(e.kind());
-    }
-
-    // Walk the symlink chain inside the container filesystem using
-    // read_link rather than canonicalize. canonicalize resolves
-    // /proc/<pid>/root itself (a kernel pseudo-symlink to /) which
-    // strips the prefix we need. read_link only reads the target of
-    // the specified symlink, keeping us in the container's namespace.
-    let mut resolved = PathBuf::from(policy_path);
-
-    // Set once the walk reaches a real (non-symlink) target or a terminal
-    // dead end. If the iteration cap is hit while every component is still a
-    // symlink, this stays false and the chain is treated as broken.
-    let mut reached_target = false;
-
-    // Linux SYMLOOP_MAX is 40; stop before infinite loops
-    for _ in 0..40 {
-        let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
-
-        tracing::debug!(
-            "Symlink resolution: probing container_path={container_path} for policy_path={policy_path} pid={entrypoint_pid}"
-        );
-
-        let meta = match std::fs::symlink_metadata(&container_path) {
-            Ok(m) => m,
-            Err(e) => {
-                // First iteration is the original policy path: an absent
-                // candidate (NotFound) is expected, any other error means the
-                // process root itself is unreachable. Later iterations are
-                // chain components, so a failure there is a broken symlink
-                // chain. Classify without logging; the caller emits the log at
-                // the appropriate level.
-                if resolved.as_os_str() == policy_path {
-                    // The up-front root check and this probe are separate
-                    // syscalls; if the process exited in between, the whole
-                    // `/proc/<pid>` tree is gone and the leaf probe also
-                    // reports NotFound. Re-check the root so a vanished process
-                    // stays classified as Inaccessible (actionable) rather than
-                    // being masked as an absent candidate (quiet).
-                    if e.kind() == std::io::ErrorKind::NotFound
-                        && let Err(root_error) =
-                            std::fs::metadata(format!("/proc/{entrypoint_pid}/root"))
-                    {
-                        return BinaryResolution::Inaccessible(root_error.kind());
-                    }
-                    return BinaryResolution::classify_first_probe_error(e.kind());
-                }
-                return BinaryResolution::ChainBroken(e.kind());
-            }
-        };
-
-        if !meta.file_type().is_symlink() {
-            // Reached a non-symlink — this is the final resolved target
-            reached_target = true;
-            break;
-        }
-
-        let target = match std::fs::read_link(&container_path) {
-            Ok(t) => t,
-            // A symlink whose target can't be read is a broken chain; the
-            // caller logs it.
-            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
-        };
-
-        if target.is_absolute() {
-            resolved = target;
-        } else if let Some(parent) = resolved.parent() {
-            // Relative symlink: resolve against the containing directory
-            // e.g., /usr/bin/python3 -> python3.11 becomes /usr/bin/python3.11
-            resolved = normalize_path(&parent.join(&target));
-        } else {
-            // No parent to resolve a relative target against — terminal.
-            reached_target = true;
-            break;
-        }
-    }
-
-    if !reached_target {
-        // The cap was exhausted while following symlinks. Linux SYMLOOP_MAX is
-        // 40, so a chain of exactly 40 symlinks ending at a real file is still
-        // valid — after the 40th hop `resolved` may already point at that file.
-        // Inspect it once more without following another link: a non-symlink is
-        // the valid final target (fall through to the Literal/Resolved logic
-        // below), while another symlink (or an error) is a genuine cycle
-        // (a -> b -> a) or a chain deeper than the kernel allows. read_link
-        // resolves one hop at a time, so the kernel never surfaces ELOOP; treat
-        // those as a broken chain so the caller logs it and matches literally.
-        let container_path = format!("/proc/{entrypoint_pid}/root{}", resolved.display());
-
-        match std::fs::symlink_metadata(&container_path) {
-            Ok(meta) if !meta.file_type().is_symlink() => {}
-            Ok(_) => {
-                return BinaryResolution::ChainBroken(
-                    std::io::Error::from_raw_os_error(libc::ELOOP).kind(),
-                );
-            }
-            Err(e) => return BinaryResolution::ChainBroken(e.kind()),
-        }
-    }
-
-    let resolved_str = resolved.to_string_lossy().into_owned();
-
-    if resolved_str == policy_path {
-        BinaryResolution::Literal
-    } else {
-        // The caller logs the resolution at info level.
-        BinaryResolution::Resolved(resolved_str)
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> BinaryResolution {
-    BinaryResolution::Literal
-}
-
-fn l7_matchers_to_json(
-    matchers: &std::collections::HashMap<String, openshell_core::proto::L7QueryMatcher>,
-) -> serde_json::Map<String, serde_json::Value> {
-    matchers
-        .iter()
-        .map(|(key, matcher)| {
-            let mut matcher_json = serde_json::json!({});
-            if !matcher.glob.is_empty() {
-                matcher_json["glob"] = matcher.glob.clone().into();
-            }
-            if !matcher.any.is_empty() {
-                matcher_json["any"] = matcher.any.clone().into();
-            }
-            (key.clone(), matcher_json)
-        })
-        .collect()
-}
-
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
 ///
 /// The rego rules reference `data.*` directly, so the JSON structure has
@@ -2298,225 +1730,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
             let endpoints: Vec<serde_json::Value> = rule
                 .endpoints
                 .iter()
-                .map(|e| {
-                    // Normalize port/ports: ports takes precedence, then
-                    // single port promoted to array. Rego always sees "ports".
-                    let ports: Vec<u32> = if !e.ports.is_empty() {
-                        e.ports.clone()
-                    } else if e.port > 0 {
-                        vec![e.port]
-                    } else {
-                        vec![]
-                    };
-                    let mut ep = serde_json::json!({"host": e.host, "ports": ports});
-                    if !e.path.is_empty() {
-                        ep["path"] = e.path.clone().into();
-                    }
-                    if !e.protocol.is_empty() {
-                        ep["protocol"] = e.protocol.clone().into();
-                    }
-                    if e.tls != 0 {
-                        ep["tls"] = openshell_policy::network_tls_mode_to_str(e.tls)
-                            .map_or_else(|| format!("unknown({})", e.tls), str::to_owned)
-                            .into();
-                    }
-                    if e.enforcement != 0 {
-                        ep["enforcement"] =
-                            openshell_policy::network_enforcement_mode_to_str(e.enforcement)
-                                .map_or_else(
-                                    || format!("unknown({})", e.enforcement),
-                                    str::to_owned,
-                                )
-                                .into();
-                    }
-                    if e.access != 0 {
-                        ep["access"] = openshell_policy::network_access_preset_to_str(e.access)
-                            .map_or_else(|| format!("unknown({})", e.access), str::to_owned)
-                            .into();
-                    }
-                    if !e.rules.is_empty() {
-                        let rules: Vec<serde_json::Value> = e
-                            .rules
-                            .iter()
-                            .map(|r| {
-                                let a = r.allow.as_ref();
-                                let mut allow = serde_json::Map::new();
-                                if let Some(a) = a {
-                                    // Proto3 represents absent scalar selectors as empty
-                                    // strings. Omit them so protobuf and YAML rules expose
-                                    // the same selector families to runtime validation.
-                                    if !a.method.is_empty() {
-                                        allow.insert("method".to_string(), a.method.clone().into());
-                                    }
-                                    if !a.path.is_empty() {
-                                        allow.insert("path".to_string(), a.path.clone().into());
-                                    }
-                                    if !a.command.is_empty() {
-                                        allow
-                                            .insert("command".to_string(), a.command.clone().into());
-                                    }
-                                    if !a.operation_type.is_empty() {
-                                        allow.insert(
-                                            "operation_type".to_string(),
-                                            a.operation_type.clone().into(),
-                                        );
-                                    }
-                                    if !a.operation_name.is_empty() {
-                                        allow.insert(
-                                            "operation_name".to_string(),
-                                            a.operation_name.clone().into(),
-                                        );
-                                    }
-                                    if !a.fields.is_empty() {
-                                        allow.insert("fields".to_string(), a.fields.clone().into());
-                                    }
-                                }
-                                let query = a.map_or_else(serde_json::Map::new, |allow| {
-                                    l7_matchers_to_json(&allow.query)
-                                });
-                                if !query.is_empty() {
-                                    allow.insert("query".to_string(), query.into());
-                                }
-                                let params = a.map_or_else(serde_json::Map::new, |allow| {
-                                    l7_matchers_to_json(&allow.params)
-                                });
-                                if !params.is_empty() {
-                                    allow.insert("params".to_string(), params.into());
-                                }
-                                serde_json::json!({ "allow": allow })
-                            })
-                            .collect();
-                        ep["rules"] = rules.into();
-                    }
-                    if !e.allowed_ips.is_empty() {
-                        ep["allowed_ips"] = e.allowed_ips.clone().into();
-                    }
-                    if e.advisor_proposed {
-                        ep["advisor_proposed"] = true.into();
-                    }
-                    if !e.deny_rules.is_empty() {
-                        let deny_rules: Vec<serde_json::Value> = e
-                            .deny_rules
-                            .iter()
-                            .map(|d| {
-                                let mut deny = serde_json::json!({});
-                                if !d.method.is_empty() {
-                                    deny["method"] = d.method.clone().into();
-                                }
-                                if !d.path.is_empty() {
-                                    deny["path"] = d.path.clone().into();
-                                }
-                                if !d.command.is_empty() {
-                                    deny["command"] = d.command.clone().into();
-                                }
-                                if !d.operation_type.is_empty() {
-                                    deny["operation_type"] = d.operation_type.clone().into();
-                                }
-                                if !d.operation_name.is_empty() {
-                                    deny["operation_name"] = d.operation_name.clone().into();
-                                }
-                                if !d.fields.is_empty() {
-                                    deny["fields"] = d.fields.clone().into();
-                                }
-                                let query = l7_matchers_to_json(&d.query);
-                                if !query.is_empty() {
-                                    deny["query"] = query.into();
-                                }
-                                let params = l7_matchers_to_json(&d.params);
-                                if !params.is_empty() {
-                                    deny["params"] = params.into();
-                                }
-                                deny
-                            })
-                            .collect();
-                        ep["deny_rules"] = deny_rules.into();
-                    }
-                    if e.allow_encoded_slash {
-                        ep["allow_encoded_slash"] = true.into();
-                    }
-                    if e.websocket_credential_rewrite {
-                        ep["websocket_credential_rewrite"] = true.into();
-                    }
-                    if e.request_body_credential_rewrite {
-                        ep["request_body_credential_rewrite"] = true.into();
-                    }
-                    if e.allow_uninspected_credentials {
-                        ep["allow_uninspected_credentials"] = true.into();
-                    }
-                    if e.provider_credentialed {
-                        ep["provider_credentialed"] = true.into();
-                    }
-                    if !e.token_grant_owner.is_empty() {
-                        // Preserve the gateway's endpoint identity so admission
-                        // can select its grants without reconstructing ownership
-                        // from overlapping host and path selectors.
-                        ep["token_grant_owner"] = e.token_grant_owner.clone().into();
-                    }
-                    // Every inspected protocol must bind grant reporting to the
-                    // policy selected before credential acquisition.
-                    ep["policy_hash"] = policy_hash.clone().into();
-                    if is_mcp_protocol(&e.protocol) {
-                        // Derive endpoint identity from the policy endpoint while
-                        // it is still available. Request handling carries this
-                        // opaque value through exact path selection and never
-                        // recomputes identity from a concrete request host.
-                        ep["endpoint_id"] =
-                            openshell_core::endpoint_status::endpoint_id(e).into();
-                    }
-                    if !e.credential_signing.is_empty() {
-                        ep["credential_signing"] = e.credential_signing.clone().into();
-                    }
-                    if !e.signing_service.is_empty() {
-                        ep["signing_service"] = e.signing_service.clone().into();
-                    }
-                    if !e.signing_region.is_empty() {
-                        ep["signing_region"] = e.signing_region.clone().into();
-                    }
-                    if let Some(binding) = &e.credential_binding {
-                        ep["credential_binding"] = serde_json::json!({
-                            "provider": binding.provider.clone(),
-                        });
-                    }
-                    if !e.persisted_queries.is_empty() {
-                        ep["persisted_queries"] = e.persisted_queries.clone().into();
-                    }
-                    if !e.graphql_persisted_queries.is_empty() {
-                        let persisted: serde_json::Map<String, serde_json::Value> = e
-                            .graphql_persisted_queries
-                            .iter()
-                            .map(|(key, op)| {
-                                (
-                                    key.clone(),
-                                    serde_json::json!({
-                                        "operation_type": op.operation_type,
-                                        "operation_name": op.operation_name,
-                                        "fields": op.fields,
-                                    }),
-                                )
-                            })
-                            .collect();
-                        ep["graphql_persisted_queries"] = persisted.into();
-                    }
-                    if e.graphql_max_body_bytes > 0 {
-                        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
-                    }
-                    if e.json_rpc_max_body_bytes > 0 {
-                        ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
-                    }
-                    if let Some(mcp) = &e.mcp {
-                        if e.protocol.eq_ignore_ascii_case("mcp") {
-                            ep["mcp_versions"] = mcp.versions.clone().into();
-                        }
-                        if let Some(strict_tool_names) = mcp.strict_tool_names {
-                            ep["mcp_strict_tool_names"] = strict_tool_names.into();
-                        }
-                        if let Some(allow_all_known_mcp_methods) = mcp.allow_all_known_mcp_methods {
-                            ep["mcp_allow_all_known_mcp_methods"] =
-                                allow_all_known_mcp_methods.into();
-                        }
-                    }
-                    ep
-                })
+                .map(|e| endpoint_policy_value(e, &policy_hash))
                 .collect();
             let binaries: Vec<serde_json::Value> = rule
                 .binaries
@@ -2524,46 +1738,8 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .flat_map(|b| {
                     let binary_entry = |path: &str| serde_json::json!({"path": path});
                     let mut entries = vec![binary_entry(&b.path)];
-                    match resolve_binary_in_container(&b.path, entrypoint_pid) {
-                        BinaryResolution::Resolved(resolved) => {
-                            tracing::info!(
-                                "Resolved policy binary symlink: original={} resolved={resolved} pid={entrypoint_pid}",
-                                b.path
-                            );
-                            entries.push(binary_entry(&resolved));
-                        }
-                        BinaryResolution::Absent => {
-                            tracing::debug!(
-                                "Policy binary candidate not present in container: path={} pid={entrypoint_pid}. Matched literally.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::Inaccessible(kind) => {
-                            tracing::warn!(
-                                "Cannot access container filesystem for symlink resolution: path={} pid={entrypoint_pid} \
-                                error_kind={kind:?}. Binary paths in policy will be matched literally. \
-                                If this binary is a symlink (e.g., /usr/bin/python3 -> python3.11), \
-                                use the canonical path instead, or run with CAP_SYS_PTRACE.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::CandidateInaccessible(kind) => {
-                            tracing::warn!(
-                                "Cannot access policy binary candidate path: path={} pid={entrypoint_pid} \
-                                error_kind={kind:?}. Binary path will be matched literally. \
-                                A parent component is permission-denied or the path forms a symlink loop; \
-                                the process root itself is reachable.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::ChainBroken(kind) => {
-                            tracing::warn!(
-                                "Symlink chain broken during resolution: path={} pid={entrypoint_pid} error_kind={kind:?}. \
-                                Matched by original path only.",
-                                b.path
-                            );
-                        }
-                        BinaryResolution::Literal => {},
+                    if let Some(resolved) = resolve_policy_binary(&b.path, entrypoint_pid) {
+                        entries.push(binary_entry(&resolved));
                     }
                     entries
                 })
@@ -2577,37 +1753,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
         })
         .collect();
 
-    let mut middleware_entries: Vec<_> = proto.network_middlewares.iter().collect();
-    middleware_entries.sort_by_key(|(name, _)| name.as_str());
-    let network_middlewares: serde_json::Map<String, serde_json::Value> = middleware_entries
-        .into_iter()
-        .map(|(name, mw)| {
-            let mut value = serde_json::json!({
-                "middleware": mw.middleware,
-                "order": mw.order,
-            });
-            if !mw.name.is_empty() {
-                value["name"] = mw.name.clone().into();
-            }
-            if let Some(config) = &mw.config {
-                value["config"] = openshell_core::proto_struct::struct_to_json_value(config);
-            }
-            if !mw.on_error.is_empty() {
-                value["on_error"] = mw.on_error.clone().into();
-            }
-            if let Some(selector) = &mw.endpoints {
-                let mut endpoints = serde_json::json!({});
-                if !selector.include.is_empty() {
-                    endpoints["include"] = selector.include.clone().into();
-                }
-                if !selector.exclude.is_empty() {
-                    endpoints["exclude"] = selector.exclude.clone().into();
-                }
-                value["endpoints"] = endpoints;
-            }
-            (name.clone(), value)
-        })
-        .collect();
+    let network_middlewares = crate::policy_data::network_middlewares_json(proto);
 
     serde_json::json!({
         "filesystem_policy": filesystem_policy,
@@ -2629,6 +1775,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 )]
 mod tests {
     use super::*;
+    use crate::binary_resolution::{BinaryResolution, normalize_path, resolve_binary_in_container};
+    use crate::policy_validation::{
+        POLICY_VALIDATION_DIAGNOSTIC_MAX_BYTES, POLICY_VALIDATION_DIAGNOSTIC_MAX_ITEMS,
+    };
+    use openshell_core::mcp::is_mcp_protocol;
 
     use openshell_core::mcp::DEFAULT_MCP_PROTOCOL_VERSION;
     use openshell_core::proto::{
@@ -3357,6 +2508,9 @@ mod tests {
             },
         );
         ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -3659,25 +2813,13 @@ network_policies:
                 cmdline_paths: vec![],
             };
             let yaml_config = yaml_engine
-                .query_endpoint_config(&network_input)
+                .query_endpoint_config_json(&network_input)
                 .expect("query YAML endpoint config")
                 .unwrap_or_else(|| panic!("{protocol}: expected YAML endpoint config"));
             let proto_config = proto_engine
-                .query_endpoint_config(&network_input)
+                .query_endpoint_config_json(&network_input)
                 .expect("query protobuf endpoint config")
                 .unwrap_or_else(|| panic!("{protocol}: expected protobuf endpoint config"));
-            let yaml_config: serde_json::Value = serde_json::from_str(
-                &yaml_config
-                    .to_json_str()
-                    .expect("YAML endpoint config must serialize"),
-            )
-            .expect("YAML endpoint config must be JSON");
-            let proto_config: serde_json::Value = serde_json::from_str(
-                &proto_config
-                    .to_json_str()
-                    .expect("protobuf endpoint config must serialize"),
-            )
-            .expect("protobuf endpoint config must be JSON");
 
             let endpoint = proto.network_policies["parity"]
                 .endpoints
@@ -3801,22 +2943,25 @@ network_policies:
                     yaml_engine.reload(TEST_POLICY, &normalized).unwrap();
                     proto_engine.reload_from_proto(&proto).unwrap();
                 }
-                let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap().unwrap();
-                let proto_config = proto_engine.query_endpoint_config(&input).unwrap().unwrap();
+                let yaml_config = yaml_engine
+                    .query_endpoint_config_json(&input)
+                    .unwrap()
+                    .unwrap();
+                let proto_config = proto_engine
+                    .query_endpoint_config_json(&input)
+                    .unwrap()
+                    .unwrap();
                 assert_endpoint_config_parity(
-                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
-                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
+                    &yaml_config,
+                    &proto_config,
                     &proto,
                     &proto.network_policies["matchers"].endpoints[0],
                 );
                 for engine in [&yaml_engine, &proto_engine] {
                     let snapshot = engine.authorize_egress(&input).unwrap();
                     assert_eq!(snapshot.generation, u64::from(phase == "reload"));
-                    assert_eq!(
-                        yaml_config["provider_credentialed"],
-                        regorus::Value::Bool(true)
-                    );
-                    assert_eq!(yaml_config["advisor_proposed"], regorus::Value::Bool(true));
+                    assert_eq!(yaml_config["provider_credentialed"], true);
+                    assert_eq!(yaml_config["advisor_proposed"], true);
                     assert!(eval_l7(engine, &allowed), "{protocol} {phase}: allow");
                     assert!(
                         !eval_l7(engine, &denied),
@@ -3868,12 +3013,24 @@ network_policies:
             let yaml_config = yaml_engine.query_endpoint_config(&input).unwrap();
             let proto_config = proto_engine.query_endpoint_config(&input).unwrap();
             match (&yaml_config, &proto_config) {
-                (Some(yaml_config), Some(proto_config)) => assert_endpoint_config_parity(
-                    &serde_json::from_str(&yaml_config.to_json_str().unwrap()).unwrap(),
-                    &serde_json::from_str(&proto_config.to_json_str().unwrap()).unwrap(),
-                    &proto,
-                    &proto.network_policies["parity"].endpoints[0],
-                ),
+                (Some(yaml_config), Some(proto_config)) => {
+                    // Grant reporting binds every protocol to the canonical
+                    // policy. Derive this metadata independently and compare
+                    // all remaining configuration.
+                    assert!(yaml_config.policy_hash.is_empty());
+                    assert!(yaml_config.endpoint_id.is_empty());
+                    let endpoint = &proto.network_policies["parity"].endpoints[0];
+                    let mut expected = yaml_config.clone();
+                    expected.policy_hash = deterministic_policy_hash(&proto);
+                    if is_mcp_protocol(&endpoint.protocol) {
+                        expected.endpoint_id =
+                            openshell_core::endpoint_status::endpoint_id(endpoint);
+                    }
+                    assert_eq!(
+                        &expected, proto_config,
+                        "{protocol}: endpoint configuration must match apart from verified gateway identity"
+                    );
+                }
                 _ => assert_eq!(yaml_config, proto_config),
             }
             for engine in [&yaml_engine, &proto_engine] {
@@ -3883,7 +3040,10 @@ network_policies:
                 ));
                 if protocol == "sql" {
                     let config = engine.query_endpoint_config(&input).unwrap().unwrap();
-                    assert_eq!(config["enforcement"], regorus::Value::from("audit"));
+                    assert_eq!(
+                        config.enforcement,
+                        crate::policy_types::EnforcementSetting::Audit
+                    );
                     let mut request = l7_input(&input.host, 443, "", "/");
                     request["request"]["command"] = "SELECT".into();
                     assert!(eval_l7(engine, &request));
@@ -4120,16 +3280,12 @@ process:
         assert_eq!(snapshot.endpoints.len(), 4);
         assert_eq!(snapshot.endpoints[0].policy_name, "dns_transport");
         assert_eq!(snapshot.endpoints[0].endpoint_index, 0);
+        assert_eq!(snapshot.endpoints[0].endpoint.host, "resolver.example");
         assert_eq!(
-            get_str(&snapshot.endpoints[0].endpoint, "host").as_deref(),
-            Some("resolver.example")
+            snapshot.endpoints[0].endpoint.ports,
+            [53, 853],
+            "eligible endpoint must retain concrete ports"
         );
-        let Some(regorus::Value::Array(ports)) =
-            get_field(&snapshot.endpoints[0].endpoint, "ports")
-        else {
-            panic!("eligible endpoint must retain concrete ports");
-        };
-        assert_eq!(ports.as_ref(), &[53.into(), 853.into()]);
         assert_eq!(snapshot.endpoints[1].endpoint_index, 1);
         assert_eq!(snapshot.endpoints[2].endpoint_index, 2);
         assert_eq!(snapshot.endpoints[3].endpoint_index, 4);
@@ -5719,6 +4875,9 @@ process:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -6342,6 +5501,9 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -6413,6 +5575,9 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -6489,6 +5654,9 @@ network_policies:
         );
 
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -7709,9 +6877,13 @@ network_policies:
             ));
         } else {
             let config = config.expect("L7 endpoint configuration");
+            let published = engine
+                .query_endpoint_config_json(&input)
+                .expect("query endpoint config")
+                .expect("published endpoint configuration");
             assert_eq!(
-                config["protocol"],
-                regorus::Value::from(canonical),
+                published["protocol"],
+                serde_json::json!(canonical),
                 "published endpoint protocol for {authored}"
             );
             crate::l7::parse_l7_config(&config).expect("valid typed L7 configuration");
@@ -7888,12 +7060,10 @@ network_policies:
             .expect("expected MCP endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
 
-        let config_json: serde_json::Value = serde_json::from_str(
-            &config
-                .to_json_str()
-                .expect("endpoint config must serialize as JSON"),
-        )
-        .expect("endpoint config must be valid JSON");
+        let config_json = engine
+            .query_endpoint_config_json(&input)
+            .expect("query endpoint config")
+            .expect("endpoint config must be valid JSON");
         assert_eq!(
             config_json["protocol"],
             serde_json::json!("mcp"),
@@ -8232,6 +7402,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8289,6 +7462,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8347,6 +7523,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8407,6 +7586,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8466,6 +7648,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -8527,7 +7712,7 @@ network_policies:
             .unwrap();
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
-        let mut eng = cloned.engine().lock().unwrap();
+        let mut eng = cloned.rego_evaluator_for_tests().engine_for_tests();
         set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -8569,7 +7754,7 @@ network_policies:
         let cloned = engine
             .clone_engine_for_tunnel(engine.current_generation())
             .unwrap();
-        let mut eng = cloned.engine().lock().unwrap();
+        let mut eng = cloned.rego_evaluator_for_tests().engine_for_tests();
         set_regorus_input(&mut eng, input_json).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
@@ -8655,12 +7840,10 @@ network_policies:
                 .query_endpoint_config(&input)
                 .expect("query endpoint config")
                 .expect("expected MCP endpoint config");
-            let config_json: serde_json::Value = serde_json::from_str(
-                &config
-                    .to_json_str()
-                    .expect("endpoint config must serialize as JSON"),
-            )
-            .expect("endpoint config must be valid JSON");
+            let config_json = engine
+                .query_endpoint_config_json(&input)
+                .expect("query endpoint config")
+                .expect("endpoint config must be valid JSON");
             assert_eq!(config_json["protocol"], serde_json::json!("mcp"));
             let l7 = crate::l7::parse_l7_config(&config).expect("parse L7 endpoint config");
             assert_eq!(
@@ -9273,9 +8456,9 @@ process:
             .unwrap();
         assert_eq!(generation, engine.current_generation());
         assert_eq!(configs.len(), 2);
-        assert_eq!(get_str(&configs[0], "tls").as_deref(), Some("skip"));
-        assert_eq!(get_str_array(&configs[0], "allowed_ips"), ["192.168.1.100"]);
-        assert_eq!(get_str(&configs[1], "tls"), None);
+        assert_eq!(configs[0].tls, crate::policy_types::TlsSetting::Skip);
+        assert_eq!(configs[0].allowed_ips, ["192.168.1.100"]);
+        assert_eq!(configs[1].tls, crate::policy_types::TlsSetting::Auto);
 
         let selected = engine.query_endpoint_config(&input).unwrap().unwrap();
         assert_eq!(
@@ -9734,7 +8917,7 @@ process:
         assert!(authorization.exact_declared_endpoint_host);
         assert_eq!(authorization.endpoint_configs.len(), 1);
         assert_eq!(
-            get_str_array(&authorization.endpoint_configs[0], "allowed_ips"),
+            authorization.endpoint_configs[0].allowed_ips,
             vec!["10.0.5.0/24"]
         );
         assert_eq!(authorization.matched_endpoints.len(), 1);
@@ -9744,8 +8927,8 @@ process:
         );
         assert_eq!(authorization.matched_endpoints[0].endpoint_index, 0);
         assert_eq!(
-            get_str(&authorization.matched_endpoints[0].endpoint, "host").as_deref(),
-            Some("my-service.corp.net")
+            authorization.matched_endpoints[0].endpoint.host,
+            "my-service.corp.net"
         );
     }
 
@@ -9792,8 +8975,8 @@ process:
         assert_eq!(matched.policy_name, "native_tcp");
         assert_eq!(matched.endpoint_index, 0);
         assert_eq!(
-            get_str(&matched.endpoint, "protocol").as_deref(),
-            Some("tcp")
+            matched.endpoint.protocol,
+            crate::policy_types::EndpointProtocol::Tcp
         );
     }
 
@@ -9977,6 +9160,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -10047,6 +9233,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -10277,6 +9466,9 @@ network_policies:
             },
         );
         let proto = ProtoSandboxPolicy {
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
             version: 1,
             filesystem: Some(ProtoFs {
                 include_workdir: true,
@@ -11257,6 +10449,9 @@ network_policies:
             process: None,
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
         };
 
         let pid = std::process::id(); // accessible root, leaf paths absent
@@ -11940,6 +11135,9 @@ network_policies:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
         };
 
         // Build engine with our PID (symlink resolution will work via /proc/self/root/)
@@ -12103,6 +11301,9 @@ process:
             }),
             network_policies,
             network_middlewares: std::collections::HashMap::default(),
+            cedar_policy_source: String::new(),
+            provider_credential_rules: std::collections::HashMap::default(),
+            endpoint_settings: Vec::new(),
         };
 
         // Initial load at pid=0 — no symlink expansion
@@ -12193,47 +11394,6 @@ network_policies:
         assert_eq!(
             names,
             vec!["endpoint-redactor", "policy-redactor", "global-redactor"]
-        );
-    }
-
-    fn matching_middleware_configs(count: usize) -> Vec<regorus::Value> {
-        (0..count)
-            .map(|index| {
-                regorus::Value::from(serde_json::json!({
-                    "name": format!("stage-{index}"),
-                    "middleware": "openshell/regex",
-                    "endpoints": {"include": ["api.example.com"]}
-                }))
-            })
-            .collect()
-    }
-
-    #[test]
-    fn middleware_chain_accepts_maximum_selected_stages() {
-        let configs = matching_middleware_configs(
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES,
-        );
-
-        let chain =
-            global_middleware_entries(&configs, "api.example.com").expect("maximum selected chain");
-        assert_eq!(
-            chain.len(),
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES
-        );
-    }
-
-    #[test]
-    fn middleware_chain_rejects_selected_stages_over_capacity() {
-        let configs = matching_middleware_configs(
-            openshell_supervisor_middleware::MAX_MIDDLEWARE_CHAIN_STAGES + 1,
-        );
-
-        let error = global_middleware_entries(&configs, "api.example.com")
-            .expect_err("selected chain over capacity");
-        assert!(
-            error
-                .to_string()
-                .contains("selected middleware stage count exceeds platform maximum 10")
         );
     }
 

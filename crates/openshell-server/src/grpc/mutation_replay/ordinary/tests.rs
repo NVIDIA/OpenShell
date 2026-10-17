@@ -1087,11 +1087,11 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         )),
         request_id: id(),
     };
-    let approved = run(&state, authed_request(approve.clone()))
+    let approved = Box::pin(run(&state, authed_request(approve.clone())))
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(replay(&state, approve.clone()).await, approved);
+    assert_eq!(Box::pin(replay(&state, approve.clone())).await, approved);
     replay(&state, edit).await;
     let undo = UndoDraftChunkRequest {
         sandbox: name.into(),
@@ -1106,7 +1106,7 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         .unwrap()
         .into_inner();
     assert_eq!(replay(&state, undo).await, undone);
-    assert_eq!(replay(&state, approve).await, approved);
+    assert_eq!(Box::pin(replay(&state, approve)).await, approved);
     let reject = RejectDraftChunkRequest {
         sandbox: name.into(),
         chunk_id: submitted.accepted_chunk_ids[1].clone(),

@@ -135,6 +135,25 @@ impl OpenShellClient {
         })
     }
 
+    /// Reject Cedar policies before mutation if the gateway cannot interpret them.
+    /// Call this before sending Cedar through the raw gRPC escape hatch as well.
+    pub async fn require_cedar_policy_support(
+        &self,
+        policy: Option<&proto::SandboxPolicy>,
+    ) -> Result<()> {
+        if policy.is_some_and(|policy| !policy.cedar_policy_source.is_empty()) {
+            let info = self
+                .unary(|mut grpc| async move { grpc.health(proto::HealthRequest {}).await })
+                .await?;
+            if !info.supports_cedar_policy {
+                return Err(SdkError::from_status(tonic::Status::failed_precondition(
+                    "gateway does not advertise Cedar policy support; upgrade the gateway before sending Cedar policies",
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a new sandbox from a curated [`SandboxSpec`].
     pub async fn create_sandbox(&self, spec: SandboxSpec) -> Result<SandboxRef> {
         let request = create_sandbox_request(spec);
@@ -152,6 +171,8 @@ impl OpenShellClient {
         &self,
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
+        self.require_cedar_policy_support(spec.policy.as_ref())
+            .await?;
         let request = create_sandbox_from_template_request(spec);
         let response = self
             .unary(|mut grpc| {
@@ -901,6 +922,9 @@ impl WorkspaceScopedClient {
         &self,
         spec: SandboxTemplateCreateSpec,
     ) -> Result<SandboxRef> {
+        self.client
+            .require_cedar_policy_support(spec.policy.as_ref())
+            .await?;
         let mut request = create_sandbox_from_template_request(spec);
         request.workspace_scope = Some(proto::workspace_selector(&self.workspace));
         let response = self

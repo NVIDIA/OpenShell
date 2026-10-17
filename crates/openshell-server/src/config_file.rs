@@ -953,7 +953,7 @@ name = "agent-substrate"
 endpoint = { kind = "tcp", authority = "backend.example:443", addresses = ["127.0.0.1:47000"] }
 [[openshell.supervisor.isolation_backends]]
 name = "other-backend"
-endpoint = { kind = "unix", socket_path = "/run/other.sock" }
+endpoint = { kind = "tcp", authority = "other.example:443", addresses = ["127.0.0.1:47001"] }
 "#,
         );
         let file = load(tmp.path()).unwrap();
