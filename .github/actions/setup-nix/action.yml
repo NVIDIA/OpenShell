@@ -2,14 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Setup Nix
-description: Install Determinate Nix, configure Cachix, and optionally prepare the development shell
+description: Install Determinate Nix, configure read-only Cachix access, and optionally prepare the development shell
 
 inputs:
-  cachix-auth-token:
-    description: Token used to write build outputs to Cachix
-    required: false
-    default: ""
-
   prepare-shell:
     description: Prepare the development shell, retrying once on failure
     required: false
@@ -30,8 +25,7 @@ runs:
     - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
       with:
         name: openshell
-        authToken: ${{ inputs.cachix-auth-token }}
-        skipPush: ${{ inputs.cachix-auth-token == '' }}
+        skipPush: true
 
     - name: Prepare Nix development shell
       if: inputs.prepare-shell == 'true'

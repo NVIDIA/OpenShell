@@ -37,9 +37,6 @@ on:
         description: Upload results to GitHub Code Scanning
         type: boolean
         default: true
-    secrets:
-      CACHIX_AUTH_TOKEN:
-        description: Token used to write Nix build outputs to Cachix
 
   workflow_dispatch:
     inputs:
@@ -106,7 +103,6 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Test scan reporting
         run: tasks/scripts/trivy-scan-test.sh

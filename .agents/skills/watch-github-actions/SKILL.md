@@ -145,6 +145,11 @@ The public diagnostic intentionally omits them; detailed review needs an
 approved private destination. Helpers must come from the workflow revision,
 not from the candidate under scan.
 
+`setup-nix` always uses read-only Cachix access. `Populate Nix Cache` is the only
+cache writer and runs after pushes to `main`. If it fails because its credential
+is missing, follow the environment setup in `CI.md#nix-cache-access`; never add
+a Cachix write token to repository or organization secrets.
+
 `setup-nix` retries development-shell preparation once when `prepare-shell`
 is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
 shell has already been prepared. Cargo, lint, and test commands are not retried.

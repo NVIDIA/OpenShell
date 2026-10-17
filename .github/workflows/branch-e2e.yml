@@ -108,8 +108,6 @@ jobs:
     uses: ./.github/workflows/build-binaries.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-gateway-plain:
     name: openshell-gateway driver-free (${{ matrix.triple }})
@@ -134,7 +132,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
           package: openshell-gateway
@@ -175,7 +172,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
           package: ${{ matrix.package }}
@@ -191,8 +187,6 @@ jobs:
     uses: ./.github/workflows/build-vm-driver.yml
     with:
       cargo-version: ${{ needs.version.outputs.cargo }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-images:
     needs: [pr_metadata, build-binaries]

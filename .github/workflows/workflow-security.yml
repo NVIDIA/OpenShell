@@ -22,9 +22,6 @@ on:
         description: Fail on Zizmor HIGH findings; Actionlint remains informational
         default: false
         type: boolean
-    secrets:
-      CACHIX_AUTH_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -55,7 +52,6 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Actionlint
         run: |
@@ -143,7 +139,6 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ github.event_name != 'pull_request' && secrets.CACHIX_AUTH_TOKEN || '' }}
 
       - name: Run Zizmor
         id: findings

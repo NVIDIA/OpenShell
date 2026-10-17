@@ -21,8 +21,6 @@ on:
     secrets:
       CODEX_SECURITY_API_KEY:
         required: true
-      CACHIX_AUTH_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -51,8 +49,6 @@ jobs:
         ghcr.io/nvidia/openshell/gateway:${{ inputs.source-sha }}
         ghcr.io/nvidia/openshell/sandbox:${{ inputs.source-sha }}
         ghcr.io/nvidia/openshell/supervisor:${{ inputs.source-sha }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   prepare-integration:
     permissions:

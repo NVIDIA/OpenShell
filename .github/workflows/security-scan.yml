@@ -40,9 +40,6 @@ on:
         description: Newline-separated packaged Helm chart OCI references for Trivy
         default: ""
         type: string
-    secrets:
-      CACHIX_AUTH_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -73,8 +70,6 @@ jobs:
       ignore-unfixed: false
       images: ${{ inputs.images }}
       charts: ${{ inputs.charts }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   cargo-deny:
     name: Cargo Deny
@@ -95,5 +90,3 @@ jobs:
     with:
       candidate_ref: ${{ inputs.candidate_ref }}
       fail-on-findings: ${{ inputs.fail-on-static-findings }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}

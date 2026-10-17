@@ -26,8 +26,6 @@ jobs:
     with:
       release-tag: ${{ inputs.tag || github.ref_name }}
       is-prerelease: false
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   qualify:
     name: Qualify
@@ -45,7 +43,6 @@ jobs:
       is-prerelease: false
     secrets:
       CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   publish:
     name: Publish

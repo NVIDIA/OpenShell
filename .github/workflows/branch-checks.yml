@@ -192,7 +192,6 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
           prepare-shell: "true"
           shell-installable: .#devShells.x86_64-linux.default
 
@@ -211,7 +210,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Format
         shell: nix develop -c bash -euo pipefail {0}
@@ -234,7 +232,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Verify Cargo lockfiles
         shell: nix develop -c bash -euo pipefail {0}
@@ -262,7 +259,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -300,7 +296,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -331,7 +326,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -367,7 +361,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -417,7 +410,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -442,7 +434,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -469,7 +460,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -526,6 +516,7 @@ jobs:
 
       - name: Test release qualification summary
         run: mise run test:qualification-summary
+
   go:
     name: Go SDK
     needs: pr_metadata

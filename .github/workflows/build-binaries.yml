@@ -17,9 +17,6 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
-      CACHIX_AUTH_TOKEN:
-        required: true
 
 permissions:
   contents: read
@@ -52,7 +49,6 @@ jobs:
       - uses: ./.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
           package: ${{ env.PACKAGE }}

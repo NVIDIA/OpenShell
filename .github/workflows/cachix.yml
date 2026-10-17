@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Populate Nix Cache
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cachix-write
+  cancel-in-progress: false
+
+jobs:
+  populate:
+    if: github.repository == 'NVIDIA/OpenShell' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Configure this environment to allow only the main branch BEFORE adding
+    # its secret. Ref checks in YAML cannot protect a repository-wide secret.
+    environment: cachix-write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+          - system: aarch64-darwin
+            runner: macos-15-xlarge
+    # Keep credential-bearing work on fresh GitHub-hosted runners.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Require the environment credential
+        env:
+          CACHIX_WRITE_TOKEN: ${{ secrets.CACHIX_WRITE_TOKEN }}
+        run: |
+          if [ -z "$CACHIX_WRITE_TOKEN" ]; then
+            echo "::error::Configure the cachix-write environment as documented in CI.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - uses: DeterminateSystems/determinate-nix-action@e847f25223456b3058e12f7fc9d777b6a6f25060 # v3.23.2
+        with:
+          github-token: ${{ github.token }}
+          summarize: false
+
+      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_WRITE_TOKEN }}
+
+      - name: Build the development shell and VM runtime
+        env:
+          NIX_SYSTEM: ${{ matrix.system }}
+        run: |
+          # HTTP 416 is not retried by Nix; restart the build once on failure.
+          nix build --no-link ".#devShells.${NIX_SYSTEM}.default" .#vm-runtime || \
+            nix build --no-link ".#devShells.${NIX_SYSTEM}.default" .#vm-runtime

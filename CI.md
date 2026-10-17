@@ -17,6 +17,23 @@ Manual admission does not change the bot's automatic trust policy for ready PRs.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
 
+### Nix cache access
+
+All CI jobs use the public `openshell` Cachix cache read-only. `Populate Nix
+Cache` is the sole writer and runs on GitHub-hosted runners after pushes to `main`.
+
+Before enabling cache writes, a repository administrator must:
+
+1. Revoke the old Cachix write token and remove `CACHIX_AUTH_TOKEN` from
+   repository and organization secrets; audit its uploads and invalidate
+   untrusted entries.
+2. Create the `cachix-write` environment, restrict it to the exact protected
+   `main` branch with no tag rules or administrator bypass, then add a fresh
+   `CACHIX_WRITE_TOKEN` only to that environment.
+
+Mirrored PRs can edit workflow YAML, so the GitHub [environment restriction](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments)
+is the security boundary. Keep writes disabled until this migration is complete.
+
 ### Protobuf API compatibility
 
 `Protobuf Compatibility` runs in Branch Checks, Release, and Pre-release through the shared
@@ -317,8 +334,6 @@ jobs:
         ${{ needs.build.outputs.sandbox_image }}
       charts: ${{ needs.build.outputs.chart_ref }}
       fail-on-static-findings: true
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
@@ -338,7 +353,7 @@ The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
-`CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
+The scan workflows use read-only Nix cache access. The parent publishes SARIF from CodeQL, Trivy,
 and workflow reports against the candidate tag and commit. Existing standalone
 triggers stay active.
 
@@ -560,7 +575,8 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
-| `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
+| `.github/actions/setup-nix/action.yml` | Installs Nix and configures read-only access to the OpenShell Cachix cache. |
+| `.github/workflows/cachix.yml` | Populates the Nix cache from `main` using the protected `cachix-write` environment. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |

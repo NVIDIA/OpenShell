@@ -27,9 +27,6 @@ on:
       source_sha:
         description: Source commit resolved from the release tag
         value: ${{ jobs.compute-versions.outputs.source_sha }}
-    secrets:
-      CACHIX_AUTH_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -116,8 +113,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   build-vm-driver:
     needs: [compute-versions, build-binaries]
@@ -128,8 +123,6 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       supervisor-image-tag: ${{ needs.compute-versions.outputs.semver }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
-    secrets:
-      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   package-binaries:
     needs: [compute-versions, build-binaries, build-vm-driver]
