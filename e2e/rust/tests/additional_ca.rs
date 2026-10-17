@@ -132,13 +132,20 @@ fn engine_command(container_engine: &ContainerEngine) -> Command {
 #[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), String> {
     let container_engine = ContainerEngine::from_env().map_err(|error| error.clone())?;
-    let network = std::env::var("OPENSHELL_E2E_NETWORK_NAME")
-        .or_else(|_| std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME"))
-        .map_err(|error| format!("wrapper must export sandbox network: {error}"))?;
-    let network_filter = format!("network={network}");
+    // The supervisor container owns the additional CA mount and command. It is
+    // host-networked (or attached to a runtime bridge), so it cannot be
+    // located through e2e network membership; select it by managed labels.
+    // The sandbox namespace label is not used because the Podman driver
+    // labels containers with the gateway-elided request namespace.
     let output = engine_command(&container_engine)
-        .args(["ps", "-aq", "--filter"])
-        .arg(network_filter)
+        .args([
+            "ps",
+            "-aq",
+            "--filter",
+            "label=openshell.ai/isolation-role=supervisor",
+            "--filter",
+        ])
+        .arg(format!("label=openshell.ai/sandbox-name={sandbox_name}"))
         .output()
         .map_err(|error| format!("run {driver} ps: {error}"))?;
     if !output.status.success() {
@@ -155,7 +162,7 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
         .collect::<Vec<_>>();
     let [container_id] = ids.as_slice() else {
         return Err(format!(
-            "expected one {driver} container for {sandbox_name}, found {ids:?}"
+            "expected one {driver} supervisor container for {sandbox_name}, found {ids:?}"
         ));
     };
 
@@ -170,11 +177,22 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
     if destination_mounts.len() != 1 || destination_mounts[0]["RW"] != false {
         return Err(format!("unexpected destination CA mounts: {mounts:#?}"));
     }
+    // Docker bind-mounts the gateway mTLS CA. Podman bind-mounts it only when
+    // user namespaces are not remapping UIDs; otherwise it is delivered as a
+    // container secret (`openshell-tls-ca-*`), which does not appear in
+    // `.Mounts`.
     let gateway_ca_mount = mounts
         .iter()
-        .find(|mount| mount["Destination"] == GATEWAY_CA_PATH)
-        .ok_or("gateway mTLS CA mount must remain present")?;
-    if destination_mounts[0]["Source"] == gateway_ca_mount["Source"] {
+        .find(|mount| mount["Destination"] == GATEWAY_CA_PATH);
+    let gateway_ca_secret = gateway_ca_mount.is_none()
+        && driver == "podman"
+        && podman_gateway_ca_secret(&container_engine, driver, container_id)?;
+    if gateway_ca_mount.is_none() && !gateway_ca_secret {
+        return Err("gateway mTLS CA delivery must remain present".to_string());
+    }
+    if let Some(gateway_ca_mount) = gateway_ca_mount
+        && destination_mounts[0]["Source"] == gateway_ca_mount["Source"]
+    {
         return Err("destination and gateway CA mounts must be distinct".to_string());
     }
 
@@ -182,6 +200,31 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
     command_inspect.args(["inspect", "--format", "{{json .Config.Cmd}}", container_id]);
     let command = run_json(command_inspect, &format!("{driver} command inspection"))?;
     assert_network_ca_command(command.as_array().ok_or("command must be an array")?)
+}
+
+/// Check whether the supervisor received the gateway mTLS CA as a Podman
+/// container secret (the delivery path used when user namespaces remap UIDs).
+fn podman_gateway_ca_secret(
+    container_engine: &ContainerEngine,
+    driver: &str,
+    container_id: &str,
+) -> Result<bool, String> {
+    let mut secrets_command = engine_command(container_engine);
+    secrets_command.args([
+        "inspect",
+        "--format",
+        "{{json .Config.Secrets}}",
+        container_id,
+    ]);
+    let secrets = run_json(secrets_command, &format!("{driver} secret inspection"))?;
+    let secrets = secrets
+        .as_array()
+        .ok_or("supervisor secrets must be an array")?;
+    Ok(secrets.iter().any(|secret| {
+        secret["Name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("openshell-tls-ca-"))
+    }))
 }
 
 fn assert_additional_ca_command(command: &[Value]) -> Result<(), String> {

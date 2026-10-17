@@ -1333,20 +1333,43 @@ impl PodmanComputeDriver {
                         }
                     };
 
-                let tls_secret_names = if self.config.tls_enabled() {
-                    let names = container::tls_secret_names(&sandbox.id);
-                    if let Err(e) = create_tls_secrets(&self.client, &self.config, &names).await {
-                        cleanup_created().await;
-                        return Err(e);
+                let tls_secret_names = self
+                    .config
+                    .tls_enabled()
+                    .then(|| container::tls_secret_names(&sandbox.id));
+                let tls_secrets_owned = if let Some(names) = &tls_secret_names {
+                    if reuse_existing_resources {
+                        // The renamed stopped pair still owns the per-sandbox
+                        // TLS secret under the same sandbox id, and the
+                        // gateway CA it carries is unchanged; the replacement
+                        // pair reuses it instead of colliding on the name.
+                        if !self
+                            .client
+                            .secret_exists(&names[0])
+                            .await
+                            .map_err(ComputeDriverError::from)?
+                        {
+                            return Err(ComputeDriverError::Precondition(
+                                "Podman trust replacement requires the existing TLS CA secret"
+                                    .into(),
+                            ));
+                        }
+                        false
+                    } else {
+                        if let Err(e) = create_tls_secrets(&self.client, &self.config, names).await
+                        {
+                            cleanup_created().await;
+                            return Err(e);
+                        }
+                        true
                     }
-                    Some(names)
                 } else {
-                    None
+                    false
                 };
 
                 let cleanup_all = || async {
                     cleanup_created().await;
-                    if let Some(names) = &tls_secret_names {
+                    if tls_secrets_owned && let Some(names) = &tls_secret_names {
                         cleanup_tls_secrets(&self.client, names).await;
                     }
                 };
