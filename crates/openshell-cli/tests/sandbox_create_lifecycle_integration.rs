@@ -3734,6 +3734,7 @@ fn write_oidc_test_credentials(
             expires_at: Some(expires_at),
             issuer: issuer.to_string(),
             client_id: "openshell-cli".to_string(),
+            client_credentials: false,
         })
         .unwrap(),
     )
