@@ -127,6 +127,7 @@ fn process_activity_round_trips() {
                 .with_cmd_line("python3 -m pytest")
                 .with_parent(Process::new("/bin/sh", 4701)),
         )
+        .actor_process(Process::new("openshell-sandbox", 4700))
         .launch_type(LaunchTypeId::Other)
         .exit_code(0)
         .severity(SeverityId::Informational)
