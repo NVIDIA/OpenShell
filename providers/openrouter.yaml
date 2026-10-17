@@ -17,8 +17,10 @@
 #                    openrouter.ai and nowhere else.
 # Endpoint access:   openrouter.ai, read-write, L7 enforced.
 # Smoke test:        openshell sandbox create --provider <name> \
-#                      --from ghcr.io/anomalyco/opencode:latest -- \
-#                      opencode run -m openrouter/nvidia/nemotron-3.5-lightning:free 'reply with OK'
+#                      --from ghcr.io/anomalyco/opencode:latest -- sh -c \
+#                      "opencode run -m openrouter/nvidia/nemotron-3.5-lightning:free 'reply with OK' </dev/null"
+#                    The sandbox main process keeps stdin open, and `opencode run`
+#                    reads stdin until EOF, so the smoke test closes stdin itself.
 
 id: openrouter
 display_name: OpenRouter
