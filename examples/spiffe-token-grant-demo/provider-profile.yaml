@@ -34,16 +34,12 @@ endpoints:
     tls: none
     access: read-write
     enforcement: enforce
-    allowed_ips:
-      - 10.43.0.0/16
   - host: beta.default.svc.cluster.local
     port: 80
     protocol: rest
     tls: none
     access: read-write
     enforcement: enforce
-    allowed_ips:
-      - 10.43.0.0/16
 binaries:
   - /usr/bin/curl
   - /usr/local/bin/curl
