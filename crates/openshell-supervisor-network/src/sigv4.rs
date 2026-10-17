@@ -2,13 +2,79 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aws_credential_types::Credentials;
+use aws_sigv4::SigningOutput;
 use aws_sigv4::http_request::{
-    PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings, sign,
+    PayloadChecksumKind, PercentEncodingMode, SignableBody, SignableRequest, SigningInstructions,
+    SigningSettings, UriPathNormalizationMode, sign,
 };
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use miette::{Result, miette};
 use std::time::SystemTime;
+
+/// Sign without allowing the AWS SDK's canonical-request TRACE event to reach
+/// supervisor log sinks. The canonical request can contain a raw session token.
+fn sign_without_tracing<'a>(
+    request: SignableRequest<'a>,
+    params: &'a aws_sigv4::http_request::SigningParams<'a>,
+) -> std::result::Result<SigningOutput<SigningInstructions>, aws_sigv4::http_request::SigningError>
+{
+    let no_tracing = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    tracing::dispatcher::with_default(&no_tracing, || sign(request, params))
+}
+
+fn aws_uri_encode_path_once(path: &str) -> Result<String> {
+    let mut encoded = String::with_capacity(path.len());
+    let bytes = path.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'/' || byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
+        {
+            encoded.push(char::from(byte));
+            index += 1;
+        } else if byte == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return Err(miette!(
+                    "SigV4 signing: request path contains invalid percent encoding"
+                ));
+            }
+            encoded.push('%');
+            encoded.push(char::from(bytes[index + 1].to_ascii_uppercase()));
+            encoded.push(char::from(bytes[index + 2].to_ascii_uppercase()));
+            index += 3;
+        } else {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "%{byte:02X}").expect("writing to a String cannot fail");
+            index += 1;
+        }
+    }
+
+    Ok(encoded)
+}
+
+fn signing_uri(host: &str, request_target: &str, service: &str) -> Result<String> {
+    let (path, query) = request_target
+        .split_once('?')
+        .map_or((request_target, None), |(path, query)| (path, Some(query)));
+    let path = if service.eq_ignore_ascii_case("s3") {
+        aws_uri_encode_path_once(path)?
+    } else {
+        path.to_string()
+    };
+    // `aws-sigv4` parses the already-encoded query as form data, where a raw
+    // `+` means space. In an HTTP URI it is a literal plus, whose AWS canonical
+    // representation is `%2B`; protect it before the signer parses the query.
+    let query = query.map(|query| query.replace('+', "%2B"));
+    Ok(query.map_or_else(
+        || format!("https://{host}{path}"),
+        |query| format!("https://{host}{path}?{query}"),
+    ))
+}
 
 /// AWS regions contain a hyphen followed by a digit (e.g., `us-east-1`).
 /// Service names like `s3` or `bedrock-runtime` do not.
@@ -208,6 +274,10 @@ fn build_signing_params<'a>(
 ) -> Result<aws_sigv4::http_request::SigningParams<'a>> {
     let mut settings = SigningSettings::default();
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+    if service.eq_ignore_ascii_case("s3") {
+        settings.percent_encoding_mode = PercentEncodingMode::Single;
+        settings.uri_path_normalization_mode = UriPathNormalizationMode::Disabled;
+    }
 
     Ok(v4::SigningParams::builder()
         .identity(identity)
@@ -233,7 +303,7 @@ fn build_identity(access_key: &str, secret_key: &str, session_token: Option<&str
 
 fn rebuild_request(
     parts: &RequestParts<'_>,
-    instructions: &aws_sigv4::http_request::SigningInstructions,
+    instructions: &SigningInstructions,
     body: &[u8],
 ) -> Vec<u8> {
     let mut output = Vec::with_capacity(256 + body.len());
@@ -282,7 +352,7 @@ pub fn apply_sigv4_to_request(
     let header_str = std::str::from_utf8(&raw[..header_end])
         .map_err(|e| miette!("SigV4 signing: request headers are not valid UTF-8: {e}"))?;
     let parts = parse_request_parts(header_str);
-    let uri = format!("https://{host}{}", parts.path);
+    let uri = signing_uri(host, parts.path, service)?;
     let identity = build_identity(access_key, secret_key, session_token);
     let signing_params = build_signing_params(&identity, region, service)?;
 
@@ -297,7 +367,7 @@ pub fn apply_sigv4_to_request(
     )
     .map_err(|e| miette!("SigV4 signable request: {e}"))?;
 
-    let (instructions, _signature) = sign(signable_request, &signing_params)
+    let (instructions, _signature) = sign_without_tracing(signable_request, &signing_params)
         .map_err(|e| miette!("SigV4 signing failed: {e}"))?
         .into_parts();
 
@@ -349,7 +419,7 @@ pub fn apply_sigv4_headers_only_with_body(
     let header_str = std::str::from_utf8(raw_headers)
         .map_err(|e| miette!("SigV4 signing: request headers are not valid UTF-8: {e}"))?;
     let parts = parse_request_parts(header_str);
-    let uri = format!("https://{host}{}", parts.path);
+    let uri = signing_uri(host, parts.path, service)?;
     let identity = build_identity(access_key, secret_key, session_token);
     let signing_params = build_signing_params(&identity, region, service)?;
 
@@ -364,7 +434,7 @@ pub fn apply_sigv4_headers_only_with_body(
     )
     .map_err(|e| miette!("SigV4 signable request: {e}"))?;
 
-    let (instructions, _signature) = sign(signable_request, &signing_params)
+    let (instructions, _signature) = sign_without_tracing(signable_request, &signing_params)
         .map_err(|e| miette!("SigV4 signing failed: {e}"))?
         .into_parts();
 
@@ -374,6 +444,148 @@ pub fn apply_sigv4_headers_only_with_body(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::Subscriber;
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<Mutex<Vec<String>>>);
+
+    struct FieldCapture<'a>(&'a mut String);
+
+    impl Visit for FieldCapture<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            write!(self.0, "{}={value:?};", field.name())
+                .expect("writing tracing fields to a String cannot fail");
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = String::new();
+            event.record(&mut FieldCapture(&mut fields));
+            self.0
+                .lock()
+                .expect("event capture mutex must not be poisoned")
+                .push(format!("{}:{fields}", event.metadata().target()));
+        }
+    }
+
+    #[test]
+    fn s3_signing_uri_encodes_reserved_path_bytes_exactly_once() {
+        assert_eq!(
+            signing_uri(
+                "s3.us-east-1.amazonaws.com",
+                "/bucket/a+b=c@d%20e%2ff?prefix=a+b",
+                "s3",
+            )
+            .unwrap(),
+            "https://s3.us-east-1.amazonaws.com/bucket/a%2Bb%3Dc%40d%20e%2Ff?prefix=a%2Bb"
+        );
+    }
+
+    #[test]
+    fn non_s3_signing_preserves_path_and_escapes_query_plus() {
+        assert_eq!(
+            signing_uri(
+                "execute-api.us-east-1.amazonaws.com",
+                "/stage/a+b?value=a+b",
+                "execute-api",
+            )
+            .unwrap(),
+            "https://execute-api.us-east-1.amazonaws.com/stage/a+b?value=a%2Bb"
+        );
+    }
+
+    #[test]
+    fn s3_signing_uri_rejects_invalid_percent_encoding() {
+        assert!(signing_uri("s3.us-east-1.amazonaws.com", "/bucket/bad%2", "s3").is_err());
+    }
+
+    #[test]
+    fn s3_signing_keeps_the_wire_request_target_unchanged() {
+        let raw = b"GET /bucket/a+b=c@d%20e?prefix=a+b HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n";
+        let signed = apply_sigv4_to_request(
+            raw,
+            "s3.us-east-1.amazonaws.com",
+            "us-east-1",
+            "s3",
+            "AKIATEST",
+            "secret",
+            None,
+        )
+        .unwrap();
+
+        assert!(signed.starts_with(b"GET /bucket/a+b=c@d%20e?prefix=a+b HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn signing_does_not_emit_the_canonical_request_to_tracing() {
+        let events = EventCapture::default();
+        let captured = Arc::clone(&events.0);
+        let subscriber = tracing_subscriber::registry().with(events);
+        let session_token = "SUPER_SECRET_SIGV4_SESSION_TOKEN";
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "test_capture", "capture is active");
+            apply_sigv4_to_request(
+                b"GET /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n",
+                "s3.us-east-1.amazonaws.com",
+                "us-east-1",
+                "s3",
+                "ASIATEST",
+                "secret",
+                Some(session_token),
+            )
+            .unwrap();
+        });
+
+        let events = captured
+            .lock()
+            .expect("event capture mutex must not be poisoned")
+            .join("\n");
+        assert!(events.contains("test_capture"));
+        assert!(!events.contains("aws_sigv4"));
+        assert!(!events.contains(session_token));
+    }
+
+    #[test]
+    fn s3_signing_uses_service_specific_path_settings() {
+        let identity = build_identity("access-key", "secret-key", None);
+        let params = build_signing_params(&identity, "us-east-1", "s3").unwrap();
+
+        assert_eq!(
+            params.settings().percent_encoding_mode,
+            PercentEncodingMode::Single
+        );
+        assert_eq!(
+            params.settings().uri_path_normalization_mode,
+            UriPathNormalizationMode::Disabled
+        );
+    }
+
+    #[test]
+    fn non_s3_signing_preserves_default_path_settings() {
+        let identity = build_identity("access-key", "secret-key", None);
+        let params = build_signing_params(&identity, "us-east-1", "bedrock").unwrap();
+        let defaults = SigningSettings::default();
+
+        assert_eq!(
+            params.settings().percent_encoding_mode,
+            defaults.percent_encoding_mode
+        );
+        assert_eq!(
+            params.settings().uri_path_normalization_mode,
+            defaults.uri_path_normalization_mode
+        );
+    }
 
     #[test]
     fn extract_region_from_hostname() {

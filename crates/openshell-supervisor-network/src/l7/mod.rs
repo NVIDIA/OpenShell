@@ -292,6 +292,19 @@ impl EndpointObserver {
             self.observe(EndpointResult::CredentialUnavailable);
         }
     }
+
+    /// Report a typed credential-resolution failure without conflating a
+    /// signed-request placeholder denial with endpoint binding.
+    pub(crate) fn observe_credential_resolution_failure(
+        &self,
+        error: &openshell_core::secrets::UnresolvedPlaceholderError,
+    ) {
+        if error.is_endpoint_mismatch() || error.is_forbidden_in_signed_request() {
+            self.observe(EndpointResult::PolicyDenied);
+        } else if self.uses_provider_credentials {
+            self.observe(EndpointResult::CredentialUnavailable);
+        }
+    }
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -2010,6 +2023,26 @@ mod tests {
             receiver.recv().await.expect("credential observation"),
             EndpointStatusCommand::Observe {
                 result: EndpointResult::CredentialUnavailable,
+                ..
+            }
+        ));
+
+        let (_, resolver) = openshell_core::secrets::SecretResolver::from_provider_env(
+            std::iter::once(("AWS_SECRET_ACCESS_KEY".to_string(), "secret".to_string())).collect(),
+        );
+        let request_resolver = resolver
+            .expect("resolver")
+            .without_resolvable_placeholders();
+        let error = request_resolver
+            .rewrite_header_value("openshell:resolve:env:AWS_SECRET_ACCESS_KEY")
+            .expect_err("signed request placeholder denial");
+        let observer = EndpointObserver::begin(Some(&sender), &config).expect("begin observation");
+        observer.observe_credential_resolution_failure(&error);
+
+        assert!(matches!(
+            receiver.recv().await.expect("signed request observation"),
+            EndpointStatusCommand::Observe {
+                result: EndpointResult::PolicyDenied,
                 ..
             }
         ));
