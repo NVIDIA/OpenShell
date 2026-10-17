@@ -2541,14 +2541,31 @@ async fn validate_provider_composition_for_existing_sandboxes(
                 .expect("catalog was inserted for sandbox workspace");
             let base_policy =
                 current_base_policy_for_sandbox(state.store.as_ref(), &sandbox).await?;
-            let provider_layers = provider_policy_context_with_catalog(
-                state.store.as_ref(),
-                catalog,
-                &workspace,
-                provider_names,
-            )
-            .await?
-            .layers;
+            // A provider deleted under a sandbox leaves a dangling reference. The
+            // sandbox already fails closed, so warn and validate the rest.
+            let mut records = Vec::with_capacity(provider_names.len());
+            let mut missing = Vec::new();
+            for name in provider_names {
+                match super::provider::load_provider_environment_record(
+                    state.store.as_ref(),
+                    &workspace,
+                    name,
+                )
+                .await?
+                {
+                    Some(record) => records.push(record),
+                    None => missing.push(name.as_str()),
+                }
+            }
+            if !missing.is_empty() {
+                warn!(
+                    workspace = %workspace,
+                    sandbox = %sandbox.object_name(),
+                    providers = %missing.join(","),
+                    "sandbox references providers that no longer exist"
+                );
+            }
+            let provider_layers = provider_policy_context_from_records(catalog, &records).layers;
             validate_candidate_effective_policy(&base_policy, &provider_layers).map_err(|error| {
                 Status::failed_precondition(format!(
                     "cannot activate provider policy composition: sandbox '{}/{}' has an invalid effective policy: {}",
@@ -22580,6 +22597,43 @@ mod tests {
         assert_eq!(error.code(), Code::FailedPrecondition);
         assert!(error.message().contains("sandbox-upgrade"));
         assert!(error.message().contains("invalid effective policy"));
+    }
+
+    async fn install_dangling_provider_sandbox(state: &Arc<ServerState>) {
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sandbox-dangling",
+                "sandbox-dangling",
+                test_policy_with_rule("base", "api.example.com"),
+                vec!["deleted-provider".to_string()],
+            ))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_preflight_tolerates_dangling_provider_reference() {
+        let state = test_server_state().await;
+        install_dangling_provider_sandbox(&state).await;
+
+        validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect("a dangling provider reference must not block startup");
+    }
+
+    #[tokio::test]
+    async fn startup_preflight_still_rejects_invalid_policy_beside_dangling_reference() {
+        let state = test_server_state().await;
+        install_dangling_provider_sandbox(&state).await;
+        install_ambiguous_provider_binding(&state, "beside-dangling").await;
+
+        let error = validate_provider_composition_startup_preflight(&state)
+            .await
+            .expect_err("an invalid composed policy must stay fatal");
+
+        assert_eq!(error.code(), Code::FailedPrecondition);
+        assert!(error.message().contains("sandbox-beside-dangling"));
     }
 
     #[test]
