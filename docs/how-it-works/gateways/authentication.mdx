@@ -71,6 +71,12 @@ The connection flow:
 
 ### mTLS Operators
 
+An operator mTLS certificate authenticates an operator application or user as
+an administrative principal for an OpenShell gateway. Use this identity for
+gateway administration, including managing workspaces, sandboxes, and providers
+across all workspaces. It supports both administrative automation and interactive
+operator access.
+
 Enable `[openshell.gateway.mtls_auth] operator_enabled = true` to recognize a
 trusted client certificate whose organizational unit is exactly `operator`
 (`OU=operator`). This creates a distinct operator principal with user and
@@ -94,6 +100,10 @@ setting.
 
 See [Providers](/how-it-works/providers/overview#retrieve-runtime-credentials)
 for the credential retrieval contract.
+
+For a Helm deployment example using cert-manager and the chart's CA issuer,
+see [Managing Certificates](/kubernetes/managing-certificates#issue-an-operator-client-certificate).
+It covers how to issue an operator client certificate using cert-manager.
 
 ### Inspect the API with grpcurl
 

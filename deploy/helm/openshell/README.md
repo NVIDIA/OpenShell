@@ -374,6 +374,16 @@ sandbox JWT signing Secret. This precedence applies even if
 external non-cert-manager TLS source manages TLS and you pre-create the sandbox
 JWT signing Secret.
 
+Operator mTLS gives an operator application or user an administrative principal
+for managing the OpenShell gateway across all workspaces. Use a client
+certificate with exact `OU=operator` and client authentication usage, signed by
+a CA trusted by the gateway's configured client CA bundle. Enable authentication through
+`gatewayConfig["openshell.gateway.mtls_auth"].operator_enabled=true`.
+See [mTLS operators](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/authentication#mtls-operators)
+for authentication requirements, or
+[Managing Certificates](https://docs.nvidia.com/openshell/latest/kubernetes/managing-certificates#issue-an-operator-client-certificate)
+for an example using cert-manager to issue and renew the certificate.
+
 ## SPIFFE/SPIRE provider token grants
 
 Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
