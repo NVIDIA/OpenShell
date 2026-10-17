@@ -313,6 +313,19 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| {
                 openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
             }),
+            workspace_volume: std::env::var("OPENSHELL_K8S_WORKSPACE_VOLUME")
+                .ok()
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|err: String| {
+                    miette::miette!("invalid OPENSHELL_K8S_WORKSPACE_VOLUME: {err}")
+                })?
+                .unwrap_or_default(),
+            workspace_max_storage_size: std::env::var("OPENSHELL_K8S_WORKSPACE_MAX_STORAGE_SIZE")
+                .unwrap_or_else(|_| {
+                    openshell_driver_kubernetes::DEFAULT_WORKSPACE_MAX_STORAGE_SIZE.to_string()
+                }),
             workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")

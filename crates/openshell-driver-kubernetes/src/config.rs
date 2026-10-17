@@ -74,6 +74,131 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Default ceiling for a per-sandbox `workspace_storage_size` override.
+///
+/// Caller requests above this are rejected so a single sandbox cannot claim an
+/// unbounded `emptyDir` (and starve the node) or an oversized PVC.
+pub const DEFAULT_WORKSPACE_MAX_STORAGE_SIZE: &str = "10Gi";
+
+/// How the sandbox workspace (`/sandbox`) is backed on Kubernetes.
+///
+/// - `PersistentVolumeClaim` (default) — a per-sandbox PVC declared via
+///   `volumeClaimTemplates` on the `agents.x-k8s.io/Sandbox` CR. Survives pod
+///   rescheduling, but requires dynamic provisioning (a `StorageClass`).
+/// - `EmptyDir` — a size-capped `emptyDir` mounted at `/sandbox`. No PVC is
+///   created, so it works on clusters without dynamic provisioning; the
+///   workspace is reclaimed by kubelet when the Pod goes away.
+///
+/// Set gateway-wide via `workspace_volume`, and per-sandbox via
+/// `driver_config.kubernetes.workspace_volume` on gateways that enable
+/// `allow_driver_config`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceVolume {
+    /// Per-sandbox PVC via `volumeClaimTemplates` on the Sandbox CR.
+    #[default]
+    PersistentVolumeClaim,
+    /// Size-capped `emptyDir` volume — no PVC, reclaimed with the Pod.
+    EmptyDir,
+}
+
+impl std::fmt::Display for WorkspaceVolume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PersistentVolumeClaim => f.write_str("persistent_volume_claim"),
+            Self::EmptyDir => f.write_str("empty_dir"),
+        }
+    }
+}
+
+impl FromStr for WorkspaceVolume {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "persistent_volume_claim" => Ok(Self::PersistentVolumeClaim),
+            "empty_dir" => Ok(Self::EmptyDir),
+            other => Err(format!(
+                "unknown workspace volume '{other}'; expected 'persistent_volume_claim' or 'empty_dir'"
+            )),
+        }
+    }
+}
+
+/// Parse a Kubernetes resource quantity into a byte count for comparison.
+///
+/// Supports bare integers (bytes), IEC binary suffixes (`Ki Mi Gi Ti Pi Ei`),
+/// and SI decimal suffixes (`k M G T P E`, plus the `m` milli suffix which
+/// rounds up to at least one byte). This is deliberately a small subset of the
+/// full quantity grammar — enough to bound a workspace size — and does not
+/// accept exponent (`e`) notation.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "value is validated finite and non-negative, then clamped below u64::MAX before the cast"
+)]
+pub(crate) fn parse_quantity_bytes(quantity: &str) -> Result<u64, String> {
+    let trimmed = quantity.trim();
+    if trimmed.is_empty() {
+        return Err("empty quantity".to_string());
+    }
+
+    let (number, multiplier) = split_quantity_suffix(trimmed);
+    if number.is_empty() {
+        return Err(format!("invalid quantity '{quantity}': missing number"));
+    }
+
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("invalid quantity '{quantity}': '{number}' is not a number"))?;
+    if value < 0.0 {
+        return Err(format!("invalid quantity '{quantity}': must not be negative"));
+    }
+
+    // Round up so a fractional or milli quantity never resolves to zero bytes.
+    let bytes = (value * multiplier).ceil();
+    if !bytes.is_finite() || bytes > u64::MAX as f64 {
+        return Err(format!("invalid quantity '{quantity}': out of range"));
+    }
+    Ok(bytes as u64)
+}
+
+/// Split a quantity string into its numeric part and the byte multiplier its
+/// suffix implies.
+fn split_quantity_suffix(quantity: &str) -> (&str, f64) {
+    const KI: f64 = 1024.0;
+    const K: f64 = 1000.0;
+    let binary = [
+        ("Ki", KI),
+        ("Mi", KI * KI),
+        ("Gi", KI * KI * KI),
+        ("Ti", KI * KI * KI * KI),
+        ("Pi", KI * KI * KI * KI * KI),
+        ("Ei", KI * KI * KI * KI * KI * KI),
+    ];
+    for (suffix, multiplier) in binary {
+        if let Some(number) = quantity.strip_suffix(suffix) {
+            return (number, multiplier);
+        }
+    }
+    let decimal = [
+        ("m", 0.001),
+        ("k", K),
+        ("M", K * K),
+        ("G", K * K * K),
+        ("T", K * K * K * K),
+        ("P", K * K * K * K * K),
+        ("E", K * K * K * K * K * K),
+    ];
+    for (suffix, multiplier) in decimal {
+        if let Some(number) = quantity.strip_suffix(suffix) {
+            return (number, multiplier);
+        }
+    }
+    (quantity, 1.0)
+}
+
 /// Driver-owned requirements for the Kubernetes sandbox runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -262,11 +387,21 @@ pub struct KubernetesComputeConfig {
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
     pub workspace_default_storage_size: String,
+    /// How the sandbox workspace (`/sandbox`) is backed. `"persistent_volume_claim"`
+    /// (default) creates a per-sandbox PVC via `volumeClaimTemplates`;
+    /// `"empty_dir"` mounts a size-capped `emptyDir` instead, so sandboxes run
+    /// on clusters without dynamic storage provisioning. The workspace is then
+    /// reclaimed with the Pod and does not survive a reschedule or eviction.
+    pub workspace_volume: WorkspaceVolume,
+    /// Upper bound for a per-sandbox `workspace_storage_size` override. A caller
+    /// request above this is rejected. Bounds both the `emptyDir` `sizeLimit`
+    /// and the PVC storage request. Default `10Gi`.
+    pub workspace_max_storage_size: String,
     /// Kubernetes `StorageClass` name for the default workspace PVC.
     /// Empty string (default) = omit `storageClassName`, using the cluster's
     /// default `StorageClass`. Set this on clusters with no default
     /// `StorageClass`, otherwise the workspace PVC stays `Pending` and the
-    /// sandbox never starts.
+    /// sandbox never starts. Ignored when `workspace_volume = "empty_dir"`.
     pub workspace_storage_class: String,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
@@ -386,6 +521,8 @@ impl Default for KubernetesComputeConfig {
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
+            workspace_volume: WorkspaceVolume::default(),
+            workspace_max_storage_size: DEFAULT_WORKSPACE_MAX_STORAGE_SIZE.to_string(),
             workspace_storage_class: String::new(),
             default_runtime_class_name: String::new(),
             allowed_pod_annotations: Vec::new(),
@@ -402,6 +539,7 @@ impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
         self.validate_workspace_mode()?;
+        self.validate_workspace_sizes()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;
         self.validate_proxy_uid()?;
@@ -428,6 +566,47 @@ impl KubernetesComputeConfig {
     #[must_use]
     pub fn pod_label_allowed(&self, key: &str) -> bool {
         pod_metadata_key_allowed(&self.allowed_pod_labels, key)
+    }
+
+    /// Reject workspace size settings that would never admit a sandbox: a
+    /// malformed quantity, or a default size already above the per-sandbox
+    /// maximum. Surfaces operator mistakes at startup instead of at first
+    /// `sandbox create`.
+    pub fn validate_workspace_sizes(&self) -> Result<(), String> {
+        let default_size = if self.workspace_default_storage_size.is_empty() {
+            DEFAULT_WORKSPACE_STORAGE_SIZE
+        } else {
+            &self.workspace_default_storage_size
+        };
+        let default_bytes = parse_quantity_bytes(default_size)
+            .map_err(|err| format!("workspace_default_storage_size: {err}"))?;
+
+        let max_size = if self.workspace_max_storage_size.is_empty() {
+            DEFAULT_WORKSPACE_MAX_STORAGE_SIZE
+        } else {
+            &self.workspace_max_storage_size
+        };
+        let max_bytes = parse_quantity_bytes(max_size)
+            .map_err(|err| format!("workspace_max_storage_size: {err}"))?;
+
+        if default_bytes > max_bytes {
+            return Err(format!(
+                "workspace_default_storage_size ('{default_size}') exceeds \
+                 workspace_max_storage_size ('{max_size}')"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The effective per-sandbox maximum workspace size, resolving the
+    /// empty-string sentinel to the built-in default.
+    #[must_use]
+    pub fn effective_workspace_max_storage_size(&self) -> &str {
+        if self.workspace_max_storage_size.is_empty() {
+            DEFAULT_WORKSPACE_MAX_STORAGE_SIZE
+        } else {
+            &self.workspace_max_storage_size
+        }
     }
 
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
@@ -1070,6 +1249,96 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.workspace_storage_class, "fast-ssd");
+    }
+
+    #[test]
+    fn default_workspace_volume_is_persistent_volume_claim() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.workspace_volume, WorkspaceVolume::PersistentVolumeClaim);
+    }
+
+    #[test]
+    fn default_workspace_max_storage_size_is_10gi() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.workspace_max_storage_size, DEFAULT_WORKSPACE_MAX_STORAGE_SIZE);
+    }
+
+    #[test]
+    fn serde_override_workspace_volume_empty_dir() {
+        let json = serde_json::json!({ "workspace_volume": "empty_dir" });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_volume, WorkspaceVolume::EmptyDir);
+    }
+
+    #[test]
+    fn serde_override_workspace_volume_persistent_volume_claim() {
+        let json = serde_json::json!({ "workspace_volume": "persistent_volume_claim" });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_volume, WorkspaceVolume::PersistentVolumeClaim);
+    }
+
+    #[test]
+    fn serde_rejects_unknown_workspace_volume() {
+        let json = serde_json::json!({ "workspace_volume": "tmpfs" });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn workspace_volume_display_round_trips() {
+        for volume in [
+            WorkspaceVolume::PersistentVolumeClaim,
+            WorkspaceVolume::EmptyDir,
+        ] {
+            let rendered = volume.to_string();
+            let parsed: WorkspaceVolume = rendered.parse().unwrap();
+            assert_eq!(parsed, volume);
+        }
+    }
+
+    #[test]
+    fn validate_workspace_sizes_accepts_default() {
+        KubernetesComputeConfig::default()
+            .validate_workspace_sizes()
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_workspace_sizes_rejects_default_above_max() {
+        let cfg = KubernetesComputeConfig {
+            workspace_default_storage_size: "20Gi".to_string(),
+            workspace_max_storage_size: "10Gi".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+        let err = cfg.validate_workspace_sizes().unwrap_err();
+        assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_workspace_sizes_rejects_malformed_quantity() {
+        let cfg = KubernetesComputeConfig {
+            workspace_default_storage_size: "banana".to_string(),
+            ..KubernetesComputeConfig::default()
+        };
+        assert!(cfg.validate_workspace_sizes().is_err());
+    }
+
+    #[test]
+    fn parse_quantity_bytes_handles_binary_and_decimal_suffixes() {
+        assert_eq!(parse_quantity_bytes("2Gi").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_quantity_bytes("500Mi").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(parse_quantity_bytes("1G").unwrap(), 1_000_000_000);
+        assert_eq!(parse_quantity_bytes("1000").unwrap(), 1000);
+        // Comparisons used by the per-sandbox clamp.
+        assert!(parse_quantity_bytes("5Gi").unwrap() < parse_quantity_bytes("10Gi").unwrap());
+        assert!(parse_quantity_bytes("2000Mi").unwrap() > parse_quantity_bytes("1Gi").unwrap());
+    }
+
+    #[test]
+    fn parse_quantity_bytes_rejects_garbage() {
+        assert!(parse_quantity_bytes("").is_err());
+        assert!(parse_quantity_bytes("abc").is_err());
+        assert!(parse_quantity_bytes("-5Gi").is_err());
     }
 
     #[test]
