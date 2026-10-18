@@ -175,6 +175,13 @@ Supervisor sessions:
 |---|---|---|---|
 | `openshell_server_supervisor_sessions` | Gauge | None | Supervisor control sessions held by this replica. After a rollout settles, the sum across pods equals the number of connected sandboxes. |
 
+Session placement:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_supervisor_session_redirects_total` | Counter | `reason` | Supervisors this replica redirected to the replica its placement ring prefers, counted once the redirect is sent or queued. |
+| `openshell_server_supervisor_session_off_ring_admissions_total` | Counter | None | Redirected supervisors this replica admitted although its ring names another replica as the sandbox's owner. Exported only on gateways that place supervisor sessions by ring; under `supervisor_topology: gateway` the series does not exist. It counts each handoff from a stopping replica, which keeps receiving sessions until other rings refresh, up to 10 seconds later, and supervisors that fall back to their configured gateway address after a failed redirect dial. While membership is stable it stays flat, so alert on a sustained rate. |
+
 Relays:
 
 | Metric | Type | Labels | Description |
@@ -221,9 +228,23 @@ The labels take these values:
   `PeerRelay` requests do not increment this counter on the receiving replica;
   they appear in that replica's gRPC request counter instead. This counter does
   not measure active connections, unique client requests, or unfinished attempts.
-- `reason` is `replica_capacity` when the gateway replica's pending-relay budget
-  is full, or `sandbox_capacity` when one sandbox's budget on that replica, 32
-  pending relays, is full.
+- `reason` on `openshell_server_relay_rejected_total` is `replica_capacity`
+  when the gateway replica's pending-relay budget is full, or
+  `sandbox_capacity` when one sandbox's budget on that replica, 32 pending
+  relays, is full.
+- `reason` on `openshell_server_supervisor_session_redirects_total` names the
+  step that sent the redirect, currently `connect` when this replica answers a
+  connecting supervisor with a redirect, or `shutdown` when a stopping replica
+  hands an established session to a remaining replica. A stopping replica's
+  redirects at connect time also count as `connect`. A stopping replica records
+  its redirects in its last seconds before exit, so a scrape can miss some or
+  all of them, and the counter is a lower bound for rollout handoffs. Under
+  `supervisor_topology: gateway` the shared supervisor's host moves sessions, so
+  these moves never appear in this counter; a climbing `connect` count then
+  measures gateway redirect attempts, which the supervisor usually undoes by
+  returning to its home within 5 seconds, not completed moves. For pool sessions
+  the `shutdown` count is likewise a lower bound, because the supervisor prefers
+  its home within 5 seconds.
 - `outcome` is `success`, `local_error`, or `remote_error`. A relay succeeds
   when the supervisor claims it; this does not measure the data stream.
   `local_error` means the attempt failed on this replica, and `remote_error`
@@ -244,7 +265,9 @@ The labels take these values:
 - `overdue` is `true` when the skipped sandbox was already past its
   provisioning deadline, otherwise `false`.
 
-Gauges and counters exist from startup. They start at `0`, except
+Gauges and counters exist from startup, except
+`openshell_server_supervisor_session_off_ring_admissions_total`, which appears
+only on gateways that coordinate no shared supervisor. They start at `0`, except
 `openshell_server_relay_pending_capacity` and
 `openshell_server_mutation_lock_connections_capacity`, which start at their
 limits. `openshell_server_routed_request_attempts_total` starts with seven
