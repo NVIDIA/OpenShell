@@ -3608,7 +3608,7 @@ where
                     req,
                     client,
                     ctx,
-                    "http",
+                    ctx.request_scheme(),
                     openshell_supervisor_middleware::TransformedBodyPolicy::NotPolicyRelevant,
                 )
                 .await?;
@@ -3682,7 +3682,7 @@ where
         let resolver = ctx.secret_resolver.as_deref();
         let response_middleware = response_selection
             .as_ref()
-            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, "http"));
+            .map(|exchange| exchange.response_relay(&req_with_auth, ctx, ctx.request_scheme()));
 
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
@@ -7933,6 +7933,88 @@ network_policies:
     }
 
     #[tokio::test]
+    async fn passthrough_middleware_scheme_follows_transport() {
+        use openshell_supervisor_middleware::{ChainRunner, MiddlewareRegistry};
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        for (port, transport, scheme) in [(8443, 443, "https"), (443, 80, "http")] {
+            seen.lock().unwrap().clear();
+            let data = format!(
+                r#"
+network_middlewares:
+  scheme:
+    middleware: test/scheme
+    on_error: fail_closed
+    endpoints:
+      include: ["api.example.test"]
+network_policies:
+  passthrough_api:
+    name: passthrough_api
+    endpoints:
+      - host: api.example.test
+        port: {port}
+    binaries:
+      - {{ path: /usr/bin/curl }}
+"#
+            );
+            let engine = Arc::new(OpaEngine::from_strings(TEST_POLICY, &data).unwrap());
+            let registry = MiddlewareRegistry::connect_services(
+                vec![Arc::new(SchemeRecorder(seen.clone()))],
+                Vec::new(),
+            )
+            .await
+            .expect("connect named middleware services");
+            engine.set_middleware_runner_for_tests(ChainRunner::from_registry(registry));
+            let generation_guard = engine
+                .generation_guard(engine.current_generation())
+                .unwrap();
+            let ctx = L7EvalContext {
+                host: "api.example.test".into(),
+                port,
+                request_default_port: Some(transport),
+                policy_name: "passthrough_api".into(),
+                binary_path: "/usr/bin/curl".into(),
+                ..Default::default()
+            };
+
+            let (mut app, mut relay_client) = tokio::io::duplex(8192);
+            let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+            let relay = tokio::spawn(async move {
+                relay_passthrough_with_credentials(
+                    &mut relay_client,
+                    &mut relay_upstream,
+                    &ctx,
+                    &generation_guard,
+                    Some(engine.as_ref()),
+                )
+                .await
+            });
+
+            let request = format!(
+                "GET /v1/messages HTTP/1.1\r\nHost: api.example.test:{port}\r\nConnection: close\r\n\r\n"
+            );
+            app.write_all(request.as_bytes()).await.unwrap();
+            let mut upstream_request = [0u8; 1024];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                upstream.read(&mut upstream_request),
+            )
+            .await
+            .expect("request should reach upstream")
+            .unwrap();
+            assert_eq!(*seen.lock().unwrap(), [scheme]);
+
+            drop(app);
+            drop(upstream);
+            tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+                .await
+                .expect("relay should finish")
+                .unwrap()
+                .ok();
+        }
+    }
+
+    #[tokio::test]
     async fn websocket_upgrade_request_is_inspected_and_denied() {
         // The WebSocket upgrade handshake is an HTTP request the hook can inspect
         // and deny: a fail-closed middleware blocks the upgrade before it is
@@ -9050,11 +9132,16 @@ network_policies:
 
     #[test]
     fn request_event_url_scheme_follows_transport() {
-        for (port, scheme) in [(80, "http"), (443, "https")] {
+        for (port, transport, scheme, url) in [
+            (80, 80, "http", "http://api.example.test/v1"),
+            (443, 443, "https", "https://api.example.test/v1"),
+            (8443, 443, "https", "https://api.example.test:8443/v1"),
+            (443, 80, "http", "http://api.example.test:443/v1"),
+        ] {
             let ctx = L7EvalContext {
                 host: "api.example.test".into(),
                 port,
-                request_default_port: Some(port),
+                request_default_port: Some(transport),
                 policy_name: "api".into(),
                 ..Default::default()
             };
@@ -9063,6 +9150,7 @@ network_policies:
 
             let json = event.to_json().unwrap();
             assert_eq!(json["http_request"]["url"]["scheme"], scheme);
+            assert!(event.format_shorthand().contains(url), "{url}");
         }
     }
 
