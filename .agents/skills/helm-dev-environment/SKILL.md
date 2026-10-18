@@ -57,6 +57,23 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Experimental supervisor plumbing
+
+Set `gatewayConfig.openshell.drivers.kubernetes.experimental_supervisor_topology`
+using a values file (the table key is literally `openshell.drivers.kubernetes`):
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    experimental_supervisor_topology: gateway
+```
+
+The gateway chart creates a separate, single-replica idle supervisor Deployment
+in the release namespace, regardless of shared/managed/operator workspace mode.
+Use a supervisor image built from this branch: the bootstrap subcommand is new.
+Check its rollout and exec health probes separately; no sandbox sessions route
+through it. `workspace` is reserved and rejected. Omit the field to disable it.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):

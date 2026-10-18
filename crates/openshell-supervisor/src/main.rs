@@ -17,6 +17,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+mod experimental;
 mod logging;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
@@ -363,6 +364,10 @@ fn main() -> Result<()> {
     if raw_args.get(1).map(String::as_str) == Some(HEALTH_SUBCOMMAND) {
         let args = HealthArgs::parse_from(&raw_args[1..]);
         return openshell_supervisor::check_control_readiness(&args.socket);
+    }
+
+    if raw_args.get(1).map(String::as_str) == Some("experimental-bootstrap") {
+        return experimental::run(&raw_args[1..]);
     }
 
     let args = Args::parse();

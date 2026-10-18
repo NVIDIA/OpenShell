@@ -854,6 +854,23 @@ Kubernetes configurations set `namespace`, `service_account_name`, and `enable_u
 
 ### Kubernetes
 
+For experimental deployment plumbing, set
+`[openshell.drivers.kubernetes].experimental_supervisor_topology = "gateway"`.
+With Helm, use the existing gateway configuration:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    experimental_supervisor_topology: gateway
+```
+
+The chart deploys one idle supervisor in the gateway namespace for all workspace
+modes (`shared`, `managed`, and `operator`). Its health checks report process
+health only. It does not accept sandbox sessions; sandboxes retain their dedicated
+supervisors. Omit the field to disable the experiment. The `workspace` value is
+reserved and currently returns an unsupported error. Helm owns this Deployment;
+setting the field in a standalone TOML file does not provision infrastructure.
+
 The gateway runs as a Pod and creates paired workload and supervisor Pods in another namespace. The gateway CA is projected from a Kubernetes Secret into supervisor Pods; user client certificate and key entries in that Secret are not exposed to either Pod.
 
 ```toml

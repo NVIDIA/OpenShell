@@ -60,3 +60,11 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
+
+## Experimental deployment bootstrap
+
+`openshell-supervisor experimental-bootstrap --health-socket /run/openshell/health.sock`
+starts an idle process for the Kubernetes gateway topology experiment. The private
+Unix socket supports the existing `health --socket` command. No sandbox session
+listener, gateway authentication, or tenant routing is started. SIGTERM and SIGINT
+close the listener and remove the socket. This subcommand is Unix-only.

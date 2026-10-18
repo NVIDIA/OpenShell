@@ -49,6 +49,17 @@ For local evaluation only, TLS may be disabled and the gateway can be reached th
 
 Use `openshell --help` and nested `--help` output as the authority for the installed CLI version. Use the published [installation guide](https://docs.nvidia.com/openshell/latest/about/installation.md), [compute-driver reference](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/runtimes), [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration), and [Kubernetes setup guide](https://docs.nvidia.com/openshell/latest/kubernetes/setup.md) as the authority for deployment and configuration behavior.
 
+## Experimental supervisor deployment
+
+When the installed gateway configuration enables
+`[openshell.drivers.kubernetes].experimental_supervisor_topology = "gateway"`,
+Helm creates `<fullname>-experimental-supervisor` in the gateway namespace.
+Inspect that Deployment separately from per-sandbox supervisor Pods. This applies
+to shared, managed, and operator workspace modes. Its probes report idle process
+health, not sandbox session readiness; it does not serve sandboxes yet. Consult
+the published gateway configuration reference for the installed version. Omit
+the setting and upgrade the release to remove the experimental Deployment.
+
 ## Workflow
 
 Run diagnostics in order and stop once the root cause is clear.

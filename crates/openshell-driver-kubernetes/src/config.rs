@@ -194,9 +194,20 @@ where
     Ok(value)
 }
 
+/// Experimental scope of a shared supervisor deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentalSupervisorTopology {
+    Gateway,
+    Workspace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Deploy an idle experimental supervisor through Helm. Does not route sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub experimental_supervisor_topology: Option<ExperimentalSupervisorTopology>,
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
@@ -389,6 +400,7 @@ pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supple
 impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
+            experimental_supervisor_topology: None,
             workspace_mode: WorkspaceMode::default(),
             allow_driver_config: false,
             resource_admission:
@@ -442,6 +454,10 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
+        if self.experimental_supervisor_topology == Some(ExperimentalSupervisorTopology::Workspace)
+        {
+            return Err("experimental_supervisor_topology=workspace is not implemented".into());
+        }
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;

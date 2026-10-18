@@ -568,6 +568,20 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
+{{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- if hasKey $kubernetes "experimental_supervisor_topology" -}}
+{{- $topology := get $kubernetes "experimental_supervisor_topology" -}}
+{{- if not (has $topology (list "gateway" "workspace")) -}}
+{{- fail "experimental_supervisor_topology must be gateway or workspace; omit it to disable the experiment" -}}
+{{- end -}}
+{{- if eq $topology "workspace" -}}
+{{- fail "experimental_supervisor_topology=workspace is not implemented" -}}
+{{- end -}}
+{{- $gateway := get (.Values.gatewayConfig | default dict) "openshell.gateway" | default dict -}}
+{{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
+{{- fail "experimental_supervisor_topology requires the kubernetes compute driver" -}}
+{{- end -}}
+{{- end -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}
