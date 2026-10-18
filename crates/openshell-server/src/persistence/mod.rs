@@ -481,8 +481,9 @@ impl Store {
             {
                 return Err(CoreError::config(format!(
                     "database_max_connections (--db-max-connections, OPENSHELL_DB_MAX_CONNECTIONS) \
-                     is {configured}, but PostgreSQL needs at least {}: the SSH identity lock \
-                     keeps one data connection while it queries the pool",
+                     is {configured}, but PostgreSQL needs at least {}: an SSH identity or \
+                     provider-refresh lock holder keeps one data connection for its lock and \
+                     queries the pool on another",
                     postgres::MIN_MAX_CONNECTIONS
                 )));
             }

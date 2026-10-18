@@ -783,7 +783,12 @@ of the lock pool, with a 10-second PostgreSQL `lock_timeout`. Sandbox create
 holds its mutation guard while it waits for that key. A wait that runs out
 returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
 `openshell_server_mutation_lock_timeouts_total` nor
-`openshell_server_mutation_lock_errors_total` counts it.
+`openshell_server_mutation_lock_errors_total` counts it. A 10-second wait for
+one of the replica's data-pool lock slots (half of
+`database_max_connections`), which provider refresh shares, fails the same way (or with "credential refresh
+coordination unavailable") and logs "data-pool lock slots stayed busy". At a
+small `database_max_connections`, slow refresh mints or slow credential
+drivers cause it, and raising the pool fixes it.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor

@@ -4,20 +4,21 @@
 //! `PostgreSQL` tests of the mutation advisory locks: exclusion between two
 //! stores (as between two gateway replicas), exclusion against the legacy
 //! global key, cleanup after timed-out and cancelled acquisitions, a stalled
-//! holder, the lock-pool bound and its in-use gauge, and lock connections that
-//! `PostgreSQL` does not open.
+//! holder, the lock-pool bound and its in-use gauge, lock connections that
+//! `PostgreSQL` does not open, and the bound on data-pool lock holders at the
+//! smallest data pool.
 //!
 //! Advisory locks are database-wide, not per schema, so every test uses
 //! random workspace and sandbox ids, and `mise run test:rust:postgres` runs
-//! the tests one at a time. Apart from the pool-size test, which connects as
-//! the gateway does, the stores here run no migrations: the schema only
-//! scopes their connections.
+//! the tests one at a time. Apart from the pool-size and SSH identity tests,
+//! which connect as the gateway does, the stores here run no migrations: the
+//! schema only scopes their connections.
 
 use super::mutation_lock::{
     GLOBAL_MUTATION_LOCK_KEY, LOCK_CONNECTION_MIN_BUDGET, MUTATION_LOCK_POOL_MAX_CONNECTIONS,
-    MUTATION_LOCK_TIMEOUT, MutationLockKey, MutationLockSet,
+    MUTATION_LOCK_TIMEOUT, MutationLockKey, MutationLockSet, SSH_IDENTITY_LOCK_KEY,
 };
-use super::postgres::LOCK_CONNECTION_RELEASE_TIMEOUT;
+use super::postgres::{LOCK_CONNECTION_RELEASE_TIMEOUT, MIN_MAX_CONNECTIONS};
 use super::test_postgres::TestSchema;
 use super::{
     DistributedMutationGuard, PersistenceError, PersistenceResult, PostgresStore, Store,
@@ -179,6 +180,117 @@ async fn postgres_concurrent_sandbox_creates_with_ssh_identity_do_not_exhaust_lo
 
     store.close().await;
     schema.drop_schema().await;
+}
+
+/// Launch authentication for a supervisor whose SSH host key is not yet
+/// resolved.
+fn ssh_launch_authentication() -> openshell_core::jwt::SandboxLaunchAuthentication {
+    use openshell_core::jwt::{
+        CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionRotation,
+        SupervisorAuthBundle,
+    };
+    use openshell_core::{SandboxSessionId, sandbox_generation::SandboxGenerationId};
+
+    SandboxLaunchAuthentication {
+        supervisor: SupervisorAuthBundle {
+            session_id: SandboxSessionId::new(),
+            runtime_generation: SandboxGenerationId::parse("generation").unwrap(),
+            session_rotation: SessionRotation::new(1).unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_token: SecretJwt::parse("gateway-token").unwrap(),
+            gateway_expires_at: 0,
+            sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
+            sandbox_expires_at: 0,
+            ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
+        },
+        gateway_id: "gateway".to_string(),
+        verification_keys: Vec::new(),
+    }
+}
+
+/// At the smallest data pool `PostgreSQL` accepts, a provider-refresh holder
+/// and an SSH identity holder on one replica leave a data connection free for
+/// queries: the SSH identity holder waits for the one data-pool lock slot
+/// instead of taking the last connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_data_pool_lock_holders_leave_a_connection_free_at_floor() {
+    use crate::credentials::CredentialRuntime;
+    use crate::ssh_identity::SshIdentityStore;
+    use openshell_core::proto::Sandbox;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use std::sync::Arc;
+
+    let fixture = LockFixture::new().await;
+    let store =
+        Store::connect_with_pool_sizes(fixture.schema.url(), Some(MIN_MAX_CONNECTIONS), None)
+            .await
+            .expect("connect a store with the smallest data pool");
+    let shared = Arc::new(store.clone());
+    let config = crate::Config::new(None)
+        .with_credential_drivers(["test-static"])
+        .with_default_credential_driver(Some("test-static"));
+    let identities = SshIdentityStore::new(
+        shared.clone(),
+        CredentialRuntime::from_config_with_store(&config, shared).unwrap(),
+    );
+    let id = random_id("sb");
+    let sandbox = Sandbox {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: id.clone(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store
+        .put_message(&sandbox)
+        .await
+        .expect("store the sandbox");
+
+    let refresh = store
+        .acquire_refresh_guard(&random_id("provider"), "ACCESS_TOKEN")
+        .await
+        .expect("hold a provider refresh lock");
+    let preparing = {
+        let identities = identities.clone();
+        let mut sandbox = sandbox.clone();
+        tokio::spawn(async move {
+            identities
+                .prepare(&mut sandbox, &mut ssh_launch_authentication())
+                .await
+                .map(|()| sandbox)
+        })
+    };
+    // Long enough for the SSH identity holder to take a data connection if
+    // nothing stops it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    tokio::time::timeout(PROCEEDS_WITHIN, store.get_message::<Sandbox>(&id))
+        .await
+        .expect("a query must find a free data connection while both lock holders run")
+        .expect("load the sandbox")
+        .expect("the sandbox exists");
+    assert_eq!(
+        fixture.lock_count(SSH_IDENTITY_LOCK_KEY).await,
+        0,
+        "the SSH identity holder waits for a data-pool lock slot, not in PostgreSQL"
+    );
+
+    drop(refresh);
+    let prepared = tokio::time::timeout(PROCEEDS_WITHIN, preparing)
+        .await
+        .expect("the SSH identity holder proceeds once the refresh lock is released")
+        .expect("prepare task")
+        .expect("prepare the SSH identity");
+    assert!(
+        !prepared.host_key_fingerprint.is_empty(),
+        "prepare publishes the SSH host key fingerprint"
+    );
+
+    fixture.finish(vec![store]).await;
 }
 
 /// Drop client traffic while keeping sockets open, like a failed network path.
