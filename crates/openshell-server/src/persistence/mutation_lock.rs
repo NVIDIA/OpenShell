@@ -23,10 +23,12 @@
 //!    ascending order, all on one lock-pool connection.
 //! 4. A task never acquires a mutation guard or a local lifecycle lock while
 //!    it holds one: no nesting and no upgrade.
-//! 5. The SSH identity key, held on a data-pool connection, is a leaf: its
-//!    holders take no mutation guard, local key, or lifecycle gate, so sandbox
-//!    creation may wait for it while holding its guard. Its data-pool lock
-//!    slot is shared with provider-refresh holders, which are not leaves: a
+//! 5. The SSH identity keys, S([`SSH_IDENTITY_LOCK_KEY`]) and then
+//!    X([`sandbox_ssh_identity_lock_key`]) on one data-pool connection and one
+//!    data-pool lock slot, together form a leaf: their holders take no
+//!    mutation guard, local key, or lifecycle gate, so sandbox creation may
+//!    wait for them while holding its guard. Their data-pool lock slot is
+//!    shared with provider-refresh holders, which are not leaves: a
 //!    refresh executor takes S(global) X(workspace) while it holds a slot.
 //!    With no more slots than the 4 refresh executors
 //!    (`database_max_connections` up to 9), creation waiting for a slot while
@@ -40,7 +42,10 @@
 //!
 //! Within each layer every waiter on a key holds only smaller keys, and the
 //! local phase ends before the `PostgreSQL` phase starts, so no wait-for cycle
-//! can form, except through data-pool lock slots (rule 5). Debug builds check
+//! can form, except through data-pool lock slots (rule 5). The SSH identity
+//! keys break key order: a waiter on a sandbox's key holds the legacy key,
+//! which can be larger. They are always taken in one fixed order, legacy key
+//! first (rule 5), which keeps that layer free of cycles. Debug builds check
 //! rules 1, 4, and 5 before every acquisition that can wait; see
 //! [`super::lock_order`].
 //!
@@ -61,13 +66,17 @@ use std::time::Duration;
 /// "OPENSHLL" and stay within `PostgreSQL`'s signed 64-bit key space.
 pub const GLOBAL_MUTATION_LOCK_KEY: i64 = 0x4f50_454e_5348_4c4c;
 
-/// Advisory-lock key that serializes sandbox SSH host identity provisioning
-/// and cleanup across replicas.
+/// Legacy compatibility key of sandbox SSH host identity provisioning and
+/// cleanup.
 ///
-/// Never change this value: every gateway in a fleet must take the same key.
-/// It is held on a data-pool connection, not the lock pool, because sandbox
-/// creation takes it while holding its mutation guard. The bytes spell
-/// "OSSHHOST".
+/// Never change this value: gateways from earlier releases hold it
+/// exclusively for every SSH identity step, and this release holds it shared
+/// next to [`sandbox_ssh_identity_lock_key`], so old and new replicas keep
+/// excluding each other during a rolling upgrade. The shared lock exists only
+/// to exclude earlier releases and can be dropped once no supported release
+/// takes the key exclusively. It is held on a data-pool connection, not the
+/// lock pool, because sandbox creation takes it while holding its mutation
+/// guard. The bytes spell "OSSHHOST".
 pub const SSH_IDENTITY_LOCK_KEY: i64 = 0x4f53_5348_484f_5354;
 
 /// Upper bound on acquiring one mutation lock set.
@@ -154,6 +163,16 @@ impl MutationLockKey<'_> {
             Self::Sandbox(sandbox_id) => derived_key(b"sandbox", sandbox_id),
         }
     }
+}
+
+/// Advisory-lock key of one sandbox's SSH host identity, held exclusively
+/// after a shared [`SSH_IDENTITY_LOCK_KEY`].
+///
+/// Derived like [`MutationLockKey::advisory_key`] but with its own kind, so it
+/// never equals the sandbox's mutation lock key, which sandbox creation holds
+/// while it takes this one.
+pub fn sandbox_ssh_identity_lock_key(sandbox_id: &str) -> i64 {
+    derived_key(b"ssh-identity", sandbox_id)
 }
 
 fn derived_key(kind: &[u8], value: &str) -> i64 {
@@ -274,6 +293,30 @@ mod tests {
             MutationLockKey::Workspace("x").advisory_key(),
             MutationLockKey::Sandbox("x").advisory_key()
         );
+    }
+
+    #[test]
+    fn sandbox_ssh_identity_keys_match_golden_values() {
+        // Computed independently from the documented byte layout with the
+        // "ssh-identity" kind. Changing either breaks mutual exclusion with
+        // running replicas.
+        assert_eq!(
+            sandbox_ssh_identity_lock_key("00000000-0000-0000-0000-000000000001"),
+            1_276_723_582_497_569_200
+        );
+        assert_eq!(
+            sandbox_ssh_identity_lock_key("sb-1"),
+            -7_153_211_921_910_715_692
+        );
+    }
+
+    #[test]
+    fn sandbox_ssh_identity_keys_separate_from_other_keys() {
+        assert_ne!(
+            sandbox_ssh_identity_lock_key("sb-1"),
+            MutationLockKey::Sandbox("sb-1").advisory_key()
+        );
+        assert_ne!(sandbox_ssh_identity_lock_key("sb-1"), SSH_IDENTITY_LOCK_KEY);
     }
 
     #[test]

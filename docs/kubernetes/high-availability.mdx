@@ -481,9 +481,13 @@ fleet. Sandbox start, stop, and delete lock only on the replica that runs them,
 and only a gateway-global change on that replica blocks them directly.
 Provider, workspace-profile, and other replicas' gateway-global changes delay
 them only while another operation on the same sandbox waits behind the change.
-Sandbox create, start, restart, and delete also take one fleet-wide lock while
-they provision or remove the sandbox's SSH host identity, so that step runs for
-one sandbox at a time across all replicas. For other
+Sandbox create, start, restart, and delete also lock the sandbox's SSH host
+identity while they provision or remove it, so that step runs for different
+sandboxes at once. During a rollout, replicas from an earlier release still
+take a fleet-wide lock for that step, so it can wait on other sandboxes' steps
+until the rollout finishes. Each replica runs at most half of
+`database_max_connections` of these steps and provider refreshes at once, and a
+step that can't start within 10 seconds returns `UNAVAILABLE`. For other
 mutations, a lock wait longer than 10 seconds returns `UNAVAILABLE` with the
 reason `MUTATION_LOCK_TIMEOUT`, and clients can retry the request. A request
 that carried a `request_id` leaves its admission unresolved, like any other

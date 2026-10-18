@@ -128,9 +128,9 @@ pub(super) struct PostgresAdvisoryLockGuard {
     checkout: LockConnectionCheckout,
 }
 
-/// Holds a session-level advisory lock on a data-pool connection and one
+/// Holds session-level advisory locks on a data-pool connection and one
 /// data-pool lock slot. Dropping it closes the connection, which releases the
-/// lock, and frees the slot only once the close ends, so a closing connection
+/// locks, and frees the slot only once the close ends, so a closing connection
 /// still counts against the slots.
 pub(super) struct PostgresDataPoolLockGuard {
     connection: Option<PoolConnection<Postgres>>,
@@ -521,27 +521,29 @@ impl PostgresStore {
         Ok(pending.into_guard())
     }
 
-    /// Acquire `key` as a session-level advisory lock on a data-pool
-    /// connection instead of the mutation lock pool. Sandbox creation takes
-    /// the SSH identity lock while it holds its mutation guard, so a second
-    /// lock-pool connection there could exhaust that pool. The wait uses the
-    /// mutation lock timeout as its `lock_timeout`. Closing the connection on
-    /// drop releases the lock.
+    /// Acquire `locks` as session-level advisory locks, in slice order, on one
+    /// data-pool connection instead of the mutation lock pool. Sandbox
+    /// creation takes the SSH identity locks while it holds its mutation
+    /// guard, so a second lock-pool connection there could exhaust that pool.
+    /// The locks use the single-`bigint` advisory functions, so a shared lock
+    /// conflicts with an earlier release's `pg_advisory_lock` of the same key.
+    /// Closing the connection on drop releases the locks.
     ///
     /// Each holder first takes one of the store's data-pool lock slots
     /// ([`data_lock_slot_count`]), so holders keep at most half the data
-    /// connections and leave the rest for queries. A
-    /// slot that stays busy for [`MUTATION_LOCK_TIMEOUT`] fails with
+    /// connections and leave the rest for queries. One deadline of
+    /// [`MUTATION_LOCK_TIMEOUT`] covers the slot, the connection, and every
+    /// lock: a slot, connection, or lock not obtained by then fails with
     /// [`PersistenceError::LockTimeout`].
-    pub(super) async fn acquire_data_pool_lock(
+    pub(super) async fn acquire_data_pool_locks(
         &self,
-        key: i64,
+        locks: &[(i64, LockMode)],
     ) -> PersistenceResult<PostgresDataPoolLockGuard> {
-        let Ok(slot) = tokio::time::timeout(
-            MUTATION_LOCK_TIMEOUT,
-            Arc::clone(&self.data_lock_slots).acquire_owned(),
-        )
-        .await
+        debug_assert!(!locks.is_empty(), "a data-pool lock guard holds a lock");
+        let deadline = tokio::time::Instant::now() + MUTATION_LOCK_TIMEOUT;
+        let Ok(slot) =
+            tokio::time::timeout_at(deadline, Arc::clone(&self.data_lock_slots).acquire_owned())
+                .await
         else {
             let max_connections = self.pool.options().get_max_connections();
             tracing::warn!(
@@ -554,22 +556,63 @@ impl PostgresStore {
             ));
         };
         let slot = slot.expect("the data-pool lock slots are never closed");
-        let connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
-        // From here on, every exit closes the connection before the slot frees.
+        let connection = match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
+            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a data-pool lock connection".into(),
+                ));
+            }
+            Ok(Err(error)) => return Err(map_db_error(&error)),
+            Ok(Ok(connection)) => connection,
+        };
+        // From here on, every exit closes the connection before the slot frees,
+        // which releases the keys already taken.
         let mut guard = PostgresDataPoolLockGuard {
             connection: Some(connection),
             slot: Some(slot),
         };
-        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-            .bind(MUTATION_LOCK_TIMEOUT_SETTING)
-            .execute(&mut **guard.connection())
-            .await
-            .map_err(|e| map_db_error(&e))?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(key)
-            .execute(&mut **guard.connection())
-            .await
-            .map_err(|e| map_db_error(&e))?;
+        for &(key, mode) in locks {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < Duration::from_millis(1) {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a PostgreSQL advisory lock".into(),
+                ));
+            }
+            // As in `acquire_mutation_locks`, one statement sets the remaining
+            // deadline as `lock_timeout` before the lock wait starts.
+            let sql = match mode {
+                LockMode::Shared => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock_shared($2) FROM timeout"
+                }
+                LockMode::Exclusive => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock($2) FROM timeout"
+                }
+            };
+            let statement = sqlx::query(sql)
+                .bind(format!("{}ms", remaining.as_millis()))
+                .bind(key)
+                .execute(&mut **guard.connection());
+            match tokio::time::timeout_at(deadline + LOCK_STATEMENT_CLIENT_GRACE, statement).await {
+                Err(_) => {
+                    return Err(PersistenceError::LockTimeout(
+                        "waiting for a PostgreSQL advisory lock".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    // 55P03 lock_not_available: the statement's own
+                    // `lock_timeout` ended the wait.
+                    if let Some(db) = error.as_database_error()
+                        && db.code().as_deref() == Some("55P03")
+                    {
+                        return Err(PersistenceError::LockTimeout(db.message().to_string()));
+                    }
+                    return Err(map_db_error(&error));
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
         Ok(guard)
     }
 
@@ -2527,7 +2570,7 @@ mod tests {
         // timeout, past this one.
         match tokio::time::timeout(
             MUTATION_LOCK_TIMEOUT * 2,
-            store.acquire_data_pool_lock(SSH_IDENTITY_LOCK_KEY),
+            store.acquire_data_pool_locks(&[(SSH_IDENTITY_LOCK_KEY, LockMode::Exclusive)]),
         )
         .await
         .expect("the slot wait must end by the mutation lock timeout")
@@ -2556,16 +2599,18 @@ mod tests {
         );
         let slots = store.data_lock_slots.available_permits();
         // SQLx retries the refused connection until its 30-second acquire
-        // timeout.
+        // timeout, so the acquisition's own deadline ends the wait first.
         match tokio::time::timeout(
-            Duration::from_mins(1),
-            store.acquire_data_pool_lock(SSH_IDENTITY_LOCK_KEY),
+            MUTATION_LOCK_TIMEOUT * 2,
+            store.acquire_data_pool_locks(&[(SSH_IDENTITY_LOCK_KEY, LockMode::Exclusive)]),
         )
         .await
-        .expect("the data connection wait ends by the SQLx acquire timeout")
+        .expect("the data connection wait must end by the mutation lock timeout")
         {
-            Err(PersistenceError::Database(_)) => {}
-            Err(error) => panic!("expected a database error, got {error:?}"),
+            Err(PersistenceError::LockTimeout(detail)) => {
+                assert_eq!(detail, "waiting for a data-pool lock connection");
+            }
+            Err(error) => panic!("expected a lock timeout, got {error:?}"),
             Ok(_) => panic!("nothing listens, yet a data-pool lock was acquired"),
         }
         assert_eq!(
