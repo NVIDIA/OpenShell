@@ -25,12 +25,24 @@
 //!    it holds one: no nesting and no upgrade.
 //! 5. The SSH identity key, held on a data-pool connection, is a leaf: its
 //!    holders take no mutation guard, local key, or lifecycle gate, so sandbox
-//!    creation may wait for it while holding its guard.
+//!    creation may wait for it while holding its guard. Its data-pool lock
+//!    slot is shared with provider-refresh holders, which are not leaves: a
+//!    refresh executor takes S(global) X(workspace) while it holds a slot.
+//!    With no more slots than the 4 refresh executors
+//!    (`database_max_connections` up to 9), creation waiting for a slot while
+//!    executors wait for its keys can form a cycle, which only
+//!    [`MUTATION_LOCK_TIMEOUT`] on the slot and lock waits breaks.
+//!    Reserving slots for SSH identity would remove it.
+//! 6. A data-pool lock holder never waits for another data-pool lock. At the
+//!    floor there is one slot, so nesting would wait on itself until the slot
+//!    deadline. Debug builds don't check this rule, because both holders
+//!    acquire inside spawned tasks.
 //!
 //! Within each layer every waiter on a key holds only smaller keys, and the
 //! local phase ends before the `PostgreSQL` phase starts, so no wait-for cycle
-//! can form. Debug builds check rules 1, 4, and 5 before every acquisition
-//! that can wait; see [`super::lock_order`].
+//! can form, except through data-pool lock slots (rule 5). Debug builds check
+//! rules 1, 4, and 5 before every acquisition that can wait; see
+//! [`super::lock_order`].
 //!
 //! The global key is the legacy cross-object key. Gateways from earlier
 //! releases hold it exclusively for every mutation, which conflicts with every
