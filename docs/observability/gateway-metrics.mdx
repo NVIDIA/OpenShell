@@ -181,6 +181,7 @@ Session placement:
 |---|---|---|---|
 | `openshell_server_supervisor_session_redirects_total` | Counter | `reason` | Supervisors this replica redirected to the replica its placement ring prefers, counted once the redirect is sent or queued. |
 | `openshell_server_supervisor_session_off_ring_admissions_total` | Counter | None | Redirected supervisors this replica admitted although its ring names another replica as the sandbox's owner. Exported only on gateways that place supervisor sessions by ring; under `supervisor_topology: gateway` the series does not exist. It counts each handoff from a stopping replica, which keeps receiving sessions until other rings refresh, up to 10 seconds later, and supervisors that fall back to their configured gateway address after a failed redirect dial. While membership is stable it stays flat, so alert on a sustained rate. |
+| `openshell_server_gateway_ring_members` | Gauge | None | Replicas in this replica's placement ring, including itself until it leaves the ring at shutdown. It drops to `0` when membership refreshes have failed for more than 30 seconds. Exported only on replicas that join the placement ring (PostgreSQL with a peer endpoint). |
 
 Relays:
 
@@ -266,6 +267,8 @@ The labels take these values:
   provisioning deadline, otherwise `false`.
 
 Gauges and counters exist from startup, except
+`openshell_server_gateway_ring_members`, which appears once the replica joins
+the placement ring, and
 `openshell_server_supervisor_session_off_ring_admissions_total`, which appears
 only on gateways that coordinate no shared supervisor. They start at `0`, except
 `openshell_server_relay_pending_capacity` and

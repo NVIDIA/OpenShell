@@ -29,6 +29,7 @@ pub const MUTATION_LOCK_CONNECTIONS_IN_USE: &str =
     "openshell_server_mutation_lock_connections_in_use";
 pub const MUTATION_LOCK_CONNECTIONS_CAPACITY: &str =
     "openshell_server_mutation_lock_connections_capacity";
+pub const GATEWAY_RING_MEMBERS: &str = "openshell_server_gateway_ring_members";
 // Counters
 pub const RELAY_REJECTED_TOTAL: &str = "openshell_server_relay_rejected_total";
 pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
@@ -304,6 +305,13 @@ pub fn describe_and_initialize(
         Unit::Count,
         "Maximum pending relay channels on one gateway replica."
     );
+    // Not zero-initialized: only replicas that join the placement ring record it, so SQLite
+    // gateways and replicas without a peer endpoint export nothing instead of a misleading 0.
+    describe_gauge!(
+        GATEWAY_RING_MEMBERS,
+        Unit::Count,
+        "Gateway replicas in this replica's placement ring, including itself."
+    );
     describe_counter!(
         ROUTED_REQUEST_ATTEMPTS_TOTAL,
         Unit::Count,
@@ -502,6 +510,11 @@ pub fn record_session_redirect(reason: RedirectReason) {
 /// export the series and never records it.
 pub fn record_off_ring_admission() {
     counter!(SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL).increment(1);
+}
+
+/// Replicas in this replica's placement ring. Recorded together with each ring write.
+pub fn record_gateway_ring_members(count: usize) {
+    gauge!(GATEWAY_RING_MEMBERS).set(count_as_f64(count));
 }
 
 /// `count` pending relays were dropped unclaimed (late claim or reaper).
@@ -775,6 +788,9 @@ mod tests {
                 off_ring_admissions.then_some(0),
                 "off_ring_admissions={off_ring_admissions}"
             );
+            // Described only, so it renders nothing, not even HELP, until the ring is published.
+            assert_eq!(metrics.value(GATEWAY_RING_MEMBERS), None);
+            assert!(!metrics.render().contains(GATEWAY_RING_MEMBERS));
             for kind in ["ssh", "tcp"] {
                 for route in ["local", "peer"] {
                     let series = format!(
@@ -851,22 +867,19 @@ mod tests {
                 None,
                 off_ring_admissions,
             );
+            record_gateway_ring_members(3);
 
             let rendered = metrics.render();
-            assert!(
-                rendered.contains(&format!(
-                    "# HELP {} ",
-                    SUPERVISOR_SESSION_REDIRECTS_TOTAL
-                )),
-                "redirects HELP"
-            );
-            assert!(
-                rendered.contains(&format!(
-                    "# TYPE {} counter",
-                    SUPERVISOR_SESSION_REDIRECTS_TOTAL
-                )),
-                "redirects TYPE"
-            );
+            for (name, kind) in [
+                (SUPERVISOR_SESSION_REDIRECTS_TOTAL, "counter"),
+                (GATEWAY_RING_MEMBERS, "gauge"),
+            ] {
+                assert!(rendered.contains(&format!("# HELP {name} ")), "{name} HELP");
+                assert!(
+                    rendered.contains(&format!("# TYPE {name} {kind}")),
+                    "{name} TYPE"
+                );
+            }
             if off_ring_admissions {
                 let name = SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL;
                 assert!(rendered.contains(&format!("# HELP {name} ")), "{name} HELP");
@@ -877,6 +890,7 @@ mod tests {
             } else {
                 assert!(!rendered.contains(SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL));
             }
+            assert_eq!(metrics.value(GATEWAY_RING_MEMBERS), Some(3));
         }
     }
 
