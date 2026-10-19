@@ -1629,10 +1629,6 @@ pub fn build_isolation_specs(
     workload
         .labels
         .insert(crate::isolation::LABEL_ROLE.into(), "sandbox".into());
-    workload.labels.insert(
-        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.into(),
-        network_trust_generation(input.network_trust).into(),
-    );
     workload.env = BTreeMap::new();
     workload.unsetenv = input
         .image
@@ -1712,6 +1708,14 @@ pub fn build_isolation_specs(
     supervisor
         .labels
         .insert(crate::isolation::LABEL_ROLE.into(), "supervisor".into());
+    // The workload is never replaced when the destination-trust bundle
+    // changes; only this supervisor is. Record the generation it was created
+    // with so a later start can detect a stale supervisor and recreate it
+    // without touching the workload or its data.
+    supervisor.labels.insert(
+        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.into(),
+        network_trust_generation(input.network_trust).into(),
+    );
     supervisor.image.clone_from(&input.config.supervisor_image);
     supervisor.entrypoint = vec!["/openshell-supervisor".into()];
     supervisor.command.extend([
@@ -1997,7 +2001,7 @@ mod tests {
 
         assert_eq!(
             specs
-                .workload
+                .supervisor
                 .labels
                 .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
                 .map(String::as_str),
@@ -2124,7 +2128,7 @@ mod tests {
         assert_eq!(specs.workload.netns.nsmode, "none");
         assert_eq!(
             specs
-                .workload
+                .supervisor
                 .labels
                 .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
                 .map(String::as_str),
