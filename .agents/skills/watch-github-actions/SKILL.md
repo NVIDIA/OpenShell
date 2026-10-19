@@ -189,6 +189,12 @@ skipped. Check the Inference Hub configuration step before diagnosing model or
 GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, and
 `ANTHROPIC_MODEL` in the repository Actions settings.
 
+Pre-release also runs `release-notes.yml` after building, alongside publication
+and qualification, and keeps the notes only in the `release-notes` artifact.
+This job is advisory: a notes failure emits a warning without failing the
+prerelease run or blocking promotion. Stable publication requires successful
+notes generation.
+
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the
 candidate and baseline SHAs before interpreting findings. `complete` describes

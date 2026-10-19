@@ -338,7 +338,7 @@ The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
-Stable GitHub Release notes are written by the Claude Code GitHub Action with
+Release notes are written by the Claude Code GitHub Action with
 Claude Opus 5.5 through NVIDIA Inference Hub. The build passes a compare link
 from the previous stable tag to the new tag; Claude uses it to read merged PR
 descriptions and writes the release body to an artifact. Stable publication
@@ -348,6 +348,13 @@ Set the `ANTHROPIC_BASE_URL` repository Actions variable to
 `https://inference-api.nvidia.com` and `ANTHROPIC_MODEL` to
 `azure/anthropic/claude-opus-5-5`. The action uses the Hub's Anthropic-compatible
 API with bearer authentication. An action failure stops stable publication.
+
+Pre-release runs the same generator after its build, in parallel with publication
+and qualification. It compares the previous stable tag with the prerelease tag
+and retains the generated Markdown only in the `release-notes` Actions artifact.
+Notes failures are advisory and do not fail the prerelease workflow or block
+publication, qualification, or promotion. Stable releases publish the generated
+notes as their GitHub Release body.
 
 To preview release notes using the same generator as stable publication, dispatch
 Release with `notes-only=true` and an explicit comparison base:
