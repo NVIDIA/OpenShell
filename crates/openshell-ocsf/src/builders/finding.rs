@@ -3,7 +3,7 @@
 
 //! Builder for Detection Finding [2004] events.
 
-use crate::builders::EventContext;
+use crate::builders::{EventContext, EventOrigin};
 use crate::enums::{ActionId, ActivityId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{DetectionFindingEvent, OcsfEvent};
@@ -25,6 +25,7 @@ pub struct DetectionFindingBuilder<'a> {
     risk_level: Option<RiskLevelId>,
     message: Option<String>,
     log_source: Option<String>,
+    correlation_uid: Option<String>,
     unmapped: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -46,6 +47,7 @@ impl<'a> DetectionFindingBuilder<'a> {
             risk_level: None,
             message: None,
             log_source: None,
+            correlation_uid: None,
             unmapped: serde_json::Map::new(),
         }
     }
@@ -73,6 +75,13 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn log_source(mut self, source: impl Into<String>) -> Self {
         self.log_source = Some(source.into());
+        self
+    }
+
+    /// Set the identifier shared by events about the same incident.
+    #[must_use]
+    pub fn correlation_uid(mut self, uid: impl Into<String>) -> Self {
+        self.correlation_uid = Some(uid.into());
         self
     }
 
@@ -114,12 +123,18 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.finding_label().to_string();
-        let mut metadata = self
-            .ctx
-            .metadata(&["security_control", "container", "host"]);
+        // Gateway events carry a container only when they concern a sandbox.
+        let profiles: &[&str] = match self.ctx.origin {
+            EventOrigin::Gateway { .. } if self.ctx.container().is_none() => {
+                &["security_control", "host"]
+            }
+            _ => &["security_control", "container", "host"],
+        };
+        let mut metadata = self.ctx.metadata(profiles);
         if let Some(source) = self.log_source {
             metadata.log_source = Some(source);
         }
+        metadata.correlation_uid = self.correlation_uid;
 
         let mut base = BaseEventData::new(
             2004,
@@ -168,7 +183,43 @@ impl_builder_setters!(DetectionFindingBuilder, no_status);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::builders::test_sandbox_context;
+    use crate::builders::{test_gateway_context, test_sandbox_context};
+
+    #[test]
+    fn gateway_finding_declares_container_only_with_a_sandbox() {
+        // Gateway-wide findings name no sandbox; MXC findings name the
+        // sandbox they concern.
+        for (sandbox_id, profiles) in [
+            ("", serde_json::json!(["security_control", "host"])),
+            (
+                "sb-1",
+                serde_json::json!(["security_control", "container", "host"]),
+            ),
+        ] {
+            let mut ctx = test_gateway_context();
+            ctx.sandbox_id = sandbox_id.to_string();
+            let json = DetectionFindingBuilder::new(&ctx)
+                .finding_info(FindingInfo::new(
+                    "cross-sandbox-access",
+                    "Cross-Sandbox Access",
+                ))
+                .correlation_uid("6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f")
+                .build()
+                .to_json()
+                .unwrap();
+
+            assert_eq!(
+                json["metadata"]["correlation_uid"],
+                "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
+            );
+            assert_eq!(json["metadata"]["profiles"], profiles, "{sandbox_id:?}");
+            assert_eq!(
+                json.get("container").is_some(),
+                !sandbox_id.is_empty(),
+                "{sandbox_id:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_detection_finding_builder() {

@@ -5,9 +5,10 @@
 //!
 //! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
 
+use crate::enums::UserTypeId;
 use crate::events::OcsfEvent;
 use crate::events::base_event::BaseEventData;
-use crate::objects::Url;
+use crate::objects::{Endpoint, Url, User};
 
 /// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
 ///
@@ -127,6 +128,36 @@ fn reason_text(text: Option<&str>) -> Option<String> {
     Some(truncate_with_ellipsis(&text, MAX_REASON_LEN))
 }
 
+/// Render a principal as `type:id`, or just the id when its type is unknown.
+fn principal_label(user: &User) -> String {
+    let principal = user
+        .uid
+        .as_deref()
+        .or(user.name.as_deref())
+        .unwrap_or_default();
+    let principal = escape_context_field(&truncate_with_ellipsis(principal, MAX_REASON_LEN));
+    if user.type_id == UserTypeId::Unknown {
+        principal
+    } else {
+        format!(
+            "{}:{principal}",
+            escape_context_field(&user.type_label.to_lowercase())
+        )
+    }
+}
+
+/// Render a caller's endpoint as ` from host:port`.
+fn peer_label(endpoint: &Endpoint) -> String {
+    let port = endpoint.port.map_or(String::new(), |p| format!(":{p}"));
+    let host = endpoint
+        .domain
+        .as_deref()
+        .or(endpoint.ip.as_deref())
+        .or(endpoint.name.as_deref())
+        .unwrap_or("unknown");
+    format!(" from {}{port}", escape_context_field(host))
+}
+
 /// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
 /// for denied events. Returns an empty string if neither field is set.
 fn reason_tag(base: &BaseEventData) -> String {
@@ -208,7 +239,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", p.name, p.pid))
                     .unwrap_or_default();
                 let dst = e
                     .dst_endpoint
@@ -278,7 +310,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", p.name, p.pid))
                     .unwrap_or_default();
                 let url_str = e
                     .http_request
@@ -317,6 +350,46 @@ impl OcsfEvent {
                     String::new()
                 };
                 format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}{message_ctx}")
+            }
+
+            Self::ApiActivity(e) if e.actor.user.is_some() => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e
+                    .action
+                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let principal = e
+                    .actor
+                    .user
+                    .as_ref()
+                    .map(principal_label)
+                    .unwrap_or_default();
+                let peer = peer_label(&e.src_endpoint);
+                let operation = e
+                    .http_request
+                    .as_ref()
+                    .and_then(|r| r.url.as_ref())
+                    .and_then(|u| u.path.as_deref())
+                    .unwrap_or(&e.api.operation);
+                let mut context = vec![format!(
+                    "op:{}",
+                    escape_context_field(&truncate_with_ellipsis(operation, MAX_REASON_LEN))
+                )];
+                for resource in e.resources.iter().flatten() {
+                    let Some(id) = resource.uid.as_deref().or(resource.name.as_deref()) else {
+                        continue;
+                    };
+                    context.push(format!(
+                        "{}:{}",
+                        escape_context_field(resource.type_label.as_deref().unwrap_or("resource")),
+                        escape_context_field(&truncate_with_ellipsis(id, MAX_REASON_LEN))
+                    ));
+                }
+                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
+                    context.push(format!("reason:{}", escape_context_field(&reason)));
+                }
+                let context = context.join(" ");
+
+                format!("API:{activity} {sev}{action} {principal}{peer} [{context}]")
             }
 
             Self::ApiActivity(e) => {
@@ -409,36 +482,8 @@ impl OcsfEvent {
                 let action = e
                     .action
                     .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
-                let principal = e
-                    .user
-                    .uid
-                    .as_deref()
-                    .or(e.user.name.as_deref())
-                    .unwrap_or_default();
-                let principal =
-                    escape_context_field(&truncate_with_ellipsis(principal, MAX_REASON_LEN));
-                let principal = if e.user.type_id == crate::enums::UserTypeId::Unknown {
-                    principal
-                } else {
-                    format!(
-                        "{}:{principal}",
-                        escape_context_field(&e.user.type_label.to_lowercase())
-                    )
-                };
-                let peer = e
-                    .src_endpoint
-                    .as_ref()
-                    .map(|ep| {
-                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
-                        let host = ep
-                            .domain
-                            .as_deref()
-                            .or(ep.ip.as_deref())
-                            .or(ep.name.as_deref())
-                            .unwrap_or("unknown");
-                        format!(" from {}{port}", escape_context_field(host))
-                    })
-                    .unwrap_or_default();
+                let principal = principal_label(&e.user);
+                let peer = e.src_endpoint.as_ref().map(peer_label).unwrap_or_default();
                 let mut context = Vec::new();
                 if let Some(protocol) = e.auth_protocol.map(|p| {
                     e.auth_protocol_label
@@ -680,9 +725,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -709,9 +752,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_ip_str("93.184.216.34", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("node", 1234),
-            }),
+            actor: Some(Actor::process(Process::new("node", 1234))),
             firewall_rule: Some(FirewallRule::new("bypass-detect", "nftables")),
             connection_info: Some(ConnectionInfo::new("tcp")),
             action: Some(ActionId::Denied),
@@ -739,9 +780,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 88),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 88))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,
@@ -856,9 +895,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("169.254.169.254", 80)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("-", "ssrf")),
             connection_info: None,
             action: Some(ActionId::Denied),
@@ -885,9 +922,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -946,9 +981,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("aws_iam", "ssrf")),
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
@@ -1069,9 +1102,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 68),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 68))),
             firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,

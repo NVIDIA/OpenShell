@@ -2754,8 +2754,22 @@ async fn resolve_sandbox_by_name_for_principal(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
     match principal {
-        Principal::Sandbox(_) => {
+        Principal::Sandbox(caller) => {
             let Some(sandbox) = sandbox else {
+                // A supervisor only ever names its own sandbox. When its own
+                // record is gone too, the sandbox was deleted, which is not
+                // misuse.
+                let caller_exists = store
+                    .get_message::<Sandbox>(&caller.sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .is_some();
+                if caller_exists {
+                    crate::auth::audit::emit_authorization_denial(
+                        principal,
+                        crate::auth::audit::AuthzDenial::CrossSandboxName { name },
+                    );
+                }
                 return Err(Status::permission_denied(
                     "sandbox not found or not owned by caller",
                 ));
@@ -4198,7 +4212,12 @@ async fn handle_update_config_inner(
         sandbox.object_workspace().to_string()
     });
     if sandbox_caller {
-        validate_sandbox_caller_update(&req)?;
+        validate_sandbox_caller_update(&req).inspect_err(|_| {
+            crate::auth::audit::emit_authorization_denial(
+                principal,
+                crate::auth::audit::AuthzDenial::MethodNotPermitted,
+            );
+        })?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -5449,6 +5468,9 @@ async fn ensure_log_stream_sandbox_scope(
     sandbox_id: &str,
     validated_sandbox_id: &mut Option<String>,
 ) -> Result<(), Status> {
+    // Guard every batch, so switching to another sandbox mid-stream is
+    // recorded like any other cross-sandbox attempt.
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
     if let Some(validated) = validated_sandbox_id.as_deref() {
         if sandbox_id != validated {
             return Err(Status::permission_denied(
@@ -5458,7 +5480,6 @@ async fn ensure_log_stream_sandbox_scope(
         return Ok(());
     }
 
-    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
     state
         .store
         .get_message::<Sandbox>(sandbox_id)
@@ -11658,6 +11679,8 @@ mod tests {
     #[tokio::test]
     async fn sandbox_submit_policy_analysis_missing_name_returns_permission_denied() {
         let state = test_server_state().await;
+        let own = test_sandbox("sb-a", "own", ProtoSandboxPolicy::default(), vec![]);
+        state.store.put_message(&own).await.unwrap();
         let req = with_sandbox(
             Request::new(SubmitPolicyAnalysisRequest {
                 workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
@@ -11667,10 +11690,47 @@ mod tests {
             "sb-a",
         );
 
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
         let err = handle_submit_policy_analysis(&state, req)
             .await
             .expect_err("missing name must not leak existence to sandbox callers");
         assert_eq!(err.code(), Code::PermissionDenied);
+        let events: Vec<_> = capture
+            .events()
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_eq!(
+            events[0]["resources"],
+            serde_json::json!([{"name": "missing-sandbox", "type": "sandbox"}])
+        );
+        assert_eq!(events[1]["class_uid"], 2004);
+    }
+
+    #[tokio::test]
+    async fn sandbox_whose_own_record_is_gone_is_denied_without_a_finding() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+                name: "own".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("a deleted sandbox must be refused");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(capture.events().is_empty(), "deletion is not misuse");
     }
 
     #[tokio::test]
@@ -11738,15 +11798,26 @@ mod tests {
         let req = with_sandbox(Request::new(()), "sb-a");
         let principal = req.extensions().get::<Principal>().unwrap().clone();
         let mut validated = None;
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
 
         ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
             .await
             .expect("first frame should validate");
+        assert!(capture.events().is_empty(), "own sandbox is not a denial");
         let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
             .await
             .expect_err("later frame must not switch sandbox ids");
 
         assert_eq!(err.code(), Code::PermissionDenied);
+        let events: Vec<_> = capture
+            .events()
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_eq!(events[1]["class_uid"], 2004);
     }
 
     #[tokio::test]

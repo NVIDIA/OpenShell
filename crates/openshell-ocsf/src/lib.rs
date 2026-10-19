@@ -57,7 +57,7 @@ pub use enums::{
 pub use objects::{
     Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence,
     FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
-    Product, Remediation, Service, Tactic, Technique, Url, User,
+    Product, Remediation, ResourceDetails, Service, Tactic, Technique, Url, User,
 };
 
 // --- Sanitizers ---

@@ -221,7 +221,7 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
 
     #[must_use]
     pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
-        self.actor = Some(Actor { process });
+        self.actor = Some(Actor::process(process));
         self
     }
 
