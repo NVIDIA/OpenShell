@@ -472,7 +472,7 @@ fn config_error(path: &Path, detail: impl std::fmt::Display) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rcgen::generate_simple_self_signed;
+    use openshell_crypto::pki::generate_simple_self_signed;
     use std::fs;
     use tempfile::tempdir;
 
@@ -1027,7 +1027,7 @@ mod tests {
         let source = write_source(
             source_dir.path(),
             "private-key.pem",
-            generated.key_pair.serialize_pem(),
+            generated.key_pair.serialize_pem().unwrap(),
         );
         assert_rejected(&source, state_dir.path(), "non-certificate PEM block");
     }
@@ -1044,7 +1044,7 @@ mod tests {
             format!(
                 "{}\n{}",
                 generated.cert.pem(),
-                generated.key_pair.serialize_pem()
+                generated.key_pair.serialize_pem().unwrap()
             ),
         );
         assert_rejected(&source, state_dir.path(), "non-certificate PEM block");
