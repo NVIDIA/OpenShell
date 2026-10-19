@@ -348,7 +348,7 @@ To preview notes without building or publishing:
 
 ```shell
 gh workflow run release.yml --ref main \
-  -f tag=v0.1.4 -f notes-base-tag=v0.1.3 -f notes-only=true
+  -f tag=v0.1.4 -f notes-only=true
 ```
 
 Dispatch Release from the intended release branch with a stable version:

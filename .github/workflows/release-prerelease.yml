@@ -40,7 +40,6 @@ jobs:
     uses: ./.github/workflows/release-notes.yml
     with:
       release-tag: ${{ inputs.tag || github.ref_name }}
-      previous-stable-tag: ${{ needs.build.outputs.previous_stable_tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
       advisory: true
     secrets:

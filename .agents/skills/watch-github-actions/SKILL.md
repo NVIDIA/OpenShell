@@ -181,8 +181,10 @@ run link. Both callers share `release-build.yml` and `release-publish.yml`.
 Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
 Snap Store uploads happen only for stable releases after qualification passes.
 
-For a release notes preview, dispatch `release.yml` with `notes-only=true`,
-`tag=<stable-tag>`, and `notes-base-tag=<previous-stable-tag>`. This runs the same
+For a release notes preview, dispatch `release.yml` with `notes-only=true` and
+`tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
+only `release-notes.yml` exposes an optional `previous-stable-tag` override.
+This runs the same
 `release-notes.yml` generator as stable publication and retains the `release-notes`
 artifact. Promotion, tag creation, builds, qualification, and publication are
 skipped. Check the Inference Hub configuration step before diagnosing model or

@@ -23,10 +23,6 @@ on:
         description: Source commit of the built artifacts in the calling run
         required: true
         type: string
-      previous-stable-tag:
-        description: Previous stable tag for the release notes comparison
-        required: false
-        type: string
       semver:
         description: Release version without the v prefix
         required: true
@@ -340,7 +336,6 @@ jobs:
     uses: ./.github/workflows/release-notes.yml
     with:
       release-tag: ${{ inputs.release-tag }}
-      previous-stable-tag: ${{ inputs.previous-stable-tag }}
       source-sha: ${{ inputs.source-sha }}
     secrets:
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}

@@ -11,8 +11,8 @@ on:
         required: true
         type: string
       previous-stable-tag:
-        description: Previous stable tag for the comparison
-        required: true
+        description: Optional comparison base; defaults to the previous reachable stable tag
+        required: false
         type: string
       source-sha:
         description: Source commit to check out; defaults to the release tag
@@ -49,17 +49,31 @@ jobs:
       - name: Check out release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ inputs.source-sha || inputs.release-tag }}
+
+      - name: Resolve release comparison
+        id: comparison
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+          BASE_TAG: ${{ inputs.previous-stable-tag }}
+        run: |
+          if [[ -z "${BASE_TAG}" ]]; then
+            BASE_TAG=$(git tag --merged HEAD --sort=-version:refname |
+              awk -v current="${RELEASE_TAG}" '$0 ~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != current && !found { print; found=1 }')
+          fi
+          : "${BASE_TAG:?No previous stable tag is reachable; provide previous-stable-tag}"
+          git rev-parse --verify "refs/tags/${BASE_TAG}^{commit}" > /dev/null
+          git merge-base --is-ancestor "refs/tags/${BASE_TAG}" HEAD
+          echo "url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_TAG}...${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Check Inference Hub configuration
         env:
           ANTHROPIC_BASE_URL: ${{ vars.ANTHROPIC_BASE_URL }}
           ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
           LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
-          PREVIOUS_STABLE_TAG: ${{ inputs.previous-stable-tag }}
         run: |
-          : "${PREVIOUS_STABLE_TAG:?Provide the previous stable tag for the release comparison}"
           : "${ANTHROPIC_BASE_URL:?Set the ANTHROPIC_BASE_URL repository Actions variable}"
           : "${ANTHROPIC_MODEL:?Set the ANTHROPIC_MODEL repository Actions variable}"
           : "${LLM_INFERENCE_API_KEY:?Set the LLM_INFERENCE_API_KEY repository Actions secret}"
@@ -86,7 +100,7 @@ jobs:
             file, commit, push, or post comments.
 
             Review the commits and merged PRs in this release comparison:
-            https://github.com/NVIDIA/OpenShell/compare/${{ inputs.previous-stable-tag }}...${{ inputs.release-tag }}
+            ${{ steps.comparison.outputs.url }}
             Use `gh api --paginate` to inspect every commit in the comparison,
             find its associated merged PRs, and read their titles and descriptions.
             Include all relevant merged PRs in the release notes.

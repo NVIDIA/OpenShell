@@ -15,10 +15,6 @@ on:
         required: false
         default: false
         type: boolean
-      notes-base-tag:
-        description: "Previous stable tag for notes-only comparison (e.g. v0.1.3)"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -38,7 +34,6 @@ jobs:
     uses: ./.github/workflows/release-notes.yml
     with:
       release-tag: ${{ inputs.tag }}
-      previous-stable-tag: ${{ inputs.notes-base-tag }}
     secrets:
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
 
@@ -140,7 +135,6 @@ jobs:
     with:
       release-tag: ${{ needs.promote.outputs.tag }}
       source-sha: ${{ needs.build.outputs.source_sha }}
-      previous-stable-tag: ${{ needs.build.outputs.previous_stable_tag }}
       semver: ${{ needs.build.outputs.semver }}
       python-version: ${{ needs.build.outputs.python_version }}
       npm-version: ${{ needs.build.outputs.npm_version }}
