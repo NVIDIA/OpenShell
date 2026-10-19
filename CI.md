@@ -326,10 +326,16 @@ Set `needs: security` on a downstream promotion job to require successful scans.
 `release-qualification.yml`. Release builds, qualifies, then publishes. Pre-release
 builds, then publishes and qualifies in parallel within the same run, using native job dependencies.
 Stable GitHub Release notes are written by the Claude Code GitHub Action with
-Claude Opus 5.5. The build passes a compare link from the previous stable tag
-to the new tag; Claude uses it to read merged PR descriptions and writes the
-release body to an artifact. The `ANTHROPIC_API_KEY` repository secret is required
-for stable publication; an action failure stops publication.
+Claude Opus 5.5 through NVIDIA Inference Hub. The build passes a compare link
+from the previous stable tag to the new tag; Claude uses it to read merged PR
+descriptions and writes the release body to an artifact. Stable publication
+requires the `LLM_INFERENCE_API_KEY` repository Actions secret, containing a key
+from [Inference Hub key management](https://inference.nvidia.com/key-management).
+The default Hub model is `azure/anthropic/claude-opus-5-5`; set the optional
+`RELEASE_NOTES_MODEL` repository Actions variable to override it with another Hub
+model ID. The action uses the Hub's Anthropic-compatible API at
+`https://inference-api.nvidia.com` with bearer authentication. An action failure
+stops stable publication.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014

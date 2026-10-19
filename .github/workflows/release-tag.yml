@@ -72,4 +72,4 @@ jobs:
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
       GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
       GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
