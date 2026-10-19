@@ -369,6 +369,9 @@ Release is manually dispatched; pushing a stable tag does not trigger publicatio
 Stable runs serialize across branches. A version older than the highest stable
 Git tag publishes versioned artifacts while preserving shared latest channels:
 GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
+Each publisher rechecks the current remote stable tags immediately before
+updating its shared channel, including when a past publishing job is rerun.
+This protection applies to runs created with these workflow definitions.
 Its npm package uses a `release-X.Y` dist-tag, and its snap files remain in the
 GitHub Release rather than updating a Snap Store support track.
 Docs publish an immutable version and already prevent latest from moving
