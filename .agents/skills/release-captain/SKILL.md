@@ -277,7 +277,10 @@ Finish these on Monday so Tuesday is only the cut.
 
 6. **Start the next train.** Until someone pushes the next `-pre.1`, Auto-Tag
    logs `vX.Y.Z is already stable — skipping tag creation` and does nothing.
-   Start the train soon after the stable release; it can be any weekday.
+   Starting it is this week's captain's job, not next week's: once `-pre.1`
+   exists, Auto-Tag cuts `-pre.2` onward every weekday, so next week's captain
+   starts Monday with pre-releases already qualifying. Start the train soon
+   after the stable release; it can be any weekday.
 
    Agree with the maintainers whether the next train is patch (the default) or
    minor (notable features or planned breaking changes; see the
