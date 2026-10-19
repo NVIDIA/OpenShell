@@ -191,9 +191,21 @@ Finish these on Monday so Tuesday is only the cut.
    no release branch or cherry-picks, so the list is for getting those PRs
    reviewed and merged before the cutoff. Tag reviewers on the linked PRs.
 
-   Set the cutoff before the last Auto-Tag run you'll take on Tuesday (14:00
-   Europe/Zurich), or before a pre-release you'll tag by hand. Approved open
-   PRs:
+   The release ships one commit: the final pre-release's, if it passes. A PR
+   ships only if that pre-release includes it. If the final pre-release fails
+   and can't be fixed in time, `Release` falls back to an earlier passing one,
+   and later merges miss the release. Pick one of two cutoffs:
+
+   - **Before Tuesday's Auto-Tag run** (14:00 Europe/Zurich): Auto-Tag tags the
+     tip of `main`, so everything merged by the cutoff is in it, along with
+     anything merged before the run starts. Suits a captain in Europe.
+   - **Later on Tuesday:** after the cutoff, the captain tags the final
+     pre-release by hand on a commit they choose, then waits about 45 minutes
+     for it to qualify. Suits a captain in the Americas, where the Auto-Tag run
+     is before the workday.
+
+   Don't promise that everything merged by the cutoff ships, or name the next
+   version; it's a patch by default but may be a minor. Approved open PRs:
 
    ```shell
    gh pr list --base main --state open --search "review:approved" --json number,title,author --jq '.[] | "#\(.number) \(.title) (@\(.author.login))"'
@@ -206,14 +218,20 @@ Finish these on Monday so Tuesday is only the cut.
 
    Status: vX.Y.Z-pre.N (<commit>) passed qualification. <blockers and owners, or "No blockers.">
 
-   Reply here with any ready PRs you'd like in vX.Y.Z. Merge cutoff is <HH:MM UTC> (<captain's local time>) Tuesday, before the next pre-release is cut. Anything merged on main by then ships; anything later goes in the next release.
+   Reply here with any ready PRs you'd like in vX.Y.Z. Merge cutoff is <HH:MM UTC> (<captain's local time>) Tuesday. I'll cut the final pre-release after the cutoff, and vX.Y.Z ships from it if it passes qualification. Anything that misses it goes in the next release.
    ```
+
+   For an Auto-Tag cutoff, replace the second sentence with "Tuesday's
+   automatic pre-release picks up everything merged by then, and vX.Y.Z ships
+   from it if it passes qualification."
 
 ## Tuesday: cut the release
 
-1. **Select the final candidate.** After the cutoff and the last pre-release
-   has finished, run the preview from Setup and repeat Monday step 3 for its
-   run. If the newest pre-release failed, either fix it (Monday step 5) or
+1. **Select the final candidate.** With a cutoff after Auto-Tag, first tag the
+   final `-pre.N` by hand after approval, on the newest commit with a
+   successful `Release Dev` run (commands as in Tuesday step 6). Once the final
+   pre-release has finished, run the preview from Setup and repeat Monday
+   step 3 for its run. If the newest pre-release failed, either fix it (Monday step 5) or
    confirm that shipping the earlier candidate without the later commits is
    acceptable. If qualification passed but publication failed, rerun the
    failed jobs first; `Release` needs the whole run to pass.
