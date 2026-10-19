@@ -930,9 +930,11 @@ mod tests {
 
     /// Generate a real, valid self-signed CA certificate PEM for tests.
     fn generate_test_ca_pem() -> String {
-        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let key_pair = openshell_crypto::pki::generate_keypair().unwrap();
         let params = rcgen::CertificateParams::new(Vec::new()).unwrap();
-        params.self_signed(&key_pair).unwrap().pem()
+        openshell_crypto::pki::self_signed(params, &key_pair)
+            .unwrap()
+            .pem()
     }
 
     #[test]

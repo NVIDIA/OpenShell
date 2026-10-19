@@ -601,7 +601,7 @@ mod tests {
         let leaf = cert_cache.get_or_generate(hostname).unwrap();
 
         let server_config = Arc::new(
-            ServerConfig::builder()
+            openshell_crypto::tls::server_builder()
                 .with_no_client_auth()
                 .with_single_cert(leaf.cert_chain.clone(), leaf.private_key.clone_key())
                 .unwrap(),

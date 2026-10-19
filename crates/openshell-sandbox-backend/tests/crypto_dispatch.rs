@@ -84,9 +84,11 @@ fn request_envelope_uses_selected_digest_and_rejects_backend_failures() {
         process_id: "test".into(),
     };
     let envelope = RequestEnvelope::new(request()).unwrap();
+    // SHA-256 of protobuf RequestEnvelope { terminate: { process_id: "test" } }
+    // with an empty request ID: 9a 01 06 0a 04 74 65 73 74.
     assert_eq!(
         envelope.payload_digest,
-        "12fa19027b624b79dacb71a241331c6b7a961ae5c8a5084df3559c097cf8ad76"
+        "6c6d7215ecc2ea064ffeffcefb0a575b2c1387b41e488380c48f9cbcfec062e0"
     );
     for stage in 1..=3 {
         FAILURE.store(stage, Ordering::SeqCst);

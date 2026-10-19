@@ -4583,6 +4583,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-crypto",
  "openshell-isolation-interface",
  "openshell-otel",
  "openshell-otel-test-support",
@@ -4796,6 +4797,7 @@ dependencies = [
 name = "openshell-otel-test-support"
 version = "0.0.0"
 dependencies = [
+ "openshell-crypto",
  "openshell-otel",
  "opentelemetry-proto",
  "rcgen",

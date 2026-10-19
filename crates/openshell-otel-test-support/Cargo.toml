@@ -20,6 +20,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+openshell-crypto = { workspace = true }
 rcgen = { workspace = true }
 tempfile = "3"
 

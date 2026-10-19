@@ -45,5 +45,8 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
 
+[dev-dependencies]
+jsonwebtoken = { workspace = true }
+
 [lints]
 workspace = true
