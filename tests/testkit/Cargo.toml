@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Shared support for the test families under tests/suites/. Families depend
+# on these crates by path.
+[workspace]
+resolver = "2"
+members = ["testkit", "testkit-macros", "testkit-spec"]
