@@ -28,7 +28,13 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
+bytes = { workspace = true }
 clap = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 miette = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
@@ -38,10 +44,12 @@ rustls = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 socket2 = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-rustls = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
@@ -58,13 +66,7 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
 tonic-prost = { workspace = true }
-bytes = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-futures = { workspace = true }
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 

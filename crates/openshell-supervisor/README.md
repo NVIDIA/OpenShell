@@ -97,15 +97,34 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
 
-## Shared host
+## Shared supervisor host
 
-`openshell-supervisor --mode=shared --gateway-endpoint https://gateway:8080 --address 0.0.0.0:5501`
-starts a shared-host placeholder for the Kubernetes gateway supervisor topology.
-The listener at `--address` accepts and closes connections, including kubelet
-`tcpSocket` probes, and reports process health only. `--gateway-endpoint` selects
-the gateway the supervisor will dial for session control. The outbound connection,
-control RPCs, sandbox sessions, gateway authentication, and tenant routing are not
-implemented yet. Omitting `--mode` keeps the existing dedicated behavior.
-`supervisor_topology = "gateway"` deploys this placeholder; sandboxes
-continue using dedicated supervisors. SIGTERM and SIGINT close the listener.
-Shared mode is Unix-only.
+`openshell-supervisor experimental-host` hosts the sessions of many sandboxes in
+one process for the Kubernetes gateway supervisor topology. It is Unix-only.
+
+- **Admission.** A mutually authenticated TLS 1.3 listener
+  (`--session-control-listen`, credentials in `--session-control-tls-dir`)
+  serves `PUT`, `GET`, and `DELETE /v1/sessions/{route}` and `GET /v1/sessions`
+  as JSON. Only a client holding the admission certificate, which Helm gives
+  only the gateway, can register sessions. A registration carries one
+  generation's runtime descriptor and gateway-issued credentials; the host
+  never acts with any other identity and has no Kubernetes identity. An
+  identical registration is accepted again; a different one for a registered
+  route returns `409`.
+- **Sessions.** `shared_host::SharedHost` starts each registration as a
+  `SessionHost` session with private files under `--session-root` (proxy CA,
+  trust directory, SSH socket). Removal runs on a task the host owns, so it
+  completes when the caller disconnects, and the route stays reserved until the
+  session has ended and its files are deleted.
+- **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
+  session's runtime-initiated Sandbox Protocol connections; see
+  `openshell-sandbox-backend` for the routing preface.
+- **Health.** `--health-socket` serves the existing `health --socket` check and
+  reports process health only. Session readiness is reported per session over
+  session control. SIGTERM and SIGINT stop every session, which ends their
+  workloads' supervision.
+
+Sessions get no upstream proxy, extra CA bundle, OCSF OTLP export, or provider
+workload identity: the Kubernetes driver refuses the topology when an upstream
+proxy or provider SPIFFE identity is configured, so a workload never silently
+loses them.

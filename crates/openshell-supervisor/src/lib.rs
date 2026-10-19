@@ -25,6 +25,7 @@ mod endpoint_status;
 mod mechanistic_mapper;
 mod provider_readiness;
 pub mod session_host;
+pub mod shared_host;
 
 use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
 use miette::{IntoDiagnostic, Result, WrapErr};
