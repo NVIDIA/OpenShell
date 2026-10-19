@@ -131,8 +131,11 @@ jobs:
             present; otherwise, use its title and description. Place these in
             Upgrade notes, preserving required actions and compatibility details.
             Prioritize breaking changes to public surfaces such as CLI commands,
-            configuration, and APIs in Upgrade notes, even when they are part
-            of a bug fix or refactor.
+            configuration, and supported SDK or service APIs in Upgrade notes,
+            even when they are part of a bug fix or refactor. Internal Rust crate
+            APIs, import moves, and code cleanup are not public upgrade guidance.
+            For command-line compatibility changes, keep the exact flag names
+            and explain any requirement to upgrade or build binaries together.
             Explain who is affected and what they need to do. Keep each PR in
             one bullet, including related feature or fix context there when needed.
 
