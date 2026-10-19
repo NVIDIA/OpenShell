@@ -2236,18 +2236,8 @@ impl ComputeRuntime {
         // The request (including its durable provisioning snapshot) is always
         // reconstructed from the gateway's record; never let a driver derive
         // provisioning input from mutable runtime inspection output.
-        let request = match self.driver_start_request(
-            &starting,
-            launch_authentication,
-            expected_runtime_identity,
-        ) {
-            Ok(request) => request,
-            Err(error) => {
-                self.persist_invalid_start_snapshot(&starting, error.message())
-                    .await;
-                return Err(error);
-            }
-        };
+        let request =
+            self.driver_start_request(&starting, launch_authentication, expected_runtime_identity)?;
         let driver = self.driver.clone();
         let operation_id = sandbox_id.clone();
         let result = Box::pin(self.await_provisioning_operation(&starting, async move {
@@ -3789,10 +3779,7 @@ impl ComputeRuntime {
             };
             // Recovery is allowed to reconstruct provisioning inputs only
             // from the persisted gateway record (the request snapshot is
-            // rebuilt by `driver_start_request`). A malformed durable record
-            // is terminal for this transition: retaining Running/Starting
-            // would risk a local driver reconstituting it from inspected
-            // runtime configuration instead.
+            // rebuilt by `driver_start_request`).
             let request = match self.driver_start_request(
                 &sandbox,
                 launch_authentication,
@@ -3801,8 +3788,6 @@ impl ComputeRuntime {
                 Ok(request) => request,
                 Err(error) => {
                     warn!(sandbox_id, %error, "Rejected recovered sandbox launch");
-                    self.persist_invalid_start_snapshot(&sandbox, error.message())
-                        .await;
                     failed += 1;
                     continue;
                 }
@@ -4078,12 +4063,6 @@ impl ComputeRuntime {
                         Ok(request) => request,
                         Err(error) => {
                             warn!(sandbox_id, %error, "Rejected pending sandbox launch");
-                            // A malformed durable record is terminal for this
-                            // transition: retaining Starting would risk a
-                            // local driver reconstituting it from mutable
-                            // runtime inspection output.
-                            self.persist_invalid_start_snapshot(&sandbox, error.message())
-                                .await;
                             continue;
                         }
                     };
@@ -4125,17 +4104,6 @@ impl ComputeRuntime {
     /// ambiguous transport failure: no start RPC has been issued, so keeping
     /// `Starting` for a blind retry would allow a local reconciliation path to
     /// fall back to mutable platform state.
-    async fn persist_invalid_start_snapshot(&self, sandbox: &Sandbox, error: &str) {
-        self.mark_sandbox_error(
-            sandbox,
-            "InvalidPersistedSandbox",
-            &format!(
-                "Sandbox lifecycle recovery requires a valid persisted driver snapshot: {error}"
-            ),
-        )
-        .await;
-    }
-
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
         let _guard = self.lock_sandbox_local(sandbox.object_id()).await;
         let sandbox_id = sandbox.object_id().to_string();
