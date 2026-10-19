@@ -1,17 +1,17 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Wait until the target's gateway is ready for tests.
+//! Wait until the gateway is ready for tests.
 //!
-//! Usage: `testkit-ready [TIMEOUT_SECS]` (default 60), with the target file
-//! named by `OPENSHELL_TEST_TARGET`. Run it once per environment before the
-//! test binaries; exits non-zero with the last error if the gateway is not
-//! healthy in time, or if the environment's CLI does not reach it.
+//! Usage: `testkit-ready [TIMEOUT_SECS]` (default 60), with the gateway
+//! selected as for tests. Run it once per environment before the test
+//! binaries; exits non-zero with the last error if the gateway is not healthy
+//! in time, or if the CLI does not reach it.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use testkit::Target;
+use testkit::{Cli, Gateway};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
@@ -26,9 +26,10 @@ async fn main() -> ExitCode {
         }
     };
     let result = async {
-        let target = Target::from_env()?;
-        let health = target.wait_ready(Duration::from_secs(timeout)).await?;
-        target.check_cli().await?;
+        let gateway = Gateway::from_env()?;
+        eprintln!("testkit-ready: {}", gateway.describe());
+        let health = gateway.wait_ready(Duration::from_secs(timeout)).await?;
+        Cli::from_env(&gateway).check_connected().await?;
         testkit::Result::Ok(health)
     }
     .await;

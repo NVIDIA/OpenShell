@@ -19,26 +19,26 @@
 //! }
 //! ```
 //!
-//! Tests read the system under test from the target file named by
-//! `OPENSHELL_TEST_TARGET` (see [`target`]).
+//! Tests find the gateway the same way the `openshell` CLI does (see
+//! [`gateway`]).
 
 mod cli;
 mod context;
 mod error;
+pub mod gateway;
 mod poll;
 mod run;
-pub mod target;
 
-pub use cli::{CLI_TIMEOUT, Cli, CliOutput};
+pub use cli::{BIN_ENV, CLI_TIMEOUT, Cli, CliOutput};
 pub use context::{
     Context, DELETE_TIMEOUT, EXEC_TIMEOUT, ExecOutput, READY_TIMEOUT, STOP_TIMEOUT, Sandbox,
     SandboxBuilder,
 };
 pub use error::{Error, Result, ResultExt};
+pub use gateway::Gateway;
 pub use openshell_sdk as sdk;
 pub use poll::{Poll, poll_until};
 pub use run::{TestInfo, run};
-pub use target::Target;
 pub use testkit_macros::test;
 
 #[doc(hidden)]

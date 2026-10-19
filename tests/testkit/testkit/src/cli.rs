@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Driving the `openshell` CLI the environment installed.
+//! Driving the installed `openshell` CLI.
 //!
 //! Some promised behavior exists only in the CLI: file upload and download,
 //! interactive connect, and port forwarding. Tests act through the CLI for
@@ -16,16 +16,18 @@ use std::time::Duration;
 use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result, ResultExt};
-use crate::target::CliTarget;
+use crate::gateway::{ENDPOINT_ENV, GATEWAY_ENV, Gateway, WORKSPACE_ENV};
 
 /// How long one CLI invocation may take.
 pub const CLI_TIMEOUT: Duration = Duration::from_mins(5);
+/// The CLI binary to run. Defaults to `openshell` on PATH.
+pub const BIN_ENV: &str = "OPENSHELL_BIN";
 
-/// Runs the target's CLI against the target's gateway.
+/// Runs the CLI against the gateway and workspace the tests use.
 #[derive(Clone, Debug)]
 pub struct Cli {
     binary: PathBuf,
-    gateway: Option<String>,
+    gateway: Gateway,
 }
 
 /// The buffered result of one CLI invocation.
@@ -38,11 +40,29 @@ pub struct CliOutput {
 }
 
 impl Cli {
-    pub(crate) fn new(target: &CliTarget, binary: PathBuf) -> Self {
+    /// The CLI named by [`BIN_ENV`], pointed at `gateway`.
+    pub fn from_env(gateway: &Gateway) -> Self {
+        let binary = std::env::var_os(BIN_ENV)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| PathBuf::from("openshell"), PathBuf::from);
         Self {
             binary,
-            gateway: target.gateway.clone(),
+            gateway: gateway.clone(),
         }
+    }
+
+    /// Check that the CLI reaches the gateway: `openshell status` must report
+    /// it connected.
+    pub async fn check_connected(&self) -> Result {
+        let output = self.run(["status", "--output", "json"]).await?.success()?;
+        let status: serde_json::Value = output.json()?;
+        crate::ensure!(
+            status["status"] == "connected",
+            "`{}` reports {}",
+            output.command,
+            status
+        );
+        Ok(())
     }
 
     /// Run the CLI with `args` and buffer its output. A non-zero exit is
@@ -75,14 +95,15 @@ impl Cli {
         process
             .args(&args)
             .env("NO_COLOR", "1")
-            // Select the target's gateway, never one from the caller's
-            // environment.
-            .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
+            .env(WORKSPACE_ENV, &self.gateway.workspace)
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        match &self.gateway {
-            Some(gateway) => process.env("OPENSHELL_GATEWAY", gateway),
-            None => process.env_remove("OPENSHELL_GATEWAY"),
+        // Select exactly the gateway the SDK connected to.
+        match &self.gateway.name {
+            Some(name) => process.env(GATEWAY_ENV, name).env_remove(ENDPOINT_ENV),
+            None => process
+                .env(ENDPOINT_ENV, &self.gateway.endpoint)
+                .env_remove(GATEWAY_ENV),
         };
         if let Some(dir) = dir {
             process.current_dir(dir);
@@ -144,20 +165,39 @@ mod tests {
     fn cli(binary: &str) -> Cli {
         Cli {
             binary: PathBuf::from(binary),
-            gateway: Some("tmachine".to_string()),
+            gateway: Gateway::named_for_test("tmachine"),
         }
     }
 
     #[tokio::test]
-    async fn runs_with_the_target_gateway_selected() {
+    async fn runs_with_the_gateway_selected() {
         let output = cli("sh")
-            .run(["-c", "echo \"$OPENSHELL_GATEWAY\"; exit 3"])
+            .run([
+                "-c",
+                "echo \"$OPENSHELL_GATEWAY|${OPENSHELL_GATEWAY_ENDPOINT-unset}|$OPENSHELL_WORKSPACE\"; exit 3",
+            ])
             .await
             .unwrap();
-        assert_eq!(output.stdout, "tmachine\n");
+        assert_eq!(output.stdout, "tmachine|unset|default\n");
         assert_eq!(output.exit_code, 3);
         let err = output.success().unwrap_err();
         assert!(err.to_string().contains("exited with 3"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn runs_with_a_raw_endpoint_selected() {
+        let cli = Cli {
+            binary: PathBuf::from("sh"),
+            gateway: Gateway::endpoint_for_test("http://127.0.0.1:1"),
+        };
+        let output = cli
+            .run([
+                "-c",
+                "echo \"${OPENSHELL_GATEWAY-unset}|$OPENSHELL_GATEWAY_ENDPOINT\"",
+            ])
+            .await
+            .unwrap();
+        assert_eq!(output.stdout, "unset|http://127.0.0.1:1\n");
     }
 
     #[tokio::test]

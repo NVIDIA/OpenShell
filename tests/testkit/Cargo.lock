@@ -1864,6 +1864,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openshell-bootstrap"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "miette",
+ "openshell-core",
+ "openshell-crypto",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -1970,7 +1986,8 @@ name = "openshell-testkit"
 version = "0.0.0"
 dependencies = [
  "futures",
- "noyalib",
+ "openshell-bootstrap",
+ "openshell-core",
  "openshell-sdk",
  "openshell-testkit-macros",
  "rand 0.9.4",

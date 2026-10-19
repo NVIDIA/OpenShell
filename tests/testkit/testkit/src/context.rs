@@ -34,13 +34,13 @@ type Registry = Arc<Mutex<BTreeSet<String>>>;
 pub struct Context {
     client: WorkspaceScopedClient,
     grpc: Grpc,
-    cli: Result<Cli>,
+    cli: Cli,
     run_id: String,
     sandboxes: Registry,
 }
 
 impl Context {
-    pub(crate) fn new(client: &OpenShellClient, workspace: &str, cli: Result<Cli>) -> Self {
+    pub(crate) fn new(client: &OpenShellClient, workspace: &str, cli: Cli) -> Self {
         Self {
             client: client.workspace(workspace),
             grpc: Grpc {
@@ -60,7 +60,7 @@ impl Context {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        self.cli_driver()?.run(args).await
+        self.cli.run(args).await
     }
 
     /// Like [`Context::cli`], with `dir` as the working directory.
@@ -69,13 +69,7 @@ impl Context {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        self.cli_driver()?.run_in(Some(dir), args).await
-    }
-
-    fn cli_driver(&self) -> Result<&Cli> {
-        self.cli
-            .as_ref()
-            .map_err(|error| Error::msg(error.to_string()))
+        self.cli.run_in(Some(dir), args).await
     }
 
     /// The ID unique to this test run, used in resource names.

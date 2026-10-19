@@ -7,7 +7,7 @@ This is a separate Cargo workspace with its own lockfile:
 
 | Crate | Purpose |
 |---|---|
-| `testkit` | Reads the target file, connects to the gateway, creates and cleans up sandboxes, runs the CLI. Also builds `testkit-ready`. |
+| `testkit` | Finds and connects to the gateway, creates and cleans up sandboxes, runs the CLI. Also builds `testkit-ready`. |
 | `testkit-macros` | The `#[testkit::test]` attribute. |
 
 ## Writing a test
@@ -51,35 +51,36 @@ test creates, such as providers, in the test itself.
 
 ## Running against a gateway
 
-Tests read the system under test from the target file named by
-`OPENSHELL_TEST_TARGET`. Relative paths resolve against the file's directory.
+Tests find the gateway the same way the `openshell` CLI does:
 
-```yaml
-gateway:
-  endpoint: https://127.0.0.1:17670   # http:// for plaintext
-  tls:                                # optional; cert and key together select mTLS
-    ca: ca.crt
-    client_cert: client.crt
-    client_key: client.key
-  auth:                               # optional
-    bearer_token_file: token
-cli:                                  # needed by tests that call cx.cli
-  binary: /usr/bin/openshell          # default: `openshell` on PATH
-  gateway: local                      # default: the CLI's active gateway
-workspace: default
-```
+1. `OPENSHELL_GATEWAY_ENDPOINT`: a gateway URL. Plaintext, or TLS without a
+   client certificate.
+2. `OPENSHELL_GATEWAY`: the name of a gateway registered with the CLI.
+3. The CLI's active gateway, set by `openshell gateway select`.
+
+A registered gateway's endpoint and auth mode come from
+`$XDG_CONFIG_HOME/openshell/gateways/<name>/metadata.json`. For mTLS, the CA
+and client certificate come from its `mtls/` directory. testkit supports
+plaintext and mTLS gateways. `OPENSHELL_WORKSPACE` selects the workspace
+(default `default`), and `OPENSHELL_BIN` selects the CLI that `cx.cli` runs
+(default `openshell` on PATH). The CLI always targets the same gateway and
+workspace as the SDK. Each test logs the gateway it used.
 
 Wait for the gateway, then run a suite. Run tests that share a gateway one at
 a time:
 
 ```shell
-export OPENSHELL_TEST_TARGET=$PWD/target.yaml
+export OPENSHELL_GATEWAY=<name>
 cargo run --manifest-path tests/testkit/Cargo.toml --bin testkit-ready -- 300
 cargo nextest run --manifest-path <suite>/Cargo.toml --test-threads 1
 ```
 
 `testkit-ready [TIMEOUT_SECS]` exits non-zero if the gateway is not healthy in
-time or the target's CLI does not report it connected.
+time or the CLI does not report it connected.
+
+`e2e/with-docker-gateway.sh` and `e2e/with-podman-gateway.sh` start an
+ephemeral gateway and export `OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so a
+suite runs under them unchanged.
 
 ## Checks
 
