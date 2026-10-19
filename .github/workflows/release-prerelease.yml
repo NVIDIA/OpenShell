@@ -102,7 +102,8 @@ jobs:
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 2
-    permissions: {}
+    permissions:
+      actions: read
     defaults:
       run:
         shell: bash
@@ -111,10 +112,14 @@ jobs:
         continue-on-error: true
         env:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          BUILD_RESULT: ${{ needs.build.result }}
           PUBLICATION_RESULT: ${{ needs.publish.result }}
+          QUALIFICATION_RESULT: ${{ needs.qualify.result }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL }}
           SLACK_MENTION: ${{ secrets.SLACK_OPENSHELL_TRIAGE_MENTION }}
+          GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ format('{0}/{1}/actions/runs/{2}/attempts/{3}', github.server_url, github.repository, github.run_id, github.run_attempt) }}
+          TAG_URL: ${{ format('{0}/{1}/tree/{2}', github.server_url, github.repository, inputs.tag || github.ref_name) }}
         run: |
           set -euo pipefail
           if [[ -z "${SLACK_WEBHOOK_URL}" ]]; then
@@ -122,14 +127,44 @@ jobs:
             exit 0
           fi
 
-          message=":x: OpenShell prerelease ${RELEASE_TAG} failed (attempt ${GITHUB_RUN_ATTEMPT})."
+          stages=()
+          [[ "${BUILD_RESULT}" == "failure" ]] && stages+=("build")
+          [[ "${PUBLICATION_RESULT}" == "failure" ]] && stages+=("publication")
+          [[ "${QUALIFICATION_RESULT}" == "failure" ]] && stages+=("release qualification")
+          if (( ${#stages[@]} == 0 )); then
+            stages=("run")
+          fi
+          headline="${stages[0]}"
+          for stage in "${stages[@]:1}"; do
+            headline+=" and ${stage}"
+          done
+
+          message=":x: OpenShell <${TAG_URL}|${RELEASE_TAG}> ${headline} failed (attempt ${GITHUB_RUN_ATTEMPT})."
           if [[ "${PUBLICATION_RESULT}" == "success" ]]; then
             message+=" Published artifacts remain available."
           fi
           if [[ -n "${SLACK_MENTION}" ]]; then
             message+=" ${SLACK_MENTION}"
           fi
-          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" \
-            '{text: ($text + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
+
+          # The aggregate Release Qualification job fails whenever a suite does,
+          # so list it only when nothing else explains the failure.
+          checks='[]'
+          if jobs=$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | {name, url: .html_url}'); then
+            checks=$(jq -s '
+              (map(select(.name | test("(^|/ )Release Qualification$") | not))) as $suites
+              | if ($suites | length) > 0 then $suites else . end' <<<"${jobs}")
+          else
+            echo "::warning::Could not list failed jobs; sending the notification without them."
+          fi
+
+          jq -n --arg text "${message}" --arg run_url "${RUN_URL}" --argjson checks "${checks}" '
+            def esc: gsub("&"; "&amp;") | gsub("<"; "&lt;") | gsub(">"; "&gt;");
+            ($checks[:10] | map("• <" + .url + "|" + (.name | esc) + ">")) as $lines
+            | (if ($checks | length) > 10 then ["• …and \(($checks | length) - 10) more"] else [] end) as $more
+            | (if ($lines | length) > 0 then "\n\nFailing checks\n" + (($lines + $more) | join("\n")) else "" end) as $list
+            | {text: ($text + $list + "\n<" + $run_url + "|View failed release run>"), unfurl_links: false, unfurl_media: false}' |
             curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
               --header 'Content-Type: application/json' --data-binary @- "${SLACK_WEBHOOK_URL}"
