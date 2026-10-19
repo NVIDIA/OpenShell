@@ -34,6 +34,7 @@ the script progresses through each gate.
 | File | Description |
 |---|---|
 | `sandbox-policy.yaml` | Restrictive policy that only allows `api.anthropic.com:443` |
+| `sandbox-policy.cedar` | The same policy in Cedar; the CTF needs YAML, because approvals merge YAML rules |
 | `ctf.py` | Python script with 7 network gates |
 | `README.md` | This walkthrough |
 

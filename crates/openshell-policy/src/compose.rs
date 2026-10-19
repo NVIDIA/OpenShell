@@ -40,12 +40,19 @@ pub fn provider_rule_name(provider_name: &str) -> String {
     }
 }
 
+/// Removes provider-derived entries, leaving the user-authored base policy.
+///
+/// Clears both provider-composed `network_policies` entries and the
+/// gateway-managed `provider_credential_rules` of a Cedar policy. Returns
+/// whether anything was removed.
 pub fn strip_provider_rule_names(policy: &mut SandboxPolicy) -> bool {
     let original_len = policy.network_policies.len();
     policy
         .network_policies
         .retain(|key, _| !is_provider_rule_name(key));
-    policy.network_policies.len() != original_len
+    let had_credential_rules = !policy.provider_credential_rules.is_empty();
+    policy.provider_credential_rules.clear();
+    policy.network_policies.len() != original_len || had_credential_rules
 }
 
 /// Compose a normal sandbox policy from user-authored policy plus provider
@@ -55,33 +62,45 @@ pub fn strip_provider_rule_names(policy: &mut SandboxPolicy) -> bool {
 /// static fields and user-authored network policies, then concatenates each
 /// provider rule under a reserved `_provider_*` key. Existing keys are not
 /// overwritten; a numeric suffix is added if provider rule names collide.
+///
+/// For a Cedar policy, provider rules go into `provider_credential_rules`
+/// instead of `network_policies`: the Cedar policy alone decides access, and
+/// provider rules only supply endpoint settings for credential injection.
 #[must_use]
 pub fn compose_effective_policy(
     source_policy: &SandboxPolicy,
     provider_layers: &[ProviderPolicyLayer],
 ) -> SandboxPolicy {
     let mut effective = source_policy.clone();
+    let rules = if effective.cedar_policy_source.is_empty() {
+        &mut effective.network_policies
+    } else {
+        &mut effective.provider_credential_rules
+    };
 
     for layer in provider_layers {
-        let key = unique_provider_rule_key(&effective, &layer.rule_name);
+        let key = unique_provider_rule_key(rules, &layer.rule_name);
         let mut rule = layer.rule.clone();
         if rule.name.is_empty() {
             rule.name.clone_from(&key);
         }
-        effective.network_policies.insert(key, rule);
+        rules.insert(key, rule);
     }
 
     effective
 }
 
-fn unique_provider_rule_key(policy: &SandboxPolicy, preferred: &str) -> String {
-    if !policy.network_policies.contains_key(preferred) {
+fn unique_provider_rule_key(
+    rules: &std::collections::HashMap<String, NetworkPolicyRule>,
+    preferred: &str,
+) -> String {
+    if !rules.contains_key(preferred) {
         return preferred.to_string();
     }
 
     for suffix in 2_u32.. {
         let candidate = format!("{preferred}_{suffix}");
-        if !policy.network_policies.contains_key(&candidate) {
+        if !rules.contains_key(&candidate) {
             return candidate;
         }
     }

@@ -15,7 +15,20 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.yaml"
+# POLICY_FORMAT selects the starting policy: policy.template.yaml (default)
+# or policy.template.cedar. The approval loop merges the agent's proposed
+# YAML rules into the sandbox policy, and the gateway rejects proposals for a
+# Cedar sandbox, so the demo runs only with YAML; POLICY_FORMAT=cedar stops
+# with an explanation.
+POLICY_FORMAT="${POLICY_FORMAT:-yaml}"
+case "$POLICY_FORMAT" in
+    yaml | cedar) ;;
+    *)
+        printf 'POLICY_FORMAT must be yaml or cedar\n' >&2
+        exit 2
+        ;;
+esac
+POLICY_TEMPLATE="${SCRIPT_DIR}/policy.template.${POLICY_FORMAT}"
 TASK_TEMPLATE="${SCRIPT_DIR}/agent-task.md"
 SANDBOX_AGENT="${SCRIPT_DIR}/sandbox-agent.sh"
 
@@ -52,7 +65,7 @@ DEMO_KEEP_SANDBOX="${DEMO_KEEP_SANDBOX:-0}"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-policy-demo.XXXXXX")"
 PAYLOAD_DIR="${TMP_DIR}/payload"
-POLICY_FILE="${TMP_DIR}/policy.yaml"
+POLICY_FILE="${TMP_DIR}/policy.${POLICY_FORMAT}"
 AGENT_LOG="${TMP_DIR}/agent.log"
 mkdir -p "$PAYLOAD_DIR"
 
@@ -216,6 +229,11 @@ resolve_codex_auth() {
 }
 
 validate_env() {
+    if [[ "$POLICY_FORMAT" == "cedar" ]]; then
+        fail "this demo approves agent proposals, which merge YAML rules into the sandbox policy; \
+the gateway rejects proposals for a Cedar sandbox. Run it with the default POLICY_FORMAT=yaml. \
+policy.template.cedar is the Cedar form of the starting policy: openshell sandbox create --policy ${POLICY_TEMPLATE}"
+    fi
     require_command curl
     require_command jq
     require_command "$OPENSHELL_BIN"

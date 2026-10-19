@@ -49,6 +49,12 @@ DEMO_GITHUB_REPO=openshell-policy-demo \
 bash e2e/policy-advisor/test.sh
 ```
 
+Set `POLICY_FORMAT=cedar` to start the sandbox from `policy.template.cedar`,
+with `middleware.yaml` passed as `--middleware` to carry the process identity
+the YAML policy sets. A Cedar policy accepts no merged rules, so in that mode
+the test checks that the gateway rejects the proposal and skips the approval
+and retry.
+
 Requires Docker, `agent_policy_proposals_enabled=true`, and a GitHub token with
 contents write on the repository. The test auto-resolves the token from
 `DEMO_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`.

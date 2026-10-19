@@ -198,6 +198,9 @@ mod tests {
     fn user_blocked_for_platform_admin_methods() {
         let id = identity_with_roles(&["openshell-user"]);
         let policy = default_policy();
+        // Cedar capability discovery must remain usable by ordinary users;
+        // elevated gateway metadata is deliberately unavailable to them.
+        assert!(policy.check(&id, "/openshell.v1.OpenShell/Health").is_ok());
         assert!(
             policy
                 .check(&id, "/openshell.v1.OpenShell/CreateWorkspace")

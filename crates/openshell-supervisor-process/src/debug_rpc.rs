@@ -76,6 +76,7 @@ async fn run_get_sandbox_config(args: &[String]) -> Result<i32> {
     let mut client = open_client().await?;
     let resp = client
         .get_sandbox_config(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: sandbox_name.to_string(),
             workspace_scope: None,
         })

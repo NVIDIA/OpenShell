@@ -53,6 +53,9 @@ preserves repeated-field order. Policy and profile hashes use the
 hash is a separate operational revision identifier and is not expected to
 match the signed governance hash.
 
+Pass `--policy policy.cedar` to govern sandboxes with the same policy written in
+Cedar; the `.cedar` extension selects the format, as it does for the CLI.
+
 The interceptor polls the policy file every second by default. When `policy.yaml`
 changes and parses successfully, the interceptor re-signs it immediately. New
 sandboxes receive the updated signed policy through `CreateSandbox`. If
@@ -149,6 +152,8 @@ To run the governance smoke test suite and stop the gateway when it completes:
 ```shell
 ./smoke.sh --test-suite
 ```
+
+Set `POLICY_FORMAT=cedar` to run the suite with `policy.cedar`.
 
 The suite uses a gateway-signed JWT for the created sandbox identity to attempt
 an unsigned policy widening and a policy proposal. It verifies that both are

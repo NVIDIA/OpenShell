@@ -15,6 +15,7 @@ while writes are blocked — all without restarting anything.
 | File          | Description                                                          |
 | ------------- | -------------------------------------------------------------------- |
 | `policy.yaml` | Complete policy with the same rule, for `sandbox create --policy`    |
+| `policy.cedar` | The same policy written in Cedar                                    |
 | `demo.sh`     | Automated script that runs the full walkthrough non-interactively    |
 
 ## Walkthrough
@@ -113,6 +114,11 @@ it to start a new sandbox with the rule in place:
 Do not apply it to a running sandbox with `openshell policy set`, which
 replaces the entire policy and is rejected if the file drops a filesystem path
 the sandbox already has.
+
+[`policy.cedar`](policy.cedar) is the same policy in Cedar. Run
+`POLICY_FORMAT=cedar bash examples/sandbox-policy-quickstart/demo.sh` to follow
+the walkthrough with it; step 4 then runs `openshell policy set` with the whole
+Cedar policy, because Cedar policies are replaced rather than merged.
 
 ### 5. Connect and verify: GET works
 

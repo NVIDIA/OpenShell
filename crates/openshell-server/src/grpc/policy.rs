@@ -2864,7 +2864,21 @@ async fn handle_get_sandbox_config_inner(
         MinWorkspaceRole::User,
     )
     .await?;
-    Ok(Response::new(load_sandbox_config(state, &sandbox).await?))
+    let config = load_sandbox_config(state, &sandbox).await?;
+    if matches!(principal, Principal::Sandbox(_))
+        && !req.supports_cedar_policy
+        && config
+            .policy
+            .as_ref()
+            .is_some_and(|policy| !policy.cedar_policy_source.is_empty())
+    {
+        // Do not return an empty compatibility response: an older supervisor
+        // might treat it as a usable YAML configuration.
+        return Err(Status::unimplemented(
+            "Cedar policy requires a supervisor with Cedar support",
+        ));
+    }
+    Ok(Response::new(config))
 }
 
 /// Resolve the same effective configuration for authenticated RPCs and trusted
@@ -3624,7 +3638,11 @@ fn canonical_endpoint_path(path: &str) -> String {
 }
 
 pub(super) fn clear_provider_credentialed_markers(policy: &mut ProtoSandboxPolicy) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = false;
             endpoint.token_grant_owner.clear();
@@ -3636,7 +3654,11 @@ fn stamp_provider_credentialed_endpoints(
     policy: &mut ProtoSandboxPolicy,
     scopes: &[CredentialedEndpointScope],
 ) {
-    for rule in policy.network_policies.values_mut() {
+    for rule in policy
+        .network_policies
+        .values_mut()
+        .chain(policy.provider_credential_rules.values_mut())
+    {
         for endpoint in &mut rule.endpoints {
             endpoint.provider_credentialed = scopes
                 .iter()
@@ -4239,6 +4261,14 @@ async fn handle_update_config_inner(
             let mut new_policy = req.policy.ok_or_else(|| {
                 Status::invalid_argument("policy is required for global policy update")
             })?;
+            // A global policy replaces every sandbox's policy, and a sandbox
+            // cannot switch formats after it starts, so a Cedar global policy
+            // would be rejected by every YAML sandbox.
+            if !new_policy.cedar_policy_source.is_empty() {
+                return Err(Status::invalid_argument(
+                    "global policies must be YAML; Cedar policies can only be set per sandbox",
+                ));
+            }
             clear_provider_credentialed_markers(&mut new_policy);
             validate_no_reserved_provider_policy_keys(&new_policy)?;
             new_policy = validate_and_canonicalize_policy(new_policy)?;
@@ -5070,6 +5100,7 @@ pub(super) async fn handle_report_sandbox_configuration(
     }
     if reported == ConfigurationAdmissionState::Accepted {
         let mut config_request = Request::new(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: sandbox_name.clone(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace.clone())),
         });
@@ -5088,6 +5119,7 @@ pub(super) async fn handle_report_sandbox_configuration(
         // Runtime error strings may contain parser payloads. Only gateway-authored
         // diagnostics may be exposed verbatim through public sandbox status.
         let mut config_request = Request::new(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
             name: sandbox_name,
         });
@@ -8660,6 +8692,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: "admission".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
@@ -8847,6 +8880,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: "image-admission".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
@@ -8879,6 +8913,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: "image-admission".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
                         "default".to_string(),
@@ -9146,6 +9181,7 @@ mod tests {
                 &state,
                 with_sandbox(
                     Request::new(GetSandboxConfigRequest {
+                        supports_cedar_policy: true,
                         name: sandbox_id.clone(),
                         workspace_scope: None,
                     }),
@@ -9194,6 +9230,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
                 }),
@@ -9258,6 +9295,7 @@ mod tests {
                 &state,
                 with_sandbox(
                     Request::new(GetSandboxConfigRequest {
+                        supports_cedar_policy: true,
                         name: sandbox_id.clone(),
                         workspace_scope: None,
                     }),
@@ -9414,6 +9452,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
                 }),
@@ -9525,6 +9564,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
                 }),
@@ -9594,6 +9634,7 @@ mod tests {
             &state,
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
+                    supports_cedar_policy: true,
                     name: sandbox_id.to_string(),
                     workspace_scope: None,
                 }),
@@ -11460,6 +11501,7 @@ mod tests {
         }
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "sb-b".to_string(),
                 workspace_scope: None,
             }),
@@ -11476,6 +11518,7 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "missing-sandbox".to_string(),
                 workspace_scope: None,
             }),
@@ -11514,6 +11557,7 @@ mod tests {
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "self".to_string(),
                 workspace_scope: None,
             }),
@@ -11529,6 +11573,7 @@ mod tests {
         let state = test_server_state().await;
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "self".to_string(),
                 workspace_scope: Some(openshell_core::proto::all_workspaces_selector()),
             }),
@@ -11709,6 +11754,7 @@ mod tests {
         sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_user(Request::new(GetSandboxConfigRequest {
+            supports_cedar_policy: true,
             name: "x".to_string(),
             workspace_scope: Some(openshell_core::proto::workspace_selector(
                 "default".to_string(),
@@ -11938,6 +11984,7 @@ mod tests {
         handle_get_sandbox_config(
             state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: sandbox.object_name().to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     (sandbox.object_workspace()).to_string(),
@@ -12055,6 +12102,7 @@ mod tests {
         let first = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "snapshot-consistency".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -12080,6 +12128,7 @@ mod tests {
         let second = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "snapshot-consistency".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -12628,6 +12677,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cedar_config_requires_supervisor_support_on_every_fetch() {
+        let state = test_server_state().await;
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, action == Sandbox::Action::\"NetworkConnect\", resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");".to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-compat",
+                "cedar-compat",
+                policy,
+                vec![],
+            ))
+            .await
+            .unwrap();
+        for supported in [false, true, false] {
+            let result = handle_get_sandbox_config(
+                &state,
+                with_sandbox(
+                    Request::new(GetSandboxConfigRequest {
+                        name: "cedar-compat".to_string(),
+                        supports_cedar_policy: supported,
+                        ..Default::default()
+                    }),
+                    "sb-cedar-compat",
+                ),
+            )
+            .await;
+            if supported {
+                assert!(
+                    !result
+                        .unwrap()
+                        .into_inner()
+                        .policy
+                        .unwrap()
+                        .cedar_policy_source
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code(), Code::Unimplemented);
+            }
+        }
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-yaml-compat",
+                "yaml-compat",
+                test_policy_with_rule("base", "api.example.com"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let legacy_yaml = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "yaml-compat".to_string(),
+                    supports_cedar_policy: false,
+                    ..Default::default()
+                }),
+                "sb-yaml-compat",
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(legacy_yaml.policy.unwrap().cedar_policy_source.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sandbox_config_delivers_provider_rules_separately_for_a_cedar_policy() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-provider",
+                "cedar-provider",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let effective_policy = get_sandbox_policy(&state, "sb-cedar-provider").await;
+
+        assert!(
+            effective_policy.network_policies.is_empty(),
+            "provider rules must not be composed into a Cedar policy"
+        );
+        let rule = effective_policy
+            .provider_credential_rules
+            .get("_provider_work_github")
+            .expect("provider rules travel in provider_credential_rules");
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            rule.endpoints
+                .iter()
+                .any(|endpoint| endpoint.provider_credentialed),
+            "credentialed endpoints must be stamped"
+        );
+    }
+
+    #[tokio::test]
     async fn sandbox_config_materializes_default_mcp_version_after_provider_composition() {
         use openshell_core::proto::{ProviderProfile, ProviderProfileCategory};
 
@@ -12686,6 +12857,7 @@ mod tests {
         let response = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "mcp-default-composed".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -13522,6 +13694,7 @@ mod tests {
         let error = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "invalid-composed-policy".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -13669,6 +13842,7 @@ mod tests {
             with_sandbox(
                 Request::new(GetSandboxConfigRequest {
                     name: "invalid-legacy".to_string(),
+                    supports_cedar_policy: true,
                     workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
                 }),
                 "sb-invalid-legacy",
@@ -14062,6 +14236,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_environment_delivers_bound_credentials_to_a_cedar_sandbox() {
+        use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        let cedar_policy = ProtoSandboxPolicy {
+            version: 1,
+            cedar_policy_source: "permit(principal, \
+                action == Sandbox::Action::\"NetworkConnect\", \
+                resource == Sandbox::NetworkEndpoint::\"api.github.com:443\");"
+                .to_string(),
+            ..Default::default()
+        };
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-cedar-env",
+                "cedar-env",
+                cedar_policy,
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let response = handle_get_sandbox_provider_environment(
+            &state,
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
+                sandbox_id: "sb-cedar-env".to_string(),
+                supports_static_credential_bindings: true,
+                supports_stable_placeholder_environment_keys: true,
+            })),
+        )
+        .await
+        .expect("provider environment must resolve for a Cedar sandbox")
+        .into_inner();
+
+        assert_eq!(
+            response.environment.get("GITHUB_TOKEN"),
+            Some(&"ghp-test".to_string())
+        );
+        let binding = response
+            .static_credential_bindings
+            .get("GITHUB_TOKEN")
+            .expect("credential must stay bound to the provider's endpoints");
+        assert!(
+            binding
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint.host == "api.github.com")
+        );
+    }
+
+    #[tokio::test]
     async fn provider_readiness_snapshot_uses_baseline_static_binding_contract() {
         let state = test_server_state().await;
         state
@@ -14288,6 +14519,7 @@ mod tests {
         let config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "policy-binding".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -14413,6 +14645,7 @@ mod tests {
         let next_config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "policy-binding".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -14479,6 +14712,7 @@ mod tests {
         let unbound_config = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "policy-binding".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -15785,6 +16019,7 @@ mod tests {
         let response = handle_get_sandbox_config(
             &state,
             with_user(Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "global-profile-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "default".to_string(),
@@ -15984,7 +16219,7 @@ mod tests {
             chunks.push(chunk);
         }
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16000,7 +16235,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16120,7 +16355,7 @@ mod tests {
         .map(Option::unwrap)
         .collect::<Vec<_>>();
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16136,7 +16371,7 @@ mod tests {
                     .collect(),
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16321,7 +16556,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -16335,7 +16570,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16352,7 +16587,7 @@ mod tests {
             "pending"
         );
 
-        let approved = handle_approve_all_draft_chunks(
+        let approved = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 request_id: String::new(),
@@ -16366,7 +16601,7 @@ mod tests {
                     review_token: chunk.review_token.clone(),
                 }],
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16477,7 +16712,7 @@ mod tests {
                 .contains("allowed_ips includes private/internal range '10.0.0.0/8'.")
         );
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16487,7 +16722,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -16544,7 +16779,7 @@ mod tests {
             .await
             .unwrap();
 
-        let skipped = handle_approve_all_draft_chunks(
+        let skipped = Box::pin(handle_approve_all_draft_chunks(
             &state,
             with_user(Request::new(ApproveAllDraftChunksRequest {
                 sandbox: sandbox_name.to_string(),
@@ -16554,7 +16789,7 @@ mod tests {
                 include_security_flagged: false,
                 ..Default::default()
             })),
-        )
+        ))
         .await
         .unwrap()
         .into_inner();
@@ -22435,6 +22670,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_config_global_policy_rejects_cedar_policy() {
+        let state = test_server_state().await;
+
+        let err = handle_update_config(
+            &state,
+            with_user(Request::new(UpdateConfigRequest {
+                global: true,
+                policy: Some(ProtoSandboxPolicy {
+                    version: 1,
+                    cedar_policy_source: "permit(principal, \
+                        action == Sandbox::Action::\"NetworkConnect\", \
+                        resource == Sandbox::NetworkEndpoint::\"pypi.org:443\");"
+                        .to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect_err("a Cedar global policy must be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("Cedar"), "{}", err.message());
+    }
+
+    #[tokio::test]
     async fn update_config_global_policy_rejects_reserved_provider_key() {
         let state = test_server_state().await;
 
@@ -23520,6 +23780,7 @@ mod tests {
 
         let alpha_req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "work".to_string(),
                 workspace_scope: None,
             }),
@@ -23533,6 +23794,7 @@ mod tests {
 
         let beta_req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "work".to_string(),
                 workspace_scope: None,
             }),
@@ -25143,7 +25405,7 @@ mod tests {
             err.code()
         );
 
-        let err = handle_approve_all_draft_chunks(
+        let err = Box::pin(handle_approve_all_draft_chunks(
             &state,
             non_member_request(ApproveAllDraftChunksRequest {
                 sandbox: ("any").to_string(),
@@ -25152,7 +25414,7 @@ mod tests {
                 )),
                 ..Default::default()
             }),
-        )
+        ))
         .await
         .unwrap_err();
         assert_eq!(
@@ -25272,6 +25534,7 @@ mod tests {
         let err = handle_get_sandbox_config(
             &state,
             non_member_request(GetSandboxConfigRequest {
+                supports_cedar_policy: true,
                 name: "other".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
                     "other-workspace".to_string(),

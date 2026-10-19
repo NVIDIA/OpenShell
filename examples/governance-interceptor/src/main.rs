@@ -235,6 +235,9 @@ impl PolicySigner {
 #[derive(Clone, Debug)]
 struct GovernanceInterceptorService {
     policy_signer: PolicySigner,
+    /// The governance policy's format, fixed for the interceptor's lifetime
+    /// because a sandbox cannot switch between YAML and Cedar.
+    policy_format: PolicyFormat,
     policy_state: Arc<RwLock<PolicyState>>,
     profiles_path: Option<PathBuf>,
     profile_state: Arc<RwLock<ProviderProfileState>>,
@@ -267,13 +270,27 @@ impl GovernanceInterceptorService {
         Self::from_yaml(include_str!("../policy.yaml"), profiles, None)
     }
 
-    fn from_policy_and_profiles_path(policy_yaml: &str, path: PathBuf) -> Result<Self, String> {
+    fn from_policy_and_profiles_path(
+        policy_text: &str,
+        policy_format: PolicyFormat,
+        path: PathBuf,
+    ) -> Result<Self, String> {
         let profiles = load_provider_profiles(&path)?;
-        Self::from_yaml(policy_yaml, profiles, Some(path))
+        Self::from_policy(policy_text, policy_format, profiles, Some(path))
     }
 
+    #[cfg(test)]
     fn from_yaml(
         policy_yaml: &str,
+        profiles: Vec<LoadedProviderProfile>,
+        profiles_path: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        Self::from_policy(policy_yaml, PolicyFormat::Yaml, profiles, profiles_path)
+    }
+
+    fn from_policy(
+        policy_text: &str,
+        policy_format: PolicyFormat,
         profiles: Vec<LoadedProviderProfile>,
         profiles_path: Option<PathBuf>,
     ) -> Result<Self, String> {
@@ -282,9 +299,10 @@ impl GovernanceInterceptorService {
         }
         let policy_signer = PolicySigner::generate()?;
         let profile_state = profile_state_from_loaded(profiles, &policy_signer)?;
-        let policy_state = load_policy_state(policy_yaml, &policy_signer)?;
+        let policy_state = load_policy_state(policy_text, policy_format, &policy_signer)?;
         Ok(Self {
             policy_signer,
+            policy_format,
             policy_state: Arc::new(RwLock::new(policy_state)),
             profiles_path,
             profile_state: Arc::new(RwLock::new(profile_state)),
@@ -472,8 +490,15 @@ impl GovernanceInterceptorService {
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
 
+    #[cfg(test)]
     fn reload_policy_from_yaml(&self, policy_yaml: &str) -> Result<Option<PolicyState>, String> {
-        let next = load_policy_state(policy_yaml, &self.policy_signer)?;
+        self.reload_policy(policy_yaml)
+    }
+
+    /// Reloads the governance policy from its text, in the format it was
+    /// loaded with.
+    fn reload_policy(&self, policy_text: &str) -> Result<Option<PolicyState>, String> {
+        let next = load_policy_state(policy_text, self.policy_format, &self.policy_signer)?;
         let mut guard = self
             .policy_state
             .write()
@@ -798,12 +823,50 @@ fn validate_delete_provider_profile() -> InterceptorResult {
     deny("provider profile deletes are blocked by provider governance")
 }
 
+/// The format of the governance policy file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyFormat {
+    Yaml,
+    /// A Cedar policy, selected by a `.cedar` extension as the CLI selects it.
+    Cedar,
+}
+
+impl PolicyFormat {
+    fn of(path: &Path) -> Self {
+        let cedar = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("cedar"));
+        if cedar { Self::Cedar } else { Self::Yaml }
+    }
+}
+
+/// Parses the governance policy file.
+///
+/// A Cedar policy is carried as `cedar_policy_source`, as the CLI builds it.
+/// This example builds `openshell-policy` without Cedar support, so the
+/// gateway validates the Cedar text when it creates the sandbox.
+fn parse_policy(policy_text: &str, policy_format: PolicyFormat) -> Result<SandboxPolicy, String> {
+    match policy_format {
+        PolicyFormat::Yaml => parse_sandbox_policy(policy_text)
+            .map_err(|err| format!("failed to parse policy YAML: {err}")),
+        PolicyFormat::Cedar if policy_text.trim().is_empty() => {
+            Err("Cedar policy file is empty".to_string())
+        }
+        PolicyFormat::Cedar => Ok(SandboxPolicy {
+            version: 1,
+            cedar_policy_source: policy_text.to_string(),
+            ..Default::default()
+        }),
+    }
+}
+
 fn load_policy_state(
-    policy_yaml: &str,
+    policy_text: &str,
+    policy_format: PolicyFormat,
     policy_signer: &PolicySigner,
 ) -> Result<PolicyState, String> {
-    let policy_proto = parse_sandbox_policy(policy_yaml)
-        .map_err(|err| format!("failed to parse policy YAML: {err}"))?;
+    let policy_proto = parse_policy(policy_text, policy_format)?;
     let policy = sandbox_policy_to_proto_json(&policy_proto)?;
     let policy = normalize_for_struct(policy)?;
     let policy_hash = canonical_policy_hash(&policy_proto)?;
@@ -1192,7 +1255,7 @@ fn spawn_policy_watch_worker(
                 }
             };
 
-            let policy_state = match service.reload_policy_from_yaml(&policy_yaml) {
+            let policy_state = match service.reload_policy(&policy_yaml) {
                 Ok(Some(policy_state)) => policy_state,
                 Ok(None) => continue,
                 Err(err) => {
@@ -1391,10 +1454,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let policy_path = policy_path.unwrap_or_else(default_policy_path);
-    let policy_yaml = tokio::fs::read_to_string(&policy_path).await?;
+    let policy_text = tokio::fs::read_to_string(&policy_path).await?;
     let profiles_path = profiles_path.unwrap_or_else(default_profiles_path);
-    let service =
-        GovernanceInterceptorService::from_policy_and_profiles_path(&policy_yaml, profiles_path)?;
+    let service = GovernanceInterceptorService::from_policy_and_profiles_path(
+        &policy_text,
+        PolicyFormat::of(&policy_path),
+        profiles_path,
+    )?;
 
     if let Some(endpoint) = &gateway_endpoint {
         println!("policy reload propagation enabled through gateway endpoint {endpoint}");

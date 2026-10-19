@@ -1,0 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Middleware configuration for the Cedar e2e suite, passed with --middleware.
+# test.sh replaces __HOST__ with the upstream echo service's host.
+# Middleware is configuration rather than policy, so it is not part of the
+# Cedar file.
+network_middlewares:
+  redact-keys:
+    name: Redact API keys
+    middleware: openshell/regex
+    order: 10
+    config:
+      mode: redact
+    on_error: fail_closed
+    endpoints:
+      include: ["__HOST__"]

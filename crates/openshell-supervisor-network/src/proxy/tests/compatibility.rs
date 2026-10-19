@@ -14,6 +14,7 @@ fn allowed_decision(intent: EgressIntent) -> EgressDecision {
             matched_policy: Some("proxy_compatibility".to_string()),
         },
         policy_generation: 0,
+        engine: "opa",
         identity: ProcessIdentityEvidence::Available,
         endpoint: EndpointDecision::default(),
         binary: Some(PathBuf::from("/usr/bin/curl")),
@@ -234,6 +235,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "curl --proxy",
         "proxy_compatibility",
         true,
+        "opa",
     ))
     .unwrap();
     assert_eq!(connect["class_name"], "Network Activity");
@@ -260,6 +262,7 @@ fn representative_adapter_allows_preserve_ocsf_fields() {
         "/usr/bin/sh",
         "curl --proxy",
         "proxy_compatibility",
+        "opa",
     ))
     .unwrap();
     assert_eq!(forward["class_name"], "HTTP Activity");
@@ -327,7 +330,7 @@ network_policies:
     // combined authorization query must deny rather than preserve the old
     // multi-query behavior that could fall back to an L4-only allow.
     let decision = evaluate_endpoint_only_opa(
-        &engine,
+        &PolicyEngine::from(Arc::new(engine)),
         EgressIntent::connect("sub\0.example.com".to_string(), 443),
     );
 
@@ -392,7 +395,7 @@ fn identity_required_mode_is_explicitly_unsupported_off_linux() {
             "127.0.0.1:41000".parse().unwrap(),
             "127.0.0.1:3000".parse().unwrap(),
         ),
-        &engine,
+        &PolicyEngine::from(Arc::new(engine)),
         &BinaryIdentityCache::new(),
         &AtomicU32::new(1),
         EgressIntent::connect("target.example".to_string(), 443),

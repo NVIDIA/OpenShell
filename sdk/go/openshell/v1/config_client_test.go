@@ -144,6 +144,7 @@ func TestConfigGetSandbox(t *testing.T) {
 	// Verify request was forwarded with resolved ID (stubSandboxResolver returns "sb-<name>").
 	mock.mu.Lock()
 	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetName())
+	assert.True(t, mock.lastSandboxReq.GetSupportsCedarPolicy())
 	mock.mu.Unlock()
 
 	// Scalar fields.
@@ -236,6 +237,7 @@ func TestConfigGetSandbox_UsesName(t *testing.T) {
 	// stubSandboxResolver returns ID "sb-<name>" — verify the proto has the resolved ID, not the name.
 	mock.mu.Lock()
 	assert.Equal(t, "my-sandbox", mock.lastSandboxReq.GetName())
+	assert.True(t, mock.lastSandboxReq.GetSupportsCedarPolicy())
 	mock.mu.Unlock()
 }
 

@@ -2198,6 +2198,66 @@ class _RecordingHighLevelClient:
         )
 
 
+@pytest.mark.parametrize(
+    "method",
+    [
+        "create",
+        "create_from_template",
+        "create_session",
+        "create_session_from_template",
+    ],
+)
+@pytest.mark.parametrize("policy_kind", ["cedar", "yaml", "default"])
+@pytest.mark.parametrize("support", ["legacy", "modern", "error"])
+def test_create_negotiates_cedar_before_mutation(
+    method: str, policy_kind: str, support: str
+) -> None:
+    health_calls: list[openshell_pb2.HealthRequest] = []
+    health_error = RuntimeError("health unavailable")
+
+    class Stub(_FakeSandboxStub):
+        def Health(
+            self, request: openshell_pb2.HealthRequest, timeout: float | None = None
+        ) -> openshell_pb2.HealthResponse:
+            health_calls.append(request)
+            assert timeout == 30.0
+            if support == "error":
+                raise health_error
+            if support == "modern":
+                return openshell_pb2.HealthResponse(supports_cedar_policy=True)
+            return openshell_pb2.HealthResponse()
+
+    stub = Stub()
+    client = _client_with_fake_stub(stub)
+    spec = None
+    if policy_kind != "default":
+        spec = openshell_pb2.SandboxSpec(policy={"version": 1}, providers=["github"])
+        if policy_kind == "cedar":
+            spec.policy.cedar_policy_source = "permit(principal, action, resource);"
+    kwargs: dict[str, Any] = {"workspace": "default", "name": "cedar", "spec": spec}
+    if "from_template" in method:
+        kwargs["workload_template"] = "python"
+    create = getattr(client, method)
+
+    if policy_kind == "cedar" and support != "modern":
+        if support == "error":
+            with pytest.raises(RuntimeError, match="health unavailable") as error:
+                create(**kwargs)
+            assert error.value is health_error
+        else:
+            with pytest.raises(SandboxError, match="Cedar policy support"):
+                create(**kwargs)
+        assert stub.create_request is None
+    else:
+        create(**kwargs)
+        assert stub.create_request is not None
+        assert stub.create_request.spec == (spec or openshell_pb2.SandboxSpec())
+        assert stub.create_request.workload_template == (
+            "python" if "from_template" in method else ""
+        )
+    assert len(health_calls) == (1 if policy_kind == "cedar" else 0)
+
+
 def test_create_forwards_name_and_labels() -> None:
     stub = _FakeSandboxStub()
     client = _client_with_fake_stub(stub)

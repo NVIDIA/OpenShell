@@ -63,7 +63,8 @@ The demo also exercises two OpenShell features:
   to understand the agent side.
 - `policy.template.yaml` — the network policy applied to every sandbox in
   the run. Renders to a concrete policy with the configured owner, repo, and
-  run id.
+  run id. `policy.template.cedar` is the same policy in Cedar; set
+  `POLICY_FORMAT=cedar` to use it.
 - `prompts/worker.md`, `prompts/synthesis.md` — agent instructions.
 
 ## Prerequisites

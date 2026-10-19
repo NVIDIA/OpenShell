@@ -10,7 +10,12 @@ rewritten) URL the client should connect to. Used both to seed the reusable
 client sandbox with a placeholder policy and to install the per-scenario policy
 in client-through-openshell.sh.
 
+A Cedar template (`.cedar`) has no room for endpoint settings, so the MCP
+revision and body limit go to a middleware file rendered from a second
+template; pass both as the last two arguments.
+
 Usage: render-policy.py <server-url> <policy-file> <policy-template> <mcp-version>
+           [<middleware-file> <middleware-template>]
 """
 
 import json
@@ -21,13 +26,16 @@ from ipaddress import ip_address
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-if len(sys.argv) != 5:
+if len(sys.argv) not in (5, 7):
     raise SystemExit(
         "usage: render-policy.py <server-url> <policy-file> "
-        "<policy-template> <mcp-version>"
+        "<policy-template> <mcp-version> [<middleware-file> <middleware-template>]"
     )
 
 raw_url, policy_file, policy_template, mcp_version = sys.argv[1:5]
+middleware_file, middleware_template = (
+    sys.argv[5:7] if len(sys.argv) == 7 else (None, None)
+)
 # Keep this boundary check synchronized with McpProtocolVersion::ALL. The
 # renderer is standalone Python, so it cannot import the Rust registry.
 supported_mcp_versions = {"2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"}
@@ -75,13 +83,21 @@ rewritten = urlunparse(
     (parsed.scheme, netloc, path, parsed.params, parsed.query, parsed.fragment)
 )
 
+values = {
+    # YAML template fields.
+    "host_spec": f"host: {json.dumps(target_host)}",
+    "port_spec": f"        port: {port}",
+    # Cedar and middleware template fields.
+    "host": target_host,
+    "host_json": json.dumps(target_host),
+    "port": str(port),
+    "path": json.dumps(path),
+    "mcp_version": json.dumps(mcp_version),
+}
 template = string.Template(Path(policy_template).read_text(encoding="utf-8"))
-policy = template.substitute(
-    host_spec=f"host: {json.dumps(target_host)}",
-    port_spec=f"        port: {port}",
-    path=json.dumps(path),
-    mcp_version=json.dumps(mcp_version),
-)
-Path(policy_file).write_text(policy, encoding="utf-8")
+Path(policy_file).write_text(template.substitute(values), encoding="utf-8")
+if middleware_file is not None and middleware_template is not None:
+    template = string.Template(Path(middleware_template).read_text(encoding="utf-8"))
+    Path(middleware_file).write_text(template.substitute(values), encoding="utf-8")
 
 print(rewritten)

@@ -87,7 +87,7 @@ Public skills live in `skills/` and work without an OpenShell source checkout. I
 | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, and BYOC workflows |
 | `debug-openshell-cluster` | Diagnose gateway deployment and health issues |
 | `debug-inference` | Diagnose attached-provider inference, native endpoints, and migration from the retired managed endpoint |
-| `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API documentation |
+| `generate-sandbox-policy` | Generate or edit YAML and Cedar sandbox policies while preserving their format and middleware configuration |
 
 Public skills use `openshell --help` for installed command syntax and published OpenShell documentation for product concepts and configuration. They must not depend on repository-relative source or documentation files.
 
@@ -337,6 +337,8 @@ These are the primary `mise` tasks for day-to-day development:
 | --------------- | --------------------------------------------- |
 | `crates/`       | Rust crates                                   |
 | `crates/openshell-policy-schema/` | Canonical authored policy DTOs and bounded YAML/JSON parser |
+| `crates/openshell-policy-cedar/` | Validation and evaluation for Cedar-authored sandbox policies |
+| `crates/openshell-policy-cedar-schema/` | Canonical Cedar schema and entity, action, and context names |
 | `crates/openshell-prover-cli/` | Standalone local policy boundary checker |
 | `python/`       | Python SDK and bindings                       |
 | `sdk/go/`       | Go SDK (types, gRPC clients, converters)      |

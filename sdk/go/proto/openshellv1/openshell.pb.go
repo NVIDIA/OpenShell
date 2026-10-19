@@ -1647,9 +1647,12 @@ type HealthResponse struct {
 	// Service status.
 	Status ServiceStatus `protobuf:"varint,1,opt,name=status,proto3,enum=openshell.v1.ServiceStatus" json:"status,omitempty"`
 	// Service version.
-	Version       string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Version string `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
+	// Clients must check this before sending Cedar policies. Older gateways
+	// silently discard Cedar fields and would interpret them as empty YAML.
+	SupportsCedarPolicy bool `protobuf:"varint,3,opt,name=supports_cedar_policy,json=supportsCedarPolicy,proto3" json:"supports_cedar_policy,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *HealthResponse) Reset() {
@@ -1694,6 +1697,13 @@ func (x *HealthResponse) GetVersion() string {
 		return x.Version
 	}
 	return ""
+}
+
+func (x *HealthResponse) GetSupportsCedarPolicy() bool {
+	if x != nil {
+		return x.SupportsCedarPolicy
+	}
+	return false
 }
 
 // Current-user request. The identity comes from the authenticated request.
@@ -12008,8 +12018,8 @@ type UpdateConfigRequest struct {
 	// The new policy to apply.
 	//
 	// Sandbox scope (`global=false`):
-	//   - only network_policies may differ from create-time
-	//     policy; static fields must match version 1.
+	//   - only network_policies and cedar_policy_source may differ from
+	//     create-time policy; static fields must match version 1.
 	//
 	// Global scope (`global=true`):
 	// - applies to all sandboxes in full (no merge).
@@ -19421,10 +19431,11 @@ const file_openshell_proto_rawDesc = "" +
 	"\n" +
 	"session_id\x18\x06 \x01(\tR\tsessionId\x12)\n" +
 	"\x10credential_epoch\x18\a \x01(\x04R\x0fcredentialEpochJ\x04\b\x02\x10\x03J\x04\b\x05\x10\x06R\rexpires_at_msR\x15sandbox_expires_at_ms\"\x0f\n" +
-	"\rHealthRequest\"_\n" +
+	"\rHealthRequest\"\x93\x01\n" +
 	"\x0eHealthResponse\x123\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x1b.openshell.v1.ServiceStatusR\x06status\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\"\x17\n" +
+	"\aversion\x18\x02 \x01(\tR\aversion\x122\n" +
+	"\x15supports_cedar_policy\x18\x03 \x01(\bR\x13supportsCedarPolicy\"\x17\n" +
 	"\x15GetCurrentUserRequest\"\xb0\x01\n" +
 	"\x16GetCurrentUserResponse\x12\x18\n" +
 	"\asubject\x18\x01 \x01(\tR\asubject\x12!\n" +

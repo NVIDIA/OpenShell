@@ -24,6 +24,7 @@ mod store;
 mod wire;
 
 pub(crate) use name::NormalizedName;
+pub(crate) use resolver::ResolveError as TrustedResolveError;
 pub(crate) use resolver::{AddressFamily, SocketTrustedResolver, TrustedAnswer, TrustedResolver};
 pub(crate) use runtime::{PolicyDnsRuntime, PolicyDnsRuntimeConfig};
 pub(crate) use store::{
@@ -32,7 +33,7 @@ pub(crate) use store::{
     SyntheticPools,
 };
 
-use crate::opa::OpaEngine;
+use crate::policy_engine::PolicyEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
 use crate::proxy::is_host_gateway_alias;
 use openshell_core::host_pattern::HostSelector;
@@ -84,7 +85,7 @@ pub(crate) enum PolicyDnsError {
 /// No socket is bound by this type. A later runtime adapter owns listener and
 /// namespace lifecycle and calls the bounded wire helpers in this module.
 pub(crate) struct PolicyDnsService<R> {
-    policy: Arc<OpaEngine>,
+    policy: PolicyEngine,
     resolver: R,
     store: Arc<ResolvedEndpointStore>,
     trusted_host_gateway: Option<std::net::IpAddr>,
@@ -92,13 +93,13 @@ pub(crate) struct PolicyDnsService<R> {
 
 impl<R: TrustedResolver> PolicyDnsService<R> {
     pub(crate) fn new(
-        policy: Arc<OpaEngine>,
+        policy: impl Into<PolicyEngine>,
         resolver: R,
         store: Arc<ResolvedEndpointStore>,
         trusted_host_gateway: Option<std::net::IpAddr>,
     ) -> Self {
         Self {
-            policy,
+            policy: policy.into(),
             resolver,
             store,
             trusted_host_gateway,
@@ -359,20 +360,24 @@ fn eligible_endpoints(
 ) -> Result<Vec<EligibleEndpoint>, PolicyDnsError> {
     let mut eligible = Vec::new();
     for endpoint in endpoints {
-        let Some(pattern) = value_string(&endpoint.endpoint, "host") else {
+        if endpoint.endpoint.host.is_empty() {
             continue;
-        };
-        let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+        }
+        let pattern = endpoint
+            .endpoint
+            .host
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         let selector = HostSelector::new(std::slice::from_ref(&pattern), &[])
             .map_err(PolicyDnsError::Policy)?;
         if !selector.matches(name.as_str()) {
             continue;
         }
-        let ports = value_ports(&endpoint.endpoint);
+        let ports = record_ports(&endpoint.endpoint);
         if ports.is_empty() {
             continue;
         }
-        let raw_allowed_ips = value_string_array(&endpoint.endpoint, "allowed_ips");
+        let raw_allowed_ips = endpoint.endpoint.allowed_ips.clone();
         let exact_declared_host = !pattern.contains('*') && pattern == name.as_str();
         let destination_plan = build_validation_plan(
             name.as_str(),
@@ -381,6 +386,7 @@ fn eligible_endpoints(
             None,
             &raw_allowed_ips,
             exact_declared_host,
+            None,
         )
         .map_err(|error| PolicyDnsError::Policy(error.reason))?;
         eligible.push(EligibleEndpoint {
@@ -390,7 +396,7 @@ fn eligible_endpoints(
             },
             ports,
             destination_plan,
-            contract_fingerprint: endpoint.endpoint.to_string(),
+            contract_fingerprint: format!("{:?}", endpoint.endpoint),
         });
     }
     Ok(eligible)
@@ -427,47 +433,14 @@ fn eligible_endpoint_context(endpoints: &[EligibleEndpoint]) -> Vec<PolicyEndpoi
     endpoint_ids
 }
 
-fn value_field<'a>(value: &'a regorus::Value, key: &str) -> Option<&'a regorus::Value> {
-    let regorus::Value::Object(fields) = value else {
-        return None;
-    };
-    fields.get(&regorus::Value::String(key.into()))
-}
-
-fn value_string(value: &regorus::Value, key: &str) -> Option<String> {
-    match value_field(value, key) {
-        Some(regorus::Value::String(value)) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn value_string_array(value: &regorus::Value, key: &str) -> Vec<String> {
-    match value_field(value, key) {
-        Some(regorus::Value::Array(values)) => values
-            .iter()
-            .filter_map(|value| match value {
-                regorus::Value::String(value) => Some(value.to_string()),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn value_ports(value: &regorus::Value) -> Vec<u16> {
-    let mut ports = match value_field(value, "ports") {
-        Some(regorus::Value::Array(values)) => values
-            .iter()
-            .filter_map(|value| match value {
-                regorus::Value::Number(number) => number
-                    .as_i64()
-                    .and_then(|port| u16::try_from(port).ok())
-                    .filter(|port| *port != 0),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
+/// Returns a record's usable ports, sorted and deduplicated, without port 0.
+fn record_ports(record: &crate::policy_types::DnsRecord) -> Vec<u16> {
+    let mut ports: Vec<u16> = record
+        .ports
+        .iter()
+        .copied()
+        .filter(|port| *port != 0)
+        .collect();
     ports.sort_unstable();
     ports.dedup();
     ports
@@ -659,6 +632,7 @@ fn build_mapping_publication_event(record: &ResolvedEndpointRecord) -> openshell
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::opa::OpaEngine;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;

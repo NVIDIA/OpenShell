@@ -591,6 +591,55 @@ fn policy_reload_updates_hash_and_preserves_last_valid_state_on_error() {
 }
 
 #[test]
+fn cedar_policy_is_carried_as_cedar_source_and_signed() {
+    let profiles = load_provider_profiles(&default_profiles_path()).unwrap();
+    let service = GovernanceInterceptorService::from_policy(
+        include_str!("../policy.cedar"),
+        PolicyFormat::Cedar,
+        profiles,
+        None,
+    )
+    .unwrap();
+    let state = policy_state(&service);
+    assert_eq!(
+        state.policy_proto.cedar_policy_source,
+        include_str!("../policy.cedar")
+    );
+    assert!(state.policy_proto.network_policies.is_empty());
+    assert!(state.policy.get("cedarPolicySource").is_some());
+    assert!(!state.policy_signature.is_empty());
+
+    let changed = service
+        .reload_policy(&format!(
+            "{}\n// reloaded\n",
+            include_str!("../policy.cedar")
+        ))
+        .unwrap()
+        .expect("policy hash should change");
+    assert_ne!(state.policy_hash, changed.policy_hash);
+    let err = service
+        .reload_policy("  \n")
+        .expect_err("an empty Cedar policy should be rejected");
+    assert!(err.contains("empty"));
+}
+
+#[test]
+fn policy_format_follows_the_file_extension() {
+    assert_eq!(
+        PolicyFormat::of(Path::new("policy.cedar")),
+        PolicyFormat::Cedar
+    );
+    assert_eq!(
+        PolicyFormat::of(Path::new("policy.CEDAR")),
+        PolicyFormat::Cedar
+    );
+    assert_eq!(
+        PolicyFormat::of(Path::new("policy.yaml")),
+        PolicyFormat::Yaml
+    );
+}
+
+#[test]
 fn signed_governance_policy_update_is_allowed() {
     let service = service();
     let state = policy_state(&service);
