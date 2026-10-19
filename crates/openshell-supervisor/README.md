@@ -22,6 +22,24 @@ only after boundary attachment and confirmation; the supervisor owns policy
 evaluation, live credentials, and listener lifetime. These settings do not add
 a proxy hook to the isolation interface or the shared Sandbox Protocol descriptor.
 
+## Session ownership
+
+`run_session` supervises one sandbox generation from a `SessionConfig` and
+`SessionControls`. Everything that belongs to that generation is an input or
+is created by the session: gateway credentials and their renewal, the Sandbox
+Protocol credential, policy, provider credentials and token grants, middleware
+credentials, OCSF JSON settings, proxy trust files, the denial history served
+by `policy.local`, the backend connection, access plane, readiness, and stop
+signal. Gateway clients receive a `GatewayEndpoint`, which pairs the URL with
+that session's `GatewayCredentials`; nothing is installed process-wide.
+
+`run_sandbox_with_backend` is the dedicated wrapper. It keeps the existing
+process contract: it sets the process-wide OCSF context, reads launch inputs
+from the environment, binds the readiness socket and port to session
+readiness, and stops the session on SIGTERM or SIGINT. The binary shares one
+`GatewayCredentials` between log push and supervision, so renewal by either
+keeps both current.
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.

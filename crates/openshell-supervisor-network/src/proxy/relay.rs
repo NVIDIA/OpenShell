@@ -47,8 +47,8 @@ pub(super) fn http_context(
     decision: &EgressDecision,
     provider_credentials: Option<openshell_core::provider_credentials::ProviderCredentialState>,
     secret_resolver: Option<Arc<SecretResolver>>,
+    policy_local: Option<&crate::policy_local::PolicyLocalContext>,
     agent_proposals: openshell_core::proposals::AgentProposals,
-    workspace: String,
     signals: RelaySignals,
 ) -> L7EvalContext {
     // Provider-backed credentials must be acquired from the live state for
@@ -58,9 +58,14 @@ pub(super) fn http_context(
         .is_none()
         .then_some(secret_resolver)
         .flatten();
+    // Grants use the owning session's resolver; without one they fail closed.
     let token_grant_resolver = provider_credentials
         .as_ref()
-        .map(|_| crate::l7::token_grant_injection::default_resolver());
+        .and(policy_local)
+        .and_then(crate::policy_local::PolicyLocalContext::token_grant_resolver);
+    let workspace = policy_local
+        .map(crate::policy_local::PolicyLocalContext::workspace)
+        .unwrap_or_default();
     let policy_name = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone().unwrap_or_default(),
         NetworkAction::Deny { .. } => String::new(),

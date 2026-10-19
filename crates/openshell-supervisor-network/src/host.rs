@@ -48,7 +48,8 @@ pub struct HostProxyConfig {
     pub binary_path: PathBuf,
     pub sandbox_id: Option<String>,
     pub sandbox_name: Option<String>,
-    pub openshell_endpoint: Option<String>,
+    /// Gateway access with this sandbox's credentials.
+    pub gateway: Option<openshell_core::grpc_client::GatewayEndpoint>,
     pub provider_credentials: Option<ProviderCredentialState>,
     /// Shared feature state for the policy.local agent proposal surface.
     pub agent_proposals: AgentProposals,
@@ -99,7 +100,7 @@ pub async fn start_host_proxy(config: HostProxyConfig) -> Result<HostProxyHandle
     let (_workspace_tx, workspace_rx) = tokio::sync::watch::channel(String::new());
     let policy_local_ctx = Arc::new(PolicyLocalContext::new(
         Some(config.policy.clone()),
-        config.openshell_endpoint.clone(),
+        config.gateway.clone(),
         config
             .sandbox_name
             .clone()

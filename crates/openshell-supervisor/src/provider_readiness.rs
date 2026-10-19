@@ -283,7 +283,7 @@ impl Tracker {
     /// Report while the owner holds this handle; reconnects use the accepted session.
     pub(crate) fn start_reporter(
         &self,
-        endpoint: String,
+        gateway: openshell_core::grpc_client::GatewayEndpoint,
         sandbox_id: String,
         credentials: ProviderCredentialState,
         sessions: watch::Receiver<Option<String>>,
@@ -297,7 +297,7 @@ impl Tracker {
                     sessions,
                     boundary,
                     GatewayReporter {
-                        endpoint,
+                        gateway,
                         sandbox_id,
                     },
                 )
@@ -399,7 +399,7 @@ trait ReportClient: Send + Sync {
 }
 
 struct GatewayReporter {
-    endpoint: String,
+    gateway: openshell_core::grpc_client::GatewayEndpoint,
     sandbox_id: String,
 }
 
@@ -409,7 +409,7 @@ impl ReportClient for GatewayReporter {
         observation: ProviderReadinessObservation,
     ) -> miette::Result<ReportProviderReadinessResponse> {
         openshell_core::grpc_client::report_provider_readiness(
-            &self.endpoint,
+            &self.gateway,
             &self.sandbox_id,
             observation,
         )

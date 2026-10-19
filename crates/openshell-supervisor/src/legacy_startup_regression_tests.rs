@@ -303,6 +303,7 @@ async fn config_push_regression_legacy_gateway_never_observes_ready_before_workl
                 payload: Vec::new(),
             },
             auth_bundle,
+            gateway_credentials: None,
             admitted_isolation_backend: Some("test-held".into()),
             main_exit_marker: None,
         },

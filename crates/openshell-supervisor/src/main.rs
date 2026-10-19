@@ -413,11 +413,10 @@ fn main() -> Result<()> {
         let setup = backend_setup(&args, &admitted_backend)?;
         let descriptor = backend_descriptor(&args, &admitted_backend)?;
         let auth = auth_bundle(&args)?;
-        // Install the driver-provisioned session before starting log push or
-        // any other gateway client. `run_sandbox` obtains the same Sandbox
-        // Protocol bearer slot after validating the descriptor binding.
-        let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth)?;
-        Some((setup, descriptor, auth, admitted_backend))
+        // Log push and supervision share these credentials, so either one's
+        // renewal keeps the other's gateway token current.
+        let credentials = openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&auth)?;
+        Some((setup, descriptor, auth, admitted_backend, credentials))
     } else {
         None
     };
@@ -443,7 +442,7 @@ fn main() -> Result<()> {
     });
     let ocsf_headers = isolation_inputs
         .as_ref()
-        .and_then(|(_, _, auth, _)| auth.ocsf_otlp_headers.as_ref())
+        .and_then(|(_, _, auth, _, _)| auth.ocsf_otlp_headers.as_ref())
         .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret);
     let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
         start_ocsf_export(
@@ -457,11 +456,18 @@ fn main() -> Result<()> {
 
     let exit_code = runtime.block_on(async move {
         openshell_crypto::tls::ensure_default_provider();
-        let log_push_state = if args.role == SupervisorRole::IsolationBackend
-            && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
-        {
+        let log_push_state = if let (Some(sandbox_id), Some(endpoint), Some(credentials)) = (
+            &args.sandbox_id,
+            &args.openshell_endpoint,
+            isolation_inputs
+                .as_ref()
+                .map(|(_, _, _, _, credentials)| credentials),
+        ) {
             let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
-                endpoint.clone(),
+                openshell_core::grpc_client::GatewayEndpoint::new(
+                    endpoint.as_str(),
+                    credentials.clone(),
+                ),
                 sandbox_id.clone(),
             );
             let layer =
@@ -538,8 +544,13 @@ fn main() -> Result<()> {
         match args.role {
             SupervisorRole::IsolationBackend => {
                 info!(command = ?command, "Starting sandbox supervision");
-                let Some((backend_setup, backend_descriptor, auth_bundle, admitted_backend)) =
-                    isolation_inputs
+                let Some((
+                    backend_setup,
+                    backend_descriptor,
+                    auth_bundle,
+                    admitted_backend,
+                    gateway_credentials,
+                )) = isolation_inputs
                 else {
                     return Err(miette::miette!(
                         "isolation-backend role started without validated runtime inputs"
@@ -567,6 +578,7 @@ fn main() -> Result<()> {
                         additional_ca_bundle: args.additional_ca_bundle,
                         backend_descriptor,
                         auth_bundle,
+                        gateway_credentials: Some(gateway_credentials),
                         admitted_isolation_backend: Some(admitted_backend),
                         main_exit_marker: args.main_exit_marker,
                     },

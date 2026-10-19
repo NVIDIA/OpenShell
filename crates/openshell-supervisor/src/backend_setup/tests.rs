@@ -702,6 +702,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
                 additional_ca_bundle: None,
                 backend_descriptor: TestSetup::descriptor(),
                 auth_bundle: setup.auth.clone(),
+                gateway_credentials: None,
                 admitted_isolation_backend: Some(TEST_BACKEND.into()),
                 main_exit_marker: Some(marker.clone()),
             },

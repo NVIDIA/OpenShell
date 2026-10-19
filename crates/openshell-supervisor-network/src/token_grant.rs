@@ -27,32 +27,30 @@
 //! - `scopes` — `OAuth2` scopes to request (optional)
 //! - `cache_ttl` — Optional exact cache override; zero disables caching
 //!
-//! ## Environment
+//! ## Session scope
 //!
-//! Requires `OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET` to be set (path to
-//! the SPIFFE Workload API socket).
+//! Each supervised sandbox owns a [`SessionTokenGrants`]: its token cache,
+//! HTTP client, gateway credentials, sandbox ID, and SPIFFE Workload API
+//! socket. A token is never served to another sandbox. Without a configured
+//! Workload API socket, grants fail closed with a configuration failure.
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use openshell_core::grpc_client::GatewayEndpoint;
 use openshell_core::oauth::{
     self, ACCESS_TOKEN_TYPE, OAuthTokenResponse, TokenExchangeParams, TokenGrantClient,
     TokenGrantParams, effective_client_assertion_type, effective_token_type,
 };
 use openshell_core::proto::ProviderCredentialTokenGrantType;
-use openshell_core::sandbox_env;
 use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
 };
 use spiffe::{WorkloadApiClient, WorkloadApiError};
 
-/// Token cache shared across all provider token grants.
-static TOKEN_CACHE: LazyLock<TokenCache> = LazyLock::new(TokenCache::new);
-// Initialization failures stay bounded and typed; credential acquisition must not panic.
-static TOKEN_GRANT_HTTP_CLIENT: LazyLock<Result<TokenGrantClient, TokenGrantFailure>> =
-    LazyLock::new(TokenGrantClient::new);
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
@@ -102,33 +100,154 @@ impl TokenCache {
     }
 }
 
-/// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
+/// Provider token grants owned by one supervised sandbox.
 ///
-/// This function fetches the sandbox's SPIFFE JWT-SVID from the local SPIRE
-/// agent, then exchanges it for an access token with a POST request to the provider's
-/// token endpoint with the JWT client assertion grant flow (RFC 7523).
-///
-/// Tokens are cached per provider name with TTL. Subsequent calls return the
-/// cached token if it has not expired.
-///
-/// # Arguments
-///
-/// * `provider_name` — Unique provider identifier (used as cache key)
-/// * `token_endpoint` — `OAuth2` token service URL
-/// * `jwt_svid_audience` — Optional audience to request when fetching the JWT-SVID
-/// * `client_assertion_type` — Optional `OAuth2` client assertion type
-/// * `audience` — Resource audience to request in the token request
-/// * `scopes` — `OAuth2` scopes to request (may be empty)
-/// * `cache_ttl_override` — Exact cache TTL; absence uses `expires_in` and zero disables caching
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - SPIFFE Workload API socket is not configured
-/// - SPIRE agent is unreachable
-/// - JWT-SVID fetch fails
-/// - Token service request fails
-/// - Token response is invalid
+/// The cache, HTTP connection pool, gateway credentials, sandbox ID, and
+/// workload identity socket all belong to this session, so a token acquired
+/// for one sandbox is never served to another.
+pub struct SessionTokenGrants {
+    cache: TokenCache,
+    // Initialization failures stay bounded and typed; acquisition must not panic.
+    http_client: Result<TokenGrantClient, TokenGrantFailure>,
+    gateway: Option<GatewayEndpoint>,
+    sandbox_id: Option<String>,
+    workload_api_socket: Option<PathBuf>,
+}
+
+impl SessionTokenGrants {
+    /// Grants authenticated as `sandbox_id` through `gateway`. A missing
+    /// Workload API socket makes every grant fail closed.
+    #[must_use]
+    pub fn new(
+        gateway: Option<GatewayEndpoint>,
+        sandbox_id: Option<String>,
+        workload_api_socket: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            cache: TokenCache::new(),
+            http_client: TokenGrantClient::new(),
+            gateway,
+            sandbox_id: sandbox_id.filter(|value| !value.trim().is_empty()),
+            workload_api_socket: workload_api_socket.filter(|path| !path.as_os_str().is_empty()),
+        }
+    }
+
+    /// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
+    ///
+    /// This fetches the sandbox's SPIFFE JWT-SVID from the session's Workload
+    /// API socket, then exchanges it for an access token with a POST request to
+    /// the provider's token endpoint with the JWT client assertion grant flow
+    /// (RFC 7523).
+    ///
+    /// Tokens are cached per provider name with TTL in this session's cache.
+    /// Subsequent calls return the cached token if it has not expired.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - SPIFFE Workload API socket is not configured
+    /// - SPIRE agent is unreachable
+    /// - JWT-SVID fetch fails
+    /// - Token service request fails
+    /// - Token response is invalid
+    pub async fn obtain_provider_token(
+        &self,
+        request: ObtainProviderTokenRequest<'_>,
+    ) -> Result<String, TokenGrantFailure> {
+        let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
+            .map_err(|_| configuration_failure())?;
+        obtain_provider_token_with_grant(
+            ObtainProviderTokenInput {
+                cache: &self.cache,
+                provider_name: request.provider_name,
+                token_endpoint: request.token_endpoint,
+                jwt_svid_audience: request.jwt_svid_audience,
+                client_assertion_type: request.client_assertion_type,
+                audience: request.audience,
+                scopes: request.scopes,
+                cache_ttl_override: request.cache_ttl_override,
+                grant_type,
+                requested_token_type: request.requested_token_type,
+            },
+            |jwt_audience| async move {
+                // Resolve local exchange prerequisites before fetching any workload credential.
+                let exchange_context = match grant_type {
+                    ProviderCredentialTokenGrantType::ClientCredentials
+                    | ProviderCredentialTokenGrantType::Unspecified => None,
+                    ProviderCredentialTokenGrantType::TokenExchange => {
+                        let (provider, credential_key) =
+                            parse_provider_credential_key(request.provider_name)?;
+                        let gateway = self.gateway.as_ref().ok_or_else(configuration_failure)?;
+                        openshell_core::grpc_client::token_grant_gateway_endpoint(gateway.url())?;
+                        let sandbox_id = self
+                            .sandbox_id
+                            .as_deref()
+                            .ok_or_else(configuration_failure)?;
+                        Some((provider, credential_key, gateway, sandbox_id))
+                    }
+                };
+                let http_client = self.http_client.as_ref().map_err(|failure| *failure)?;
+                let socket_path = self
+                    .workload_api_socket
+                    .as_deref()
+                    .ok_or_else(configuration_failure)?;
+                // Fetch JWT-SVID with authorization server as audience
+                // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
+                let jwt_svid = fetch_jwt_svid_from_socket(socket_path, &jwt_audience).await?;
+
+                match exchange_context {
+                    None => {
+                        // Perform OAuth2 JWT client assertion grant. The audience
+                        // parameter in the token request specifies the resource server.
+                        perform_token_grant(
+                            http_client,
+                            request.token_endpoint,
+                            &jwt_svid,
+                            request.client_assertion_type,
+                            request.audience,
+                            request.scopes,
+                            request.request_id,
+                        )
+                        .await
+                    }
+                    Some((provider, credential_key, gateway, sandbox_id)) => {
+                        let intermediate =
+                            openshell_core::grpc_client::exchange_provider_subject_token(
+                                gateway,
+                                sandbox_id,
+                                provider,
+                                credential_key,
+                                &jwt_svid,
+                                Some(request.request_id),
+                            )
+                            .await?;
+                        validate_access_token(&intermediate.access_token).map_err(|failure| {
+                            failure.at_stage(TokenGrantStage::IntermediateExchange)
+                        })?;
+                        perform_token_exchange(
+                            http_client,
+                            request.token_endpoint,
+                            &TokenExchangeParams {
+                                client_assertion: &jwt_svid,
+                                client_assertion_type: request.client_assertion_type,
+                                subject_token: &intermediate.access_token,
+                                subject_token_type: ACCESS_TOKEN_TYPE,
+                                audience: request.audience,
+                                scopes: request.scopes,
+                                requested_token_type: request.requested_token_type,
+                            },
+                            request.request_id,
+                        )
+                        .await
+                    }
+                }
+            },
+        )
+        .await
+    }
+}
+
+/// One provider token request; see [`SessionTokenGrants::obtain_provider_token`].
 pub struct ObtainProviderTokenRequest<'a> {
     pub provider_name: &'a str,
     pub token_endpoint: &'a str,
@@ -142,96 +261,6 @@ pub struct ObtainProviderTokenRequest<'a> {
     /// Supervisor-minted ID of the HTTP exchange that needs the token. It is
     /// sent to the gateway and token service; a cache hit sends nothing.
     pub request_id: &'a str,
-}
-
-/// Obtain and cache a provider token, retaining only bounded grant failures.
-pub async fn obtain_provider_token(
-    request: ObtainProviderTokenRequest<'_>,
-) -> Result<String, TokenGrantFailure> {
-    let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
-        .map_err(|_| configuration_failure())?;
-    obtain_provider_token_with_grant(
-        ObtainProviderTokenInput {
-            cache: &TOKEN_CACHE,
-            provider_name: request.provider_name,
-            token_endpoint: request.token_endpoint,
-            jwt_svid_audience: request.jwt_svid_audience,
-            client_assertion_type: request.client_assertion_type,
-            audience: request.audience,
-            scopes: request.scopes,
-            cache_ttl_override: request.cache_ttl_override,
-            grant_type,
-            requested_token_type: request.requested_token_type,
-        },
-        |jwt_audience| async move {
-            // Resolve local exchange prerequisites before fetching any workload credential.
-            let exchange_context = match grant_type {
-                ProviderCredentialTokenGrantType::ClientCredentials
-                | ProviderCredentialTokenGrantType::Unspecified => None,
-                ProviderCredentialTokenGrantType::TokenExchange => {
-                    let (provider, credential_key) =
-                        parse_provider_credential_key(request.provider_name)?;
-                    let endpoint = supervisor_gateway_endpoint_from_env()?;
-                    openshell_core::grpc_client::token_grant_gateway_endpoint(&endpoint)?;
-                    Some((
-                        provider,
-                        credential_key,
-                        endpoint,
-                        supervisor_sandbox_id_from_env()?,
-                    ))
-                }
-            };
-            // Fetch JWT-SVID with authorization server as audience
-            // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
-            let jwt_svid = fetch_jwt_svid_for_token_grant(&jwt_audience).await?;
-
-            match exchange_context {
-                None => {
-                    // Perform OAuth2 JWT client assertion grant. The audience
-                    // parameter in the token request specifies the resource server.
-                    perform_token_grant(
-                        request.token_endpoint,
-                        &jwt_svid,
-                        request.client_assertion_type,
-                        request.audience,
-                        request.scopes,
-                        request.request_id,
-                    )
-                    .await
-                }
-                Some((provider, credential_key, endpoint, sandbox_id)) => {
-                    let intermediate =
-                        openshell_core::grpc_client::exchange_provider_subject_token(
-                            &endpoint,
-                            &sandbox_id,
-                            provider,
-                            credential_key,
-                            &jwt_svid,
-                            Some(request.request_id),
-                        )
-                        .await?;
-                    validate_access_token(&intermediate.access_token).map_err(|failure| {
-                        failure.at_stage(TokenGrantStage::IntermediateExchange)
-                    })?;
-                    perform_token_exchange(
-                        request.token_endpoint,
-                        &TokenExchangeParams {
-                            client_assertion: &jwt_svid,
-                            client_assertion_type: request.client_assertion_type,
-                            subject_token: &intermediate.access_token,
-                            subject_token_type: ACCESS_TOKEN_TYPE,
-                            audience: request.audience,
-                            scopes: request.scopes,
-                            requested_token_type: request.requested_token_type,
-                        },
-                        request.request_id,
-                    )
-                    .await
-                }
-            }
-        },
-    )
-    .await
 }
 
 struct ObtainProviderTokenInput<'a> {
@@ -297,21 +326,14 @@ where
     Ok(token_response.access_token)
 }
 
-/// Fetch JWT-SVID from SPIRE agent for token grant authentication.
+/// Fetch a JWT-SVID from the SPIRE agent for token grant authentication.
 ///
-/// This function connects to the local SPIRE agent via the Workload API and
-/// requests a JWT-SVID with the specified audience. The JWT-SVID is used as
-/// the client assertion in the `OAuth2` grant request.
-async fn fetch_jwt_svid_for_token_grant(audience: &str) -> Result<String, TokenGrantFailure> {
-    let socket_path = provider_spiffe_workload_api_socket_from_env()?;
-    fetch_jwt_svid_from_socket(&socket_path, audience).await
-}
-
+/// The JWT-SVID is used as the client assertion in the `OAuth2` grant request.
 async fn fetch_jwt_svid_from_socket(
-    socket_path: &str,
+    socket_path: &std::path::Path,
     audience: &str,
 ) -> Result<String, TokenGrantFailure> {
-    let endpoint = openshell_core::spiffe::workload_api_endpoint(std::path::Path::new(socket_path));
+    let endpoint = openshell_core::spiffe::workload_api_endpoint(socket_path);
 
     // Connect to SPIRE agent
     let client = WorkloadApiClient::connect_to(&endpoint)
@@ -357,14 +379,8 @@ fn configuration_failure() -> TokenGrantFailure {
     )
 }
 
-fn provider_spiffe_workload_api_socket_from_env() -> Result<String, TokenGrantFailure> {
-    std::env::var(sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(configuration_failure)
-}
-
 async fn perform_token_grant(
+    http_client: &TokenGrantClient,
     token_endpoint: &str,
     jwt_svid: &str,
     client_assertion_type: &str,
@@ -373,9 +389,7 @@ async fn perform_token_grant(
     request_id: &str,
 ) -> Result<OAuthTokenResponse, TokenGrantFailure> {
     oauth::post_oauth_token_grant(
-        TOKEN_GRANT_HTTP_CLIENT
-            .as_ref()
-            .map_err(|failure| *failure)?,
+        http_client,
         token_endpoint,
         &TokenGrantParams {
             client_assertion: jwt_svid,
@@ -389,19 +403,12 @@ async fn perform_token_grant(
 }
 
 async fn perform_token_exchange(
+    http_client: &TokenGrantClient,
     token_endpoint: &str,
     params: &TokenExchangeParams<'_>,
     request_id: &str,
 ) -> Result<OAuthTokenResponse, TokenGrantFailure> {
-    oauth::post_oauth_token_exchange(
-        TOKEN_GRANT_HTTP_CLIENT
-            .as_ref()
-            .map_err(|failure| *failure)?,
-        token_endpoint,
-        params,
-        Some(request_id),
-    )
-    .await
+    oauth::post_oauth_token_exchange(http_client, token_endpoint, params, Some(request_id)).await
 }
 
 pub use oauth::validate_access_token;
@@ -455,20 +462,6 @@ fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) ->
     } else {
         jwt_svid_audience.to_string()
     }
-}
-
-fn supervisor_gateway_endpoint_from_env() -> Result<String, TokenGrantFailure> {
-    std::env::var(sandbox_env::ENDPOINT)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(configuration_failure)
-}
-
-fn supervisor_sandbox_id_from_env() -> Result<String, TokenGrantFailure> {
-    std::env::var(sandbox_env::SANDBOX_ID)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(configuration_failure)
 }
 
 fn parse_provider_credential_key(key: &str) -> Result<(&str, &str), TokenGrantFailure> {
@@ -669,6 +662,10 @@ mod tests {
     use tokio::net::TcpListener;
 
     const TEST_REQUEST_ID: &str = "4f1c2b3a-9d8e-4c7b-a6f5-e4d3c2b1a098";
+
+    fn test_http_client() -> TokenGrantClient {
+        TokenGrantClient::new().expect("token grant HTTP client")
+    }
 
     #[derive(Debug)]
     struct CapturedTokenRequest {
@@ -1415,6 +1412,7 @@ mod tests {
         let scopes = vec!["read".to_string(), "write".to_string()];
 
         let response = perform_token_grant(
+            &test_http_client(),
             &endpoint,
             "jwt-svid-token",
             "",
@@ -1475,6 +1473,7 @@ mod tests {
             token_endpoint_once("200 OK", r#"{"access_token":"access-123"}"#).await;
 
         let response = perform_token_grant(
+            &test_http_client(),
             &endpoint,
             "jwt-svid-token",
             "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
@@ -1504,9 +1503,17 @@ mod tests {
         )
         .await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[], TEST_REQUEST_ID)
-            .await
-            .expect_err("malformed access token should fail closed");
+        let err = perform_token_grant(
+            &test_http_client(),
+            &endpoint,
+            "jwt-svid-token",
+            "",
+            "",
+            &[],
+            TEST_REQUEST_ID,
+        )
+        .await
+        .expect_err("malformed access token should fail closed");
         let _request = request.await.expect("token endpoint task should finish");
 
         assert_eq!(err.upstream_status(), Some(200));
@@ -1516,9 +1523,17 @@ mod tests {
     async fn perform_token_grant_does_not_follow_redirects() {
         let (endpoint, request) = token_endpoint_redirect_once("http://127.0.0.1:1/stolen").await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[], TEST_REQUEST_ID)
-            .await
-            .expect_err("redirect response should fail closed");
+        let err = perform_token_grant(
+            &test_http_client(),
+            &endpoint,
+            "jwt-svid-token",
+            "",
+            "",
+            &[],
+            TEST_REQUEST_ID,
+        )
+        .await
+        .expect_err("redirect response should fail closed");
         let _request = request.await.expect("token endpoint task should finish");
 
         assert_eq!(err.upstream_status(), Some(302));
@@ -1529,10 +1544,17 @@ mod tests {
         let (endpoint, request) =
             token_endpoint_once("200 OK", r#"{"access_token":"access-123"}"#).await;
 
-        let response =
-            perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[], TEST_REQUEST_ID)
-                .await
-                .expect("token grant should succeed without audience or scopes");
+        let response = perform_token_grant(
+            &test_http_client(),
+            &endpoint,
+            "jwt-svid-token",
+            "",
+            "",
+            &[],
+            TEST_REQUEST_ID,
+        )
+        .await
+        .expect("token grant should succeed without audience or scopes");
         let request = request.await.expect("token endpoint task should finish");
 
         assert_eq!(response.access_token, "access-123");
@@ -1553,6 +1575,7 @@ mod tests {
         .await;
 
         let err = perform_token_grant(
+            &test_http_client(),
             &endpoint,
             "jwt-svid-token",
             "",
@@ -1580,9 +1603,17 @@ mod tests {
         )
         .await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[], TEST_REQUEST_ID)
-            .await
-            .expect_err("token grant should fail on server error");
+        let err = perform_token_grant(
+            &test_http_client(),
+            &endpoint,
+            "jwt-svid-token",
+            "",
+            "",
+            &[],
+            TEST_REQUEST_ID,
+        )
+        .await
+        .expect_err("token grant should fail on server error");
         let _request = request.await.expect("token endpoint task should finish");
         let message = err.to_string();
 
@@ -1597,9 +1628,17 @@ mod tests {
     async fn perform_token_grant_reports_malformed_success_json() {
         let (endpoint, request) = token_endpoint_once("200 OK", r#"{"access_token":42"#).await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[], TEST_REQUEST_ID)
-            .await
-            .expect_err("malformed token response should fail");
+        let err = perform_token_grant(
+            &test_http_client(),
+            &endpoint,
+            "jwt-svid-token",
+            "",
+            "",
+            &[],
+            TEST_REQUEST_ID,
+        )
+        .await
+        .expect_err("malformed token response should fail");
         let _request = request.await.expect("token endpoint task should finish");
 
         assert_eq!(err.upstream_status(), Some(200));
