@@ -40,7 +40,6 @@ jobs:
     uses: ./.github/workflows/release-notes.yml
     with:
       release-tag: ${{ inputs.tag || github.ref_name }}
-      source-sha: ${{ needs.build.outputs.source_sha }}
       advisory: true
     secrets:
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}

@@ -336,7 +336,6 @@ jobs:
     uses: ./.github/workflows/release-notes.yml
     with:
       release-tag: ${{ inputs.release-tag }}
-      source-sha: ${{ inputs.source-sha }}
     secrets:
       LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
 

@@ -187,7 +187,7 @@ only `release-notes.yml` exposes an optional `previous-stable-tag` override.
 This runs the same
 `release-notes.yml` generator as stable publication and retains the `release-notes`
 artifact. Promotion, tag creation, builds, qualification, and publication are
-skipped. Check the Inference Hub configuration step before diagnosing model or
+skipped. Check the `Prepare release notes` step before diagnosing model or
 GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, and
 `ANTHROPIC_MODEL` in the repository Actions settings.
 
