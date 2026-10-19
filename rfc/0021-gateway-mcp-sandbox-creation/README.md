@@ -191,8 +191,8 @@ flowchart LR
   classDef user fill:#f1e6ff,stroke:#8a4fd1,stroke-width:2px,color:#18202e
 ```
 
-The endpoint lives in the gateway rather than in each supervisor for three
-reasons. Host agents have no supervisor, so a supervisor-hosted server would
+The endpoint lives in the gateway rather than in each sandbox's own supervisor
+(one per sandbox, running outside the agent's container) for three reasons. Host agents have no supervisor, so a supervisor-hosted server would
 need a second path for them. Keeping the decision in one component means there
 is one implementation of the security checks and no second copy to drift. And
 MCP revisions change quickly; a gateway-hosted server is upgraded once, while a
@@ -340,7 +340,9 @@ message CreateSandboxRequest {
 
 **One grant per tree.** Children and grandchildren draw from the same grant.
 When a child creates its own child, the gateway charges the shared counters and
-checks an agent child's depth against the same `max_depth`. Tool sandboxes
+checks an agent child's depth against the same `max_depth`. A tool sandbox runs
+no agent and cannot create children, so it never makes the tree deeper; depth
+limits delegation, not the commands an agent runs. Tool sandboxes therefore
 ignore the depth limit, so an agent at the bottom of the tree can still run
 commands in tool sandboxes of its own; they count toward breadth and total like
 any child. A child never uses more than the grant has left, so the user
@@ -451,6 +453,25 @@ not change that model. It is used only for decisions about trees (cascade stop,
 "a sandbox acts only on its own descendants") and for audit attribution.
 
 ### Ceiling and policy proof
+
+At a glance, the cases this section and the following ones cover:
+
+| # | Situation | What the child gets | Result |
+|---|-----------|---------------------|--------|
+| 1 | The agent writes a narrower policy, such as `/sandbox` read-only or GitHub read-only | its own policy | Created; proved within the parent |
+| 2 | The agent omits the filesystem, process or Landlock section | the parent's section | Created |
+| 3 | The agent omits network rules | no network access | Created |
+| 4 | The agent asks for more than the parent has, such as `POST /repos/**` | nothing | `EXCEEDS_CEILING`, with a counterexample and a hint |
+| 5 | The parent needs to pass on more than it has | the parent proposes the rule for itself through `policy.local`; after the user approves, the agent retries | Created on retry |
+| 6 | The agent lists a path the parent does not list | nothing | `UNSUPPORTED_RULES`; the prover is conservative with paths |
+| 7 | The agent sets a network middleware | nothing | Refused; middlewares are not proved |
+| 8 | The parent has MCP rules and `child_policy: narrow` | MCP endpoints are dropped from the ceiling before the proof | Created for everything else; MCP rules cannot be passed on |
+| 9 | `child_policy: inherit` and no policy in the request | the parent's policy unchanged, MCP rules included | Created; no proof needed |
+| 10 | `child_policy: inherit` and a policy in the request | nothing | Refused |
+| 11 | A later write to a child's policy (`UpdateConfig`, policy sync, approved proposal) | proved again against the parent | Refused if it would widen the child past the parent |
+| 12 | The parent's policy shrinks after the child starts | the child keeps its policy | Out of scope; see [#3808](https://github.com/NVIDIA/OpenShell/issues/3808) |
+| 13 | The global policy is in `maximum` mode | proved against the parent and the global policy | `EXCEEDS_GLOBAL_POLICY` if over |
+| 14 | The global policy is in `replace` mode and the request has a policy | nothing | `GLOBAL_POLICY_ACTIVE` |
 
 **A child's ceiling is its parent's policy.** When a sandbox creates a child,
 the gateway proves the child's policy against the parent's current policy,
