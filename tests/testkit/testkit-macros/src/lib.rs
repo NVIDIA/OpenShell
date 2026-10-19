@@ -3,27 +3,24 @@
 
 //! The `#[testkit::test]` attribute.
 //!
-//! A test is an `async fn` taking `&mut testkit::Context` and
-//! returning `testkit::Result`. Its doc comment is the test's description and
-//! is required. `id` is the required stable test ID: random, never changed,
-//! and kept when the test is renamed or moved. A missing ID's compile error
-//! suggests a fresh one. Requirements are named after target capabilities:
+//! A test is an `async fn` taking `&mut testkit::Context` and returning
+//! `testkit::Result`. Its doc comment is the test's description and is
+//! required:
 //!
 //! ```ignore
 //! /// An exposed loopback HTTP service is reachable and goes away after delete.
-//! #[testkit::test(id = "t-4f8k2m0q", requires = [service_exposure])]
+//! #[testkit::test]
 //! async fn expose_service(cx: &mut Context) -> testkit::Result { /* ... */ }
 //! ```
 //!
 //! The attribute expands to a `#[tokio::test]` wrapper with the same name, so
-//! the nextest test name is the function name. The original function is nested in
-//! the wrapper and passed to `testkit::run`. Parsing lives in `testkit-spec`,
-//! so tools that list tests share the macro's rules.
+//! the nextest test name is the function name. The original function is nested
+//! in the wrapper and passed to `testkit::run`.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
-use syn::{Ident, ItemFn, LitStr};
+use syn::{Attribute, Expr, ExprLit, ItemFn, Lit, LitStr, Meta};
 
 #[proc_macro_attribute]
 pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
@@ -34,16 +31,35 @@ pub fn test(attr: TokenStream, item: TokenStream) -> TokenStream {
 
 fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     let mut body: ItemFn = syn::parse2(item)?;
-    let spec = testkit_spec::parse(attr, &body)?;
+    if !attr.is_empty() {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[testkit::test]` takes no arguments",
+        ));
+    }
+    if body.sig.asyncness.is_none() {
+        return Err(syn::Error::new_spanned(
+            body.sig.fn_token,
+            "testkit tests must be `async fn`",
+        ));
+    }
+    if body.sig.inputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &body.sig.inputs,
+            "testkit tests take exactly one argument: `cx: &mut testkit::Context`",
+        ));
+    }
+    let description = doc_comment(&body.attrs);
+    if description.is_empty() {
+        return Err(syn::Error::new(
+            body.sig.ident.span(),
+            "testkit tests need a doc comment describing the behavior they verify",
+        ));
+    }
 
-    let name = spec.name;
+    let name = body.sig.ident.clone();
     let name_str = LitStr::new(&name.to_string(), name.span());
-    let id = LitStr::new(&spec.id, name.span());
-    let description = LitStr::new(&spec.description, name.span());
-    let requires = spec.requires.iter().map(|capability| {
-        let variant = Ident::new(&to_camel_case(&capability.to_string()), capability.span());
-        quote!(::testkit::Capability::#variant)
-    });
+    let description = LitStr::new(&description, name.span());
 
     let vis = body.vis.clone();
     let doc_attrs: Vec<_> = body
@@ -63,10 +79,8 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
             #body
             ::testkit::run(
                 ::testkit::TestInfo {
-                    id: #id,
                     name: #name_str,
                     description: #description,
-                    requires: &[#(#requires),*],
                 },
                 body,
             )
@@ -75,16 +89,23 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     })
 }
 
-fn to_camel_case(snake: &str) -> String {
-    snake
-        .split('_')
-        .map(|word| {
-            let mut chars = word.chars();
-            chars.next().map_or_else(String::new, |first| {
-                first.to_uppercase().chain(chars).collect()
-            })
+/// The doc comment, joined into one line. Empty if there is none.
+fn doc_comment(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .filter_map(|attr| match &attr.meta {
+            Meta::NameValue(meta) if meta.path.is_ident("doc") => match &meta.value {
+                Expr::Lit(ExprLit {
+                    lit: Lit::Str(line),
+                    ..
+                }) => Some(line.value().trim().to_string()),
+                _ => None,
+            },
+            _ => None,
         })
-        .collect()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -98,39 +119,53 @@ mod tests {
     #[test]
     fn expands_to_wrapper_with_same_name() {
         let out = expand_str(
-            "id = \"t-0123abcd\"",
-            "/// Does a thing.\nasync fn does_a_thing(cx: &mut Context) -> testkit::Result { Ok(()) }",
+            "",
+            "/// First line\n/// second line.\nasync fn does_a_thing(cx: &mut Context) -> testkit::Result { Ok(()) }",
         )
         .unwrap();
         assert!(out.contains("async fn does_a_thing ()"), "{out}");
         assert!(out.contains("async fn body (cx : & mut Context)"), "{out}");
-        assert!(out.contains("id : \"t-0123abcd\""), "{out}");
         assert!(out.contains("name : \"does_a_thing\""), "{out}");
-        assert!(out.contains("description : \"Does a thing.\""), "{out}");
-    }
-
-    #[test]
-    fn maps_requirements_to_capabilities() {
-        let out = expand_str(
-            "id = \"t-0123abcd\", requires = [service_exposure, gpu]",
-            "/// Doc.\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap();
         assert!(
-            out.contains(
-                "requires : & [:: testkit :: Capability :: ServiceExposure , :: testkit :: Capability :: Gpu]"
-            ),
+            out.contains("description : \"First line second line.\""),
             "{out}"
         );
     }
 
     #[test]
-    fn reports_spec_errors() {
+    fn rejects_missing_doc_comment() {
         let err = expand_str(
             "",
             "async fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
         )
         .unwrap_err();
         assert!(err.to_string().contains("doc comment"), "{err}");
+    }
+
+    #[test]
+    fn rejects_sync_fn() {
+        let err = expand_str(
+            "",
+            "/// Doc.\nfn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("async fn"), "{err}");
+    }
+
+    #[test]
+    fn rejects_wrong_arity() {
+        let err =
+            expand_str("", "/// Doc.\nasync fn t() -> testkit::Result { Ok(()) }").unwrap_err();
+        assert!(err.to_string().contains("exactly one argument"), "{err}");
+    }
+
+    #[test]
+    fn rejects_arguments() {
+        let err = expand_str(
+            "id = \"t-0123abcd\"",
+            "/// Doc.\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("takes no arguments"), "{err}");
     }
 }

@@ -16,7 +16,6 @@ name = "testkit_macros"
 proc-macro = true
 
 [dependencies]
-openshell-testkit-spec = { path = "../testkit-spec" }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }

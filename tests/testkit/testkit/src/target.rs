@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The target: how tests reach the system under test, and what it provides.
+//! The target: how tests reach the system under test.
 //!
 //! An environment writes a target file; tests find it through
 //! [`TARGET_ENV`]. Relative paths in the file resolve against its directory.
@@ -17,9 +17,6 @@
 //!   binary: /usr/bin/openshell   # default: `openshell` on PATH
 //!   gateway: tmachine            # the name the gateway is registered under
 //! workspace: default
-//! capabilities:
-//!   compute_driver: docker
-//!   service_exposure: true
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -48,8 +45,6 @@ pub struct Target {
     pub cli: Option<CliTarget>,
     #[serde(default = "default_workspace")]
     pub workspace: String,
-    #[serde(default)]
-    pub capabilities: Capabilities,
     #[serde(skip)]
     base_dir: PathBuf,
 }
@@ -94,55 +89,6 @@ fn default_cli_binary() -> PathBuf {
 #[serde(deny_unknown_fields)]
 pub struct Auth {
     pub bearer_token_file: PathBuf,
-}
-
-/// Facts about the environment, declared by the environment definition.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Capabilities {
-    pub arch: Option<String>,
-    pub compute_driver: Option<String>,
-    #[serde(default)]
-    pub rootless: bool,
-    #[serde(default)]
-    pub gpu: bool,
-    #[serde(default)]
-    pub service_exposure: bool,
-    /// Files in the sandbox workspace survive stop and start. The docs leave
-    /// this to the compute driver.
-    #[serde(default)]
-    pub persistent_workspace: bool,
-}
-
-/// A capability a test can require with `#[testkit::test(requires = [...])]`.
-///
-/// Variants are the snake-case requirement names in CamelCase, so an unknown
-/// requirement fails to compile.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Capability {
-    Gpu,
-    PersistentWorkspace,
-    ServiceExposure,
-}
-
-impl Capability {
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Gpu => "gpu",
-            Self::PersistentWorkspace => "persistent_workspace",
-            Self::ServiceExposure => "service_exposure",
-        }
-    }
-}
-
-impl Capabilities {
-    pub const fn provides(&self, capability: Capability) -> bool {
-        match capability {
-            Capability::Gpu => self.gpu,
-            Capability::PersistentWorkspace => self.persistent_workspace,
-            Capability::ServiceExposure => self.service_exposure,
-        }
-    }
 }
 
 fn default_workspace() -> String {
@@ -348,7 +294,7 @@ mod tests {
     #[test]
     fn parses_mtls_target_and_resolves_relative_paths() {
         let target = parse(
-            "gateway:\n  endpoint: https://127.0.0.1:17670\n  tls:\n    ca: ca.crt\n    client_cert: client.crt\n    client_key: /abs/client.key\ncapabilities:\n  compute_driver: docker\n  service_exposure: true\n",
+            "gateway:\n  endpoint: https://127.0.0.1:17670\n  tls:\n    ca: ca.crt\n    client_cert: client.crt\n    client_key: /abs/client.key\n",
         )
         .unwrap();
         let tls = target.gateway.tls.as_ref().unwrap();
@@ -361,15 +307,12 @@ mod tests {
             target.resolve(tls.client_key.as_deref().unwrap()),
             PathBuf::from("/abs/client.key")
         );
-        assert!(target.capabilities.provides(Capability::ServiceExposure));
-        assert!(!target.capabilities.provides(Capability::Gpu));
     }
 
     #[test]
     fn parses_plaintext_target() {
         let target = parse("gateway:\n  endpoint: http://127.0.0.1:17670\n").unwrap();
         assert!(target.gateway.tls.is_none());
-        assert!(!target.capabilities.provides(Capability::ServiceExposure));
     }
 
     #[test]
