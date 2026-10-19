@@ -400,6 +400,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                         authority: control_authority.clone(),
                         addresses: vec![supervisor_address],
                         tls: self.sandbox_tls,
+                        route: None,
                     },
                     SandboxTransport::RuntimeInitiatedTcp {
                         authority: control_authority,

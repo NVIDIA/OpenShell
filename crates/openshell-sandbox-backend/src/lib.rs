@@ -18,7 +18,9 @@ pub mod mediation;
 pub mod protobuf;
 mod runtime;
 mod runtime_initiated;
+pub mod runtime_routed;
 pub mod sandbox_auth;
+pub mod session_control;
 pub mod stream_adapter;
 
 pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;
@@ -27,7 +29,7 @@ pub use runtime::{
     ConfirmedBoundary, ExecSession, NetworkMediationSource, OpenShellRuntimeBackend,
     ProcessAttachment, ReadyBoundary, RunningBoundary,
 };
-pub use runtime::{BoundaryTransport, BoundaryTransportConnector};
+pub use runtime::{BoundaryTransport, BoundaryTransportConnector, validate_runtime_coordinates};
 
 /// Stable isolation backend name implemented by `openshell-sandbox`.
 pub const BACKEND_NAME: &str = openshell_core::isolation_registration::BUILTIN_BACKEND_NAME;
