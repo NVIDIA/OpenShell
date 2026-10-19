@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: supervisor gateway wiring
+templates:
+  - templates/certgen.yaml
+  - templates/peer-role.yaml
+  - templates/statefulset.yaml
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: gateway
+tests:
+  - it: issues the session-control PKI with the hook
+    template: templates/certgen.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[1].args
+          value:
+            - generate-certs
+            - --tls-only
+            - --server-secret-name=openshell-supervisor-control
+            - --client-secret-name=openshell-supervisor-control-client
+            - --server-san=openshell-supervisor.gateway.svc
+        documentIndex: 3
+  - it: issues only the session-control PKI when the gateway PKI is external
+    template: templates/certgen.yaml
+    set:
+      pkiInitJob:
+        enabled: false
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.containers
+          count: 1
+        documentIndex: 3
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: supervisor-certgen
+        documentIndex: 3
+  - it: lets the gateway read only the shared supervisor Service
+    template: templates/peer-role.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - services
+            resourceNames:
+              - openshell-supervisor
+            verbs:
+              - get
+        documentIndex: 0
+  - it: mounts the session-control client credential only on the gateway
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: supervisor-control
+            secret:
+              secretName: openshell-supervisor-control-client
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: supervisor-control
+            mountPath: /etc/openshell-tls/supervisor-control
+            readOnly: true

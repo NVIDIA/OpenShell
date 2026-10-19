@@ -4,34 +4,42 @@
 {{- range .Values.imagePullSecrets -}}
 {{- $imagePullSecrets = append $imagePullSecrets .name -}}
 {{- end -}}
-{{- if eq (get $kubernetes "supervisor_topology" | default "") "gateway" }}
+{{- if include "openshell.supervisorEnabled" . }}
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+{{- $shared := get $kubernetes "shared_supervisor" }}
+{{- $name := include "openshell.supervisorName" . }}
+{{- $endpoint := get $kubernetes "grpc_endpoint" }}
+{{- $endpointUrl := urlParse $endpoint }}
+{{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
+# One supervisor process hosting a session per sandbox generation. Sessions
+# are registered only by the gateway, over a mutually authenticated API whose
+# client credential only the gateway mounts. The Pod holds no Kubernetes or
+# gateway identity of its own: each session acts only with the credentials
+# the gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "openshell.fullname" . }}-supervisor
+  name: {{ $name }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
+  # Sessions live in this process; a second replica could not serve them.
   replicas: 1
   strategy:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: openshell-supervisor
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: supervisor
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: openshell-supervisor
-        app.kubernetes.io/instance: {{ .Release.Name }}
-        app.kubernetes.io/component: supervisor
+        {{- include "openshell.supervisorSelectorLabels" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
+      enableServiceLinks: false
       terminationGracePeriodSeconds: 30
       {{- with ($imagePullSecrets | uniq) }}
       imagePullSecrets:
@@ -48,14 +56,36 @@ spec:
           image: {{ get $kubernetes "supervisor_image" | quote }}
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
-            - --mode=shared
-            - --gateway-endpoint
-            - {{ include "openshell.grpcEndpoint" . | quote }}
-            - --address
-            - 0.0.0.0:5501
+            - experimental-host
+            - --health-socket
+            - /run/openshell/health.sock
+            - --session-control-listen
+            - 0.0.0.0:{{ get $shared "control_port" }}
+            - --session-control-tls-dir
+            - /etc/openshell/session-control
+            - --runtime-listen
+            - 0.0.0.0:{{ get $shared "runtime_port" }}
+            - --session-root
+            - /run/openshell/sessions
+          env:
+            - name: OPENSHELL_ENDPOINT
+              value: {{ $endpoint | quote }}
+            - name: OPENSHELL_LOG_LEVEL
+              value: info
+            {{- if $gatewayTls }}
+            - name: OPENSHELL_TLS_CA
+              value: /var/run/secrets/openshell-tls/ca.crt
+            {{- end }}
+            {{- if eq (get $endpointUrl "scheme") "https" }}
+            - name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
+              value: {{ get $endpointUrl "hostname" | quote }}
+            {{- end }}
           ports:
-            - name: supervisor
-              containerPort: 5501
+            - name: runtime
+              containerPort: {{ get $shared "runtime_port" }}
+              protocol: TCP
+            - name: session-control
+              containerPort: {{ get $shared "control_port" }}
               protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
@@ -64,14 +94,109 @@ spec:
               drop: [ALL]
           resources:
             requests:
-              cpu: 10m
-              memory: 32Mi
+              cpu: 50m
+              memory: 64Mi
             limits:
-              memory: 128Mi
+              memory: 1Gi
+          # Process health only; each session reports its own readiness to
+          # the gateway through the session-control API.
           readinessProbe:
-            tcpSocket:
-              port: supervisor
+            exec:
+              command: [/openshell-supervisor, health, --socket, /run/openshell/health.sock]
           livenessProbe:
-            tcpSocket:
-              port: supervisor
+            exec:
+              command: [/openshell-supervisor, health, --socket, /run/openshell/health.sock]
+          volumeMounts:
+            - name: run
+              mountPath: /run/openshell
+            - name: logs
+              mountPath: /var/log
+            - name: session-control
+              mountPath: /etc/openshell/session-control
+              readOnly: true
+            {{- if $gatewayTls }}
+            - name: gateway-ca
+              mountPath: /var/run/secrets/openshell-tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: logs
+          emptyDir: {}
+        - name: session-control
+          secret:
+            secretName: {{ $name }}-control
+        {{- if $gatewayTls }}
+        - name: gateway-ca
+          secret:
+            secretName: {{ .Values.server.tls.clientTlsSecretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  selector:
+    {{- include "openshell.supervisorSelectorLabels" . | nindent 4 }}
+  ports:
+    - name: runtime
+      port: {{ get $shared "runtime_port" }}
+      targetPort: runtime
+      protocol: TCP
+    - name: session-control
+      port: {{ get $shared "control_port" }}
+      targetPort: session-control
+      protocol: TCP
+{{- if .Values.networkPolicy.enabled }}
+---
+# Only the gateway reaches session control, and only sandbox workloads in this
+# gateway's sandbox namespaces reach the routed runtime listener. Each
+# sandbox's own egress allowance limits its workload to that port, and the
+# routing preface plus the generation's pinned TLS identity decide which
+# session it reaches.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "openshell.selectorLabels" . | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ get $shared "control_port" }}
+    - from:
+        - namespaceSelector:
+            {{- include "openshell.supervisorSandboxNamespaces" (dict "kubernetes" $kubernetes) | nindent 12 }}
+          podSelector:
+            matchLabels:
+              openshell.ai/boundary-role: workload
+      ports:
+        - protocol: TCP
+          port: {{ get $shared "runtime_port" }}
+  # Sessions carry policy-approved sandbox egress, as dedicated supervisors do.
+  egress:
+    - {}
+{{- end }}
 {{- end }}
