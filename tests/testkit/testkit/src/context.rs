@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use openshell_sdk::raw::{AuthedGrpcClient, proto};
 use openshell_sdk::{
@@ -153,27 +153,29 @@ impl Context {
 
     /// Delete every sandbox the test created and has not deleted. Returns the
     /// cleanup failures; they are reported separately from the test result.
+    ///
+    /// Sandboxes are deleted concurrently, each with the full
+    /// [`CLEANUP_TIMEOUT`], so a slow delete cannot use up the time for the
+    /// others and cleanup takes about one timeout however many there are.
     pub(crate) async fn cleanup(&self) -> Vec<String> {
-        let started = Instant::now();
         let names: Vec<String> = lock(&self.sandboxes).iter().cloned().collect();
+        let results = futures::future::join_all(names.iter().map(|name| async move {
+            self.client
+                .delete_sandbox(
+                    name,
+                    DeleteOptions {
+                        allow_missing: true,
+                    },
+                )
+                .await?;
+            self.client.wait_deleted(name, CLEANUP_TIMEOUT, None).await
+        }))
+        .await;
         let mut failures = Vec::new();
-        for name in names {
-            let remaining = CLEANUP_TIMEOUT.saturating_sub(started.elapsed());
-            let result = async {
-                self.client
-                    .delete_sandbox(
-                        &name,
-                        DeleteOptions {
-                            allow_missing: true,
-                        },
-                    )
-                    .await?;
-                self.client.wait_deleted(&name, remaining, None).await
-            }
-            .await;
+        for (name, result) in names.iter().zip(results) {
             match result {
                 Ok(()) => {
-                    lock(&self.sandboxes).remove(&name);
+                    lock(&self.sandboxes).remove(name);
                 }
                 Err(error) => failures.push(format!("delete sandbox {name}: {error}")),
             }
