@@ -40,7 +40,8 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
   `#[testkit::test(id = "...", requires = [service_exposure])]`. The names are
   the boolean fields of `capabilities` in the target file. An unknown name
   fails to compile. If the target lacks a required capability, the test
-  fails rather than passing untested, so exclude it when you select tests.
+  fails rather than passing untested. See
+  [Excluding tests by capability](#excluding-tests-by-capability).
 - **The function name is the nextest test name.** Rename it freely; the ID
   keeps the history.
 
@@ -105,6 +106,21 @@ cargo nextest run --manifest-path <suite>/Cargo.toml --test-threads 1
 
 `testkit-ready [TIMEOUT_SECS]` exits non-zero if the gateway is not healthy in
 time or the target's CLI does not report it connected.
+
+### Excluding tests by capability
+
+Nothing selects tests by capability yet, so a test whose `requires` the target
+does not provide fails with `requires <capability>, which the target does not
+provide`. Find those tests and exclude them by name with a nextest filter:
+
+```shell
+grep -rn 'requires = \[' <suite>/tests
+cargo nextest run --manifest-path <suite>/Cargo.toml --test-threads 1 \
+  -E 'not test(=stopped_sandbox_keeps_workspace)'
+```
+
+Combine names with `or` inside the parentheses, for example
+`-E 'not (test(=a) or test(=b))'`.
 
 ## Checks
 
