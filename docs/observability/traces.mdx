@@ -69,7 +69,7 @@ Give each installation that reports to the same collector its own name, includin
 
 The gateway continues a valid W3C `traceparent` sent by the caller, so a client's trace can include the gateway's spans for its requests. Without one, the gateway starts a new trace.
 
-The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on every gateway request. A CI system that exports these variables (GitHub Actions, GitLab CI, Jenkins OpenTelemetry plugins) therefore parents the gateway's spans for the commands it runs, with no collector or provider configuration on the CI runner.
+The CLI forwards `TRACEPARENT` and `TRACESTATE` from its environment on gateway requests from its standard commands. A CI system that exports these variables (GitHub Actions, GitLab CI, Jenkins OpenTelemetry plugins) therefore parents the gateway's spans for the commands it runs, with no collector or provider configuration on the CI runner.
 
 The gateway also passes its trace context to compute drivers, so driver spans appear in the same trace as the gateway request that caused them. Built-in drivers export their spans through the gateway's process. Managed external drivers receive the trace endpoint, gateway name, and compute driver from the gateway. Drivers that you run yourself own their telemetry configuration.
 

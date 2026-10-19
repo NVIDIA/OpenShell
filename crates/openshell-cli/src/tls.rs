@@ -19,7 +19,8 @@ pub type GrpcClient = openshell_sdk::raw::GrpcClient<
     tonic::service::interceptor::InterceptedService<Channel, GatewayInterceptor>,
 >;
 
-/// Interceptor stack applied to every gateway gRPC request.
+/// Interceptor stack applied to gateway requests from clients built by
+/// [`grpc_client`].
 ///
 /// Runs authentication header injection first, then passive W3C trace-context
 /// forwarding so a CI pipeline's `TRACEPARENT` extends into the gateway's
@@ -401,13 +402,61 @@ pub fn retry_unrouted(replica: Option<&AsciiMetadataValue>, status: &tonic::Stat
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, owner_replica, retry_unrouted, routed_to, sdk_client_config, with_owner_hint,
+        GatewayInterceptor, TlsOptions, owner_replica, retry_unrouted, routed_to,
+        sdk_client_config, with_owner_hint,
     };
+    use crate::TEST_ENV_LOCK;
     use openshell_core::replica_routing::{
         OWNER_REPLICA_HEADER, OWNER_REQUEST_HEADER, ROUTE_REPLICA_HEADER,
     };
-    use openshell_sdk::AuthConfig;
+    use openshell_otel::EnvTraceContextInterceptor;
+    use openshell_sdk::{AuthConfig, EdgeAuthInterceptor};
     use std::io::Write;
+    use tonic::service::Interceptor as _;
+
+    #[test]
+    fn gateway_interceptor_composes_auth_and_trace_forwarding() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        temp_env::with_vars(
+            [
+                ("TRACEPARENT", Some(traceparent)),
+                ("TRACESTATE", Some("vendor=value")),
+            ],
+            || {
+                let mut interceptor = GatewayInterceptor {
+                    auth: EdgeAuthInterceptor::new(Some("test-token"), None).unwrap(),
+                    trace: EnvTraceContextInterceptor::from_env(),
+                };
+
+                let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+                assert_eq!(
+                    request
+                        .metadata()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer test-token")
+                );
+                assert_eq!(
+                    request
+                        .metadata()
+                        .get("traceparent")
+                        .and_then(|value| value.to_str().ok()),
+                    Some(traceparent)
+                );
+                assert_eq!(
+                    request
+                        .metadata()
+                        .get("tracestate")
+                        .and_then(|value| value.to_str().ok()),
+                    Some("vendor=value")
+                );
+            },
+        );
+    }
 
     #[test]
     fn owner_hint_is_requested_explicitly() {

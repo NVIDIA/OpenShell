@@ -113,12 +113,16 @@ pub fn current_trace_context_environment() -> Vec<(&'static str, String)> {
 
 /// Parent `span` under the trace context in `TRACEPARENT` and `TRACESTATE`.
 ///
+/// Reads the environment the same way [`EnvTraceContextInterceptor`] does:
+/// both spellings are accepted, whitespace is trimmed, and blank values are
+/// treated as unset.
+///
 /// Leaves `span` unchanged when the environment carries no valid context.
 pub fn set_parent_from_environment(span: &tracing::Span) {
     set_parent_from_trace_context(
         span,
-        std::env::var(TRACEPARENT_ENV).ok().as_deref(),
-        std::env::var(TRACESTATE_ENV).ok().as_deref(),
+        read_env(TRACEPARENT_ENV).as_deref(),
+        read_env(TRACESTATE_ENV).as_deref(),
     );
 }
 
@@ -194,20 +198,27 @@ struct EnvTraceContext {
 impl EnvTraceContext {
     fn from_env() -> Self {
         Self {
-            traceparent: read_env("TRACEPARENT"),
-            tracestate: read_env("TRACESTATE"),
+            traceparent: read_env(TRACEPARENT_ENV),
+            tracestate: read_env(TRACESTATE_ENV),
         }
     }
 }
 
-/// Read an environment variable by its upper-case name, falling back to the
-/// lower-case spelling, trimming whitespace and discarding blank values.
-fn read_env(upper: &str) -> Option<String> {
-    std::env::var(upper)
+/// Read one environment variable, trimming whitespace and discarding blanks.
+fn read_one(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
-        .or_else(|| std::env::var(upper.to_ascii_lowercase()).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// Read an environment variable by its upper-case name, falling back to the
+/// lower-case spelling, trimming whitespace and discarding blank values.
+///
+/// Each spelling is normalized before the fallback, so a blank upper-case
+/// value never shadows a valid lower-case one.
+fn read_env(upper: &str) -> Option<String> {
+    read_one(upper).or_else(|| read_one(&upper.to_ascii_lowercase()))
 }
 
 impl Extractor for EnvTraceContext {
@@ -251,9 +262,12 @@ impl EnvTraceContextInterceptor {
     /// Capture the W3C trace context from the process environment.
     #[must_use]
     pub fn from_env() -> Self {
-        Self {
-            context: context_from(&EnvTraceContext::from_env()),
+        let env = EnvTraceContext::from_env();
+        let context = context_from(&env);
+        if env.traceparent.is_some() && !span_context_is_valid(&context) {
+            tracing::debug!("TRACEPARENT is set but invalid; not forwarding trace context");
         }
+        Self { context }
     }
 }
 
@@ -261,6 +275,12 @@ impl EnvTraceContextInterceptor {
 /// the result depends only on the extractor and not on any ambient context.
 fn context_from(extractor: &impl Extractor) -> Context {
     TraceContextPropagator::new().extract_with_context(&Context::new(), extractor)
+}
+
+fn span_context_is_valid(context: &Context) -> bool {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    context.span().span_context().is_valid()
 }
 
 impl tonic::service::Interceptor for EnvTraceContextInterceptor {
@@ -437,6 +457,71 @@ mod tests {
         }
     }
 
+    fn snapshot_env(names: &[&'static str]) -> Vec<(&'static str, Option<String>)> {
+        names
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect()
+    }
+
+    #[allow(unsafe_code)]
+    fn restore_env(saved: &[(&'static str, Option<String>)]) {
+        for (name, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn env_trace_context_from_env_reads_both_spellings_and_skips_blanks() {
+        let _tracing_lock = crate::test_lock();
+        let saved = snapshot_env(&[TRACEPARENT_ENV, "traceparent", TRACESTATE_ENV, "tracestate"]);
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+        // Upper-case spelling with surrounding whitespace.
+        unsafe {
+            std::env::set_var(TRACEPARENT_ENV, format!("  {traceparent}  "));
+            std::env::set_var(TRACESTATE_ENV, " vendor=value ");
+        }
+        let padded = EnvTraceContext::from_env();
+        assert_eq!(padded.traceparent.as_deref(), Some(traceparent));
+        assert_eq!(padded.tracestate.as_deref(), Some("vendor=value"));
+
+        // Lower-case-only spelling.
+        unsafe {
+            std::env::remove_var(TRACEPARENT_ENV);
+            std::env::remove_var(TRACESTATE_ENV);
+            std::env::set_var("traceparent", traceparent);
+            std::env::set_var("tracestate", "vendor=value");
+        }
+        let lower = EnvTraceContext::from_env();
+        assert_eq!(lower.traceparent.as_deref(), Some(traceparent));
+        assert_eq!(lower.tracestate.as_deref(), Some("vendor=value"));
+
+        // A blank upper-case value must not shadow a valid lower-case one.
+        unsafe {
+            std::env::set_var(TRACEPARENT_ENV, "   ");
+            std::env::remove_var("tracestate");
+        }
+        let shadowed = EnvTraceContext::from_env();
+        assert_eq!(shadowed.traceparent.as_deref(), Some(traceparent));
+        assert_eq!(shadowed.tracestate, None);
+
+        // Blank values in both spellings are treated as unset.
+        unsafe {
+            std::env::set_var("traceparent", "");
+        }
+        let blank = EnvTraceContext::from_env();
+        assert_eq!(blank.traceparent, None);
+
+        restore_env(&saved);
+    }
+
     #[test]
     fn env_interceptor_forwards_valid_traceparent() {
         let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -477,11 +562,12 @@ mod tests {
     fn env_interceptor_is_noop_for_invalid_traceparent() {
         let mut interceptor = interceptor_with(EnvTraceContext {
             traceparent: Some("not-a-valid-traceparent".to_string()),
-            tracestate: None,
+            tracestate: Some("vendor=value".to_string()),
         });
 
         let request = interceptor.call(tonic::Request::new(())).unwrap();
 
         assert!(request.metadata().get("traceparent").is_none());
+        assert!(request.metadata().get("tracestate").is_none());
     }
 }
