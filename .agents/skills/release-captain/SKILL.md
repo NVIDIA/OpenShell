@@ -192,8 +192,13 @@ Finish these on Monday so Tuesday is only the cut.
      gives a qualifiable candidate a day sooner.
 
 6. **Draft the coordination post.** Release coordination happens in a thread
-   in the OpenShell CNCF Slack channel, started on Monday. Draft it for the
-   captain to post:
+   the captain starts on Monday in the OpenShell channel of the CNCF Slack
+   (`cloud-native.slack.com`, channel `C0B6Y8WQHU1`). Also link the thread in
+   the internal team channel. The thread asks contributors to link ready PRs
+   they want in the release. The release ships from `main`; there's no release
+   branch and no cherry-picking. The list exists so the captain can get those
+   PRs reviewed and merged in order before the cutoff. Tag reviewers on the
+   linked PRs. Draft it for the captain to post:
 
    - the target version and current candidate (tag, commit, run link);
    - qualification and compatibility status, with an owner for each blocker;
@@ -206,6 +211,16 @@ Finish these on Monday so Tuesday is only the cut.
 
    ```shell
    gh pr list --base main --state open --search "review:approved" --json number,title,author --jq '.[] | "#\(.number) \(.title) (@\(.author.login))"'
+   ```
+
+   Example post:
+
+   ```text
+   :thread: OpenShell vX.Y.Z release, Tuesday <date>. I'm release captain this week.
+
+   Status: vX.Y.Z-pre.N (<commit>) passed qualification. <blockers and owners, or "No blockers.">
+
+   Reply here with any ready PRs you'd like in vX.Y.Z. Merge cutoff is <HH:MM UTC> (<captain's local time>) Tuesday, before the next pre-release is cut. Anything merged on main by then ships; anything later goes in the next release.
    ```
 
 ## Tuesday: cut the release
