@@ -68,15 +68,16 @@ gatewayConfig:
     supervisor_topology: gateway
 ```
 
-The gateway chart creates a separate, single-replica shared-host placeholder Deployment
-in the release namespace, regardless of shared/managed/operator workspace mode.
-Use a supervisor image built from this branch: `--mode=shared` is new.
-The chart sets `--gateway-endpoint` from the gateway's gRPC endpoint and
-`--address` to `0.0.0.0:5501`. Check its rollout and TCP health probes on this
-listener (container port `supervisor`, 5501). The outbound gateway connection and
-session RPCs are not implemented yet; sandboxes
-still use dedicated supervisors. `workspace` is reserved and rejected. Omit the
-field to disable it.
+The gateway chart creates a single-replica shared supervisor Deployment,
+Service, and NetworkPolicy in the release namespace, regardless of
+shared/managed/operator workspace mode, and the certgen hook issues its
+session-control Secrets. New sandbox generations run as sessions in that
+process. Build the gateway, supervisor, and sandbox images from the same branch:
+all three must support the routed runtime connection. `workspace` is reserved
+and rejected. Omit the field to disable it. `mise run
+e2e:kubernetes:shared-supervisor` runs the focused e2e
+(`ci/values-supervisor.yaml`); layer a workspace-mode overlay
+through `OPENSHELL_E2E_KUBE_EXTRA_VALUES` to cover managed namespaces.
 
 ### 2. Deploy OpenShell
 
