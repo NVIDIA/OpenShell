@@ -470,7 +470,7 @@ impl Drop for ClientSpanStatus {
 #[cfg(test)]
 mod gateway_tls_isolation_tests {
     use super::*;
-    use rcgen::{CertificateParams, IsCa, KeyPair};
+    use rcgen::{CertificateParams, IsCa};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::io::Cursor;
     use tokio::net::TcpListener;
@@ -490,18 +490,17 @@ mod gateway_tls_isolation_tests {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
 
-        let server_key = KeyPair::generate().unwrap();
-        let server = CertificateParams::new(vec![server_name.to_string()])
-            .unwrap()
-            .signed_by(&server_key, &ca, &ca_key)
-            .unwrap();
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_params = CertificateParams::new(vec![server_name.to_string()]).unwrap();
+        let server =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca, &ca_key).unwrap();
         TestPki {
             ca_pem: ca.pem().into_bytes(),
             server_cert_pem: server.pem().into_bytes(),
-            server_key_pem: server_key.serialize_pem().into_bytes(),
+            server_key_pem: server_key.serialize_pem().unwrap().into_bytes(),
         }
     }
 

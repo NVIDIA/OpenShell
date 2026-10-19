@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use rcgen::generate_simple_self_signed;
+use openshell_crypto::pki::generate_simple_self_signed;
 use tempfile::TempDir;
 
 const CONFIG_FIELD: &str = "openshell.supervisor.network.additional_ca_bundle";
@@ -117,7 +117,7 @@ fn contains_wrapped(haystack: &str, needle: &str) -> bool {
     squash(haystack).contains(&squash(needle))
 }
 
-fn generated_certificate() -> rcgen::CertifiedKey {
+fn generated_certificate() -> openshell_crypto::pki::CertifiedKey {
     generate_simple_self_signed(vec!["destination.example".to_string()])
         .expect("generate certificate fixture")
 }
@@ -163,7 +163,7 @@ fn valid_bundle_reports_only_redacted_metadata_before_custom_driver_rejection() 
 fn invalid_bundles_fail_startup_with_actionable_redacted_errors() {
     let source_dir = tempfile::tempdir().expect("create source directory");
     let generated = generated_certificate();
-    let private_key = generated.key_pair.serialize_pem();
+    let private_key = generated.key_pair.serialize_pem().unwrap();
     let cases = [
         (
             source_dir.path().join("missing.pem"),

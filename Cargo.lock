@@ -4715,6 +4715,7 @@ dependencies = [
  "miette",
  "nix 0.29.0",
  "openshell-core",
+ "openshell-crypto",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",
  "openshell-driver-mxc",
