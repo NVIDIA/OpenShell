@@ -40,6 +40,24 @@ readiness, and stops the session on SIGTERM or SIGINT. The binary shares one
 `GatewayCredentials` between log push and supervision, so renewal by either
 keeps both current.
 
+`session_host::SessionHost` runs several sessions in one process. Each session
+gets its own Tokio runtime; every thread of that runtime, and the thread
+driving it, is bound to the session's OCSF context, OCSF JSON settings, log
+sink, and denial log. Spawned tasks, blocking work, callbacks, reconnects, and
+renewal therefore inherit the session's identity, and threads outside a
+session carry none and push no logs. The OCSF context also supplies the
+sandbox identity in middleware requests.
+
+Removing a session stops its workload, shuts down only its runtime, and
+revokes its gateway credentials; the key stays registered until the session's
+thread has finished. A session that panics reports a failure and is revoked
+the same way. A session that is still starting is cancelled at once; the
+sandbox runtime then loses supervision and fails closed, as it does when a
+dedicated supervisor exits. A hosted session without an explicit proxy trust
+directory receives a private one for its lifetime. Hosted processes must
+install `LogPushLayer::thread_bound` and an `OcsfShorthandLayer` writing to
+`SessionDenialWriter`.
+
 ## Console logging
 
 Diagnostics and OCSF shorthand share a bounded, nonblocking stderr writer. With `ocsf_json_enabled=true`, the same writer also receives timestamped `OCSF-JSON` records. Each formatter submits a complete line in one write so concurrent producers cannot interleave records in the queue. The 1,024-line queue drops new lines when full rather than waiting for stderr.

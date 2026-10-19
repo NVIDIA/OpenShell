@@ -5093,8 +5093,13 @@ dependencies = [
 name = "openshell-supervisor"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "miette",
  "nix 0.29.0",
  "openshell-core",
