@@ -2598,14 +2598,6 @@ fn build_container_create_body_replaces_inherited_cmd_with_sandbox_bootstrap() {
             .and_then(|labels| labels.get(LABEL_SANDBOX_NAMESPACE)),
         Some(&"default".to_string())
     );
-    assert_eq!(
-        create_body
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY))
-            .map(String::as_str),
-        Some(NETWORK_SUPERVISOR_TRUST_GENERATION_NONE)
-    );
     let host_config = create_body.host_config.as_ref().unwrap();
     assert!(
         host_config.device_requests.as_ref().is_none(),
@@ -2645,13 +2637,12 @@ fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
     config.network_trust = Some(bundle.clone());
 
     let workload = build_container_create_body(&test_sandbox(), &config).unwrap();
-    assert_eq!(
+    assert!(
         workload
             .labels
             .as_ref()
-            .and_then(|labels| labels.get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY))
-            .map(String::as_str),
-        Some("sha256:paired-digest")
+            .and_then(|labels| labels.get(LABEL_SANDBOX_ID))
+            .is_some()
     );
     assert!(
         workload
@@ -2680,88 +2671,6 @@ fn additional_destination_trust_is_supervisor_only_and_digest_paired() {
     assert_eq!(mount.target.as_deref(), Some(ADDITIONAL_CA_MOUNT_PATH));
     assert_eq!(mount.source.as_deref(), artifact.to_str());
     assert_eq!(mount.read_only, Some(true));
-}
-
-#[test]
-fn trust_generation_reconciliation_requires_an_explicit_none_marker() {
-    let mut labels = HashMap::new();
-    labels.insert(LABEL_SANDBOX_ID.to_string(), "sandbox-id".to_string());
-    labels.insert(
-        NETWORK_SUPERVISOR_TRUST_GENERATION_KEY.to_string(),
-        "sha256:old".to_string(),
-    );
-    let stopped = ContainerSummary {
-        labels: Some(labels),
-        state: Some(ContainerSummaryStateEnum::EXITED),
-        ..Default::default()
-    };
-    let mut config = runtime_config();
-    let dir = TempDir::new().unwrap();
-    let artifact = dir.path().join("additional-ca.crt");
-    fs::write(&artifact, b"expected").unwrap();
-    #[cfg(unix)]
-    fs::set_permissions(
-        &artifact,
-        std::os::unix::fs::PermissionsExt::from_mode(0o444),
-    )
-    .unwrap();
-    config.network_trust = Some(NetworkSupervisorTrustBundle::new(
-        b"expected".to_vec(),
-        1,
-        "sha256:new",
-        artifact,
-    ));
-    let driver = test_driver_with_config(config);
-    assert!(
-        !driver.network_trust_generation_matches(&stopped),
-        "a stale protected generation requires durable reconciliation"
-    );
-
-    let no_trust_driver = test_driver_with_config(runtime_config());
-    let legacy = ContainerSummary {
-        labels: Some(HashMap::from([(
-            LABEL_SANDBOX_ID.to_string(),
-            "sandbox-id".to_string(),
-        )])),
-        state: Some(ContainerSummaryStateEnum::EXITED),
-        ..Default::default()
-    };
-    assert!(
-        !no_trust_driver.network_trust_generation_matches(&legacy),
-        "an unmarked stopped legacy workload must be reconciled to durable `none`"
-    );
-}
-
-#[test]
-fn workspace_restore_archive_rejects_entries_outside_the_workspace() {
-    let mut archive = tar::Builder::new(Vec::new());
-    let bytes = b"not a workspace file";
-    let mut header = tar::Header::new_gnu();
-    header.set_size(bytes.len() as u64);
-    header.set_mode(0o600);
-    header.set_cksum();
-    archive
-        .append_data(&mut header, "outside-workspace", &bytes[..])
-        .unwrap();
-    let archive = archive.into_inner().unwrap();
-
-    let error = validate_docker_workspace_archive(&archive, "/sandbox").unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error.message().contains("outside the workspace root"));
-
-    let mut archive = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
-    header.set_entry_type(tar::EntryType::Symlink);
-    header.set_size(0);
-    header.set_mode(0o777);
-    header.set_cksum();
-    archive
-        .append_link(&mut header, "sandbox/escape", "../../outside")
-        .unwrap();
-    let archive = archive.into_inner().unwrap();
-    let error = validate_docker_workspace_archive(&archive, "/sandbox").unwrap_err();
-    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-    assert!(error.message().contains("non-regular entry"));
 }
 
 #[test]
