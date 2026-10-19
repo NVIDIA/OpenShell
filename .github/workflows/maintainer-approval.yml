@@ -4,8 +4,6 @@
 name: Maintainer Approval
 
 on:
-  merge_group:
-    types: [checks_requested]
   pull_request_review:
     types: [submitted, dismissed]
 
@@ -19,13 +17,9 @@ concurrency:
 
 jobs:
   maintainer-approval:
-    # This name is the required status check context. Changing it silently
-    # breaks the ruleset entry that gates merges on this job.
     name: OpenShell / Maintainer Approval
-    # Merge-group checks do not need to repeat the PR approval evaluation.
     if: >-
       github.repository_owner == 'NVIDIA' &&
-      github.event_name != 'merge_group' &&
       github.event.pull_request.state == 'open'
     runs-on: ubuntu-latest
     timeout-minutes: 5

@@ -7,8 +7,9 @@ rules:
       # These base-branch workflows never check out or execute pull request
       # head code. Keep each suppression scoped to its reviewed trigger block.
       - dco.yml:3
-      - e2e-label-help.yml:13
+      - e2e-label-help.yml:7
       - maintainers-change-alert.yml:6
+      - pr-ci-dispatch.yml:9
       - pr-issue-acceptance.yml:6
       - release-canary.yml:3
       - required-ci-gates.yml:3

@@ -1,6 +1,11 @@
 name: Setup E2E VM Driver
 description: Download an architecture-matched prebuilt OpenShell VM driver for E2E tests
 
+outputs:
+  binary:
+    description: Path to the prebuilt OpenShell VM driver
+    value: ${{ steps.configure.outputs.binary }}
+
 runs:
   using: composite
   steps:
@@ -10,10 +15,11 @@ runs:
         name: ${{ runner.arch == 'X64' && 'openshell-driver-vm-x86_64-unknown-linux-gnu' || 'openshell-driver-vm-aarch64-unknown-linux-gnu' }}
         path: .e2e/prebuilt-vm-driver
 
-    - name: Configure prebuilt VM driver
+    - id: configure
+      name: Configure prebuilt VM driver
       shell: bash
       run: |
         driver="$GITHUB_WORKSPACE/.e2e/prebuilt-vm-driver/openshell-driver-vm"
         chmod +x "$driver"
         "$driver" --version
-        echo "OPENSHELL_VM_DRIVER_BIN=$driver" >> "$GITHUB_ENV"
+        echo "binary=$driver" >> "$GITHUB_OUTPUT"

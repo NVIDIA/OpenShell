@@ -1,6 +1,11 @@
 name: Setup E2E CLI
 description: Download architecture-matched prebuilt OpenShell host CLIs for E2E tests
 
+outputs:
+  binary:
+    description: Path to the prebuilt OpenShell CLI
+    value: ${{ steps.configure.outputs.binary }}
+
 runs:
   using: composite
   steps:
@@ -10,10 +15,11 @@ runs:
         name: ${{ runner.arch == 'X64' && 'openshell-x86_64-unknown-linux-musl' || 'openshell-aarch64-unknown-linux-musl' }}
         path: .e2e/prebuilt-cli
 
-    - name: Configure prebuilt CLI
+    - id: configure
+      name: Configure prebuilt CLI
       shell: bash
       run: |
         cli="$GITHUB_WORKSPACE/.e2e/prebuilt-cli/openshell"
         chmod +x "$cli"
         "$cli" --version
-        echo "OPENSHELL_BIN=$cli" >> "$GITHUB_ENV"
+        echo "binary=$cli" >> "$GITHUB_OUTPUT"

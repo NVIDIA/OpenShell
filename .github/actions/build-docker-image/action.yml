@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 name: Build Docker Image
-description: Build, push, and export a multi-platform OpenShell image
+description: Build an OpenShell image for publication or local artifact testing
 
 inputs:
   component:
@@ -18,17 +18,23 @@ inputs:
     description: Docker image tag
     required: true
   github-token:
-    description: Token used to push the image
-    required: true
+    description: Token used to push the image when push-image is true
+    required: false
+    default: ""
+  push-image:
+    description: Push the image to GHCR
+    required: false
+    default: "false"
 
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/setup-buildx
+    - uses: $/.github/actions/setup-buildx
       with:
         buildkitd-config: /etc/buildkit/buildkitd.toml
 
     - name: Log in to GHCR
+      if: inputs.push-image == 'true'
       uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
       with:
         registry: ghcr.io
@@ -60,23 +66,41 @@ runs:
       env:
         COMPONENT: ${{ inputs.component }}
         IMAGE_TAG: ${{ inputs.image-tag }}
+        PUSH_IMAGE: ${{ inputs.push-image }}
       run: |
+        set -euo pipefail
         install -d artifacts/images
-        docker buildx build \
-          --builder openshell \
-          --platform linux/amd64,linux/arm64 \
-          --file deploy/docker/Dockerfile.${COMPONENT} \
-          --target ${COMPONENT} \
-          --tag ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG} \
-          --cache-from type=gha,scope=${COMPONENT} \
-          --cache-to type=gha,mode=max,scope=${COMPONENT} \
-          --provenance=mode=min \
-          --attest type=sbom \
-          --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \
-          --output type=oci,dest=artifacts/images/${COMPONENT}.tar \
-          .
+        common_args=(
+          --builder openshell
+          --file "deploy/docker/Dockerfile.${COMPONENT}"
+          --target "$COMPONENT"
+          --tag "ghcr.io/nvidia/openshell/${COMPONENT}:${IMAGE_TAG}"
+          --cache-from "type=gha,scope=${COMPONENT}"
+        )
+        if [ "$PUSH_IMAGE" = "true" ]; then
+          docker buildx build \
+            "${common_args[@]}" \
+            --platform linux/amd64,linux/arm64 \
+            --cache-to "type=gha,mode=max,scope=${COMPONENT}" \
+            --provenance=mode=min \
+            --attest type=sbom \
+            --output type=image,push=true,oci-mediatypes=true,oci-artifact=true \
+            --output "type=oci,dest=artifacts/images/${COMPONENT}.tar" \
+            .
+          exit 0
+        fi
+
+        for arch in amd64 arm64; do
+          docker buildx build \
+            "${common_args[@]}" \
+            --platform "linux/${arch}" \
+            --provenance=false \
+            --output "type=docker,dest=artifacts/images/${COMPONENT}-linux-${arch}.tar" \
+            .
+        done
 
     - name: Verify SBOM attestation
+      if: inputs.push-image == 'true'
       shell: bash
       env:
         IMAGE_REF: ghcr.io/nvidia/openshell/${{ inputs.component }}:${{ inputs.image-tag }}

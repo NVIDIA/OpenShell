@@ -63,8 +63,11 @@ for the supported source and installed-artifact test paths.
 
 A manual `Integration Tests` workflow run can select the `policy-advisor`
 testsuite to run the policy-related subset against an installed candidate. Set
-`artifact-run-id` to the candidate build's workflow run ID and `test-matrix`
-to:
+`artifact-run-id` to the candidate build's workflow run ID, `source-sha` to the
+exact candidate commit, and `checkout-repository` when that commit belongs to a
+fork. Keep `use-image-artifacts` enabled for a Branch E2E or pull request run.
+Disable it only for a Release Dev, Release, or Pre-release run whose exact-SHA images
+were published in GHCR. Set `test-matrix` to:
 
 ```json
 [{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]

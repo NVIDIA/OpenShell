@@ -23,6 +23,7 @@ depends = [
   "test:docs-website",
   "test:docs-nav",
   "test:maintainer-approval",
+  "test:pr-workflow-security",
 ]
 
 ["test:docs-website"]
@@ -89,6 +90,11 @@ hide = true
 ["test:maintainer-approval"]
 description = "Test the maintainer approval gate and change-alert tools"
 run = "uv run --no-project --with pytest pytest -o \"python_files=*_test.py\" tasks/scripts/check_maintainer_approval_test.py tasks/scripts/alert_maintainer_change_test.py"
+hide = true
+
+["test:pr-workflow-security"]
+description = "Test exact-SHA PR workflow isolation and artifact-only image builds"
+run = "uv run --no-project --with pytest --with PyYAML pytest tasks/scripts/check_pr_workflow_security_test.py"
 hide = true
 
 [e2e]

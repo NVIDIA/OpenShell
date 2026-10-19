@@ -1,10 +1,6 @@
 name: Required CI Gates
 
 on:
-  merge_group:
-    types: [checks_requested]
-  pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
   workflow_run:
     workflows:
       - Branch Checks
@@ -15,273 +11,686 @@ on:
 permissions:
   actions: read
   contents: read
+  issues: read
   pull-requests: read
   statuses: write
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha || github.sha || github.run_id }}
-  cancel-in-progress: true
-
 jobs:
+  route:
+    name: Route trusted status publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      lock-key: ${{ steps.route.outputs.lock-key }}
+    steps:
+      - id: route
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const definitions = new Map([
+              ['Branch Checks', {
+                file: 'branch-checks.yml',
+                path: '.github/workflows/branch-checks.yml',
+                kind: 'standard',
+              }],
+              ['Branch E2E Checks', {
+                file: 'branch-e2e.yml',
+                path: '.github/workflows/branch-e2e.yml',
+                kind: 'e2e',
+              }],
+              ['Helm Lint', {
+                file: 'helm-lint.yml',
+                path: '.github/workflows/helm-lint.yml',
+                kind: 'standard',
+              }],
+            ]);
+            const normalizeWorkflowPath = (value) => String(value || '').split('@', 1)[0];
+            const payloadRun = context.payload.workflow_run;
+            const definition = definitions.get(payloadRun?.name);
+            if (!definition || normalizeWorkflowPath(payloadRun.path) !== definition.path) return;
+
+            const [{ data: run }, { data: trustedWorkflow }] = await Promise.all([
+              github.rest.actions.getWorkflowRun({
+                ...context.repo,
+                run_id: payloadRun.id,
+              }),
+              github.rest.actions.getWorkflow({
+                ...context.repo,
+                workflow_id: definition.file,
+              }),
+            ]);
+            const expectedRepository = `${context.repo.owner}/${context.repo.repo}`;
+            const defaultBranch = context.payload.repository.default_branch;
+            if (run.id !== payloadRun.id
+                || run.workflow_id !== trustedWorkflow.id
+                || run.name !== payloadRun.name
+                || normalizeWorkflowPath(run.path) !== definition.path
+                || run.event !== 'workflow_dispatch'
+                || run.head_branch !== defaultBranch
+                || run.head_repository?.full_name !== expectedRepository
+                || run.status !== 'completed') {
+              return;
+            }
+
+            const escapedTitle = run.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pullPattern = new RegExp(
+              definition.kind === 'e2e'
+                ? `^${escapedTitle} / PR #([1-9][0-9]*) / ([0-9a-f]{40}) / approval `
+                  + `([1-9][0-9]*) / core (?:true|false) / gpu (?:true|false) / `
+                  + `kubernetes (?:true|false)$`
+                : `^${escapedTitle} / PR #([1-9][0-9]*) / ([0-9a-f]{40}) / approval `
+                  + `([1-9][0-9]*)$`,
+            );
+            const queuePattern = new RegExp(
+              `^${escapedTitle} / merge group / PR #([1-9][0-9]*) / `
+              + `([0-9a-f]{40}) / head ([0-9a-f]{40}) / approval ([1-9][0-9]*)$`,
+            );
+            const pullMatch = pullPattern.exec(run.display_title);
+            const queueMatch = definition.kind === 'standard'
+              ? queuePattern.exec(run.display_title)
+              : null;
+            if (queueMatch) {
+              core.setOutput('lock-key', 'merge-queue');
+            } else if (pullMatch) {
+              core.setOutput('lock-key', `sha-${pullMatch[2]}`);
+            }
+
   publish:
     name: Publish required CI gate statuses
+    needs: route
+    if: needs.route.outputs.lock-key != ''
+    concurrency:
+      group: pr-ci-status-${{ needs.route.outputs.lock-key }}
+      cancel-in-progress: false
+      queue: max
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Evaluate required CI gates
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER_FROM_EVENT: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
-          PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
-          GITHUB_SHA_FROM_CONTEXT: ${{ github.sha }}
-          GITHUB_REF_NAME_FROM_CONTEXT: ${{ github.ref_name }}
-          GITHUB_RUN_ID_FROM_CONTEXT: ${{ github.run_id }}
-          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
-          WORKFLOW_RUN_HTML_URL: ${{ github.event.workflow_run.html_url }}
-        shell: bash
-        run: |
-          set -euo pipefail
+      - name: Evaluate trusted CI results
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const gates = {
+              branch: 'OpenShell / Branch Checks',
+              coreE2e: 'OpenShell / E2E',
+              gpuE2e: 'OpenShell / GPU E2E',
+              helm: 'OpenShell / Helm Lint',
+            };
+            const workflows = new Map([
+              ['Branch Checks', {
+                path: '.github/workflows/branch-checks.yml',
+                title: 'Branch Checks',
+                gate: gates.branch,
+                kind: 'standard',
+              }],
+              ['Branch E2E Checks', {
+                path: '.github/workflows/branch-e2e.yml',
+                title: 'Branch E2E Checks',
+                kind: 'e2e',
+              }],
+              ['Helm Lint', {
+                path: '.github/workflows/helm-lint.yml',
+                title: 'Helm Lint',
+                gate: gates.helm,
+                kind: 'standard',
+              }],
+            ]);
 
-          post_status() {
-            local context="$1"
-            local state="$2"
-            local description="$3"
-            local target_url="${4:-}"
+            const postStatus = async (sha, statusContext, state, description, targetUrl) => {
+              core.info(`${statusContext}: ${state} - ${description}`);
+              await github.rest.repos.createCommitStatus({
+                ...context.repo,
+                sha,
+                state,
+                context: statusContext,
+                description: description.slice(0, 140),
+                target_url: targetUrl,
+              });
+            };
 
-            args=(
-              --method POST
-              "repos/$GH_REPO/statuses/$HEAD_SHA"
-              -f "state=$state"
-              -f "context=$context"
-              -f "description=$description"
-            )
-            if [ -n "$target_url" ]; then
-              args+=(-f "target_url=$target_url")
-            fi
+            if (context.eventName !== 'workflow_run') {
+              core.setFailed(`Unsupported event ${context.eventName}.`);
+              return;
+            }
 
-            echo "$context: $state - $description"
-            gh api "${args[@]}" >/dev/null
-          }
+            const normalizeWorkflowPath = (value) => String(value || '').split('@', 1)[0];
+            const payloadRun = context.payload.workflow_run;
+            const payloadWorkflowPath = normalizeWorkflowPath(payloadRun.path);
+            const workflow = workflows.get(payloadRun.name);
+            if (!workflow || payloadWorkflowPath !== workflow.path) {
+              core.notice(
+                `Ignoring workflow run ${payloadRun.id}: unexpected name/path `
+                + `${payloadRun.name}/${payloadRun.path}.`,
+              );
+              return;
+            }
 
-          has_label() {
-            local label="$1"
-            jq -e --arg label "$label" 'index($label) != null' <<< "$LABELS_JSON" >/dev/null
-          }
+            const { data: payloadRunData } = await github.rest.actions.getWorkflowRun({
+              ...context.repo,
+              run_id: payloadRun.id,
+            });
+            let run = payloadRunData;
+            const eventAttempt = Number(payloadRun.run_attempt);
+            let currentAttempt = Number(run.run_attempt);
+            const sameRun = run.id === payloadRun.id
+              && run.workflow_id === payloadRun.workflow_id
+              && run.name === payloadRun.name
+              && normalizeWorkflowPath(run.path) === payloadWorkflowPath
+              && run.event === payloadRun.event
+              && run.head_sha === payloadRun.head_sha
+              && run.head_branch === payloadRun.head_branch
+              && run.html_url === payloadRun.html_url;
+            if (!sameRun
+                || !Number.isSafeInteger(eventAttempt)
+                || eventAttempt < 1
+                || currentAttempt !== eventAttempt
+                || run.status !== 'completed') {
+              core.notice(`Ignoring stale or inconsistent workflow run ${payloadRun.id}.`);
+              return;
+            }
 
-          resolve_pull_request_event() {
-            CONTEXT_KIND="pull_request"
-            WORKFLOW_EVENT="push"
-            PR_NUMBER="$PR_NUMBER_FROM_EVENT"
-            HEAD_SHA="$PR_HEAD_SHA_FROM_EVENT"
-            LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
-            MIRROR_REF="pull-request/$PR_NUMBER"
-            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
-            STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
-          }
+            const loadCurrentJobs = async () => {
+              const jobs = await github.paginate(
+                github.rest.actions.listJobsForWorkflowRun,
+                {
+                  ...context.repo,
+                  run_id: run.id,
+                  filter: 'latest',
+                  per_page: 100,
+                },
+              );
+              return jobs.filter((job) => Number(job.run_attempt) === currentAttempt);
+            };
+            let currentJobs = await loadCurrentJobs();
+            let authorizationSucceeded = false;
+            const refreshAuthorization = () => {
+              const authorizationJobs = currentJobs.filter(
+                (job) => job.name === 'Authorize PR revision',
+              );
+              authorizationSucceeded = authorizationJobs.length === 1
+                && authorizationJobs[0].status === 'completed'
+                && authorizationJobs[0].conclusion === 'success';
+            };
+            refreshAuthorization();
 
-          load_pr_context() {
-            CONTEXT_KIND="pull_request"
-            WORKFLOW_EVENT="push"
-            PR_NUMBER="$1"
+            const attemptIsStillCurrent = async () => {
+              const { data: latestRun } = await github.rest.actions.getWorkflowRun({
+                ...context.repo,
+                run_id: run.id,
+              });
+              const current = latestRun.id === run.id
+                && Number(latestRun.run_attempt) === currentAttempt
+                && latestRun.status === 'completed'
+                && latestRun.conclusion === run.conclusion;
+              if (!current) {
+                core.notice(`Ignoring superseded attempt ${currentAttempt} of run ${run.id}.`);
+              }
+              return current;
+            };
 
-            local pr state
-            pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
-            state=$(jq -r '.state' <<< "$pr")
-            if [ "$state" != "open" ]; then
-              echo "PR #$PR_NUMBER is $state; nothing to publish."
-              exit 0
-            fi
+            const finishStandardGate = async (sha, publish = async (state, description) => {
+              await postStatus(sha, workflow.gate, state, description, run.html_url);
+            }) => {
+              if (!await attemptIsStillCurrent()) return;
+              if (!authorizationSucceeded) {
+                await publish(
+                  'failure',
+                  'PR revision authorization did not succeed',
+                );
+                return;
+              }
+              if (run.conclusion !== 'success') {
+                await publish(
+                  'failure',
+                  `${workflow.title} concluded ${run.conclusion || 'without a conclusion'}`,
+                );
+                return;
+              }
+              const realSuccess = currentJobs.some(
+                (job) => job.name !== 'Authorize PR revision'
+                  && job.status === 'completed'
+                  && job.conclusion === 'success',
+              );
+              if (!realSuccess) {
+                await publish(
+                  'failure',
+                  `${workflow.title} ran no successful CI job`,
+                );
+                return;
+              }
+              await publish('success', `${workflow.title} passed`);
+            };
 
-            HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
-            LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
-            MIRROR_REF="pull-request/$PR_NUMBER"
-            EXPECTED_HEAD_BRANCH="$MIRROR_REF"
-            STATUS_TARGET_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
-          }
+            if (run.event !== 'workflow_dispatch') {
+              core.notice(`Ignoring ${run.event} run ${run.id}.`);
+              return;
+            }
 
-          resolve_merge_group_event() {
-            CONTEXT_KIND="merge_group"
-            WORKFLOW_EVENT="merge_group"
-            HEAD_SHA="$GITHUB_SHA_FROM_CONTEXT"
-            LABELS_JSON="[]"
-            EXPECTED_HEAD_BRANCH="$GITHUB_REF_NAME_FROM_CONTEXT"
-            STATUS_TARGET_URL="https://github.com/$GH_REPO/actions/runs/$GITHUB_RUN_ID_FROM_CONTEXT"
-          }
+            const { data: repository } = await github.rest.repos.get(context.repo);
+            const expectedRepository = `${context.repo.owner}/${context.repo.repo}`;
+            if (run.head_branch !== repository.default_branch
+                || run.head_repository?.full_name !== expectedRepository) {
+              core.notice(`Ignoring workflow run ${run.id} from an untrusted ref.`);
+              return;
+            }
 
-          resolve_merge_group_workflow_run_event() {
-            CONTEXT_KIND="merge_group"
-            WORKFLOW_EVENT="merge_group"
-            HEAD_SHA="$WORKFLOW_RUN_HEAD_SHA"
-            LABELS_JSON="[]"
-            EXPECTED_HEAD_BRANCH="$WORKFLOW_RUN_HEAD_BRANCH"
-            STATUS_TARGET_URL="${WORKFLOW_RUN_HTML_URL:-https://github.com/$GH_REPO/actions}"
-          }
+            const escapedTitle = workflow.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pullTitlePattern = new RegExp(
+              workflow.kind === 'e2e'
+                ? `^${escapedTitle} / PR #([1-9][0-9]*) / ([0-9a-f]{40}) / approval `
+                  + `([1-9][0-9]*) / core (true|false) / gpu (true|false) / `
+                  + `kubernetes (true|false)$`
+                : `^${escapedTitle} / PR #([1-9][0-9]*) / ([0-9a-f]{40}) / approval `
+                  + `([1-9][0-9]*)$`,
+            );
+            const queueTitlePattern = new RegExp(
+              `^${escapedTitle} / merge group / PR #([1-9][0-9]*) / `
+              + `([0-9a-f]{40}) / head ([0-9a-f]{40}) / approval ([1-9][0-9]*)$`,
+            );
+            let pullTitleMatch = pullTitlePattern.exec(run.display_title);
+            let queueTitleMatch = queueTitlePattern.exec(run.display_title);
+            if (!pullTitleMatch && !queueTitleMatch) {
+              core.notice(`Ignoring workflow run ${run.id} with malformed title.`);
+              return;
+            }
 
-          resolve_workflow_run_event() {
-            if [ "$WORKFLOW_RUN_EVENT" = "merge_group" ]; then
-              resolve_merge_group_workflow_run_event
-              return
-            fi
+            let isMergeQueueRun = Boolean(queueTitleMatch);
+            if (isMergeQueueRun && workflow.kind !== 'standard') {
+              core.notice(`Ignoring merge queue run for ${workflow.title}.`);
+              return;
+            }
+            let titleMatch = queueTitleMatch || pullTitleMatch;
+            let pullNumber = Number(titleMatch[1]);
+            let candidateSha = titleMatch[2];
+            let approvedHeadSha = isMergeQueueRun ? titleMatch[3] : candidateSha;
+            let approvalCommentId = Number(titleMatch[isMergeQueueRun ? 4 : 3]);
+            if (!Number.isSafeInteger(pullNumber)
+                || !Number.isSafeInteger(approvalCommentId)) {
+              core.notice(`Ignoring workflow run ${run.id} with unsafe numeric identifiers.`);
+              return;
+            }
 
-            if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
-              echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
-              exit 0
-            fi
+            const sleep = (milliseconds) => new Promise(
+              (resolve) => setTimeout(resolve, milliseconds),
+            );
+            const loadLatestStatuses = async () => {
+              const statuses = await github.paginate(
+                github.rest.repos.listCommitStatusesForRef,
+                {
+                  ...context.repo,
+                  ref: candidateSha,
+                  per_page: 100,
+                },
+              );
+              const latest = new Map();
+              for (const status of statuses) {
+                if (!latest.has(status.context)) latest.set(status.context, status);
+              }
+              return latest;
+            };
 
-            if [[ "$WORKFLOW_RUN_HEAD_BRANCH" =~ ^pull-request/([0-9]+)$ ]]; then
-              load_pr_context "${BASH_REMATCH[1]}"
-              return
-            fi
+            const expectedContexts = workflow.kind === 'e2e'
+              ? [gates.coreE2e, gates.gpuE2e]
+              : [workflow.gate];
+            const runIdFromTargetUrl = (value) => {
+              let target;
+              try {
+                target = new URL(value || '');
+              } catch {
+                return 0;
+              }
+              const parts = target.pathname.split('/').filter(Boolean);
+              if (target.origin !== new URL(context.serverUrl).origin
+                  || parts.length !== 5
+                  || parts[0] !== context.repo.owner
+                  || parts[1] !== context.repo.repo
+                  || parts[2] !== 'actions'
+                  || parts[3] !== 'runs'
+                  || !/^[1-9][0-9]*$/.test(parts[4])) {
+                return 0;
+              }
+              const id = Number(parts[4]);
+              return Number.isSafeInteger(id) ? id : 0;
+            };
+            let latestStatuses;
+            let pointedContexts = [];
+            for (let attempt = 1; attempt <= 3; attempt += 1) {
+              latestStatuses = await loadLatestStatuses();
+              pointedContexts = expectedContexts.filter(
+                (statusContext) => latestStatuses.get(statusContext)?.target_url === run.html_url,
+              );
+              const pointerFound = workflow.kind === 'e2e'
+                ? pointedContexts.length > 0
+                : pointedContexts.length === 1;
+              if (pointerFound) break;
+              if (attempt < 3) await sleep(2000);
+            }
+            if ((workflow.kind === 'e2e' && pointedContexts.length === 0)
+                || (workflow.kind !== 'e2e' && pointedContexts.length !== 1)) {
+              const pointedRunIds = new Set(expectedContexts
+                .map((statusContext) => runIdFromTargetUrl(
+                  latestStatuses.get(statusContext)?.target_url,
+                ))
+                .filter((runId) => runId > 0));
+              if (pointedRunIds.size !== 1) {
+                core.notice(`Ignoring run ${run.id}: it is not the current dispatched run.`);
+                return;
+              }
 
-            local associated_prs pr
-            associated_prs=$(gh api "repos/$GH_REPO/commits/$WORKFLOW_RUN_HEAD_SHA/pulls")
-            pr=$(jq -c 'map(select(.state == "open"))[0] // empty' <<< "$associated_prs")
-            if [ -z "$pr" ]; then
-              echo "No open PR associated with $WORKFLOW_RUN_HEAD_SHA; nothing to publish."
-              exit 0
-            fi
+              const pointedRunId = [...pointedRunIds][0];
+              const { data: pointedRun } = await github.rest.actions.getWorkflowRun({
+                ...context.repo,
+                run_id: pointedRunId,
+              });
+              const pointedPullMatch = pullTitlePattern.exec(pointedRun.display_title);
+              const pointedQueueMatch = queueTitlePattern.exec(pointedRun.display_title);
+              const pointedIsQueue = Boolean(pointedQueueMatch);
+              const pointedTitleMatch = pointedQueueMatch || pointedPullMatch;
+              const pointedPullNumber = Number(pointedTitleMatch?.[1]);
+              const pointedCandidateSha = pointedTitleMatch?.[2];
+              const pointedApprovalId = Number(
+                pointedTitleMatch?.[pointedIsQueue ? 4 : 3],
+              );
+              const pointedAttempt = Number(pointedRun.run_attempt);
+              const trustedPointedRun = pointedRun.id === pointedRunId
+                && pointedRun.workflow_id === payloadRun.workflow_id
+                && pointedRun.name === run.name
+                && normalizeWorkflowPath(pointedRun.path) === workflow.path
+                && pointedRun.event === 'workflow_dispatch'
+                && pointedRun.head_branch === repository.default_branch
+                && pointedRun.head_repository?.full_name === expectedRepository
+                && pointedRun.status === 'completed'
+                && pointedIsQueue === isMergeQueueRun
+                && pointedPullNumber === pullNumber
+                && pointedCandidateSha === candidateSha
+                && Number.isSafeInteger(pointedApprovalId)
+                && Number.isSafeInteger(pointedAttempt)
+                && pointedAttempt >= 1;
+              if (!trustedPointedRun) {
+                core.notice(`Ignoring untrusted pointed run ${pointedRunId}.`);
+                return;
+              }
 
-            load_pr_context "$(jq -r '.number' <<< "$pr")"
-          }
+              core.info(`Reconciling current run ${pointedRunId} instead of stale run ${run.id}.`);
+              run = pointedRun;
+              currentAttempt = pointedAttempt;
+              pullTitleMatch = pointedPullMatch;
+              queueTitleMatch = pointedQueueMatch;
+              isMergeQueueRun = pointedIsQueue;
+              titleMatch = pointedTitleMatch;
+              pullNumber = pointedPullNumber;
+              candidateSha = pointedCandidateSha;
+              approvedHeadSha = pointedIsQueue ? pointedTitleMatch[3] : candidateSha;
+              approvalCommentId = pointedApprovalId;
+              currentJobs = await loadCurrentJobs();
+              refreshAuthorization();
+              pointedContexts = expectedContexts.filter(
+                (statusContext) => latestStatuses.get(statusContext)?.target_url === run.html_url,
+              );
+              if ((workflow.kind === 'e2e' && pointedContexts.length === 0)
+                  || (workflow.kind !== 'e2e' && pointedContexts.length !== 1)) {
+                core.notice(`Pointed run ${run.id} no longer owns a required status.`);
+                return;
+              }
+            }
 
-          resolve_context() {
-            if [ "$EVENT_NAME" = "pull_request_target" ]; then
-              resolve_pull_request_event
-            elif [ "$EVENT_NAME" = "merge_group" ]; then
-              resolve_merge_group_event
-            elif [ "$EVENT_NAME" = "workflow_run" ]; then
-              resolve_workflow_run_event
-            else
-              echo "Unsupported event '$EVENT_NAME'."
-              exit 1
-            fi
+            const postDispatchStatus = async (
+              statusContext,
+              state,
+              description,
+              targetUrl = run.html_url,
+            ) => {
+              if (!await attemptIsStillCurrent()) return false;
+              const currentStatuses = await loadLatestStatuses();
+              if (currentStatuses.get(statusContext)?.target_url !== run.html_url) {
+                core.notice(
+                  `Ignoring run ${run.id}: ${statusContext} now points to a newer run.`,
+                );
+                return false;
+              }
+              await postStatus(
+                candidateSha,
+                statusContext,
+                state,
+                description,
+                targetUrl,
+              );
+              return true;
+            };
 
-            STATUS_TARGET_URL="${STATUS_TARGET_URL:-https://github.com/$GH_REPO/actions}"
-          }
+            const failPointedContexts = async (
+              description,
+              targetUrl = run.html_url,
+            ) => {
+              for (const statusContext of pointedContexts) {
+                await postDispatchStatus(
+                  statusContext,
+                  'failure',
+                  description,
+                  targetUrl,
+                );
+              }
+            };
 
-          verify_mirror() {
-            local context="$1"
-            local mirror_sha
+            let pull;
+            let comment;
+            try {
+              ({ data: pull } = await github.rest.pulls.get({
+                ...context.repo,
+                pull_number: pullNumber,
+              }));
+              ({ data: comment } = await github.rest.issues.getComment({
+                ...context.repo,
+                comment_id: approvalCommentId,
+              }));
+            } catch (error) {
+              core.warning(`Could not reload PR approval: ${error.message}`);
+              await failPointedContexts('Exact-SHA approval is no longer valid');
+              return;
+            }
 
-            if [ "$CONTEXT_KIND" = "merge_group" ]; then
-              return 0
-            fi
+            const expectedIssueUrl = `${context.apiUrl}/repos/${expectedRepository}/issues/${pullNumber}`;
+            const expectedCommand = `/ok to test ${approvedHeadSha}`;
+            const pullIsCurrent = pull.state === 'open'
+              && !pull.draft
+              && pull.base.repo.full_name === expectedRepository
+              && pull.base.ref === repository.default_branch
+              && pull.head.sha === approvedHeadSha;
+            const commentMatches = comment.issue_url === expectedIssueUrl
+              && comment.body.trim() === expectedCommand
+              && Boolean(comment.user?.login);
+            // The approval authorizes immutable candidate code. A non-queue run
+            // may finish after its original PR closes or moves to another SHA;
+            // queue runs still require the exact live PR and queue entry below.
+            if (!commentMatches || (isMergeQueueRun && !pullIsCurrent)) {
+              await failPointedContexts('Exact-SHA approval is no longer valid');
+              return;
+            }
 
-            mirror_sha=$(gh api "repos/$GH_REPO/branches/$MIRROR_REF" --jq '.commit.sha' 2>/dev/null || true)
-            if [ -z "$mirror_sha" ]; then
-              post_status "$context" pending "Waiting for /ok to test mirror" "$STATUS_TARGET_URL"
-              return 1
-            fi
+            let permission;
+            try {
+              const response = await github.rest.repos.getCollaboratorPermissionLevel({
+                ...context.repo,
+                username: comment.user.login,
+              });
+              permission = response.data.permission;
+            } catch (error) {
+              core.warning(`Could not reload approver permission: ${error.message}`);
+              await failPointedContexts('Exact-SHA approval is no longer valid');
+              return;
+            }
+            if (!['admin', 'maintain', 'write'].includes(permission)) {
+              await failPointedContexts('Exact-SHA approval is no longer valid');
+              return;
+            }
 
-            if [ "$mirror_sha" != "$HEAD_SHA" ]; then
-              post_status "$context" pending "Waiting for /ok to test mirror" "$STATUS_TARGET_URL"
-              return 1
-            fi
+            if (isMergeQueueRun) {
+              let queueData;
+              try {
+                queueData = await github.graphql(
+                  `query($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      pullRequest(number: $number) {
+                        isInMergeQueue
+                        mergeQueueEntry {
+                          id
+                          state
+                          baseCommit { oid }
+                          headCommit { oid }
+                          pullRequest {
+                            number
+                            state
+                            isDraft
+                            headRefOid
+                            baseRefName
+                            repository { nameWithOwner }
+                          }
+                        }
+                      }
+                    }
+                  }`,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    number: pullNumber,
+                  },
+                );
+              } catch (error) {
+                core.warning(`Could not reload merge queue entry: ${error.message}`);
+                await failPointedContexts('Merge queue revision is no longer current');
+                return;
+              }
+              const queuedPull = queueData.repository?.pullRequest;
+              const entry = queuedPull?.mergeQueueEntry;
+              const baseSha = entry?.baseCommit?.oid;
+              const entryPull = entry?.pullRequest;
+              const queueEntryIsCurrent = queuedPull?.isInMergeQueue
+                && entry
+                && /^[0-9a-f]{40}$/.test(baseSha || '')
+                && entry.headCommit?.oid === candidateSha
+                && entryPull?.number === pullNumber
+                && entryPull.state === 'OPEN'
+                && !entryPull.isDraft
+                && entryPull.headRefOid === approvedHeadSha
+                && entryPull.baseRefName === repository.default_branch
+                && entryPull.repository?.nameWithOwner === expectedRepository;
+              if (!queueEntryIsCurrent) {
+                await failPointedContexts('Merge queue revision is no longer current');
+                return;
+              }
 
-            return 0
-          }
+              const queueRef = `heads/gh-readonly-queue/${repository.default_branch}`
+                + `/pr-${pullNumber}-${baseSha}`;
+              let queueRefData;
+              try {
+                ({ data: queueRefData } = await github.rest.git.getRef({
+                  ...context.repo,
+                  ref: queueRef,
+                }));
+              } catch (error) {
+                core.warning(`Could not reload merge queue ref: ${error.message}`);
+                await failPointedContexts('Merge queue revision is no longer current');
+                return;
+              }
+              if (queueRefData.object?.type !== 'commit'
+                  || queueRefData.object.sha !== candidateSha) {
+                await failPointedContexts('Merge queue revision is no longer current');
+                return;
+              }
+            }
 
-          evaluate_workflow() {
-            local context="$1"
-            local workflow_file="$2"
-            local workflow_name="$3"
-            local required_label="${4:-}"
-            local required_job_name="${5:-}"
-            local workflow_url="https://github.com/$GH_REPO/actions/workflows/$workflow_file"
+            if (workflow.kind === 'standard') {
+              await finishStandardGate(
+                candidateSha,
+                async (state, description) => {
+                  await postDispatchStatus(workflow.gate, state, description);
+                },
+              );
+              return;
+            }
 
-            if [ "$CONTEXT_KIND" = "pull_request" ] && [ -n "$required_label" ] && ! has_label "$required_label"; then
-              post_status "$context" success "$required_label not applied" "$STATUS_TARGET_URL"
-              return 0
-            fi
+            let openPulls;
+            try {
+              openPulls = await github.paginate(github.rest.pulls.list, {
+                ...context.repo,
+                state: 'open',
+                base: repository.default_branch,
+                per_page: 100,
+              });
+            } catch (error) {
+              core.setFailed(`Could not resolve current E2E requirements: ${error.message}`);
+              return;
+            }
+            const requiredLabels = new Set(openPulls
+              .filter((candidate) =>
+                !candidate.draft
+                && candidate.base?.repo?.full_name === expectedRepository
+                && candidate.base?.ref === repository.default_branch
+                && candidate.head?.sha === candidateSha)
+              .flatMap((candidate) =>
+                (candidate.labels || []).map((label) => label.name)));
+            const runSelection = {
+              'test:e2e': pullTitleMatch?.[4] === 'true',
+              'test:e2e-gpu': pullTitleMatch?.[5] === 'true',
+              'test:e2e-kubernetes': pullTitleMatch?.[6] === 'true',
+            };
+            const missingSelection = Object.entries(runSelection)
+              .find(([label, selected]) => requiredLabels.has(label) && !selected);
+            if (missingSelection) {
+              await failPointedContexts(
+                `E2E selection no longer covers ${missingSelection[0]}`,
+                pull.html_url,
+              );
+              return;
+            }
 
-            if ! verify_mirror "$context"; then
-              return 0
-            fi
+            const statusLabels = new Map([
+              [gates.coreE2e, 'test:e2e'],
+              [gates.gpuE2e, 'test:e2e-gpu'],
+            ]);
+            const requiredContexts = new Set();
+            for (const statusContext of pointedContexts) {
+              const label = statusLabels.get(statusContext);
+              if (requiredLabels.has(label)) {
+                requiredContexts.add(statusContext);
+                continue;
+              }
+              await postDispatchStatus(
+                statusContext,
+                'success',
+                `${label} not applied`,
+                pull.html_url,
+              );
+            }
 
-            local runs latest run_id status conclusion run_url real_success
-            runs=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=$WORKFLOW_EVENT" --jq '.workflow_runs')
-            if [ -n "${EXPECTED_HEAD_BRANCH:-}" ]; then
-              latest=$(jq -c --arg branch "$EXPECTED_HEAD_BRANCH" '[.[] | select(.head_branch == $branch)] | sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
-            else
-              latest=$(jq -c 'sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
-            fi
-
-            if [ -z "$latest" ]; then
-              post_status "$context" pending "Waiting for $workflow_name" "$workflow_url"
-              return 0
-            fi
-
-            run_id=$(jq -r '.id' <<< "$latest")
-            status=$(jq -r '.status' <<< "$latest")
-            conclusion=$(jq -r '.conclusion' <<< "$latest")
-            run_url=$(jq -r '.html_url' <<< "$latest")
-
-            if [ "$status" != "completed" ]; then
-              post_status "$context" pending "$workflow_name is $status" "$run_url"
-              return 0
-            fi
-
-            if [ -n "$required_job_name" ]; then
-              local jobs required_job job_status job_conclusion
-              jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" | jq -s '[.[].jobs[]]')
-              required_job=$(jq -c --arg name "$required_job_name" '[.[] | select(.name == $name)] | .[0] // empty' <<< "$jobs")
-
-              if [ -z "$required_job" ]; then
-                if [ "$conclusion" = "success" ]; then
-                  post_status "$context" pending "Waiting for $required_job_name" "$run_url"
-                else
-                  post_status "$context" failure "$required_job_name did not run" "$run_url"
-                fi
-                return 0
-              fi
-
-              job_status=$(jq -r '.status' <<< "$required_job")
-              job_conclusion=$(jq -r '.conclusion' <<< "$required_job")
-
-              if [ "$job_status" != "completed" ]; then
-                post_status "$context" pending "$required_job_name is $job_status" "$run_url"
-                return 0
-              fi
-
-              if [ "$job_conclusion" = "success" ]; then
-                post_status "$context" success "$required_job_name passed" "$run_url"
-              elif [ "$job_conclusion" = "skipped" ] && [ "$conclusion" = "success" ]; then
-                post_status "$context" pending "Waiting for $required_job_name" "$run_url"
-              else
-                post_status "$context" failure "$required_job_name concluded $job_conclusion" "$run_url"
-              fi
-              return 0
-            fi
-
-            if [ "$conclusion" != "success" ]; then
-              post_status "$context" failure "$workflow_name concluded $conclusion" "$run_url"
-              return 0
-            fi
-
-            real_success=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" \
-              | jq -s '[.[].jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
-
-            if [ "$real_success" -lt 1 ]; then
-              post_status "$context" failure "No real CI jobs ran" "$run_url"
-              return 0
-            fi
-
-            post_status "$context" success "$workflow_name passed" "$run_url"
-          }
-
-          resolve_context
-
-          evaluate_workflow "OpenShell / Branch Checks" "branch-checks.yml" "Branch Checks"
-          # E2E is opt-in on PRs and does not run for merge groups.
-          if [ "$CONTEXT_KIND" != "merge_group" ]; then
-            evaluate_workflow "OpenShell / E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e" "Core E2E result"
-            evaluate_workflow "OpenShell / GPU E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e-gpu" "GPU E2E result"
-          else
-            post_status "OpenShell / E2E" success "Not applicable: E2E runs only on PRs" "$STATUS_TARGET_URL"
-            post_status "OpenShell / GPU E2E" success "Not applicable: GPU E2E runs only on PRs" "$STATUS_TARGET_URL"
-          fi
-          evaluate_workflow "OpenShell / Helm Lint" "helm-lint.yml" "Helm Lint"
+            if (!authorizationSucceeded) {
+              for (const statusContext of requiredContexts) {
+                await postDispatchStatus(
+                  statusContext,
+                  'failure',
+                  'PR revision authorization did not succeed',
+                );
+              }
+              return;
+            }
+            const resultJobs = new Map([
+              [gates.coreE2e, 'Core E2E result'],
+              [gates.gpuE2e, 'GPU E2E result'],
+            ]);
+            for (const statusContext of requiredContexts) {
+              const expectedJobName = resultJobs.get(statusContext);
+              const matchingJobs = currentJobs.filter((job) => job.name === expectedJobName);
+              const passed = matchingJobs.length === 1
+                && matchingJobs[0].status === 'completed'
+                && matchingJobs[0].conclusion === 'success';
+              await postDispatchStatus(
+                statusContext,
+                passed ? 'success' : 'failure',
+                passed ? `${expectedJobName} passed` : `${expectedJobName} did not pass`,
+              );
+            }

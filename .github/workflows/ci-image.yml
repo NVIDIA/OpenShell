@@ -17,7 +17,6 @@ env:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build-ci-image:
@@ -34,6 +33,9 @@ jobs:
             runner: linux-arm64-cpu8
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -89,6 +91,9 @@ jobs:
     needs: build-ci-image
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0

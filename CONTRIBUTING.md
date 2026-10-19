@@ -70,7 +70,7 @@ Use agents and the repository skills as needed to understand the affected code, 
 
 Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTAINERS.md) before it can merge. This is enforced by the `OpenShell / Maintainer Approval` status check, which turns green once one of those reviewers approves. Reviews from other contributors are welcome and count toward the general approval requirement, but they do not satisfy this check.
 
-Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
+Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). Trusted PR CI rejects workflow-file changes from forks before candidate code runs. After reviewing an intended workflow contribution, a maintainer must recreate it on a branch in the NVIDIA repository.
 
 Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
@@ -413,7 +413,7 @@ Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor br
 
 For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
-Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
+Branches created by automation, such as Dependabot branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
 ### Choose Verification for the Change
 
@@ -507,7 +507,7 @@ git commit --signoff --message "feat(sandbox): add new capability"
 DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
 
 - **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
-- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+- **Cryptographic commit signing** is recommended but does not admit a revision to self-hosted CI. A maintainer must approve every exact PR head SHA; see [CI.md](CI.md#commit-signing).
 
 ### PR testing checklist
 
@@ -515,4 +515,4 @@ Only mark a checklist item as complete after you have run and verified it, not a
 
 ## CI
 
-How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How exact-SHA PR CI admission works, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, and commit-signing setup are documented in [CI.md](CI.md).

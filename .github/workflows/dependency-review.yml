@@ -5,8 +5,6 @@ name: Dependency Review
 
 on:
   pull_request:
-  merge_group:
-    types: [checks_requested]
   workflow_dispatch:
     inputs:
       base_sha:
@@ -30,8 +28,8 @@ jobs:
     name: Dependency Review (informational)
     runs-on: ubuntu-latest
     env:
-      BASE_REF: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || inputs.base_sha }}
-      HEAD_REF: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || inputs.head_sha }}
+      BASE_REF: ${{ github.event.pull_request.base.sha || inputs.base_sha }}
+      HEAD_REF: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
     steps:
       - name: Check Dependency Graph availability
         id: preflight

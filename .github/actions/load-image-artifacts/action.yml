@@ -1,0 +1,95 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Load image artifacts
+description: Download artifact-only OpenShell image builds into a local container engine
+
+inputs:
+  engine:
+    description: Container engine used to load the images
+    required: false
+    default: docker
+  components:
+    description: Space-separated OpenShell image components to load
+    required: false
+    default: sandbox supervisor
+  image-tag:
+    description: Expected tag on each loaded OpenShell image
+    required: true
+  artifact-run-id:
+    description: Workflow run containing the image artifacts; defaults to the current run
+    required: false
+    default: ""
+  platform:
+    description: Image platform to load (native, linux/amd64, or linux/arm64)
+    required: false
+    default: native
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      with:
+        pattern: image-*
+        path: ${{ runner.temp }}/openshell-image-artifacts
+        github-token: ${{ github.token }}
+        repository: ${{ github.repository }}
+        run-id: ${{ inputs.artifact-run-id || github.run_id }}
+
+    - name: Load OpenShell images
+      shell: bash
+      env:
+        ARTIFACT_ROOT: ${{ runner.temp }}/openshell-image-artifacts
+        COMPONENTS: ${{ inputs.components }}
+        ENGINE: ${{ inputs.engine }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        PLATFORM: ${{ inputs.platform }}
+      run: |
+        set -euo pipefail
+        case "$ENGINE" in
+          docker | podman) ;;
+          *) echo "ERROR: unsupported container engine: $ENGINE" >&2; exit 1 ;;
+        esac
+        if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+          echo "ERROR: invalid image tag: $IMAGE_TAG" >&2
+          exit 1
+        fi
+        case "$PLATFORM" in
+          native)
+            case "$(uname -m)" in
+              amd64 | x86_64) arch=amd64 ;;
+              arm64 | aarch64) arch=arm64 ;;
+              *) echo "ERROR: unsupported native architecture: $(uname -m)" >&2; exit 1 ;;
+            esac
+            ;;
+          linux/amd64) arch=amd64 ;;
+          linux/arm64) arch=arm64 ;;
+          *) echo "ERROR: unsupported image platform: $PLATFORM" >&2; exit 1 ;;
+        esac
+        expected_platform="linux/${arch}"
+        read -r -a components <<< "$COMPONENTS"
+        if [ "${#components[@]}" -eq 0 ]; then
+          echo "ERROR: at least one image component is required" >&2
+          exit 1
+        fi
+        for component in "${components[@]}"; do
+          case "$component" in
+            gateway | sandbox | supervisor) ;;
+            *) echo "ERROR: unsupported OpenShell image component: $component" >&2; exit 1 ;;
+          esac
+          archive="${ARTIFACT_ROOT}/image-${component}/images/${component}-linux-${arch}.tar"
+          if [ ! -f "$archive" ]; then
+            echo "ERROR: image archive not found: $archive" >&2
+            exit 1
+          fi
+          "$ENGINE" load --input "$archive"
+          image="ghcr.io/nvidia/openshell/${component}:${IMAGE_TAG}"
+          loaded_platform=$(
+            "$ENGINE" image inspect "$image" --format '{{.Os}}/{{.Architecture}}'
+          )
+          if [ "$loaded_platform" != "$expected_platform" ]; then
+            echo "ERROR: $image has platform $loaded_platform; expected $expected_platform" >&2
+            exit 1
+          fi
+          echo "Loaded $image for $expected_platform"
+        done

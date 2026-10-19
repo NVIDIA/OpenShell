@@ -148,6 +148,7 @@ jobs:
     uses: ./.github/workflows/build-images.yml
     with:
       image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      push-images: true
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-python-wheel:

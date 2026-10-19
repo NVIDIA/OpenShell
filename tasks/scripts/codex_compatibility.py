@@ -207,7 +207,7 @@ def main() -> None:
     parser.add_argument(
         "--base-ref", default="", help="Target ref for a branch review."
     )
-    parser.add_argument("--pr-number", default=0, type=int, help="Mirrored PR number.")
+    parser.add_argument("--pr-number", default=0, type=int, help="Approved PR number.")
     args = parser.parse_args()
     result = run_review(
         args.candidate, args.source_sha, args.output_dir, args.base_ref, args.pr_number

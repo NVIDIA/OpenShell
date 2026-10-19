@@ -25,6 +25,10 @@ inputs:
   registry-password:
     description: Registry password
     required: true
+  use-image-artifacts:
+    description: Load OpenShell images from workflow artifacts instead of GHCR
+    required: false
+    default: "false"
   mise-version:
     description: mise release to install
     required: false
@@ -33,11 +37,20 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/setup-mise
+    - uses: $/.github/actions/setup-mise
       with:
         version: ${{ inputs.mise-version }}
 
+    - if: inputs.use-image-artifacts == 'true'
+      uses: $/.github/actions/load-image-artifacts
+      with:
+        engine: docker
+        components: ${{ inputs.images }}
+        image-tag: ${{ inputs.image-tag }}
+        platform: linux/amd64
+
     - name: Log in to GHCR
+      if: inputs.use-image-artifacts != 'true'
       shell: bash
       env:
         REGISTRY: ${{ inputs.registry }}
@@ -67,6 +80,7 @@ runs:
         IMAGE_COMPONENTS: ${{ inputs.images }}
         IMAGE_TAG: ${{ inputs.image-tag }}
         REGISTRY: ${{ inputs.registry }}
+        USE_IMAGE_ARTIFACTS: ${{ inputs.use-image-artifacts }}
       run: |
         set -euo pipefail
         for component in $IMAGE_COMPONENTS; do
@@ -76,7 +90,9 @@ runs:
           esac
           image="${REGISTRY}/${component}:${IMAGE_TAG}"
           archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
-          docker pull --platform linux/amd64 "$image"
+          if [ "$USE_IMAGE_ARTIFACTS" != "true" ]; then
+            docker pull --platform linux/amd64 "$image"
+          fi
           docker image save --platform linux/amd64 --output "$archive" "$image"
           kind load image-archive "$archive" --name "$CLUSTER_NAME"
         done

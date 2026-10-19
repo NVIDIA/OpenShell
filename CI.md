@@ -6,16 +6,54 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 ## Overview
 
-PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
+PR CI that runs candidate code on NVIDIA self-hosted runners requires an
+exact-revision approval. A maintainer with Write, Maintain, or Admin access
+reviews the current revision and comments `/ok to test <SHA>`, using the full
+40-character PR head SHA. Every new commit requires a new approval.
+Commit statuses belong to the SHA rather than an individual PR. If several
+eligible open PRs share a head SHA, the dispatcher uses one valid exact-SHA
+approval and the union of their opt-in test labels. One PR therefore cannot
+publish a not-applicable result for a suite requested by another PR.
 
-When a PR is not mirrored automatically, anyone with Write, Maintain, or Admin
-access to this repository can admit its current revision with
-`/ok to test <SHA>`. This includes external maintainers with repository access.
-Manual admission does not change the bot's automatic trust policy for ready PRs.
+The trusted `PR CI Dispatch` workflow runs from the default branch. It verifies
+the command and the commenter's current permission, then dispatches `Branch
+Checks` and `Helm Lint` from the default branch with the PR number, approved
+head SHA, and approval comment ID. The dispatched workflow revalidates all
+three values before it checks out candidate code. Candidate jobs receive
+read-only tokens and cache access. PR image builds transfer images as workflow
+artifacts and do not log in to or publish to GHCR.
 
-`Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
+The self-hosted pools used for approved candidate jobs must provide a fresh,
+isolated runner and container daemon for every job. Do not route PR jobs to a
+persistent host, a shared Docker daemon, or a runner later reused by release
+jobs: candidate code is intentionally arbitrary, even though its token and
+cache permissions are read-only. Self-hosted images must run GitHub Actions
+Runner 2.336.0 or newer because trusted `$/.` self-repository action and
+reusable-workflow references require it.
 
-Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
+`PR CI Dispatch` posts PR-head statuses and ties each pending status to the
+exact run it creates. `Required CI Gates` completes a status only
+when its run URL, approved SHA, approval comment, current approver permission,
+and authorization job still match. Queue results additionally require the live
+PR, queue entry, and temporary Git ref. E2E suites remain opt-in because they
+are more expensive.
+
+Fork pull requests that add, remove, rename, or modify files under
+`.github/workflows/` are rejected before candidate code runs. A maintainer must
+recreate an intended workflow change on a branch in the NVIDIA repository after
+reviewing it. This keeps an untrusted merge-queue revision from adding its own
+`merge_group` trigger and requesting write permissions or repository secrets.
+The organization ruleset described under [Merge queue](#merge-queue) enforces
+the same policy with a required workflow whose identity is controlled outside
+this repository.
+
+Merge queue validation is a second integration gate for `main`. After a PR has
+passed the required PR-head statuses, a maintainer adds it to the merge queue.
+GitHub creates a temporary queue revision that combines the latest `main`, the
+queued PR, and any earlier queued PRs. The trusted dispatcher verifies that
+revision through the merge queue API and temporary Git ref before it starts CI.
+The same required `OpenShell / ...` status contexts are then published against
+the queue SHA before GitHub merges it.
 
 ### Protobuf API compatibility
 
@@ -67,11 +105,13 @@ For an intentional minor-train incompatibility, record the Buf finding,
 linked issue, consumer impact, and migration plan in the PR. Keep the finding
 visible; do not disable the job or add a broad Buf ignore rule.
 
-Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
-on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
+Windows PR checks are opt-in: add `test:windows`. If the current SHA is already
+approved, the dispatcher starts the Windows MSVC run. Otherwise, approve it
+with `/ok to test <SHA>` and the approval dispatches the labeled run.
 Windows checks are not required for merging and do not run in merge queues.
-Main and manual runs also build release binaries, with `continue-on-error: true`
-so Windows failures do not fail the workflow.
+Pushes to the `windows` branch and manual runs on that branch also build release
+binaries, with `continue-on-error: true` so Windows failures do not fail the
+workflow.
 
 ### Advisory compatibility review
 
@@ -99,9 +139,9 @@ established; acknowledgement does not override release policy. Reports lead with
 the concrete change, consumer impact, action, and PR, with coverage details
 collapsed.
 
-Mirrored PR branch runs with findings post a fresh PR comment on every run,
+Approved PR runs with findings post a fresh PR comment on every run,
 including reruns. Runs without findings post no comment. The publisher checks
-that the PR is still open at the reviewed head before commenting. Merge-group
+that the PR is still open at the reviewed head before commenting. Merge-queue
 and manual branch runs retain reports without posting PR comments. The reviewer
 has read access; a separate branch job has permission to publish comments.
 
@@ -165,12 +205,22 @@ Three opt-in labels enable the long-running E2E suites:
   (`replicaCount: 2` and bundled PostgreSQL) and the credential-driver suite
   (Kubernetes Secrets plus Vault) in `Branch E2E Checks`
 
-When multiple labels are present, `Branch E2E Checks` builds each generic multi-architecture artifact set once and fans out enabled suites in parallel. Runtime-specific reusable workflows define the Docker, Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman, KVM, kind, and mise setup. Each lane depends only on the artifact categories it consumes: VM does not wait for container-driver artifacts or supervisor images, and GPU does not wait for the gateway image. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E reuse matching prebuilt gateway and CLI binaries instead of compiling debug binaries in test jobs. Standalone-driver lanes additionally reuse driver-free gateway and compute-driver artifacts. Kubernetes managed-driver lanes consume published gateway and supervisor images, while the standalone-driver lane composes its gateway image from prebuilt binaries.
+When multiple labels are present, `Branch E2E Checks` builds each required
+image once per target architecture and fans out enabled suites in parallel.
+The shared image build uploads gateway, sandbox, and supervisor Docker archives
+as workflow artifacts; each consumer loads only the archives it needs after the
+shared build completes. Runtime-specific reusable workflows define the Docker,
+Podman, VM, and Kubernetes lanes. Composite actions own the replaceable Podman,
+KVM, kind, and mise setup. Docker, Podman, GPU, Rust, Python, MCP, and VM E2E
+reuse matching prebuilt gateway and CLI binaries instead of compiling debug
+binaries in test jobs. Standalone-driver lanes additionally reuse driver-free
+gateway and compute-driver artifacts. Kubernetes managed-driver lanes load the
+gateway and supervisor image artifacts, while the standalone-driver lane
+composes its gateway image from prebuilt binaries.
 The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while Kubernetes HA and credential-driver behavior are under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
-The GitHub ruleset should require the `OpenShell / ...` statuses published by
-`Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
-push-triggered workflow jobs themselves.
+The GitHub ruleset should require the four `OpenShell / ...` statuses published
+by `Required CI Gates`, not the dispatched workflow jobs themselves.
 
 ### K3s conformance version baseline
 
@@ -189,12 +239,15 @@ diagnostics as `tmachine-diagnostics-*` artifacts.
 
 ### Run only the policy advisor conformance tests
 
-Manually dispatch `Integration Tests` on the candidate branch with an
-`artifact-run-id` from a build of the same commit. When a `Release` or `Pre-release` run was
-dispatched from a different commit, also set `source-sha` to the release tag's
-resolved commit so runtime images and test inputs match the candidate binaries.
-Otherwise, `source-sha` defaults to the artifact run's head SHA. Set `category`
-to `policy-advisor` and `test-matrix` to:
+Manually dispatch `Integration Tests` with an `artifact-run-id` from the
+candidate build and its exact `source-sha`. Set `checkout-repository` when the
+commit belongs to a fork; it defaults to this repository. The workflow loads
+the binaries and packages from that artifact run and checks out the same source
+revision for the test definitions. Keep `use-image-artifacts` enabled to load
+the runtime images from a Branch E2E or pull request run. Disable it only for a
+Release Dev, Release, or Pre-release run whose exact-SHA runtime images were published in
+GHCR. There is no automatic registry fallback. Set `category` to
+`policy-advisor` and `test-matrix` to:
 
 ```json
 [{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
@@ -209,7 +262,7 @@ required PR E2E gate.
 
 Security workflow compute runs directly on GitHub-hosted runners instead of
 NVIDIA self-hosted runners. The PR-oriented workflows receive no secrets and run
-on fork pull requests without waiting for copy-pr-bot. Codex Security release
+on fork pull requests without waiting for exact-SHA approval. Codex Security release
 qualification is the exception: it runs only for maintainer-created
 pre-release tags and receives a scoped NVIDIA Inference API key for the scan
 step. Scanner jobs request `security-events: write` to publish SARIF to Code
@@ -248,9 +301,9 @@ scanners upload results directly:
   enforcement remain part of RFC 0014 and are not implemented by this workflow.
 
 Findings do not fail these workflows. Tool startup, configuration, build, and
-analysis failures still fail so a broken scanner cannot appear healthy. The
-PR-oriented reports also run on merge groups; CodeQL is not a PR or merge-queue
-check. None of these reports are required statuses or gate merges.
+analysis failures still fail so a broken scanner cannot appear healthy. CodeQL
+is not a PR or merge-queue check. None of these reports are required statuses or
+gate merges.
 
 Run the workflow-definition scanners locally with:
 
@@ -423,15 +476,15 @@ Use a fresh `TRIVY_REPORT_DIR` for each scan session. `prepare-sarif` creates
 ### Pull-request change gate
 
 `Trivy Changes` scans the base and candidate when a pull request changes
-deployment configuration or scanner inputs; merge groups and manual runs always
-scan. It fails only for new `HIGH` or `CRITICAL` misconfigurations and retains
+deployment configuration or scanner inputs; manual runs always scan. It fails
+only for new `HIGH` or `CRITICAL` misconfigurations and retains
 both report sets.
 
 For pull requests, change detection compares the exact tested merge commit with
 its first parent. Both detection and scanning use that same pair. This excludes
 unrelated changes on `main` even when the event carries an older base SHA or a
-job is rerun. Merge groups use the event's base SHA; manual runs use the supplied
-base and head. A missing revision or invalid PR merge checkout fails the gate.
+job is rerun. Manual runs use the supplied base and head. A missing revision or
+invalid PR merge checkout fails the gate.
 
 The candidate ignore file is validated, but the baseline policy applies to both
 scans so a change cannot exempt its own finding. Existing profiles are compared
@@ -443,7 +496,9 @@ operating-system CVEs remain the responsibility of the standalone scan.
 
 ## Commit signing
 
-copy-pr-bot decides whether to mirror a PR automatically based on whether the author is trusted. For org members and collaborators, "trusted" means **all commits in the PR are cryptographically signed**. Unsigned commits, even from an org member, force the bot to wait for a maintainer's `/ok to test <SHA>`.
+Cryptographic commit signing is recommended, but it does not admit a revision
+to self-hosted PR CI. Every candidate revision requires a maintainer's exact
+`/ok to test <SHA>` approval, whether the commits are signed or unsigned.
 
 DCO sign-off (`-s` / `Signed-off-by`) is a separate requirement and does not count as commit signing. Dependabot-authored dependency update PRs are allowlisted in DCO Assistant because the bot cannot sign commits.
 
@@ -478,39 +533,34 @@ If you already use an SSH key for `git push`, you can reuse it as a signing key.
 
 ## Pull request flows
 
-### Internal contributor PR
+### Pull request CI
 
 Prerequisites:
 
-- Org member or collaborator on the repo.
-- All commits cryptographically signed (see [Commit signing](#commit-signing)).
 - All commits include a DCO sign-off (`git commit -s`).
-
-Flow:
-
-1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
-2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
-3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
-4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
-5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
-6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
-7. When the PR is ready to merge, use **Add to merge queue** instead of merging directly. The queue validates the final integration state before updating `main`.
-
-### PR requiring manual admission
-
-Prerequisites:
-
-- DCO sign-off (`git commit -s`) on every commit. Manual admission does not require cryptographic commit signing.
-- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
+- First-time external contributors must be vouched. See the
+  [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
 1. Open the PR. The vouch check confirms first-time external contributors are vouched (otherwise their PRs are auto-closed).
-2. If copy-pr-bot does not mirror it automatically, a maintainer with Write access or greater reviews the diff and comments `/ok to test <SHA>` with the latest commit SHA. Fork location alone does not determine whether a PR is mirrored automatically.
-3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to automatically admitted PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
-4. When the PR is ready to merge, maintainers add it to the merge queue so the queued integration state is tested before it reaches `main`.
-
-Important: if a PR requires manual admission, every new commit needs another `/ok to test <new-SHA>` from a maintainer with Write access or greater before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
+2. A maintainer with Write access or greater reviews the exact diff and comments
+   `/ok to test <SHA>` with the full current head SHA. `PR CI Dispatch` starts
+   `Branch Checks` and `Helm Lint` from the trusted default-branch definitions.
+3. For extended testing, apply `test:e2e`, `test:e2e-gpu`,
+   `test:e2e-kubernetes`, and/or `test:windows`. If the current SHA is already
+   approved, applying the label dispatches the corresponding workflow. Labels
+   already present when the approval is posted are dispatched with the standard
+   checks.
+4. `Required CI Gates` keeps each required status tied to the exact dispatched
+   run and turns it green when that run succeeds. When open PRs share the same
+   head SHA, the dispatcher applies their combined opt-in test requirements.
+5. Every new commit returns the standard statuses to pending. A maintainer must
+   review the new diff and post `/ok to test <new-SHA>` before candidate code
+   runs again.
+6. When the PR is ready to merge, use **Add to merge queue** instead of merging
+   directly. The queue validates the final integration state before updating
+   `main`.
 
 ## Merge queue
 
@@ -518,59 +568,141 @@ GitHub merge queue is required for `main`. Repository administrators must enable
 
 - `OpenShell / Branch Checks`
 - `OpenShell / Helm Lint`
-- `OpenShell / Trivy Changes`
+- `OpenShell / E2E`
+- `OpenShell / GPU E2E`
 
-`Required CI Gates` publishes the stable statuses for mirror-based workflows.
-`Trivy Changes` runs directly on pull requests and merge groups and publishes
-its own stable result status.
+Keep **Only merge non-failing pull requests** enabled (`ALLGREEN`) and restrict
+ruleset bypass to repository administrators.
 
-Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
+The merge queue also requires an organization or enterprise **Require workflows
+to pass** rule. Commit-status names and their GitHub Actions source do not prove
+which workflow definition produced them: a candidate workflow can use the same
+job names. GitHub can also suppress `pull_request_target` for head branch names
+that resemble commit SHAs. The required-workflow rule supplies the independent
+workflow identity and must be active before fork pull requests can enter the
+queue.
 
-- `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs. `Required CI Gates` publishes successful not-applicable statuses for both E2E contexts on merge-group events and subsequent merge-group workflow completions.
-- `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
-- `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
-- `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
+Define the policy workflow in a separate, protected, public NVIDIA repository
+and pin its exact commit SHA in the ruleset. It must:
 
-Maintainers should add ready PRs to the queue rather than pressing a direct merge button. GitHub removes a PR from the queue if the merge-group checks fail or time out.
+- trigger on both `pull_request` and `merge_group`
+- use read-only `contents` and `pull-requests` permissions
+- avoid candidate checkout, local actions, or any candidate code execution
+- fail closed for a fork PR unless the immutable `.github/workflows` tree at
+  the exact fork head equals the tree at its exact merge base
 
-## copy-pr-bot
+Target only `NVIDIA/OpenShell` and its default branch. The rule parameters have
+this shape; replace the placeholders with the trusted source repository ID and
+40-character source commit:
 
-[copy-pr-bot](https://github.com/apps/copy-pr-bot) is a GitHub App maintained by NVIDIA that solves a specific GitHub Actions security problem: by default, `pull_request`-triggered workflows on a self-hosted runner can run an arbitrary contributor's code on hardware the project owns. For projects that need self-hosted runners (GPU access, ARM hardware, on-prem secrets), GitHub's recommended pattern is to never trigger workflows directly from external `pull_request` events.
+```json
+{
+  "type": "workflows",
+  "parameters": {
+    "do_not_enforce_on_create": false,
+    "workflows": [
+      {
+        "repository_id": 123456789,
+        "path": ".github/workflows/openshell-workflow-policy.yml",
+        "sha": "0123456789abcdef0123456789abcdef01234567"
+      }
+    ]
+  }
+}
+```
 
-copy-pr-bot enforces that pattern. When a PR is opened against this repository, the bot evaluates whether the change is trusted - by default, only commits authored by org members and signed with a verified key are trusted, and forks always need an explicit per-SHA approval. Once a change passes that check, the bot mirrors the PR head into a branch named `pull-request/<N>` inside this repository. Our self-hosted workflows then trigger on `push` to those mirror branches, never on the original `pull_request` event.
+Keep the four required statuses below in addition to this rule: they carry the
+exact-SHA approval and test results, while the required workflow establishes
+non-spoofable policy identity. Test the rule in evaluate mode with a fork PR and
+the merge queue, then make it active. Until it is active, do not approve
+candidate Actions workflows or enqueue fork PRs.
 
-The user-visible consequences inside this repo:
+No repository workflow runs directly on `merge_group`, because GitHub loads
+that workflow definition from the synthetic revision being tested. A fork could
+otherwise add the trigger back to an existing workflow and request a write
+token. The trusted dispatcher and authorizer therefore compare the immutable
+`.github/workflows` Git tree at the exact fork head with the tree at its merge
+base and reject any difference.
 
-- A PR cannot run E2E until copy-pr-bot has mirrored it. For trusted authors this happens within seconds of opening the PR; for forked PRs it requires a maintainer to comment `/ok to test <SHA>`.
-- New commits to a fork need a fresh `/ok to test <new-SHA>` before the mirror updates.
-- The `pull-request/<N>` branches are not for humans to push to - they are managed by the bot.
+`PR CI Dispatch` handles enqueue and dequeue events from the default branch,
+rescans after updates to `main`, and runs a five-minute scheduled reconciliation
+as a fallback. For every current queue entry it verifies the GraphQL entry, the
+matching `gh-readonly-queue` Git ref, and the workflow-change policy before it
+dispatches trusted default-branch workflow definitions. Reconciliation is
+idempotent and does not replace a current run.
 
-The bot's full administrator documentation is internal to NVIDIA. The only command contributors may see in PR comments is `/ok to test <SHA>`, used by maintainers to approve a specific commit on a forked PR for testing.
+In the queue:
+
+- `Branch Checks` runs the standard non-E2E gates on the exact queue SHA.
+- `Helm Lint` compares the queue revision with its queue base.
+- E2E suites remain opt-in on PRs. The dispatcher publishes successful
+  not-applicable statuses for both E2E contexts on queue revisions.
+- `Required CI Gates` accepts only the exact dispatched run recorded in the
+  pending status. It repeats the approval, queue entry, Git ref, authorization
+  job, and result checks before publishing success.
+- The exact `/ok to test <PR-head-SHA>` approval remains required while the PR
+  is queued.
+
+Maintainers should add ready PRs to the queue rather than pressing a direct
+merge button. GitHub removes a PR from the queue if its checks fail or time out.
+
+## PR CI dispatch controller
+
+PR checks do not run candidate workflow definitions or copy candidate commits
+to internal branches. `.github/copy-pr-bot.yaml` keeps copy-pr-bot disabled.
+
+`PR CI Dispatch` handles approval comments, opt-in test labels, and merge queue
+reconciliation without checking out candidate code. It dispatches a target
+workflow at the repository's default branch and passes the PR number, exact
+head SHA, approval comment ID, and, for queue work, the verified synthetic SHA
+as inputs. The target workflow uses the trusted `authorize-pr-ci` action before
+checkout to verify that:
+
+- the PR is open, ready for review, and targets the default branch
+- the supplied SHA is still the current PR head
+- the supplied comment belongs to the PR and exactly equals
+  `/ok to test <SHA>`
+- the commenter still has Write, Maintain, or Admin permission
+- a fork PR's immutable `.github/workflows` tree is identical to the tree at
+  its exact merge base
+- a supplied queue SHA is still the PR's current GraphQL queue entry and the
+  corresponding temporary Git ref resolves to that SHA
+
+The dispatcher records the returned run URL in the pending commit status.
+`Required CI Gates` accepts completion only from that exact run and repeats the
+SHA, approval, permission, and authorization-job checks. Queue runs also repeat
+the current PR, queue entry, and Git-ref checks. A stale run cannot complete the
+status for a newer revision.
+
+Candidate jobs check out the approved SHA only after authorization. Trusted
+composite actions are loaded from the workflow revision, tokens and caches are
+read-only, and PR container images remain Actions artifacts. Workflows that
+publish releases continue to run only from trusted branches or tags.
 
 ## Workflow files
 
 | File | Role |
 |---|---|
-| `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
+| `.github/workflows/pr-ci-dispatch.yml` | Verifies exact-SHA maintainer approvals, reconciles merge queue entries, and dispatches trusted default-branch workflows. It does not check out candidate code. |
+| `.github/workflows/branch-checks.yml` | Required non-E2E checks, dispatched from the trusted default branch for approved PR and verified queue SHAs. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E, dispatched for approved PR SHAs selected by `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes`. Merge groups do not run E2E. |
+| `.github/workflows/windows-msvc.yml` | Opt-in Windows lint and tests, dispatched for approved PR SHAs labeled `test:windows`, plus advisory cache seeding and binary builds on the `windows` branch. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
-| `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
+| `.github/workflows/build-images.yml` | Builds container images. Approved PR runs upload per-architecture Docker archives without registry authentication; release callers explicitly enable multi-platform publication. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
 | `.github/workflows/e2e-docker-test.yml`, `e2e-podman-test.yml`, `e2e-vm-test.yml`, `e2e-kubernetes-test.yml` | Reusable runtime lanes called directly by branch and release workflows. Callers select suites and declare only the artifacts each runtime consumes. |
 | `.github/actions/setup-e2e-*` | Shared artifact, Podman, KVM, and kind setup used by the runtime lanes. |
-| `.github/workflows/helm-lint.yml` | Helm chart validation. PR mirror pushes skip lint jobs unless Helm inputs changed; merge groups always validate Helm because they represent the final integration state. |
+| `.github/workflows/helm-lint.yml` | Helm chart validation. Approved PR dispatches skip lint jobs unless Helm inputs changed; queue dispatches compare the synthetic revision with its queue base. |
 | `.github/actions/setup-nix/action.yml` | Installs Nix and configures the OpenShell Cachix cache, using read-only cache access when no authentication token is available. |
-| `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set for PR mirror pushes. Non-push events are allowed through. |
-| `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
-| `.github/workflows/required-ci-gates.yml` | Posts required PR-head and merge-group statuses for gated CI workflows. This is what branch protection and merge queue should require. |
-| `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
+| `.github/actions/authorize-pr-ci/action.yml` | Revalidates the PR, exact head SHA, approval comment, current approver permission, and optional queue entry/ref before a dispatched workflow checks out candidate code. |
+| `.github/workflows/required-ci-gates.yml` | Posts required PR-head and queue-revision statuses. Completions must match the exact run URL recorded by the trusted dispatcher. This is what branch protection and merge queue should require. |
+| `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, reminds maintainers of the exact-SHA approval command when the current revision is not approved. |
 | `.github/workflows/workflow-security.yml` | Runs informational Actionlint and High-severity Zizmor reports on GitHub-hosted runners. |
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
 | `.github/workflows/codex-compatibility.yml` | Reviews branch and cumulative tagged-release compatibility with Codex and retains advisory findings, PR acknowledgements, and coverage; it does not gate merging or publication. |
-| `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
+| `.github/workflows/trivy-changes.yml` | Scans pull requests for new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
 ## Release workflows
@@ -587,7 +719,7 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after an API-verified `Release Dev` push on `main` or maintainer dispatch and supports direct manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 
@@ -595,18 +727,14 @@ Require these statuses in the branch ruleset for PR and merge-queue CI:
 
 - `OpenShell / Branch Checks`
 - `OpenShell / Helm Lint`
-- `OpenShell / Trivy Changes`
+- `OpenShell / E2E` (`test:e2e` on PRs; not applicable in the merge queue)
+- `OpenShell / GPU E2E` (`test:e2e-gpu` on PRs; not applicable in the merge queue)
 
-The following statuses are opt-in and controlled by labels:
-
-- `OpenShell / E2E`: `test:e2e`
-- `OpenShell / GPU E2E`: `test:e2e-gpu`
-
-For mirror-based workflows, require the statuses published by
-`Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
-the stable result job of the direct pull-request workflow. Together these
-contexts prove the expected checks completed for the commit GitHub is about to
-merge.
+For dispatch-based workflows, require the statuses published by
+`Required CI Gates`, not their underlying jobs. Together these contexts prove
+the expected checks completed for the commit GitHub is about to merge. They do
+not replace the organization-level required workflow described under
+[Merge queue](#merge-queue).
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.

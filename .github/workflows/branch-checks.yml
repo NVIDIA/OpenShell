@@ -1,12 +1,35 @@
 name: Branch Checks
 
+run-name: >-
+  ${{ inputs.merge_group_sha != ''
+      && format('Branch Checks / merge group / PR #{0} / {1} / head {2} / approval {3}', inputs.pr_number, inputs.merge_group_sha, inputs.head_sha, inputs.approval_comment_id)
+      || inputs.pr_number != ''
+      && format('Branch Checks / PR #{0} / {1} / approval {2}', inputs.pr_number, inputs.head_sha, inputs.approval_comment_id)
+      || 'Branch Checks' }}
+
 on:
-  merge_group:
-    types: [checks_requested]
-  push:
-    branches:
-      - "pull-request/[0-9]+"
   workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number supplied by the trusted PR dispatcher
+        required: false
+        type: string
+        default: ""
+      head_sha:
+        description: Exact approved pull request head SHA
+        required: false
+        type: string
+        default: ""
+      approval_comment_id:
+        description: Exact-SHA maintainer approval comment
+        required: false
+        type: string
+        default: ""
+      merge_group_sha:
+        description: Exact synthetic merge queue SHA from the trusted dispatcher
+        required: false
+        type: string
+        default: ""
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,38 +40,35 @@ permissions:
   contents: read
   packages: read
 
+cache-mode: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.merge_group_sha || inputs.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
   pr_metadata:
-    name: Resolve PR metadata
+    name: Authorize PR revision
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      issues: read
       pull-requests: read
     outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-      base_sha: ${{ steps.gate.outputs.base_sha }}
-      pr_number: ${{ steps.pr-number.outputs.number }}
+      should_run: ${{ steps.authorize.outcome == 'success' }}
+      base_sha: ${{ steps.authorize.outputs.base-sha }}
+      checkout_repository: ${{ steps.authorize.outputs.checkout-repository }}
+      head_sha: ${{ steps.authorize.outputs.head-sha }}
+      pr_number: ${{ steps.authorize.outputs.pr-number }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - id: gate
-        uses: ./.github/actions/pr-gate
-
-      - id: pr-number
-        shell: bash
-        env:
-          PR_REF: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = push ] && [[ "$PR_REF" =~ ^pull-request/([0-9]+)$ ]]; then
-            echo "number=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
-          else
-            echo "number=0" >> "$GITHUB_OUTPUT"
-          fi
+      - id: authorize
+        uses: $/.github/actions/authorize-pr-ci
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pr-number: ${{ inputs.pr_number }}
+          head-sha: ${{ inputs.head_sha }}
+          approval-comment-id: ${{ inputs.approval_comment_id }}
+          merge-group-sha: ${{ inputs.merge_group_sha }}
 
   compatibility-review:
     name: Compatibility Review (advisory)
@@ -57,13 +77,13 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: ./.github/workflows/codex-compatibility.yml
+    uses: $/.github/workflows/codex-compatibility.yml
     with:
-      candidate_ref: ${{ github.sha }}
-      source_sha: ${{ github.sha }}
+      candidate_ref: ${{ needs.pr_metadata.outputs.head_sha }}
+      source_sha: ${{ needs.pr_metadata.outputs.head_sha }}
+      candidate_repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
       base_ref: >-
-        ${{ github.event.merge_group.base_sha
-            || needs.pr_metadata.outputs.base_sha
+        ${{ needs.pr_metadata.outputs.base_sha
             || format('refs/remotes/origin/{0}', github.event.repository.default_branch) }}
       pr_number: ${{ fromJSON(needs.pr_metadata.outputs.pr_number) }}
     secrets:
@@ -93,7 +113,7 @@ jobs:
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           PR_NUMBER: ${{ needs.pr_metadata.outputs.pr_number }}
-          SOURCE_SHA: ${{ github.sha }}
+          SOURCE_SHA: ${{ needs.pr_metadata.outputs.head_sha }}
         with:
           script: |
             const fs = require('node:fs');
@@ -124,14 +144,22 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/check-protobuf-compatibility
+      - name: Fetch target history and canonical tags
+        env:
+          BASE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          BASE_SHA: ${{ needs.pr_metadata.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          git for-each-ref --format='delete %(refname)' refs/tags | git update-ref --stdin
+          git -c core.hooksPath=/dev/null fetch --force --no-recurse-submodules \
+            "$BASE_REPOSITORY_URL" "$BASE_SHA" '+refs/tags/*:refs/tags/*'
+
+      - uses: $/.github/actions/check-protobuf-compatibility
         with:
-          ref: >-
-            ${{ github.event_name == 'workflow_dispatch'
-                && format('refs/remotes/origin/{0}', github.event.repository.default_branch)
-                || github.event.merge_group.base_sha
-                || needs.pr_metadata.outputs.base_sha }}
+          ref: ${{ needs.pr_metadata.outputs.base_sha }}
 
   mise-lockfile:
     name: mise Lockfile
@@ -146,6 +174,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -171,6 +203,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Install tools
         run: mise install --locked
@@ -189,10 +225,13 @@ jobs:
         shell: nix develop .#devShells.x86_64-linux.default -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: ./.github/actions/setup-nix
         with:
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
+
+      - uses: $/.github/actions/setup-nix
+        with:
           prepare-shell: "true"
           shell-installable: .#devShells.x86_64-linux.default
 
@@ -207,11 +246,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Format
         shell: nix develop -c bash -euo pipefail {0}
@@ -230,11 +272,14 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Verify Cargo lockfiles
         shell: nix develop -c bash -euo pipefail {0}
@@ -258,13 +303,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "false"
@@ -296,13 +344,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "true"
@@ -327,13 +378,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "false"
@@ -363,13 +415,16 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "false"
@@ -413,13 +468,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "false"
@@ -438,13 +496,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "false"
@@ -465,13 +526,16 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
-      - uses: ./.github/actions/setup-nix
+      - uses: $/.github/actions/setup-nix
         with:
           prepare-shell: "true"
-          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - uses: ./.github/actions/setup-rust
+      - uses: $/.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "false"
@@ -500,6 +564,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Install tools
         run: mise install --locked
@@ -539,6 +607,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Install tools
         run: mise install --locked
@@ -559,6 +631,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Install tools
         run: mise install --locked
@@ -579,6 +655,10 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          repository: ${{ needs.pr_metadata.outputs.checkout_repository }}
+          ref: ${{ needs.pr_metadata.outputs.head_sha }}
 
       - name: Install tools
         run: mise install --locked

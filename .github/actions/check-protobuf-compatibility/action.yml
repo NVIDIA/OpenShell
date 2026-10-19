@@ -12,7 +12,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/setup-nix
+    - uses: $/.github/actions/setup-nix
 
     - name: Check protobuf compatibility
       shell: bash

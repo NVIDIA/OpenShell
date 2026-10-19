@@ -36,7 +36,7 @@ inputs:
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/setup-rust
+    - uses: $/.github/actions/setup-rust
       with:
         cache-key: binaries-v2-${{ inputs.binary }}-${{ inputs.triple }}
         save-cache: "true"

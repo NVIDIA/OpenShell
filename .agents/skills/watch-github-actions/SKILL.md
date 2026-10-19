@@ -81,18 +81,21 @@ gh run list --branch feature-branch
 
 ## Check Runs for a PR
 
-List workflow runs associated with a PR:
-
-```bash
-# Get the head branch of the PR, then list runs
-BRANCH=$(gh pr view <pr-number> --json headRefName --jq '.headRefName')
-gh run list --branch "$BRANCH"
-```
-
-Or view the checks directly on the PR:
+List checks associated with a PR:
 
 ```bash
 gh pr checks <pr-number>
+gh pr checks <pr-number> --json name,state,link
+```
+
+OpenShell's trusted PR dispatcher runs `Branch Checks`, `Helm Lint`, and
+`Branch E2E Checks` from the default branch, so filtering workflow runs by the
+PR head branch misses them. Follow the `link` on the corresponding
+`OpenShell / ...` status, then inspect or watch that exact run:
+
+```bash
+gh run view <run-id>
+gh run watch <run-id>
 ```
 
 ## List Recent Runs
@@ -155,8 +158,8 @@ coverage.
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do
-not substitute the current `main` tip or the event's older PR base SHA. Merge
-groups and manual runs use their explicit baseline. Findings are reported by
+not substitute the current `main` tip or the event's older PR base SHA. Manual
+runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
 
 For `Protobuf Compatibility`, check the logged train and comparison baseline.

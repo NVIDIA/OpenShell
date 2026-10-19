@@ -14,13 +14,18 @@ on:
         description: Expected candidate commit from branch checks or release qualification
         required: true
         type: string
+      candidate_repository:
+        description: Repository containing the candidate commit
+        required: false
+        default: ""
+        type: string
       base_ref:
         description: Target branch ref or SHA; empty for tagged release qualification
         required: false
         default: ""
         type: string
       pr_number:
-        description: Mirrored PR whose discussion to review; zero for other events
+        description: Approved PR whose discussion to review; zero for other events
         required: false
         default: 0
         type: number
@@ -69,12 +74,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch branch source commit
+      - name: Fetch exact branch comparison commits
         if: inputs.base_ref != ''
         working-directory: review-tools
         env:
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_REF: ${{ inputs.base_ref }}
+          CANDIDATE_REPOSITORY: ${{ inputs.candidate_repository || github.repository }}
           SOURCE_SHA: ${{ inputs.source_sha }}
-        run: git -c core.hooksPath=/dev/null fetch --no-tags origin "$SOURCE_SHA"
+        run: |
+          git -c core.hooksPath=/dev/null fetch --no-tags \
+            "${{ github.server_url }}/${CANDIDATE_REPOSITORY}.git" "$SOURCE_SHA"
+          git -c core.hooksPath=/dev/null fetch --no-tags \
+            "${{ github.server_url }}/${BASE_REPOSITORY}.git" "$BASE_REF"
 
       - name: Set up Nix
         uses: ./review-tools/.github/actions/setup-nix
