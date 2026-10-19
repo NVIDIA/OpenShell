@@ -209,9 +209,17 @@ impl SqliteStore {
         self.close().await;
     }
 
-    /// Test support only: the pool's effective connection ceiling.
+    /// Runs raw SQL against the test database.
     #[cfg(test)]
-    pub(crate) fn max_connections_for_test(&self) -> u32 {
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        sqlx::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .expect("test SQL");
+    }
+
+    /// The pool's effective connection ceiling.
+    pub fn max_connections(&self) -> u32 {
         self.pool.options().get_max_connections()
     }
 
@@ -1280,6 +1288,36 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         .bind("pending")
         .bind(wrapped_payload)
         .bind(now_ms)
+        .bind(workspace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let wrapped_payload = policy_payload_from_record(record)?;
+        sqlx::query(
+            r#"
+INSERT INTO "objects" (
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms", "workspace"
+)
+SELECT ?1, ?2, ?3, 1, ?4, ?5, ?6, ?6, ?7
+WHERE EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = 'sandbox' AND "id" = ?3)
+  AND NOT EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = ?1 AND "scope" = ?3)
+ON CONFLICT DO NOTHING
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&record.id)
+        .bind(&record.sandbox_id)
+        .bind(&record.status)
+        .bind(wrapped_payload)
+        .bind(record.created_at_ms)
         .bind(workspace)
         .execute(&self.pool)
         .await

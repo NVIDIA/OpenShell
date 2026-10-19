@@ -747,7 +747,7 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
     let service = MultiplexService::new(state);
     let server = tokio::spawn(async move {
         loop {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
             openshell_core::net::set_tcp_nodelay_best_effort(&stream);
             let acceptor = acceptor.acceptor();
             let service = service.clone();
@@ -756,7 +756,12 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                     let identity = extract_peer_identity(&stream);
                     let fingerprint = extract_peer_certificate_sha256(&stream);
                     let _ = service
-                        .serve_with_verified_certificate(stream, identity, fingerprint)
+                        .serve_with_verified_certificate(
+                            stream,
+                            identity,
+                            fingerprint,
+                            crate::auth::audit::ConnectionSource::Peer(peer),
+                        )
                         .await;
                 }
             });

@@ -1,36 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Backend-selected interpretation of opaque boundary confirmation evidence.
+//! Validation of the built-in Linux backend's audit evidence.
 
-use openshell_isolation_interface::contract::{BackendError, BoundaryProperties};
+use openshell_isolation_interface::contract::BackendError;
 
-/// Validate measured evidence and derive the properties it actually supports.
-/// Implementations must reject incomplete evidence and unsupported formats.
-pub trait BoundaryAuditValidator: std::fmt::Debug + Send + Sync {
-    /// # Errors
-    /// Returns an error when evidence cannot establish the boundary guarantees.
-    fn validate(&self, evidence: &serde_json::Value) -> Result<BoundaryProperties, BackendError>;
-}
-
-/// Default evidence interpreter for the Linux `OpenShell` sandbox.
-#[derive(Debug)]
-pub struct LinuxBoundaryAuditValidator;
-
-impl BoundaryAuditValidator for LinuxBoundaryAuditValidator {
-    fn validate(&self, evidence: &serde_json::Value) -> Result<BoundaryProperties, BackendError> {
-        let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
-            serde_json::from_value(evidence.clone()).map_err(|error| {
-                BackendError::Confirm(format!("decode Linux sandbox audit evidence: {error}"))
-            })?;
-        audit.validate()?;
-        Ok(audit.properties())
-    }
+/// Validate the built-in Linux backend's measured enforcement state.
+pub fn validate_native_linux_audit(evidence: &serde_json::Value) -> Result<(), BackendError> {
+    let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
+        serde_json::from_value(evidence.clone()).map_err(|error| {
+            BackendError::Confirm(format!("decode Linux sandbox audit evidence: {error}"))
+        })?;
+    audit.validate()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundaryAuditValidator as _, LinuxBoundaryAuditValidator};
+    use super::validate_native_linux_audit;
 
     #[test]
     fn default_validator_accepts_complete_linux_evidence() {
@@ -52,20 +38,17 @@ mod tests {
                 "tcp_allow_round_trip": true, "tcp_deny_round_trip": true,
                 "socket_loopback_confinement": true
         });
-        let properties = LinuxBoundaryAuditValidator.validate(&evidence).unwrap();
-        let audit: crate::boundary_protocol::NativeLinuxSandboxAuditEvidence =
-            serde_json::from_value(evidence.clone()).unwrap();
-        assert_eq!(properties, audit.properties());
+        validate_native_linux_audit(&evidence).unwrap();
         let mut incomplete = evidence;
         incomplete["no_new_privileges"] = false.into();
-        assert!(LinuxBoundaryAuditValidator.validate(&incomplete).is_err());
+        assert!(validate_native_linux_audit(&incomplete).is_err());
     }
 
     #[test]
     fn default_validator_rejects_unknown_platform_and_incomplete_evidence() {
         for platform in ["windows_mxc", "unknown", "linux"] {
             let evidence = serde_json::json!({"platform": platform, "evidence": {}});
-            assert!(LinuxBoundaryAuditValidator.validate(&evidence).is_err());
+            assert!(validate_native_linux_audit(&evidence).is_err());
         }
     }
 }

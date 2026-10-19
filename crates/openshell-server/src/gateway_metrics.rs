@@ -38,6 +38,10 @@ pub const MUTATION_LOCK_ERRORS_TOTAL: &str = "openshell_server_mutation_lock_err
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
+pub const SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_build_duration_seconds";
+pub const SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS: &str =
+    "openshell_supervisor_config_apply_duration_seconds";
 pub const MUTATION_LOCK_WAIT_SECONDS: &str = "openshell_server_mutation_lock_wait_seconds";
 pub const MUTATION_LOCK_HOLD_SECONDS: &str = "openshell_server_mutation_lock_hold_seconds";
 
@@ -57,9 +61,11 @@ const LATENCY_BUCKETS_SECONDS: [f64; 14] = [
 
 /// Only these names render as Prometheus histograms. Every existing `*_duration_seconds` metric
 /// keeps its summary format, so current dashboards are unaffected.
-const BUCKETED_HISTOGRAMS: [&str; 4] = [
+const BUCKETED_HISTOGRAMS: [&str; 6] = [
     RELAY_CLAIM_DURATION_SECONDS,
     PEER_REQUEST_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+    SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
     MUTATION_LOCK_WAIT_SECONDS,
     MUTATION_LOCK_HOLD_SECONDS,
 ];
@@ -297,6 +303,16 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         PEER_REQUEST_DURATION_SECONDS,
         Unit::Seconds,
         "Latency of outbound requests to the owning replica. For relays, until the owner's supervisor claimed the relay."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time to build one pushed supervisor configuration, including store reads and credential resolution."
+    );
+    describe_histogram!(
+        SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+        Unit::Seconds,
+        "Time from queuing a pushed configuration update on the supervisor session to receiving its apply result."
     );
     describe_histogram!(
         MUTATION_LOCK_WAIT_SECONDS,
@@ -733,6 +749,16 @@ mod tests {
         .record(sample);
         histogram!(MUTATION_LOCK_WAIT_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
         histogram!(MUTATION_LOCK_HOLD_SECONDS, LABEL_SCOPE => "sandbox").record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_BUILD_DURATION_SECONDS,
+            "outcome" => "ok"
+        )
+        .record(sample);
+        histogram!(
+            SUPERVISOR_CONFIG_APPLY_DURATION_SECONDS,
+            "outcome" => "CONFIG_APPLY_OUTCOME_APPLIED"
+        )
+        .record(sample);
         histogram!(
             "openshell_server_grpc_request_duration_seconds",
             "method" => "ListSandboxes",

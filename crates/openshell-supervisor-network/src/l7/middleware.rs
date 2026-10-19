@@ -521,7 +521,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         req,
         client,
         ctx,
-        "https",
+        ctx.request_scheme(),
         chain,
         runner,
         generation_guard,

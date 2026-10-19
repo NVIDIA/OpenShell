@@ -99,6 +99,10 @@ vulnerability findings, check the deployed image digest and package version;
 deploy a rebuilt gateway image with the patched base. Updating the gateway
 binary alone does not update the libraries supplied by its container image.
 
+For stable releases, inspect the version tag or deployed digest. Promotion
+preserves the qualified prerelease's commit-SHA image tags; those tags do not
+identify the stable rebuild. See [image contents verification](https://docs.nvidia.com/openshell/latest/security/verify-image-contents).
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
@@ -333,8 +337,9 @@ Common findings:
   published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
   for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
-- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
+- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: inspect supervisor and backend logs for policy rejection, network-mediation initialization, protected-channel setup, or listener failures. A backend that cannot enforce the admitted policy must reject it before starting workload code.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
+- Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
 - Docker or Podman rejects an explicit `cdi_devices` selector: use a CDI qualified name (`<vendor>/<class>=<name>`), not a host-device path. Syntax validation accepts other vendors; it does not establish that the runtime has the device or that its GPU workload is supported. Consult the published GPU selection documentation for request requirements.
@@ -582,8 +587,11 @@ that scan, then logs
 the `sandbox_id` and exits with
 `tool server endpoint-status startup reconciliation failed`. A pod that
 restarts with that error during a rollout or scale-out is waiting behind a
-long holder: find it as above. Those startup timeouts appear in the gateway log
-only, because the metrics endpoint starts after the scan.
+long holder: find it as above. When the scan finishes, its waits and timeouts
+are already in the lock metrics at the pod's first scrape, so read the counter
+and `_count` values on the new pod: `rate()` and `increase()` take that first
+scrape as their baseline and do not show them. A scan that fails exits before
+the metrics endpoint starts, so its timeouts appear in the gateway log only.
 
 A lock connection that PostgreSQL does not open, although at least a second of
 the 10-second limit remained, is not a lock timeout. The request fails with
@@ -1010,6 +1018,20 @@ privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
 the sandbox over per-sandbox TLS with server-certificate verification plus
 bootstrap-token client authentication, and owns gateway policy, provider
 credentials, DNS, and mediated upstream connections.
+
+The supervisor loads its startup configuration through the polling RPCs and
+opens `ConnectSupervisor` once the workload runs. When the gateway runs with
+`config_delivery_mode = "push"`, it accepts the session with
+`config_push_enabled` and a bootstrap update. The supervisor applies the
+bootstrap, stops polling, and receives later updates on that stream. Every
+update must contain both the sandbox configuration and the provider
+environment it names. A reconnect to a gateway in poll mode resumes polling.
+
+If live policy or provider changes do not reach a sandbox in push mode, inspect
+gateway and supervisor logs for bootstrap build failures, updates missing a
+configuration part, apply failures, or the two-minute bootstrap timeout. Do not
+add gateway credentials to the workload Pod; configuration delivery terminates
+in the separate supervisor.
 
 Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
 or loses readiness:

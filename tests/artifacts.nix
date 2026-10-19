@@ -214,8 +214,13 @@ rec {
   binaries = pkgs.writeShellApplication {
     name = "build-artifacts-binaries";
     runtimeInputs = [
+      pkgs.binutils-unwrapped
       pkgs.coreutils
+      pkgs.file
+      pkgs.gawk
       pkgs.git
+      pkgs.gnugrep
+      pkgs.gnused
       rustToolchain
     ];
     runtimeEnv = toolchainEnv;
@@ -223,10 +228,19 @@ rec {
       root=$(git rev-parse --show-toplevel)
       cd "$root"
 
-      cargo build --target ${muslToolchain.target} \
+      # z3-sys links libstdc++ dynamically unless CXXSTDLIB says otherwise, and
+      # the musl binaries must be fully static. CXXSTDLIB applies to every
+      # target, so set it only for the musl build: Darwin has no libstdc++.
+      CXXSTDLIB=static:-bundle=stdc++ cargo build --target ${muslToolchain.target} \
         -p openshell-cli \
         -p openshell-sandbox \
         -p openshell-prover-cli
+
+      # Fail as the release does if a musl binary is not fully static.
+      tasks/scripts/verify-static-binary.sh \
+        target/${muslToolchain.target}/debug/openshell \
+        target/${muslToolchain.target}/debug/openshell-sandbox \
+        target/${muslToolchain.target}/debug/openshell-prover
 
       cargo build --target ${gnuToolchain.target} \
         -p openshell-gateway \
@@ -431,6 +445,93 @@ rec {
     '';
   };
 
+  # Build the CLI and gateway RPMs the way .github/workflows/build-rpm.yml does:
+  # `packit build locally` with openshell.spec in the same Fedora image, packaging
+  # the binaries staged by build-artifacts-binaries. The container runs on the
+  # host's Linux architecture, so the RPMs match the tmachine guest.
+  rpm = pkgs.writeShellApplication {
+    name = "build-artifacts-rpm";
+    runtimeInputs = [
+      pkgs.coreutils
+      pkgs.docker-client
+      pkgs.git
+      pkgs.python3
+    ];
+    text = ''
+      root=$(git rev-parse --show-toplevel)
+      cd "$root"
+
+      # Keep in sync with the container image in .github/workflows/build-rpm.yml.
+      image=docker.io/library/fedora:44@sha256:43b29f65a41eb9c35e1cd5323e3bdf3b655c2357a9f4f1ff2f9c2798e5045d80
+      output_dir="$root/artifacts/packages/rpm"
+      # Default to the development version that branch E2E CI computes.
+      rpm_version="''${OPENSHELL_RPM_VERSION:-$(python3 tasks/scripts/release.py get-version --dev --rpm-version)}"
+      rpm_release="''${OPENSHELL_RPM_RELEASE:-$(python3 tasks/scripts/release.py get-version --dev --rpm-release)}"
+
+      for binary in \
+        artifacts/binaries/${muslToolchain.target}/openshell \
+        artifacts/binaries/${gnuToolchain.target}/openshell-gateway \
+        artifacts/binaries/${muslToolchain.target}/openshell-prover; do
+        if [[ ! -x "$binary" ]]; then
+          echo "missing $binary; run build-artifacts-binaries first" >&2
+          exit 1
+        fi
+      done
+
+      mkdir -p "$output_dir"
+      rm -f "$output_dir"/*.rpm
+
+      # Packit archives the files git tracks, so build from a fresh repository
+      # holding the checkout's tracked and untracked, non-ignored files.
+      git ls-files -z --cached --others --exclude-standard \
+        | docker run --rm -i \
+          --platform linux/${dockerArch} \
+          --volume "$root:/repo:ro" \
+          --volume "$root/artifacts/binaries/${muslToolchain.target}/openshell:/binaries/openshell:ro" \
+          --volume "$root/artifacts/binaries/${gnuToolchain.target}/openshell-gateway:/binaries/openshell-gateway:ro" \
+          --volume "$root/artifacts/binaries/${muslToolchain.target}/openshell-prover:/binaries/openshell-prover:ro" \
+          --volume "$output_dir:/out" \
+          --volume openshell-rpm-cargo:/root/.cargo/registry \
+          --volume openshell-rpm-dnf:/var/cache/libdnf5 \
+          --env OPENSHELL_RPM_VERSION="$rpm_version" \
+          --env OPENSHELL_RPM_RELEASE="$rpm_release" \
+          --env OPENSHELL_PREBUILT_BINARIES_DIR=/binaries \
+          --env HOST_UID="$(id -u)" \
+          --env HOST_GID="$(id -g)" \
+          "$image" \
+          bash -euo pipefail -c '
+            dnf install -y --setopt=keepcache=1 \
+              packit rpm-build \
+              cargo cargo-rpm-macros git-core \
+              pandoc python3-devel systemd-rpm-macros tar
+
+            mkdir /build
+            tar -C /repo --null --files-from=- --ignore-failed-read -cf - \
+              | tar -C /build -xf -
+            cd /build
+            git init -q
+            git add -A
+            git -c user.name=local -c user.email=local@localhost \
+              commit -q -m "Local OpenShell RPM build"
+
+            packit build locally
+
+            cli_rpms=(/build/*/openshell-[0-9]*.rpm)
+            gateway_rpms=(/build/*/openshell-gateway-[0-9]*.rpm)
+            if [[ ''${#cli_rpms[@]} -ne 1 || ''${#gateway_rpms[@]} -ne 1 ]]; then
+              echo "expected exactly one CLI and one gateway RPM" >&2
+              exit 1
+            fi
+            install -m 0644 "''${cli_rpms[0]}" "''${gateway_rpms[0]}" /out/
+            install -m 0644 "''${cli_rpms[0]}" /out/openshell.rpm
+            install -m 0644 "''${gateway_rpms[0]}" /out/openshell-gateway.rpm
+            chown "$HOST_UID:$HOST_GID" /out/*.rpm
+          '
+
+      ls -l "$output_dir"
+    '';
+  };
+
   helm = pkgs.writeShellApplication {
     name = "build-artifacts-helm";
     runtimeInputs = [
@@ -452,6 +553,7 @@ rec {
       binaries
       vmDriver
       deb
+      rpm
       testArchives
       images
       helm
@@ -460,6 +562,7 @@ rec {
       build-artifacts-binaries
       build-artifacts-vm-driver
       build-artifacts-deb
+      build-artifacts-rpm
       build-artifacts-test-archives
       build-artifacts-images
       build-artifacts-helm

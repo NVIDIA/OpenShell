@@ -36,24 +36,28 @@ pub mod tracing_layers;
 #[cfg(any(test, feature = "test-support"))]
 pub mod validation;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 // --- Core event types ---
 pub use events::{
-    ApiActivityEvent, ApplicationLifecycleEvent, BaseEvent, BaseEventData, DetectionFindingEvent,
-    DeviceConfigStateChangeEvent, HttpActivityEvent, NetworkActivityEvent, OcsfEvent,
-    ProcessActivityEvent, SshActivityEvent,
+    ApiActivityEvent, ApplicationLifecycleEvent, AuthenticationEvent, BaseEvent, BaseEventData,
+    DetectionFindingEvent, DeviceConfigStateChangeEvent, HttpActivityEvent, NetworkActivityEvent,
+    OcsfEvent, ProcessActivityEvent, SshActivityEvent,
 };
 
 // --- Enum types ---
 pub use enums::{
-    ActionId, ActivityId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId, HttpMethod,
-    LaunchTypeId, OcsfEnum, RiskLevelId, SecurityLevelId, SeverityId, StateId, StatusId,
+    ActionId, ActivityId, AuthProtocolId, AuthTypeId, ConfidenceId, DeviceTypeId, DispositionId,
+    HttpMethod, LaunchTypeId, OcsfEnum, OsTypeId, RiskLevelId, SecurityLevelId, SeverityId,
+    StateId, StatusId, UserTypeId,
 };
 
 // --- Object types ---
 pub use objects::{
     Actor, AiModel, Api, Attack, ConnectionInfo, Container, Device, Endpoint, Evidence,
     FindingInfo, FirewallRule, HttpRequest, HttpResponse, Image, Metadata, OsInfo, Process,
-    Product, Remediation, Tactic, Technique, Url,
+    Product, Remediation, Service, Tactic, Technique, Url, User,
 };
 
 // --- Sanitizers ---
@@ -63,9 +67,9 @@ pub use format::downgrade::OcsfSchemaVersion;
 
 // --- Builders ---
 pub use builders::{
-    ApiActivityBuilder, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-    DetectionFindingBuilder, EventContext, EventOrigin, HttpActivityBuilder,
-    NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
+    ApiActivityBuilder, AppLifecycleBuilder, AuthenticationBuilder, BaseEventBuilder,
+    ConfigStateChangeBuilder, DetectionFindingBuilder, EventContext, EventOrigin,
+    HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
 };
 
 // --- Tracing layers ---

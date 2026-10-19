@@ -27,6 +27,8 @@ e2e = []
 e2e-host-gateway = ["e2e"]
 e2e-local-container-driver = ["e2e"]
 e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
+# Selects tests that need a Docker gateway with config_delivery_mode = "push".
+e2e-config-push = ["e2e-docker"]
 e2e-gpu = ["e2e"]
 e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
@@ -38,6 +40,11 @@ e2e-podman = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
 e2e-oidc-pkce = []
 e2e-vm = ["e2e", "e2e-host-gateway"]
+
+[[test]]
+name = "config_push"
+path = "tests/config_push.rs"
+required-features = ["e2e-config-push"]
 
 [[test]]
 name = "policy_activation"

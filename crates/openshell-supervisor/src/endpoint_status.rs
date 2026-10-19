@@ -427,7 +427,6 @@ mod tests {
         reports: UnboundedSender<EndpointStatusSnapshot>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for EndpointStatusGateway {
         async fn poll_settings(
             &self,
@@ -469,7 +468,6 @@ mod tests {
         reports: UnboundedSender<EndpointStatusSnapshot>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for RetryEndpointStatusGateway {
         async fn poll_settings(
             &self,
@@ -866,7 +864,6 @@ mod tests {
         reports: UnboundedSender<ControlledEndpointStatusAttempt>,
     }
 
-    #[tonic::async_trait]
     impl PolicyGatewayClient for ControlledEndpointStatusGateway {
         async fn poll_settings(
             &self,

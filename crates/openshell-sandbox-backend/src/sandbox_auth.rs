@@ -439,6 +439,24 @@ mod tests {
     }
 
     #[test]
+    fn bearer_identity_must_match_the_provisioned_runtime() {
+        let (mut authenticator, token) = fixture(1);
+        let metadata = metadata(token.token.expose_secret());
+        authenticator.expected_sandbox_id = SandboxId::parse("sandbox-b").unwrap();
+        assert_eq!(
+            authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+            Err(SandboxAuthError::WrongSandbox)
+        );
+        authenticator.expected_sandbox_id = SandboxId::parse("sandbox-a").unwrap();
+        authenticator.expected_runtime_generation =
+            SandboxGenerationId::parse("generation-2").unwrap();
+        assert_eq!(
+            authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+            Err(SandboxAuthError::WrongRuntimeGeneration)
+        );
+    }
+
+    #[test]
     fn bearer_metadata_must_occur_exactly_once() {
         let (authenticator, token) = fixture(1);
         assert_eq!(

@@ -11,7 +11,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_DOCKER_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_DOCKER_FEATURES-e2e-docker}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+E2E_FEATURES="${OPENSHELL_E2E_DOCKER_FEATURES:-e2e-docker}"
 DEFAULT_WORKLOAD_MANIFEST="${ROOT}/e2e/gpu/images/.build/workloads.yaml"
 RUN_WITH_GATEWAY_COMMAND="__openshell_run_docker_e2e"
 # shellcheck source=e2e/support/conformance.sh
@@ -20,7 +21,8 @@ source "${ROOT}/e2e/support/conformance.sh"
 run_e2e() {
   e2e_run_openshell_conformance "Docker"
 
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     return 0
   fi
 
@@ -28,9 +30,12 @@ run_e2e() {
     cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml"
     --features "${E2E_FEATURES}"
   )
-  if [ -n "${E2E_TEST}" ]; then
-    cargo_args+=(--test "${E2E_TEST}")
-  fi
+  # OPENSHELL_E2E_DOCKER_TEST may name several space-separated test targets.
+  local test_names test_name
+  read -ra test_names <<<"${E2E_TEST}"
+  for test_name in "${test_names[@]}"; do
+    cargo_args+=(--test "${test_name}")
+  done
   cargo_args+=(-- --nocapture)
   "${cargo_args[@]}"
 }
@@ -44,7 +49,7 @@ if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   exit 0
 fi
 
-if [ -n "${E2E_FEATURES}" ]; then
+if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
   CONTAINER_ENGINE=docker bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 fi
 

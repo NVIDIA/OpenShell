@@ -136,6 +136,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # Tests import the example profiles from providers/ the way an operator
 # would; the feature is test-only and never reaches a release binary.
 openshell-providers = { path = "../openshell-providers", features = ["example-profiles"] }
+openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
 base64 = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "aws-lc-rs"] }
 rcgen = { workspace = true }

@@ -1,13 +1,75 @@
 # OpenShell sandbox backend
 
-This crate implements the supervisor-side isolation backend and the private
+This crate implements the concrete supervisor-side RPC client and the versioned
 control protocol shared with `openshell-sandbox`.
+
+The protobuf services replace the Rust backend traits. The supervisor holds
+concrete lifecycle, process, exec, forwarding, and mediation handles backed by
+RPCs. Confirmation consumes the bound handle, validates enforcement evidence,
+and produces the ready handle; starting consumes that ready handle. Both the
+in-tree Linux runtime and external backends implement the generated services.
+Linux process helpers remain internal to the runtime server.
+
+## Boundary startup and routing
+
+The supervisor uses the generated `IsolationBackend` control service to
+negotiate capabilities and open a boundary before reading image policy. Each
+physical connection repeats that handshake, including credential-epoch changes
+and transport recovery. The launch session and generation identify retries;
+the descriptor must bind to the same provisioned resource. Reopening returns
+the same handle for the runtime's lifetime. Driver deletion terminates the
+runtime and invalidates that handle.
+
+Isolation protocol 1.0 includes boundary routing and requires
+`openshell.sandbox.protocol` on both peers. The shared extension
+negotiator checks major versions and each peer's required capabilities. The
+built-in runtime does not advertise `openshell.sandbox.suspend-resume` and
+returns `UNIMPLEMENTED` for those optional RPCs.
+
+`SandboxProtocol.Exchange` and `.Mediate` begin with the handle from
+`OpenBoundary`. The server authenticates the stream's bearer, checks the handle
+against its provisioned sandbox and generation, then accepts typed protobuf
+messages. `ExchangeFrame` carries control, process I/O, network decisions, and
+TCP relay data. `MediateFrame` carries the OpenMediation handshake and DNS messages.
+Missing bindings, repeated bindings, and frames that do not match the operation
+or direction are rejected. There is no nested JSON or length/channel framing on
+the wire. Private in-process adapters retain the Rust byte-stream interfaces.
+
+Opening a boundary only validates and reserves a route. It neither attaches a
+supervisor nor runs workload code. Policy discovery is followed by the existing
+attach, mediation setup, confirm, and explicit start sequence. The existing
+connection registry continues to govern supervisor replacement and recovery.
+
+Sandbox and generation identity come from the verified bearer, rather than
+duplicate fields on `OpenBoundaryRequest`. Attach supplies policy; confirmation
+reports resource claims from backend-owned provisioned state, which the
+supervisor compares with its trusted launch metadata.
+
+Update the supervisor and sandbox runtime together; an older peer fails during
+startup instead of using a fallback path.
+
+## Endpoint-registered backends
+
+`OpenShellRuntimeBackend::registered` constructs the same client and lifecycle
+handles for an operator-registered backend. Trusted endpoint registration and `DelegatedLaunch`
+metadata are separate from the driver's opaque descriptor, which crosses
+`OpenBoundary` unchanged. Common confirmation checks bind identity, session,
+generation, resource claims, and the driver's provisioning evidence digest. Native evidence is
+validated by the registered backend; Linux evidence validation remains in the
+built-in adapter.
+
+The public gRPC contracts are in
+[`isolation_backend.proto`](../../proto/isolation_backend.proto) and
+[`sandbox_protocol.proto`](../../proto/sandbox_protocol.proto).
 
 ## Exec recovery
 
-An exec envelope carries a UUID request ID and an absolute expiration time in
-Unix milliseconds, set to 30 seconds after creation. The payload digest includes
-the expiration time, and transport recovery preserves the entire envelope.
+An exec envelope carries a UUID request ID and a protobuf timestamp set to
+30 seconds after creation. Transport recovery preserves the entire request,
+including that deadline. Repeated mutations with the same ID and equivalent
+decoded fields replay the original result; conflicting reuse is rejected.
+Map entry order is immaterial. The receiver computes its local replay
+fingerprint; clients do not transmit a digest.
 The supervisor and sandbox need synchronized wall clocks.
 
 The sandbox checks expiration before starting or reattaching an exec. It keeps
@@ -30,19 +92,16 @@ and sandbox runtime together when deploying this protocol change.
 `OpenShellRuntimeBackend` implements the authenticated host side of the shared
 Sandbox Protocol.
 
-Backend implementations may inject a `BoundaryAuditValidator` to interpret
-their opaque confirmation evidence. The default Linux validator rejects
-incomplete or foreign evidence. Confirmation compares the asserted properties
-with the properties derived by the selected validator; validator injection does
-not bypass generation, session, resource, identity, or outer-fence checks.
-
-Concrete platform validators belong to the implementing backend, not this
-shared transport library.
+For the built-in Linux backend, the client validates native audit evidence and
+rejects incomplete or foreign measurements. External backends validate their own
+mechanisms and may omit audit data; they do not need to reproduce Linux
+measurements. Optional audit data is a UTF-8 JSON value; empty bytes mean absent.
+Successful confirmation asserts that the backend can enforce the
+admitted policy; unsupported requirements fail before workload start. Both paths
+retain generation, session, resource, identity, and provisioning evidence checks.
 
 ## Boundary transport establishment
 
-Backends may supply a `BoundaryTransportConnector` for raw stream establishment.
-The shared client retains TLS peer verification, session bearer authentication,
-generation checks, and reconnection handling. The connector is reused for policy
-discovery and attachment; it does not define platform launch configuration or
-replace the isolation interface.
+The client connects to the configured Unix socket, TCP, or vsock endpoint. It
+owns TLS peer verification, session bearer authentication, generation checks,
+and reconnection handling for policy discovery and attachment.

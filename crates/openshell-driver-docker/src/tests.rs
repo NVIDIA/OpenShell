@@ -75,6 +75,117 @@ fn test_launch_authentication() -> Vec<u8> {
     .unwrap()
 }
 
+#[tokio::test]
+async fn restart_rotates_bootstrap_descriptor_and_provisioning_evidence_together() {
+    let config = runtime_config();
+    let sandbox_id = format!("restart-{}", openshell_core::SandboxSessionId::new());
+    let directory = docker_boundary_state_dir_by_id(&sandbox_id, &config).unwrap();
+    fs::create_dir_all(&directory).unwrap();
+    let mut authentication: SandboxLaunchAuthentication =
+        serde_json::from_slice(&test_launch_authentication()).unwrap();
+    let tls = generate_sandbox_tls_material(authentication.supervisor.session_id).unwrap();
+    let provisioned = isolation::DockerBoundarySpec {
+        boundary_id: sandbox_id.clone(),
+        generation: authentication.supervisor.runtime_generation.to_string(),
+        session_id: authentication.supervisor.session_id,
+        session_rotation: authentication.supervisor.session_rotation,
+        auth_epoch: authentication.supervisor.auth_epoch,
+        gateway_id: authentication.gateway_id.clone(),
+        verification_keys: gateway_verification_keys(&authentication.verification_keys).unwrap(),
+        container_id: "container-test".into(),
+        image_identity: "image-test".into(),
+        gpu_requested: false,
+        listener_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        control_socket: BOUNDARY_SOCKET_MOUNT_PATH.into(),
+        sandbox_tls: SandboxTlsServerConfig {
+            certificate_chain_path: BOUNDARY_CERTIFICATE_MOUNT_PATH.into(),
+            private_key_path: BOUNDARY_PRIVATE_KEY_MOUNT_PATH.into(),
+        },
+        supervisor_tls: SandboxTlsClientConfig {
+            server_name: tls.server_name,
+            trust_anchor_pem: tls.trust_anchor_pem,
+        },
+        host_gateway_ip: None,
+        workload_identity: ResolvedWorkloadIdentity::new(
+            1000,
+            1000,
+            vec![],
+            "image".into(),
+            "image-test".into(),
+        )
+        .unwrap(),
+        child_env: HashMap::new(),
+    }
+    .provision()
+    .unwrap();
+    fs::write(
+        directory.join(BOUNDARY_CONFIG_FILE),
+        provisioned.boundary_config.encode().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        directory.join(RUNTIME_DESCRIPTOR_FILE),
+        provisioned
+            .runtime_descriptor
+            .backend_descriptor()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    let previous_evidence = provisioned.boundary_config.provisioning_evidence;
+    authentication.supervisor.runtime_generation =
+        openshell_core::sandbox_generation::SandboxGenerationId::parse("generation-2").unwrap();
+    authentication.supervisor.session_id = openshell_core::SandboxSessionId::new();
+    let encoded = serde_json::to_vec(&authentication).unwrap();
+    refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
+        .await
+        .unwrap();
+
+    let bootstrap: BoundaryConfig =
+        serde_json::from_slice(&fs::read(directory.join(BOUNDARY_CONFIG_FILE)).unwrap()).unwrap();
+    let descriptor = read_docker_runtime_descriptor(&sandbox_id, &config)
+        .await
+        .unwrap()
+        .unwrap();
+    let supervisor: SupervisorAuthBundle =
+        serde_json::from_slice(&fs::read(directory.join(SUPERVISOR_AUTH_BUNDLE_FILE)).unwrap())
+            .unwrap();
+    assert_eq!(bootstrap.generation, "generation-2");
+    assert_eq!(descriptor.generation, bootstrap.generation);
+    assert_eq!(supervisor.runtime_generation.as_str(), bootstrap.generation);
+    assert_eq!(bootstrap.session_id, descriptor.session_id);
+    assert_eq!(bootstrap.session_id, supervisor.session_id);
+    bootstrap
+        .provisioning_evidence
+        .validate("generation-2")
+        .unwrap();
+    assert_eq!(
+        bootstrap.provisioning_evidence,
+        descriptor.provisioning_evidence
+    );
+    assert_ne!(
+        bootstrap.provisioning_evidence.evidence_digest,
+        previous_evidence.evidence_digest
+    );
+    assert_eq!(
+        bootstrap.resource_claims,
+        provisioned.runtime_descriptor.resource_claims
+    );
+    // Retrying this launch keeps its generation/evidence binding stable.
+    refresh_docker_boundary_authentication(&sandbox_id, &config, &encoded)
+        .await
+        .unwrap();
+    let retried = read_docker_runtime_descriptor(&sandbox_id, &config)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        retried.provisioning_evidence,
+        descriptor.provisioning_evidence
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
     // longer carries `namespace`, so the gateway elides the field and the
@@ -101,6 +212,7 @@ fn test_sandbox() -> DriverSandbox {
             await_main_process_attachment: false,
             workload_identity: None,
             launch_authentication: test_launch_authentication(),
+            ..Default::default()
         }),
         status: None,
         workspace: String::new(),

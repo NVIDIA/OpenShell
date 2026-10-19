@@ -19,7 +19,7 @@ Merge queue validation is a second integration gate for `main`. After a PR has p
 
 ### Protobuf API compatibility
 
-`Protobuf Compatibility` runs in Branch Checks, Release, and Pre-release through the shared
+`Protobuf Compatibility` runs in Branch Checks and Pre-release through the shared
 `check-protobuf-compatibility` action and Nix app. The app supplies Python, Buf,
 and Git from the flake lockfile.
 It uses Buf's `FILE` policy for the `proto/`
@@ -322,19 +322,9 @@ jobs:
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-`Release` and `Pre-release` share `release-build.yml`, `release-publish.yml`, and
-`release-qualification.yml`. Release builds, qualifies, then publishes. Pre-release
-builds, then publishes and qualifies in parallel within the same run, using native job dependencies.
-Stable GitHub Release notes are written by the Claude Code GitHub Action with
-Claude Opus 5.5 through NVIDIA Inference Hub. The build passes a compare link
-from the previous stable tag to the new tag; Claude uses it to read merged PR
-descriptions and writes the release body to an artifact. Stable publication
-requires the `LLM_INFERENCE_API_KEY` repository Actions secret, containing a key
-from [Inference Hub key management](https://inference.nvidia.com/key-management).
-Set the `ANTHROPIC_BASE_URL` repository Actions variable to
-`https://inference-api.nvidia.com` and `ANTHROPIC_MODEL` to
-`azure/anthropic/claude-opus-5-5`. The action uses the Hub's Anthropic-compatible
-API with bearer authentication. An action failure stops stable publication.
+`Release` and `Pre-release` share `release-build.yml` and `release-publish.yml`.
+Pre-release builds, then publishes and calls `release-qualification.yml` in
+parallel within the same run, using native job dependencies.
 Its platform package artifacts are uploaded after versioned images and the chart,
 so the installer can use them while qualification runs or after it fails.
 The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
@@ -347,6 +337,68 @@ workflow attempts to publish passing and failing summaries to
 The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
+
+Stable GitHub Release notes are written by the Claude Code GitHub Action with
+Claude Opus 5.5 through NVIDIA Inference Hub. The build passes a compare link
+from the previous stable tag to the new tag; Claude uses it to read merged PR
+descriptions and writes the release body to an artifact. Stable publication
+requires the `LLM_INFERENCE_API_KEY` repository Actions secret, containing a key
+from [Inference Hub key management](https://inference.nvidia.com/key-management).
+Set the `ANTHROPIC_BASE_URL` repository Actions variable to
+`https://inference-api.nvidia.com` and `ANTHROPIC_MODEL` to
+`azure/anthropic/claude-opus-5-5`. The action uses the Hub's Anthropic-compatible
+API with bearer authentication. An action failure stops stable publication.
+
+To preview release notes using the same generator as stable publication, dispatch
+Release with `notes-only=true` and an explicit comparison base:
+
+```shell
+gh workflow run release.yml --ref main \
+  -f tag=v0.1.4 -f notes-base-tag=v0.1.3 -f notes-only=true
+```
+
+This path runs `release-notes.yml` and uploads the `release-notes` artifact.
+It skips promotion, tag creation, builds, qualification, and publication.
+
+Dispatch Release from the intended release branch with a stable version:
+
+```shell
+gh workflow run release.yml --ref main -f tag=v0.4.3
+```
+
+For a support release, replace `main` with its support branch. Release chooses
+the highest-numbered `v0.4.3-pre.N` reachable from the selected branch with a
+successful Pre-release run triggered by the tag or dispatched on that branch.
+The entire Pre-release run must succeed, including publication. If qualification
+passes but publication fails, rerun the failed jobs before promoting the candidate.
+It verifies the qualification summary's
+tag, commit, profile, run, attempt, and passing result before creating `v0.4.3`
+at the same commit. Missing or expired evidence blocks promotion. The promotion
+summary and `stable-promotion-*` artifact retain the selected candidate and evidence link.
+Successful reruns can retain passing evidence from an earlier attempt of the
+same run; the promotion record links to the attempt that produced that evidence.
+Release rebuilds all stable artifacts with the stable version and publishes
+without rerunning qualification. These artifacts have different embedded versions
+from the qualified prerelease. Existing stable tags are never moved; a retry must
+resolve to the same qualified candidate.
+
+Stable image builds save multi-platform OCI archives as workflow artifacts without
+pushing to GHCR. Publication copies those archives, including their attestations,
+to the stable version tags and verifies their SBOMs before updating `latest`.
+The qualified prerelease's commit-SHA image tags remain unchanged.
+
+Release is manually dispatched; pushing a stable tag does not trigger publication.
+Stable runs serialize across branches. A version older than the highest stable
+Git tag publishes versioned artifacts while preserving shared latest channels:
+GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
+Each publisher rechecks the current remote stable tags immediately before
+updating its shared channel, including when a past publishing job is rerun.
+This protection applies to runs created with these workflow definitions.
+Its npm package uses a `release-X.Y` dist-tag, and its snap files remain in the
+GitHub Release rather than updating a Snap Store support track.
+Docs publish an immutable version and already prevent latest from moving
+backward. Release Auto-Tag continues on `main`; support branch prereleases can
+use tag pushes or manual Pre-release dispatch from that branch.
 
 `CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
 and workflow reports against the candidate tag and commit. Existing standalone
@@ -590,10 +642,11 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Release orchestrator for stable tags: build, qualify, publish. Automatic tag triggers exclude `-pre.*`. |
+| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. The notes-only mode generates a release notes preview artifact. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually: build, then publish and qualify in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by stable publication and notes-only previews. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |

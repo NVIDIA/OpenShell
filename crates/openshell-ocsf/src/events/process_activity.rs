@@ -91,6 +91,7 @@ mod tests {
                     profiles: vec!["container".to_string()],
                     uid: Some("sandbox-abc123".to_string()),
                     log_source: None,
+                    correlation_uid: None,
                 },
             ),
             process: Process::new("python3", 42).with_cmd_line("python3 /app/main.py"),

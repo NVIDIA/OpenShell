@@ -135,6 +135,7 @@ macro_rules! impl_src_endpoint_addr_setter {
 }
 
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
 mod finding;
@@ -145,6 +146,7 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
 pub use finding::DetectionFindingBuilder;
@@ -211,6 +213,7 @@ impl EventContext {
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 

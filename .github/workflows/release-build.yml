@@ -10,6 +10,11 @@ on:
         description: Git tag to build and publish
         required: true
         type: string
+      expected-source-sha:
+        description: Qualified source commit that the release tag must resolve to
+        required: false
+        default: ""
+        type: string
       is-prerelease:
         description: Whether the caller is publishing a pre-release
         required: true
@@ -50,11 +55,9 @@ jobs:
     name: Compute Versions
     runs-on: linux-amd64-cpu8
     timeout-minutes: 5
-    container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: nix develop -c bash -euo pipefail {0}
     outputs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
@@ -75,8 +78,9 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.release-tag }}
 
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
 
       - name: Fetch tags
         run: git fetch --tags --force
@@ -85,8 +89,13 @@ jobs:
         id: v
         env:
           EXPECTED_PRERELEASE: ${{ inputs.is-prerelease }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected-source-sha }}
         run: |
           set -euo pipefail
+          if [[ -n "${EXPECTED_SOURCE_SHA}" && "$(git rev-parse HEAD)" != "${EXPECTED_SOURCE_SHA}" ]]; then
+            echo "Release tag ${RELEASE_TAG} does not match the qualified commit ${EXPECTED_SOURCE_SHA}." >&2
+            exit 1
+          fi
           if [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[1-9][0-9]*$ ]]; then
             is_prerelease=true
           elif [[ "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -107,12 +116,12 @@ jobs:
           fi
           {
             echo "is_prerelease=${is_prerelease}"
-            echo "python=$(uv run python tasks/scripts/release.py get-version --python)"
-            echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)"
-            echo "npm=$(uv run python tasks/scripts/release.py get-version --npm)"
-            echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)"
-            echo "rpm_version=$(uv run python tasks/scripts/release.py get-version --rpm-version)"
-            echo "rpm_release=$(uv run python tasks/scripts/release.py get-version --rpm-release)"
+            echo "python=$(uv run --no-project python tasks/scripts/release.py get-version --python)"
+            echo "cargo=$(uv run --no-project python tasks/scripts/release.py get-version --cargo)"
+            echo "npm=$(uv run --no-project python tasks/scripts/release.py get-version --npm)"
+            echo "deb=$(uv run --no-project python tasks/scripts/release.py get-version --deb)"
+            echo "rpm_version=$(uv run --no-project python tasks/scripts/release.py get-version --rpm-version)"
+            echo "rpm_release=$(uv run --no-project python tasks/scripts/release.py get-version --rpm-release)"
             echo "semver=${RELEASE_TAG#v}"
             echo "source_sha=$(git rev-parse HEAD)"
             echo "previous_stable_tag=${previous_stable_tag}"
@@ -158,7 +167,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/build-images.yml
     with:
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      image-tag: ${{ inputs.is-prerelease && needs.compute-versions.outputs.source_sha || needs.compute-versions.outputs.semver }}
+      push-images: ${{ inputs.is-prerelease }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-python-wheel:
@@ -166,13 +176,10 @@ jobs:
     needs: [compute-versions]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
-    container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: nix develop -c bash -euo pipefail {0}
     env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL: ${{ needs.compute-versions.outputs.python_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -181,16 +188,20 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.compute-versions.outputs.source_sha }}
 
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
 
       - name: Sync Python dependencies
-        run: uv sync
+        run: uv sync --frozen
 
       - name: Build Python wheel
         run: |
           set -euo pipefail
-          mise run python:build
+          uv run --frozen python tasks/scripts/generate_python_proto.py
+          uv build --wheel --out-dir target/wheels
+          uv run --no-project python tasks/scripts/verify-python-wheel.py target/wheels \
+            --expected-version "${SETUPTOOLS_SCM_PRETEND_VERSION_FOR_OPENSHELL}"
           ls -la target/wheels/*.whl
 
       - name: Upload wheel artifact

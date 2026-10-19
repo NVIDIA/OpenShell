@@ -50,7 +50,8 @@ GATEWAY_BIN="${OPENSHELL_GATEWAY_BIN:-${ROOT}/target/debug/openshell-gateway}"
 DRIVER_BIN="${OPENSHELL_VM_DRIVER_BIN:-${ROOT}/target/debug/openshell-driver-vm}"
 CLI_BIN="${OPENSHELL_BIN:-${ROOT}/target/debug/openshell}"
 E2E_TEST_OVERRIDE="${OPENSHELL_E2E_VM_TEST:-}"
-E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES-e2e-vm}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-nvcr.io/nvidia/base/ubuntu:24.04}"
 
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
@@ -405,6 +406,10 @@ e2e_export_gateway_restart_metadata \
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
 e2e_run_openshell_conformance "VM"
+if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+  echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
+  exit 0
+fi
 
 # Seed the catalog once for the whole lane. The profiles live in the gateway
 # for as long as it runs, and the import is create-only: a second import of

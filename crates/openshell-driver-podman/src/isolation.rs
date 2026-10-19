@@ -10,9 +10,7 @@ use std::path::PathBuf;
 
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::DriverSandbox;
-use openshell_isolation_interface::contract::{
-    OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
-};
+use openshell_isolation_interface::contract::{ProvisioningEvidence, ResolvedWorkloadIdentity};
 use openshell_sandbox_backend::ALLOW_EXTRA_SUPPLEMENTARY_GROUPS_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
@@ -38,27 +36,16 @@ struct PodmanOuterFenceEvidence<'a> {
 }
 
 impl PodmanOuterFenceEvidence<'_> {
-    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, ComputeDriverError> {
-        if self.container_id.is_empty() {
-            return Err(invalid("Podman outer fence evidence is incomplete"));
-        }
-        let mut established = Vec::new();
-        if self.network_mode == "none" {
-            // With no container network namespace attachment, workload egress
-            // remains denied both after revocation and if the supervisor exits.
-            established.extend([
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ]);
-        }
-        if self.unexpected_networks.is_empty() {
-            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
+    fn project(&self, generation: &str) -> Result<ProvisioningEvidence, ComputeDriverError> {
+        if self.container_id.is_empty()
+            || self.network_mode != "none"
+            || !self.unexpected_networks.is_empty()
+        {
+            return Err(invalid("Podman provisioning evidence is incomplete"));
         }
         let encoded = serde_json::to_vec(self).map_err(invalid)?;
-        let projection =
-            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)
-                .map_err(invalid)?;
+        let projection = ProvisioningEvidence::from_enforcement_evidence(generation, &encoded)
+            .map_err(invalid)?;
         projection.validate(generation).map_err(invalid)?;
         Ok(projection)
     }
@@ -242,7 +229,7 @@ pub fn bootstrap_archives(
         .runtime_generation
         .to_string();
     let unexpected_networks = Vec::new();
-    let outer_fence = PodmanOuterFenceEvidence {
+    let provisioning_evidence = PodmanOuterFenceEvidence {
         container_id,
         network_mode: "none",
         unexpected_networks: &unexpected_networks,
@@ -278,7 +265,7 @@ pub fn bootstrap_archives(
         resource_claims: resource_claims.clone(),
         resource_claim_files: BTreeMap::new(),
         workload_identity: identity.clone(),
-        outer_fence: outer_fence.clone(),
+        provisioning_evidence: provisioning_evidence.clone(),
         child_env: child_env.clone(),
     };
     let runtime_descriptor = SandboxRuntimeDescriptor {
@@ -295,7 +282,7 @@ pub fn bootstrap_archives(
         host_gateway_ip: Some(host_gateway_ip),
         resource_claims,
         workload_identity: identity.clone(),
-        outer_fence,
+        provisioning_evidence,
     };
     // Libpod resolves the requested upload destination once for a stopped
     // container. Archive entries must be relative to the selected named volume,
@@ -568,14 +555,17 @@ mod tests {
         .unwrap();
         assert_eq!(config.boundary_id, runtime_descriptor.boundary_id);
         assert_eq!(config.session_id, runtime_descriptor.session_id);
-        assert_eq!(config.outer_fence, runtime_descriptor.outer_fence);
+        assert_eq!(
+            config.provisioning_evidence,
+            runtime_descriptor.provisioning_evidence
+        );
         assert_eq!(config.workload_identity, identity);
         assert_eq!(
             runtime_descriptor.host_gateway_ip,
             Some("127.0.0.1".parse().unwrap())
         );
         runtime_descriptor
-            .outer_fence
+            .provisioning_evidence
             .validate(&runtime_descriptor.generation)
             .unwrap();
         assert!(

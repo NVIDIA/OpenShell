@@ -188,6 +188,11 @@ image_preparation_timeout_seconds = 1800
 # "retain_last_valid" only when availability takes priority.
 policy_validation_failure_mode = "fail_closed"
 
+# How supervisors receive configuration. "poll" keeps periodic polling.
+# "push" sends configuration over the supervisor session to supervisors that
+# apply it; supervisors that do not support streamed configuration keep polling.
+config_delivery_mode = "poll"
+
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
 # service URLs under that domain.

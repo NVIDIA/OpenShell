@@ -15,6 +15,8 @@ mod firewall_rule;
 mod http;
 mod metadata;
 mod process;
+mod service;
+mod user;
 
 pub use ai_model::AiModel;
 pub use api::Api;
@@ -28,3 +30,5 @@ pub use firewall_rule::FirewallRule;
 pub use http::{HttpRequest, HttpResponse, Url};
 pub use metadata::{Metadata, Product};
 pub use process::{Actor, Process};
+pub use service::Service;
+pub use user::User;
