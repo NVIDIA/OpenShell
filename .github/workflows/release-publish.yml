@@ -476,22 +476,20 @@ jobs:
     permissions:
       contents: read
       packages: write
-    container:
-      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
+    defaults:
+      run:
+        shell: nix shell --inputs-from . nixpkgs#nodejs_24 -c bash -euo pipefail {0}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ inputs.source-sha }}
 
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: ./.github/actions/setup-nix
 
-      - name: Install tools
-        run: mise install --locked
+      - name: Install TypeScript dependencies
+        working-directory: ./sdk/typescript
+        run: npm ci
 
       - name: Configure npm auth for GitHub Packages
         working-directory: ./sdk/typescript
@@ -504,16 +502,19 @@ jobs:
           } > .npmrc
 
       - name: Publish
+        working-directory: ./sdk/typescript
         env:
           OPENSHELL_NPM_VERSION: ${{ inputs.npm-version }}
           MAKE_LATEST: ${{ inputs.make-latest }}
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          npm pkg set version="${OPENSHELL_NPM_VERSION}"
+          dist_tag=latest
           if [[ "${MAKE_LATEST}" != "true" ]]; then
-            export OPENSHELL_NPM_PUBLISH_ARGS="--tag release-${OPENSHELL_NPM_VERSION%.*}"
+            dist_tag="release-${OPENSHELL_NPM_VERSION%.*}"
           fi
-          mise run sdk:ts:publish
+          npm publish --tag "${dist_tag}"
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
