@@ -1,6 +1,6 @@
 ---
 name: release-captain
-description: Run the weekly OpenShell release captain checklist. Monday checks that the current pre-release train is qualified, triages qualification, compatibility, and security reports, and prepares the release coordination post. Tuesday selects the final qualified pre-release, tags its commit as stable after maintainer approval, verifies publication, and starts the next train. Trigger keywords - release captain, weekly release, Tuesday release, cut the release, release checklist, pre-release status, release train, start next train, stable release.
+description: Run the weekly OpenShell release captain checklist. Monday checks that the current pre-release train is qualified, triages qualification, compatibility, and security reports, and prepares the release coordination post. Tuesday previews the qualified pre-release that Release will promote, dispatches Release after maintainer approval, verifies publication, and starts the next train. Trigger keywords - release captain, weekly release, Tuesday release, cut the release, release checklist, pre-release status, release train, start next train, stable release.
 metadata:
   internal: true
 ---
@@ -13,6 +13,19 @@ release captain keeps the week's pre-release train green, coordinates the last
 merges, and cuts the release. `CI.md` describes the release workflows,
 qualification profile, and scanner policies. This skill covers what the captain
 does with them.
+
+## How to use this skill
+
+Ask for the part of the week you're in:
+
+| When | Ask | What happens |
+|---|---|---|
+| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists and Auto-Tag is cutting pre-releases. If not, ask this week's captain to start the train (Tuesday step 6). Nothing else is needed until Monday. |
+| Monday | "Run the release captain Monday checklist." | Monday steps 1–6: candidate status, failure triage, compatibility review, canary, and a draft coordination post. |
+| A pre-release failed | "`vX.Y.Z-pre.N` failed, help me fix it." | Monday step 5 and Recovery: classify the failure, propose a rerun or fix, and draft the `#openshell-triage` reply. |
+| Tuesday | "Cut the release." | Tuesday steps 1–7: preview the candidate, dispatch `Release` after approval, verify, and start the next train. |
+
+Every command that changes something is shown for approval first.
 
 ## Guardrails
 
@@ -28,43 +41,37 @@ specific action, never:
 Ask for approval with the exact command and target commit SHA. Every other
 step in this skill is read-only.
 
-Never repoint a stable tag at a different commit, and never re-dispatch a
-release while an earlier run for the same tag might still start. `Release Tag`
-has no concurrency guard, so two runs race to publish. Don't delete `-pre.N`
-tags; the RFC's cleanup step is not implemented and tag deletion is restricted.
+Never repoint a stable tag, and don't delete `-pre.N` tags; tag deletion is
+restricted. `Pre-release` has no concurrency guard, so never start a second run
+for a tag while an earlier one might still start.
 
 ## How the train works
 
 - A train has one base version, such as `v0.1.4`, fixed by its `-pre.1` tag. A
   patch train can't take breaking changes to Stable interfaces. Those wait for a
   minor train.
-- `Release Auto-Tag` runs Monday through Friday at 14:00 Europe/Zurich. That's
-  12:00 UTC during Central European Summer Time and 13:00 UTC in winter. If
-  `main` has commits since the latest `-pre.N`, it tags the next one and
-  dispatches `Release Tag` (about 45 minutes). It skips after the base version
-  gets a stable tag, and fails if the latest pre-release isn't an ancestor of
-  `main`. A skip still counts as a successful run.
-- Pushing any release tag by hand, pre-release or stable, starts `Release Tag`.
-  Don't also dispatch it, or two runs race to publish. Auto-Tag dispatches
-  explicitly only because its `GITHUB_TOKEN` push can't trigger workflows.
-- A stable `vX.Y.Z` tag push rebuilds and requalifies the commit. Always tag
-  the commit of a pre-release that passed.
-- Codex Security is temporarily excluded from release qualification (#4469).
-  `CI.md` explains how to run it by hand against a `-pre.N` candidate.
-- Only stable tags create a GitHub Release, so pre-releases never appear on the
-  Releases page. A passing pre-release publishes its images, Helm chart, and
-  qualification summary to GHCR. Its Debian, RPM, and macOS packages stay as
-  artifacts on the `Release Tag` run. To check a pre-release, look at the tag
-  and that run.
-- OpenShell TriageBot posts a top-level message in `#openshell-triage`
-  (`C0C20SDLDNW`) for every failed `Release Tag` attempt, with a link to the
-  run. Each rerun that fails gets its own message.
+- `Release Auto-Tag` runs Monday through Friday at 14:00 Europe/Zurich (12:00
+  UTC in summer, 13:00 UTC in winter). If `main` has commits since the latest
+  `-pre.N`, it tags the next one and dispatches `Pre-release`
+  (`release-prerelease.yml`, about 45 minutes). It skips when the train has no
+  `-pre.1` or the base version is already stable. A skip still counts as a
+  successful run.
+- `Pre-release` builds, then publishes and qualifies in parallel. Its artifacts
+  are published even when qualification fails. Pushing a `-pre.N` tag by hand
+  starts it; don't also dispatch it.
+- `Release` (`release.yml`) is dispatched by hand with the stable version. It
+  picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
+  creates the stable tag on that commit, then rebuilds and publishes without
+  requalifying. Pushing a stable tag does nothing.
+- Pre-releases never appear on the Releases page. Their images, Helm chart, and
+  qualification summary go to GHCR; packages stay as run artifacts.
+- OpenShell TriageBot posts in `#openshell-triage` (`C0C20SDLDNW`) for every
+  failed `Pre-release` attempt, with links to the failed jobs.
 
 ## Setup
 
 Run from an OpenShell checkout with an authenticated `gh` CLI. Fetch tags with
-`--force`, because release tags have been removed and recreated, and a plain
-fetch keeps stale local copies:
+`--force`, because release tags have been removed and recreated:
 
 ```shell
 export GH_REPO=NVIDIA/OpenShell
@@ -74,35 +81,32 @@ echo "Latest stable: $PREV"
 git tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-pre\.[0-9]+$' | head -5
 ```
 
-Release workflows change often, and a local branch may be days behind. Before
-relying on trigger or job behavior, including anything in this skill, read the
-current workflow from `origin/main`:
+Release workflows change often. Before relying on anything in this skill, check
+the release workflows on `origin/main` and their recent history:
 
 ```shell
-git show origin/main:.github/workflows/release-tag.yml | sed -n '/^on:/,/^permissions:/p'
+git ls-tree --name-only origin/main .github/workflows/ | grep release
+git log --oneline -5 origin/main -- '.github/workflows/release*.yml'
 ```
 
-Release tags are lightweight, matching the tags Auto-Tag creates. The tag
-commands below pass `-c tag.gpgSign=false` and read from `/dev/null`. With
-`tag.gpgSign` set, `git tag` would otherwise create a signed annotated tag and
-wait in an editor for a message.
-
-Find the `Release Tag` run for a tag. A tag pushed by hand runs on the tag
-itself. An Auto-Tag run is dispatched on `main`, so its head commit is the
-tagged commit:
+Find the `Pre-release` run for a tag. A tag pushed by hand runs on the tag; an
+Auto-Tag run is dispatched on `main` at the tagged commit:
 
 ```shell
 TAG=vX.Y.Z-pre.N
-gh run list --workflow release-tag.yml --branch "$TAG"
-gh run list --workflow release-tag.yml --event workflow_dispatch --commit "$(git rev-parse "$TAG^{commit}")"
+gh run list --workflow release-prerelease.yml --branch "$TAG"
+gh run list --workflow release-prerelease.yml --event workflow_dispatch --commit "$(git rev-parse "$TAG^{commit}")"
 ```
 
-If a commit has several dispatched runs, the one with a
-`qualification-$TAG-run-*` artifact is the match. That artifact appears only
-after qualification finishes:
+Preview the candidate `Release` would promote. This runs the same selection
+script, read-only, from a temporary `origin/main` checkout:
 
 ```shell
-gh api "repos/NVIDIA/OpenShell/actions/runs/<run-id>/artifacts?per_page=100" --jq '.artifacts[].name' | grep "qualification-$TAG-"
+VERSION=vX.Y.Z
+wt=$(mktemp -d)
+git worktree add -q --detach "$wt" origin/main
+(cd "$wt" && GITHUB_REPOSITORY=NVIDIA/OpenShell uv run -q --no-project python tasks/scripts/select-release-candidate.py "$VERSION" --branch main | jq .)
+git worktree remove --force "$wt"
 ```
 
 ## Monday: pre-flight
@@ -110,46 +114,40 @@ gh api "repos/NVIDIA/OpenShell/actions/runs/<run-id>/artifacts?per_page=100" --j
 Finish these on Monday so Tuesday is only the cut.
 
 1. **Check the train.** Confirm that the latest `-pre.N` targets the version you
-   plan to ship. Check that today's `Release Auto-Tag` run (14:00
-   Europe/Zurich) succeeded, and check from its log whether it tagged or
-   skipped:
+   plan to ship, and whether today's Auto-Tag run tagged or skipped:
 
    ```shell
-   gh run list --workflow release-auto-tag.yml --limit 3
    gh run view "$(gh run list --workflow release-auto-tag.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --log | grep -E 'Next tag:|— skipping' | grep -v echo
    ```
 
    If the next version has no `-pre.1`, start the train (Tuesday step 6).
 
-2. **Read the qualification summary for the latest attempt.** The summary's
-   `tag` and `source_sha` must match the candidate, and `current_profile_passed`
-   must be `true`:
+2. **Check the candidate.** Run the preview from Setup. It shows the newest
+   pre-release that would ship. If the latest `-pre.N` isn't the candidate,
+   its run failed; read why:
 
    ```shell
    RUN=<run-id>
-   ATTEMPT=$(gh run view "$RUN" --json attempt --jq .attempt)
-   dir=$(mktemp -d)
-   gh run download "$RUN" -n "qualification-$TAG-run-$RUN-attempt-$ATTEMPT" -D "$dir/q"
-   jq '{tag, source_sha, current_profile_passed, suites}' "$dir/q/qualification-summary.json"
-   git rev-parse "$TAG^{commit}"
+   gh run view "$RUN" --json jobs --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out") | "\(.name)\t\(.url)"'
+   gh run view "$RUN" --log-failed
    ```
 
-   For any failed suite, read the log with `gh run view "$RUN" --log-failed`.
    `CI.md` lists which scanners block. Use the `watch-github-actions` skill for
    CI diagnosis.
 
-3. **Triage the advisory compatibility review.** It never blocks publication,
-   and a green job doesn't mean it found no breaks:
+3. **Triage the advisory compatibility review** for the candidate's run. It
+   never blocks publication, and a green job doesn't mean it found no breaks:
 
    ```shell
-   gh run download "$RUN" -n "compatibility-review-run-$RUN-attempt-$ATTEMPT" -D "$dir/c"
-   jq '{status, verdict: .review.verdict}' "$dir/c/report.json"
-   cat "$dir/c/report.md"
+   ATTEMPT=$(gh run view "$RUN" --json attempt --jq .attempt)
+   dir=$(mktemp -d)
+   gh run download "$RUN" -n "compatibility-review-run-$RUN-attempt-$ATTEMPT" -D "$dir"
+   jq '{status, verdict: .review.verdict}' "$dir/report.json"
+   cat "$dir/report.md"
    ```
 
-   Only `complete` with `no_unaddressed_breaks` is a clean review. A missing
-   report or any other result means there's no assessment. For each finding,
-   decide whether it's a real break, a false positive, or unclear:
+   Only `complete` with `no_unaddressed_breaks` is a clean review. Anything
+   else means there's no assessment. For each finding:
 
    - **Real break:** needs a fix or revert before Tuesday, or must wait for a
      minor train.
@@ -159,55 +157,43 @@ Finish these on Monday so Tuesday is only the cut.
 
    The reviewer treats every `pub` Rust item as a Stable interface. No
    workspace crate is published to crates.io, so a finding in an internal
-   crate such as `openshell-core` or `openshell-isolation-interface` is often a
-   false positive. Check whether a supported SDK surface, such as
-   `openshell-sdk`, exposes the item before deciding.
+   crate such as `openshell-core` is often a false positive. Check whether a
+   supported SDK surface, such as `openshell-sdk`, exposes the item.
 
 4. **Check the dev canary.** `Release Canary` smoke-tests `main` dev artifacts.
-   It doesn't gate the tag, but treat a red canary as a release risk. Use the
+   It doesn't gate the release, but treat a red canary as a risk. Use the
    `test-release-canary` skill to diagnose it:
 
    ```shell
    gh run list --workflow release-canary.yml --limit 3
    ```
 
-5. **Plan fixes.** A failed pre-release doesn't end the train. The goal is a
-   green pre-release before Tuesday, so fix forward:
+5. **Plan fixes.** A failed pre-release doesn't end the train. Fix forward to a
+   green pre-release before Tuesday:
 
-   - Reply in the thread of the failure's `#openshell-triage` message, so
-     others know someone is working on a fix. Post the cause and the fix or
-     rerun, then post again when a pre-release passes. Draft these replies for
-     the captain to post.
-   - A transient infrastructure failure can be rerun after approval. Runner
-     setup errors, registry push errors, and integration tests that fail only
-     some of the time are common. If a failure looks unrelated to the commit's
-     changes, rerun once before treating it as a code defect.
+   - Reply in the thread of the failure's `#openshell-triage` message with the
+     cause and the fix or rerun, then again when a pre-release passes. Draft
+     these replies for the captain to post.
+   - Rerun a transient infrastructure failure once, after approval: runner
+     setup errors, registry push errors, and intermittent integration tests.
    - A code defect, or a new advisory against a locked dependency, needs a
-     merged fix and a new pre-release. Don't rerun or promote the failed one.
-   - Let the failed run finish rather than cancelling it. Its other suites
-     still show whether the rest of the commit is healthy.
+     merged fix and a new pre-release. Don't rerun the failed one.
+   - Let a failed run finish rather than cancelling it. Its other suites still
+     show whether the rest of the commit is healthy.
    - Once the fix merges and its `Release Dev` run passes, tag the next
-     `-pre.N` on that commit by hand after approval (as in Tuesday step 6, with
-     the next number), instead of waiting for the next Auto-Tag run. That
-     gives a qualifiable candidate a day sooner.
+     `-pre.N` on that commit by hand after approval (as in Tuesday step 6),
+     instead of waiting a day for Auto-Tag.
 
-6. **Draft the coordination post.** Release coordination happens in a thread
-   the captain starts on Monday in the OpenShell channel of the CNCF Slack
-   (`cloud-native.slack.com`, channel `C0B6Y8WQHU1`). Also link the thread in
-   the internal team channel. The thread asks contributors to link ready PRs
-   they want in the release. The release ships from `main`; there's no release
-   branch and no cherry-picking. The list exists so the captain can get those
-   PRs reviewed and merged in order before the cutoff. Tag reviewers on the
-   linked PRs. Draft it for the captain to post:
+6. **Draft the coordination post.** The captain starts a thread on Monday in the
+   OpenShell channel of the CNCF Slack (`cloud-native.slack.com`, channel
+   `C0B6Y8WQHU1`) and links it in the internal team channel. Contributors reply
+   with ready PRs they want in the release. The release ships from `main`, with
+   no release branch or cherry-picks, so the list is for getting those PRs
+   reviewed and merged before the cutoff. Tag reviewers on the linked PRs.
 
-   - the target version and current candidate (tag, commit, run link);
-   - qualification and compatibility status, with an owner for each blocker;
-   - ready but unmerged PRs that should make the release, in merge order;
-   - the merge cutoff in UTC and the captain's time zone. Set it before
-     Tuesday's 14:00 Europe/Zurich Auto-Tag run so the last merges make that
-     pre-release.
-
-   Candidate PRs:
+   Set the cutoff before the last Auto-Tag run you'll take on Tuesday (14:00
+   Europe/Zurich), or before a pre-release you'll tag by hand. Approved open
+   PRs:
 
    ```shell
    gh pr list --base main --state open --search "review:approved" --json number,title,author --jq '.[] | "#\(.number) \(.title) (@\(.author.login))"'
@@ -225,87 +211,62 @@ Finish these on Monday so Tuesday is only the cut.
 
 ## Tuesday: cut the release
 
-1. **Select the final candidate.** After the cutoff and Tuesday's Auto-Tag run,
-   pick the newest `-pre.N` whose qualification passed, and repeat Monday steps
-   2 and 3 for it. If the newest pre-release failed, either merge a fix and
-   qualify another pre-release, or pick an earlier one that passed and confirm
-   that leaving out the later commits is acceptable.
+1. **Select the final candidate.** After the cutoff and the last pre-release
+   has finished, run the preview from Setup and repeat Monday step 3 for its
+   run. If the newest pre-release failed, either fix it (Monday step 5) or
+   confirm that shipping the earlier candidate without the later commits is
+   acceptable. If qualification passed but publication failed, rerun the
+   failed jobs first; `Release` needs the whole run to pass.
 
-2. **Request approval.** Present the candidate tag, commit SHA, qualification
-   run, compatibility assessment, and the commits since `$PREV`:
+2. **Request approval.** Present the candidate tag, commit, qualification run,
+   compatibility assessment, and the commits since `$PREV`:
 
    ```shell
-   git log --oneline --no-merges "$PREV..$TAG"
+   git log --oneline --no-merges "$PREV..<candidate_tag>"
    ```
 
-3. **Tag the stable release.** After approval, check the candidate, then tag its
-   exact commit and push only that tag:
+3. **Dispatch the release.** After approval:
 
    ```shell
-   VERSION=vX.Y.Z
-   SHA=$(git rev-parse "$TAG^{commit}")
-   [[ "$VERSION" == "${TAG%-pre.*}" ]] || echo "version does not match the train"
-   [[ "$SHA" == "$(jq -r .source_sha "$dir/q/qualification-summary.json")" ]] || echo "commit does not match qualification"
-   git tag --points-at "$SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' && echo "commit already has a stable tag"
-   git -c tag.gpgSign=false tag "$VERSION" "$SHA" </dev/null
-   git push origin "refs/tags/$VERSION"
+   gh workflow run release.yml --ref main -f tag="$VERSION"
    ```
 
-   Stop if any check prints a message.
-
-4. **Watch the release.** The tag push starts `Release Tag`. It runs for about
-   45 minutes, so poll the status, or run the watch in the background:
+4. **Watch the release.** It runs for about 45 minutes. Check that the
+   `Select Qualified Prerelease` job summary names the approved candidate:
 
    ```shell
-   gh run list --workflow release-tag.yml --branch "$VERSION" --limit 1
+   gh run list --workflow release.yml --limit 1
    gh run watch <run-id> --exit-status
    ```
 
-   If no run appears within a few minutes, or the run stays queued, see
-   Recovery.
-
-5. **Verify publication.** Confirm that the GitHub Release exists as a
-   non-pre-release with assets and generated notes, and that no job failed:
+5. **Verify publication.** Confirm the GitHub Release has assets and that no
+   job failed:
 
    ```shell
-   gh release view "$VERSION" --json name,isPrerelease,publishedAt,assets --jq '{name, isPrerelease, publishedAt, assets: (.assets | length)}'
+   gh release view "$VERSION" --json isPrerelease,publishedAt,assets --jq '{isPrerelease, publishedAt, assets: (.assets | length)}'
    gh run view <run-id> --json jobs --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "\(.conclusion)\t\(.name)"'
    ```
 
    `Trigger Wheel Publish` only starts the GitLab pipeline, so confirm that the
-   Python wheel reached PyPI separately.
+   wheel reached PyPI separately.
 
-6. **Start the next train.** Until someone pushes the next `-pre.1`, Auto-Tag
-   logs `vX.Y.Z is already stable — skipping tag creation` and does nothing.
-   Starting it is this week's captain's job, not next week's: once `-pre.1`
-   exists, Auto-Tag cuts `-pre.2` onward every weekday, so next week's captain
-   starts Monday with pre-releases already qualifying. Start the train soon
-   after the stable release; it can be any weekday.
+6. **Start the next train.** This is this week's captain's job, not next
+   week's. Until the next `-pre.1` exists, Auto-Tag skips. Once it does,
+   Auto-Tag cuts `-pre.2` onward every weekday, so next week's captain starts
+   Monday with qualified pre-releases. Do it soon after the release.
 
    Agree with the maintainers whether the next train is patch (the default) or
    minor (notable features or planned breaking changes; see the
-   [version selection supplement](../../../rfc/0014-release-stability/release-version-selection.md)).
-   List the commit types since the release to inform the decision:
+   [version selection supplement](../../../rfc/0014-release-stability/release-version-selection.md)):
 
    ```shell
    git log --format=%s --no-merges "$VERSION..origin/main" | sed -E 's/^([a-z]+)(\(.*\))?(!?):.*/\1\3/' | sort | uniq -c
    ```
 
-   Seed the train on a `main` commit that:
-
-   - comes after `$VERSION`;
-   - has no stable tag of its own;
-   - has a successful `Release Dev` run.
-
-   Release versioning prefers a stable tag over a pre-release tag on the same
-   commit, which would mislabel the packages. If nothing has merged since the
-   release, wait.
-
-   Branch Checks already passed in the merge queue before each merge.
-   `Release Dev` runs the post-merge E2E and dev publication on every commit. A
-   newer push cancels the older run, so `cancelled` means superseded, not
-   failed. Pick the newest commit whose run succeeded, or wait for the tip's
-   run to finish:
+   Seed it on a `main` commit after `$VERSION`, without a stable tag of its own
+   (versioning prefers the stable tag), and with a successful `Release Dev` run.
+   `cancelled` means a newer push superseded the run. If nothing has merged
+   since the release, wait.
 
    ```shell
    for sha in $(git rev-list --max-count=10 "$VERSION..origin/main"); do
@@ -314,26 +275,17 @@ Finish these on Monday so Tuesday is only the cut.
    done
    ```
 
-   After approval, push the tag. The push starts `Release Tag`; don't dispatch
-   it as well:
+   After approval, push the tag, which starts `Pre-release`. The `-c` and
+   `/dev/null` keep `git` from signing the tag and opening an editor:
 
    ```shell
    NEXT=vX.Y.Z-pre.1
    NEXT_SHA=<main commit>
    git merge-base --is-ancestor "$VERSION" "$NEXT_SHA" || echo "commit does not contain the release"
-   git tag --points-at "$NEXT_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' && echo "commit already has a stable tag"
    git -c tag.gpgSign=false tag "$NEXT" "$NEXT_SHA" </dev/null
    git push origin "refs/tags/$NEXT"
-   gh run list --workflow release-tag.yml --branch "$NEXT"
+   gh run list --workflow release-prerelease.yml --branch "$NEXT"
    ```
-
-   Stop if either check prints a message. The rolling `dev` tag may point at
-   the same commit; it isn't a release tag and doesn't affect versioning.
-
-   The run should appear as `queued` within a minute. Watch it as in Tuesday
-   step 4, then read its qualification summary (Monday step 2). It won't appear
-   on the Releases page. From the next weekday, Auto-Tag creates `-pre.2` onward
-   when `main` has new commits.
 
 7. **Close the loop.** Draft a reply to the coordination thread with the release
    link and any PRs deferred to the next train.
@@ -342,19 +294,19 @@ Finish these on Monday so Tuesday is only the cut.
 
 | Symptom | Action |
 |---|---|
-| Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the new attempt's summary. Reply in the failure's `#openshell-triage` thread with the result. |
-| Code defect in a pre-release | Fix forward (Monday step 5): merge the fix, then, after approval, tag and push the next `-pre.N` on the fix commit once its `Release Dev` run passes. Waiting for Auto-Tag also works but costs up to a day. |
-| `Cargo Deny` fails a pre-release with `error[vulnerability]` | A new RustSec advisory was published against a locked dependency. Code that passed earlier can start failing this way. Rerunning won't help. Find the advisory IDs with `gh run view <run-id> --log-failed \| grep -E 'ID: RUSTSEC'`, look for an open dependency bump PR, and treat the merged bump as a code-defect fix. |
-| A pushed tag started no `Release Tag` run | Wait a few minutes and check `gh run list --workflow release-tag.yml --branch "$TAG"` again. Only after confirming that no run exists, and with approval, dispatch it with `gh workflow run release-tag.yml --ref main -f tag="$TAG"`. |
-| Stable run stuck queued | Don't re-dispatch or delete the tag. Check for a GitHub Actions incident and ask a maintainer to cancel the run (`gh run cancel <run-id>`, or force-cancel through the API). Only after it shows `cancelled` or `failed`, rerun it after approval. |
-| Stable run fails before the `Release` job, transient | Nothing was published. After approval, run `gh run rerun <run-id> --failed`. |
-| Stable run fails before the `Release` job, code defect | Nothing was published, and Auto-Tag won't create pre-releases for a base version that has a stable tag. Ask the maintainers to choose: remove the unpublished tag (needs a ruleset bypass) and recut from a qualified fix, or skip to the next patch version. |
-| Stable run fails after the `Release` job | The GitHub Release exists. Check which publish jobs succeeded. A rerun of an npm or snap publish fails if that version already went out. Rerun only jobs that didn't publish, after approval. |
+| Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the candidate. Reply in the failure's `#openshell-triage` thread with the result. |
+| Pre-release qualification passed but publication failed | Usually a registry error, such as GHCR `failed to perform "Tag"`. Rerun failed jobs after approval; `Release` won't select the run until it fully passes. |
+| Code defect in a pre-release | Fix forward (Monday step 5): merge the fix, then tag the next `-pre.N` on it after its `Release Dev` run passes. |
+| `Cargo Deny` fails with `error[vulnerability]` | A new RustSec advisory hit a locked dependency; rerunning won't help. Find the IDs with `gh run view <run-id> --log-failed \| grep -E 'ID: RUSTSEC'`, find or open the bump PR, and treat it as a code defect. |
+| A pushed `-pre.N` tag started no run | Wait a few minutes and check again. Only after confirming no run exists, and with approval, run `gh workflow run release-prerelease.yml --ref main -f tag="$TAG"`. |
+| `Release` fails in `Select Qualified Prerelease` | No candidate qualified, or its evidence expired. Nothing was tagged or published. Fix the train, then dispatch again. |
+| `Release` fails after selection, transient | After approval, run `gh run rerun <run-id> --failed`. A stable tag that already points at the selected commit can be retried. |
+| `Release` fails after the `Release` job | The GitHub Release exists. A rerun of an npm or snap publish fails if that version already went out. Rerun only jobs that didn't publish, after approval. |
+| `Release` stuck queued | Releases queue behind each other. Check for another running `Release` or a GitHub Actions incident before asking a maintainer to cancel. Don't dispatch again. |
 
 ## Related
 
-- `release-openshell`: the short procedure for selecting a qualified
-  pre-release and tagging it stable.
+- `release-openshell`: the short procedure behind Tuesday steps 1–5.
 - `watch-github-actions`: general `gh run` monitoring and log retrieval.
 - `test-release-canary`: diagnose dev artifact smoke-test failures.
 - `CI.md`: release workflows, qualification profile, and scanner policies.
