@@ -143,7 +143,7 @@ sandbox overlay. Each mounts it at
 `/etc/openshell/tls/additional/ca-bundle.pem` and starts the supervisor with
 `--additional-ca-bundle` for that path. Drivers verify their staged artifact
 before handing it to a runtime; the SHA-256 generation is an internal staging
-and restart-reconciliation value, not a supervisor argument. The supervisor
+value, not a supervisor argument. The supervisor
 reads the mounted bundle and folds it into its system roots. Remote and custom
 compute drivers reject this setting because the compute-driver protocol does
 not carry the normalized material.
@@ -166,7 +166,7 @@ To apply any addition, removal, or source update, the operator must:
 Stop/start retains the sandbox identity and its supported durable workspace; it
 does not create a replacement sandbox. The restarted supervisor consumes the
 bundle staged from the restarted gateway's snapshot. Source normalization,
-driver delivery/reconciliation, and supervisor validation failures fail closed:
+driver delivery, and supervisor validation failures fail closed:
 they do not silently fall back to a previous or default trust bundle.
 
 Use this sequence for a non-disruptive private-CA rollover:
