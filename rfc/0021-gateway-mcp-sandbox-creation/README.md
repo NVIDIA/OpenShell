@@ -6,7 +6,7 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/4574
 ---
 
-# RFC NNNN - Gateway MCP for Creating Sandboxes
+# RFC 0021 - Gateway MCP for Creating Sandboxes
 
 ## Summary
 
