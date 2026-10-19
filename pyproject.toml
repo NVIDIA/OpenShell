@@ -44,7 +44,7 @@ documentation = "https://docs.nvidia.com/openshell/latest/"
 
 [dependency-groups]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
     "pytest-xdist>=3.0",
