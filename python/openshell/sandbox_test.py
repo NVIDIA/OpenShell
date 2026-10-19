@@ -28,10 +28,12 @@ from openshell.sandbox import (
     Pager,
     Sandbox,
     SandboxClient,
+    SandboxConditionRef,
     SandboxError,
     SandboxRef,
     SandboxStatusRef,
     SandboxTemplateClient,
+    ServiceAuthorizationMode,
     ServiceExposure,
     TlsConfig,
     _atomic_replace,
@@ -2219,15 +2221,26 @@ def test_create_forwards_service_exposures() -> None:
         name="app-server",
         service_exposures=[
             ServiceExposure(target_port=4500),
-            ServiceExposure(service="metrics", target_port=9090),
+            ServiceExposure(
+                service="metrics",
+                target_port=9090,
+                authorization_mode=ServiceAuthorizationMode.BEARER_PASSTHROUGH,
+            ),
         ],
     )
 
     assert stub.create_request is not None
     assert [
-        (exposure.service, exposure.target_port)
+        (exposure.service, exposure.target_port, exposure.authorization_mode)
         for exposure in stub.create_request.service_exposures
-    ] == [("", 4500), ("metrics", 9090)]
+    ] == [
+        ("", 4500, openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP),
+        (
+            "metrics",
+            9090,
+            openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH,
+        ),
+    ]
     assert dict(ref.service_urls) == {
         "": "https://.example.test/",
         "metrics": "https://metrics.example.test/",
@@ -2716,13 +2729,83 @@ def test_sandbox_ref_retains_gateway_labels() -> None:
     assert dict(ref.labels) == {"aiq": "deep-research", "env": "dev"}
 
 
+def test_sandbox_ref_exposes_host_identity_and_accepts_legacy_response() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+    assert _sandbox_ref(proto).host_key_fingerprint is None
+    proto.host_key_fingerprint = "SHA256:expected"
+    assert _sandbox_ref(proto).host_key_fingerprint == "SHA256:expected"
+
+
 def test_sandbox_ref_includes_main_process_result() -> None:
     proto = _make_sandbox_proto("sandbox-1", "job-1")
     proto.status.exit_code = 0
+    proto.status.restart_count = 2
+    proto.status.next_restart_time.FromMilliseconds(1_700_000_000_000)
+    proto.status.main_process_started_time.FromMilliseconds(1_699_999_000_000)
 
     status = _sandbox_ref(proto).status
 
     assert status.exit_code == 0
+    assert status.restart_count == 2
+    assert status.next_restart_at_ms == 1_700_000_000_000
+    assert status.main_process_started_at_ms == 1_699_999_000_000
+
+
+def test_sandbox_ref_includes_conditions() -> None:
+    proto = _make_sandbox_proto("sandbox-1", "job-1")
+
+    ready = proto.status.conditions.add()
+    ready.type = "Ready"
+    ready.status = "True"
+    ready.reason = "BackendReady"
+    ready.message = "Container is running"
+    ready.transition_time.FromMilliseconds(1_700_000_000_000)
+
+    failed = proto.status.conditions.add()
+    failed.type = "Ready"
+    failed.status = "Unknown"
+    failed.reason = "InspectFailed"
+    failed.message = "Container inspect failed: connection refused"
+
+    ref = _sandbox_ref(proto)
+
+    assert ref.status.conditions == (
+        SandboxConditionRef(
+            type="Ready",
+            status="True",
+            reason="BackendReady",
+            message="Container is running",
+            transition_time_ms=1_700_000_000_000,
+        ),
+        SandboxConditionRef(
+            type="Ready",
+            status="Unknown",
+            reason="InspectFailed",
+            message="Container inspect failed: connection refused",
+            transition_time_ms=None,
+        ),
+    )
+    # Surfaces the same conditions through SandboxRef directly.
+    assert ref.conditions == ref.status.conditions
+
+
+def test_sandbox_ref_conditions_default_to_empty() -> None:
+    ref = _sandbox_ref(_make_sandbox_proto("sandbox-1", "job-1"))
+
+    assert ref.status.conditions == ()
+    assert ref.conditions == ()
+
+
+def test_direct_sandbox_ref_construction_defaults_conditions() -> None:
+    ref = SandboxRef(
+        id="sandbox-1",
+        name="job-1",
+        workspace="default",
+        status=SandboxStatusRef(phase=2, current_policy_version=0),
+    )
+
+    assert ref.status.conditions == ()
+    assert ref.conditions == ()
 
 
 def test_returned_labels_are_immutable() -> None:

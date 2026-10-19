@@ -63,10 +63,9 @@ pub struct OpenShellRoot {
     #[serde(default)]
     pub supervisor: SupervisorFileSection,
 
-    /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
-    /// crate's `Deserialize` impl. Stored as raw [`toml::Value`] so each
-    /// driver can evolve its schema
-    /// independently of this crate.
+    /// `[openshell.drivers.<name>]` tables — passed to each driver crate's
+    /// `Deserialize` impl after removing common gateway controls. Stored as
+    /// raw [`toml::Value`] so each driver can evolve its schema independently.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
 
@@ -102,6 +101,28 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub log_level: Option<String>,
 
+    // ── Database ─────────────────────────────────────────────────────────
+    /// Connection ceiling for the persistence pool. One shared pool serves
+    /// every database-backed RPC, so this is also the gateway's ceiling on
+    /// concurrent database work. On Postgres, each replica also opens up to
+    /// `database_lock_max_connections` lock connections, so total server
+    /// connections are `(database_max_connections +
+    /// database_lock_max_connections) × replica_count`, plus rollout pods,
+    /// which must stay under the server's own `max_connections`. Omit to keep
+    /// the backend default (10 for Postgres, 5 for on-disk `SQLite`); an
+    /// in-memory `SQLite` database is always a single connection. Postgres
+    /// needs at least 2, because the SSH identity lock keeps one connection
+    /// while it queries the pool.
+    #[serde(default)]
+    pub database_max_connections: Option<u32>,
+
+    /// Connection ceiling for the Postgres mutation lock pool. Each mutation
+    /// guard holds one lock connection, so this bounds how many guarded
+    /// mutations a replica runs or waits on in Postgres at once. Omit to keep
+    /// the default of 4; `SQLite` has no lock pool and ignores it.
+    #[serde(default)]
+    pub database_lock_max_connections: Option<u32>,
+
     // ── Drivers ──────────────────────────────────────────────────────────
     /// Explicit compute driver selection. `None` enables auto-detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,6 +137,9 @@ pub struct GatewayFileSection {
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    /// Absolute preparation budget for new attempts; existing deadlines persist.
+    #[serde(default)]
+    pub image_preparation_timeout_seconds: Option<u32>,
     #[serde(default)]
     pub grpc_rate_limit_requests: Option<u64>,
     #[serde(default)]
@@ -123,6 +147,9 @@ pub struct GatewayFileSection {
     /// Security posture when a sandbox rejects a candidate policy generation.
     #[serde(default)]
     pub policy_validation_failure_mode: Option<openshell_core::PolicyValidationFailureMode>,
+    /// Supervisor configuration delivery; omitted uses the release default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_delivery_mode: Option<openshell_core::config::ConfigDeliveryMode>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -132,14 +159,13 @@ pub struct GatewayFileSection {
     /// Enable plaintext HTTP routing for loopback sandbox service URLs.
     #[serde(default)]
     pub enable_loopback_service_http: Option<bool>,
+    /// Enable the WebSocket tunnel for an authenticated edge proxy.
+    #[serde(default)]
+    pub enable_websocket_tunnel: Option<bool>,
 
     // ── Sandbox client TLS ───────────────────────────────────────────────
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_cert: Option<PathBuf>,
-    #[serde(default)]
-    pub guest_tls_key: Option<PathBuf>,
 
     // ── TLS toggle ───────────────────────────────────────────────────────
     /// When `true`, the gateway listens on plaintext HTTP and ignores any
@@ -164,6 +190,8 @@ pub struct GatewayFileSection {
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
     pub otlp: Option<OtlpConfig>,
+    #[serde(default)]
+    pub ocsf_log: Option<OcsfLogConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -195,31 +223,256 @@ pub struct GatewayTlsFileConfig {
     pub external_server_names: Vec<String>,
 }
 
-/// `[openshell.gateway.otlp]` section.
-///
-/// Presence of this table enables OTLP export; there is no `enabled` flag.
-/// SDK tuning knobs are deliberately absent — see [`crate::otel_tracing`] for what
-/// this table owns and what the `OTEL_*` environment variables own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OcsfLogRotation {
+    Never,
+    #[default]
+    Daily,
+}
+
+pub use openshell_ocsf::OcsfSchemaVersion;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawOcsfLogConfig")]
+pub struct OcsfLogConfig {
+    pub path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<OcsfSchemaVersion>,
+    pub rotation: OcsfLogRotation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_files: Option<std::num::NonZeroUsize>,
+    pub queue_capacity: std::num::NonZeroUsize,
+    pub queue_max_bytes: std::num::NonZeroUsize,
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawOcsfLogConfig {
+    path: PathBuf,
+    schema_version: Option<OcsfSchemaVersion>,
+    #[serde(default)]
+    rotation: OcsfLogRotation,
+    max_files: Option<std::num::NonZeroUsize>,
+    queue_capacity: Option<std::num::NonZeroUsize>,
+    queue_max_bytes: Option<std::num::NonZeroUsize>,
+}
+
+impl TryFrom<RawOcsfLogConfig> for OcsfLogConfig {
+    type Error = &'static str;
+
+    fn try_from(raw: RawOcsfLogConfig) -> Result<Self, Self::Error> {
+        if raw.path.as_os_str().is_empty() {
+            return Err("ocsf_log.path must not be empty");
+        }
+        if raw.rotation == OcsfLogRotation::Never && raw.max_files.is_some() {
+            return Err("ocsf_log.max_files requires daily rotation");
+        }
+        Ok(Self {
+            path: raw.path,
+            schema_version: raw.schema_version,
+            rotation: raw.rotation,
+            max_files: (raw.rotation == OcsfLogRotation::Daily).then(|| {
+                raw.max_files
+                    .unwrap_or(std::num::NonZeroUsize::new(7).unwrap())
+            }),
+            queue_capacity: raw
+                .queue_capacity
+                .unwrap_or(std::num::NonZeroUsize::new(10_000).unwrap()),
+            queue_max_bytes: raw
+                .queue_max_bytes
+                .unwrap_or(std::num::NonZeroUsize::new(16 * 1024 * 1024).unwrap()),
+        })
+    }
+}
+/// `[openshell.gateway.otlp]` section and its per-signal tables.
+///
+/// `endpoint` is the collector for every enabled signal, and on its own
+/// enables trace export. `[otlp.traces]` overrides the trace endpoint, and
+/// `[otlp.ocsf]` with `enabled = true` exports OCSF events as log records,
+/// optionally to a different endpoint. SDK tuning knobs are deliberately absent — see
+/// [`crate::otel_tracing`] for what this table owns and what the `OTEL_*`
+/// environment variables own.
+///
+/// Endpoints are resolved when parsing, so each enabled signal carries its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawOtlpConfig")]
 pub struct OtlpConfig {
+    /// `service.name` resource attribute. Defaults to `openshell-gateway`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+
+    /// Trace export, when enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traces: Option<OtlpTracesConfig>,
+
+    /// OCSF event export as OTLP log records, when enabled.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_enabled_ocsf"
+    )]
+    pub ocsf: Option<OcsfOtlpConfig>,
+}
+
+/// Writes `enabled = true` so that a serialized config parses back to the
+/// same export.
+fn serialize_enabled_ocsf<S: serde::Serializer>(
+    ocsf: &Option<OcsfOtlpConfig>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Enabled<'a> {
+        enabled: bool,
+        #[serde(flatten)]
+        ocsf: &'a OcsfOtlpConfig,
+    }
+    ocsf.as_ref()
+        .map(|ocsf| Enabled {
+            enabled: true,
+            ocsf,
+        })
+        .serialize(serializer)
+}
+
+impl OtlpConfig {
+    /// The collector that receives traces, when trace export is enabled.
+    pub fn traces_endpoint(&self) -> Option<&str> {
+        self.traces.as_ref().map(|traces| traces.endpoint.as_str())
+    }
+}
+
+/// `[openshell.gateway.otlp.traces]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtlpTracesConfig {
     /// OTLP/gRPC collector endpoint, e.g.
     /// `http://otel-collector.observability.svc:4317`.
     pub endpoint: String,
+}
 
-    /// `service.name` resource attribute. Defaults to `openshell-gateway`.
+/// `[openshell.gateway.otlp.ocsf]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OcsfOtlpConfig {
+    /// OTLP/gRPC collector endpoint for OCSF log records.
+    pub endpoint: String,
+
+    /// Optional OCSF downgrade target for exported log records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<OcsfSchemaVersion>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOtlpConfig {
     #[serde(default)]
-    pub service_name: Option<String>,
+    endpoint: Option<String>,
+    #[serde(default)]
+    service_name: Option<String>,
+    #[serde(default)]
+    traces: Option<RawOtlpTraces>,
+    #[serde(default)]
+    ocsf: Option<RawOcsfOtlp>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOtlpTraces {
+    #[serde(default)]
+    endpoint: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawOcsfOtlp {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    endpoint: Option<String>,
+    #[serde(default)]
+    schema_version: Option<OcsfSchemaVersion>,
+}
+
+impl TryFrom<RawOtlpConfig> for OtlpConfig {
+    type Error = String;
+
+    fn try_from(raw: RawOtlpConfig) -> Result<Self, Self::Error> {
+        let endpoint_for = |table: &str, endpoint: Option<String>| {
+            endpoint.or_else(|| raw.endpoint.clone()).ok_or_else(|| {
+                format!("otlp.{table} needs an endpoint, or otlp.endpoint to default to")
+            })
+        };
+        let traces = match raw.traces {
+            Some(traces) => Some(endpoint_for("traces", traces.endpoint)?),
+            None => raw.endpoint.clone(),
+        }
+        .map(|endpoint| OtlpTracesConfig { endpoint });
+        let ocsf = raw
+            .ocsf
+            .filter(|ocsf| ocsf.enabled)
+            .map(|ocsf| {
+                Ok::<_, String>(OcsfOtlpConfig {
+                    endpoint: endpoint_for("ocsf", ocsf.endpoint)?,
+                    schema_version: ocsf.schema_version,
+                })
+            })
+            .transpose()?;
+        if traces.is_none() && ocsf.is_none() {
+            return Err("otlp needs an endpoint, or otlp.ocsf with enabled = true".to_string());
+        }
+        Ok(Self {
+            service_name: raw.service_name,
+            traces,
+            ocsf,
+        })
+    }
 }
 
 /// `[openshell.supervisor]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorFileSection {
+    /// Operator-owned external isolation routes, reachable by supervisors.
+    #[serde(default)]
+    pub isolation_backends: Vec<openshell_core::isolation_registration::BackendRegistration>,
     /// Statically registered supervisor middleware services. Registration is
     /// operator-owned and changes require a gateway restart.
     #[serde(default)]
     pub middleware: Vec<MiddlewareServiceFileConfig>,
+}
+
+impl ConfigFile {
+    /// Resolve the selected driver's exact backend name without sandbox input.
+    pub(crate) fn isolation_backend(
+        &self,
+        driver_name: &str,
+    ) -> Result<Option<&openshell_core::isolation_registration::BackendRegistration>, &'static str>
+    {
+        use openshell_core::isolation_registration::{
+            BUILTIN_BACKEND_NAME, validate_backend_name, validate_registrations,
+        };
+        let registrations = &self.openshell.supervisor.isolation_backends;
+        validate_registrations(registrations)?;
+        let Some(value) = self
+            .openshell
+            .drivers
+            .get(driver_name)
+            .and_then(|driver| driver.get("isolation_backend"))
+        else {
+            return Ok(None);
+        };
+        let name = value
+            .as_str()
+            .ok_or("driver isolation_backend must be a string")?;
+        if name == BUILTIN_BACKEND_NAME {
+            return Ok(None);
+        }
+        validate_backend_name(name)?;
+        registrations
+            .iter()
+            .find(|registration| registration.name == name)
+            .map(Some)
+            .ok_or("selected isolation backend is not registered")
+    }
 }
 
 /// One `[[openshell.supervisor.middleware]]` supervisor middleware registration.
@@ -375,6 +628,8 @@ pub enum ConfigFileError {
     },
     #[error("invalid gateway config field `openshell.drivers.{name}`: expected a TOML table")]
     InvalidDriverTable { name: String },
+    #[error("invalid gateway config field `openshell.drivers.{name}.isolation_backend`: {message}")]
+    InvalidIsolationBackend { name: String, message: &'static str },
     #[error(
         "failed to read TLS CA certificate for supervisor middleware '{name}' from '{}': {source}",
         path.display()
@@ -509,6 +764,21 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
             cli: "--db-url",
         });
     }
+    // A zero-sized pool would deadlock every `acquire` rather than degrade,
+    // so reject it at load instead of starting a gateway that cannot serve.
+    if file.openshell.gateway.database_max_connections == Some(0) {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.database_max_connections",
+            message: "must be greater than zero; omit the key to use the built-in default",
+        });
+    }
+    // A zero-sized lock pool would time out every guarded mutation.
+    if file.openshell.gateway.database_lock_max_connections == Some(0) {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.database_lock_max_connections",
+            message: "must be greater than zero; omit the key to use the built-in default",
+        });
+    }
     if file
         .openshell
         .gateway
@@ -530,6 +800,21 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         return Err(ConfigFileError::InvalidDriverTable { name: name.clone() });
     }
 
+    openshell_core::isolation_registration::validate_registrations(
+        &file.openshell.supervisor.isolation_backends,
+    )
+    .map_err(|message| ConfigFileError::InvalidValue {
+        field: "openshell.supervisor.isolation_backends",
+        message,
+    })?;
+    for driver_name in file.openshell.drivers.keys() {
+        file.isolation_backend(driver_name).map_err(|message| {
+            ConfigFileError::InvalidIsolationBackend {
+                name: driver_name.clone(),
+                message,
+            }
+        })?;
+    }
     Ok(file)
 }
 
@@ -577,6 +862,7 @@ fn preflight_error(
         | ConfigFileError::SecretInFile { .. }
         | ConfigFileError::InvalidValue { .. }
         | ConfigFileError::InvalidDriverTable { .. }
+        | ConfigFileError::InvalidIsolationBackend { .. }
         | ConfigFileError::MiddlewareTlsCaRead { .. }
         | ConfigFileError::MiddlewareTlsCaInvalid { .. } => "malformed",
     };
@@ -625,15 +911,22 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
 }
 
 /// Return a driver's table without gateway-level inheritance.
+///
 /// Driver-specific configuration belongs exclusively to
-/// `[openshell.drivers.<name>]` in schema version 2.
+/// `[openshell.drivers.<name>]` in schema version 2. The gateway resolves and
+/// removes the common `isolation_backend` selector before driver decoding.
 pub fn driver_table(
     _driver_name: &str,
     _gateway: &GatewayFileSection,
     raw: Option<&toml::Value>,
 ) -> toml::Value {
     match raw {
-        Some(toml::Value::Table(table)) => toml::Value::Table(table.clone()),
+        Some(toml::Value::Table(table)) => {
+            let mut table = table.clone();
+            // Resolved by the gateway, not part of the driver's own schema.
+            table.remove("isolation_backend");
+            toml::Value::Table(table)
+        }
         _ => toml::Value::Table(toml::Table::new()),
     }
 }
@@ -642,6 +935,62 @@ pub fn driver_table(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn isolation_backend_selection_follows_the_driver_and_matches_exactly() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+compute_driver = "external"
+[openshell.drivers.external]
+isolation_backend = "agent-substrate"
+[openshell.drivers.alternative]
+isolation_backend = "other-backend"
+[openshell.drivers.builtin]
+isolation_backend = "openshell-sandbox"
+[[openshell.supervisor.isolation_backends]]
+name = "agent-substrate"
+endpoint = { kind = "tcp", authority = "backend.example:443", addresses = ["127.0.0.1:47000"] }
+[[openshell.supervisor.isolation_backends]]
+name = "other-backend"
+endpoint = { kind = "unix", socket_path = "/run/other.sock" }
+"#,
+        );
+        let file = load(tmp.path()).unwrap();
+        for (driver, backend) in [
+            ("external", "agent-substrate"),
+            ("alternative", "other-backend"),
+        ] {
+            assert_eq!(
+                file.isolation_backend(driver).unwrap().unwrap().name,
+                backend
+            );
+        }
+        for driver in ["builtin", "absent"] {
+            assert!(file.isolation_backend(driver).unwrap().is_none());
+        }
+        let mut file = file;
+        file.openshell.drivers.get_mut("external").unwrap()["isolation_backend"] =
+            toml::Value::String("Agent-substrate".into());
+        assert!(file.isolation_backend("external").is_err());
+    }
+
+    #[test]
+    fn isolation_backend_invalid_registration_fails_load_and_preflight() {
+        for contents in [
+            "[openshell.gateway]\nisolation_backend = 'agent-substrate'",
+            "[openshell.drivers.external]\nisolation_backend = 'missing'",
+            "[openshell.drivers.unused]\nisolation_backend = ''",
+            "[openshell.drivers.external]\nisolation_backend = 42",
+            "[[openshell.supervisor.isolation_backends]]\nname = 'openshell-sandbox'\nendpoint = { kind = 'unix', socket_path = '/run/backend.sock' }",
+            "[[openshell.supervisor.isolation_backends]]\nname = 'unused'\nendpoint = { kind = 'unix', socket_path = 'relative.sock' }",
+            "[[openshell.supervisor.isolation_backends]]\nname = 'duplicate'\nendpoint = { kind = 'unix', socket_path = '/run/a.sock' }\n[[openshell.supervisor.isolation_backends]]\nname = 'duplicate'\nendpoint = { kind = 'unix', socket_path = '/run/b.sock' }",
+        ] {
+            let tmp = write_tmp(contents);
+            assert!(load(tmp.path()).is_err(), "{contents}");
+            assert!(preflight(tmp.path()).is_err(), "{contents}");
+        }
+    }
 
     fn write_raw_tmp(contents: &str) -> tempfile::NamedTempFile {
         let mut tmp = tempfile::Builder::new()
@@ -679,6 +1028,17 @@ mod tests {
                 load(tmp.path()),
                 Err(ConfigFileError::InvalidDriverTable { ref name }) if name == "docker"
             ));
+        }
+    }
+
+    #[test]
+    fn gateway_rate_limits_reject_negative_values_during_toml_parsing() {
+        for field in ["grpc_rate_limit_requests", "grpc_rate_limit_window_seconds"] {
+            let tmp = write_tmp(&format!("[openshell.gateway]\n{field} = -1\n"));
+            assert!(
+                matches!(load(tmp.path()), Err(ConfigFileError::Parse { .. })),
+                "{field} must reject negative values because gateway rate limits are unsigned"
+            );
         }
     }
 
@@ -839,23 +1199,166 @@ service_name = "openshell-gateway-dev"
         let file = load(tmp.path()).expect("valid otlp config parses");
         let otlp = file.openshell.gateway.otlp.expect("otlp config");
         assert_eq!(
-            otlp.endpoint,
-            "http://otel-collector.observability.svc:4317"
+            otlp.traces_endpoint(),
+            Some("http://otel-collector.observability.svc:4317")
         );
         assert_eq!(otlp.service_name.as_deref(), Some("openshell-gateway-dev"));
     }
 
     #[test]
-    fn otlp_config_requires_only_endpoint() {
-        let toml = r#"
-[openshell.gateway.otlp]
-endpoint = "http://127.0.0.1:4317"
-"#;
-        let tmp = write_tmp(toml);
-        let file = load(tmp.path()).expect("minimal otlp config parses");
-        let otlp = file.openshell.gateway.otlp.expect("otlp config");
-        assert_eq!(otlp.endpoint, "http://127.0.0.1:4317");
+    fn gateway_accepts_a_single_ocsf_log_destination() {
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\n");
+        let config = load(tmp.path())
+            .unwrap()
+            .openshell
+            .gateway
+            .ocsf_log
+            .unwrap();
+        assert_eq!(config.rotation, OcsfLogRotation::Daily);
+        assert_eq!(config.schema_version, None);
+        assert_eq!(config.max_files.unwrap().get(), 7);
+        assert_eq!(config.queue_capacity.get(), 10_000);
+        assert_eq!(config.queue_max_bytes.get(), 16 * 1024 * 1024);
+        assert!(ConfigFile::default().openshell.gateway.ocsf_log.is_none());
+
+        let tmp = write_tmp(
+            "[openshell.gateway.ocsf_log]\npath = 'events.jsonl'\nschema_version = '1.3'\n",
+        );
+        assert_eq!(
+            load(tmp.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .ocsf_log
+                .unwrap()
+                .schema_version,
+            Some(OcsfSchemaVersion::V1_3)
+        );
+    }
+
+    #[test]
+    fn ocsf_log_rejects_invalid_and_unshipped_options() {
+        for settings in [
+            "",
+            "path = ''",
+            "path = 'log'\nqueue_capacity = 0",
+            "path = 'log'\nqueue_max_bytes = 0",
+            "path = 'log'\nmax_files = 0",
+            "path = 'log'\nrotation = 'hourly'",
+            "path = 'log'\nschema_version = ''",
+            "path = 'log'\nschema_version = '1.8'",
+            "path = 'log'\nkind = 'jsonl'",
+            "path = 'log'\nrotation = 'never'\nmax_files = 7",
+        ] {
+            let tmp = write_tmp(&format!("[openshell.gateway.ocsf_log]\n{settings}\n"));
+            assert!(load(tmp.path()).is_err(), "accepted {settings}");
+        }
+        let tmp = write_tmp("[openshell.gateway.ocsf_log]\npath = 'log'\nrotation = 'never'\n");
+        let config = load(tmp.path()).unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(toml::from_str::<ConfigFile>(&encoded).is_ok());
+    }
+
+    fn otlp(table: &str) -> OtlpConfig {
+        let tmp = write_tmp(table);
+        load(tmp.path())
+            .unwrap_or_else(|error| panic!("{table}: {error:#}"))
+            .openshell
+            .gateway
+            .otlp
+            .expect("otlp config")
+    }
+
+    #[test]
+    fn otlp_endpoint_alone_exports_traces_only() {
+        let otlp = otlp("[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n");
+        assert_eq!(otlp.traces_endpoint(), Some("http://127.0.0.1:4317"));
         assert!(otlp.service_name.is_none());
+        assert_eq!(otlp.ocsf, None);
+    }
+
+    #[test]
+    fn otlp_ocsf_defaults_to_the_shared_endpoint() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), Some("http://127.0.0.1:4317"));
+        assert_eq!(
+            otlp.ocsf,
+            Some(OcsfOtlpConfig {
+                endpoint: "http://127.0.0.1:4317".into(),
+                schema_version: None,
+            })
+        );
+    }
+
+    #[test]
+    fn otlp_signal_tables_override_the_shared_endpoint() {
+        let otlp = otlp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\n\n\
+             [openshell.gateway.otlp.traces]\nendpoint = 'http://traces:4317'\n\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.1'\n",
+        );
+        assert_eq!(otlp.traces_endpoint(), Some("http://traces:4317"));
+        assert_eq!(
+            otlp.ocsf,
+            Some(OcsfOtlpConfig {
+                endpoint: "http://siem:4317".into(),
+                schema_version: Some(OcsfSchemaVersion::V1_1),
+            })
+        );
+    }
+
+    #[test]
+    fn otlp_ocsf_exports_without_traces() {
+        let otlp =
+            otlp("[openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\n");
+        assert_eq!(otlp.traces_endpoint(), None);
+        assert_eq!(
+            otlp.ocsf.map(|ocsf| ocsf.endpoint).as_deref(),
+            Some("http://siem:4317")
+        );
+    }
+
+    #[test]
+    fn otlp_ocsf_is_off_unless_enabled() {
+        for ocsf in ["", "enabled = false\n", "endpoint = 'http://siem:4317'\n"] {
+            let otlp = otlp(&format!(
+                "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\n\n\
+                 [openshell.gateway.otlp.ocsf]\n{ocsf}"
+            ));
+            assert_eq!(otlp.ocsf, None, "enabled OCSF export with {ocsf:?}");
+        }
+    }
+
+    #[test]
+    fn otlp_config_round_trips() {
+        let tmp = write_tmp(
+            "[openshell.gateway.otlp]\nendpoint = 'http://shared:4317'\nservice_name = 'gw'\n\n\
+             [openshell.gateway.otlp.ocsf]\nenabled = true\nschema_version = '1.3'\n",
+        );
+        let file = load(tmp.path()).unwrap();
+        let encoded = toml::to_string(&file).unwrap();
+        let decoded = toml::from_str::<ConfigFile>(&encoded).unwrap();
+        assert_eq!(decoded.openshell.gateway.otlp, file.openshell.gateway.otlp);
+    }
+
+    #[test]
+    fn otlp_config_rejects_missing_endpoints_and_unsupported_settings() {
+        for table in [
+            "[openshell.gateway.otlp]\n",
+            "[openshell.gateway.otlp.traces]\n",
+            "[openshell.gateway.otlp.ocsf]\n",
+            "[openshell.gateway.otlp.ocsf]\nenabled = true\n",
+            "[openshell.gateway.otlp.ocsf]\nenabled = true\nendpoint = 'http://siem:4317'\nschema_version = '1.8'\n",
+            "[openshell.gateway.otlp.ocsf]\nenabled = 'yes'\nendpoint = 'http://siem:4317'\n",
+            "[openshell.gateway.otlp.metrics]\nendpoint = 'http://metrics:4317'\n",
+            "[openshell.gateway.otlp]\nendpoint = 'http://127.0.0.1:4317'\nocsf_logs = true\n",
+        ] {
+            let tmp = write_tmp(table);
+            assert!(load(tmp.path()).is_err(), "accepted {table}");
+        }
     }
 
     #[test]
@@ -896,6 +1399,29 @@ policy_validation_failure_mode = "keep_old"
         );
         let error = load(tmp.path()).expect_err("unknown posture must fail TOML validation");
         assert!(error.to_string().contains("policy_validation_failure_mode"));
+    }
+
+    #[test]
+    fn parses_delivery_mode_and_rejects_unknown_value() {
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+config_delivery_mode = "push"
+"#,
+        );
+        let file = load(tmp.path()).unwrap();
+        assert_eq!(
+            file.openshell.gateway.config_delivery_mode,
+            Some(openshell_core::config::ConfigDeliveryMode::Push)
+        );
+
+        let tmp = write_tmp(
+            r#"
+[openshell.gateway]
+config_delivery_mode = "enabled"
+"#,
+        );
+        assert!(load(tmp.path()).is_err());
     }
 
     #[test]
@@ -1137,6 +1663,65 @@ database_url = "sqlite::memory:"
             err,
             ConfigFileError::SecretInFile {
                 field: "database_url",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_database_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_max_connections = 64
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("a positive pool ceiling parses");
+        assert_eq!(file.openshell.gateway.database_max_connections, Some(64));
+    }
+
+    #[test]
+    fn rejects_zero_database_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_max_connections = 0
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("a zero pool ceiling must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidValue {
+                field: "openshell.gateway.database_max_connections",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_database_lock_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_lock_max_connections = 8
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("a positive lock pool ceiling parses");
+        assert_eq!(
+            file.openshell.gateway.database_lock_max_connections,
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_database_lock_max_connections() {
+        let toml = r"
+[openshell.gateway]
+database_lock_max_connections = 0
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("a zero lock pool ceiling must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidValue {
+                field: "openshell.gateway.database_lock_max_connections",
                 ..
             }
         ));

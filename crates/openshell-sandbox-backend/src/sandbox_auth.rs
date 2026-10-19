@@ -103,8 +103,7 @@ impl SandboxProtocolAuthenticator {
         let value = value
             .to_str()
             .map_err(|_| SandboxAuthError::InvalidBearer)?;
-        let token = value
-            .strip_prefix("Bearer ")
+        let token = openshell_core::auth::strip_bearer_scheme(value)
             .filter(|token| !token.is_empty() && !token.chars().any(char::is_whitespace))
             .ok_or(SandboxAuthError::InvalidBearer)?;
         let session = self.verifier.verify(token)?;
@@ -440,6 +439,24 @@ mod tests {
     }
 
     #[test]
+    fn bearer_identity_must_match_the_provisioned_runtime() {
+        let (mut authenticator, token) = fixture(1);
+        let metadata = metadata(token.token.expose_secret());
+        authenticator.expected_sandbox_id = SandboxId::parse("sandbox-b").unwrap();
+        assert_eq!(
+            authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+            Err(SandboxAuthError::WrongSandbox)
+        );
+        authenticator.expected_sandbox_id = SandboxId::parse("sandbox-a").unwrap();
+        authenticator.expected_runtime_generation =
+            SandboxGenerationId::parse("generation-2").unwrap();
+        assert_eq!(
+            authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+            Err(SandboxAuthError::WrongRuntimeGeneration)
+        );
+    }
+
+    #[test]
     fn bearer_metadata_must_occur_exactly_once() {
         let (authenticator, token) = fixture(1);
         assert_eq!(
@@ -457,6 +474,26 @@ mod tests {
             authenticator.authenticate(SandboxConnectionId::new(), &duplicate),
             Err(SandboxAuthError::DuplicateBearer)
         );
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        let (authenticator, token) = fixture(1);
+        for scheme in ["bearer", "BEARER"] {
+            let mut metadata = MetadataMap::new();
+            metadata.insert(
+                "authorization",
+                format!("{scheme} {}", token.token.expose_secret())
+                    .parse()
+                    .expect("metadata value"),
+            );
+            assert!(
+                authenticator
+                    .authenticate(SandboxConnectionId::new(), &metadata)
+                    .is_ok(),
+                "{scheme}"
+            );
+        }
     }
 
     #[test]

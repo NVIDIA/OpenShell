@@ -50,6 +50,8 @@ that are not listed are inaccessible. When the effective policy has at least one
 network rule, OpenShell also adds the baseline paths described in [Default
 Policy](/how-it-works/policies/default-policy#baseline-filesystem-paths).
 
+These defaults and the filesystem path restrictions below also apply when the supervisor or standalone proxy loads local policy files directly. Local loading enforces the same non-root process identities as typed policy. It rejects invalid filesystem, Landlock, and process field types, unknown fields in those sections, and explicit `null` JSON-RPC or MCP options. Network settings must also use the declared types: for example, `allow_encoded_slash: "true"` and an array-valued deny-rule `method` are rejected. A rejected reload keeps the active OPA policy and its generation unchanged.
+
 Each path must be absolute, must not contain `..`, and must not exceed 4096
 bytes. `read_write` cannot contain `/`. A policy can list at most 256 paths.
 
@@ -75,9 +77,10 @@ fails to enforce the policy's rules:
 | `best_effort` | The sandbox runs without the filesystem rules and logs a high-severity finding. |
 | `hard_requirement` | The sandbox fails to start. |
 
-In either mode, a sandbox requires a kernel with Landlock ABI v3 or later. The
-sandbox log's `Landlock ruleset built` event reports how many paths were applied
-and skipped.
+In either mode, a sandbox requires a kernel with Landlock ABI v3 or later. On an
+older kernel, startup fails with an error that names the required and detected
+ABI. The sandbox log's `Landlock ruleset built` event reports how many paths
+were applied and skipped.
 
 ## Process
 
@@ -87,11 +90,9 @@ and skipped.
 | `run_as_group` | string | Driver default | `sandbox` or a numeric GID for the workload. |
 
 A numeric ID must be from `1` through `4294967294`, so OpenShell rejects root.
-Each field is independent, so you can set one and let the compute driver choose
-the other. Only Docker and Podman apply these fields, and only from the policy
-that you pass when you create the sandbox. Without them, Docker and Podman use
-the image's `USER`. Kubernetes and VM sandboxes run as the identity configured
-for their driver.
+Each field is independent, so you can set one and let the compute driver choose the other. Docker and Podman use these fields to select the workload identity from the policy passed at creation; omitted fields use the image's `USER`. Kubernetes uses the identity configured for its driver.
+
+MicroVM preserves the driver's resolved overlay owner. An explicit numeric selector must match that owner; `sandbox` names the guest account reconciled to that owner. A conflicting selector fails before the workload starts, and omitted fields accept the driver default. `openshell sandbox get <name>` reports the resolved UID:GID in its `WorkloadIdentity` condition. This condition reports identity selection, not workload readiness. Sandbox policy updates cannot change process selectors; global policy updates must still match the resolved identity. Ordinary exec uses the same identity as the canonical process.
 
 ```yaml showLineNumbers={false}
 process:
@@ -137,19 +138,22 @@ reach the private addresses they resolve to, unless the endpoint comes from an
 approved policy advisor proposal. Wildcard and hostless endpoints can reach
 private addresses only through `allowed_ips`.
 
-Loopback, link-local, and unspecified addresses, including the cloud metadata
-address `169.254.169.254`, are always blocked. `openshell policy update` rejects
-an `allowed_ips` entry that overlaps them, and in a complete policy such an
-entry blocks every connection to the endpoint. OpenShell also blocks the
-Kubernetes and etcd control-plane ports 2379, 2380, 6443, 10250, and 10255 on
-endpoints that use an exact hostname, an IP address, or `allowed_ips`. A rule
-for `host.openshell.internal` can still reach services on the gateway host.
+Network policy never authorizes an outbound endpoint whose destination is
+loopback, link-local, or unspecified, including the cloud metadata address
+`169.254.169.254`. This does not prevent a workload from connecting to a
+sandbox-local service listening on loopback. `openshell policy update` rejects
+an `allowed_ips` entry that overlaps the blocked ranges, and in a complete
+policy such an entry blocks every connection to the endpoint. OpenShell also
+blocks the Kubernetes and etcd control-plane ports 2379, 2380, 6443, 10250,
+and 10255 on endpoints that use an exact hostname, an IP address, or
+`allowed_ips`. A rule for `host.openshell.internal` can still reach services on
+the gateway host.
 
 #### Inspection Fields
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
+| `protocol` | string | None | `rest`, `websocket`, `graphql`, `mcp`, or `json-rpc` for request inspection, or `tcp` for a native TCP connection. `graphql`, `mcp`, and `json-rpc` endpoints refuse requests that carry an `Upgrade` header with `403`. Refer to [Connection and Request Checks](/how-it-works/policies/network-rules#connection-and-request-checks). |
 | `tls` | string | Automatic | `skip` relays traffic without terminating TLS, so OpenShell cannot inspect it. Do not use it with a request protocol. |
 | `enforcement` | string | `audit` | `enforce` blocks requests that break the endpoint's rules. `audit` logs them and allows the request. |
 | `access` | string | None | Access preset: `read-only`, `read-write`, or `full`. Refer to [Access Presets](#access-presets). |
@@ -200,7 +204,7 @@ network_policies:
 | `mcp.versions` | list of strings | `["2025-11-25"]` | Allowed MCP revisions. Refer to [MCP Version Selection](#mcp-version-selection). |
 | `mcp.max_body_bytes` | integer | `65536` | Maximum MCP request body size for inspection. |
 | `mcp.strict_tool_names` | bool | `true` | Requires tool names to match `^[A-Za-z0-9_.-]{1,128}$`. |
-| `mcp.allow_all_known_mcp_methods` | bool | `false` | When `true`, the endpoint allows every MCP method except those that deny rules match. If rules name specific tools, `tools/call` is limited to those tools. Rules can omit `method`. Refer to [MCP Rules](#mcp-rules). |
+| `mcp.allow_all_known_mcp_methods` | bool | `false` | Allow core MCP methods for the selected request revision. Tool restrictions still apply, and deny rules take precedence. Refer to [Allow Core MCP Methods](#allow-core-mcp-methods) for the behavior and [Core MCP Methods](#core-mcp-methods) for the method list. |
 | `json_rpc.max_body_bytes` | integer | `65536` | Maximum JSON-RPC request body size for inspection. |
 
 #### Endpoint Constraints
@@ -344,9 +348,11 @@ matcher fields in one rule.
 - Tool arguments are not matched, so an allowed tool accepts any arguments.
 - One denied call denies an entire batched request.
 - Server responses and server-to-client messages are not inspected.
+- Only an allow rule that names an extension method exactly can allow it.
+  Method globs and `mcp.allow_all_known_mcp_methods` do not. An extension
+  method is one that no supported MCP revision defines.
 
-A client sends `initialize` and `notifications/initialized` before calling
-tools, so allow both:
+Under the 2025 revisions, a client sends `initialize` and `notifications/initialized` before calling tools. When `mcp.allow_all_known_mcp_methods` is omitted or `false`, allow both explicitly:
 
 ```yaml showLineNumbers={false}
 rules:
@@ -363,23 +369,136 @@ deny_rules:
     tool: send_email
 ```
 
+OpenShell uses the `tower-mcp-types` library to inspect each request under its
+MCP revision. It checks the JSON-RPC structure, whether a client can send the
+method in that revision, and the parameter types of known methods. It rejects a
+body that repeats a key within any JSON object, and a method that MCP defines
+but the request's revision does not, such as `server/discover` under
+`2025-11-25`. A request that fails these checks returns `400` with the error
+`invalid_mcp_request`, even on an endpoint that uses `enforcement: audit`. These
+type checks are not complete JSON Schema validation.
+
+#### Allow Core MCP Methods
+
+Set `mcp.allow_all_known_mcp_methods: true` to allow the [core methods](#core-mcp-methods) available in each request's [selected MCP revision](#mcp-version-selection). A policy that accepts several revisions still checks each request against its own revision. The option does not combine their method sets.
+
+Tool-specific allow rules continue to restrict `tools/call` to matching names, and deny rules take precedence over every allow. Without tool-specific allow rules, this option allows calls to every tool name, subject to deny rules and tool-name validation. Extension methods require an allow rule that names the method exactly. An explicit allow rule cannot enable a core method that is unavailable in the selected revision.
+
+For example, this endpoint allows core methods for `2025-11-25`, while limiting tool calls to `search_web` and `read_document`:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: mcp.example.com
+    port: 443
+    protocol: mcp
+    enforcement: enforce
+    mcp:
+      versions: ["2025-11-25"]
+      allow_all_known_mcp_methods: true
+    rules:
+      - allow:
+          tool:
+            any: [search_web, read_document]
+```
+
+Here, `tools/call` is the JSON-RPC method, and `search_web` is the tool name in `params.name`. Allowing a method does not establish that the server supports it or that a tool is read-only.
+
+#### Core MCP Methods
+
+The following list covers client-to-server requests and notifications that OpenShell inspects over HTTP. Server-to-client methods, such as `sampling/createMessage`, `roots/list`, and `elicitation/create`, are outside this inspection. Each row lists the revisions that accept those methods over HTTP in the client-to-server direction.
+
+| Methods or notifications | MCP revisions |
+|---|---|
+| `tools/list`, `tools/call` | All supported revisions. |
+| `resources/list`, `resources/templates/list`, `resources/read` | All supported revisions. |
+| `prompts/list`, `prompts/get`, `completion/complete` | All supported revisions. |
+| `notifications/cancelled` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `initialize`, `ping`, `logging/setLevel` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `resources/subscribe`, `resources/unsubscribe` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `notifications/initialized`, `notifications/progress`, `notifications/roots/list_changed` | `2025-03-26`, `2025-06-18`, `2025-11-25`. |
+| `tasks/get`, `tasks/result`, `tasks/list`, `tasks/cancel`, `notifications/tasks/status` | `2025-11-25` only; experimental. |
+| `server/discover`, `subscriptions/listen` | `2026-07-28` only. |
+
+For `2026-07-28` HTTP requests, cancel a request by closing its response stream. OpenShell rejects `notifications/cancelled` over HTTP in that revision.
+
+MCP introduced [tasks](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks) as an experimental feature in `2025-11-25`, so the March and June 2025 revisions do not include the task methods or `notifications/tasks/status`. The default policy revision includes them, but using tasks also requires the peer's task capabilities and, for task-augmented tool calls, the tool's task-support declaration. The policy option does not negotiate these capabilities.
+
 #### MCP Version Selection
 
 `mcp.versions` lists the MCP revisions an endpoint accepts: `2025-03-26`,
-`2025-06-18`, or `2025-11-25`. When omitted, only `2025-11-25` is allowed.
+`2025-06-18`, `2025-11-25`, or `2026-07-28`. When omitted, the list is exactly
+`["2025-11-25"]`, so the endpoint does not accept `2026-07-28` until you list
+it.
 
 ```yaml showLineNumbers={false}
 mcp:
   versions: ["2025-03-26", "2025-11-25"]
 ```
 
-OpenShell does not check the revision of a single `initialize` request, because
-the client negotiates the revision in that request. For other requests,
-OpenShell reads the revision from the `MCP-Protocol-Version` header, or uses
-`2025-03-26` when the header is absent. A duplicate, empty, or
-unsupported header value returns `400`, and a supported revision that the
-endpoint does not allow returns `403`. For a client that requires an unsupported
-revision, omit `protocol` and `mcp` to allow its traffic without MCP inspection.
+OpenShell selects each request's revision from its `MCP-Protocol-Version`
+header. When the header is absent, OpenShell selects `2025-03-26`, so an
+endpoint whose clients omit the header must allow `2025-03-26`. A duplicate,
+empty, or unsupported header value returns `400`, and a supported revision that
+the endpoint does not allow returns `403`.
+
+OpenShell inspects each request under its selected revision only. For example,
+only `2025-03-26` accepts JSON-RPC batches, with at most 64 messages each, and
+later revisions reject a request body that is a JSON array.
+
+Under the 2025 revisions, a client starts with a single `initialize` request
+that proposes a revision in its body, so OpenShell does not check that request's
+revision against `mcp.versions`. An endpoint that allows only `2026-07-28`
+rejects `initialize`.
+
+For a client that requires an unsupported revision, omit `protocol` and `mcp` to
+allow its traffic without MCP inspection.
+
+#### Understand MCP Rejections
+
+Use the response's error code and detail to distinguish a protocol problem from a policy denial:
+
+- `unsupported_mcp_protocol_version` (`400`) means this OpenShell build does not support the header's revision. Configure the client to use a revision that OpenShell and the server support and that `mcp.versions` permits.
+- `mcp_protocol_version_not_allowed` (`403`) means the selected revision is supported but excluded by the endpoint policy. Use a compatible revision the policy permits, or ask the policy owner to review `mcp.versions`.
+- A detail that names the missing-header fallback means OpenShell selected `2025-03-26`, even if the policy defaults to `2025-11-25`. Send the client/server revision explicitly in `MCP-Protocol-Version`; the policy must permit it.
+- `invalid_mcp_request` (`400`) can mean the method is unavailable in the selected revision. For example, `tasks/get` is unavailable in `2025-06-18`. Use a method available in that revision, or configure the client and server to use a compatible revision that includes it and is permitted by policy. Adding an allow rule or enabling `allow_all_known_mcp_methods` cannot override this protocol check.
+- A rule denial (`403` under `enforcement: enforce`) requires a policy review. An extension method needs an exact method allow rule; a denied tool call may need a matching tool selector. An explicit deny rule takes precedence, so adding an allow rule cannot override it. Ask the policy owner to review the relevant allow or deny rule.
+
+#### Sessionless MCP Requests
+
+The `2026-07-28` revision has no `initialize` handshake or session. Each request
+carries the client's protocol version and capabilities. A client can call
+`server/discover` to learn what the server supports, and can call
+`subscriptions/listen` to receive notifications on that request's response
+stream. Each HTTP `POST` carries one JSON-RPC request or extension notification.
+
+OpenShell checks each `2026-07-28` request for the following:
+
+- `params._meta` contains `io.modelcontextprotocol/protocolVersion` set to
+  `2026-07-28`, and `io.modelcontextprotocol/clientCapabilities`. Extension
+  requests need this metadata too.
+- The `MCP-Protocol-Version` header is `2026-07-28`. Without it, OpenShell
+  selects `2025-03-26` and rejects the request.
+- The `Mcp-Method` header equals the JSON-RPC `method`.
+- For `tools/call` and `prompts/get`, the `Mcp-Name` header equals
+  `params.name`. For `resources/read`, it equals `params.uri`. OpenShell decodes
+  a `=?base64?...?=` value before comparing it.
+
+A request with missing or invalid metadata, or with a missing, duplicate, or
+mismatched `Mcp-Method` or `Mcp-Name` header, returns `400`. OpenShell also
+rejects `initialize`, `notifications/initialized`, `notifications/cancelled`,
+JSON-RPC responses from the client, and batches. A request that uses an HTTP
+method other than `POST` returns `405`.
+
+OpenShell repeats these checks after middleware changes a request. A middleware
+that replaces the body of a `2026-07-28` request must also update `Mcp-Method`
+and `Mcp-Name` to match the new body.
+
+An extension notification needs `MCP-Protocol-Version: 2026-07-28` and an allow
+rule that names its `method` exactly, such as `method: vendor/notice`. It does
+not need `params._meta`, `Mcp-Method`, or `Mcp-Name`.
+
+OpenShell forwards `Mcp-Param-*` headers without comparing them with tool
+arguments.
 
 ### JSON-RPC Rules
 
@@ -388,6 +507,7 @@ revision, omit `protocol` and `mcp` to allow its traffic without MCP inspection.
 | `method` | string | Yes | Exact method name, or `*` for all methods. Other globs are rejected. |
 
 Parameters are not matched. One denied call denies an entire batched request.
+OpenShell rejects a body that repeats a key within any JSON object.
 
 ```yaml showLineNumbers={false}
 rules:

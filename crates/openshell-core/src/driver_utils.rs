@@ -58,10 +58,21 @@ pub const CONDITION_WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFail
 
 /// Supervisor exit status reserved for OCI workspace validation failures.
 ///
-/// Local container drivers translate this status into
+/// Local container drivers translate a supervisor exit with this status into
 /// [`CONDITION_WORKSPACE_VALIDATION_FAILED`] so users receive the specific
 /// provisioning failure rather than a generic container exit.
 pub const SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED: i32 = 78;
+
+/// Error context for a rejected image-provided OCI working directory.
+///
+/// The supervisor recognizes it in a failed agent start and exits with
+/// [`SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED`].
+pub const WORKSPACE_VALIDATION_ERROR_CONTEXT: &str = "image workspace validation failed";
+
+/// Driver condition message for [`CONDITION_WORKSPACE_VALIDATION_FAILED`].
+/// Fixed text, because supervisor output may contain secrets.
+pub const WORKSPACE_VALIDATION_FAILED_MESSAGE: &str =
+    "OCI WorkingDir is not usable by the sandbox identity";
 
 /// Ready-condition reason when a container was terminated by an external signal.
 ///
@@ -104,21 +115,14 @@ pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sand
 // ---------------------------------------------------------------------------
 // In-container mount paths for guest TLS materials and the sandbox token.
 //
-// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
-// mTLS client credentials at these fixed paths inside every sandbox container.
-// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
-// connection back to the gateway. The paths must remain stable across driver
-// versions since the supervisor binary is built and packaged separately.
+// Container-based drivers mount the gateway CA at this fixed path inside every
+// supervisor container. The supervisor reads it on startup to authenticate the
+// gateway TLS endpoint. Sandbox identity is provided separately by a bearer
+// token.
 // ---------------------------------------------------------------------------
 
-/// Container-side mount path for the guest mTLS CA certificate.
+/// Container-side mount path for the gateway CA certificate.
 pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-
-/// Container-side mount path for the guest mTLS client certificate.
-pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-
-/// Container-side mount path for the guest mTLS client private key.
-pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 
 /// Container-side mount path for the per-sandbox JWT token.
 pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
@@ -140,6 +144,18 @@ pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-p
 /// credential, a CA certificate is not secret, so a plain read-only bind
 /// mount is used rather than a driver secret.
 pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
+
+/// Container-side mount path for an operator-supplied additional destination
+/// CA bundle.
+///
+/// Drivers with an `additional_ca_bundle` operator setting bind-mount the
+/// host PEM file here (read-only) and pass the path on the supervisor's argv
+/// via `--additional-ca-bundle`. The supervisor folds it into its upstream
+/// TLS trust store alongside the system CA bundle, for direct (non-proxied)
+/// inspected HTTPS egress to destinations signed by a private CA — unlike
+/// [`PROXY_CA_MOUNT_PATH`], this applies regardless of whether a corporate
+/// forward proxy is configured.
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = "/etc/openshell/tls/additional/ca-bundle.pem";
 
 /// A validated corporate upstream-proxy address.
 ///

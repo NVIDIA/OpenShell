@@ -19,6 +19,14 @@ let
     OVMF = firmwarePkgs.OVMF;
   };
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
+  k3sInputs = {
+    agent_sandbox_version = "0.5.0";
+    openshell_cli_binary = "../artifacts/binaries/${muslTarget}/openshell";
+    openshell_gateway_image = "../artifacts/images/openshell-gateway-tmachine.tar";
+    openshell_helm_chart = "../artifacts/helm/helm-chart-0.0.0.tgz";
+    openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+    openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+  };
   config = (pkgs.formats.yaml { }).generate "tmachine-config.yaml" {
     machines = [
       {
@@ -40,6 +48,17 @@ let
           playbooks = [
             "ansible/playbooks/nextest.yaml"
             "ansible/playbooks/docker.yaml"
+          ];
+        };
+      }
+      {
+        name = "ubuntu-k3s";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = false;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/k3s.yaml"
           ];
         };
       }
@@ -71,6 +90,20 @@ let
 
     installers = [
       {
+        name = "k3s";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s.yaml" ];
+        inputs = k3sInputs;
+      }
+      {
+        name = "k3s-ha";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-k3s-ha.yaml" ];
+        inputs = k3sInputs // {
+          openshell_postgres_fixture = "../e2e/kubernetes/postgres-fixture.yaml";
+        };
+      }
+      {
         name = "none";
         use_galaxy = false;
         playbooks = [ ];
@@ -98,6 +131,17 @@ let
         ];
         inputs = {
           openshell_deb = "../artifacts/packages/openshell.deb";
+          openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
+          openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
+        };
+      }
+      {
+        name = "rpm";
+        use_galaxy = false;
+        playbooks = [ "ansible/playbooks/openshell-rpm.yaml" ];
+        inputs = {
+          openshell_rpm = "../artifacts/packages/rpm/openshell.rpm";
+          openshell_gateway_rpm = "../artifacts/packages/rpm/openshell-gateway.rpm";
           openshell_supervisor_image = "../artifacts/images/openshell-supervisor-tmachine.tar";
           openshell_sandbox_image = "../artifacts/images/openshell-sandbox-tmachine.tar";
         };
@@ -131,6 +175,21 @@ let
         inputs = {
           keycloak_realm_file = "../scripts/keycloak-realm.json";
           provider_refresh_keycloak_test_bundle = "../artifacts/test-archives/${muslTarget}/provider-refresh-keycloak-tests.tar";
+        };
+      }
+      {
+        name = "oci-image";
+        playbooks = [ "ansible/playbooks/features/oci-image.yaml" ];
+        inputs = {
+          oci_image_test_bundle = "../artifacts/test-archives/${muslTarget}/oci-image-tests.tar";
+        };
+      }
+      {
+        name = "e2e-podman";
+        playbooks = [ "ansible/playbooks/drivers/podman/e2e.yaml" ];
+        inputs = {
+          openshell_podman_e2e_test_bundle = "../artifacts/test-archives/${muslTarget}/openshell-podman-e2e-tests.tar";
+          openshell_podman_e2e_workload_image = "../artifacts/images/openshell-e2e-python-dev.tar";
         };
       }
       {

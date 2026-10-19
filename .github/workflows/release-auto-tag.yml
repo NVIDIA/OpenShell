@@ -85,12 +85,12 @@ jobs:
           git tag "$NEXT_TAG"
           git push origin "refs/tags/$NEXT_TAG"
 
-      - name: Trigger Release Tag workflow
+      - name: Trigger Pre-release workflow
         if: steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NEXT_TAG: ${{ steps.version.outputs.next }}
         run: |
-          gh workflow run release-tag.yml \
+          gh workflow run release-prerelease.yml \
             --ref main \
             -f tag="$NEXT_TAG"

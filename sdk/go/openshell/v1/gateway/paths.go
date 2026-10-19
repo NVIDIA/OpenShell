@@ -24,6 +24,10 @@ const (
 
 	// systemConfigBase is the system-wide config directory.
 	systemConfigBase = "/etc/openshell"
+
+	// systemGatewayDirEnv overrides the system-wide config root. Keep this in
+	// sync with the Rust CLI so SDK discovery sees the same gateway set.
+	systemGatewayDirEnv = "OPENSHELL_SYSTEM_GATEWAY_DIR"
 )
 
 // userConfigDir returns the user-specific configuration directory for
@@ -49,7 +53,16 @@ func userConfigDir() (string, error) {
 
 // systemGatewayDir returns the system-wide gateway config directory.
 func systemGatewayDir() string {
-	return filepath.Join(systemConfigBase, gatewaySubdir)
+	return filepath.Join(systemConfigDir(), gatewaySubdir)
+}
+
+// systemConfigDir returns the system-wide configuration root. Empty and
+// relative overrides are ignored to match the CLI's fail-safe behavior.
+func systemConfigDir() string {
+	if dir := os.Getenv(systemGatewayDirEnv); dir != "" && filepath.IsAbs(dir) {
+		return dir
+	}
+	return systemConfigBase
 }
 
 // resolveGatewayDir searches for a gateway directory by name, checking the

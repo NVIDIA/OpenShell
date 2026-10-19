@@ -30,13 +30,13 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use openshell_e2e::harness::cli::wait_for_healthy;
 use openshell_e2e::harness::gateway::ManagedGateway;
 use openshell_e2e::harness::host_process::HostPythonFixture;
-use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serial_test::serial;
 use tempfile::NamedTempFile;
@@ -63,11 +63,29 @@ struct FixturePorts {
 
 impl FixturePorts {
     fn pick() -> Self {
+        // Keep all four listeners bound while allocating ports. Calling the
+        // single-port helper repeatedly can return the same released port,
+        // making an allowed CONNECT look like one to the denied fixture.
+        let listeners: Vec<_> = (0..4)
+            .map(|_| {
+                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+                    .expect("reserve corporate proxy fixture port")
+            })
+            .collect();
+        let ports: Vec<_> = listeners
+            .iter()
+            .map(|listener| {
+                listener
+                    .local_addr()
+                    .expect("fixture listener address")
+                    .port()
+            })
+            .collect();
         Self {
-            proxy: find_free_port(),
-            allowed: find_free_port(),
-            denied: find_free_port(),
-            bypass: find_free_port(),
+            proxy: ports[0],
+            allowed: ports[1],
+            denied: ports[2],
+            bypass: ports[3],
         }
     }
 }

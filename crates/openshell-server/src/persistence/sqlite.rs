@@ -7,9 +7,9 @@ use super::{
     map_migrate_error,
 };
 use crate::policy_store::{
-    AtomicPolicyRevisionWrite, draft_chunk_payload_from_record, draft_chunk_record_from_parts,
-    policy_payload_from_record, policy_record_for_atomic_write, policy_record_from_parts,
-    project_policy_revision_onto_sandbox,
+    AtomicPolicyRevisionWrite, apply_draft_chunk_evaluation, draft_chunk_evaluation_inputs_match,
+    draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
+    policy_record_for_atomic_write, policy_record_from_parts, project_policy_revision_onto_sandbox,
 };
 use openshell_core::SetResourceVersion;
 use openshell_core::paths::set_file_owner_only;
@@ -37,6 +37,14 @@ pub(super) fn embedded_migration_sql(version: i64) -> Option<&'static str> {
 static IN_MEMORY_DB_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 use super::{DELETE_MANY_BATCH_SIZE, DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
+
+/// Pool ceiling for an on-disk database when the operator has not configured
+/// one.
+///
+/// `SQLite` serializes writers, so raising this mainly buys read concurrency;
+/// a gateway that needs more write throughput wants Postgres, not a larger
+/// `SQLite` pool.
+pub const DEFAULT_MAX_CONNECTIONS: u32 = 5;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -201,9 +209,43 @@ impl SqliteStore {
         self.close().await;
     }
 
-    pub async fn connect(url: &str) -> PersistenceResult<Self> {
+    /// Runs raw SQL against the test database.
+    #[cfg(test)]
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        sqlx::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .expect("test SQL");
+    }
+
+    /// The pool's effective connection ceiling.
+    pub fn max_connections(&self) -> u32 {
+        self.pool.options().get_max_connections()
+    }
+
+    /// Connect and size the pool, falling back to [`DEFAULT_MAX_CONNECTIONS`]
+    /// for an on-disk database.
+    ///
+    /// An in-memory database is always held by exactly one connection — the
+    /// database lives in that connection, so a second one would see a
+    /// different (empty) database. A configured ceiling is ignored there.
+    pub async fn connect(url: &str, max_connections: Option<u32>) -> PersistenceResult<Self> {
         let is_in_memory = url.contains(":memory:") || url.contains("mode=memory");
-        let max_connections = if is_in_memory { 1 } else { 5 };
+        let max_connections = if is_in_memory {
+            if max_connections.is_some_and(|configured| configured != 1) {
+                tracing::warn!(
+                    "ignoring the configured database pool ceiling: an in-memory SQLite database is held by a single connection"
+                );
+            }
+            1
+        } else {
+            max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS)
+        };
+        // Keep the pool eagerly warm up to the built-in size, but let a raised
+        // ceiling grow on demand rather than pinning that many file handles
+        // open for the life of the process.
+        let min_connections = max_connections.min(DEFAULT_MAX_CONNECTIONS);
+        tracing::info!(max_connections, "sizing SQLite connection pool");
 
         let mut options = SqliteConnectOptions::from_str(url)
             .map_err(|e| map_db_error(&e))?
@@ -221,7 +263,7 @@ impl SqliteStore {
 
         let mut pool_options = SqlitePoolOptions::new()
             .max_connections(max_connections)
-            .min_connections(max_connections);
+            .min_connections(min_connections);
 
         if is_in_memory {
             pool_options = pool_options.idle_timeout(None).max_lifetime(None);
@@ -423,12 +465,12 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .await
             }
             WriteCondition::MatchResourceVersion(expected_version) => {
-                // Update with version check
-                let result = sqlx::query(
+                let row = sqlx::query(
                     r#"
 UPDATE "objects"
 SET "payload" = ?4, "labels" = ?5, "updated_at_ms" = ?6, "resource_version" = "resource_version" + 1
 WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -437,37 +479,28 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
                 .bind(payload)
                 .bind(labels.unwrap_or("{}"))
                 .bind(now_ms)
-                .execute(&self.pool)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                if result.rows_affected() == 0 {
-                    // The version-matched UPDATE matched no row. Distinguish a
-                    // version mismatch (row present, different version) from an
-                    // absent row (deleted / never existed). Both are CAS
-                    // precondition failures, so report them as typed `Conflict`
-                    // rather than a backend-dependent error string: absent rows
-                    // carry `current_resource_version: None`.
-                    let existing = self.get(object_type, id).await?;
-                    return Err(PersistenceError::Conflict {
-                        current_resource_version: existing.map(|record| record.resource_version),
-                    });
+                if let Some(row) = row {
+                    return Ok(write_result_from_row(&row));
                 }
 
-                // Fetch the updated record to get the new resource_version
-                let updated = self.get(object_type, id).await?.ok_or_else(|| {
-                    PersistenceError::Database("object disappeared after update".to_string())
-                })?;
-
-                Ok(WriteResult {
-                    resource_version: updated.resource_version,
-                    created_at_ms: updated.created_at_ms,
-                    updated_at_ms: updated.updated_at_ms,
+                // The version-matched UPDATE matched no row. Distinguish a
+                // version mismatch (row present, different version) from an
+                // absent row (deleted / never existed). Both are CAS
+                // precondition failures, so report them as typed `Conflict`
+                // rather than a backend-dependent error string: absent rows
+                // carry `current_resource_version: None`.
+                let existing = self.get(object_type, id).await?;
+                Err(PersistenceError::Conflict {
+                    current_resource_version: existing.map(|record| record.resource_version),
                 })
             }
             WriteCondition::Unconditional => {
                 // Unconditional upsert by name
-                sqlx::query(
+                let row = sqlx::query(
                     r#"
 INSERT INTO "objects" ("object_type", "id", "name", "workspace", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
@@ -476,6 +509,7 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
     "updated_at_ms" = excluded."updated_at_ms",
     "labels" = excluded."labels",
     "resource_version" = "objects"."resource_version" + 1
+RETURNING "resource_version", "created_at_ms", "updated_at_ms"
 "#,
                 )
                 .bind(object_type)
@@ -485,23 +519,11 @@ ON CONFLICT ("object_type", "workspace", "name") WHERE "name" IS NOT NULL DO UPD
                 .bind(payload)
                 .bind(now_ms)
                 .bind(labels.unwrap_or("{}"))
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| map_db_error(&e))?;
 
-                // Fetch the result to get the resource_version
-                let record = self
-                    .get_by_name(object_type, workspace, name)
-                    .await?
-                    .ok_or_else(|| {
-                        PersistenceError::Database("object disappeared after upsert".to_string())
-                    })?;
-
-                Ok(WriteResult {
-                    resource_version: record.resource_version,
-                    created_at_ms: record.created_at_ms,
-                    updated_at_ms: record.updated_at_ms,
-                })
+                Ok(write_result_from_row(&row))
             }
         }
     }
@@ -1273,6 +1295,36 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)
         Ok(())
     }
 
+    pub async fn put_initial_policy_revision(
+        &self,
+        record: &PolicyRecord,
+        workspace: &str,
+    ) -> PersistenceResult<()> {
+        let wrapped_payload = policy_payload_from_record(record)?;
+        sqlx::query(
+            r#"
+INSERT INTO "objects" (
+    "object_type", "id", "scope", "version", "status", "payload", "created_at_ms", "updated_at_ms", "workspace"
+)
+SELECT ?1, ?2, ?3, 1, ?4, ?5, ?6, ?6, ?7
+WHERE EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = 'sandbox' AND "id" = ?3)
+  AND NOT EXISTS (SELECT 1 FROM "objects" WHERE "object_type" = ?1 AND "scope" = ?3)
+ON CONFLICT DO NOTHING
+"#,
+        )
+        .bind(POLICY_OBJECT_TYPE)
+        .bind(&record.id)
+        .bind(&record.sandbox_id)
+        .bind(&record.status)
+        .bind(wrapped_payload)
+        .bind(record.created_at_ms)
+        .bind(workspace)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn put_policy_revision_atomic(
         &self,
         write: &AtomicPolicyRevisionWrite,
@@ -1781,6 +1833,54 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn update_draft_chunk_evaluation_if_unchanged(
+        &self,
+        expected: &DraftChunkRecord,
+        evaluated: &DraftChunkRecord,
+    ) -> PersistenceResult<bool> {
+        let Some(row) = sqlx::query(
+            r#"
+SELECT "id", "scope", "status", "hit_count", "payload", "created_at_ms", "updated_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&expected.id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?
+        else {
+            return Ok(false);
+        };
+        let stored_payload: Vec<u8> = row.get("payload");
+        let mut current = row_to_draft_chunk_record(row)?;
+        if !draft_chunk_evaluation_inputs_match(&current, expected) {
+            return Ok(false);
+        }
+        apply_draft_chunk_evaluation(&mut current, evaluated);
+        let payload = draft_chunk_payload_from_record(&current)?;
+        // Compare-and-swap on the payload read above: a concurrent edit or
+        // evaluation between the read and this write leaves nothing updated.
+        let result = sqlx::query(
+            r#"
+UPDATE "objects"
+SET "payload" = ?3, "updated_at_ms" = ?4
+WHERE "object_type" = ?1 AND "id" = ?2 AND "status" IN ('pending', 'rejected')
+  AND "payload" = ?5
+"#,
+        )
+        .bind(DRAFT_CHUNK_OBJECT_TYPE)
+        .bind(&expected.id)
+        .bind(payload)
+        .bind(current.last_seen_ms)
+        .bind(stored_payload)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn delete_draft_chunks(
         &self,
         sandbox_id: &str,
@@ -1865,8 +1965,22 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
     [with_suffix("-wal"), with_suffix("-shm")]
 }
 
+/// Read the `RETURNING` columns of a write, so the result describes that write
+/// and not whichever one landed last.
+fn write_result_from_row(row: &sqlx::sqlite::SqliteRow) -> WriteResult {
+    WriteResult {
+        resource_version: row_resource_version(row),
+        created_at_ms: row.get("created_at_ms"),
+        updated_at_ms: row.get("updated_at_ms"),
+    }
+}
+
+fn row_resource_version(row: &sqlx::sqlite::SqliteRow) -> u64 {
+    let resource_version: i64 = row.try_get("resource_version").unwrap_or(1);
+    resource_version.max(1).cast_unsigned()
+}
+
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
-    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -1876,7 +1990,7 @@ fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: row.get("labels"),
-        resource_version: resource_version_i64.max(1).cast_unsigned(),
+        resource_version: row_resource_version(&row),
     }
 }
 

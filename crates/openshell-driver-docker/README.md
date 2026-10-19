@@ -41,14 +41,40 @@ mediates every supported TCP and DNS operation, attributes it to the calling
 binary, and sends the request across the private channel. The supervisor
 authorizes the request before it opens an upstream connection. Docker's absent
 workload network is the mandatory outer fence if mediation fails or is
-bypassed. The trusted supervisor companion uses Docker host networking, where
-it reaches the gateway's primary loopback listener and originates approved
-egress.
+bypassed. The trusted supervisor companion originates approved egress. Its
+operator-owned `supervisor_network_mode` defaults to `host`. Set `bridge` to
+run the supervisor on Docker's bridge network; `auto` also selects host.
 
 The driver copies trusted runtime bytes from the configured supervisor image
 through the Docker archive API. No workload launch depends on a host bind
 mount or a tool supplied by the workload image, so the same path works with
 local, remote, and VM-backed Docker daemons.
+
+## Corporate Proxy Egress
+
+`[openshell.drivers.docker]` accepts the operator-owned corporate proxy fields
+`https_proxy`, `no_proxy`, `proxy_auth_file`,
+`proxy_auth_allow_insecure`, `proxy_connect_by_hostname`, and
+`proxy_ca_bundle`. Sandbox environment, image contents, and per-sandbox driver
+configuration cannot select or override them.
+
+The driver validates the proxy URL and cross-field relationships at gateway
+startup. It bounded-reads proxy credentials and the PEM CA bundle before use.
+Missing, unreadable, empty, oversized, malformed, or certificate-free CA files
+fail closed. A CA bundle requires `https_proxy`, although the proxy URL may be
+`http://` when the proxy intercepts destination TLS.
+
+For each supervisor launch, Docker copies the credential and CA contents into
+the existing supervisor-only named volume. It passes only the fixed container
+paths `/.openshell/supervisor/upstream-proxy-auth` and
+`/.openshell/supervisor/upstream-proxy-ca-bundle.pem` to the supervisor. It
+does not bind-mount the gateway-host files, which preserves remote-daemon
+support and keeps host paths out of workload container metadata.
+
+The supervisor trusts the configured CA for its TLS connection to an HTTPS
+proxy and for destination certificates re-signed by a TLS-intercepting proxy.
+It also includes the corporate root in the generated combined trust bundle
+used by workload processes.
 
 ## Identity and Workspace
 
@@ -132,7 +158,7 @@ openshell sandbox create \
 `/openshell-sandbox` binary. The driver extracts that binary as bytes and
 stages it into the stopped workload. `supervisor_image` contains the
 dynamically linked glibc `/openshell-supervisor` binary that runs in the
-host-networked supervisor container. Release and gateway image builds bake
+supervisor companion container. Release and gateway image builds bake
 matching image tags into the binary.
 
 ## Gateway session and TLS
@@ -146,14 +172,42 @@ When no endpoint is configured, the supervisor connects to
 Docker daemon host. A configured HTTPS server certificate must include the
 endpoint host in its subject alternative names.
 
-The driver publishes host loopback as the backend address for
+In host mode, the driver publishes host loopback as the backend address for
 `host.openshell.internal`. Policy DNS resolves that reserved name through the
 mediated path, so policies can reach host services without a Docker bridge,
 container DNS alias, or another gateway listener.
 
-Docker Engine on Linux supports host networking directly. Docker Desktop
-requires host networking to be enabled in Settings and does not support it
-when Enhanced Container Isolation is enabled.
+For HTTPS endpoints, the supervisor receives only the gateway CA and
+uses its sandbox-scoped bearer token to authenticate RPCs. User client
+certificates and private keys are not delivered to either container.
+
+Host mode on Docker Desktop requires host networking enabled in Settings.
+For bridge mode or a gateway endpoint using `host.docker.internal`, the driver
+resolves Docker's `host-gateway` once during initialization and caches it.
+A temporary container runs `--help` from the immutable supervisor image with
+no network, no capabilities, no privilege escalation, and a read-only root
+filesystem. The driver downloads Docker's generated `/etc/hosts` through the
+archive API, preferring a unique IPv4 address and otherwise a unique IPv6
+address. Resolution has a 30-second timeout; forced cleanup has a separate
+10-second timeout and runs after success or failure.
+
+The driver uses the selected address for both host aliases and the runtime
+descriptor's trust pin; workload DNS and hosts files cannot select it. Host
+mode with other gateway endpoints retains its gateway-address pin. An explicit
+operator-owned `host_gateway_ip` overrides discovery and skips the temporary
+container. No supervisor changes or per-sandbox discovery are required.
+
+When `grpc_endpoint` is omitted, bridge mode uses `host.docker.internal` on
+Desktop or for a wildcard gateway listener, and the concrete bind address for
+other non-loopback Linux listeners. The port is the gateway bind port; remapped
+container publications require an explicit endpoint. Native Linux loopback-only
+listeners cannot serve a bridge supervisor and produce an actionable error.
+Explicit endpoints retain TLS verification and are never rewritten; bridge
+rejects loopback/unspecified endpoint addresses. Host services bound only to
+loopback are also unreachable from a native Linux bridge supervisor.
+
+The selected network mode does not change the sandbox's mandatory Landlock
+and seccomp qualification.
 
 The supervisor owns these security-critical variables:
 
@@ -163,7 +217,7 @@ The supervisor owns these security-critical variables:
 - `OPENSHELL_SANDBOX_TOKEN_FILE`
 - `OPENSHELL_SSH_SOCKET_PATH`
 - `OPENSHELL_MAIN_PROCESS_SPEC`
-- TLS path variables when HTTPS is enabled
+- `OPENSHELL_TLS_CA` when HTTPS is enabled
 
 Template and sandbox environment is encoded in the protected bootstrap and
 exposed only to workload children. Workload input cannot override

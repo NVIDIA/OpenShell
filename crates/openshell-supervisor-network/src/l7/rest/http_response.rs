@@ -236,20 +236,27 @@ where
         return Ok(RelayOutcome::Reusable);
     }
 
-    // Forward response headers + any overflow body bytes
-    client.write_all(&buf).await.into_diagnostic()?;
+    // Hold buffered chunk framing until relay_chunked validates it.
+    client
+        .write_all(&buf[..header_end])
+        .await
+        .into_diagnostic()?;
+    let overflow = &buf[header_end..];
     let overflow_len = (buf.len() - header_end) as u64;
 
     // Forward remaining response body
     match body_length {
         BodyLength::ContentLength(len) => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
             let remaining = len.saturating_sub(overflow_len);
             if remaining > 0 {
                 relay_fixed(upstream, client, remaining, None).await?;
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client, &buf[header_end..], None).await?;
+            relay_chunked(upstream, client, overflow, None).await?;
         }
         BodyLength::None => unreachable!(),
     }
@@ -817,9 +824,11 @@ where
         });
     }
 
-    client.write_all(overflow).await.into_diagnostic()?;
     match body_length {
         BodyLength::ContentLength(length) => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
             let remaining = length.saturating_sub(overflow.len() as u64);
             if remaining > 0 {
                 relay_fixed(upstream, client, remaining, None).await?;
@@ -827,6 +836,9 @@ where
         }
         BodyLength::Chunked => relay_chunked(upstream, client, overflow, None).await?,
         BodyLength::None if server_wants_close || event_stream => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
             if event_stream {
                 relay_until_eof_without_idle_timeout(upstream, client).await?;
             } else {
@@ -835,7 +847,11 @@ where
             client.flush().await.into_diagnostic()?;
             return Ok(RelayOutcome::Consumed);
         }
-        BodyLength::None => {}
+        BodyLength::None => {
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
+        }
     }
     client.flush().await.into_diagnostic()?;
     Ok(if server_wants_close {
@@ -1450,15 +1466,7 @@ where
             let mut size_line =
                 read_response_line_with_deadline(reader, session, client, &mut framing).await?;
             loop {
-                let size_line_text = std::str::from_utf8(&size_line)
-                    .map_err(|_| miette!("Invalid UTF-8 in response chunk-size line"))?;
-                let size_token = size_line_text
-                    .split(';')
-                    .next()
-                    .map(str::trim)
-                    .unwrap_or_default();
-                let chunk_size = usize::from_str_radix(size_token, 16)
-                    .map_err(|_| miette!("Invalid HTTP response chunk size"))?;
+                let chunk_size = parse_chunk_size_line(&size_line)?;
                 if chunk_size == 0 {
                     flush_normalized_response_bytes(session, client, pending, &mut framing).await?;
                     return read_response_trailers(
@@ -1894,6 +1902,7 @@ where
     let mut trailers = Vec::new();
     loop {
         let line = read_response_line_with_deadline(reader, session, client, framing).await?;
+        validate_chunk_trailer_line(&line)?;
         if line.is_empty() {
             return Ok(trailers);
         }

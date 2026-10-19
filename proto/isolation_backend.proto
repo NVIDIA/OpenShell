@@ -1,0 +1,131 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.sandbox.backend.v1;
+
+import "extension.proto";
+import "options.proto";
+
+// EXPERIMENTAL: This protocol is under active development. Its API and wire
+// format may change incompatibly before stabilization.
+//
+// Isolation Backend control contract. The supervisor uses this service on a
+// trusted, authenticated endpoint selected by operator configuration or compute
+// driver provisioning. Workload control, network mediation, and byte streams
+// remain on the Sandbox Protocol.
+// Before serving a launch, the trusted compute driver provisions the backend
+// with gateway_id and verification_keys from the gateway-created
+// launch_authentication in compute_driver.proto. These public keys verify the
+// supervisor's sandbox bearer; the driver delivers supervisor bearer credentials
+// only to the supervisor, never to workload code. The gateway identity and key
+// set remain fixed for that runtime generation. Bearers may be renewed within
+// the generation using the provisioned keys; changing the gateway identity or
+// key set requires a fresh launch and generation. These RPCs do not provision
+// or update verification keys.
+// Describe exchanges PeerMetadata to negotiate the base contract and optional
+// suspend/resume support.
+// Version 1.0 requires openshell.sandbox.protocol on both peers and includes
+// boundary routing. Optional state retention support advertises
+// openshell.sandbox.suspend-resume. Add optional capabilities
+// or fields with compatible minor versions; incompatible semantics require a
+// major bump. Peers ignore unknown protobuf fields and must satisfy both peers'
+// required capabilities before use.
+service IsolationBackend {
+  // Describe the backend and negotiate before opening a boundary. This call
+  // conveys no sandbox credentials or driver descriptor.
+  rpc Describe(DescribeIsolationBackendRequest) returns (DescribeIsolationBackendResponse);
+
+  // Bind a driver-provisioned resource to the authenticated sandbox and generation
+  // using the launch in OpenBoundaryRequest. Follow SandboxProtocol admission.
+  // A resource that already is the boundary may only validate and reserve its
+  // binding, then return a handle.
+  // Reopening the same session and generation returns the same result. The
+  // descriptor must bind to the same provisioned resource; a different resource
+  // binding fails.
+  // Driver deletion invalidates all handles and retained-state references,
+  // including abandoned launches and suspended boundaries.
+  rpc OpenBoundary(OpenBoundaryRequest) returns (OpenBoundaryResponse);
+
+  // Freeze the workload, retain its state, and fence the old generation before
+  // returning. The caller credential must match the active boundary. The
+  // compute driver owns storage and handoff of the reference bytes; the backend
+  // owns placement and retention of the state itself. Fenced means old-generation
+  // calls and streams are rejected and the old workload cannot make progress.
+  rpc SuspendBoundary(SuspendBoundaryRequest) returns (SuspendBoundaryResponse);
+
+  // Restore a suspended boundary using the fresh launch in ResumeBoundaryRequest.
+  // Follow SandboxProtocol admission while keeping the restored workload frozen
+  // until StartAgent. A permitted cold start is reported. Unsupported optional
+  // suspend/resume RPCs return UNIMPLEMENTED without advancing lifecycle state.
+  rpc ResumeBoundary(ResumeBoundaryRequest) returns (OpenBoundaryResponse);
+}
+
+message DescribeIsolationBackendRequest {
+  openshell.extension.v1.PeerMetadata supervisor = 1;
+}
+
+message DescribeIsolationBackendResponse {
+  openshell.extension.v1.PeerMetadata backend = 1;
+}
+
+// Launch identity is issued by the gateway: session and generation are fresh
+// for each launch and unchanged on retries. Sandbox and generation identity
+// come from the verified sandbox bearer; backends must bind that identity to
+// their own provisioned state.
+message OpenBoundaryRequest {
+  string session_id = 2;
+  // Must match trusted admission and the configured endpoint registration.
+  string backend_name = 4;
+  // Opaque descriptor from the trusted compute driver. The backend validates
+  // its resource binding; workload-controlled input must not select it.
+  bytes driver_descriptor = 5 [(openshell.options.v1.secret) = true];
+}
+
+message OpenBoundaryResponse {
+  // Opaque handle scoped to this sandbox and runtime generation. The supervisor
+  // presents it when opening Sandbox Protocol streams.
+  string boundary_id = 1;
+
+  enum LaunchOutcome {
+    LAUNCH_OUTCOME_UNSPECIFIED = 0;
+    LAUNCH_OUTCOME_FRESH = 1;
+    LAUNCH_OUTCOME_RESTORED = 2;
+    LAUNCH_OUTCOME_COLD_START_FALLBACK = 3;
+  }
+
+  // Required. Distinguishes restoration from cold-start fallback; admission
+  // follows SandboxProtocol for either outcome.
+  LaunchOutcome outcome = 2;
+}
+
+message SuspendBoundaryRequest {
+  // Retries for this session and generation return the same reference or a
+  // terminal error.
+  string boundary_id = 1;
+  string session_id = 2;
+  string generation_id = 3;
+}
+
+message SuspendBoundaryResponse {
+  // Opaque protected state reference. It may be used only with an authorized
+  // ResumeBoundary request for the same sandbox and a fresh generation.
+  // A backend may invalidate superseded references; resuming one then fails
+  // terminally with FAILED_PRECONDITION rather than restoring a different state.
+  bytes restore_reference = 1 [(openshell.options.v1.secret) = true];
+}
+
+message ResumeBoundaryRequest {
+  // New launch identity and trusted driver descriptor, as defined by
+  // OpenBoundaryRequest; replays reuse this launch request.
+  OpenBoundaryRequest launch = 1;
+  // Reference returned by SuspendBoundary for this sandbox. It carries no
+  // authority without the new authenticated launch credential.
+  bytes restore_reference = 2 [(openshell.options.v1.secret) = true];
+  // If false, fail when the memory image cannot be restored. If true, a clean
+  // boot from the image and persistent volumes is permitted and reported as
+  // LAUNCH_OUTCOME_COLD_START_FALLBACK. This never permits unauthorized or
+  // superseded references to select a new launch.
+  bool allow_cold_start_fallback = 3;
+}

@@ -14,7 +14,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 
-use super::binary::openshell_cmd;
+use super::binary::{openshell_bin, openshell_cmd};
 use super::output::{extract_field, strip_ansi};
 
 /// Tool-capable workload image used by the E2E harness.
@@ -67,13 +67,18 @@ fn add_test_image_if_missing(command: &mut tokio::process::Command, args: &[&str
     }
 }
 
+/// Generate a sandbox name that is unique within and across test processes.
+pub fn unique_sandbox_name() -> String {
+    format!(
+        "e2e-{}-{}",
+        std::process::id(),
+        NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn add_unique_name_if_missing(command: &mut tokio::process::Command, args: &[&str]) {
     if !has_explicit_sandbox_name(args) {
-        command.arg("--name").arg(format!(
-            "e2e-{}-{}",
-            std::process::id(),
-            NEXT_SANDBOX_NAME.fetch_add(1, Ordering::Relaxed)
-        ));
+        command.arg("--name").arg(unique_sandbox_name());
     }
 }
 
@@ -505,39 +510,6 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Upload local files to the sandbox's discovered working directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the upload command fails.
-    pub async fn upload_to_workdir(&self, local_path: &str) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
-        cmd.arg("sandbox")
-            .arg("upload")
-            .arg(&self.name)
-            .arg(local_path)
-            .arg("--no-git-ignore");
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{stdout}{stderr}");
-
-        if !output.status.success() {
-            return Err(format!(
-                "sandbox upload failed (exit {:?}):\n{combined}",
-                output.status.code()
-            ));
-        }
-
-        Ok(combined)
-    }
-
     /// Upload local files with `.gitignore` filtering (default behavior).
     ///
     /// Unlike [`upload`], this does NOT pass `--no-git-ignore`, so the CLI
@@ -613,7 +585,11 @@ impl SandboxGuard {
         for arg in argv {
             cmd.arg(arg);
         }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        // Never share the test runner's stdin: parallel test processes share
+        // its open file description, and the command needs no input.
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let output = cmd
             .output()
@@ -723,27 +699,22 @@ impl Drop for SandboxGuard {
             return;
         }
 
-        // We need to run async cleanup in a sync Drop. Use block_in_place to
-        // avoid blocking the tokio runtime. This is acceptable for test code.
-        let name = self.name.clone();
-        let mut child = self.child.take();
+        // A detached thread here would get killed along with the test
+        // process before the delete command finishes, leaking the sandbox.
+        // Use a blocking std::process::Command instead, matching the
+        // ManagedCleanup pattern in workspace_namespace_managed.rs, so
+        // cleanup completes before this function returns.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
 
-        // Attempt cleanup with a new runtime if we're not inside one, or
-        // block_in_place if we are.
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("create cleanup runtime");
-            rt.block_on(async {
-                if let Some(ref mut child) = child {
-                    let _: Result<(), _> = child.kill().await;
-                    let _ = child.wait().await;
-                }
-
-                let mut cmd = openshell_cmd();
-                cmd.arg("sandbox").arg("delete").arg(&name);
-                cmd.stdout(Stdio::null()).stderr(Stdio::null());
-                let _ = cmd.status().await;
-            });
-        });
+        let _ = std::process::Command::new(openshell_bin())
+            .arg("sandbox")
+            .arg("delete")
+            .arg(&self.name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 

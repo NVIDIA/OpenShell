@@ -30,7 +30,7 @@ if len(sys.argv) != 5:
 raw_url, policy_file, policy_template, mcp_version = sys.argv[1:5]
 # Keep this boundary check synchronized with McpProtocolVersion::ALL. The
 # renderer is standalone Python, so it cannot import the Rust registry.
-supported_mcp_versions = {"2025-03-26", "2025-06-18", "2025-11-25"}
+supported_mcp_versions = {"2025-03-26", "2025-06-18", "2025-11-25", "2026-07-28"}
 if mcp_version not in supported_mcp_versions:
     raise SystemExit(f"unsupported MCP protocol version: {mcp_version!r}")
 parsed = urlparse(raw_url)

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import re
-import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -100,7 +99,8 @@ def test_generate_homebrew_formula_uses_channel_urls_and_exact_version(
     assert 'bind_address = "[::1]:17670"' in legacy_ipv6_config.group("contents")
     assert "gateway_config.read == legacy_empty_gateway_config_contents ||" in formula
     assert "gateway_config.read == legacy_ipv6_gateway_config_contents" in formula
-    assert "gateway_config.write gateway_config_contents" in formula
+    assert formula.count("gateway_config.write gateway_config_contents") == 1
+    assert "gateway_config.atomic_write gateway_config_contents" in formula
     assert '# compute_driver = "vm"' not in formula
     assert (
         "openshell gateway add https://localhost:17670 --local --name openshell"
@@ -151,27 +151,13 @@ def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> 
     )
 
     assert "init-gateway-config.sh" not in wrapper
-    assert (
-        'export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"'
-        in wrapper
-    )
-    assert 'export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"' in wrapper
-    assert (
-        'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
-        in wrapper
-    )
+    assert "CANONICAL_CONFIG_FILE" not in wrapper
+    assert '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]' in wrapper
+    assert 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"' in wrapper
+    assert "export OPENSHELL_DB_URL=" not in wrapper
+    assert "OPENSHELL_DISABLE_TLS" not in wrapper
+    assert 'export OPENSHELL_LOCAL_TLS_DIR="${XDG_STATE_HOME}/openshell/tls"' in wrapper
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
-
-
-def test_snap_docker_connect_hook_restarts_gateway() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    hook = repo_root / "snap/hooks/connect-plug-docker"
-
-    assert hook.is_file()
-    assert hook.stat().st_mode & stat.S_IXUSR
-    assert 'snapctl restart "${SNAP_INSTANCE_NAME}.gateway"' in hook.read_text(
-        encoding="utf-8"
-    )
 
 
 def test_rpm_spec_seeds_and_migrates_gateway_defaults() -> None:
@@ -256,17 +242,8 @@ def test_schema_v2_debian_and_snap_preflight_wiring() -> None:
     assert "ExecStart=/usr/bin/openshell-gateway" in unit
     assert "$src_dir/openshell-gateway.service" in package_deb
     assert "$pkgroot/usr/lib/systemd/user/openshell-gateway.service" in package_deb
-    assert 'if [ -n "${OPENSHELL_GATEWAY_CONFIG:-}" ]; then' in wrapper
-    assert (
-        'elif [ -e "$CANONICAL_CONFIG_FILE" ] || [ -L "$CANONICAL_CONFIG_FILE" ]; then'
-        in wrapper
-    )
-    assert wrapper.count('"${SNAP}/bin/openshell-gateway" config preflight') == 4
+    assert '[ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ]' in wrapper
+    assert 'export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"' in wrapper
+    assert wrapper.count('"${SNAP}/bin/openshell-gateway" config preflight') == 1
     assert 'config preflight -- "$@"' in wrapper
-    assert 'config preflight -- --config "$CANONICAL_CONFIG_FILE" "$@"' in wrapper
-    assert (
-        'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
-        in wrapper
-    )
-    assert wrapper.count('exec "${SNAP}/bin/openshell-gateway" "$@"') == 3
-    assert '[ -f "$CANONICAL_CONFIG_FILE" ]' not in wrapper
+    assert wrapper.count('exec "${SNAP}/bin/openshell-gateway" "$@"') == 1

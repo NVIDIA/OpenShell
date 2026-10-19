@@ -15,11 +15,11 @@ body:
     id: user-story
     attributes:
       label: User Story
-      description: Describe who encountered this behavior, what they need to do, and why it matters.
+      description: Attest that you personally use OpenShell. Describe the specific use case and behavior you directly encountered or need.
       placeholder: |
-        As a <persona>,
-        I want <capability or outcome>,
-        so that <benefit or impact>.
+        I use OpenShell for <specific use case>.
+        I directly encountered or need <specific behavior>.
+        This affects <outcome>.
     validations:
       required: true
 
@@ -60,23 +60,31 @@ body:
     id: reproduction
     attributes:
       label: Reproduction Steps
-      description: Provide the minimal steps needed to reproduce the issue.
+      description: Provide minimal steps using only an OpenShell deployment. Do not install third-party tools solely to reproduce the issue.
       placeholder: |
-        1. Run `openshell sandbox create -- claude`
+        1. Run `openshell sandbox create ...`
         2. ...
     validations:
       required: true
 
   - type: textarea
+    id: suggested-ux
+    attributes:
+      label: Suggested UX (if applicable)
+      description: If the fix changes configuration, CLI, SDK, or another user interaction, show a notional OpenShell example for human review.
+      placeholder: Show the command, configuration, or API interaction you expect.
+    validations:
+      required: false
+
+  - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: Include the OpenShell version and relevant OS, deployment mode, runtime, or integration details.
+      description: Include the OpenShell version and relevant OpenShell deployment details.
       placeholder: |
         - OpenShell: v0.x.x (output of `openshell --version`)
         - OS: macOS 15.2 / Ubuntu 24.04 / Windows 11 + WSL2
-        - Runtime: Docker Desktop 4.x / Docker Engine 27.x / Kubernetes v1.x
-        - Deployment or integration: <relevant details>
+        - OpenShell deployment mode and runtime: <relevant details>
     validations:
       required: true
 

@@ -97,7 +97,7 @@ phases = ["validate"]
 
 The gateway supports `http://`, `https://`, and `unix://` interceptor endpoints. When gateway JWT signing is configured, authenticated network interceptors use `https://`; Unix sockets remain available for local integrations. HTTPS uses platform trust roots unless `tls_ca_cert_path` supplies a private CA, and normal hostname verification remains enabled. The gateway calls `Describe` and builds an immutable execution plan during startup. An unavailable service, invalid manifest, missing credential, or unauthorized configured binding prevents the gateway from starting.
 
-When gateway JWT signing is configured, the gateway authenticates every call to the interceptor with a short-lived token. [Extension Authentication](/extensibility/overview#authentication) describes how your service validates it. Set `allow_insecure_transport = true` to use a plaintext `http://` endpoint without authentication, for local development or on a network that already authenticates callers.
+When gateway JWT signing is configured, the gateway authenticates every call to the interceptor with a short-lived token. [Authenticating Extensions](/extensibility/overview#authenticating-extensions) describes how your service validates it. Set `allow_insecure_transport = true` to use a plaintext `http://` endpoint without authentication, for local development or on a network that already authenticates callers.
 
 Registration is static. Restart the gateway after adding, removing, or changing an interceptor. See [Gateway Configuration](/how-it-works/gateways/configuration#gateway-interceptors) for the complete field reference.
 

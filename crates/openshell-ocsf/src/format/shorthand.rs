@@ -134,12 +134,24 @@ fn reason_tag(base: &BaseEventData) -> String {
         .map_or_else(String::new, |text| format!(" [reason:{text}]"))
 }
 
-fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
-    base.unmapped
+fn sorted_unmapped_fields(base: &BaseEventData) -> Vec<(&str, &serde_json::Value)> {
+    let mut fields: Vec<_> = base
+        .unmapped
         .as_ref()
         .and_then(serde_json::Value::as_object)
         .into_iter()
         .flatten()
+        .map(|(key, value)| (key.as_str(), value))
+        .collect();
+    // Cargo can enable insertion-ordered JSON maps through another dependency.
+    // Keep shorthand ordering and truncated field selection stable either way.
+    fields.sort_unstable_by_key(|(key, _)| *key);
+    fields
+}
+
+fn unmapped_fields(base: &BaseEventData) -> Vec<String> {
+    sorted_unmapped_fields(base)
+        .into_iter()
         .filter_map(|(key, value)| {
             let value = match value {
                 serde_json::Value::Bool(value) => value.to_string(),
@@ -392,6 +404,72 @@ impl OcsfEvent {
                 format!("SSH:{activity} {sev}{detail}{auth_ctx}")
             }
 
+            Self::Authentication(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e
+                    .action
+                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let principal = e
+                    .user
+                    .uid
+                    .as_deref()
+                    .or(e.user.name.as_deref())
+                    .unwrap_or_default();
+                let principal =
+                    escape_context_field(&truncate_with_ellipsis(principal, MAX_REASON_LEN));
+                let principal = if e.user.type_id == crate::enums::UserTypeId::Unknown {
+                    principal
+                } else {
+                    format!(
+                        "{}:{principal}",
+                        escape_context_field(&e.user.type_label.to_lowercase())
+                    )
+                };
+                let peer = e
+                    .src_endpoint
+                    .as_ref()
+                    .map(|ep| {
+                        let port = ep.port.map_or(String::new(), |p| format!(":{p}"));
+                        let host = ep
+                            .domain
+                            .as_deref()
+                            .or(ep.ip.as_deref())
+                            .or(ep.name.as_deref())
+                            .unwrap_or("unknown");
+                        format!(" from {}{port}", escape_context_field(host))
+                    })
+                    .unwrap_or_default();
+                let mut context = Vec::new();
+                if let Some(protocol) = e.auth_protocol.map(|p| {
+                    e.auth_protocol_label
+                        .as_deref()
+                        .unwrap_or_else(|| p.label())
+                }) {
+                    context.push(format!("protocol:{}", escape_context_field(protocol)));
+                }
+                if let Some(path) = e
+                    .http_request
+                    .as_ref()
+                    .and_then(|r| r.url.as_ref())
+                    .and_then(|u| u.path.as_deref())
+                {
+                    context.push(format!(
+                        "op:{}",
+                        escape_context_field(&truncate_with_ellipsis(path, MAX_REASON_LEN))
+                    ));
+                }
+                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
+                    context.push(format!("reason:{}", escape_context_field(&reason)));
+                }
+                let context = if context.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", context.join(" "))
+                };
+
+                format!("AUTH:{activity} {sev}{action} {principal}{peer}{context}")
+            }
+
             Self::ProcessActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
                 let proc_str = format!("{}({})", e.process.name, e.process.pid);
@@ -457,7 +535,8 @@ impl OcsfEvent {
                 // Bracketed suffix carries the structured provenance fields a
                 // reviewer needs to scan a CONFIG audit line. Auto-approval
                 // emits `auto`/`source`/`prover_delta`; every config change
-                // also carries `policy_version` and `policy_hash`. Order is
+                // also carries `policy_version` and `policy_hash`. Rejections
+                // add `chunk_id`, `rejection_reason`, and `actor`. Order is
                 // stable so logs are greppable.
                 let suffix = e
                     .base
@@ -467,18 +546,21 @@ impl OcsfEvent {
                         let mut parts: Vec<String> = Vec::new();
                         let mut push = |key: &str| {
                             if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
-                                parts.push(format!("{key}:{value}"));
+                                parts.push(format!("{key}:{}", escape_context_field(value)));
                             }
                         };
                         push("auto");
                         push("source");
                         push("prover_delta");
                         push("resolved_from");
+                        push("chunk_id");
+                        push("rejection_reason");
+                        push("actor");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
-                            parts.push(format!("version:{ver}"));
+                            parts.push(format!("version:{}", escape_context_field(ver)));
                         }
                         if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
-                            parts.push(format!("hash:{hash}"));
+                            parts.push(format!("hash:{}", escape_context_field(hash)));
                         }
                         if parts.is_empty() {
                             String::new()
@@ -502,9 +584,9 @@ impl OcsfEvent {
                         if obj.is_empty() {
                             return None;
                         }
-                        let fields: Vec<String> = obj
-                            .iter()
-                            .take(3) // Limit to 3 most important fields
+                        let fields: Vec<String> = sorted_unmapped_fields(&e.base)
+                            .into_iter()
+                            .take(3)
                             .map(|(k, v)| {
                                 let val = v.as_str().map_or_else(|| v.to_string(), String::from);
                                 format!("{k}:{val}")
@@ -538,6 +620,7 @@ mod tests {
             profiles: vec!["security_control".to_string()],
             uid: Some("sandbox-abc123".to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -676,8 +759,8 @@ mod tests {
     #[test]
     fn test_http_activity_shorthand_includes_unmapped_attributes() {
         let mut base = base(4002, "HTTP Activity", 4, "Network Activity", 99, "Other");
-        base.add_unmapped("attempt", serde_json::json!(2));
         base.add_unmapped("cached", serde_json::json!(true));
+        base.add_unmapped("attempt", serde_json::json!(2));
         let event = OcsfEvent::HttpActivity(HttpActivityEvent {
             base,
             http_request: Some(HttpRequest::new(
@@ -1025,6 +1108,68 @@ mod tests {
     }
 
     #[test]
+    fn test_authentication_failure_shorthand() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .auth_protocol(crate::enums::AuthProtocolId::OpenId)
+        .action(ActionId::Denied)
+        .severity(crate::enums::SeverityId::Medium)
+        .status_detail("expired_credential")
+        .src_endpoint(Endpoint::from_ip_str("203.0.113.7", 51234))
+        .http_request(HttpRequest {
+            http_method: crate::enums::HttpMethod::Post,
+            url: Some(Url::from_path("/openshell.v1.OpenShell/ListSandboxes")),
+        })
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [MED] DENIED unknown from 203.0.113.7:51234 [protocol:OpenID op:/openshell.v1.OpenShell/ListSandboxes reason:expired_credential]"
+        );
+    }
+
+    #[test]
+    fn test_authentication_shorthand_names_an_unaddressed_source() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .action(ActionId::Denied)
+        .severity(crate::enums::SeverityId::Low)
+        .src_endpoint(Endpoint::from_name("edge-tunnel"))
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [LOW] DENIED unknown from edge-tunnel"
+        );
+    }
+
+    #[test]
+    fn test_authentication_success_shorthand_labels_principal_type() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::other("sb 7f3a", "Sandbox"),
+            Service::new("openshell-gateway"),
+        )
+        .auth_protocol_other("sandbox_jwt")
+        .action(ActionId::Allowed)
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [INFO] ALLOWED sandbox:sb\\u{20}7f3a [protocol:sandbox_jwt]"
+        );
+    }
+
+    #[test]
     fn test_process_activity_shorthand_launch() {
         let event = OcsfEvent::ProcessActivity(ProcessActivityEvent {
             base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
@@ -1232,6 +1377,32 @@ mod tests {
         );
     }
 
+    /// Rejection audit events carry the chunk, reason, and deciding actor.
+    /// Reviewer-typed text must not be able to close the bracketed suffix.
+    #[test]
+    fn test_config_state_change_shorthand_includes_rejection_fields() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("gateway rejected draft chunk chunk-1");
+        b.add_unmapped("chunk_id", serde_json::json!("chunk-1"));
+        b.add_unmapped("rejection_reason", serde_json::json!("too broad] [x"));
+        b.add_unmapped("actor", serde_json::json!("user:reviewer"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Other),
+            state_custom_label: Some("REJECTED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        assert_eq!(
+            event.format_shorthand(),
+            "CONFIG:REJECTED [INFO] gateway rejected draft chunk chunk-1 \
+             [chunk_id:chunk-1 rejection_reason:too\\u{20}broad\\]\\u{20}\\[x \
+             actor:user:reviewer]"
+        );
+    }
+
     #[test]
     fn test_base_event_shorthand() {
         let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
@@ -1244,6 +1415,21 @@ mod tests {
         assert_eq!(
             shorthand,
             "EVENT [INFO] Network namespace created [ns:openshell-sandbox-abc123]"
+        );
+    }
+
+    #[test]
+    fn test_base_event_selects_unmapped_fields_in_key_order() {
+        let mut b = base(0, "Base Event", 0, "Uncategorized", 99, "Other");
+        b.set_message("Context");
+        for (key, value) in [("z", 4), ("c", 3), ("a", 1), ("b", 2)] {
+            b.add_unmapped(key, serde_json::json!(value));
+        }
+
+        let event = OcsfEvent::Base(BaseEvent { base: b });
+        assert_eq!(
+            event.format_shorthand(),
+            "EVENT [INFO] Context [a:1 b:2 c:3]"
         );
     }
 }

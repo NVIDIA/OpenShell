@@ -10,7 +10,8 @@ import "google/protobuf/descriptor.proto";
 // Per-method authorization rule. Consumed at runtime by the gateway's
 // descriptor-pool-based auth table to enforce auth mode, role, and scope.
 message AuthorizationRule {
-  // Authentication mode: "bearer", "sandbox", "dual", or "unauthenticated".
+  // Authentication mode: "bearer", "sandbox", "dual", "peer", "operator",
+  // or "unauthenticated". Operator requires a verified mTLS operator certificate.
   string auth_mode = 1;
   // Minimum workspace-level role required (checked by handler via
   // authorize_workspace): "user" or "admin". Mutually exclusive with

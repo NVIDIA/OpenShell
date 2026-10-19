@@ -129,6 +129,10 @@ pub async fn sandbox_provider_list(
     Ok(())
 }
 
+/// Attempts for an attach or detach whose resource version went stale between
+/// the command's read and its write.
+const PROVIDER_ATTACHMENT_CAS_ATTEMPTS: u32 = 5;
+
 /// Save a provider attachment and optionally wait for its installed authority.
 pub async fn sandbox_provider_attach(
     server: &str,
@@ -141,45 +145,53 @@ pub async fn sandbox_provider_attach(
     readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    // The resource version only guards this command's own read, so a
+    // conflict from a concurrent status write is retried with a fresh read.
+    let mut attempt = 1;
+    let (sandbox, response) = loop {
+        let sandbox = client
+            .get_sandbox(GetSandboxRequest {
+                name: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+            })
+            .await
+            .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+        let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
 
-    let response = match client
-        .attach_sandbox_provider(AttachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        match client
+            .attach_sandbox_provider(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to attach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break (sandbox, response.into_inner()),
+            // Explicit post-save uncertainty takes precedence over a generic retry hint.
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                if attempt < PROVIDER_ATTACHMENT_CAS_ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "Failed to attach provider: sandbox was modified by another operation.\n\
+                     Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "attachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "attachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| {
@@ -216,45 +228,53 @@ pub async fn sandbox_provider_detach(
     readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    // The resource version only guards this command's own read, so a
+    // conflict from a concurrent status write is retried with a fresh read.
+    let mut attempt = 1;
+    let (sandbox, response) = loop {
+        let sandbox = client
+            .get_sandbox(GetSandboxRequest {
+                name: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+            })
+            .await
+            .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+        let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
 
-    let response = match client
-        .detach_sandbox_provider(DetachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        match client
+            .detach_sandbox_provider(DetachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to detach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break (sandbox, response.into_inner()),
+            // Explicit post-save uncertainty takes precedence over a generic retry hint.
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                if attempt < PROVIDER_ATTACHMENT_CAS_ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "Failed to detach provider: sandbox was modified by another operation.\n\
+                     Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "detachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "detachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
@@ -382,6 +402,7 @@ pub async fn ensure_required_providers(
         loop {
             let response = client
                 .list_providers(ListProvidersRequest {
+                    label_selector: String::new(),
                     page_size: 100,
                     page_token,
                     workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1046,6 +1067,7 @@ pub async fn provider_create(
         server,
         name,
         provider_type,
+        labels: &[],
         credentials,
         credential_source,
         config,
@@ -1060,6 +1082,7 @@ pub struct ProviderCreateOptions<'a> {
     pub server: &'a str,
     pub name: &'a str,
     pub provider_type: &'a str,
+    pub labels: &'a [String],
     pub credentials: &'a [String],
     pub credential_source: ProviderCreateCredentialSource,
     pub config: &'a [String],
@@ -1082,6 +1105,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         server,
         name,
         provider_type,
+        labels,
         credentials,
         credential_source,
         config,
@@ -1089,6 +1113,8 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         profile_workspace,
         tls,
     } = options;
+
+    let labels = parse_key_value_pairs(labels, "--label")?;
 
     let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
     let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
@@ -1209,7 +1235,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     id: String::new(),
                     name: name.to_string(),
                     created_time: None,
-                    labels: HashMap::new(),
+                    labels,
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
@@ -1346,6 +1372,21 @@ pub async fn provider_get(
     println!("  {} {}", "Id:".dimmed(), provider.object_id());
     println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
+    if let Some(meta) = &provider.metadata
+        && !meta.labels.is_empty()
+    {
+        let mut labels: Vec<_> = meta.labels.iter().collect();
+        labels.sort_unstable_by_key(|(key, _)| *key);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            labels
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -1455,6 +1496,7 @@ pub async fn provider_list(
     server: &str,
     page_size: i32,
     page_token: &str,
+    label_selector: &str,
     names_only: bool,
     output: &str,
     workspace: &str,
@@ -1466,6 +1508,7 @@ pub async fn provider_list(
         .list_providers(ListProvidersRequest {
             page_size,
             page_token: page_token.to_string(),
+            label_selector: label_selector.to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {
@@ -1717,6 +1760,9 @@ pub async fn provider_profile_import(
 
     let mut client = grpc_client(server, tls).await?;
     if !items.is_empty() {
+        if profiles_require_stable_placeholders(&items) {
+            lint_profile_items(&mut client, items.clone(), workspace).await?;
+        }
         let response = client
             .import_provider_profiles(ImportProviderProfilesRequest {
                 request_id: String::new(),
@@ -1763,6 +1809,9 @@ pub async fn provider_profile_update(
 
     let mut client = grpc_client(server, tls).await?;
     if let Some(item) = items.pop() {
+        if profiles_require_stable_placeholders(std::slice::from_ref(&item)) {
+            lint_profile_items(&mut client, vec![item.clone()], workspace).await?;
+        }
         let expected_resource_version = item
             .profile
             .as_ref()
@@ -1804,14 +1853,7 @@ pub async fn provider_profile_lint(
 
     if !items.is_empty() {
         let mut client = grpc_client(server, tls).await?;
-        let response = client
-            .lint_provider_profiles(LintProviderProfilesRequest {
-                profiles: items,
-                workspace_scope: provider_profile_workspace_scope(workspace),
-            })
-            .await
-            .into_diagnostic()?
-            .into_inner();
+        let response = lint_profile_items(&mut client, items, workspace).await?;
         diagnostics.extend(response.diagnostics);
     }
 
@@ -2096,7 +2138,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     )
 }
 
-fn provider_refresh_recovery_action_name(
+pub fn provider_refresh_recovery_action_name(
     action: ProviderCredentialRefreshRecoveryAction,
 ) -> &'static str {
     match action {
@@ -2118,6 +2160,42 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
+}
+
+fn profiles_require_stable_placeholders(items: &[ProviderProfileImportItem]) -> bool {
+    items
+        .iter()
+        .filter_map(|item| item.profile.as_ref())
+        .any(|profile| {
+            profile
+                .credentials
+                .iter()
+                .any(|credential| credential.stable_placeholder)
+        })
+}
+
+// Check support before persisting an opt-in: older gateways discard unknown
+// credential fields and can otherwise report a successful revision-scoped import.
+async fn lint_profile_items(
+    client: &mut crate::tls::GrpcClient,
+    items: Vec<ProviderProfileImportItem>,
+    workspace: &str,
+) -> Result<openshell_core::proto::LintProviderProfilesResponse> {
+    let requires_stable = profiles_require_stable_placeholders(&items);
+    let response = client
+        .lint_provider_profiles(LintProviderProfilesRequest {
+            profiles: items,
+            workspace_scope: provider_profile_workspace_scope(workspace),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    if requires_stable && !response.supports_stable_placeholder {
+        return Err(miette!(
+            "gateway does not support stable_placeholder; upgrade the gateway before enabling it"
+        ));
+    }
+    Ok(response)
 }
 
 fn load_profile_import_items(
@@ -2566,7 +2644,8 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
         let access = match network_access_preset_to_str(endpoint.access) {
             Some("") if !endpoint.rules.is_empty() => "custom rules".to_string(),
             Some("") if is_mcp && allow_all_known_mcp_methods == Some(true) => {
-                "all known MCP methods (subject to tool and deny rules)".to_string()
+                "core MCP methods for the selected revision (subject to tool and deny rules)"
+                    .to_string()
             }
             Some("") => "not specified".to_string(),
             Some(access) => access.to_string(),
@@ -2601,9 +2680,26 @@ fn format_provider_profile_details(profile: &ProviderProfile) -> String {
                     || "not specified".to_string(),
                     |options| options.versions.join(", "),
                 );
-            let _ = writeln!(rendered, "    Allow all known MCP methods: {methods}");
+            let _ = writeln!(
+                rendered,
+                "    Allow core MCP methods for the selected revision: {methods}"
+            );
+            if allow_all_known_mcp_methods == Some(true) {
+                rendered
+                    .push_str("      Tool restrictions still apply; deny rules take precedence.\n");
+                rendered.push_str(
+                    "      Without tool-specific allow rules, all tool names are allowed.\n",
+                );
+            }
+            rendered.push_str("    Extension methods: require an exact allow rule\n");
             let _ = writeln!(rendered, "    Strict MCP tool names: {strict_names}");
             let _ = writeln!(rendered, "    MCP versions (declared): {versions}");
+            rendered.push_str(
+                "    Revision selection: MCP-Protocol-Version header; 2025-03-26 when absent\n",
+            );
+            rendered.push_str(
+                "      Legacy initialize requests negotiate their revision in the body.\n",
+            );
         }
         if !endpoint.allowed_ips.is_empty() {
             let _ = writeln!(
@@ -2852,7 +2948,7 @@ pub async fn provider_delete(
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK;
-    use crate::test_utils::EnvVarGuard;
+    use crate::test_utils::Environment;
     use std::fs;
     use std::io::Write;
 
@@ -2940,30 +3036,34 @@ mod tests {
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _credential = EnvVarGuard::set("GITHUB_TOKEN", "test-private-token-value");
-        let mut profile = openshell_providers::example_profiles::load("github").to_proto();
-        profile.source = "user".to_string();
-        profile.scope = "platform".to_string();
 
-        let rendered =
-            format_provider_profile_description(&profile, "table").expect("profile details render");
-        assert!(rendered.starts_with("github (provider)\nCategory: SOURCE CONTROL\n"));
-        assert!(
-            rendered.contains("Display name: GitHub\nDescription: GitHub API and Git operations\n")
-        );
-        assert!(rendered.contains("Source: user\nScope: platform\n"));
-        assert!(rendered.contains("Environment variables: GITHUB_TOKEN, GH_TOKEN\n"));
-        assert!(rendered.contains("Authentication: bearer\n"));
-        assert!(rendered.contains("Header: authorization\n"));
-        assert!(!rendered.contains("test-private-token-value"));
-        assert!(!rendered.contains("Default URL"));
-        assert!(rendered.contains("Protocol: graphql\n"));
-        assert!(rendered.contains("Path: /graphql\n"));
-        assert_eq!(rendered.matches("Access: read-only\n").count(), 2);
-        assert!(rendered.contains("Access: custom rules\n    Rules: 4 allow, 0 deny\n"));
-        assert!(rendered.contains("Enforcement: enforce\n"));
-        assert!(rendered.contains("  /usr/bin/gh\n"));
-        assert!(rendered.contains("  /usr/local/bin/git\n"));
+        Environment::new()
+            .set("GITHUB_TOKEN", "test-private-token-value")
+            .run(|| {
+                let mut profile = openshell_providers::example_profiles::load("github").to_proto();
+                profile.source = "user".to_string();
+                profile.scope = "platform".to_string();
+
+                let rendered = format_provider_profile_description(&profile, "table")
+                    .expect("profile details render");
+                assert!(rendered.starts_with("github (provider)\nCategory: SOURCE CONTROL\n"));
+                assert!(rendered.contains(
+                    "Display name: GitHub\nDescription: GitHub API and Git operations\n"
+                ));
+                assert!(rendered.contains("Source: user\nScope: platform\n"));
+                assert!(rendered.contains("Environment variables: GITHUB_TOKEN, GH_TOKEN\n"));
+                assert!(rendered.contains("Authentication: bearer\n"));
+                assert!(rendered.contains("Header: authorization\n"));
+                assert!(!rendered.contains("test-private-token-value"));
+                assert!(!rendered.contains("Default URL"));
+                assert!(rendered.contains("Protocol: graphql\n"));
+                assert!(rendered.contains("Path: /graphql\n"));
+                assert_eq!(rendered.matches("Access: read-only\n").count(), 2);
+                assert!(rendered.contains("Access: custom rules\n    Rules: 4 allow, 0 deny\n"));
+                assert!(rendered.contains("Enforcement: enforce\n"));
+                assert!(rendered.contains("  /usr/bin/gh\n"));
+                assert!(rendered.contains("  /usr/local/bin/git\n"));
+            });
     }
 
     #[test]
@@ -3143,11 +3243,39 @@ binaries: [/usr/bin/curl]
             let rendered = format_provider_profile_details(&proto);
             assert!(
                 rendered
-                    .contains("Access: all known MCP methods (subject to tool and deny rules)\n")
+                    .contains("Access: core MCP methods for the selected revision (subject to tool and deny rules)\n")
             );
-            assert!(rendered.contains("Allow all known MCP methods: true\n"));
+            assert!(rendered.contains("Allow core MCP methods for the selected revision: true\n"));
+            assert!(
+                rendered.contains("Tool restrictions still apply; deny rules take precedence.")
+            );
+            assert!(
+                rendered.contains("Without tool-specific allow rules, all tool names are allowed.")
+            );
+            assert!(rendered.contains("Extension methods: require an exact allow rule\n"));
             assert!(rendered.contains("Strict MCP tool names: true (default)\n"));
             assert!(rendered.contains("MCP versions (declared): 2025-11-25\n"));
+            assert!(rendered.contains(
+                "Revision selection: MCP-Protocol-Version header; 2025-03-26 when absent\n"
+            ));
+            assert!(
+                rendered
+                    .contains("Legacy initialize requests negotiate their revision in the body.\n")
+            );
+
+            for output in ["json", "yaml"] {
+                let structured = format_provider_profile_description(&proto, output)
+                    .expect("structured description renders");
+                let roundtrip = if output == "json" {
+                    parse_profile_json(&structured)
+                } else {
+                    parse_profile_yaml(&structured)
+                }
+                .expect("structured description is a full profile document");
+                assert_eq!(roundtrip, ProviderTypeProfile::from_proto(&proto));
+                assert!(structured.contains("allow_all_known_mcp_methods"));
+                assert!(!structured.contains("Allow core MCP methods"));
+            }
 
             // Explicit rules remain relevant when the method default is enabled,
             // and independent tool-name validation must not disappear from view.
@@ -3163,7 +3291,13 @@ binaries: [/usr/bin/curl]
                 options.strict_tool_names = Some(false);
                 let rendered = format_provider_profile_details(&proto);
                 assert!(rendered.contains("Access: custom rules\n    Rules: 1 allow, 0 deny\n"));
-                assert!(rendered.contains(&format!("Allow all known MCP methods: {allow_all}\n")));
+                assert!(rendered.contains(&format!(
+                    "Allow core MCP methods for the selected revision: {allow_all}\n"
+                )));
+                assert_eq!(
+                    rendered.contains("Tool restrictions still apply"),
+                    allow_all
+                );
                 assert!(rendered.contains("Strict MCP tool names: false\n"));
             }
         }
@@ -3436,15 +3570,19 @@ binaries: [/usr/bin/curl]
         let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            "/nonexistent/path/to/adc.json",
-        );
-        let err = read_gcloud_adc().expect_err("missing file should error");
-        assert!(
-            err.to_string().contains("failed to read gcloud ADC file"),
-            "unexpected error: {err}"
-        );
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "/nonexistent/path/to/adc.json",
+            )
+            .run(|| {
+                let err = read_gcloud_adc().expect_err("missing file should error");
+                assert!(
+                    err.to_string().contains("failed to read gcloud ADC file"),
+                    "unexpected error: {err}"
+                );
+            });
     }
 
     #[test]
@@ -3459,19 +3597,23 @@ binaries: [/usr/bin/curl]
             "private_key_id": "key123"
         });
         Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let err = read_gcloud_adc().expect_err("wrong type should error");
-        // The service_account type gets a targeted message directing the user
-        // to the real Vertex service-account credential flow instead of the
-        // generic authorized_user hint.
-        assert!(
-            err.to_string()
-                .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
-            "error should mention the service-account token key, got: {err}"
-        );
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                tmp.path().to_str().expect("tempfile path"),
+            )
+            .run(|| {
+                let err = read_gcloud_adc().expect_err("wrong type should error");
+                // The service_account type gets a targeted message directing the user
+                // to the real Vertex service-account credential flow instead of the
+                // generic authorized_user hint.
+                assert!(
+                    err.to_string()
+                        .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+                    "error should mention the service-account token key, got: {err}"
+                );
+            });
     }
 
     #[test]
@@ -3487,15 +3629,19 @@ binaries: [/usr/bin/curl]
             "refresh_token": "test-refresh-token"
         });
         Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let (client_id, client_secret, refresh_token) =
-            read_gcloud_adc().expect("valid ADC should parse");
-        assert_eq!(client_id, "test-client-id.apps.googleusercontent.com");
-        assert_eq!(client_secret, "test-client-secret");
-        assert_eq!(refresh_token, "test-refresh-token");
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                tmp.path().to_str().expect("tempfile path"),
+            )
+            .run(|| {
+                let (client_id, client_secret, refresh_token) =
+                    read_gcloud_adc().expect("valid ADC should parse");
+                assert_eq!(client_id, "test-client-id.apps.googleusercontent.com");
+                assert_eq!(client_secret, "test-client-secret");
+                assert_eq!(refresh_token, "test-refresh-token");
+            });
     }
 
     #[test]
@@ -3512,15 +3658,17 @@ binaries: [/usr/bin/curl]
             "refresh_token": "cloudsdk-refresh-token"
         });
         fs::write(&adc_path, json.to_string()).expect("write adc file");
-        let _adc_guard = EnvVarGuard::unset("GOOGLE_APPLICATION_CREDENTIALS");
-        let _cloudsdk_guard =
-            EnvVarGuard::set("CLOUDSDK_CONFIG", dir.path().to_str().expect("config path"));
 
-        let (client_id, client_secret, refresh_token) =
-            read_gcloud_adc().expect("valid CLOUDSDK_CONFIG ADC should parse");
-        assert_eq!(client_id, "cloudsdk-client-id.apps.googleusercontent.com");
-        assert_eq!(client_secret, "cloudsdk-client-secret");
-        assert_eq!(refresh_token, "cloudsdk-refresh-token");
+        Environment::new()
+            .remove("GOOGLE_APPLICATION_CREDENTIALS")
+            .set("CLOUDSDK_CONFIG", dir.path().to_str().expect("config path"))
+            .run(|| {
+                let (client_id, client_secret, refresh_token) =
+                    read_gcloud_adc().expect("valid CLOUDSDK_CONFIG ADC should parse");
+                assert_eq!(client_id, "cloudsdk-client-id.apps.googleusercontent.com");
+                assert_eq!(client_secret, "cloudsdk-client-secret");
+                assert_eq!(refresh_token, "cloudsdk-refresh-token");
+            });
     }
 
     #[test]
@@ -3531,25 +3679,29 @@ binaries: [/usr/bin/curl]
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         Write::write_all(&mut tmp.as_file(), b"not valid json at all {{{{")
             .expect("write tempfile");
-        let _guard = EnvVarGuard::set(
-            "GOOGLE_APPLICATION_CREDENTIALS",
-            tmp.path().to_str().expect("tempfile path"),
-        );
-        let result = read_gcloud_adc();
-        assert!(
-            result.is_err(),
-            "malformed JSON should produce an error, got: {result:?}"
-        );
-        let err = result.unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("parse")
-                || msg.contains("JSON")
-                || msg.contains("json")
-                || msg.contains("invalid")
-                || msg.contains("failed"),
-            "error message should mention parse/JSON failure, got: {msg}"
-        );
+
+        Environment::new()
+            .set(
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                tmp.path().to_str().expect("tempfile path"),
+            )
+            .run(|| {
+                let result = read_gcloud_adc();
+                assert!(
+                    result.is_err(),
+                    "malformed JSON should produce an error, got: {result:?}"
+                );
+                let err = result.unwrap_err();
+                let msg = format!("{err}");
+                assert!(
+                    msg.contains("parse")
+                        || msg.contains("JSON")
+                        || msg.contains("json")
+                        || msg.contains("invalid")
+                        || msg.contains("failed"),
+                    "error message should mention parse/JSON failure, got: {msg}"
+                );
+            });
     }
 
     #[test]

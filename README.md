@@ -14,7 +14,7 @@
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen)](https://docs.nvidia.com/openshell/latest/index.html)
 
 > [!IMPORTANT]
-> **New in OpenShell 0.1.0:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
+> **New in OpenShell 0.1.x:** a stable release cadence, new isolation primitives, an expanded extension surface, and new APIs. [Read the 0.1.0 upgrade guide](https://docs.nvidia.com/openshell/latest/upgrade/0-1-0).
 
 OpenShell is the safe, private runtime for fleets of autonomous AI agents. Agents are most useful when they can read files, install packages, call APIs, and use credentials. OpenShell gives them that capability without giving them unrestricted access to your data, secrets, or network. You declare what each agent can touch in a policy, and OpenShell enforces it.
 
@@ -68,7 +68,7 @@ SDKs connect applications to an OpenShell gateway. They do not install the CLI. 
 | Python | `uv add openshell` | [README](python/openshell/) |
 | TypeScript | `npm install @nvidia/openshell-sdk` (GitHub Packages) | [README](sdk/typescript/README.md) |
 | Go | `go get github.com/NVIDIA/OpenShell/sdk/go@latest` | [README](sdk/go/README.md) |
-| Rust | Git dependency pinned to a release tag | [README](crates/openshell-sdk/README.md) |
+| Rust | `cargo add openshell-sdk --git https://github.com/NVIDIA/OpenShell --tag <release-tag>` | [Installation and usage](docs/sdk/rust.mdx) |
 
 ## Community
 
@@ -78,7 +78,7 @@ SDKs connect applications to an OpenShell gateway. They do not install the CLI. 
 - **Roadmap:** [OpenShell Roadmap](https://github.com/orgs/NVIDIA/projects/233) and the [RFC board](https://github.com/orgs/NVIDIA/projects/233/views/6)
 - **Try it in the cloud:** [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg)
 
-OpenShell is built agent-first: it is developed with the same agent-driven workflows it enables. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the contribution workflow, and [AGENTS.md](AGENTS.md) for the contributor agent skills and workflow chains.
+OpenShell is built agent-first: it is developed with the same agent-driven workflows it enables. See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and the contribution workflow, and [AGENTS.md](AGENTS.md) for repository coding conventions.
 
 ## Telemetry
 

@@ -21,7 +21,7 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
@@ -39,30 +39,21 @@ struct KubernetesOuterFenceEvidence<'a> {
 }
 
 impl KubernetesOuterFenceEvidence<'_> {
-    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
-        if self.network_policy_uid.is_empty() || self.network_policy_resource_version.is_empty() {
+    fn project(&self, generation: &str) -> Result<ProvisioningEvidence, BackendError> {
+        if self.network_policy_uid.is_empty()
+            || self.network_policy_resource_version.is_empty()
+            || !self.ingress_isolated
+            || !self.egress_isolated
+            || self.egress_rule_count != 0
+        {
             return Err(BackendError::Descriptor(
-                "Kubernetes outer fence evidence is incomplete".to_string(),
+                "Kubernetes provisioning evidence is incomplete".to_string(),
             ));
-        }
-        let mut established = Vec::new();
-        if self.ingress_isolated && self.egress_isolated && self.egress_rule_count == 0 {
-            // A persisted policy selecting both directions with no egress rule
-            // continues to deny direct egress after revocation or controller loss.
-            established.extend([
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ]);
-        }
-        if self.egress_isolated && self.egress_rule_count == 0 {
-            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
         }
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode Kubernetes outer fence evidence: {error}"))
         })?;
-        let projection =
-            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)?;
+        let projection = ProvisioningEvidence::from_enforcement_evidence(generation, &encoded)?;
         projection.validate(generation)?;
         Ok(projection)
     }
@@ -247,7 +238,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 self.egress_policy_resource_version,
             ),
         ]);
-        let outer_fence = KubernetesOuterFenceEvidence {
+        let provisioning_evidence = KubernetesOuterFenceEvidence {
             network_policy_uid: &resource_claims["kubernetes.egress_policy_uid"],
             network_policy_resource_version: &resource_claims
                 ["kubernetes.egress_policy_resource_version"],
@@ -275,7 +266,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                     self.workload_pod_uid_path,
                 )]),
                 workload_identity: self.workload_identity.clone(),
-                outer_fence: outer_fence.clone(),
+                provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -290,7 +281,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
-                outer_fence,
+                provisioning_evidence,
             },
         })
     }
@@ -403,13 +394,13 @@ mod tests {
             "1945"
         );
         assert_eq!(
-            provisioned.boundary_config.outer_fence,
-            provisioned.runtime_descriptor.outer_fence
+            provisioned.boundary_config.provisioning_evidence,
+            provisioned.runtime_descriptor.provisioning_evidence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .outer_fence
+                .provisioning_evidence
                 .validate("generation-1")
                 .is_ok()
         );

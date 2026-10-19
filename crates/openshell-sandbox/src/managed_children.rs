@@ -9,9 +9,11 @@
 //! from incidental zombies.
 
 #![cfg(target_os = "linux")]
+#![allow(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
@@ -19,6 +21,22 @@ use std::time::Duration;
 static MANAGED_CHILDREN: LazyLock<Mutex<HashMap<i32, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static REAPER_EVENT_FD: AtomicI32 = AtomicI32::new(-1);
+const REAPER_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+static REAPER_SCAN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn notify_reaper_on_sigchld(_: libc::c_int) {
+    let fd = REAPER_EVENT_FD.load(Ordering::Acquire);
+    if fd >= 0 {
+        let wakeup = 1_u64;
+        // SAFETY: write is async-signal-safe; the process-lifetime eventfd is
+        // nonblocking, so a full counter cannot stall the signal handler.
+        unsafe {
+            libc::write(fd, (&raw const wakeup).cast(), size_of::<u64>());
+        }
+    }
+}
 
 /// Identity of one registry entry. The generation prevents an old waiter from
 /// removing a newer child that reused the same numeric PID after reap.
@@ -110,22 +128,87 @@ pub fn wait_until_terminal(pid: u32) -> io::Result<()> {
 /// Explicitly managed children remain owned by their normal waiters. Only
 /// unregistered children adopted from the workload process tree are reaped.
 pub fn start_orphan_reaper() -> io::Result<()> {
+    // This is installed before the boundary starts its runtime threads or
+    // workload children. The descriptor and handler live until process exit.
+    // SAFETY: eventfd has scalar arguments and returns a new descriptor.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    REAPER_EVENT_FD.store(fd, Ordering::Release);
+    let action = nix::sys::signal::SigAction::new(
+        nix::sys::signal::SigHandler::Handler(notify_reaper_on_sigchld),
+        nix::sys::signal::SaFlags::SA_RESTART | nix::sys::signal::SaFlags::SA_NOCLDSTOP,
+        nix::sys::signal::SigSet::empty(),
+    );
+    // SAFETY: the handler only reads a lock-free atomic and writes to the
+    // nonblocking eventfd, both valid for the remaining process lifetime.
+    unsafe { nix::sys::signal::sigaction(nix::sys::signal::Signal::SIGCHLD, &action) }
+        .map_err(io::Error::other)?;
     std::thread::Builder::new()
         .name("openshell-orphan-reaper".to_string())
-        .spawn(|| {
+        .spawn(move || {
             loop {
                 if let Err(error) = reap_unmanaged_children_once() {
                     tracing::debug!(%error, "orphan reaper scan failed");
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                if let Err(error) = wait_for_reaper_event(fd) {
+                    tracing::debug!(%error, "orphan reaper notification failed");
+                    std::thread::sleep(REAPER_RECOVERY_INTERVAL);
+                }
             }
         })
         .map(|_| ())
 }
 
+fn wait_for_reaper_event(fd: libc::c_int) -> io::Result<()> {
+    let mut notification = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: poll receives one valid pollfd for the process-lifetime eventfd.
+    let ready = unsafe {
+        libc::poll(
+            &raw mut notification,
+            1,
+            i32::try_from(REAPER_RECOVERY_INTERVAL.as_millis()).unwrap(),
+        )
+    };
+    if ready < 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if ready == 0 {
+        return Ok(());
+    }
+    if notification.revents & libc::POLLIN == 0 {
+        return Err(io::Error::other("orphan reaper eventfd is not readable"));
+    }
+    let mut count = 0_u64;
+    // Drain before scanning: a SIGCHLD arriving during the next scan remains
+    // queued and triggers another pass. A single read drains coalesced writes.
+    // SAFETY: read writes one u64 into valid storage; the fd is nonblocking.
+    let read = unsafe { libc::read(fd, (&raw mut count).cast(), size_of::<u64>()) };
+    if read == isize::try_from(size_of::<u64>()).expect("u64 size fits isize")
+        || (read < 0 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock)
+    {
+        Ok(())
+    } else if read < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Err(io::Error::other("short orphan reaper eventfd read"))
+    }
+}
+
 fn reap_unmanaged_children_once() -> io::Result<usize> {
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
+    #[cfg(test)]
+    REAPER_SCAN_COUNT.fetch_add(1, Ordering::Relaxed);
     let children = direct_child_pids()?;
     let registry = lock();
     let mut reaped = 0;
@@ -170,7 +253,89 @@ mod tests {
     use nix::unistd::Pid;
     use std::process::Command;
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    fn fork_exiting_child() -> i32 {
+        // SAFETY: the child does not run Rust code after fork; it exits through
+        // libc immediately, avoiding inherited test-harness locks.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            // SAFETY: terminate without unwinding or touching Rust state.
+            unsafe { libc::_exit(0) };
+        }
+        assert!(pid > 0, "fork failed: {}", io::Error::last_os_error());
+        pid
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "condition did not become true");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn orphan_reaper_waits_while_idle_and_reaps_only_unmanaged_children() {
+        const HELPER_ENV: &str = "OPENSHELL_ORPHAN_REAPER_TEST_HELPER";
+        if std::env::var_os(HELPER_ENV).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "managed_children::tests::orphan_reaper_waits_while_idle_and_reaps_only_unmanaged_children",
+                    "--nocapture",
+                ])
+                .env(HELPER_ENV, "1")
+                .output()
+                .expect("start isolated reaper test process");
+            assert!(
+                output.status.success(),
+                "reaper test failed: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+
+        start_orphan_reaper().expect("start orphan reaper");
+        wait_until(|| REAPER_SCAN_COUNT.load(Ordering::Relaxed) > 0);
+        let idle_scan_count = REAPER_SCAN_COUNT.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(REAPER_SCAN_COUNT.load(Ordering::Relaxed), idle_scan_count);
+
+        let mut registry = lock();
+        let managed_pid = fork_exiting_child();
+        let managed = registry
+            .register(u32::try_from(managed_pid).unwrap())
+            .unwrap();
+        drop(registry);
+        wait_until(|| {
+            matches!(
+                waitid(
+                    Id::Pid(Pid::from_raw(managed_pid)),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT
+                ),
+                Ok(WaitStatus::Exited(..))
+            )
+        });
+        wait_until(|| REAPER_SCAN_COUNT.load(Ordering::Relaxed) > idle_scan_count);
+        assert!(matches!(
+            waitpid(Pid::from_raw(managed_pid), None),
+            Ok(WaitStatus::Exited(..))
+        ));
+        unregister(managed);
+
+        let orphan_pids: Vec<i32> = (0..8).map(|_| fork_exiting_child()).collect();
+        wait_until(|| {
+            let children = direct_child_pids().expect("inspect direct children");
+            orphan_pids.iter().all(|pid| !children.contains(pid))
+        });
+        for pid in orphan_pids {
+            assert_eq!(
+                waitpid(Pid::from_raw(pid), Some(WaitPidFlag::WNOHANG)),
+                Err(nix::errno::Errno::ECHILD)
+            );
+        }
+    }
 
     #[test]
     fn fast_child_remains_waitable_after_orphan_reap_attempt() {

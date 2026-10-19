@@ -222,7 +222,7 @@ without `--dangerously-skip-permissions`.
 
 - **Customize the policy**: Change `access: read-only` to `read-write`
   or add explicit `rules` for specific paths. See the
-  [security policy reference](../../architecture/security-policy.md).
+  [policy schema reference](../../docs/how-it-works/policies/schema.mdx).
 - **Scope to an agent**: Replace the `binaries` section with your
   agent's binary (e.g., `/usr/local/bin/claude`) instead of `curl`.
 - **Add more endpoints**: Stack multiple policies in the same file

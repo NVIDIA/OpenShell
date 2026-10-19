@@ -13,6 +13,7 @@ network_policies:
         enforcement: enforce
         mcp:
           versions:
+            - "2026-07-28"
             - "2025-11-25"
             - "2025-03-26"
             - "2025-06-18"

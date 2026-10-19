@@ -5,6 +5,7 @@ use std::process::Stdio;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
+use openshell_e2e::harness::sandbox::SandboxGuard;
 
 fn normalize_output(output: &str) -> String {
     let stripped = strip_ansi(output).replace('\r', "");
@@ -104,14 +105,6 @@ async fn get_sandbox_details(name: &str) -> String {
     combined
 }
 
-async fn delete_sandbox(name: &str) {
-    let mut cmd = openshell_cmd();
-    cmd.args(["sandbox", "delete", name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = cmd.status().await;
-}
-
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // end-to-end test exercises full label lifecycle
 async fn sandbox_labels_are_stored_and_filterable() {
@@ -122,6 +115,12 @@ async fn sandbox_labels_are_stored_and_filterable() {
     let staging_backend = format!("lbl-sb-{suffix}");
     let prod_frontend = format!("lbl-pf-{suffix}");
     let dev_data = format!("lbl-dd-{suffix}");
+
+    // Arm guards before create so a partial create still cleans up.
+    let _cleanup: Vec<_> = [&dev_backend, &staging_backend, &prod_frontend, &dev_data]
+        .into_iter()
+        .map(|name| SandboxGuard::manage_existing(name.clone()))
+        .collect();
 
     // Create sandboxes with different labels
     let name1 =
@@ -228,10 +227,4 @@ async fn sandbox_labels_are_stored_and_filterable() {
         all_sandboxes.contains(&name4),
         "list without filter should include all test sandboxes"
     );
-
-    // Cleanup
-    delete_sandbox(&name1).await;
-    delete_sandbox(&name2).await;
-    delete_sandbox(&name3).await;
-    delete_sandbox(&name4).await;
 }

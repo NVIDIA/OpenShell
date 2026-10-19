@@ -7,7 +7,7 @@
 //! pure schema validation, and lexical policy-path normalization. Runtime and
 //! protobuf adaptation intentionally live in `openshell-policy`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
@@ -17,16 +17,26 @@ use std::str::FromStr;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Deserializer, Serialize};
 
-/// Fixed batch-member bound for the MCP 2025-03-26 wire profile.
+pub mod yaml;
+
+/// Fixed resource bound for legacy MCP request batches inspected by Tower.
 pub const MAX_MCP_LEGACY_BATCH_MESSAGES: usize = 64;
 
 /// Stable MCP protocol revisions accepted in authored policy.
+///
+/// This closed vocabulary pins product support and ordering independently of
+/// the protocol inspector. Wire semantics remain owned by the inspector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum McpProtocolVersion {
+    /// MCP protocol revision `2025-03-26`.
     V2025_03_26,
+    /// MCP protocol revision `2025-06-18`.
     V2025_06_18,
+    /// MCP protocol revision `2025-11-25`.
     V2025_11_25,
+    /// Sessionless MCP protocol revision `2026-07-28`.
+    V2026_07_28,
 }
 
 /// Pinned revision used when authored policy omits MCP versions.
@@ -35,30 +45,22 @@ pub const DEFAULT_MCP_PROTOCOL_VERSION: McpProtocolVersion = McpProtocolVersion:
 pub const MCP_VERSION_REMEDIATION: &str = "omit mcp.versions to use the pinned default revision, use an exact supported revision, or omit protocol and mcp for deliberate uninspected L4 passthrough only when that weaker boundary is acceptable";
 
 impl McpProtocolVersion {
-    pub const ALL: &'static [Self] = &[Self::V2025_03_26, Self::V2025_06_18, Self::V2025_11_25];
+    /// Every supported policy revision in canonical semantic order.
+    pub const ALL: &'static [Self] = &[
+        Self::V2025_03_26,
+        Self::V2025_06_18,
+        Self::V2025_11_25,
+        Self::V2026_07_28,
+    ];
 
+    /// Return the exact MCP protocol identifier accepted in policy.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::V2025_03_26 => "2025-03-26",
             Self::V2025_06_18 => "2025-06-18",
             Self::V2025_11_25 => "2025-11-25",
-        }
-    }
-
-    #[must_use]
-    pub const fn wire_profile(self) -> McpWireProfile {
-        match self {
-            Self::V2025_03_26 => McpWireProfile {
-                version: self,
-                allows_json_rpc_batches: true,
-                max_batch_messages: Some(MAX_MCP_LEGACY_BATCH_MESSAGES),
-            },
-            Self::V2025_06_18 | Self::V2025_11_25 => McpWireProfile {
-                version: self,
-                allows_json_rpc_batches: false,
-                max_batch_messages: None,
-            },
+            Self::V2026_07_28 => "2026-07-28",
         }
     }
 }
@@ -77,6 +79,7 @@ impl FromStr for McpProtocolVersion {
             "2025-03-26" => Ok(Self::V2025_03_26),
             "2025-06-18" => Ok(Self::V2025_06_18),
             "2025-11-25" => Ok(Self::V2025_11_25),
+            "2026-07-28" => Ok(Self::V2026_07_28),
             _ => Err(ParseMcpProtocolVersionError {
                 value: value.to_owned(),
             }),
@@ -84,12 +87,14 @@ impl FromStr for McpProtocolVersion {
     }
 }
 
+/// Error returned for a revision outside the exact policy vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseMcpProtocolVersionError {
     value: String,
 }
 
 impl ParseMcpProtocolVersionError {
+    /// Return the original rejected identifier without normalization.
     #[must_use]
     pub fn value(&self) -> &str {
         &self.value
@@ -108,29 +113,64 @@ impl fmt::Display for ParseMcpProtocolVersionError {
 
 impl std::error::Error for ParseMcpProtocolVersionError {}
 
-/// Immutable batch-shape metadata for an exact MCP revision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct McpWireProfile {
-    version: McpProtocolVersion,
-    allows_json_rpc_batches: bool,
-    max_batch_messages: Option<usize>,
+/// Sort MCP policy revisions without hiding invalid input.
+///
+/// Supported revisions use [`McpProtocolVersion::ALL`] semantic order, followed
+/// by unsupported identifiers in lexical order. Duplicate values and the exact
+/// spelling of every identifier remain available to subsequent validation.
+/// Empty lists remain empty; the caller owns omission and default handling.
+pub fn canonicalize_mcp_versions(versions: &mut [String]) {
+    versions.sort_by(|left, right| {
+        match (
+            left.parse::<McpProtocolVersion>(),
+            right.parse::<McpProtocolVersion>(),
+        ) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+            (Err(_), Err(_)) => left.cmp(right),
+        }
+    });
 }
 
-impl McpWireProfile {
-    #[must_use]
-    pub const fn version(self) -> McpProtocolVersion {
-        self.version
+/// Parse an explicit MCP policy allowlist into canonical semantic order.
+///
+/// This does not choose a default or modify the input. Callers must handle
+/// omitted fields before passing an explicit list to this function.
+///
+/// # Errors
+///
+/// Returns [`ParseMcpVersionsError::Empty`] for an empty list, or the first
+/// unsupported or duplicate revision in input order.
+pub fn parse_mcp_versions(
+    values: &[String],
+) -> std::result::Result<BTreeSet<McpProtocolVersion>, ParseMcpVersionsError> {
+    if values.is_empty() {
+        return Err(ParseMcpVersionsError::Empty);
     }
 
-    #[must_use]
-    pub const fn allows_json_rpc_batches(self) -> bool {
-        self.allows_json_rpc_batches
+    let mut versions = BTreeSet::new();
+    for value in values {
+        let version = value.parse::<McpProtocolVersion>()?;
+        if !versions.insert(version) {
+            return Err(ParseMcpVersionsError::Duplicate(version));
+        }
     }
+    Ok(versions)
+}
 
-    #[must_use]
-    pub const fn max_batch_messages(self) -> Option<usize> {
-        self.max_batch_messages
-    }
+/// Error returned when an explicit MCP policy allowlist is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParseMcpVersionsError {
+    /// The explicitly supplied allowlist contains no revisions.
+    #[error("mcp.versions must contain at least one supported protocol version")]
+    Empty,
+    /// An identifier does not exactly match a supported revision.
+    #[error(transparent)]
+    Unsupported(#[from] ParseMcpProtocolVersionError),
+    /// A supported revision occurs more than once in the list.
+    #[error("duplicate MCP protocol version '{0}'")]
+    Duplicate(McpProtocolVersion),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -480,7 +520,9 @@ where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    T::deserialize(deserializer).map(Some)
+    Option::<T>::deserialize(deserializer)?
+        .map(Some)
+        .ok_or_else(|| serde::de::Error::custom("null is not allowed for this field"))
 }
 
 const MAX_UNKNOWN_FIELD_PATH_BYTES: usize = 1_024;
@@ -553,9 +595,47 @@ pub fn parse_policy_with_limits(source: &str, limits: ParseLimits) -> Result<Pol
     if let Some(unknown_field) = find_unknown_field(&value) {
         miette::bail!("unknown field '{}' in authored policy", unknown_field.path);
     }
-    let policy: PolicyDocument = serde_yml::from_value(&value)
-        .into_diagnostic()
-        .wrap_err("failed to decode sandbox policy fields")?;
+    yaml::reject_null_objects(
+        &value,
+        &[
+            "filesystem_policy",
+            "landlock",
+            "process",
+            "network_policies",
+            "network_policies.*",
+            "network_policies.*.endpoints.*",
+            "network_policies.*.binaries.*",
+            "network_middlewares",
+            "network_middlewares.*",
+            "network_middlewares.*.config",
+            "network_middlewares.*.endpoints",
+            "network_policies.*.endpoints.*.credential_binding",
+            "network_policies.*.endpoints.*.json_rpc",
+            "network_policies.*.endpoints.*.mcp",
+            "network_policies.*.endpoints.*.graphql_persisted_queries",
+            "network_policies.*.endpoints.*.graphql_persisted_queries.*",
+            "network_policies.*.endpoints.*.rules.*",
+            "network_policies.*.endpoints.*.rules.*.allow",
+            "network_policies.*.endpoints.*.rules.*.allow.query",
+            "network_policies.*.endpoints.*.rules.*.allow.params",
+            "network_policies.*.endpoints.*.deny_rules.*",
+            "network_policies.*.endpoints.*.deny_rules.*.query",
+            "network_policies.*.endpoints.*.deny_rules.*.params",
+        ],
+    )
+    .into_diagnostic()
+    .wrap_err("failed to decode sandbox policy fields")?;
+    let policy: PolicyDocument =
+        serde_path_to_error::deserialize(serde_yml::Deserializer::new(&value))
+            .map_err(|error| {
+                let path = bound_path(error.path().to_string());
+                if path == "." {
+                    miette::miette!("{}", error.inner())
+                } else {
+                    miette::miette!("{path}: {}", error.inner())
+                }
+            })
+            .wrap_err("failed to decode sandbox policy fields")?;
     validate_policy(&policy)?;
     Ok(policy)
 }
@@ -899,11 +979,15 @@ fn sequence(value: Option<&serde_yml::Value>) -> &[serde_yml::Value] {
 }
 
 fn join(parent: &str, child: &str) -> String {
-    let mut path = if parent.is_empty() {
+    bound_path(if parent.is_empty() {
         child.to_owned()
     } else {
         format!("{parent}.{child}")
-    };
+    })
+}
+
+// Cap diagnostic paths so oversized authored keys cannot bloat errors.
+fn bound_path(mut path: String) -> String {
     if path.len() > MAX_UNKNOWN_FIELD_PATH_BYTES {
         let mut end = MAX_UNKNOWN_FIELD_PATH_BYTES - 3;
         while !path.is_char_boundary(end) {
@@ -917,7 +1001,7 @@ fn join(parent: &str, child: &str) -> String {
 
 /// Serialize the authored representation to YAML.
 pub fn serialize_policy(document: &PolicyDocument) -> Result<String> {
-    serde_yml::to_string(document)
+    yaml::to_string(document)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
 }
@@ -960,21 +1044,19 @@ pub fn validate_mcp_config(config: &McpConfig, context: &str) -> Result<()> {
     let Some(versions) = config.versions.as_deref() else {
         return Ok(());
     };
-    if versions.is_empty() {
-        miette::bail!(
-            "{context} has an empty mcp.versions list; omit it to use the pinned default revision"
-        );
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for value in versions {
-        let version = value
-            .parse::<McpProtocolVersion>()
-            .map_err(|error| miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}"))?;
-        if !seen.insert(version) {
-            miette::bail!("{context} has duplicate protocol version '{value}'");
-        }
-    }
-    Ok(())
+    parse_mcp_versions(versions)
+        .map(|_| ())
+        .map_err(|error| match error {
+            ParseMcpVersionsError::Empty => miette::miette!(
+                "{context} has an empty mcp.versions list; omit it to use the pinned default revision"
+            ),
+            ParseMcpVersionsError::Unsupported(error) => {
+                miette::miette!("{context}: {error}; {MCP_VERSION_REMEDIATION}")
+            }
+            ParseMcpVersionsError::Duplicate(version) => {
+                miette::miette!("{context} has duplicate protocol version '{version}'")
+            }
+        })
 }
 
 fn reject_json_unknown_fields(
@@ -1151,6 +1233,55 @@ mod tests {
     }
 
     #[test]
+    fn nested_null_objects_remain_invalid() {
+        for spelling in ["null", "~", ""] {
+            for body in [
+                format!("network_policies: {spelling}"),
+                format!("network_policies: {{x: {spelling}}}"),
+                format!("network_middlewares: {spelling}"),
+                format!("landlock: {spelling}"),
+                format!("network_middlewares: {{x: {{middleware: foo, config: {spelling}}}}}"),
+                format!("network_middlewares: {{x: {{middleware: foo, endpoints: {spelling}}}}}"),
+                format!("network_policies: {{x: {{endpoints: [{spelling}]}}}}"),
+            ] {
+                // A bare [] is an empty collection rather than a null entry.
+                if spelling.is_empty() && body.ends_with("[]}}") {
+                    continue;
+                }
+                assert!(
+                    parse_policy(&format!("version: 1\n{body}\n")).is_err(),
+                    "{body}"
+                );
+            }
+            for field in [
+                format!("rules: [{{allow: {spelling}}}]"),
+                format!("deny_rules: [{{method: GET, query: {spelling}}}]"),
+                format!("deny_rules: [{spelling}]"),
+                format!("rules: [{{allow: {{query: {spelling}}}}}]"),
+                format!("rules: [{{allow: {{params: {spelling}}}}}]"),
+                format!("rules: [{{allow: {{tool: {spelling}}}}}]"),
+                format!("deny_rules: [{{tool: {spelling}}}]"),
+                format!("graphql_persisted_queries: {spelling}"),
+                format!("graphql_persisted_queries: {{op: {spelling}}}"),
+                format!("credential_binding: {spelling}"),
+                format!("json_rpc: {spelling}"),
+                format!("mcp: {spelling}"),
+            ] {
+                if field == "deny_rules: []" {
+                    continue;
+                }
+                let yaml = format!(
+                    "version: 1\nnetwork_policies: {{x: {{endpoints: [{{host: example.com, port: 443, {field}}}]}}}}\n"
+                );
+                assert!(parse_policy(&yaml).is_err(), "{yaml}");
+            }
+        }
+        let yaml =
+            "version: 1\nnetwork_middlewares: {x: {middleware: foo, config: {optional: null}}}\n";
+        assert!(parse_policy(yaml).is_ok());
+    }
+
+    #[test]
     fn truncation_paths_are_unicode_safe() {
         let oversized = "é".repeat(ParseLimits::default().max_bytes);
         let source = format!("version: 1\nunknown_{oversized}: true\n");
@@ -1241,6 +1372,44 @@ mod tests {
                 "missing path {expected_path} in {error:?}"
             );
         }
+    }
+
+    fn decode_error_chain(source: &str) -> Vec<String> {
+        let error = parse_policy(source).expect_err("type mismatch must fail closed");
+        error.chain().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn type_errors_name_the_offending_field() {
+        let source = "version: 1\nnetwork_policies:\n  github_api:\n    endpoints:\n      - host: api.github.com\n        port: \"443\"\n";
+        assert_eq!(
+            decode_error_chain(source),
+            [
+                "failed to decode sandbox policy fields",
+                "network_policies.github_api.endpoints[0].port: type mismatch: expected unsigned integer, found string",
+            ]
+        );
+    }
+
+    #[test]
+    fn type_errors_without_a_path_keep_their_message() {
+        let chain = decode_error_chain("- version: 1\n");
+        assert_eq!(chain[0], "failed to decode sandbox policy fields");
+        assert!(
+            !chain[1].starts_with(".: "),
+            "unexpected prefix in {chain:?}"
+        );
+    }
+
+    #[test]
+    fn bounds_type_error_paths_under_long_keys() {
+        let policy_name = "é".repeat(2_000);
+        let source = format!(
+            "version: 1\nnetwork_policies:\n  {policy_name}:\n    endpoints:\n      - host: example.com\n        port: \"443\"\n"
+        );
+        let chain = decode_error_chain(&source);
+        assert!(chain[1].contains("...: type mismatch"));
+        assert!(chain[1].len() <= MAX_UNKNOWN_FIELD_PATH_BYTES + 100);
     }
 
     #[test]
@@ -1383,6 +1552,37 @@ network_policies:
         };
         assert!(parse_policy_reader(&b"version: 1\nextra"[..], limits,).is_err());
         assert!(parse_policy_bytes(&[0xff]).is_err());
+    }
+
+    #[test]
+    fn mcp_config_preserves_explicit_sessionless_versions_and_omission() {
+        let config = parse_mcp_config(serde_json::json!({
+            "versions": ["2026-07-28", "2025-03-26"],
+        }))
+        .expect("explicit supported revisions");
+        assert_eq!(
+            config.versions.as_deref(),
+            Some(["2026-07-28".to_string(), "2025-03-26".to_string()].as_slice())
+        );
+        assert!(
+            parse_mcp_config(serde_json::json!({}))
+                .unwrap()
+                .versions
+                .is_none()
+        );
+        assert_eq!(DEFAULT_MCP_PROTOCOL_VERSION.as_str(), "2025-11-25");
+    }
+
+    #[test]
+    fn mcp_config_rejects_empty_duplicate_and_unknown_versions() {
+        for versions in [
+            serde_json::json!([]),
+            serde_json::json!(["2026-07-28", "2026-07-28"]),
+            serde_json::json!(["2026-07-29"]),
+            serde_json::json!([" 2026-07-28"]),
+        ] {
+            assert!(parse_mcp_config(serde_json::json!({ "versions": versions })).is_err());
+        }
     }
 
     #[test]

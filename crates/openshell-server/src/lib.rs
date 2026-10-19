@@ -17,15 +17,21 @@ mod auth;
 pub mod certgen;
 pub mod cli;
 mod compute;
+mod config_delivery;
 pub mod config_file;
 mod config_update_operation;
 mod credentials;
 mod defaults;
 mod gateway_listener;
+mod gateway_members;
+mod gateway_metrics;
+mod gateway_ocsf;
+mod gateway_ring;
 mod grpc;
 mod http;
 mod middleware;
 mod multiplex;
+mod ocsf_log;
 mod otel_tracing;
 mod pagination;
 mod persistence;
@@ -33,9 +39,11 @@ pub(crate) mod policy_store;
 mod provider_profile_sources;
 mod provider_refresh;
 mod readiness;
+mod reflection;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
+mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
@@ -51,7 +59,6 @@ mod tracing_setup;
 mod watch_cursor;
 mod ws_tunnel;
 
-use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
 use openshell_core::telemetry::TelemetryComputeDriver;
 use openshell_core::{Config, Error, ObjectLabels, Result};
@@ -73,9 +80,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
-
-#[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Serializes tests that assert on captured spans, which share one exporter.
 #[cfg(test)]
@@ -237,6 +241,7 @@ fn spawn_gateway_extension_token_refresh(
         }
     });
 }
+pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
@@ -285,12 +290,6 @@ pub struct ServerState {
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 
-    /// Serializes settings mutations (global and sandbox) to prevent
-    /// read-modify-write races. Held for the duration of any setting
-    /// set/delete operation, including the precedence check on sandbox
-    /// mutations that reads global state.
-    pub settings_mutex: tokio::sync::Mutex<()>,
-
     /// Registry of active supervisor sessions and pending relay channels.
     ///
     /// Stored as `Arc` so compiled compute drivers can be constructed before
@@ -301,6 +300,8 @@ pub struct ServerState {
     /// Set once graceful gateway shutdown begins so stream handlers can
     /// distinguish expected transport closes from runtime failures.
     pub(crate) gateway_shutting_down: AtomicBool,
+    /// Per-session delivery tasks for supervisor configuration.
+    pub(crate) config_delivery: config_delivery::ConfigDelivery,
 
     /// Stable identity for this gateway process.
     pub replica_id: String,
@@ -315,6 +316,15 @@ pub struct ServerState {
     /// Idle HTTP/1 upstreams to sandbox services, so routed requests reuse a
     /// relay instead of opening one per request.
     pub service_upstreams: Arc<service_routing::ServiceUpstreamPool>,
+
+    /// Latest placement ring, refreshed from live gateway membership. Decides
+    /// which replica *should* own a sandbox; the owner record in the store
+    /// remains authoritative for which one does.
+    pub gateway_ring: Arc<std::sync::RwLock<gateway_ring::GatewayRing>>,
+
+    /// Peer endpoints of live replicas, keyed by replica ID. Refreshed
+    /// alongside `gateway_ring` so a redirect can name a dialable address.
+    pub gateway_peers: Arc<std::sync::RwLock<HashMap<String, String>>>,
 
     /// Validated built-in and operator-registered supervisor middleware.
     pub middleware_registry: Arc<MiddlewareRegistry>,
@@ -337,6 +347,9 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Immutable public reflection index and its per-query rate limiter.
+    pub(crate) reflection_service: reflection::GatewayReflectionServer,
 
     /// Per-sandbox bound on extension credential minting, which resolves the
     /// caller's effective policy on every request.
@@ -412,12 +425,17 @@ impl ServerState {
         credentials: credentials::CredentialRuntime,
     ) -> Self {
         let replica_id = compute::lease::replica_id();
+        compute.configure_ssh_identities(credentials.clone());
         let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
+        let reflection_service = reflection::build_gateway_reflection_service(&config)
+            .expect("compiled public gateway descriptors must be valid");
         let admin_role = config
             .oidc
             .as_ref()
             .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let config_delivery =
+            config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
             config,
             store,
@@ -429,13 +447,15 @@ impl ServerState {
             telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
-            settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             gateway_shutting_down: AtomicBool::new(false),
+            config_delivery,
             replica_id,
             peer_endpoint,
             peer_routes: Arc::new(supervisor_session::PeerRouteCache::default()),
             service_upstreams: Arc::new(service_routing::ServiceUpstreamPool::default()),
+            gateway_ring: Arc::new(std::sync::RwLock::new(gateway_ring::GatewayRing::default())),
+            gateway_peers: Arc::new(std::sync::RwLock::new(HashMap::new())),
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
@@ -444,6 +464,7 @@ impl ServerState {
             compute_driver_authenticator: None,
             peer_authenticator: None,
             grpc_rate_limiter,
+            reflection_service,
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
@@ -534,59 +555,16 @@ pub(crate) async fn run_server(
     // startup Describe calls can authenticate with gateway-caller tokens.
     let (extension_jwt_issuer, sandbox_session_jwt_authority) =
         if let Some(ref jwt) = config.gateway_jwt {
-            let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT signing key from {}: {e}",
-                    jwt.signing_key_path.display()
-                ))
-            })?;
-            let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
-                Error::config(format!(
-                    "failed to read sandbox JWT public key from {}: {e}",
-                    jwt.public_key_path.display()
-                ))
-            })?;
-            let kid = std::fs::read_to_string(&jwt.kid_path)
-                .map_err(|e| {
-                    Error::config(format!(
-                        "failed to read sandbox JWT kid from {}: {e}",
-                        jwt.kid_path.display()
-                    ))
-                })?
-                .trim()
-                .to_string();
-            if kid.is_empty() {
-                return Err(Error::config(format!(
-                    "sandbox JWT kid file {} is empty",
-                    jwt.kid_path.display()
-                )));
-            }
-            let issuer = Arc::new(
-                auth::sandbox_jwt::ExtensionJwtIssuer::from_pem(
-                    &signing_pem,
-                    &public_pem,
-                    kid.clone(),
-                    &jwt.gateway_id,
-                    jwt.token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
-            let session_authority = Arc::new(
-                auth::sandbox_jwt::SandboxSessionJwtAuthority::from_pem(
-                    &signing_pem,
-                    &public_pem,
-                    kid,
-                    &jwt.gateway_id,
-                    jwt.sandbox_token_ttl(),
-                )
-                .map_err(Error::config)?,
-            );
+            let authorities = auth::launch_signing::load(jwt)?;
             info!(
                 gateway_id = %jwt.gateway_id,
                 ttl_secs = jwt.ttl_secs.map(std::num::NonZeroU64::get),
                 "gateway-minted sandbox JWT enabled"
             );
-            (Some(issuer), Some(session_authority))
+            (
+                Some(authorities.extension),
+                Some(authorities.sandbox_session),
+            )
         } else {
             (None, None)
         };
@@ -637,7 +615,14 @@ pub(crate) async fn run_server(
         .map_err(|error| Error::config(format!("middleware registration failed: {error}")))?,
     );
 
-    let store = Arc::new(Store::connect(database_url).await?);
+    let store = Arc::new(
+        Store::connect_with_pool_sizes(
+            database_url,
+            config.database_max_connections,
+            config.database_lock_max_connections,
+        )
+        .await?,
+    );
     let credentials = credentials::CredentialRuntime::from_config_file_with_store(
         &config,
         config_file.as_ref(),
@@ -686,6 +671,11 @@ pub(crate) async fn run_server(
         shutdown_rx.clone(),
     )
     .await?;
+    compute.configure_supervisor_ocsf_headers(otel_tracing::supervisor_ocsf_headers(
+        config_file
+            .as_ref()
+            .and_then(|file| file.openshell.gateway.otlp.as_ref()),
+    ));
     let gateway_interceptors = if let Some(issuer) = extension_jwt_issuer.as_ref() {
         let mut slots = BTreeMap::new();
         for interceptor in &config.gateway_interceptors {
@@ -711,9 +701,13 @@ pub(crate) async fn run_server(
         openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone()).await
     }
     .map_err(|e| Error::config(format!("gateway interceptor initialization failed: {e}")))?;
+    // Push delivery needs the refresh to notice catalog changes, so only push
+    // mode serves interceptor profiles from a cached snapshot.
     let provider_profile_sources = provider_profile_sources::ProviderProfileSources::from_config(
         &config.provider_profile_sources,
         gateway_interceptors.as_ref(),
+        (config.config_delivery_mode == openshell_core::config::ConfigDeliveryMode::Push)
+            .then_some(provider_profile_sources::PROVIDER_PROFILE_SOURCE_REFRESH_INTERVAL),
     )
     .map_err(|err| {
         Error::config(format!(
@@ -724,6 +718,8 @@ pub(crate) async fn run_server(
         sources = ?provider_profile_sources.source_ids(),
         "provider profile sources configured"
     );
+    // Builds read cached interceptor snapshots, so fetch them before serving.
+    provider_profile_sources.refresh_cached(&store).await;
     let mut state = ServerState::new_with_credentials(
         config.clone(),
         store.clone(),
@@ -843,6 +839,25 @@ pub(crate) async fn run_server(
 
     let state = Arc::new(state);
 
+    // Install the recorder before the endpoint-status startup reconciliation so
+    // the lock waits and timeouts recorded there are exported. Its listener
+    // binds with the others.
+    let metrics_endpoint = config
+        .metrics_bind_address
+        .map(|metrics_bind_address| {
+            gateway_metrics::install_global_recorder(
+                supervisor_session::RELAY_CAPACITY,
+                store.mutation_lock_connections(),
+            )
+            .map(|prometheus_handle| (metrics_bind_address, prometheus_handle))
+        })
+        .transpose()
+        .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+
+    grpc::policy::backfill_legacy_policy_history(&state)
+        .await
+        .map_err(|error| Error::execution(error.to_string()))?;
+
     // Reconcile local-driver running intent before watchers spawn so their
     // first snapshots observe the post-start backend state. Explicitly stopped
     // sandboxes remain stopped.
@@ -891,10 +906,7 @@ pub(crate) async fn run_server(
     }
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
-    if let Some(metrics_bind_address) = config.metrics_bind_address {
-        let prometheus_handle = PrometheusBuilder::new()
-            .install_recorder()
-            .map_err(|e| Error::config(format!("failed to install metrics recorder: {e}")))?;
+    if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
         let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
             Error::transport(format!(
                 "failed to bind metrics port {metrics_bind_address}: {e}",
@@ -949,9 +961,11 @@ pub(crate) async fn run_server(
 
     // Deadlines must run while restored supervisors wait for policy repair.
     let (startup_tx, startup_rx) = watch::channel(false);
-    state
-        .compute
-        .spawn_watchers(shutdown_rx.clone(), startup_rx);
+    state.compute.spawn_watchers(
+        shutdown_rx.clone(),
+        startup_rx,
+        state.sandbox_session_jwt_authority.clone(),
+    );
 
     // Serve the gateway before reconciling persisted sandboxes so restored
     // supervisors can fetch policy and register their sessions.
@@ -966,6 +980,7 @@ pub(crate) async fn run_server(
                         return Ok(Vec::new());
                     }
                     let authentication = grpc::mint_persisted_authentication(&state, &sandbox)
+                        .await
                         .map_err(|error| error.to_string())?;
                     serde_json::to_vec(&authentication)
                         .map_err(|error| format!("encode launch authentication: {error}"))
@@ -990,8 +1005,14 @@ pub(crate) async fn run_server(
             shutdown_rx.clone(),
         );
     }
+    let membership_worker = gateway_members::spawn_membership_worker(
+        state.clone(),
+        gateway_members::MEMBER_REFRESH_INTERVAL,
+        shutdown_rx.clone(),
+    );
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_hours(1));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_profile_sources::spawn_refresh(state.clone());
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_mins(1));
 
     shutdown_signal().await;
@@ -1005,11 +1026,20 @@ pub(crate) async fn run_server(
     }
 
     let compute_cleanup = state.compute.cleanup_on_shutdown().await;
+    // Closing sessions redirect their supervisors through the ring. Let the
+    // membership worker finish pointing it at the remaining replicas first.
+    if let Some(worker) = membership_worker
+        && tokio::time::timeout(gateway_members::SHUTDOWN_MEMBERSHIP_TIMEOUT, worker)
+            .await
+            .is_err()
+    {
+        warn!("Gateway membership worker did not finish leaving the ring before session shutdown");
+    }
     // A stopped supervisor may still have a detached task deleting its owner
     // record. Drain it even when compute cleanup failed before exiting Tokio.
     let session_cleanup = state
         .supervisor_sessions
-        .shutdown(Duration::from_secs(10))
+        .shutdown(supervisor_session::SUPERVISOR_SESSION_SHUTDOWN_TIMEOUT)
         .await;
     if let Err(err) = &session_cleanup {
         warn!(error = %err, "Gateway supervisor session cleanup incomplete");
@@ -1161,8 +1191,15 @@ fn spawn_gateway_connection(
                     match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
+                            let certificate_sha256 =
+                                multiplex::extract_peer_certificate_sha256(&tls_stream);
                             if let Err(e) = service
-                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .serve_with_verified_certificate(
+                                    tls_stream,
+                                    peer_identity,
+                                    certificate_sha256,
+                                    ConnectionSource::Peer(addr),
+                                )
                                 .await
                             {
                                 if is_benign_connection_close(e.as_ref()) {
@@ -1188,7 +1225,7 @@ fn spawn_gateway_connection(
         });
     } else {
         tokio::spawn(async move {
-            if let Err(e) = service.serve(stream).await {
+            if let Err(e) = service.serve(stream, ConnectionSource::Peer(addr)).await {
                 if is_benign_connection_close(e.as_ref()) {
                     debug!(error = %e, client = %addr, "Connection closed");
                 } else {
@@ -1247,6 +1284,19 @@ pub enum ComputeDriverInstance {
 /// Factory for a compute driver linked into a gateway binary.
 #[async_trait::async_trait]
 pub trait ComputeDriverFactory: Send + Sync {
+    /// Resolve the driver's external-resource admission contract. Defaults to
+    /// the operator-configured policy, including secure admission defaults.
+    /// Drivers without resource-label support may override this explicitly.
+    fn admission_policy(
+        &self,
+        context: ComputeDriverConfigContext<'_>,
+    ) -> Result<openshell_core::resource_admission::DriverAdmissionConfig> {
+        compute::driver_config::admission_config_from_context(
+            context.driver_startup,
+            context.driver_name,
+        )
+    }
+
     /// Validate selected-driver configuration without starting a driver,
     /// connecting a transport, or modifying runtime state.
     ///
@@ -1264,6 +1314,21 @@ pub trait ComputeDriverFactory: Send + Sync {
         false
     }
 
+    /// Check locally installed host tools after configuration validation.
+    ///
+    /// Only the explicit `config preflight` command calls this hook. Probes
+    /// must bound time and output, clean up on cancellation, and avoid driver
+    /// startup, transport connections, images, and runtime state. Return
+    /// operator-readable results including the selected executable paths.
+    /// The process inherits the gateway's account and environment. When
+    /// `cancellation` becomes true, finish process cleanup before returning.
+    async fn preflight_host_tools(
+        &self,
+        _cancellation: watch::Receiver<bool>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     async fn build(&self, context: ComputeDriverBuildContext<'_>) -> Result<ComputeDriverInstance>;
 }
 
@@ -1275,8 +1340,6 @@ pub struct ComputeDriverRegistration {
     detect: Option<fn() -> bool>,
     factory: Arc<dyn ComputeDriverFactory>,
     telemetry_category: TelemetryComputeDriver,
-    local_singleplayer: bool,
-    supports_mtls_user_auth: bool,
     in_process_tracing: Option<openshell_otel::ComputeDriverTracing>,
 }
 
@@ -1307,8 +1370,6 @@ impl ComputeDriverRegistration {
             detect,
             factory: Arc::new(factory),
             telemetry_category: TelemetryComputeDriver::custom(),
-            local_singleplayer: false,
-            supports_mtls_user_auth: true,
             in_process_tracing: None,
         })
     }
@@ -1334,17 +1395,10 @@ impl ComputeDriverRegistration {
         self
     }
 
-    /// Mark a backend whose local deployment should use single-player defaults.
+    /// Compatibility no-op retained for existing factory registrations.
+    /// Gateway mTLS user authentication is independent of compute drivers.
     #[must_use]
-    pub fn with_local_singleplayer(mut self) -> Self {
-        self.local_singleplayer = true;
-        self
-    }
-
-    /// Mark a backend that requires user authentication other than mTLS.
-    #[must_use]
-    pub fn without_mtls_user_auth(mut self) -> Self {
-        self.supports_mtls_user_auth = false;
+    pub fn with_local_singleplayer(self) -> Self {
         self
     }
 
@@ -1356,16 +1410,6 @@ impl ComputeDriverRegistration {
     ) -> Self {
         self.in_process_tracing = Some(tracing);
         self
-    }
-
-    #[must_use]
-    pub(crate) fn is_local_singleplayer(&self) -> bool {
-        self.local_singleplayer
-    }
-
-    #[must_use]
-    pub(crate) fn supports_mtls_user_auth(&self) -> bool {
-        self.supports_mtls_user_auth
     }
 
     #[must_use]
@@ -1600,13 +1644,13 @@ impl ComputeDriverBuildContext<'_> {
         self.config.gateway_tls_enabled()
     }
 
-    /// Gateway client credentials that a local driver may mount into guests.
+    /// Gateway CA certificate that a local driver may provide to supervisors.
     #[must_use]
-    pub fn guest_tls_paths(&self) -> Option<(&Path, &Path, &Path)> {
+    pub fn guest_tls_ca(&self) -> Option<&Path> {
         self.config
             .driver_startup
             .guest_tls
-            .map(compute::driver_config::GuestTlsPaths::as_paths)
+            .map(compute::driver_config::GuestTlsPaths::as_path)
     }
 
     /// Deserialize the selected driver's merged TOML table.
@@ -1644,6 +1688,17 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
     shutdown_rx: watch::Receiver<bool>,
 ) -> Result<ComputeRuntime> {
+    let isolation_backend = driver_startup
+        .file
+        .map(|file| file.isolation_backend(selection.name()))
+        .transpose()
+        .map_err(Error::config)?
+        .flatten();
+    if isolation_backend.is_some() && config.gateway_jwt.is_none() {
+        return Err(Error::config(
+            "external isolation backends require gateway launch signing; configure openshell.gateway.gateway_jwt or the package-managed local signing keys",
+        ));
+    }
     let driver = validate_compute_driver_config(
         registry,
         selection.name(),
@@ -1654,8 +1709,20 @@ async fn build_compute_runtime(
         false,
     )?;
     let telemetry_compute_driver = driver.telemetry_compute_driver(registry);
-    let admission =
-        compute::driver_config::admission_config_from_context(driver_startup, driver.name())?;
+    let admission = match &driver {
+        ConfiguredComputeDriver::Registered(registration) => registration
+            .factory
+            .admission_policy(ComputeDriverConfigContext {
+                driver_name: &registration.name,
+                gateway_name: &config.name,
+                gateway_bind_address: config.bind_address,
+                gateway_log_level: &config.log_level,
+                driver_startup,
+            })?,
+        ConfiguredComputeDriver::Remote { name } => {
+            compute::driver_config::admission_config_from_context(driver_startup, name)?
+        }
+    };
     info!(driver = %driver.name(), "Using compute driver");
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
@@ -1727,7 +1794,11 @@ async fn build_compute_runtime(
     };
 
     let runtime = runtime
-        .with_admission_policy(admission)
+        .with_isolation_backend(isolation_backend)
+        .and_then(|runtime| runtime.with_admission_policy(admission))
+        .and_then(|runtime| {
+            runtime.with_image_preparation_timeout(config.image_preparation_timeout_seconds)
+        })
         .map_err(Error::config)?;
     Ok(runtime.with_telemetry_compute_driver(telemetry_compute_driver))
 }
@@ -1913,6 +1984,9 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::tls_test_utils::generate_test_certs_with_ca;
+    use axum::body::Body;
+    use http::{Request, StatusCode};
+    use tower::ServiceExt;
 
     fn tls_enabled_config() -> Config {
         Config::new(Some(openshell_core::TlsConfig {
@@ -2117,6 +2191,29 @@ mod tests {
     #[derive(Clone, Copy)]
     struct TestComputeDriverFactory;
 
+    #[test]
+    fn factory_admission_defaults_remain_enabled() {
+        use super::ComputeDriverFactory as _;
+        let endpoint_overrides = std::collections::BTreeMap::new();
+        let context = super::ComputeDriverConfigContext {
+            driver_name: "custom",
+            gateway_name: "test",
+            gateway_bind_address: "127.0.0.1:8080".parse().unwrap(),
+            gateway_log_level: "info",
+            driver_startup: crate::compute::driver_config::DriverStartupContext {
+                file: None,
+                guest_tls: None,
+                gateway_port: 8080,
+                gateway_tls_enabled: false,
+                endpoint_overrides: &endpoint_overrides,
+            },
+        };
+        let policy = TestComputeDriverFactory.admission_policy(context).unwrap();
+        assert!(policy.resource_admission.enabled);
+        assert_eq!(policy.resource_admission.required_labels.len(), 2);
+        assert!(!policy.allow_driver_config);
+    }
+
     // Omitting validate_config exercises source compatibility for out-of-tree
     // factories written before package preflight introduced that hook.
     #[async_trait::async_trait]
@@ -2174,6 +2271,27 @@ mod tests {
         ))
     }
 
+    #[tokio::test]
+    async fn websocket_tunnel_is_mounted_only_when_enabled() {
+        let state = test_state("127.0.0.1:17670".parse().unwrap(), true).await;
+        let response = super::http_router(state.clone())
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let mut enabled = state;
+        Arc::get_mut(&mut enabled)
+            .unwrap()
+            .config
+            .enable_websocket_tunnel = true;
+        let response = super::http_router(enabled)
+            .oneshot(Request::get("/_ws_tunnel").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     async fn start_tls_gateway_listener(
         bind_addr: &str,
         enable_loopback_service_http: bool,
@@ -2202,6 +2320,68 @@ mod tests {
             shutdown_rx,
         ));
         (listen_addr, shutdown_tx, handle, tls_dir)
+    }
+
+    async fn start_plaintext_gateway_listener()
+    -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test listener");
+        let listen_addr = listener.local_addr().expect("failed to read local addr");
+        let state = test_state(listen_addr, false).await;
+        let service = MultiplexService::new(state);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_gateway_listener(
+            BoundGatewayListener {
+                listener,
+                address: listen_addr,
+            },
+            service,
+            None,
+            false,
+            shutdown_rx,
+        ));
+        (listen_addr, shutdown_tx, handle)
+    }
+
+    #[tokio::test]
+    async fn production_gateway_listener_serves_reflection() {
+        use tonic_reflection::pb::v1::{
+            ServerReflectionRequest, server_reflection_client::ServerReflectionClient,
+            server_reflection_request::MessageRequest, server_reflection_response::MessageResponse,
+        };
+
+        let (addr, shutdown, handle) = start_plaintext_gateway_listener().await;
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = ServerReflectionClient::new(channel);
+        let request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let mut responses = client
+            .server_reflection_info(tokio_stream::iter([request]))
+            .await
+            .unwrap()
+            .into_inner();
+        let response = responses.message().await.unwrap().unwrap();
+        let Some(MessageResponse::ListServicesResponse(services)) = response.message_response
+        else {
+            panic!("expected a reflection list-services response");
+        };
+        assert_eq!(
+            services
+                .service
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>(),
+            ["openshell.v1.OpenShell"]
+        );
+
+        stop_listener(shutdown, handle).await;
     }
 
     async fn send_plain_http(addr: SocketAddr, request: String) -> String {
@@ -2611,3 +2791,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

@@ -521,7 +521,7 @@ pub async fn apply_middleware_chain_with_request_id<C: AsyncRead + AsyncWrite + 
         req,
         client,
         ctx,
-        "https",
+        ctx.request_scheme(),
         chain,
         runner,
         generation_guard,
@@ -1213,6 +1213,7 @@ mod tests {
             product_version: "0".into(),
             proxy_ip: [127, 0, 0, 1].into(),
             proxy_port: 3128,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
         };
 
         let eval = L7EvalContext {

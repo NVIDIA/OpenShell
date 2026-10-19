@@ -53,6 +53,13 @@ pub struct TestOpenShell;
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
@@ -325,6 +332,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented(
             "create_provider not implemented in test",
         ))
+    }
+
+    async fn get_provider_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        Err(Status::unimplemented("not used by this mock"))
     }
 
     async fn get_provider(

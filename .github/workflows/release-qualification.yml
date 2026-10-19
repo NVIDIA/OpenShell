@@ -1,0 +1,268 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Qualification
+
+on:
+  workflow_call:
+    inputs:
+      release-tag:
+        description: Release tag identifying the candidate
+        required: true
+        type: string
+      source-sha:
+        description: Source commit of the candidate artifacts in the calling run
+        required: true
+        type: string
+      is-prerelease:
+        description: Whether the candidate is a pre-release
+        required: true
+        type: boolean
+    secrets:
+      CODEX_SECURITY_API_KEY:
+        required: true
+      CACHIX_AUTH_TOKEN:
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release-tag }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  security:
+    name: Security Scan
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+      security-events: write
+    uses: ./.github/workflows/security-scan.yml
+    with:
+      candidate_ref: ${{ inputs.release-tag }}
+      fail-on-static-findings: false
+      images: |
+        ghcr.io/nvidia/openshell/gateway:${{ inputs.source-sha }}
+        ghcr.io/nvidia/openshell/sandbox:${{ inputs.source-sha }}
+        ghcr.io/nvidia/openshell/supervisor:${{ inputs.source-sha }}
+    secrets:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+  prepare-integration:
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/prepare-integration-inputs.yml
+    with:
+      source-sha: ${{ inputs.source-sha }}
+      deb-artifact-name: deb-linux-amd64
+      rpm-artifact-name: rpm-linux-x86_64
+
+  conformance-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: conformance
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
+        ]
+
+  feature-specific-integration:
+    needs: prepare-integration
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/integration-runner.yml
+    with:
+      category: feature-specific
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+      test-matrix: >-
+        [
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
+        ]
+
+  docker-e2e:
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-docker-test.yml
+    with:
+      image-tag: ${{ inputs.source-sha }}
+      checkout-ref: ${{ inputs.source-sha }}
+      runner: linux-arm64-cpu8
+
+  vm-e2e:
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-vm-test.yml
+    with:
+      checkout-ref: ${{ inputs.source-sha }}
+
+  protobuf-compatibility:
+    name: Protobuf Compatibility
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.source-sha }}
+
+      - uses: ./.github/actions/check-protobuf-compatibility
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+
+  compatibility-review:
+    name: Compatibility Review (advisory)
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/codex-compatibility.yml
+    with:
+      candidate_ref: ${{ inputs.release-tag }}
+      source_sha: ${{ inputs.source-sha }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
+  qualification-result:
+    name: Release Qualification
+    if: always()
+    needs:
+      - protobuf-compatibility
+      - security
+      - conformance-integration
+      - feature-specific-integration
+      - docker-e2e
+      - vm-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source-sha }}
+
+      - name: Record qualification result
+        id: summary
+        env:
+          CONFORMANCE_RESULT: ${{ needs.conformance-integration.result }}
+          DOCKER_E2E_RESULT: ${{ needs.docker-e2e.result }}
+          FEATURE_INTEGRATION_RESULT: ${{ needs.feature-specific-integration.result }}
+          IS_PRERELEASE: ${{ inputs.is-prerelease }}
+          PROTO_COMPATIBILITY_RESULT: ${{ needs.protobuf-compatibility.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          VM_E2E_RESULT: ${{ needs.vm-e2e.result }}
+        run: |
+          set -euo pipefail
+          current_profile_passed=$(tasks/scripts/generate-qualification-summary.sh qualification-summary.json)
+          artifact_name="qualification-${RELEASE_TAG}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          run_url=$(jq -r '.run.url' qualification-summary.json)
+
+          {
+            echo "artifact-name=${artifact_name}"
+            echo "current-profile-passed=${current_profile_passed}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "## Release qualification"
+            echo
+            echo "- Candidate: \`${RELEASE_TAG}\` (\`${SOURCE_SHA}\`)"
+            echo "- Current qualification profile passed: **${current_profile_passed}**"
+            echo "- RFC-0014 qualification coverage complete: **false**"
+            echo "- Run: [${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}](${run_url})"
+            echo
+            echo "| Suite | Result |"
+            echo "| --- | --- |"
+            echo "| Protobuf API compatibility | ${PROTO_COMPATIBILITY_RESULT} |"
+            echo "| Security | ${SECURITY_RESULT} |"
+            echo "| Conformance integration | ${CONFORMANCE_RESULT} |"
+            echo "| Feature integration | ${FEATURE_INTEGRATION_RESULT} |"
+            echo "| Docker E2E | ${DOCKER_E2E_RESULT} |"
+            echo "| VM E2E | ${VM_E2E_RESULT} |"
+            echo
+            echo "Advisory compatibility findings do not affect the qualification result."
+            echo "See the Compatibility Review job and compatibility-review-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT} artifact in [this run](${run_url})."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload qualification result
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ steps.summary.outputs.artifact-name }}
+          path: qualification-summary.json
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Install ORAS
+        id: oras
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: oras-project/setup-oras@1d808f7d7f6995cc68b7bf507bfe5c5446e1dc9d # v2.0.0
+
+      - name: Log in to GHCR
+        id: ghcr
+        if: steps.oras.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish qualification summary
+        id: oci
+        if: steps.ghcr.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          ref="ghcr.io/nvidia/openshell/qualification:${VERSION}-run-${GITHUB_RUN_ID}-attempt-${GITHUB_RUN_ATTEMPT}"
+          oras push "${ref}" \
+            --artifact-type application/vnd.nvidia.openshell.qualification.v1 \
+            --annotation "org.opencontainers.image.revision=${SOURCE_SHA}" \
+            --annotation "org.opencontainers.image.version=${VERSION}" \
+            qualification-summary.json:application/vnd.nvidia.openshell.qualification.summary.v1+json
+
+          echo "Published qualification summary to \`${ref}\`." >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Warn if OCI summary publication failed
+        if: ${{ !cancelled() && (steps.oras.outcome == 'failure' || steps.ghcr.outcome == 'failure' || steps.oci.outcome == 'failure') }}
+        run: |
+          echo "::warning::Could not publish the qualification summary to OCI. The summary remains available in this run's Actions artifacts."
+
+      - name: Require current qualification profile
+        if: steps.summary.outputs.current-profile-passed != 'true'
+        run: |
+          echo "Release ${RELEASE_TAG} did not pass the current release-tag-v1 qualification profile." >&2
+          exit 1

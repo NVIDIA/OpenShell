@@ -12,7 +12,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -29,33 +29,35 @@ struct DockerOuterFenceEvidence<'a> {
 }
 
 impl DockerOuterFenceEvidence<'_> {
-    fn project(&self, generation: &str) -> Result<OuterFenceGuarantees, BackendError> {
-        if self.container_id.is_empty() {
+    fn project(&self, generation: &str) -> Result<ProvisioningEvidence, BackendError> {
+        if self.container_id.is_empty()
+            || self.network_mode != "none"
+            || !self.unexpected_networks.is_empty()
+        {
             return Err(BackendError::Descriptor(
-                "Docker outer fence evidence is incomplete".to_string(),
+                "Docker provisioning evidence is incomplete".to_string(),
             ));
-        }
-        let mut established = Vec::new();
-        if self.network_mode == "none" {
-            // With no container network namespace attachment, workload egress
-            // remains denied both after revocation and if the supervisor exits.
-            established.extend([
-                OuterFenceGuarantee::DefaultDenyEgress,
-                OuterFenceGuarantee::RevocationVerified,
-                OuterFenceGuarantee::ControllerLossFailsClosed,
-            ]);
-        }
-        if self.unexpected_networks.is_empty() {
-            established.push(OuterFenceGuarantee::NoUnmanagedEgressPath);
         }
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode Docker outer fence evidence: {error}"))
         })?;
-        let projection =
-            OuterFenceGuarantees::from_enforcement_evidence(generation, established, &encoded)?;
+        let projection = ProvisioningEvidence::from_enforcement_evidence(generation, &encoded)?;
         projection.validate(generation)?;
         Ok(projection)
     }
+}
+
+/// Bind the validated container fence to the generation being launched.
+pub fn provisioning_evidence(
+    container_id: &str,
+    generation: &str,
+) -> Result<ProvisioningEvidence, BackendError> {
+    DockerOuterFenceEvidence {
+        container_id,
+        network_mode: "none",
+        unexpected_networks: &[],
+    }
+    .project(generation)
 }
 
 /// Driver-owned inputs that bind one Docker container to one boundary.
@@ -96,13 +98,8 @@ impl DockerBoundarySpec {
         if self.gpu_requested {
             resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
         }
-        let unexpected_networks = Vec::new();
-        let outer_fence = DockerOuterFenceEvidence {
-            container_id: &resource_claims["docker.container_id"],
-            network_mode: "none",
-            unexpected_networks: &unexpected_networks,
-        }
-        .project(&self.generation)?;
+        let provisioning_evidence =
+            provisioning_evidence(&resource_claims["docker.container_id"], &self.generation)?;
         Ok(DockerBoundaryProvisioning {
             boundary_config: BoundaryConfig {
                 boundary_id: self.boundary_id.clone(),
@@ -119,7 +116,7 @@ impl DockerBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: self.workload_identity.clone(),
-                outer_fence: outer_fence.clone(),
+                provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -133,7 +130,7 @@ impl DockerBoundarySpec {
                 tls: self.supervisor_tls,
                 host_gateway_ip: self.host_gateway_ip,
                 resource_claims,
-                outer_fence,
+                provisioning_evidence,
             },
         })
     }
@@ -224,13 +221,13 @@ mod tests {
             "true"
         );
         assert_eq!(
-            provisioned.boundary_config.outer_fence,
-            provisioned.runtime_descriptor.outer_fence
+            provisioned.boundary_config.provisioning_evidence,
+            provisioned.runtime_descriptor.provisioning_evidence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .outer_fence
+                .provisioning_evidence
                 .validate("generation-1")
                 .is_ok()
         );

@@ -14,8 +14,6 @@
 //! Generated code references `crate::auth::method_authz::{MethodAuth,
 //! AuthMode, Role}`, so the macro is only intended for use inside the
 //! `openshell-server` crate.
-//!
-//! See `architecture/plans/scope-annotations.md` for the design.
 
 use proc_macro::TokenStream;
 use quote::quote;

@@ -28,6 +28,13 @@ prompt templates, provider profiles, policies, and references to skills or
 subagents. They should not contain `harnesses/codex`, `harnesses/opencode`, or
 similar runtime code.
 
+Sandbox names supplied through `--name`, `GATOR_SANDBOX_NAME`, or generated
+from the manifest prefix must be DNS-1123 labels of at most 19 characters.
+The launcher validates them before building images or changing gateway state.
+For example, use `gtr-pr-4633-watch` for a supervised Gator watcher. Generated
+names append a hyphen and a 14-digit timestamp, leaving four characters for
+the manifest's name prefix.
+
 ## Agent Manifest
 
 Each agent has an `agent.yaml` manifest. The launcher currently reads these

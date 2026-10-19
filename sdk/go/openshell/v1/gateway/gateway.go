@@ -135,7 +135,7 @@ func ListGateways() ([]Info, error) {
 		}
 	}
 
-	sysNames, listErr := listGatewayDirs(systemConfigBase)
+	sysNames, listErr := listGatewayDirs(systemConfigDir())
 	if listErr != nil {
 		return nil, listErr
 	}

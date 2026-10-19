@@ -1,0 +1,491 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gatewayConfig TOML serializer
+templates:
+  - templates/gateway-config.yaml
+release:
+  name: serializer-test
+  namespace: serializer-namespace
+
+tests:
+  - it: gives gatewayConfig precedence over a deprecated proxy alias
+    set:
+      upstreamProxy.url: http://legacy-proxy.example:8080
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          https_proxy: http://schema-v2-proxy.example:8443
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^https_proxy = "http://schema-v2-proxy\.example:8443"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: legacy-proxy
+
+  - it: derives runtime listener ports from chart-owned Service ports
+    set:
+      service.port: 19080
+      service.healthPort: 19081
+      service.metricsPort: 19090
+      gatewayConfig:
+        openshell.gateway:
+          bind_address: 0.0.0.0:8080
+          health_bind_address: 0.0.0.0:8081
+          metrics_bind_address: 0.0.0.0:9090
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^bind_address = "0\.0\.0\.0:19080"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^health_bind_address = "0\.0\.0\.0:19081"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^metrics_bind_address = "0\.0\.0\.0:19090"$'
+
+  - it: aligns runtime namespace and ServiceAccount with chart-owned resources
+    set:
+      server.sandboxNamespace: chart-sandboxes
+      sandboxServiceAccount.create: false
+      sandboxServiceAccount.name: chart-sandbox
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          namespace: unrelated-namespace
+          service_account_name: unrelated-service-account
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^namespace = "chart-sandboxes"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_account_name = "chart-sandbox"$'
+
+  - it: gives gatewayConfig precedence over deprecated image, runtime, and CA aliases
+    set:
+      sandboxRuntime.image.repository: legacy.example/sandbox
+      sandboxRuntime.image.tag: legacy
+      supervisor.image.repository: legacy.example/supervisor
+      supervisor.image.tag: legacy
+      supervisor.sandboxRuntime.boundaryPort: 6600
+      upstreamProxy.caBundle.configMapName: legacy-proxy-ca
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          sandbox_runtime_image: schema.example/sandbox:2
+          supervisor_image: schema.example/supervisor:2
+          sandbox_runtime:
+            boundary_port: 7700
+          proxy_ca_bundle: /schema-v2/ca.crt
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime_image = "schema\.example/sandbox:2"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^supervisor_image = "schema\.example/supervisor:2"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^proxy_ca_bundle = "/schema-v2/ca\.crt"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 7700 \}$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: legacy\.example|6600|proxy-ca
+
+  - it: does not serialize the removed NetworkPolicy acknowledgement alias
+    set:
+      supervisor.sandboxRuntime.networkPolicyEnforced: true
+      supervisor.sandboxRuntime.boundaryPort: 6600
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime = \{ boundary_port = 6600 \}$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: network_policy_enforced
+
+  - it: translates a deprecated workspace mode when schema-v2 keeps its default
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^workspace_mode = "managed"$'
+
+  - it: gives an explicit schema-v2 workspace mode precedence over the deprecated alias
+    set:
+      server.drivers.kubernetes.workspaceMode: managed
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          workspace_mode: shared
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^workspace_mode = "shared"$'
+
+  - it: gives explicit schema-v2 gateway settings precedence over legacy aliases
+    set:
+      server.name: legacy-gateway
+      server.enableWebsocketTunnel: false
+      gatewayConfig:
+        openshell.gateway:
+          name: schema-v2-gateway
+          enable_websocket_tunnel: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^name = "schema-v2-gateway"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^enable_websocket_tunnel = true$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: legacy-gateway
+
+  - it: translates legacy OIDC roles and scopes into schema-v2 field names
+    set:
+      server.oidc.issuer: https://issuer.example/realms/openshell
+      server.oidc.audience: openshell-cli
+      server.oidc.rolesClaim: custom.roles
+      server.oidc.adminRole: platform-admin
+      server.oidc.userRole: platform-user
+      server.oidc.scopesClaim: permissions
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?admin_role = "platform-admin"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?roles_claim = "custom\.roles"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?scopes_claim = "permissions"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.oidc\].*?user_role = "platform-user"'
+
+  - it: fills absent schema-v2 OIDC fields from legacy values without overwriting schema-v2 fields
+    set:
+      server.oidc.issuer: https://legacy.example/realms/openshell
+      server.oidc.rolesClaim: legacy.roles
+      server.oidc.adminRole: legacy-admin
+      server.oidc.userRole: legacy-user
+      server.oidc.scopesClaim: legacy.scopes
+      gatewayConfig:
+        openshell.gateway.oidc:
+          issuer: https://schema-v2.example/realms/openshell
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^issuer = "https://schema-v2\.example/realms/openshell"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^roles_claim = "legacy\.roles"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role = "legacy-admin"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role = "legacy-user"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^scopes_claim = "legacy\.scopes"$'
+
+  - it: fills an absent schema-v2 OTLP endpoint from legacy values
+    set:
+      server.otlp.endpoint: https://legacy-otlp.example:4317
+      server.otlp.serviceName: legacy-service
+      gatewayConfig:
+        openshell.gateway.otlp:
+          service_name: schema-v2-service
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^endpoint = "https://legacy-otlp\.example:4317"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^service_name = "schema-v2-service"$'
+
+  - it: fills an absent schema-v2 OCSF path from legacy values
+    set:
+      server.ocsfLog.enabled: true
+      server.ocsfLog.path: /var/log/openshell/legacy.jsonl
+      gatewayConfig:
+        openshell.gateway.ocsf_log:
+          rotation: never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^path = "/var/log/openshell/legacy\.jsonl"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^rotation = "never"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^max_files ='
+
+  - it: omits empty optional OIDC role fields translated from legacy values
+    set:
+      server.oidc.issuer: https://issuer.example/realms/openshell
+      server.oidc.audience: openshell-cli
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^issuer = "https://issuer\.example/realms/openshell"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^roles_claim ='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role ='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role ='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^scopes_claim ='
+
+  - it: preserves explicit empty schema-v2 OIDC role fields
+    set:
+      server.oidc.issuer: https://legacy.example/realms/openshell
+      server.oidc.adminRole: legacy-admin
+      gatewayConfig:
+        openshell.gateway.oidc:
+          issuer: https://schema-v2.example/realms/openshell
+          roles_claim: ""
+          admin_role: ""
+          user_role: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^issuer = "https://schema-v2\.example/realms/openshell"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^roles_claim = ""$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^admin_role = ""$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^user_role = ""$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: legacy-admin
+
+  - it: translates legacy resource admission labels into snake_case
+    set:
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/approved: "true"
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^required_labels = \{ "platform\.example\.com/approved" = "true" \}$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/approved" = "true"'
+
+  - it: gives schema-v2 resource admission precedence over the legacy alias
+    set:
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/source: legacy
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          resource_admission:
+            required_labels:
+              platform.example.com/source: schema-v2
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/source" = "schema-v2"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/source" = "legacy"'
+
+  - it: preserves the dotted schema-v2 resource admission table over legacy defaults
+    set:
+      server.drivers.kubernetes.resourceAdmission.enabled: true
+      server.drivers.kubernetes.resourceAdmission.requiredLabels:
+        platform.example.com/source: legacy
+      gatewayConfig:
+        openshell.drivers.kubernetes.resource_admission:
+          enabled: false
+          required_labels:
+            platform.example.com/source: schema-v2
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[openshell\.drivers\.kubernetes\.resource_admission\]\nenabled = false\nrequired_labels = \{ "platform\.example\.com/source" = "schema-v2" \}$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '"platform.example.com/source" = "legacy"'
+
+  - it: leaves the workload image pull policy unset when only the global policy is configured
+    set:
+      global.image.pullPolicy: Always
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^image_pull_policy ='
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^sandbox_runtime_image_pull_policy = "always"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^supervisor_image_pull_policy = "always"$'
+
+  - it: translates an explicit legacy workload image pull policy
+    set:
+      sandbox.image.pullPolicy: Always
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^image_pull_policy = "always"$'
+
+  - it: gives the canonical workload image pull policy precedence over the legacy alias
+    set:
+      sandbox.image.pullPolicy: Always
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          image_pull_policy: never
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^image_pull_policy = "never"$'
+
+  - it: renders all supported YAML shapes with deterministic TOML output
+    set:
+      gatewayConfig:
+        example.config:
+          string_value: plain text
+          boolean_value: true
+          integer_value: 42
+          float_value: 1.5
+          scalar_array:
+            - first
+            - second
+          nested_map:
+            zebra: 2
+            alpha: false
+          map_array:
+            - name: first
+              enabled: true
+            - name: second
+              enabled: false
+          omitted_value: null
+          empty_value: ""
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)^\[example\.config\]\n.*?boolean_value = true\n.*?empty_value = ""\n.*?float_value = 1\.5\n.*?integer_value = 42\n.*?map_array = \[\{ enabled = true, name = "first" \}, \{ enabled = false, name = "second" \}\]\n.*?nested_map = \{ alpha = false, zebra = 2 \}\n.*?scalar_array = \["first", "second"\]\n.*?string_value = "plain text"$'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: omitted_value
+
+  - it: renders top-level lists as ordered TOML arrays of tables
+    set:
+      gatewayConfig:
+        openshell.gateway.interceptors:
+          - name: governance
+            grpc_endpoint: http://governance.ns.svc.cluster.local:18081
+            order: 0
+            failure_policy: fail_closed
+          - name: audit
+            grpc_endpoint: http://audit.ns.svc.cluster.local:18081
+            order: 1
+            failure_policy: fail_open
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)^\[\[openshell\.gateway\.interceptors\]\]\nfailure_policy = "fail_closed"\ngrpc_endpoint = "http://governance\.ns\.svc\.cluster\.local:18081"\nname = "governance"\norder = 0\n\[\[openshell\.gateway\.interceptors\]\]\nfailure_policy = "fail_open"\ngrpc_endpoint = "http://audit\.ns\.svc\.cluster\.local:18081"\nname = "audit"\norder = 1$'
+
+  - it: renders the CI extension lists as separate ordered interceptor and middleware tables
+    values:
+      - ../ci/values-gateway-extensions.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[\[openshell\.gateway\.interceptors\]\]\nallow_insecure_transport = true\nfailure_policy = "fail_closed"\ngrpc_endpoint = "http://governance\.ns\.svc\.cluster\.local:18081"\nname = "governance"\norder = 0\n\[\[openshell\.gateway\.interceptors\]\]\nallow_insecure_transport = true\nfailure_policy = "fail_open"\ngrpc_endpoint = "http://audit\.ns\.svc\.cluster\.local:18081"\nname = "audit"\norder = 1$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^\[\[openshell\.supervisor\.middleware\]\]\nallow_insecure_transport = true\ngrpc_endpoint = "http://content-guard\.ns\.svc\.cluster\.local:18082"\nmax_payload_bytes = 262144\nname = "content-guard"\ntimeout = "500ms"\n\[\[openshell\.supervisor\.middleware\]\]\nallow_insecure_transport = true\ngrpc_endpoint = "http://request-audit\.ns\.svc\.cluster\.local:18082"\nmax_payload_bytes = 262144\nname = "request-audit"\ntimeout = "1s"$'
+
+  - it: rejects non-map entries in a top-level array of tables
+    set:
+      gatewayConfig:
+        example.entries:
+          - valid: true
+          - invalid
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig array-of-tables "example.entries" entry 1 must be a map, got string'
+
+  - it: rejects a nested map that collides with a dotted top-level table
+    set:
+      gatewayConfig:
+        openshell:
+          gateway:
+            log_level: debug
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig defines "openshell.gateway" both as a nested map and a dotted top-level table; use only the dotted top-level key'
+
+  - it: serializes strings literally without evaluating Helm expressions
+    set:
+      gatewayConfig:
+        example:
+          release_template: '{{ .Release.Namespace }}/{{ .Release.Name }}'
+          helm_function: '{{ randAlphaNum 8 }}'
+          lookup_expression: '{{ lookup "v1" "Secret" "default" "example" }}'
+          boolean_value: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^release_template = "\{\{ \.Release\.Namespace \}\}/\{\{ \.Release\.Name \}\}"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^helm_function = "\{\{ randAlphaNum 8 \}\}"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^lookup_expression = "\{\{ lookup \\"v1\\" \\"Secret\\" \\"default\\" \\"example\\" \}\}"$'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^boolean_value = true$'
+
+  - it: quotes non-bare TOML keys safely
+    set:
+      gatewayConfig:
+        example:
+          "field with spaces": value
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?m)^"field with spaces" = "value"$'
+
+  - it: rejects a top-level table that is not a map
+    set:
+      gatewayConfig:
+        example: invalid
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig table "example" must be a map, got string'
+
+  - it: rejects null members in arrays
+    set:
+      gatewayConfig:
+        example:
+          values:
+            - valid
+            - null
+    asserts:
+      - failedTemplate:
+          errorMessage: gatewayConfig arrays cannot contain null values
+
+  - it: rejects table names with empty TOML key segments
+    set:
+      gatewayConfig:
+        "example..config":
+          value: valid
+    asserts:
+      - failedTemplate:
+          errorMessage: 'gatewayConfig table "example..config" contains an empty TOML key segment'

@@ -55,10 +55,11 @@ func (s *mockServiceServer) ExposeService(_ context.Context, req *pb.ExposeServi
 			Metadata: &dm.ObjectMeta{
 				Id: "ep-" + req.GetName(),
 			},
-			Sandbox:    req.GetSandbox(),
-			Name:       req.GetName(),
-			TargetPort: req.GetTargetPort(),
-			Domain:     req.GetDomain(),
+			Sandbox:           req.GetSandbox(),
+			Name:              req.GetName(),
+			TargetPort:        req.GetTargetPort(),
+			Domain:            req.GetDomain(),
+			AuthorizationMode: req.GetAuthorizationMode(),
 		},
 	}
 	if req.GetDomain() {
@@ -150,7 +151,15 @@ func TestServiceExpose(t *testing.T) {
 	client, cleanup := setupServiceTest(t, mock)
 	defer cleanup()
 
-	ep, err := client.Expose(context.Background(), "default", "web-app", "api", 8080, true)
+	ep, err := client.Expose(
+		context.Background(),
+		"default",
+		"web-app",
+		"api",
+		8080,
+		true,
+		ExposeServiceOptions{AuthorizationMode: ServiceAuthorizationModeBearerPassthrough},
+	)
 
 	require.NoError(t, err)
 	require.NotNil(t, ep)
@@ -159,6 +168,7 @@ func TestServiceExpose(t *testing.T) {
 	assert.Equal(t, "api", ep.Name)
 	assert.Equal(t, uint32(8080), ep.TargetPort)
 	assert.True(t, ep.Domain)
+	assert.Equal(t, ServiceAuthorizationModeBearerPassthrough, ep.AuthorizationMode)
 	assert.Equal(t, "https://api.example.com", ep.URL)
 }
 
