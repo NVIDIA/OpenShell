@@ -3,7 +3,7 @@
 
 //! Builder for HTTP Activity [4002] events.
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{HttpActivityEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 
 /// Builder for HTTP Activity [4002] events.
 pub struct HttpActivityBuilder<'a, Context = MissingHttpContext> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -56,9 +56,9 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     /// HttpActivityBuilder::new(&ctx).build();
     /// ```
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Unknown,
             action: None,
             disposition: None,

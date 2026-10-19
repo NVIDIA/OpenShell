@@ -3,7 +3,7 @@
 
 //! Builder for Network Activity [4001] events.
 
-use crate::builders::EventContext;
+use crate::builders::ContextRef;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{NetworkActivityEvent, OcsfEvent};
@@ -11,7 +11,7 @@ use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 
 /// Builder for Network Activity [4001] events.
 pub struct NetworkActivityBuilder<'a, EndpointState = MissingNetworkEndpoint> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     activity: ActivityId,
     activity_name: Option<String>,
     action: Option<ActionId>,
@@ -58,9 +58,9 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     /// NetworkActivityBuilder::new(&ctx).build();
     /// ```
     #[must_use]
-    pub fn new(ctx: &'a EventContext) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             activity: ActivityId::Unknown,
             activity_name: None,
             action: None,

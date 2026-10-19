@@ -114,17 +114,27 @@ pub fn current_trace_context_environment() -> Vec<(&'static str, String)> {
 ///
 /// Leaves `span` unchanged when the environment carries no valid context.
 pub fn set_parent_from_environment(span: &tracing::Span) {
-    let carrier = [
-        ("traceparent", TRACEPARENT_ENV),
-        ("tracestate", TRACESTATE_ENV),
-    ]
-    .into_iter()
-    .filter_map(|(field, name)| {
-        std::env::var(name)
-            .ok()
-            .map(|value| (field.to_string(), value))
-    })
-    .collect::<BTreeMap<_, _>>();
+    set_parent_from_trace_context(
+        span,
+        std::env::var(TRACEPARENT_ENV).ok().as_deref(),
+        std::env::var(TRACESTATE_ENV).ok().as_deref(),
+    );
+}
+
+/// Parent `span` under an explicit W3C `traceparent` and `tracestate`.
+///
+/// A process supervising several sandboxes receives each launch's context
+/// with its session instead of through process environment. Leaves `span`
+/// unchanged when the values carry no valid context.
+pub fn set_parent_from_trace_context(
+    span: &tracing::Span,
+    traceparent: Option<&str>,
+    tracestate: Option<&str>,
+) {
+    let carrier = [("traceparent", traceparent), ("tracestate", tracestate)]
+        .into_iter()
+        .filter_map(|(field, value)| value.map(|value| (field.to_string(), value.to_string())))
+        .collect::<BTreeMap<_, _>>();
     set_parent_from_carrier(span, &carrier);
 }
 

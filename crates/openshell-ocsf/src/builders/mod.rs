@@ -157,6 +157,7 @@ pub use process::ProcessActivityBuilder;
 pub use ssh::SshActivityBuilder;
 
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use crate::OCSF_VERSION;
 use crate::enums::StatusId;
@@ -197,6 +198,45 @@ pub struct EventContext {
     pub proxy_port: u16,
     /// Which component is emitting.
     pub origin: EventOrigin,
+}
+
+/// Event context borrowed from the caller or shared by a hosted session.
+///
+/// Builders accept either form, so events attributed to a hosted supervisor
+/// session need not leak a `'static` context for each session.
+#[derive(Debug, Clone)]
+pub enum ContextRef<'a> {
+    Borrowed(&'a EventContext),
+    Shared(Arc<EventContext>),
+}
+
+impl std::ops::Deref for ContextRef<'_> {
+    type Target = EventContext;
+
+    fn deref(&self) -> &EventContext {
+        match self {
+            Self::Borrowed(context) => context,
+            Self::Shared(context) => context,
+        }
+    }
+}
+
+impl<'a> From<&'a EventContext> for ContextRef<'a> {
+    fn from(context: &'a EventContext) -> Self {
+        Self::Borrowed(context)
+    }
+}
+
+impl From<Arc<EventContext>> for ContextRef<'_> {
+    fn from(context: Arc<EventContext>) -> Self {
+        Self::Shared(context)
+    }
+}
+
+impl<'a> From<&'a ContextRef<'_>> for ContextRef<'a> {
+    fn from(context: &'a ContextRef<'_>) -> Self {
+        Self::Borrowed(context)
+    }
 }
 
 impl EventContext {

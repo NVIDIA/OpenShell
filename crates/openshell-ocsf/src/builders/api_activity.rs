@@ -3,7 +3,7 @@
 
 //! Builder for API Activity [6003] events.
 
-use crate::builders::{EventContext, EventOrigin};
+use crate::builders::{ContextRef, EventOrigin};
 use crate::enums::{ActionId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{ApiActivityEvent, OcsfEvent};
@@ -28,7 +28,7 @@ fn sanitize_model_name(name: &str) -> String {
 
 /// Builder for API Activity [6003] events.
 pub struct ApiActivityBuilder<'a> {
-    ctx: &'a EventContext,
+    ctx: ContextRef<'a>,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -49,9 +49,9 @@ pub struct ApiActivityBuilder<'a> {
 
 impl<'a> ApiActivityBuilder<'a> {
     #[must_use]
-    pub fn new(ctx: &'a EventContext, operation: impl Into<String>) -> Self {
+    pub fn new(ctx: impl Into<ContextRef<'a>>, operation: impl Into<String>) -> Self {
         Self {
-            ctx,
+            ctx: ctx.into(),
             severity: SeverityId::Informational,
             status: None,
             message: None,

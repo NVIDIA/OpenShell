@@ -16,7 +16,7 @@ use miette::Result;
 use openshell_ocsf::{ActivityId, AppLifecycleBuilder, SeverityId, StatusId, ocsf_emit};
 
 #[cfg(unix)]
-fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
+fn ocsf_ctx() -> openshell_ocsf::ContextRef<'static> {
     openshell_ocsf::ctx::ctx()
 }
 
