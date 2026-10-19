@@ -1004,7 +1004,7 @@ impl PodmanComputeDriver {
         )
     )]
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), ComputeDriverError> {
-        self.create_sandbox_with_existing_token(sandbox, None, None)
+        self.create_sandbox_with_existing_token(sandbox, None, None, None)
             .await
     }
 
@@ -1016,6 +1016,7 @@ impl PodmanComputeDriver {
         sandbox: &DriverSandbox,
         existing_token_secret: Option<&str>,
         restart_generation: Option<&str>,
+        existing_workload_container_id: Option<&str>,
     ) -> Result<(), ComputeDriverError> {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         let reuse_existing_resources = restart_generation.is_some();
@@ -1417,8 +1418,16 @@ impl PodmanComputeDriver {
                             )
                             .await?;
                     }
-                    let workload_id = self.client.create_typed_container(&specs.workload).await?;
-                    created_workload = Some(workload_id.clone());
+                    // Supervisor-only trust reconciliation reuses the stopped
+                    // workload container together with its volumes, secrets,
+                    // and workspace data. Only the supervisor is replaced.
+                    let workload_id = if let Some(existing) = existing_workload_container_id {
+                        existing.to_string()
+                    } else {
+                        let id = self.client.create_typed_container(&specs.workload).await?;
+                        created_workload = Some(id.clone());
+                        id
+                    };
                     self.client.verify_isolation_fence(&workload_id).await?;
                     self.admit_container_resources(&workload_id).await?;
                     let child_env = podman_child_environment(sandbox, &resolved_image.environment);
@@ -1466,7 +1475,7 @@ impl PodmanComputeDriver {
                             )
                             .await?;
                     }
-                    if managed_workspace {
+                    if managed_workspace && existing_workload_container_id.is_none() {
                         self.client
                             .copy_to_container(&workload_id, "/sandbox", archives.workspace)
                             .await?;
@@ -1703,18 +1712,33 @@ impl PodmanComputeDriver {
         span_status.finish(result)
     }
 
-    fn network_trust_generation_matches(&self, container: &ContainerListEntry) -> bool {
-        // Reconcile an unmarked stopped legacy pair once instead of treating
-        // absence as disabled trust. New workloads must durably record the
-        // explicit `none` generation too.
-        container
-            .labels
-            .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
-            .map(String::as_str)
-            .is_some_and(|generation| generation == self.expected_network_trust_generation())
+    /// Whether the trusted supervisor of a sandbox predates the gateway's
+    /// current destination-trust bundle. A missing supervisor or a missing
+    /// generation label (a supervisor created before this labeling existed)
+    /// counts as stale: only the supervisor is recreated to refresh it, never
+    /// the workload or its data.
+    async fn supervisor_network_trust_stale(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<bool, ComputeDriverError> {
+        let supervisor = crate::isolation::supervisor_name(sandbox_id);
+        match self.client.inspect_container(&supervisor).await {
+            Ok(inspect) => Ok(inspect
+                .config
+                .labels
+                .get(NETWORK_SUPERVISOR_TRUST_GENERATION_KEY)
+                .map(String::as_str)
+                != Some(self.expected_network_trust_generation())),
+            Err(PodmanApiError::NotFound(_)) => Ok(true),
+            Err(error) => Err(error.into()),
+        }
     }
 
-    async fn replace_stopped_pair_for_network_trust(
+    /// Recreate only the trusted supervisor of a stopped pair so the start
+    /// picks up the gateway's current destination-trust bundle. The workload
+    /// container, its volumes, its secrets, and its workspace data are never
+    /// replaced: the additional CA bundle is mounted only into the supervisor.
+    async fn replace_supervisor_for_network_trust(
         &self,
         old_workload: &ContainerListEntry,
         durable_sandbox: &DriverSandbox,
@@ -1733,17 +1757,18 @@ impl PodmanComputeDriver {
         }
         if durable_sandbox.name.is_empty() || durable_sandbox.spec.is_none() {
             return Err(ComputeDriverError::Precondition(
-                "a durable sandbox provisioning snapshot is required for stopped Podman trust reconciliation".into(),
+                "a durable sandbox provisioning snapshot is required for Podman supervisor trust reconciliation".into(),
             ));
         }
         if encoded_authentication.is_empty() {
             return Err(ComputeDriverError::Precondition(
-                "fresh launch authentication is required for stopped Podman trust reconciliation"
+                "fresh launch authentication is required for Podman supervisor trust reconciliation"
                     .into(),
             ));
         }
-        // Validate all untrusted fields before changing the old pair. Image
-        // selection below is driven exclusively by this durable snapshot.
+        // Validate all untrusted fields before changing the old supervisor.
+        // Image selection below is driven exclusively by this durable
+        // snapshot.
         self.validated_sandbox_create(durable_sandbox).await?;
 
         let canonical_supervisor = crate::isolation::supervisor_name(&durable_sandbox.id);
@@ -1759,30 +1784,14 @@ impl PodmanComputeDriver {
             Err(error) => return Err(error.into()),
         };
 
-        let workload_rollback_name = format!("openshell-rollback-{}", uuid::Uuid::new_v4());
         let supervisor_rollback_name =
             format!("openshell-supervisor-rollback-{}", uuid::Uuid::new_v4());
-        self.client
-            .rename_container(&old_workload.id, &workload_rollback_name)
-            .await
-            .map_err(ComputeDriverError::from)?;
         if previous_supervisor.is_some()
             && let Err(error) = self
                 .client
                 .rename_container(&canonical_supervisor, &supervisor_rollback_name)
                 .await
         {
-            let _ = self
-                .client
-                .rename_container(
-                    &workload_rollback_name,
-                    &container::container_name(
-                        &durable_sandbox.workspace,
-                        &durable_sandbox.name,
-                        &durable_sandbox.id,
-                    ),
-                )
-                .await;
             return Err(error.into());
         }
 
@@ -1804,21 +1813,13 @@ impl PodmanComputeDriver {
                 &replacement,
                 existing_token,
                 Some(generation.as_str()),
+                Some(&old_workload.id),
             )
             .await;
         if let Err(error) = provisioned {
-            // The old pair retained both named volumes. Restore the canonical
-            // names so a failed replacement has no externally observable
-            // provisioning change.
-            let canonical_workload = container::container_name(
-                &durable_sandbox.workspace,
-                &durable_sandbox.name,
-                &durable_sandbox.id,
-            );
-            let _ = self
-                .client
-                .rename_container(&workload_rollback_name, &canonical_workload)
-                .await;
+            // The stopped workload and all of its resources were retained.
+            // Restore the canonical supervisor name so a failed replacement
+            // has no externally observable provisioning change.
             if previous_supervisor.is_some() {
                 let _ = self
                     .client
@@ -1828,14 +1829,6 @@ impl PodmanComputeDriver {
             return Err(error);
         }
 
-        // Delayed remove events from the rollback containers must never
-        // delete the gateway's newly-created workload snapshot.
-        self.lifecycle_event_fences
-            .record_intentional_removal(&old_workload.id);
-        self.client
-            .remove_container_preserving_volumes(&workload_rollback_name)
-            .await
-            .map_err(ComputeDriverError::from)?;
         if previous_supervisor.is_some() {
             self.client
                 .remove_container_preserving_volumes(&supervisor_rollback_name)
@@ -1879,35 +1872,8 @@ impl PodmanComputeDriver {
             .await?
             .ok_or(ComputeDriverError::NotFound)?;
         self.admit_container_resources(&container.id).await?;
-        if !self.network_trust_generation_matches(&container) {
-            if container.state == "running" {
-                return span_status.finish(Err(ComputeDriverError::Precondition(
-                    "refusing to replace a running Podman workload during trust reconciliation"
-                        .into(),
-                )));
-            }
-            if !matches!(container.state.as_str(), "exited" | "stopped") {
-                return span_status.finish(Err(ComputeDriverError::Precondition(
-                    "Podman trust reconciliation requires a stopped workload; transitional resources are never replaced"
-                        .into(),
-                )));
-            }
-            let durable_sandbox = durable_sandbox.ok_or_else(|| {
-                ComputeDriverError::Precondition(
-                    "a durable sandbox provisioning snapshot is required for stopped Podman trust reconciliation".into(),
-                )
-            })?;
-            let result = self
-                .replace_stopped_pair_for_network_trust(
-                    &container,
-                    durable_sandbox,
-                    &generation,
-                    encoded_authentication,
-                )
-                .await;
-            return span_status.finish(result);
-        }
-        if container.state == "running" {
+        let workload_running = container.state == "running";
+        if workload_running {
             let supervisor = self
                 .client
                 .inspect_container(&crate::isolation::supervisor_name(sandbox_id))
@@ -1942,6 +1908,29 @@ impl PodmanComputeDriver {
             self.client.stop_container(&container.id, 0).await?;
             self.wait_for_container_stopped(sandbox_id, &container.id)
                 .await?;
+        }
+        // A user-driven start of a stopped sandbox mints fresh launch
+        // credentials. When the trusted supervisor predates the gateway's
+        // current destination-trust bundle (including supervisors created
+        // before generation labels existed), recreate only the supervisor so
+        // stop/start picks up the current additional CA bundle. The workload
+        // container, its volumes, and its workspace data are never replaced.
+        // Recovery without fresh credentials and running sandboxes keep their
+        // existing supervisor and bundle unchanged.
+        if !workload_running
+            && launch_authentication.is_some()
+            && let Some(durable_sandbox) = durable_sandbox
+            && self.supervisor_network_trust_stale(sandbox_id).await?
+        {
+            let result = self
+                .replace_supervisor_for_network_trust(
+                    &container,
+                    durable_sandbox,
+                    &generation,
+                    encoded_authentication,
+                )
+                .await;
+            return span_status.finish(result);
         }
         let container_id = container.id;
         info!(sandbox_id = %sandbox_id, container = %container_id, "Starting sandbox container");
