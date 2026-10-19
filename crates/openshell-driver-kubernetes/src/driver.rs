@@ -1000,6 +1000,14 @@ impl KubernetesComputeDriver {
         };
 
         let shared_supervisor = config.shared_supervisor.clone().map(SharedSupervisor::new);
+        if shared_supervisor.is_some()
+            && (config.supervisor_otlp_endpoint.is_some()
+                || config.supervisor_ocsf_export.is_some())
+        {
+            warn!(
+                "the gateway supervisor topology does not export supervisor OTLP traces or OCSF events; shared sessions keep console logs and gateway log push"
+            );
+        }
         let driver = Self {
             client,
             watch_client,
@@ -4314,8 +4322,11 @@ impl KubernetesComputeDriver {
         match tokio::time::timeout(KUBE_API_TIMEOUT, delete_api.api.delete(&kube_name, &dp)).await {
             Ok(Ok(_response)) => {
                 info!(sandbox_id = %sandbox_id, namespace = %obj_namespace, "Sandbox deleted from Kubernetes");
-                if let Some(placement) = &placement {
-                    self.remove_shared_session(placement).await;
+                // The workload is going away, so its session cannot stop it
+                // gracefully; end the session without delaying the delete.
+                if let Some(placement @ SupervisorPlacement::Shared { .. }) = placement {
+                    let driver = self.clone();
+                    tokio::spawn(async move { driver.remove_shared_session(&placement).await });
                 }
                 {
                     let pod_api = Api::<Pod>::namespaced(self.client.clone(), &obj_namespace);

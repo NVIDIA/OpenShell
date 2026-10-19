@@ -215,6 +215,8 @@ fails closed.
 
 The topology does not support upstream proxies or provider SPIFFE identity, and
 the shared supervisor is a single point of failure for the sandboxes it hosts.
+Shared sessions export no supervisor OTLP traces or OCSF events; the driver
+warns at startup when the gateway configures that export.
 When the setting is removed, reconciliation suspends shared generations, and a
 restart creates the dedicated generation's boundary Service the shared one never
 had.

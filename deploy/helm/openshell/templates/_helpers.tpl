@@ -363,10 +363,19 @@ raw gateway configuration so openshell.effectiveKubernetesConfig can use it.
 {{- end }}
 
 {{/*
-Name of the shared supervisor Deployment, Service, and session-control Secrets.
+Name of the shared supervisor Deployment, Service, and session-control Secrets:
+the fullname with a fixed suffix, within the 63-character Service name limit.
+A fullname without room for the suffix keeps a prefix and a hash of the whole
+fullname, so the name never collapses into another release resource's name.
 */}}
 {{- define "openshell.supervisorName" -}}
-{{- printf "%s-supervisor" (include "openshell.fullname" .) | trunc 52 | trimSuffix "-" -}}
+{{- $suffix := "-supervisor" -}}
+{{- $base := include "openshell.fullname" . -}}
+{{- $room := sub 63 (len $suffix) | int -}}
+{{- if gt (len $base) $room -}}
+{{- $base = printf "%s-%s" ($base | trunc (sub $room 9 | int) | trimSuffix "-") ($base | sha256sum | trunc 8) -}}
+{{- end -}}
+{{- printf "%s%s" $base $suffix -}}
 {{- end }}
 
 {{/*

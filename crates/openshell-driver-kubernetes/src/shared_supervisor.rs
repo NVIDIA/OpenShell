@@ -13,7 +13,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use kube::core::DynamicObject;
 use openshell_sandbox_backend::session_control::{
-    SESSIONS_PATH, SessionList, SessionRegistration, SessionStatusReport,
+    SESSION_REMOVAL_TIMEOUT, SESSIONS_PATH, SessionList, SessionRegistration, SessionStatusReport,
 };
 
 use crate::config::SharedSupervisorConfig;
@@ -27,6 +27,8 @@ pub const ANNOTATION_SUPERVISOR_SESSION: &str = "openshell.ai/sandbox-runtime-su
 pub const GATEWAY_TOPOLOGY: &str = "gateway";
 
 /// Bound on one session-control request, including connection and TLS.
+/// Removals wait for the session's workload to stop and use the contract's
+/// longer bound instead.
 const SESSION_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where a generation's supervisor runs, as recorded when it started.
@@ -152,16 +154,18 @@ impl SharedSupervisor {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<(http::StatusCode, Bytes), KubernetesDriverError> {
-        tokio::time::timeout(
-            SESSION_CONTROL_TIMEOUT,
-            self.request_once(method, path, body),
-        )
-        .await
-        .map_err(|_| {
-            KubernetesDriverError::Message(
-                "timed out calling the shared supervisor session-control API".to_string(),
-            )
-        })?
+        let deadline = if method == http::Method::DELETE {
+            SESSION_REMOVAL_TIMEOUT
+        } else {
+            SESSION_CONTROL_TIMEOUT
+        };
+        tokio::time::timeout(deadline, self.request_once(method, path, body))
+            .await
+            .map_err(|_| {
+                KubernetesDriverError::Message(
+                    "timed out calling the shared supervisor session-control API".to_string(),
+                )
+            })?
     }
 
     async fn request_once(

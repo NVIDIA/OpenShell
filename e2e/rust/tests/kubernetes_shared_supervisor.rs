@@ -430,10 +430,36 @@ async fn install_provider(name: &str, port: u16, secret: &str) {
     assert!(created, "provider create {name} failed:\n{output}");
 }
 
+/// Bound on the shared supervisor answering a routed connection: its own
+/// handshake deadline is 5 s.
+const PROBE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// What the shared supervisor did with a connection that named a route.
+#[derive(Debug, PartialEq, Eq)]
+enum RouteAnswer {
+    /// Closed or reset the connection before sending anything.
+    Refused,
+    /// Started the TLS handshake for the route's pinned identity; the first
+    /// bytes it sent.
+    Challenged(Vec<u8>),
+}
+
+/// A connection closed or reset by the peer.
+fn is_closed(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
 /// Port-forward to the shared supervisor's routed runtime listener.
 struct RuntimeListener {
     child: tokio::process::Child,
     port: u16,
+    stderr: Arc<Mutex<Vec<String>>>,
 }
 
 impl RuntimeListener {
@@ -451,10 +477,18 @@ impl RuntimeListener {
                 &format!(":{RUNTIME_PORT}"),
             ])
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .expect("spawn kubectl port-forward");
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let mut errors = tokio::io::BufReader::new(child.stderr.take().expect("stderr")).lines();
+        let recorded = stderr.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(line)) = errors.next_line().await {
+                recorded.lock().unwrap().push(line);
+            }
+        });
         let mut lines = tokio::io::BufReader::new(child.stdout.take().expect("stdout")).lines();
         let port = tokio::time::timeout(Duration::from_secs(30), async {
             while let Some(line) = lines.next_line().await.expect("read port-forward") {
@@ -474,12 +508,42 @@ impl RuntimeListener {
         // kubectl reports every forwarded connection on stdout and exits if
         // that pipe closes.
         tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
-        Self { child, port }
+        Self {
+            child,
+            port,
+            stderr,
+        }
     }
 
-    /// Name `route` in a routing preface and return the first bytes the
-    /// supervisor answers with before it closes the connection or goes quiet.
-    async fn probe(&self, route: &str, reply: &[u8]) -> Vec<u8> {
+    /// Every connection reached the supervisor Pod: kubectl reports a failed
+    /// pod-side dial on stderr, and the local side then sees the same EOF as a
+    /// refusal.
+    async fn assert_forwarded_every_connection(&mut self) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let failed = self.stderr.lock().unwrap().iter().any(|line| {
+            line.contains("an error occurred forwarding") || line.contains("error forwarding port")
+        });
+        assert!(
+            !failed,
+            "a probe never reached the supervisor; {}",
+            self.diagnostics()
+        );
+    }
+
+    /// The forwarder's state, for failure messages.
+    fn diagnostics(&mut self) -> String {
+        format!(
+            "kubectl port-forward status {:?}, stderr {:?}",
+            self.child.try_wait(),
+            self.stderr.lock().unwrap()
+        )
+    }
+
+    /// Name `route` in a routing preface and report how the supervisor
+    /// answered. A challenged connection is then sent `reply` in place of the
+    /// pinned TLS identity and must be closed. Silence fails the test: a
+    /// listener that hangs has not rejected anything.
+    async fn probe(&mut self, route: &str, reply: &[u8]) -> RouteAnswer {
         let mut stream = TcpStream::connect(("127.0.0.1", self.port))
             .await
             .expect("connect to forwarded runtime listener");
@@ -488,18 +552,33 @@ impl RuntimeListener {
         preface.extend_from_slice(route.as_bytes());
         stream.write_all(&preface).await.expect("send preface");
         let mut answer = vec![0_u8; 5];
-        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut answer))
-            .await
-            .map_or(0, |read| read.unwrap_or(0));
-        answer.truncate(read);
-        if read > 0 {
-            // Answer the supervisor's TLS handshake without its pinned identity.
-            let _ = stream.write_all(reply).await;
-            let mut rest = Vec::new();
-            let _ =
-                tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest)).await;
+        let read = match tokio::time::timeout(PROBE_DEADLINE, stream.read(&mut answer)).await {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) if is_closed(&error) => 0,
+            Ok(Err(error)) => panic!("read the answer to route {route}: {error}"),
+            Err(elapsed) => panic!(
+                "route {route} was neither refused nor challenged ({elapsed}, {PROBE_DEADLINE:?}); {}",
+                self.diagnostics()
+            ),
+        };
+        if read == 0 {
+            return RouteAnswer::Refused;
         }
-        answer
+        answer.truncate(read);
+        if let Err(error) = stream.write_all(reply).await {
+            assert!(is_closed(&error), "answer route {route}: {error}");
+        }
+        let mut rest = Vec::new();
+        match tokio::time::timeout(PROBE_DEADLINE, stream.read_to_end(&mut rest)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) if is_closed(&error) => {}
+            Ok(Err(error)) => panic!("wait for route {route} to close: {error}"),
+            Err(elapsed) => panic!(
+                "route {route} stayed open without its pinned TLS identity ({elapsed}, {PROBE_DEADLINE:?}); {}",
+                self.diagnostics()
+            ),
+        }
+        RouteAnswer::Challenged(answer)
     }
 }
 
@@ -509,6 +588,8 @@ impl Drop for RuntimeListener {
     }
 }
 
+/// A fatal TLS `handshake_failure` alert: a peer without the pinned identity.
+const TLS_HANDSHAKE_FAILURE: &[u8] = b"\x15\x03\x03\x00\x02\x02\x28";
 const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 
 #[tokio::test]
@@ -578,26 +659,35 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
     // A peer naming a live route must present that session's pinned TLS
     // identity, and failing to does not displace the session. Stale and
     // unknown routes are refused before any handshake.
-    let listener = RuntimeListener::forward().await;
+    let mut listener = RuntimeListener::forward().await;
     for _ in 0..3 {
-        let answer = listener
-            .probe(&beta_route, b"\x15\x03\x03\x00\x02\x02\x28")
-            .await;
-        assert_eq!(
-            answer.first(),
-            Some(&TLS_HANDSHAKE_RECORD),
-            "a live route should demand the session's pinned TLS identity"
-        );
+        match listener.probe(&beta_route, TLS_HANDSHAKE_FAILURE).await {
+            RouteAnswer::Challenged(answer) => assert_eq!(
+                answer.first(),
+                Some(&TLS_HANDSHAKE_RECORD),
+                "a live route should start the session's pinned TLS handshake"
+            ),
+            RouteAnswer::Refused => {
+                panic!("a live route should demand the session's pinned TLS identity")
+            }
+        }
     }
-    assert!(
-        listener.probe(&alpha_route, b"").await.is_empty(),
+    assert_eq!(
+        listener.probe(&alpha_route, &[]).await,
+        RouteAnswer::Refused,
         "stale route reached a session"
     );
     let unknown = format!("rt-{:032x}", rand::random::<u128>());
-    assert!(
-        listener.probe(&unknown, b"").await.is_empty(),
+    assert_eq!(
+        listener.probe(&unknown, &[]).await,
+        RouteAnswer::Refused,
         "unknown route reached a session"
     );
+    assert!(matches!(
+        listener.probe(&beta_route, TLS_HANDSHAKE_FAILURE).await,
+        RouteAnswer::Challenged(_)
+    ));
+    listener.assert_forwarded_every_connection().await;
     drop(listener);
     assert_eq!(call(&beta, beta_endpoint.port).await, "SAW_BETA");
 
@@ -623,11 +713,19 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
         "restarted alpha never regained supervision"
     );
     assert_eq!(call(&beta, beta_endpoint.port).await, "SAW_BETA");
-    let listener = RuntimeListener::forward().await;
-    assert!(
-        listener.probe(&alpha_route, b"").await.is_empty(),
+    let mut listener = RuntimeListener::forward().await;
+    assert_eq!(
+        listener.probe(&alpha_route, &[]).await,
+        RouteAnswer::Refused,
         "the replaced route reached a session"
     );
+    assert!(matches!(
+        listener
+            .probe(&restarted_route, TLS_HANDSHAKE_FAILURE)
+            .await,
+        RouteAnswer::Challenged(_)
+    ));
+    listener.assert_forwarded_every_connection().await;
     drop(listener);
 
     assert_eq!(

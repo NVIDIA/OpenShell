@@ -11,6 +11,7 @@
 //! Sandbox Protocol credentials it carries; it confers no other identity.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use openshell_isolation_interface::contract::BackendError;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,13 @@ use crate::boundary_protocol::{SandboxRuntimeDescriptor, SandboxTransport};
 pub const SESSIONS_PATH: &str = "/v1/sessions";
 /// Largest registration body a supervisor accepts.
 pub const MAX_REGISTRATION_BYTES: usize = 256 * 1024;
+/// Time a shared supervisor gives a removed session's workload to stop
+/// before cancelling the session.
+pub const SESSION_REMOVAL_GRACE: Duration = Duration::from_secs(20);
+/// Bound on answering a removal request: the grace period, the session
+/// runtime's shutdown, file cleanup, and the connection itself. A removal
+/// continues on the supervisor if its caller stops waiting.
+pub const SESSION_REMOVAL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// PEM private key that never appears in `Debug` output.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

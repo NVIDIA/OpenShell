@@ -4,13 +4,9 @@
 //! Supervisor shared by the sandboxes of one gateway (experimental).
 
 use clap::Parser;
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::Result;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
-
-/// Time a removed or shut-down session may take to stop its workload.
-const SESSION_REMOVAL_GRACE: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Parser)]
 #[command(name = "openshell-supervisor experimental-host")]
@@ -51,6 +47,7 @@ pub fn run(raw_args: &[String]) -> Result<()> {
 
 #[cfg(unix)]
 fn run_platform(args: Args) -> Result<()> {
+    use miette::{IntoDiagnostic as _, WrapErr as _};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
@@ -108,7 +105,7 @@ fn run_platform(args: Args) -> Result<()> {
                 gateway_endpoint: args.openshell_endpoint.clone(),
                 session_root: args.session_root.clone(),
                 runtime_listen: args.runtime_listen,
-                removal_grace: SESSION_REMOVAL_GRACE,
+                removal_grace: openshell_sandbox_backend::session_control::SESSION_REMOVAL_GRACE,
             },
         )?;
         let control = tokio::net::TcpListener::bind(args.session_control_listen)

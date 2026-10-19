@@ -174,6 +174,22 @@ tests:
     asserts:
       - failedTemplate:
           errorMessage: supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value
+  - it: keeps a distinct name when the release fullname leaves no room for the suffix
+    template: templates/supervisor.yaml
+    set:
+      fullnameOverride: openshell-gateway-release-with-a-very-very-long-name-0057
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: metadata.name
+          pattern: ^openshell-gateway-release-with-a-very-very-[0-9a-f]{8}-supervisor$
+        documentIndex: 1
+      - notEqual:
+          path: metadata.name
+          value: openshell-gateway-release-with-a-very-very-long-name-0057
+        documentIndex: 1
   - it: omits the gateway CA when gateway TLS is disabled
     template: templates/supervisor.yaml
     set:
