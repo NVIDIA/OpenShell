@@ -42,15 +42,17 @@ thiserror = { workspace = true }
 miette = { workspace = true }
 notify = "8"
 rcgen = { workspace = true }
-
-[dev-dependencies]
-openshell-otel-test-support = { path = "../openshell-otel-test-support" }
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
 bytes = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+
+[dev-dependencies]
+openshell-otel-test-support = { path = "../openshell-otel-test-support" }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }

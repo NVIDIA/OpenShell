@@ -36,6 +36,7 @@ mod lifecycle_reconciliation {
             lifecycle_gates: Arc::default(),
             config: KubernetesComputeConfig::default(),
             operator_allowlist: None,
+            shared_supervisor: None,
         };
         (driver, steps, Arc::default())
     }

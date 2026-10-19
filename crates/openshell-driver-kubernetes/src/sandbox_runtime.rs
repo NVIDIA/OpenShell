@@ -118,6 +118,8 @@ pub struct SandboxRuntimeNames {
     pub supervisor_service: String,
     /// Per-sandbox egress allowance used only by runtime-initiated control.
     pub control_policy: String,
+    /// Per-sandbox egress allowance to the gateway's shared supervisor.
+    pub shared_control_policy: String,
     pub supervisor_pod: String,
     pub workload_policy: String,
     pub supervisor_policy: String,
@@ -134,6 +136,7 @@ impl SandboxRuntimeNames {
             boundary_service: format!("os-boundary-{suffix}"),
             supervisor_service: format!("os-supervisor-{suffix}"),
             control_policy: format!("os-control-{suffix}"),
+            shared_control_policy: format!("os-shared-control-{suffix}"),
             supervisor_pod: format!("os-supervisor-{suffix}"),
             workload_policy: NAMESPACE_WORKLOAD_POLICY_NAME.to_string(),
             supervisor_policy: NAMESPACE_SUPERVISOR_EGRESS_POLICY_NAME.to_string(),
@@ -280,6 +283,30 @@ pub fn control_policy(
     );
     policy.metadata.owner_references = Some(vec![owner]);
     policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-control-egress"));
+    policy
+}
+
+/// Egress allowance from this sandbox's workload Pod to the shared supervisor.
+#[must_use]
+pub fn shared_control_policy(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    supervisor_namespace: &str,
+    supervisor_selector: BTreeMap<String, String>,
+    runtime_port: u16,
+    owner: OwnerReference,
+) -> NetworkPolicy {
+    let mut policy = crate::isolation::shared_runtime_control_policy(
+        namespace,
+        &names.shared_control_policy,
+        &pair_label_value(sandbox_id),
+        supervisor_namespace,
+        supervisor_selector,
+        runtime_port,
+    );
+    policy.metadata.owner_references = Some(vec![owner]);
+    policy.metadata.labels = Some(common_labels(sandbox_id, "sandbox-shared-control-egress"));
     policy
 }
 
