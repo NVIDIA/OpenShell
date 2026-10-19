@@ -279,9 +279,7 @@ reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
 Scanner failures still fail qualification.
 
 Failed pre-release builds, publication, or qualification send notifications via Slack using a webhook and
-at-mentioning the triage engineer. The message names the failed stage, links
-each failing job, and links the run. The aggregate Release Qualification job is
-listed only when no other job failed. The webhook is
+at-mentioning the triage engineer, with links to each failed job and to the run. The webhook is
 stored in the repository secret `SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` and the
 mention is stored in the repository secret `SLACK_OPENSHELL_TRIAGE_MENTION`.
 Successful pre-release builds post a top-level message to the same webhook
