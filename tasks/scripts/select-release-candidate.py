@@ -14,18 +14,27 @@ import os
 import re
 import subprocess
 import zipfile
+from typing import TYPE_CHECKING
 from urllib.parse import urlencode
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 
 def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], text=True).strip()
 
 
-def api_pages(path: str, key: str) -> list[dict]:
-    pages = json.loads(
-        subprocess.check_output(["gh", "api", "--paginate", "--slurp", path])
-    )
-    return [item for page in pages for item in page[key]]
+def api_pages(path: str, key: str) -> Iterator[dict]:
+    page = 1
+    while True:
+        items = json.loads(
+            subprocess.check_output(["gh", "api", f"{path}&page={page}"])
+        )[key]
+        yield from items
+        if len(items) < 100:
+            return
+        page += 1
 
 
 def verify_summary(summary: dict, tag: str, sha: str, run: dict, attempt: int) -> None:
@@ -67,59 +76,54 @@ def select_candidate(tag: str, branch: str) -> dict:
 
     repository = os.environ["GITHUB_REPOSITORY"]
     query = urlencode({"status": "success", "per_page": 100})
-    runs = api_pages(
-        f"repos/{repository}/actions/workflows/release-prerelease.yml/runs?{query}",
-        "workflow_runs",
-    )
-    evidence = {}
-    for run in sorted(runs, key=lambda item: item["id"], reverse=True):
-        if run["event"] not in {"push", "workflow_dispatch"}:
-            continue
-        if run["event"] == "workflow_dispatch" and run["head_branch"] != branch:
-            continue
-        if run["event"] == "push" and run["head_branch"] not in candidates:
-            continue
-        artifacts = api_pages(
-            f"repos/{repository}/actions/runs/{run['id']}/artifacts?per_page=100",
-            "artifacts",
-        )
-        for artifact in artifacts:
-            match = re.fullmatch(
-                rf"qualification-({re.escape(tag)}-pre\.[1-9][0-9]*)"
-                rf"-run-{run['id']}-attempt-([1-9][0-9]*)",
-                artifact["name"],
-            )
-            if not match:
-                continue
-            candidate, attempt_text = match.groups()
-            attempt = int(attempt_text)
-            if attempt > run["run_attempt"]:
-                continue
-            if run["event"] == "push" and (
-                run["head_branch"] != candidate
-                or run["head_sha"] != candidates.get(candidate)
-            ):
-                continue
-            if candidate in candidates and not artifact["expired"]:
-                previous = evidence.get(candidate)
-                if previous is None or (run["id"], attempt) > (
-                    previous[0]["id"],
-                    previous[2],
-                ):
-                    evidence[candidate] = (run, artifact, attempt)
-
+    artifacts_by_run = {}
     for candidate in sorted(
         candidates, key=lambda item: int(item.rsplit(".", 1)[1]), reverse=True
     ):
-        if candidate not in evidence:
+        sha = candidates[candidate]
+        runs = api_pages(
+            f"repos/{repository}/actions/workflows/release-prerelease.yml/runs?{query}",
+            "workflow_runs",
+        )
+        for run in runs:
+            if run["event"] not in {"push", "workflow_dispatch"}:
+                continue
+            if run["event"] == "workflow_dispatch" and run["head_branch"] != branch:
+                continue
+            if run["event"] == "push" and (
+                run["head_branch"] != candidate or run["head_sha"] != sha
+            ):
+                continue
+            if run["id"] not in artifacts_by_run:
+                artifacts_by_run[run["id"]] = list(
+                    api_pages(
+                        f"repos/{repository}/actions/runs/{run['id']}/artifacts?per_page=100",
+                        "artifacts",
+                    )
+                )
+            evidence = {}
+            for artifact in artifacts_by_run[run["id"]]:
+                match = re.fullmatch(
+                    rf"qualification-{re.escape(candidate)}"
+                    rf"-run-{run['id']}-attempt-([1-9][0-9]*)",
+                    artifact["name"],
+                )
+                if not match or artifact["expired"]:
+                    continue
+                attempt = int(match[1])
+                if attempt <= run["run_attempt"]:
+                    evidence[attempt] = artifact
+            if evidence:
+                attempt = max(evidence)
+                artifact = evidence[attempt]
+                break
+        else:
             continue
-        run, artifact, attempt = evidence[candidate]
         archive = subprocess.check_output(
             ["gh", "api", f"repos/{repository}/actions/artifacts/{artifact['id']}/zip"]
         )
         with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
             summary = json.loads(bundle.read("qualification-summary.json"))
-        sha = candidates[candidate]
         verify_summary(summary, candidate, sha, run, attempt)
 
         # An existing stable tag may be retried, but must never be moved.

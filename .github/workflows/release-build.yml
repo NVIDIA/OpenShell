@@ -157,7 +157,8 @@ jobs:
       packages: write
     uses: ./.github/workflows/build-images.yml
     with:
-      image-tag: ${{ needs.compute-versions.outputs.source_sha }}
+      image-tag: ${{ inputs.is-prerelease && needs.compute-versions.outputs.source_sha || needs.compute-versions.outputs.semver }}
+      push-images: ${{ inputs.is-prerelease }}
       checkout-ref: ${{ needs.compute-versions.outputs.source_sha }}
 
   build-python-wheel:

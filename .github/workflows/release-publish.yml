@@ -219,30 +219,68 @@ jobs:
           if-no-files-found: error
 
   tag-ghcr-release:
-    name: Tag GHCR Images
+    name: Publish GHCR Images
     needs: assemble
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
+      actions: read
+      contents: read
       packages: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: ${{ !inputs.is-prerelease }}
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.source-sha }}
+
+      - uses: ./.github/actions/setup-nix
+        if: ${{ !inputs.is-prerelease }}
+
+      - name: Download stable image archives
+        if: ${{ !inputs.is-prerelease }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: image-*
+          path: artifacts/
+          merge-multiple: true
+
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish stable image archives
+        if: ${{ !inputs.is-prerelease }}
+        env:
+          VERSION: ${{ inputs.semver }}
+        run: |
+          set -euo pipefail
+          for component in gateway sandbox supervisor; do
+            image="ghcr.io/nvidia/openshell/${component}:${VERSION}"
+            # Archives are build artifacts from this run, not externally signed images.
+            nix shell --inputs-from . nixpkgs#skopeo -c \
+              skopeo --insecure-policy copy --all --preserve-digests \
+              --authfile "${HOME}/.docker/config.json" \
+              "oci-archive:artifacts/images/${component}.tar" "docker://${image}"
+            tasks/scripts/verify-image-sbom.sh "${image}" --require-cargo
+          done
 
       - name: Tag images with release version
         env:
           MAKE_LATEST: ${{ !inputs.is-prerelease && inputs.make-latest }}
-          SOURCE_TAG: ${{ inputs.source-sha }}
+          IS_PRERELEASE: ${{ inputs.is-prerelease }}
+          SOURCE_TAG: ${{ inputs.is-prerelease && inputs.source-sha || inputs.semver }}
           VERSION: ${{ inputs.semver }}
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
           for component in gateway sandbox supervisor; do
-            echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
-            docker buildx imagetools create \
-              --prefer-index=false \
-              -t "${REGISTRY}/${component}:${VERSION}" \
-              "${REGISTRY}/${component}:${SOURCE_TAG}"
+            if [[ "${IS_PRERELEASE}" == "true" ]]; then
+              echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as ${VERSION}..."
+              docker buildx imagetools create \
+                --prefer-index=false \
+                -t "${REGISTRY}/${component}:${VERSION}" \
+                "${REGISTRY}/${component}:${SOURCE_TAG}"
+            fi
             if [[ "${MAKE_LATEST}" == "true" ]]; then
               echo "Tagging ${REGISTRY}/${component}:${SOURCE_TAG} as latest..."
               docker buildx imagetools create \
@@ -473,7 +511,7 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "${MAKE_LATEST}" != "true" ]]; then
-            export OPENSHELL_NPM_PUBLISH_ARGS="--tag v${OPENSHELL_NPM_VERSION%.*}"
+            export OPENSHELL_NPM_PUBLISH_ARGS="--tag release-${OPENSHELL_NPM_VERSION%.*}"
           fi
           mise run sdk:ts:publish
 

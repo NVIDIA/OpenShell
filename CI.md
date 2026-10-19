@@ -347,6 +347,8 @@ gh workflow run release.yml --ref main -f tag=v0.4.3
 For a support release, replace `main` with its support branch. Release chooses
 the highest-numbered `v0.4.3-pre.N` reachable from the selected branch with a
 successful Pre-release run triggered by the tag or dispatched on that branch.
+The entire Pre-release run must succeed, including publication. If qualification
+passes but publication fails, rerun the failed jobs before promoting the candidate.
 It verifies the qualification summary's
 tag, commit, profile, run, attempt, and passing result before creating `v0.4.3`
 at the same commit. Missing or expired evidence blocks promotion. The promotion
@@ -358,12 +360,18 @@ without rerunning qualification. These artifacts have different embedded version
 from the qualified prerelease. Existing stable tags are never moved; a retry must
 resolve to the same qualified candidate.
 
+Stable image builds save multi-platform OCI archives as workflow artifacts without
+pushing to GHCR. Publication copies those archives, including their attestations,
+to the stable version tags and verifies their SBOMs before updating `latest`.
+The qualified prerelease's commit-SHA image tags remain unchanged.
+
 Release is manually dispatched; pushing a stable tag does not trigger publication.
 Stable runs serialize across branches. A version older than the highest stable
 Git tag publishes versioned artifacts while preserving shared latest channels:
 GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
-Its npm package uses a `vX.Y` dist-tag, and its snap files remain in the GitHub
-Release. Docs publish an immutable version and already prevent latest from moving
+Its npm package uses a `release-X.Y` dist-tag, and its snap files remain in the
+GitHub Release rather than updating a Snap Store support track.
+Docs publish an immutable version and already prevent latest from moving
 backward. Release Auto-Tag continues on `main`; support branch prereleases can
 use tag pushes or manual Pre-release dispatch from that branch.
 

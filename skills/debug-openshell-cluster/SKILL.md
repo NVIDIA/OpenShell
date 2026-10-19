@@ -99,6 +99,10 @@ vulnerability findings, check the deployed image digest and package version;
 deploy a rebuilt gateway image with the patched base. Updating the gateway
 binary alone does not update the libraries supplied by its container image.
 
+For stable releases, inspect the version tag or deployed digest. Promotion
+preserves the qualified prerelease's commit-SHA image tags; those tags do not
+identify the stable rebuild. See [image contents verification](https://docs.nvidia.com/openshell/latest/security/verify-image-contents).
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
