@@ -15,7 +15,7 @@ let
   images = import ./images.nix {
     inherit pkgs qemuPkgs firmwarePkgs;
   };
-  tmachine = pkgs.callPackage ./cli {
+  tmachine = pkgs.callPackage ./orchestrator {
     OVMF = firmwarePkgs.OVMF;
   };
   qemu = qemuPkgs.qemu.override { hostCpuOnly = true; };
