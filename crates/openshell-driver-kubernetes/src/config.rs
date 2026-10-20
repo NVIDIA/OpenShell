@@ -74,18 +74,34 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Operator-owned placement policy for each sandbox workload/supervisor pair.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum KubernetesPodAntiAffinity {
+    /// Leave pair placement to the scheduler without an anti-affinity rule.
+    #[default]
+    Off,
+    /// Prefer different nodes while allowing colocation.
+    Preferred,
+    /// Require different nodes, leaving a Pod pending when unavailable.
+    Required,
+}
+
 /// Driver-owned requirements for the Kubernetes sandbox runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
     /// TCP port exposed by the workload boundary to its paired control pod.
     pub boundary_port: u16,
+    /// Operator-owned node separation for each workload/supervisor pair.
+    pub pod_anti_affinity: KubernetesPodAntiAffinity,
 }
 
 impl Default for KubernetesSandboxRuntimeConfig {
     fn default() -> Self {
         Self {
             boundary_port: 5500,
+            pod_anti_affinity: KubernetesPodAntiAffinity::Off,
         }
     }
 }

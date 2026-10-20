@@ -996,7 +996,34 @@ gateway_pod_selector = { "app.kubernetes.io/name" = "openshell", "app.kubernetes
 [openshell.drivers.kubernetes.sandbox_runtime]
 # TLS-protected boundary listener reached only by the paired control pod.
 boundary_port = 5500
+# Node separation for each sandbox and its own supervisor: off (default),
+# preferred (allow colocation), or required (wait for different nodes).
+pod_anti_affinity = "off"
 ```
+
+Set `sandbox_runtime.pod_anti_affinity` to `required` to schedule each sandbox
+workload on a different node from its own supervisor. With insufficient eligible
+nodes, one pod remains Pending and sandbox startup cannot complete. `preferred`
+allows colocation when the scheduler cannot satisfy the preference. The default,
+`off`, adds no pair anti-affinity rule. Other sandbox/supervisor pairs may share
+these nodes; this setting does not create separate workload and supervisor pools.
+
+The setting applies when creating a sandbox and each time a stopped sandbox
+starts. Running pods keep their placement. Required mode uses the default
+Kubernetes scheduler and rejects admission changes that remove its required
+rule, change pair labels, or prebind a pod through `nodeName`. Node separation
+does not continuously evict pods when cluster conditions change.
+
+For Helm, configure the driver through `gatewayConfig`:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    sandbox_runtime:
+      pod_anti_affinity: required
+```
+
+The chart's top-level `affinity` value configures the gateway pod separately.
 
 The Kubernetes driver always creates the workload `NetworkPolicy` before
 releasing a sandbox Pod. Your cluster CNI must enforce ingress and egress
