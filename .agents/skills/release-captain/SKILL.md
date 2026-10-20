@@ -150,7 +150,10 @@ Finish these on Monday so Tuesday is only the cut.
    else means there's no assessment. For each finding:
 
    - **Real break:** needs a fix or revert before Tuesday, or must wait for a
-     minor train.
+     minor train. A break whose author accepted the risk on the PR can ship
+     in a patch only if the maintainers agree to the exception (as for the
+     Go SDK change in v0.1.5). Check that the release notes preview (Tuesday
+     step 2) gives upgrade steps for it.
    - **Unclear:** ask an owner of that code.
    - **False positive:** send it to the owner of
      `.github/prompts/compatibility-review.md` so the prompt can be tuned.
@@ -225,22 +228,43 @@ Finish these on Monday so Tuesday is only the cut.
    automatic pre-release picks up everything merged by then, and vX.Y.Z ships
    from it if it passes qualification."
 
+   The posted cutoff must match the pre-release that ships. If you end up
+   shipping one cut before the posted cutoff, such as Auto-Tag's or a fix-up
+   tagged early, reply in the thread with its commit and time, and say that
+   later merges go in the next release. For v0.1.5, the post said 16:00 UTC,
+   but `pre.7` was cut at 12:38 UTC.
+
 ## Tuesday: cut the release
 
 1. **Select the final candidate.** With a cutoff after Auto-Tag, first tag the
    final `-pre.N` by hand after approval, on the newest commit with a
    successful `Release Dev` run (commands as in Tuesday step 6). Once the final
    pre-release has finished, run the preview from Setup and repeat Monday
-   step 3 for its run. If the newest pre-release failed, either fix it (Monday step 5) or
-   confirm that shipping the earlier candidate without the later commits is
-   acceptable. If qualification passed but publication failed, rerun the
+   step 3 for its run. If the newest pre-release failed, either fix it (Monday
+   step 5) or confirm that shipping the earlier candidate without the later
+   commits is acceptable. If qualification passed but publication failed, rerun the
    failed jobs first; `Release` needs the whole run to pass.
 
 2. **Request approval.** Present the candidate tag, commit, qualification run,
-   compatibility assessment, and the commits since `$PREV`:
+   compatibility assessment, release notes preview, and the commits since
+   `$PREV`:
 
    ```shell
    git log --oneline --no-merges "$PREV..<candidate_tag>"
+   gh run download "$RUN" -n release-notes -D "$dir/notes" && cat "$dir/notes/release-notes.md"
+   ```
+
+   Release notes are generated from the merged PRs, including each PR's
+   "Release Notes" section, by `release-notes.yml`. Every `Pre-release` run
+   writes an advisory preview as its `release-notes` artifact. `Release`
+   writes them again in `Publish / Write Release Notes` and uses them as the
+   GitHub Release body, so the final text can differ slightly from the
+   preview. Check that upgrade notes cover every accepted break. To fix the
+   notes, edit the PR's Release Notes section and preview again without
+   publishing:
+
+   ```shell
+   gh workflow run release.yml --ref main -f tag="$VERSION" -f notes-only=true
    ```
 
 3. **Dispatch the release.** After approval:
@@ -314,10 +338,12 @@ Finish these on Monday so Tuesday is only the cut.
 |---|---|
 | Transient infrastructure failure in a pre-release | After approval, run `gh run rerun <run-id> --failed`, then recheck the candidate. Reply in the failure's `#openshell-triage` thread with the result. |
 | Pre-release qualification passed but publication failed | Usually a registry error, such as GHCR `failed to perform "Tag"`. Rerun failed jobs after approval; `Release` won't select the run until it fully passes. |
+| Pre-release run ends in `startup_failure` with no jobs | The workflow file is invalid at that commit, for example a missing permission (`v0.1.5-pre.6`). Rerunning won't help. Merge the workflow fix, then tag the next `-pre.N` on it. |
 | Code defect in a pre-release | Fix forward (Monday step 5): merge the fix, then tag the next `-pre.N` on it after its `Release Dev` run passes. |
 | `Cargo Deny` fails with `error[vulnerability]` | A new RustSec advisory hit a locked dependency; rerunning won't help. Find the IDs with `gh run view <run-id> --log-failed \| grep -E 'ID: RUSTSEC'`, find or open the bump PR, and treat it as a code defect. |
 | A pushed `-pre.N` tag started no run | Wait a few minutes and check again. Only after confirming no run exists, and with approval, run `gh workflow run release-prerelease.yml --ref main -f tag="$TAG"`. |
 | `Release` fails in `Select Qualified Prerelease` | No candidate qualified, or its evidence expired. Nothing was tagged or published. Fix the train, then dispatch again. |
+| `Release` fails in `Write Release Notes` | The GitHub Release isn't created until the notes succeed. After approval, rerun failed jobs. If it keeps failing, check the inference API key and variables named in the job log. |
 | `Release` fails after selection, transient | After approval, run `gh run rerun <run-id> --failed`. A stable tag that already points at the selected commit can be retried. |
 | `Release` fails after the `Release` job | The GitHub Release exists. A rerun of an npm or snap publish fails if that version already went out. Rerun only jobs that didn't publish, after approval. |
 | `Release` stuck queued | Releases queue behind each other. Check for another running `Release` or a GitHub Actions incident before asking a maintainer to cancel. Don't dispatch again. |
