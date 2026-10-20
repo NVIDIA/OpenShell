@@ -60,6 +60,24 @@ TLS.
     stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
+**--db-max-connections** *N*
+:   Connection ceiling for the database pool, shared by every
+    database-backed request. Must be at least 1, and at least 2 with
+    Postgres, because the SSH identity lock keeps one connection while it
+    queries the pool. When unset, the gateway uses the backend default:
+    **10** for Postgres, **5** for on-disk SQLite. An in-memory SQLite
+    database is always one connection.
+    TOML key: `database_max_connections`.
+    Environment: **OPENSHELL_DB_MAX_CONNECTIONS**.
+
+**--db-lock-max-connections** *N*
+:   Connection ceiling for the Postgres mutation lock pool, which each
+    replica opens on top of its database pool. Each mutation guard holds
+    one lock connection. Must be at least 1. When unset, the gateway uses
+    **4**. SQLite has no lock pool and ignores it.
+    TOML key: `database_lock_max_connections`.
+    Environment: **OPENSHELL_DB_LOCK_MAX_CONNECTIONS**.
+
 **--compute-driver** *DRIVER*
 :   Compute driver. Selects exactly one driver. Options: **podman**,
     **docker**, **kubernetes**, **vm**. When unset, the gateway

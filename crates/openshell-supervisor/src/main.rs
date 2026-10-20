@@ -88,6 +88,18 @@ struct Args {
     #[arg(long, env = openshell_core::sandbox_env::OTLP_ENDPOINT)]
     otlp_endpoint: Option<String>,
 
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_ENDPOINT)]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that exported events are downgraded to.
+    #[arg(long, env = openshell_core::sandbox_env::OTLP_OCSF_SCHEMA_VERSION)]
+    otlp_ocsf_schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
+
+    /// Name of the gateway that launched this sandbox, for telemetry.
+    #[arg(long, env = openshell_core::sandbox_env::GATEWAY_NAME)]
+    gateway_name: Option<String>,
+
     /// Create the private readiness socket after boundary and gateway attach.
     #[arg(long, env = "OPENSHELL_HEALTH_SOCKET_PATH")]
     health_socket_path: Option<PathBuf>,
@@ -118,8 +130,22 @@ struct Args {
     #[arg(long)]
     upstream_proxy_ca_bundle: Option<String>,
 
+    /// Path to a PEM CA bundle trusted for direct (non-proxied), inspected
+    /// upstream HTTPS egress. Independent of `--upstream-proxy-ca-bundle`:
+    /// applies regardless of whether a corporate proxy is configured.
+    #[arg(long)]
+    additional_ca_bundle: Option<String>,
+
     #[arg(long)]
     backend_descriptor_file: Option<PathBuf>,
+
+    /// Operator-owned endpoint registrations (JSON), outside the workload mount.
+    #[arg(long)]
+    isolation_backends_file: Option<PathBuf>,
+
+    /// Protected driver launch identity and generation-pinned TLS (JSON).
+    #[arg(long)]
+    boundary_launch_file: Option<PathBuf>,
 
     /// Protected gateway-issued credentials for this exact sandbox launch.
     #[arg(long)]
@@ -173,16 +199,62 @@ fn arm_parent_liveness(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-fn backend_descriptor(args: &Args) -> Result<BackendDescriptor> {
+fn backend_descriptor(args: &Args, admitted_backend: &str) -> Result<BackendDescriptor> {
     let path = args.backend_descriptor_file.as_deref().ok_or_else(|| {
         miette::miette!("--backend-descriptor-file is required for --role=isolation-backend")
     })?;
     let payload = std::fs::read(path)
         .map_err(|error| miette::miette!("read backend descriptor {}: {error}", path.display()))?;
     Ok(BackendDescriptor {
-        backend_name: openshell_sandbox_backend::BACKEND_NAME.to_string(),
+        backend_name: admitted_backend.to_string(),
         payload,
     })
+}
+
+fn backend_setup(
+    args: &Args,
+    admitted_backend: &str,
+) -> Result<Box<dyn openshell_supervisor::backend_setup::BackendSetup>> {
+    use openshell_supervisor::backend_setup::{BackendRegistrations, OpenShellBackendSetup};
+    let registrations = match &args.isolation_backends_file {
+        Some(path) => {
+            let bytes = std::fs::read(path).map_err(|error| {
+                miette::miette!("read isolation backend registrations: {error}")
+            })?;
+            let registrations: BackendRegistrations =
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    miette::miette!("decode isolation backend registrations: {error}")
+                })?;
+            registrations.validate()?;
+            registrations
+        }
+        None => BackendRegistrations::default(),
+    };
+    if admitted_backend == openshell_sandbox_backend::BACKEND_NAME {
+        if args.boundary_launch_file.is_some() {
+            return Err(miette::miette!(
+                "--boundary-launch-file is only valid for a registered external backend"
+            ));
+        }
+        return Ok(Box::new(OpenShellBackendSetup));
+    }
+    if !registrations
+        .backends
+        .iter()
+        .any(|backend| backend.name == admitted_backend)
+    {
+        return Err(miette::miette!(
+            "isolation backend {admitted_backend:?} is not registered"
+        ));
+    }
+    let path = args.boundary_launch_file.as_ref().ok_or_else(|| {
+        miette::miette!("--boundary-launch-file is required for a registered external backend")
+    })?;
+    let bytes = std::fs::read(path)
+        .map_err(|error| miette::miette!("read boundary launch metadata: {error}"))?;
+    let launch = serde_json::from_slice(&bytes)
+        .map_err(|error| miette::miette!("decode boundary launch metadata: {error}"))?;
+    Ok(Box::new(registrations.resolve(admitted_backend, launch)?))
 }
 
 fn auth_bundle(args: &Args) -> Result<openshell_core::jwt::SupervisorAuthBundle> {
@@ -228,7 +300,9 @@ fn validate_role_arguments(args: &Args) -> Result<()> {
             }
         }
         SupervisorRole::NetworkProxy => {
-            if args.backend_descriptor_file.is_some()
+            if args.isolation_backends_file.is_some()
+                || args.boundary_launch_file.is_some()
+                || args.backend_descriptor_file.is_some()
                 || args.auth_bundle_file.is_some()
                 || args.sandbox_id.is_some()
                 || args.sandbox.is_some()
@@ -281,7 +355,7 @@ fn main() -> Result<()> {
             .build()
             .into_diagnostic()?;
         return runtime.block_on(async move {
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            openshell_crypto::tls::ensure_default_provider();
             let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
@@ -296,13 +370,17 @@ fn main() -> Result<()> {
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
     let isolation_inputs = if args.role == SupervisorRole::IsolationBackend {
-        let descriptor = backend_descriptor(&args)?;
+        let admitted_backend =
+            std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND)
+                .map_err(|_| miette::miette!("driver must supply an admitted isolation backend"))?;
+        let setup = backend_setup(&args, &admitted_backend)?;
+        let descriptor = backend_descriptor(&args, &admitted_backend)?;
         let auth = auth_bundle(&args)?;
         // Install the driver-provisioned session before starting log push or
         // any other gateway client. `run_sandbox` obtains the same Sandbox
         // Protocol bearer slot after validating the descriptor binding.
         let _ = openshell_core::grpc_client::install_supervisor_auth_bundle(&auth)?;
-        Some((descriptor, auth))
+        Some((setup, descriptor, auth, admitted_backend))
     } else {
         None
     };
@@ -313,25 +391,35 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .into_diagnostic()?;
-    // The tonic exporter must be created inside the runtime that drives it.
+    let export_config = |endpoint| openshell_otel::OtlpExportConfig {
+        endpoint,
+        service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
+        service_version: Some(openshell_core::VERSION),
+        resource_attributes: supervisor_resource_attributes(
+            args.sandbox_id.as_deref(),
+            args.gateway_name.as_deref(),
+        ),
+    };
+    // The tonic exporters must be created inside the runtime that drives them.
     let (otlp_provider, otlp_setup_error) = runtime.block_on(async {
-        openshell_otel::provider_for(args.otlp_endpoint.as_deref().map(|endpoint| {
-            openshell_otel::OtlpTraceConfig {
-                endpoint,
-                service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
-                service_version: Some(openshell_core::VERSION),
-                resource_attributes: args
-                    .sandbox_id
-                    .iter()
-                    .map(|id| opentelemetry::KeyValue::new("openshell.sandbox.id", id.clone()))
-                    .collect(),
-            }
-        }))
+        openshell_otel::provider_for(args.otlp_endpoint.as_deref().map(export_config))
+    });
+    let ocsf_headers = isolation_inputs
+        .as_ref()
+        .and_then(|(_, _, auth, _)| auth.ocsf_otlp_headers.as_ref())
+        .map(openshell_core::jwt::SecretOtlpHeaders::expose_secret);
+    let (ocsf_export, ocsf_setup_error) = runtime.block_on(async {
+        start_ocsf_export(
+            args.otlp_ocsf_endpoint.as_deref().map(export_config),
+            ocsf_headers,
+            args.otlp_ocsf_schema_version,
+        )
     });
     let otlp_layer_provider = otlp_provider.clone();
+    let ocsf_layer = ocsf_export.as_ref().map(openshell_otel::OcsfOtlp::layer);
 
     let exit_code = runtime.block_on(async move {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let log_push_state = if args.role == SupervisorRole::IsolationBackend
             && let (Some(sandbox_id), Some(endpoint)) = (&args.sandbox_id, &args.openshell_endpoint)
         {
@@ -360,6 +448,7 @@ fn main() -> Result<()> {
         tracing_subscriber::registry()
             .with(logging_layers)
             .with(push_layer)
+            .with(ocsf_layer)
             .with(
                 otlp_layer_provider
                     .as_ref()
@@ -374,6 +463,11 @@ fn main() -> Result<()> {
             warn!(%error, "OTLP exporting could not be started; continuing without it");
         } else if let Some(endpoint) = &args.otlp_endpoint {
             info!(endpoint, "OTLP exporting enabled");
+        }
+        if let Some(error) = ocsf_setup_error {
+            warn!(%error, "OTLP OCSF export could not be started; continuing without it");
+        } else if let Some(endpoint) = &args.otlp_ocsf_endpoint {
+            info!(endpoint, "OTLP OCSF export enabled");
         }
 
         let workdir = args.workdir.clone();
@@ -407,34 +501,38 @@ fn main() -> Result<()> {
         match args.role {
             SupervisorRole::IsolationBackend => {
                 info!(command = ?command, "Starting sandbox supervision");
-                let Some((backend_descriptor, auth_bundle)) = isolation_inputs else {
+                let Some((backend_setup, backend_descriptor, auth_bundle, admitted_backend)) =
+                    isolation_inputs
+                else {
                     return Err(miette::miette!(
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
-                let admitted_isolation_backend =
-                    std::env::var(openshell_core::sandbox_env::ADMITTED_ISOLATION_BACKEND).ok();
-                let result = Box::pin(openshell_supervisor::run_sandbox(
-                    command,
-                    workdir,
-                    args.timeout,
-                    interactive,
-                    await_main_process_attachment,
-                    args.sandbox_id,
-                    args.sandbox,
-                    args.openshell_endpoint,
-                    args.policy_rules,
-                    args.policy_data,
-                    args.ssh_socket_path,
-                    args.health_socket_path,
-                    args.health_port,
-                    ocsf_enabled,
-                    ocsf_schema_version,
-                    upstream_proxy_args,
-                    backend_descriptor,
-                    auth_bundle,
-                    admitted_isolation_backend,
-                    args.main_exit_marker,
+                let result = Box::pin(openshell_supervisor::run_sandbox_with_backend(
+                    backend_setup.as_ref(),
+                    openshell_supervisor::SandboxRunConfig {
+                        command,
+                        workdir,
+                        timeout_secs: args.timeout,
+                        interactive,
+                        await_main_process_attachment,
+                        sandbox_id: args.sandbox_id,
+                        sandbox: args.sandbox,
+                        openshell_endpoint: args.openshell_endpoint,
+                        policy_rules: args.policy_rules,
+                        policy_data: args.policy_data,
+                        ssh_socket_path: args.ssh_socket_path,
+                        health_socket_path: args.health_socket_path,
+                        health_port: args.health_port,
+                        ocsf_enabled,
+                        ocsf_schema_version,
+                        upstream_proxy_args,
+                        additional_ca_bundle: args.additional_ca_bundle,
+                        backend_descriptor,
+                        auth_bundle,
+                        admitted_isolation_backend: Some(admitted_backend),
+                        main_exit_marker: args.main_exit_marker,
+                    },
                 ))
                 .await;
                 supervisor_exit(result)
@@ -453,12 +551,16 @@ fn main() -> Result<()> {
                     policy_data,
                     args.tls_dir,
                     upstream_proxy_args,
+                    args.additional_ca_bundle,
                 )
                 .await
             }
         }
     });
-    // Flush spans before `process::exit` skips destructors.
+    // Flush spans and OCSF records before `process::exit` skips destructors.
+    if let Some(export) = ocsf_export {
+        runtime.block_on(export.shutdown());
+    }
     if let Some(provider) = otlp_provider
         && let Err(error) = provider.shutdown()
     {
@@ -466,6 +568,50 @@ fn main() -> Result<()> {
     }
 
     std::process::exit(exit_code?);
+}
+
+/// Start OCSF event export to an OTLP collector.
+///
+/// A setup failure disables export and is returned for the caller to report
+/// once its tracing subscriber is installed.
+fn start_ocsf_export(
+    config: Option<openshell_otel::OtlpExportConfig<'_>>,
+    headers: Option<&str>,
+    schema_version: Option<openshell_ocsf::OcsfSchemaVersion>,
+) -> (
+    Option<openshell_otel::OcsfOtlp>,
+    Option<openshell_otel::SetupError>,
+) {
+    let Some(config) = config else {
+        return (None, None);
+    };
+    let started = openshell_otel::OtlpTarget::new(&config).and_then(|target| {
+        Ok(openshell_otel::OcsfOtlp::start(
+            target.log_exporter_with_headers(headers)?,
+            target.resource().clone(),
+            schema_version,
+        ))
+    });
+    match started {
+        Ok(export) => (Some(export), None),
+        Err(error) => (None, Some(error)),
+    }
+}
+
+/// Resource attributes identifying this supervisor's sandbox and the gateway
+/// that launched it.
+fn supervisor_resource_attributes(
+    sandbox_id: Option<&str>,
+    gateway_name: Option<&str>,
+) -> Vec<opentelemetry::KeyValue> {
+    sandbox_id
+        .map(|id| opentelemetry::KeyValue::new("openshell.sandbox.id", id.to_string()))
+        .into_iter()
+        .chain(openshell_otel::gateway_resource_attributes(
+            gateway_name,
+            None,
+        ))
+        .collect()
 }
 
 /// A more verbose log level raises `openshell*` spans; dependency spans stay at
@@ -634,6 +780,75 @@ mod tests {
     }
 
     #[test]
+    fn telemetry_names_the_sandbox_and_its_gateway() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--sandbox-id",
+            "sb-1",
+            "--gateway-name",
+            "prod-west",
+        ])
+        .expect("parse telemetry identity");
+        let attributes = supervisor_resource_attributes(
+            args.sandbox_id.as_deref(),
+            args.gateway_name.as_deref(),
+        );
+        assert_eq!(
+            attributes,
+            vec![
+                opentelemetry::KeyValue::new("openshell.sandbox.id", "sb-1"),
+                opentelemetry::KeyValue::new("openshell.gateway.name", "prod-west"),
+            ]
+        );
+        assert!(supervisor_resource_attributes(None, None).is_empty());
+    }
+
+    #[test]
+    fn ocsf_export_takes_a_supported_schema_version() {
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--otlp-ocsf-endpoint",
+            "http://siem:4317",
+            "--otlp-ocsf-schema-version",
+            "1.3",
+        ])
+        .expect("parse OCSF export");
+        assert_eq!(args.otlp_ocsf_endpoint.as_deref(), Some("http://siem:4317"));
+        assert_eq!(
+            args.otlp_ocsf_schema_version,
+            Some(openshell_ocsf::OcsfSchemaVersion::V1_3)
+        );
+        assert!(
+            Args::try_parse_from(["openshell-supervisor", "--otlp-ocsf-schema-version", "1.8"])
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn ocsf_export_starts_only_with_a_valid_endpoint() {
+        let config = |endpoint| openshell_otel::OtlpExportConfig {
+            endpoint,
+            service_name: openshell_otel::ServiceName::Fixed(SERVICE_NAME),
+            service_version: None,
+            resource_attributes: Vec::new(),
+        };
+        let (export, error) = start_ocsf_export(None, None, None);
+        assert!(export.is_none() && error.is_none());
+
+        let (export, error) = start_ocsf_export(Some(config("not a url")), None, None);
+        assert!(export.is_none());
+        assert!(error.is_some());
+
+        let (export, error) = start_ocsf_export(
+            Some(config("http://127.0.0.1:4317")),
+            Some("authorization=Bearer%20t"),
+            None,
+        );
+        assert!(error.is_none(), "unexpected setup error: {error:?}");
+        export.expect("OCSF export").shutdown().await;
+    }
+
+    #[test]
     fn isolation_backend_is_the_default_role() {
         let directory = tempfile::tempdir().expect("temporary runtime descriptor directory");
         let descriptor_path = directory.path().join("runtime-descriptor.json");
@@ -653,7 +868,7 @@ mod tests {
         assert_eq!(args.role, SupervisorRole::IsolationBackend);
         assert!(validate_role_arguments(&args).is_ok());
         assert_eq!(
-            backend_descriptor(&args)
+            backend_descriptor(&args, openshell_sandbox_backend::BACKEND_NAME)
                 .expect("runtime descriptor")
                 .payload,
             vec![0]
@@ -664,6 +879,47 @@ mod tests {
     fn isolation_backend_inputs_are_mandatory() {
         let args = Args::try_parse_from(["openshell-supervisor"]).expect("parse defaults");
         assert!(validate_role_arguments(&args).is_err());
+    }
+
+    #[test]
+    fn external_backend_names_require_operator_registration() {
+        let args = Args::try_parse_from(["openshell-supervisor"]).unwrap();
+        assert_eq!(
+            backend_setup(&args, openshell_sandbox_backend::BACKEND_NAME)
+                .unwrap()
+                .backend_name(),
+            openshell_sandbox_backend::BACKEND_NAME
+        );
+        assert!(
+            backend_setup(&args, "external")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not registered")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("backends.json");
+        std::fs::write(&path, r#"{"backends":[{"name":"external","endpoint":{"kind":"unix","socket_path":"/trusted/backend.sock"}}]}"#).unwrap();
+        let args = Args::try_parse_from([
+            "openshell-supervisor",
+            "--isolation-backends-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(
+            backend_setup(&args, "external")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("--boundary-launch-file is required")
+        );
+        assert!(
+            backend_setup(&args, "External")
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("not registered")
+        );
     }
 
     #[test]
@@ -715,6 +971,7 @@ mod tests {
     #[test]
     fn completion_marker_must_be_absolute() {
         assert!(validate_main_exit_marker(Some(Path::new("relative"))).is_err());
-        assert!(validate_main_exit_marker(Some(Path::new("/run/openshell/main-exit"))).is_ok());
+        let absolute = std::env::temp_dir().join("openshell-main-exit");
+        assert!(validate_main_exit_marker(Some(&absolute)).is_ok());
     }
 }

@@ -145,6 +145,18 @@ pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-p
 /// mount is used rather than a driver secret.
 pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
 
+/// Container-side mount path for an operator-supplied additional destination
+/// CA bundle.
+///
+/// Drivers with an `additional_ca_bundle` operator setting bind-mount the
+/// host PEM file here (read-only) and pass the path on the supervisor's argv
+/// via `--additional-ca-bundle`. The supervisor folds it into its upstream
+/// TLS trust store alongside the system CA bundle, for direct (non-proxied)
+/// inspected HTTPS egress to destinations signed by a private CA — unlike
+/// [`PROXY_CA_MOUNT_PATH`], this applies regardless of whether a corporate
+/// forward proxy is configured.
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = "/etc/openshell/tls/additional/ca-bundle.pem";
+
 /// A validated corporate upstream-proxy address.
 ///
 /// Produced by [`parse_upstream_proxy_url`], which is the single source of
@@ -1239,8 +1251,10 @@ mod tests {
     fn ca_bundle_file_accepts_a_real_certificate() {
         // The positive case that pins host acceptance to guest acceptance:
         // what the driver stages is exactly what rustls will trust.
-        let cert = rcgen::generate_simple_self_signed(vec!["proxy.corp.example".to_string()])
-            .expect("test CA");
+        let cert = openshell_crypto::pki::generate_simple_self_signed(vec![
+            "proxy.corp.example".to_string(),
+        ])
+        .expect("test CA");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy-ca.pem");
         std::fs::write(&path, cert.cert.pem()).unwrap();

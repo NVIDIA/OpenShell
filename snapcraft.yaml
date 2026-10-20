@@ -13,7 +13,8 @@ description: |
 
   The OpenShell snap ships a CLI (`openshell`), a terminal UI
   (`openshell.term`), a standalone policy prover (`openshell.prover`), and a
-  managed gateway daemon (`openshell.user-gateway`).
+  managed gateway daemon (`openshell.user-gateway`). The user gateway is
+  disabled by default so that one selected user can run it.
 
   **Setup instructions**
 
@@ -23,12 +24,30 @@ description: |
 
        Snap Store installations automatically connect the required interfaces.
 
+       Enable and start the gateway from the single user account that will run
+       it:
+
+         systemctl --user enable --now snap.openshell.user-gateway.service
+
+       Do not enable the gateway for multiple users who may be logged in at the
+       same time. Every user gateway binds to 127.0.0.1:17670, so only one can
+       run on the system at a time.
+
+       Older OpenShell snap revisions could enable the user gateway globally.
+       When upgrading such an installation, remove that global enablement so
+       the gateway does not start automatically for other users:
+
+         sudo systemctl disable --global snap.openshell.user-gateway.service
+
+       This does not stop gateways already running in other user sessions.
+       Those users must disable and stop the service from their own sessions.
+
        If the OpenShell snap was installed before Docker was running, its user
        service may have hit the systemd start limit. Resolve this from the
        affected user's session after Docker is available:
 
          systemctl --user reset-failed snap.openshell.user-gateway.service
-         snap start --user openshell.user-gateway
+         systemctl --user restart snap.openshell.user-gateway.service
 
     2. Register the per-user gateway after it provisions its mTLS credentials:
 

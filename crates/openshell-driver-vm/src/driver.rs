@@ -44,6 +44,8 @@ use oci_client::manifest::{
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::UpstreamProxyConfig;
+use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
+use openshell_core::driver_mounts;
 use openshell_core::gpu::{
     driver_gpu_requirements, effective_driver_gpu_count, validate_specific_gpu_device_request,
 };
@@ -89,9 +91,11 @@ use std::os::fd::AsRawFd as _;
 use std::os::fd::OwnedFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -120,6 +124,41 @@ const DEFAULT_ROOTFS_TAR_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const ROOTFS_TAR_STAGING_DIR: &str = "rootfs-tar-staging";
 const VM_CONSOLE_DIAGNOSTIC_BYTES: u64 = 8 * 1024;
 
+/// Mirrors the Docker/Podman `type` tag so their bind entries parse
+/// unchanged; virtiofs can only share host directories.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum VmMountType {
+    Bind,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VmMountConfig {
+    #[serde(default, rename = "type")]
+    #[allow(dead_code)]
+    mount_type: Option<VmMountType>,
+    source: String,
+    target: String,
+    #[serde(default = "default_read_only")]
+    read_only: bool,
+}
+
+impl VmMountConfig {
+    /// Source without trailing slashes. A trailing slash makes both the
+    /// symlink check and libkrun's `O_NOFOLLOW` open resolve a final symlink.
+    fn host_source(&self) -> &str {
+        match self.source.trim_end_matches('/') {
+            "" => "/",
+            trimmed => trimmed,
+        }
+    }
+}
+
+fn default_read_only() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct VmSandboxDriverConfig {
@@ -129,6 +168,8 @@ struct VmSandboxDriverConfig {
     )]
     gpu_device_ids: Option<Vec<String>>,
     rootfs_tar_path: Option<String>,
+    #[serde(default)]
+    mounts: Vec<VmMountConfig>,
 }
 
 impl VmSandboxDriverConfig {
@@ -251,6 +292,7 @@ enum GuestImagePayloadSource {
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VmDriverConfig {
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     #[serde(default)]
@@ -263,6 +305,12 @@ pub struct VmDriverConfig {
     /// supplies its own export endpoint; driver TOML cannot set it.
     #[serde(skip)]
     pub supervisor_otlp_endpoint: Option<String>,
+    /// OCSF event export passed to supervisors. The gateway supplies its own
+    /// export; driver TOML cannot set it.
+    #[serde(skip)]
+    pub supervisor_ocsf_export: Option<openshell_core::sandbox_env::OcsfOtlpExport>,
+    /// Gateway name passed to supervisors for their telemetry.
+    pub supervisor_gateway_name: Option<String>,
     pub state_dir: PathBuf,
     pub launcher_bin: Option<PathBuf>,
     pub default_image: String,
@@ -306,6 +354,9 @@ pub struct VmDriverConfig {
     /// Maximum rootfs tar file size in bytes. Defaults to 10 GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs_tar_max_bytes: Option<u64>,
+
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 /// Redacting `Debug` so a proxy URL or credential path never reaches a log.
@@ -317,6 +368,8 @@ impl std::fmt::Debug for VmDriverConfig {
         f.debug_struct("VmDriverConfig")
             .field("grpc_endpoint", &self.grpc_endpoint)
             .field("supervisor_otlp_endpoint", &self.supervisor_otlp_endpoint)
+            .field("supervisor_ocsf_export", &self.supervisor_ocsf_export)
+            .field("supervisor_gateway_name", &self.supervisor_gateway_name)
             .field("state_dir", &self.state_dir)
             .field("launcher_bin", &self.launcher_bin)
             .field("default_image", &self.default_image)
@@ -368,6 +421,7 @@ impl std::fmt::Debug for VmDriverConfig {
             )
             .field("rootfs_tar_staging_dir", &self.rootfs_tar_staging_dir)
             .field("rootfs_tar_max_bytes", &self.rootfs_tar_max_bytes)
+            .field("enable_bind_mounts", &self.enable_bind_mounts)
             .finish()
     }
 }
@@ -381,6 +435,8 @@ impl Default for VmDriverConfig {
         Self {
             grpc_endpoint: String::new(),
             supervisor_otlp_endpoint: None,
+            supervisor_ocsf_export: None,
+            supervisor_gateway_name: None,
             allow_driver_config: false,
             resource_admission:
                 openshell_core::resource_admission::ResourceAdmissionConfig::default(),
@@ -407,6 +463,7 @@ impl Default for VmDriverConfig {
             sandbox_gid: None,
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -988,6 +1045,12 @@ impl VmDriver {
                 .env(openshell_core::sandbox_env::OTLP_ENDPOINT, endpoint)
                 .envs(openshell_otel::current_trace_context_environment());
         }
+        if let Some(export) = &self.config.supervisor_ocsf_export {
+            command.envs(export.environment());
+        }
+        if let Some(name) = &self.config.supervisor_gateway_name {
+            command.env(openshell_core::sandbox_env::GATEWAY_NAME, name);
+        }
         if let Some(server_name) = gateway_tls_server_name {
             command.env(
                 openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME,
@@ -1094,8 +1157,14 @@ impl VmDriver {
             sandbox,
         )?;
         validate_vm_sandbox(sandbox, self.config.gpu_enabled)?;
-        let has_rootfs_tar =
-            VmSandboxDriverConfig::from_sandbox(sandbox).is_ok_and(|c| c.rootfs_tar_path.is_some());
+        let driver_config =
+            VmSandboxDriverConfig::from_sandbox(sandbox).map_err(Status::invalid_argument)?;
+        validate_vm_driver_mounts(
+            &driver_config.mounts,
+            &self.config,
+            sandbox_requests_gpu(sandbox),
+        )?;
+        let has_rootfs_tar = driver_config.rootfs_tar_path.is_some();
         if self.resolved_sandbox_image(sandbox).is_none() && !has_rootfs_tar {
             return Err(Status::failed_precondition(
                 "vm sandboxes require template.image, rootfs_tar_path in driver_config, or a configured default sandbox image",
@@ -1314,14 +1383,11 @@ impl VmDriver {
                 .as_ref()
                 .map_or(&[], |spec| spec.launch_authentication.as_slice()),
         )?;
-        let is_gpu = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.resource_requirements.as_ref())
-            .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
-            .is_some();
+        let is_gpu = sandbox_requests_gpu(&sandbox);
         let driver_config =
             VmSandboxDriverConfig::from_sandbox(&sandbox).map_err(Status::invalid_argument)?;
+        // Check host sources before the costly image and overlay preparation.
+        validate_vm_mount_sources(&driver_config.mounts).await?;
         let driver_config_had_rootfs_tar = driver_config.rootfs_tar_path.is_some();
         let rootfs_tar_path = match driver_config.rootfs_tar_path {
             Some(raw) if overlay_preparation == OverlayPreparation::Fresh => {
@@ -1389,9 +1455,9 @@ impl VmDriver {
         let boundary_generation =
             match tokio::fs::read_to_string(state_dir.join(HOST_BOUNDARY_GENERATION_FILE)).await {
                 Ok(generation) if !generation.trim().is_empty() => generation.trim().to_string(),
-                Ok(_) => random_boundary_token(),
+                Ok(_) => random_boundary_token()?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    random_boundary_token()
+                    random_boundary_token()?
                 }
                 Err(error) => {
                     return Err(Status::internal(format!(
@@ -1497,7 +1563,16 @@ impl VmDriver {
             return Err(err);
         }
 
-        if let Err(err) = Self::validate_launch_plan_backend(is_gpu, &plan) {
+        if let Err(err) = Self::validate_launch_plan_backend(is_gpu, &plan).and_then(|()| {
+            // Cannot fail today: `validate_sandbox` already ran and non-GPU
+            // QEMU is blocked above. Keeps virtiofs mounts off QEMU once that
+            // guard is lifted.
+            validate_vm_driver_mounts(
+                &driver_config.mounts,
+                &self.config,
+                plan.backend == VmBackend::Qemu,
+            )
+        }) {
             self.lifecycle_extensions
                 .after_launch_failed(
                     &sandbox,
@@ -1533,7 +1608,14 @@ impl VmDriver {
             });
         }
 
-        if let Err(err) = inject_guest_init_dropins(&overlay_disk, &plan.guest_init_dropins) {
+        // The mount manifest is always written, even when empty, so an
+        // image-supplied manifest in the lowerdir can never drive guest mounts.
+        if let Err(err) = inject_guest_init_dropins(&overlay_disk, &plan.guest_init_dropins)
+            .and_then(|()| {
+                inject_guest_mount_manifest(&overlay_disk, &driver_config.mounts)
+                    .map_err(|error| Status::internal(format!("inject VM mount manifest: {error}")))
+            })
+        {
             self.lifecycle_extensions
                 .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
                 .await;
@@ -1554,14 +1636,20 @@ impl VmDriver {
             trust_anchor_pem: channel_tls.trust_anchor_pem.clone(),
         };
         let transport = if plan.backend == VmBackend::Qemu {
-            SandboxTransport::Vsock {
-                guest_cid: plan.vsock_cid.ok_or_else(|| {
-                    Status::internal("QEMU launch plan is missing a guest vsock CID")
-                })?,
-                port: VM_CONTROL_PORT,
+            let guest_cid = plan
+                .vsock_cid
+                .ok_or_else(|| Status::internal("QEMU launch plan is missing a guest vsock CID"))?;
+            SandboxTransport::RuntimeInitiatedVsock {
+                guest_cid,
+                // Each QEMU guest connects to a distinct host port. The CID
+                // allocator already guarantees uniqueness among live guests.
+                port: VM_CONTROL_PORT
+                    .checked_add(guest_cid)
+                    .filter(|port| *port != u32::MAX)
+                    .ok_or_else(|| Status::resource_exhausted("VM control port space exhausted"))?,
             }
         } else {
-            SandboxTransport::Unix {
+            SandboxTransport::RuntimeInitiatedUnix {
                 socket_path: control_socket.clone(),
             }
         };
@@ -1651,6 +1739,7 @@ impl VmDriver {
         } else {
             let _ = tokio::fs::remove_file(&control_socket).await;
             command
+                .arg("--vm-vsock-runtime-initiated")
                 .arg("--vm-vsock-control-port")
                 .arg(VM_CONTROL_PORT.to_string())
                 .arg("--vm-vsock-control-socket")
@@ -1674,6 +1763,21 @@ impl VmDriver {
         }
         for env in sandbox_owner_state.guest_environment() {
             command.arg("--vm-env").arg(env);
+        }
+        for (i, mount) in driver_config.mounts.iter().enumerate() {
+            command.arg("--vm-mount").arg(format!(
+                "{}\t{}\t{}",
+                mount.host_source(),
+                virtiofs_tag(i),
+                vm_mount_mode(mount.read_only)
+            ));
+            info!(
+                sandbox_id = %sandbox.id,
+                source = %mount.host_source(),
+                target = %mount.target,
+                mode = vm_mount_mode(mount.read_only),
+                "vm driver: sharing host directory with sandbox"
+            );
         }
 
         info!(
@@ -4983,6 +5087,183 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
     Ok(())
 }
 
+/// Each share is one virtio device and libkrun has a fixed number of interrupt
+/// lines; a share beyond them breaks VM start. The VM's own devices take up
+/// to 8 (balloon, rng, console, root filesystem, three disks, vsock), plus an
+/// RTC on `aarch64`. `x86_64` has 11 lines. `aarch64` has 128 on HVF but only
+/// 64 usable on KVM (the vGIC is created with 96 SPIs and libkrun allocates
+/// from GSI 32), so 32 leaves headroom on both.
+const VM_MAX_BIND_MOUNTS: usize = if cfg!(target_arch = "aarch64") { 32 } else { 3 };
+
+const VM_RESERVED_GUEST_PATHS: &[&str] = &[
+    "/.openshell",
+    "/.openshell-bootstrap",
+    "/overlay",
+    "/lower",
+    "/newroot",
+    "/image-cache",
+    "/srv",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/tmp",
+];
+
+const VIRTIOFS_TAG_PREFIX: &str = "osfs";
+
+fn virtiofs_tag(index: usize) -> String {
+    format!("{VIRTIOFS_TAG_PREFIX}{index}")
+}
+
+fn vm_mount_mode(read_only: bool) -> &'static str {
+    if read_only { "ro" } else { "rw" }
+}
+
+/// Guest manifest consumed by `mount_virtiofs_shares`: `tag\ttarget\tmode`.
+fn render_mount_manifest(mounts: &[VmMountConfig]) -> String {
+    let mut manifest = String::new();
+    for (i, mount) in mounts.iter().enumerate() {
+        writeln!(
+            manifest,
+            "{}\t{}\t{}",
+            virtiofs_tag(i),
+            driver_mounts::normalize_mount_target(&mount.target),
+            vm_mount_mode(mount.read_only)
+        )
+        .expect("write to String cannot fail");
+    }
+    manifest
+}
+
+fn sandbox_requests_gpu(sandbox: &Sandbox) -> bool {
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
+        .is_some()
+}
+
+fn validate_no_control_chars(value: &str, field: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_vm_driver_mounts(
+    mounts: &[VmMountConfig],
+    config: &VmDriverConfig,
+    is_qemu: bool,
+) -> Result<(), Status> {
+    if mounts.is_empty() {
+        return Ok(());
+    }
+    if is_qemu {
+        return Err(Status::failed_precondition(
+            "vm bind mounts require the libkrun backend; GPU sandboxes and other QEMU launches cannot use them",
+        ));
+    }
+    if !config.enable_bind_mounts {
+        return Err(Status::failed_precondition(
+            "vm bind mounts require enable_bind_mounts = true in the VM driver configuration",
+        ));
+    }
+    config
+        .resource_admission
+        .reject_unlabelable("host bind mount")?;
+    if mounts.len() > VM_MAX_BIND_MOUNTS {
+        return Err(Status::invalid_argument(format!(
+            "vm sandboxes support at most {VM_MAX_BIND_MOUNTS} bind mounts, got {}",
+            mounts.len()
+        )));
+    }
+    let mut targets: Vec<String> = Vec::with_capacity(mounts.len());
+    for mount in mounts {
+        driver_mounts::validate_absolute_mount_source(&mount.source, "vm mount source")
+            .map_err(Status::invalid_argument)?;
+        validate_no_control_chars(&mount.source, "vm mount source")
+            .map_err(Status::invalid_argument)?;
+        driver_mounts::validate_container_mount_target(&mount.target)
+            .map_err(Status::invalid_argument)?;
+        let normalized = driver_mounts::normalize_mount_target(&mount.target);
+        driver_mounts::validate_workspace_mount_target(
+            &normalized,
+            driver_mounts::DEFAULT_WORKSPACE_ROOT,
+        )
+        .map_err(Status::invalid_argument)?;
+        for reserved in VM_RESERVED_GUEST_PATHS {
+            if driver_mounts::paths_overlap(Path::new(&normalized), Path::new(reserved)) {
+                return Err(Status::invalid_argument(format!(
+                    "vm mount target '{}' conflicts with VM-internal path '{reserved}'",
+                    mount.target
+                )));
+            }
+        }
+        // Nested shares would make guest init create directories inside an
+        // already-mounted host share, so targets must be disjoint.
+        if let Some(existing) = targets.iter().find(|existing| {
+            driver_mounts::paths_overlap(Path::new(&normalized), Path::new(existing))
+        }) {
+            return Err(Status::invalid_argument(if *existing == normalized {
+                format!("duplicate vm driver_config mount target '{normalized}'")
+            } else {
+                format!("vm mount target '{normalized}' overlaps mount target '{existing}'")
+            }));
+        }
+        targets.push(normalized);
+    }
+    Ok(())
+}
+
+/// Host filesystem checks, run at provisioning rather than in
+/// `validate_sandbox` so a briefly missing source (for example an NFS share
+/// not yet mounted after a reboot) fails provisioning visibly instead of
+/// denying recovery of a persisted sandbox.
+#[allow(clippy::result_large_err)]
+async fn validate_vm_mount_sources(mounts: &[VmMountConfig]) -> Result<(), Status> {
+    for mount in mounts {
+        // libkrun opens the share root without following a final symlink.
+        let metadata = match tokio::fs::symlink_metadata(mount.host_source()).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Status::failed_precondition(format!(
+                    "vm mount source path does not exist: {}",
+                    mount.source
+                )));
+            }
+            Err(err) => {
+                return Err(Status::failed_precondition(format!(
+                    "cannot access vm mount source {}: {err}",
+                    mount.source
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(Status::invalid_argument(format!(
+                "vm mount source must be a real directory, not a symbolic link: {}",
+                mount.source
+            )));
+        }
+        if !metadata.is_dir() {
+            return Err(Status::invalid_argument(format!(
+                "vm mount source must be a directory, not a file: {}",
+                mount.source
+            )));
+        }
+        // On macOS libkrun opens the share root during guest boot and panics
+        // if it cannot, so an unreadable source must fail here instead.
+        if let Err(err) = tokio::fs::read_dir(mount.host_source()).await {
+            return Err(Status::failed_precondition(format!(
+                "cannot access vm mount source {}: {err}",
+                mount.source
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn validate_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     let spec = sandbox
@@ -5953,12 +6234,14 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
     environment
 }
 
-fn random_boundary_token() -> String {
+fn random_boundary_token() -> Result<String, Status> {
     let mut token = String::with_capacity(64);
-    for byte in rand::random::<[u8; 32]>() {
+    for byte in openshell_crypto::random_bytes::<32>()
+        .map_err(|error| Status::internal(error.to_string()))?
+    {
         write!(&mut token, "{byte:02x}").expect("writing to String cannot fail");
     }
-    token
+    Ok(token)
 }
 
 fn build_guest_environment(sandbox: &Sandbox, config: &VmDriverConfig) -> Vec<String> {
@@ -6026,17 +6309,19 @@ fn sandbox_socket_dir(socket_root: &Path, sandbox_id: &str) -> PathBuf {
 fn allocate_socket_root() -> Result<(PathBuf, OwnedFd), std::io::Error> {
     let uid = rustix::process::geteuid().as_raw();
     allocate_socket_root_with(Path::new("/tmp"), || {
-        let random: u128 = rand::random();
-        format!("os-{uid}-{random:032x}")
+        let random = u128::from_ne_bytes(
+            openshell_crypto::random_bytes::<16>().map_err(std::io::Error::other)?,
+        );
+        Ok(format!("os-{uid}-{random:032x}"))
     })
 }
 
 fn allocate_socket_root_with(
     base: &Path,
-    mut gen_name: impl FnMut() -> String,
+    mut gen_name: impl FnMut() -> Result<String, std::io::Error>,
 ) -> Result<(PathBuf, OwnedFd), std::io::Error> {
     for _ in 0..SOCKET_ROOT_ALLOC_RETRIES {
-        let root = base.join(gen_name());
+        let root = base.join(gen_name()?);
         match rustix::fs::mkdir(&root, rustix::fs::Mode::from_raw_mode(0o700)) {
             Ok(()) => {
                 let fd = rustix::fs::open(
@@ -6840,7 +7125,10 @@ fn inject_guest_boundary_bundle(
     let tls = match &config.listener {
         BoundaryListener::Unix { tls, .. }
         | BoundaryListener::TlsTcp { tls, .. }
-        | BoundaryListener::Vsock { tls, .. } => tls.clone(),
+        | BoundaryListener::Vsock { tls, .. }
+        | BoundaryListener::RuntimeInitiatedTlsTcp { tls, .. }
+        | BoundaryListener::RuntimeInitiatedUnix { tls, .. }
+        | BoundaryListener::RuntimeInitiatedVsock { tls, .. } => tls.clone(),
     };
     let encoded_config = config
         .encode()
@@ -6859,6 +7147,17 @@ fn inject_guest_boundary_bundle(
         write_rootfs_image_file(overlay_disk, &path, contents)?;
         set_rootfs_image_file_mode(overlay_disk, &path, 0o600)?;
     }
+    Ok(())
+}
+
+fn inject_guest_mount_manifest(
+    overlay_disk: &Path,
+    mounts: &[VmMountConfig],
+) -> Result<(), String> {
+    let manifest = render_mount_manifest(mounts);
+    let guest_path = overlay_upper_path("/.openshell/mounts.manifest");
+    write_rootfs_image_file(overlay_disk, &guest_path, manifest.as_bytes())?;
+    set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644)?;
     Ok(())
 }
 
@@ -7180,7 +7479,47 @@ fn overlay_staging_dir(overlay_disk: &Path) -> PathBuf {
     ))
 }
 
+/// Grace after SIGTERM before killing a host process.
+const PROCESS_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+
+/// Mirrors the supervisor's workload SIGTERM grace.
+const SUPERVISOR_WORKLOAD_TERM_SECS: u64 = 5;
+/// Guest process-tree termination grace plus forced-kill reap time.
+const GUEST_PROCESS_TREE_SECS: u64 = DEFAULT_STOP_TIMEOUT_SECS as u64 + 2;
+/// Mirrors the guest's filesystem flush timeout.
+const GUEST_FLUSH_SECS: u64 = 3;
+/// Allow control round trips and scheduling between shutdown stages.
+const SHUTDOWN_SCHEDULING_SECS: u64 = 2;
+
+/// Budget for workload termination, guest process cleanup and filesystem flush.
+/// The cap may interrupt slow shutdown or log draining. Only the stop timeout
+/// is shared; changes to the other stage limits must be reflected here.
+const SUPERVISOR_SHUTDOWN_GRACE: Duration = Duration::from_secs(
+    SUPERVISOR_WORKLOAD_TERM_SECS
+        + GUEST_PROCESS_TREE_SECS
+        + GUEST_FLUSH_SECS
+        + SHUTDOWN_SCHEDULING_SECS,
+);
+
+/// Mirrors the gateway's stop deadline when reclaiming expired provisioning.
+const STOP_CALLER_DEADLINE: Duration = Duration::from_secs(30);
+
+// The longest stop is the supervisor's grace plus the VM's.
+const _: () = assert!(
+    SUPERVISOR_SHUTDOWN_GRACE.as_secs() + PROCESS_TERMINATION_GRACE.as_secs()
+        < STOP_CALLER_DEADLINE.as_secs()
+);
+
 async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
+    terminate_vm_process_within(child, PROCESS_TERMINATION_GRACE)
+        .await
+        .map(|_| ())
+}
+
+async fn terminate_vm_process_within(
+    child: &mut Child,
+    grace: Duration,
+) -> Result<ExitStatus, std::io::Error> {
     if let Some(pid) = child.id()
         && let Err(err) = kill(Pid::from_raw(pid.cast_signed()), Signal::SIGTERM)
         && err != Errno::ESRCH
@@ -7190,19 +7529,42 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
         )));
     }
 
-    match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(err)) => Err(err),
-        Err(_) => {
-            child.kill().await?;
-            child.wait().await.map(|_| ())
-        }
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        status
+    } else {
+        child.kill().await?;
+        child.wait().await
     }
 }
 
+/// Stop the host supervisor first, then the VM it was supervising.
+///
+/// Keep liveness open until the supervisor exits: EOF skips orderly workload
+/// teardown, the guest filesystem flush and the supervisor's log export drain.
 async fn terminate_sandbox_processes(process: &mut VmProcess) -> Result<(), std::io::Error> {
+    terminate_sandbox_processes_within(process, SUPERVISOR_SHUTDOWN_GRACE).await
+}
+
+async fn terminate_sandbox_processes_within(
+    process: &mut VmProcess,
+    supervisor_grace: Duration,
+) -> Result<(), std::io::Error> {
+    let supervisor_pid = process.supervisor.id();
+    let supervisor_error = terminate_vm_process_within(&mut process.supervisor, supervisor_grace)
+        .await
+        .inspect(|status| {
+            // An orderly shutdown returns the workload's exit code, which can
+            // be nonzero even after the guest acknowledges termination.
+            if status.signal().is_some() {
+                warn!(
+                    ?supervisor_pid,
+                    %status,
+                    "VM host supervisor was terminated by a signal; guest filesystem flush was not confirmed and recent writes may be lost"
+                );
+            }
+        })
+        .err();
     process.supervisor_liveness.take();
-    let supervisor_error = terminate_vm_process(&mut process.supervisor).await.err();
     let vm_error = terminate_vm_process(&mut process.child).await.err();
 
     match (supervisor_error, vm_error) {
@@ -7466,7 +7828,10 @@ mod tests {
     use tonic::Code;
 
     fn test_socket_root() -> (PathBuf, Arc<OwnedFd>) {
-        let dir = std::env::temp_dir().join(format!("os-test-{:016x}", rand::random::<u64>()));
+        let dir = std::env::temp_dir().join(format!(
+            "os-test-{:016x}",
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
+        ));
         std::fs::create_dir(&dir).expect("create test socket root");
         std::fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .expect("set test socket root permissions");
@@ -9449,12 +9814,12 @@ mod tests {
         let mut counter = 0u64;
         let (root_a, _fd_a) = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
-            format!("root-{counter}")
+            Ok(format!("root-{counter}"))
         })
         .unwrap();
         let (root_b, _fd_b) = allocate_socket_root_with(tmp.path(), || {
             counter += 1;
-            format!("root-{counter}")
+            Ok(format!("root-{counter}"))
         })
         .unwrap();
         assert_ne!(
@@ -9478,7 +9843,7 @@ mod tests {
         let call_count = AtomicUsize::new(0);
         let (root, _fd) = allocate_socket_root_with(tmp.path(), || {
             let n = call_count.fetch_add(1, Ordering::SeqCst);
-            format!("attempt-{n}")
+            Ok(format!("attempt-{n}"))
         })
         .expect("should succeed after retries");
 
@@ -9505,12 +9870,23 @@ mod tests {
     }
 
     #[test]
+    fn allocate_socket_root_propagates_name_generation_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = allocate_socket_root_with(tmp.path(), || {
+            Err(std::io::Error::other(openshell_crypto::CryptoError::Random))
+        })
+        .expect_err("entropy failure must stop allocation");
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
     fn allocate_socket_root_exhaustion_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let blocked = tmp.path().join("blocked");
         std::fs::create_dir(&blocked).unwrap();
 
-        let err = allocate_socket_root_with(tmp.path(), || "blocked".to_string())
+        let err = allocate_socket_root_with(tmp.path(), || Ok("blocked".to_string()))
             .expect_err("should fail when all names are occupied");
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
@@ -10090,6 +10466,7 @@ mod tests {
                 sandbox_token: SecretJwt::parse(format!("sandbox-{label}")).expect("sandbox token"),
                 sandbox_expires_at: 1,
                 ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
             },
             gateway_id: "gateway-a".to_string(),
             verification_keys: vec![SessionVerificationKey {
@@ -11111,7 +11488,7 @@ mod tests {
         let outside = Path::new("/tmp").join(format!(
             "openshell-vm-layer-test-{}-{:x}",
             std::process::id(),
-            rand::random::<u64>()
+            u64::from_ne_bytes(openshell_crypto::random_bytes::<8>().expect("test entropy"))
         ));
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("sentinel"), "unchanged").unwrap();
@@ -11718,6 +12095,186 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap()
+    }
+
+    /// Delay SIGTERM handling so premature liveness EOF wins the race.
+    #[tokio::test]
+    async fn stop_signals_supervisor_before_closing_its_liveness_pipe() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let events = dir.join("events");
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        for fd in [&read_end, &write_end] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let read_fd = read_end.as_raw_fd();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"events=$1
+(cat <&3 >/dev/null; echo eof >>"$events") &
+trap 'sleep 0.2; echo term >>"$events"; exit 143' TERM
+echo ready >>"$events"
+while :; do sleep 0.05; done"#,
+            )
+            .arg("supervisor")
+            .arg(&events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only async-signal-safe `dup2` runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let supervisor = command.spawn().unwrap();
+        drop(read_end);
+
+        let ready = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("ready")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .expect("stand-in supervisor installs its SIGTERM handler");
+
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(fs::File::from(write_end)),
+            deleting: false,
+        };
+        terminate_sandbox_processes(&mut process).await.unwrap();
+
+        let log = fs::read_to_string(&events).unwrap();
+        let first_event = log.lines().find(|line| *line != "ready");
+        assert_eq!(
+            first_event,
+            Some("term"),
+            "SIGTERM must reach the supervisor before its liveness pipe closes; events: {log:?}"
+        );
+        assert!(
+            fs::read_to_string(&driver_log).unwrap().is_empty(),
+            "an orderly supervisor shutdown must not warn about lost writes"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A supervisor that ignores SIGTERM is killed once its grace expires, and
+    /// only then is its liveness pipe closed.
+    #[tokio::test]
+    async fn stop_kills_a_supervisor_that_ignores_sigterm_after_the_grace() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let driver_log = dir.join("driver.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .without_time()
+            .with_ansi(false)
+            .with_writer(Arc::new(fs::File::create(&driver_log).unwrap()))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let events = dir.join("events");
+        let (read_end, write_end) = nix::unistd::pipe().unwrap();
+        for fd in [&read_end, &write_end] {
+            nix::fcntl::fcntl(
+                fd.as_raw_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .unwrap();
+        }
+        let read_fd = read_end.as_raw_fd();
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"events=$1
+(cat <&3 >/dev/null; echo eof >>"$events") &
+trap '' TERM
+echo ready >>"$events"
+while :; do sleep 0.05; done"#,
+            )
+            .arg("supervisor")
+            .arg(&events)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // SAFETY: only async-signal-safe `dup2` runs between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(read_fd, 3) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let supervisor = command.spawn().unwrap();
+        drop(read_end);
+        let ready = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("ready")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), ready)
+            .await
+            .expect("stand-in supervisor starts");
+
+        let mut process = VmProcess {
+            child: spawn_exited_child(),
+            supervisor,
+            supervisor_liveness: Some(fs::File::from(write_end)),
+            deleting: false,
+        };
+        let grace = Duration::from_millis(300);
+        let started = tokio::time::Instant::now();
+        terminate_sandbox_processes_within(&mut process, grace)
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed >= grace,
+            "the supervisor must get its full grace before the kill: {elapsed:?}"
+        );
+        assert!(
+            process.supervisor.try_wait().unwrap().is_some(),
+            "the supervisor is gone once the grace has expired"
+        );
+        assert!(process.supervisor_liveness.is_none());
+        // The liveness pipe closes only after the supervisor has been dealt with.
+        let closed = async {
+            while !fs::read_to_string(&events).is_ok_and(|log| log.contains("eof")) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the liveness pipe is closed after the stop");
+        let driver_log = fs::read_to_string(&driver_log).unwrap();
+        assert!(
+            driver_log.contains("WARN")
+                && driver_log.contains("guest filesystem flush was not confirmed"),
+            "a forced supervisor shutdown must warn that recent writes may be lost: {driver_log:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     async fn insert_test_record(
@@ -12894,5 +13451,585 @@ mod tests {
             .expect("an unambiguous name-only stop should still resolve");
 
         assert!(alpha.join(SANDBOX_STOPPED_FILE).exists());
+    }
+
+    // ── VM mount config tests ──────────────────────────────────────────
+
+    fn mount_test_config(enable_bind_mounts: bool) -> VmDriverConfig {
+        let mut config = VmDriverConfig {
+            enable_bind_mounts,
+            ..VmDriverConfig::default()
+        };
+        config.resource_admission.enabled = false;
+        config
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_when_resource_admission_enabled() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let mut config = mount_test_config(true);
+        config.resource_admission.enabled = true;
+        let err = validate_vm_driver_mounts(&mounts, &config, false).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("resource admission"));
+    }
+
+    #[test]
+    fn vm_mount_config_deserializes_with_default_readonly() {
+        let json = serde_json::json!({
+            "mounts": [{"source": "/host/data", "target": "/sandbox/data"}]
+        });
+        let config: VmSandboxDriverConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(config.mounts.len(), 1);
+        assert_eq!(config.mounts[0].source, "/host/data");
+        assert_eq!(config.mounts[0].target, "/sandbox/data");
+        assert!(config.mounts[0].read_only);
+    }
+
+    #[test]
+    fn vm_mount_config_accepts_docker_style_bind_type() {
+        let json = serde_json::json!({
+            "mounts": [{"type": "bind", "source": "/host/data", "target": "/sandbox/data"}]
+        });
+        let config: VmSandboxDriverConfig = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            config.mounts[0].mount_type,
+            Some(VmMountType::Bind)
+        ));
+        assert!(config.mounts[0].read_only);
+    }
+
+    #[test]
+    fn vm_mount_config_rejects_non_bind_types() {
+        for mount_type in ["volume", "tmpfs", "image"] {
+            let json = serde_json::json!({
+                "mounts": [{"type": mount_type, "source": "x", "target": "/sandbox/data"}]
+            });
+            let err = serde_json::from_value::<VmSandboxDriverConfig>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("expected `bind`"),
+                "{mount_type}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn vm_mount_config_deserializes_explicit_readwrite() {
+        let json = serde_json::json!({
+            "mounts": [{"source": "/host/data", "target": "/sandbox/data", "read_only": false}]
+        });
+        let config: VmSandboxDriverConfig = serde_json::from_value(json).unwrap();
+        assert!(!config.mounts[0].read_only);
+    }
+
+    #[test]
+    fn vm_mount_validation_requires_enable_bind_mounts() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(false), false).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("enable_bind_mounts"));
+    }
+
+    #[test]
+    fn vm_mount_validation_allows_when_enabled() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        assert!(validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).is_ok());
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_relative_source() {
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: "relative/path".to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_control_chars_in_source() {
+        // The launcher receives mounts as tab-separated arguments.
+        for source in ["/srv/data\tvfs9\trw", "/srv/data\n/etc"] {
+            let mounts = vec![VmMountConfig {
+                mount_type: None,
+                source: source.to_string(),
+                target: "/sandbox/data".to_string(),
+                read_only: true,
+            }];
+            let err =
+                validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("control characters"));
+        }
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_reserved_openshell_target() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/opt/openshell/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_vm_internal_paths() {
+        let dir = std::env::temp_dir();
+        for reserved in VM_RESERVED_GUEST_PATHS {
+            let mounts = vec![VmMountConfig {
+                mount_type: None,
+                source: dir.display().to_string(),
+                target: reserved.to_string(),
+                read_only: true,
+            }];
+            let err =
+                validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+            assert_eq!(
+                err.code(),
+                Code::InvalidArgument,
+                "expected rejection for target {reserved}"
+            );
+            assert!(
+                err.message().contains("VM-internal path"),
+                "expected VM-internal path message for {reserved}, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_duplicate_targets() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![
+            VmMountConfig {
+                mount_type: None,
+                source: dir.display().to_string(),
+                target: "/sandbox/data".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: dir.display().to_string(),
+                target: "/sandbox/data".to_string(),
+                read_only: false,
+            },
+        ];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn vm_mount_validation_defers_missing_source_to_provisioning() {
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: "/nonexistent/openshell-vm-mount-source".to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        assert!(validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).is_ok());
+        let err = validate_vm_mount_sources(&mounts).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_nested_targets() {
+        let dir = std::env::temp_dir().display().to_string();
+        for (first, second) in [
+            ("/sandbox/a", "/sandbox/a/b"),
+            ("/sandbox/a/b", "/sandbox/a"),
+        ] {
+            let mounts = vec![
+                VmMountConfig {
+                    mount_type: None,
+                    source: dir.clone(),
+                    target: first.to_string(),
+                    read_only: true,
+                },
+                VmMountConfig {
+                    mount_type: None,
+                    source: dir.clone(),
+                    target: second.to_string(),
+                    read_only: true,
+                },
+            ];
+            let err =
+                validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("overlaps"), "{first} vs {second}");
+        }
+    }
+
+    #[test]
+    fn vm_mount_validation_allows_sibling_targets() {
+        let dir = std::env::temp_dir().display().to_string();
+        let mounts = vec![
+            VmMountConfig {
+                mount_type: None,
+                source: dir.clone(),
+                target: "/sandbox/a".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: dir,
+                target: "/sandbox/ab".to_string(),
+                read_only: true,
+            },
+        ];
+        assert!(validate_vm_driver_mounts(&mounts, &mount_test_config(true), false).is_ok());
+    }
+
+    #[test]
+    fn vm_mount_validation_empty_passes() {
+        assert!(validate_vm_driver_mounts(&[], &mount_test_config(false), false).is_ok());
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_qemu_backend() {
+        let dir = std::env::temp_dir();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: dir.display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_driver_mounts(&mounts, &mount_test_config(true), true).unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("QEMU"));
+    }
+
+    #[test]
+    fn vm_mount_validation_rejects_too_many_mounts() {
+        let dir = std::env::temp_dir().display().to_string();
+        let mounts = |count: usize| -> Vec<VmMountConfig> {
+            (0..count)
+                .map(|i| VmMountConfig {
+                    mount_type: None,
+                    source: dir.clone(),
+                    target: format!("/sandbox/data{i}"),
+                    read_only: true,
+                })
+                .collect()
+        };
+        let config = mount_test_config(true);
+        assert!(validate_vm_driver_mounts(&mounts(VM_MAX_BIND_MOUNTS), &config, false).is_ok());
+        let err =
+            validate_vm_driver_mounts(&mounts(VM_MAX_BIND_MOUNTS + 1), &config, false).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("at most"), "{}", err.message());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vm_mount_validation_rejects_unreadable_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return; // root bypasses directory permissions
+        }
+        let source = tempfile::tempdir().unwrap();
+        fs::set_permissions(source.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: source.path().display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let result = validate_vm_mount_sources(&mounts).await;
+        // Restore access before asserting so the temp dir can always be removed.
+        fs::set_permissions(source.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("cannot access"), "{}", err.message());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn vm_mount_validation_rejects_symlink_source() {
+        let parent = tempfile::tempdir().unwrap();
+        let real = parent.path().join("real");
+        let link = parent.path().join("link");
+        fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // A trailing slash would make the stat resolve the link.
+        for suffix in ["", "/"] {
+            let mounts = vec![VmMountConfig {
+                mount_type: None,
+                source: format!("{}{suffix}", link.display()),
+                target: "/sandbox/data".to_string(),
+                read_only: true,
+            }];
+            let err = validate_vm_mount_sources(&mounts).await.unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(err.message().contains("symbolic link"), "{}", err.message());
+        }
+    }
+
+    #[tokio::test]
+    async fn vm_mount_validation_rejects_file_source() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: file.path().display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_mount_sources(&mounts).await.unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("must be a directory"));
+    }
+
+    #[tokio::test]
+    async fn vm_mount_validation_reports_inaccessible_source() {
+        // A path below a regular file fails stat with something other than
+        // NotFound, even as root.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mounts = vec![VmMountConfig {
+            mount_type: None,
+            source: file.path().join("child").display().to_string(),
+            target: "/sandbox/data".to_string(),
+            read_only: true,
+        }];
+        let err = validate_vm_mount_sources(&mounts).await.unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("cannot access"), "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn provisioning_checks_mount_sources_before_resolving_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        let sandbox = Sandbox {
+            id: "sb-mount-source".to_string(),
+            name: "mount-source".to_string(),
+            spec: Some(SandboxSpec {
+                launch_authentication: test_launch_authentication("mount-source").0,
+                template: Some(SandboxTemplate {
+                    driver_config: Some(mounts_driver_config(
+                        "/nonexistent/openshell-vm-mount-source",
+                        "/sandbox/data",
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let state_dir = directory.path().join("sandbox");
+        driver.registry.lock().await.insert(
+            sandbox.id.clone(),
+            SandboxRecord {
+                snapshot: sandbox.clone(),
+                state_dir: state_dir.clone(),
+                process: None,
+                provisioning_task: None,
+                preparation: None,
+                gpu_bdf: None,
+                deleting: false,
+            },
+        );
+        let mut events = driver.events.subscribe();
+        let error = driver
+            .provision_sandbox_inner(
+                sandbox,
+                "invalid image reference".to_string(),
+                state_dir,
+                None,
+                OverlayPreparation::Fresh,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.message().contains("does not exist"),
+            "{}",
+            error.message()
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// Runs `prepare_virtiofs_target` from the guest init script against a
+    /// host directory standing in for the guest root.
+    #[cfg(unix)]
+    fn run_prepare_virtiofs_target(root: &Path, target: &str) -> std::process::Output {
+        let script = include_str!("../scripts/openshell-vm-sandbox-init.sh");
+        let start = script
+            .find("prepare_virtiofs_target() {")
+            .expect("init script defines prepare_virtiofs_target");
+        let end = start + script[start..].find("\n}\n").expect("function end") + 3;
+        let program = format!(
+            "set -euo pipefail\nts() {{ echo \"$@\"; }}\n{}\nprepare_virtiofs_target \"$1\" \"$(id -u):$(id -g)\"\n",
+            &script[start..end]
+        );
+        std::process::Command::new("bash")
+            .args(["-c", &program, "test", target])
+            .env("ROOT_PREFIX", root)
+            .output()
+            .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_init_prepare_virtiofs_target_creates_missing_directories() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("sandbox")).unwrap();
+        let output = run_prepare_virtiofs_target(root.path(), "/sandbox/a/b");
+        assert!(output.status.success(), "{output:?}");
+        let expected = root.path().join("sandbox/a/b");
+        assert!(expected.is_dir());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            expected.display().to_string()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_init_prepare_virtiofs_target_refuses_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("sandbox")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("sandbox/link")).unwrap();
+        let output = run_prepare_virtiofs_target(root.path(), "/sandbox/link/x");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("traverses symlink"));
+        assert!(!elsewhere.path().join("x").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vm_init_prepare_virtiofs_target_refuses_non_directory() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("sandbox")).unwrap();
+        fs::write(root.path().join("sandbox/file"), b"").unwrap();
+        let output = run_prepare_virtiofs_target(root.path(), "/sandbox/file/x");
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("is not a directory"));
+    }
+
+    fn mounts_driver_config(source: &str, target: &str) -> Struct {
+        let string = |s: &str| Value {
+            kind: Some(Kind::StringValue(s.to_string())),
+        };
+        let mount = Struct {
+            fields: [
+                ("source".to_string(), string(source)),
+                ("target".to_string(), string(target)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        Struct {
+            fields: std::iter::once((
+                "mounts".to_string(),
+                Value {
+                    kind: Some(Kind::ListValue(prost_types::ListValue {
+                        values: vec![Value {
+                            kind: Some(Kind::StructValue(mount)),
+                        }],
+                    })),
+                },
+            ))
+            .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_denied_when_bind_mounts_are_revoked() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let mut driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
+        driver.config.state_dir = directory.path().to_path_buf();
+        driver.config.default_image = "invalid image reference".to_string();
+        driver.config.allow_driver_config = true;
+        driver.config.resource_admission.enabled = false;
+        driver.config.enable_bind_mounts = true;
+        let sandbox = Sandbox {
+            id: "sb-mount-restore".to_string(),
+            name: "mount-restore".to_string(),
+            spec: Some(SandboxSpec {
+                launch_authentication: test_launch_authentication("mount-restore").0,
+                template: Some(SandboxTemplate {
+                    driver_config: Some(mounts_driver_config(
+                        &source.path().display().to_string(),
+                        "/sandbox/data",
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        decode_launch_authentication(&sandbox.spec.as_ref().unwrap().launch_authentication)
+            .expect("credentials are valid, so only the mount gate can deny recovery");
+        driver
+            .validate_sandbox(&sandbox)
+            .expect("mounts are admitted while enabled");
+
+        driver.config.enable_bind_mounts = false;
+        let err = driver.validate_sandbox(&sandbox).unwrap_err();
+        assert!(
+            err.message().contains("enable_bind_mounts"),
+            "{}",
+            err.message()
+        );
+        let state_dir = sandbox_state_dir(directory.path(), &sandbox.id).unwrap();
+        create_private_dir_all(&state_dir).await.unwrap();
+        write_sandbox_request(&state_dir, &sandbox).await.unwrap();
+        let accepted = driver
+            .restore_persisted_sandbox(sandbox, state_dir, true, &tracing::Span::current())
+            .await;
+        assert!(!accepted, "revoked bind mounts must deny restoration");
+        assert!(driver.registry.lock().await.is_empty());
+    }
+
+    #[test]
+    fn vm_mount_manifest_renders_tab_separated_entries() {
+        let mounts = [
+            VmMountConfig {
+                mount_type: None,
+                source: "/host/a".to_string(),
+                target: "/sandbox/a".to_string(),
+                read_only: true,
+            },
+            VmMountConfig {
+                mount_type: None,
+                source: "/host/b".to_string(),
+                target: "/sandbox/b".to_string(),
+                read_only: false,
+            },
+        ];
+        assert_eq!(
+            render_mount_manifest(&mounts),
+            "osfs0\t/sandbox/a\tro\nosfs1\t/sandbox/b\trw\n"
+        );
     }
 }

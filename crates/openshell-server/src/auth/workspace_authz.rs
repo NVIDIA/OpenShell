@@ -8,6 +8,7 @@
 //! auth mode + scope + global role; this module validates workspace membership
 //! and workspace-level role.
 
+use super::audit::{AuthzDenial, emit_authorization_denial};
 use super::principal::Principal;
 use openshell_core::proto::{
     WorkspaceRole as ProtoWorkspaceRole, WorkspaceSelector,
@@ -158,6 +159,12 @@ pub async fn authorize_workspace(
                 .map_err(|e| Status::internal(format!("membership lookup failed: {e}")))?;
 
             let Some(member) = member else {
+                emit_authorization_denial(
+                    principal,
+                    AuthzDenial::NotWorkspaceMember {
+                        workspace: &workspace,
+                    },
+                );
                 let workspace_arg = shell_quote_for_hint(&workspace);
                 let subject_arg = shell_quote_for_hint(&user.identity.subject);
                 return Err(Status::permission_denied(format!(
@@ -171,6 +178,12 @@ pub async fn authorize_workspace(
                 .unwrap_or(ProtoWorkspaceRole::Unspecified);
 
             if !role_satisfies(member_role, min_role) {
+                emit_authorization_denial(
+                    principal,
+                    AuthzDenial::InsufficientWorkspaceRole {
+                        workspace: &workspace,
+                    },
+                );
                 let workspace_arg = shell_quote_for_hint(&workspace);
                 let subject_arg = shell_quote_for_hint(&user.identity.subject);
                 let role = min_role.as_str();
@@ -194,9 +207,12 @@ pub async fn authorize_workspace(
             workspace,
             grant: AuthGrant::Sandbox,
         }),
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals cannot perform workspace operations",
-        )),
+        Principal::Peer(_) => {
+            emit_authorization_denial(principal, AuthzDenial::MethodNotPermitted);
+            Err(Status::permission_denied(
+                "gateway peer principals cannot perform workspace operations",
+            ))
+        }
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }
@@ -222,20 +238,18 @@ pub async fn authorize_sandbox_workspace(
 /// `list_*` with `all_workspaces: true`.
 #[allow(clippy::result_large_err)]
 pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result<(), Status> {
-    match principal {
-        Principal::Operator(_) => Ok(()),
-        Principal::User(user) if is_platform_admin(&user.identity.roles, admin_role) => Ok(()),
-        Principal::User(_) => Err(Status::permission_denied(
-            "platform admin role required for cross-workspace operations",
-        )),
-        Principal::Sandbox(_) => Err(Status::permission_denied(
-            "sandbox principals cannot perform cross-workspace operations",
-        )),
-        Principal::Peer(_) => Err(Status::permission_denied(
-            "gateway peer principals cannot perform cross-workspace operations",
-        )),
-        Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
-    }
+    let message = match principal {
+        Principal::Operator(_) => return Ok(()),
+        Principal::User(user) if is_platform_admin(&user.identity.roles, admin_role) => {
+            return Ok(());
+        }
+        Principal::User(_) => "platform admin role required for cross-workspace operations",
+        Principal::Sandbox(_) => "sandbox principals cannot perform cross-workspace operations",
+        Principal::Peer(_) => "gateway peer principals cannot perform cross-workspace operations",
+        Principal::Anonymous => return Err(Status::unauthenticated("authentication required")),
+    };
+    emit_authorization_denial(principal, AuthzDenial::PlatformAdminRequired);
+    Err(Status::permission_denied(message))
 }
 
 /// Check whether the caller's OIDC roles include the platform admin role.
@@ -390,6 +404,60 @@ mod tests {
             err.message(),
             "workspace role 'admin' required in workspace 'default'; ask a platform admin to run: \
              openshell workspace member add --workspace 'default' --subject 'user-c' --role admin"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_denials_record_the_workspace_and_reason() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+        let store = test_store().await;
+        add_member(&store, "default", "user-c", ProtoWorkspaceRole::User).await;
+
+        for (subject, reason) in [
+            ("stranger", "not_workspace_member"),
+            ("user-c", "insufficient_workspace_role"),
+        ] {
+            let principal = user_principal(subject, &["openshell-user"]);
+            authorize_workspace(
+                &store,
+                "openshell-admin",
+                &principal,
+                "default",
+                MinWorkspaceRole::Admin,
+            )
+            .await
+            .expect_err("must be denied");
+            let event = capture.events().pop().unwrap().to_json().unwrap();
+            assert_eq!(event["status_detail"], reason);
+            assert_eq!(event["actor"]["user"]["uid"], subject);
+            assert_eq!(
+                event["resources"],
+                serde_json::json!([{"name": "default", "type": "workspace"}])
+            );
+        }
+        assert_eq!(capture.events().len(), 2, "users never produce a finding");
+    }
+
+    #[tokio::test]
+    async fn sandbox_cross_workspace_request_raises_a_finding() {
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        require_platform_admin("openshell-admin", &sandbox_principal())
+            .expect_err("sandbox must be denied");
+
+        let events: Vec<_> = capture
+            .events()
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "platform_admin_required");
+        assert_eq!(events[1]["class_uid"], 2004);
+        assert_eq!(
+            events[0]["metadata"]["correlation_uid"],
+            events[1]["metadata"]["correlation_uid"]
         );
     }
 

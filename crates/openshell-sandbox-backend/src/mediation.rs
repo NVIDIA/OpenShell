@@ -8,7 +8,6 @@
 
 use std::io;
 
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
@@ -56,8 +55,11 @@ pub struct DnsQueryWire {
     pub timing: MediationTimingWire,
 }
 
-pub fn encode_json<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
-    let payload = serde_json::to_vec(value)
+pub fn encode_message<T: crate::protobuf::WireMessage>(value: &T) -> io::Result<Vec<u8>>
+where
+    T::Proto: prost::Message + Default,
+{
+    let payload = crate::protobuf::encode(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     if payload.len() > MAX_METADATA_BYTES {
         return Err(io::Error::new(
@@ -68,8 +70,11 @@ pub fn encode_json<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
     Ok(payload)
 }
 
-pub fn decode_json<T: DeserializeOwned>(payload: &[u8]) -> io::Result<T> {
-    serde_json::from_slice(payload)
+pub fn decode_message<T: crate::protobuf::WireMessage>(payload: &[u8]) -> io::Result<T>
+where
+    T::Proto: prost::Message + Default,
+{
+    crate::protobuf::decode(payload)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 

@@ -227,7 +227,7 @@ jobs:
 
             if [ -n "$required_job_name" ]; then
               local jobs required_job job_status job_conclusion
-              jobs=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" --jq '.jobs')
+              jobs=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" | jq -s '[.[].jobs[]]')
               required_job=$(jq -c --arg name "$required_job_name" '[.[] | select(.name == $name)] | .[0] // empty' <<< "$jobs")
 
               if [ -z "$required_job" ]; then
@@ -262,8 +262,8 @@ jobs:
               return 0
             fi
 
-            real_success=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" \
-              --jq '[.jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
+            real_success=$(gh api --paginate "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=10" \
+              | jq -s '[.[].jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
 
             if [ "$real_success" -lt 1 ]; then
               post_status "$context" failure "No real CI jobs ran" "$run_url"

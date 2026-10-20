@@ -336,7 +336,6 @@ async fn profile_scope(
 
 macro_rules! mutation {
     ($req:ty, $resp:ty, $method:literal, $handler:path, $auth:expr, $capture:expr, $restore:expr) => {
-        #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;
@@ -650,7 +649,6 @@ provider_mutation!(
 // Terminal receipts deliberately do not resolve a deleted parent or replacement.
 macro_rules! ordinary_deletion {
     ($req:ty, $resp:ident, $method:literal, $handler:path, $auth:expr) => {
-        #[tonic::async_trait]
         impl Mutation for $req {
             type Output = $resp;
             const METHOD: &'static str = $method;

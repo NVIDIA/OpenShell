@@ -12,6 +12,7 @@ depends = [
   "test:sbom",
   "test:install-sh",
   "test:build-env",
+  "test:postgres-runner",
   "test:gateway-pull-policy",
   "test:e2e-image-overrides",
   "test:gateway-config",
@@ -111,6 +112,8 @@ description = "Run Rust tests"
 depends = ["rust:lockfiles:check"]
 env = { OPENSHELL_TELEMETRY_ENABLED = "false" }
 run = [
+  # Prove the facade contract without the default backend's compiled features.
+  "cargo test -p openshell-crypto --no-default-features --test independent_backend",
   # Run the workspace once without openshell-server so we can run that crate
   # with test-only helpers enabled.
   "cargo test --workspace --exclude openshell-server",
@@ -118,6 +121,23 @@ run = [
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
+hide = true
+
+["test:rust:postgres"]
+description = "Run PostgreSQL-backed openshell-server tests against OPENSHELL_TEST_POSTGRES_URL or a disposable Docker/Podman PostgreSQL container"
+run = "tasks/scripts/run-postgres-tests.sh"
+run_windows = "echo Skipping test:rust:postgres: PostgreSQL integration tests need a Linux or macOS container engine."
+
+["test:rust:postgres:bench"]
+description = "Run the load-sensitive bench_postgres_* capacity checks that test:rust:postgres and CI skip"
+env = { OPENSHELL_TEST_POSTGRES_PREFIX = "bench_postgres_" }
+run = "tasks/scripts/run-postgres-tests.sh"
+run_windows = "echo Skipping test:rust:postgres:bench: PostgreSQL integration tests need a Linux or macOS container engine."
+
+["test:postgres-runner"]
+description = "Test PostgreSQL test runner database and prefix selection without a database or container engine"
+run = "tasks/scripts/test-postgres-test-runner.sh"
+run_windows = "echo Skipping test:postgres-runner: the Unix PostgreSQL test runner does not apply on Windows."
 hide = true
 
 ["test:python"]
@@ -138,6 +158,12 @@ run = "OPENSHELL_TEST_CONTAINER_ENGINE=docker e2e/with-docker-gateway.sh cargo t
 ["e2e:oci-image:podman"]
 description = "Run the shared OCI image feature suite against a Podman-backed gateway"
 run = "OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1 --nocapture"
+
+["e2e:rust:push"]
+description = "Run CLI conformance and policy e2e tests against a Docker gateway that pushes configuration"
+depends = ["e2e:conformance:build"]
+env = { OPENSHELL_CONFIG_DELIVERY_MODE = "push", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-config-push", OPENSHELL_E2E_DOCKER_TEST = "config_push live_policy_update policy_activation" }
+run = "OPENSHELL_CONFORMANCE_BIN=\"${OPENSHELL_CONFORMANCE_BIN:-$PWD/target/debug/openshell-conformance}\" e2e/rust/e2e-docker.sh"
 
 ["e2e:workload:build"]
 description = "Build the Docker E2E workload fixture"
@@ -255,12 +281,12 @@ run = "bash e2e/no-compute-driver-gateway.sh"
 
 ["e2e:docker:external-driver"]
 description = "Run Docker conformance with a driver-free gateway and external Docker driver binary"
-env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_DOCKER_FEATURES = "" }
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-conformance-only" }
 run = "e2e/rust/e2e-docker.sh"
 
 ["e2e:podman:external-driver"]
 description = "Run Podman conformance with a driver-free gateway and external Podman driver binary"
-env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_PODMAN_FEATURES = "" }
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_PODMAN_FEATURES = "e2e-conformance-only" }
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:vm:external-driver"]
@@ -270,7 +296,7 @@ run = "e2e/rust/e2e-vm.sh"
 
 ["e2e:kubernetes:external-driver"]
 description = "Run Kubernetes conformance with a driver-free gateway and external Kubernetes driver"
-env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_KUBE_BUILD_IMAGES = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "" }
+env = { OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER = "1", OPENSHELL_E2E_KUBE_BUILD_IMAGES = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e-conformance-only" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:docker"]

@@ -1830,47 +1830,21 @@ mod tests {
         );
     }
 
-    /// Captures structured OCSF events during tracing dispatch.
-    #[derive(Clone, Default)]
-    struct ProbeLayer {
-        seen: Arc<Mutex<Vec<Option<OcsfEvent>>>>,
-    }
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ProbeLayer {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if event.metadata().target() == openshell_ocsf::OCSF_TARGET {
-                self.seen
-                    .lock()
-                    .unwrap()
-                    .push(openshell_ocsf::clone_current_event());
-            }
-        }
-    }
-
     #[test]
     fn gateway_ocsf_events_expose_the_structured_event_to_layers() {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        let probe = ProbeLayer::default();
-        let subscriber = tracing_subscriber::registry().with(probe.clone());
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
 
         let endpoint = endpoint();
         let expected = build_service_endpoint_config_event(&endpoint, "https://example.test", true);
         let expected_shorthand = expected.format_shorthand();
 
-        tracing::subscriber::with_default(subscriber, || {
+        {
+            let _guard = capture.install();
             emit_service_endpoint_config_event(&endpoint, "https://example.test", true);
-        });
+        }
 
-        let seen = probe.seen.lock().unwrap();
+        let seen = capture.events();
         assert_eq!(seen.len(), 1, "expected exactly one OCSF tracing event");
-        let event = seen[0]
-            .as_ref()
-            .expect("structured OCSF event should be reachable from the layer");
-        assert_eq!(event.format_shorthand(), expected_shorthand);
+        assert_eq!(seen[0].format_shorthand(), expected_shorthand);
     }
 }

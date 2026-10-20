@@ -21,6 +21,13 @@ Today the supervisor both builds the workload's isolation boundary and applies i
 
 The compute driver orchestrates the workload, supervisor, sandbox runtime, protected channel, and outer network fence. The supervisor is the trusted bridge between the gateway and the workload: it maintains the gateway connection, handles authorized requests, and drives the backend. The backend establishes the isolation controls, manages workload processes, and routes egress to network mediation. The same lifecycle supports different compute drivers and backend implementations without driver-specific supervisor paths.
 
+The implementation expresses this contract through
+[`isolation_backend.proto`](../../proto/isolation_backend.proto) and
+[`sandbox_protocol.proto`](../../proto/sandbox_protocol.proto). The Rust
+signatures below illustrate the lifecycle model; they are not backend extension
+traits. The supervisor uses concrete RPC clients, and backends implement the
+generated services. Wire negotiation and message definitions live in the protos.
+
 ## Motivation
 
 Boundary construction is embedded in the supervisor, so moving it anywhere else means changing the supervisor. That placement creates three problems:
@@ -80,7 +87,7 @@ flowchart TB
     Mediator -->|"allowed egress"| Egress["Egress"]
 ```
 
-The initial implementation is `OpenShellRuntimeBackend`: a supervisor-side client that delegates operations over the authenticated OpenShell Sandbox Protocol to `openshell-sandbox` beside the workload. A future runtime-native backend could implement the same interface without using that protocol or binary.
+The initial implementation is `OpenShellRuntimeBackend`: a supervisor-side client that delegates operations over the authenticated OpenShell Sandbox Protocol to `openshell-sandbox` beside the workload. Other backends implement the same RPC services using their own isolation mechanisms; they do not need the `openshell-sandbox` binary.
 
 A boundary is active from successful `attach` until normal backend cleanup releases the binding or the compute driver's trusted cleanup path invalidates it. A backend may coordinate multiple trusted helper or interception processes for that boundary. The backend owns the active-boundary binding; the compute driver owns the sandbox instance and infrastructure lifecycle.
 
@@ -93,9 +100,9 @@ Six invariants hold for every boundary:
 3. An operation is authorized only when the complete effective policy permits it; network operations are decided through network mediation. There is no silent weakening.
 4. Agent startup, `exec`, and forwarding occur only through the active backend, and every workload process remains in the compute driver's provisioned execution environment.
 5. Shared infrastructure preserves strict per-boundary lifecycle, policy, identity, enforcement, and cleanup isolation.
-6. If the logical supervisor is lost, the boundary remains under its last confirmed enforcement state while supervisor-dependent operations fail closed. Loss of required enforcement ends `Running` and terminates all workload processes within a documented bound; detection and termination may be performed by a trusted node or control-plane actor. Network-mediation unavailability denies outbound connections and never enables direct egress. Exit of the Sandbox Runtime that owns the boundary terminates its workload through the compute driver's containment primitive; it never leaves an unmanaged agent process tree.
+6. If the logical supervisor or its transport is lost, enforcement remains in force and supervisor-dependent operations fail closed. A backend may terminate, pause, or keep the workload contained. Network-mediation unavailability denies outbound connections and never enables direct egress. If required enforcement cannot be maintained, the backend or a trusted node or control-plane actor stops workload execution within a documented bound. Runtime exit must not leave a workload running without its required enforcement; terminating the workload is one backend-specific way to meet this requirement.
 
-Each backend states its termination bound in its implementation documentation. Loss of the logical supervisor means loss of the components holding the backend lifecycle, not loss of the gateway connection; gateway disconnection follows RFC 0001's reconnection semantics.
+Each backend documents its behavior on supervisor or runtime loss and its bound for stopping execution when enforcement cannot be maintained. Loss of the logical supervisor means loss of the components holding the backend lifecycle, not loss of the gateway connection; gateway disconnection follows RFC 0001's reconnection semantics.
 
 Transport recovery is scoped to the same logical supervisor process. A backend
 may reconnect that process and re-confirm its binding, but a replacement
@@ -209,6 +216,23 @@ The states have normative meanings:
 `confirm` is the pre-launch commit point. The supervisor calls it only after connecting the boundary's network-mediation source to network mediation. The backend confirms standing enforcement for the concrete boundary and may rely on a trusted provisioning-time or out-of-pod signal tied to that boundary's placement, but not on general placement health alone.
 
 `attach` rejects a resource already bound to an active boundary. A boundary that cannot enforce the complete admitted policy does not reach `Ready`: the backend fails `attach` or `confirm`, or the supervisor fails network-mediation initialization.
+
+Successful `confirm` asserts these requirements; it does not return a universal
+checklist of mechanisms or guarantee flags. Authentication, launch binding,
+trusted identity for policy decisions, and prevention of unmediated egress are
+mandatory. Filesystem and privilege controls depend on the admitted policy and
+the backend's execution model. An isolate with no filesystem API need not
+implement Linux filesystem controls. Unsupported requirements are rejected
+before workload execution; they are never silently ignored.
+
+The protobuf representation in
+[`sandbox_protocol.proto`](../../proto/sandbox_protocol.proto) returns the
+generation, session, admitted workload identity, resource claims, and a digest
+of the driver's validated provisioning evidence bound to that generation.
+The client compares these with trusted launch metadata. The digest preserves
+the provisioning binding; it is not independent proof of enforcement.
+Backend-specific audit data is optional on the wire. The native Linux client
+continues to require and validate its measured audit evidence.
 
 **Standing enforcement** is established independently of a workload process. **Launch-time controls** must be in force before a process executes its first untrusted instruction. Both `start_agent` and `BoundaryExec::exec` enforce this ordering and preserve the provisioned execution environment.
 
@@ -386,9 +410,12 @@ This is natural for drivers such as MXC, and the same component may implement bo
 
 ### Start with a remote backend service
 
-The contract could be expressed as a gRPC service or plugin ABI rather than an in-process Rust contract. [RFC 0001](../0001-core-architecture/README.md) chose gRPC for its gateway-facing drivers, so the question applies here.
-
-The callers differ. A gateway driver is a control-plane peer with its own release cycle, while the Isolation Backend is driven by the supervisor that operates the boundary, and a co-located implementation needs no transport at all. Starting in-process serves that case directly and lets delegated implementations carry their own transport behind the same interface. A transport-bearing surface is not precluded: it is versioned contract surface, added when a concrete delegated backend requires it.
+The original proposal started with an in-process Rust contract and allowed a
+versioned transport when a delegated backend required it. The implementation
+now uses gRPC for both the in-tree Linux runtime and external backends, retaining
+the lifecycle semantics described here. As in
+[RFC 0001](../0001-core-architecture/README.md), protobuf services let external
+implementations generate their own bindings without linking supervisor code.
 
 ### Standardize placement and capabilities
 

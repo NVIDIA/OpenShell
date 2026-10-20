@@ -4,6 +4,14 @@
 
 Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess and talks to it over the `openshell.compute.v1.ComputeDriver` Unix-socket surface. `openshell-supervisor` runs as a native host process, while `openshell-sandbox` runs as capability-free PID 1 inside each microVM and applies guest-local isolation over virtio-vsock.
 
+New VM generations initiate the control connection to host CID 2 over vsock.
+Libkrun forwards that guest connection to the supervisor's protected Unix
+socket; QEMU uses a host vsock listener on a per-guest port and checks the guest
+CID before TLS authentication. Existing protocol roles and authorization stay
+unchanged. Running legacy generations retain their original descriptors;
+newly booted generations require matching embedded runtime and supervisor
+binaries.
+
 The driver embeds libkrun, libkrunfw, the guest OCI unpacker, the portable guest sandbox, and the custom kernel runtime. Each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
@@ -174,6 +182,7 @@ Select the VM driver with `--compute-driver vm`, `OPENSHELL_COMPUTE_DRIVER=vm`, 
 | `proxy_connect_by_hostname` | unset | Send hostnames rather than validated IPs in CONNECT. Last resort for proxies whose ACLs reject IP CONNECT targets. |
 | `proxy_ca_bundle` | unset | Gateway-host PEM CA bundle trusted for the corporate proxy and TLS-intercepted server certificates. The driver validates it and stages it at a fixed non-secret guest path in the protected overlay. Requires `https_proxy`. |
 | `provider_spiffe_workload_api_tcp_endpoint` | unset | Explicit guest-reachable `tcp:IP:port` SPIFFE Workload API listener for provider token exchange. It requires `provider_spiffe_allow_guest_tcp = true`; a host UNIX socket is never silently exposed to a VM guest. |
+| `enable_bind_mounts` | `false` | Allow per-sandbox `driver_config.vm.mounts` host directory shares (libkrun virtiofs only). The driver writes a `tag\ttarget\tmode` manifest to `/.openshell/mounts.manifest` in the overlay, and guest init mounts each share after `/sandbox` ownership fixups. Rejected while resource admission is enabled. |
 
 The proxy settings are operator-owned and deployment-level: they are not accepted through `template.driver_config.vm`, and the driver passes them only to native host control. Every present-but-invalid value is fatal at gateway or sandbox startup rather than degrading to a direct dial.
 

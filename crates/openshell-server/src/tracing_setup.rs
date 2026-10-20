@@ -13,22 +13,15 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::{FilterExt, filter_fn};
 use tracing_subscriber::prelude::*;
 
-use crate::config_file::OtlpConfig;
-use crate::otel_tracing::{GatewayResourceAttributes, SetupError};
+use crate::otel_tracing::{GatewayResourceAttributes, OtlpExport, SetupError};
 use crate::tracing_bus::TracingLogBus;
 
 pub struct TracingHandle {
-    tracer_provider: Option<SdkTracerProvider>,
     driver_tracer_provider: Option<SdkTracerProvider>,
 }
 
 impl TracingHandle {
     pub fn shutdown(&self) {
-        if let Some(provider) = &self.tracer_provider
-            && let Err(err) = provider.shutdown()
-        {
-            tracing::warn!(error = %err, "OTLP tracer provider shutdown failed");
-        }
         if let Some(provider) = &self.driver_tracer_provider
             && let Err(err) = provider.shutdown()
         {
@@ -72,16 +65,15 @@ pub fn install(
     filter_directives: &str,
     tracing_log_bus: &TracingLogBus,
     ocsf_log: Option<&crate::ocsf_log::OcsfLog>,
-    otlp_config: Option<&OtlpConfig>,
+    otlp: Option<&OtlpExport>,
     driver: Option<openshell_otel::ComputeDriverTracing>,
     gateway: GatewayResourceAttributes<'_>,
 ) -> (TracingHandle, Option<SetupError>) {
-    let (tracer_provider, setup_error) = crate::otel_tracing::provider_for(otlp_config, gateway);
     let driver_endpoint = driver
         .is_some()
-        .then_some(otlp_config)
+        .then_some(otlp)
         .flatten()
-        .map(|config| config.endpoint.as_str());
+        .and_then(OtlpExport::traces_endpoint);
     let (driver_tracer_provider, driver_setup_error) = driver.map_or_else(
         || (None, None),
         |descriptor| {
@@ -93,7 +85,7 @@ pub fn install(
             )
         },
     );
-    let (jsonl_layer, jsonl_dir) = build_ocsf_jsonl_layer(gateway.compute_driver());
+    let (jsonl_layer, jsonl_dir) = build_ocsf_jsonl_layer();
 
     // Keep the audit sink independent from the operator's diagnostic log
     // level. An explicit JSONL opt-in must keep every OCSF event even when the
@@ -102,6 +94,13 @@ pub fn install(
         .with(
             ocsf_log
                 .map(crate::ocsf_log::OcsfLog::layer)
+                .with_filter(filter_fn(|metadata| {
+                    metadata.target() == openshell_ocsf::OCSF_TARGET
+                })),
+        )
+        .with(
+            otlp.and_then(OtlpExport::ocsf)
+                .map(openshell_otel::OcsfOtlp::layer)
                 .with_filter(filter_fn(|metadata| {
                     metadata.target() == openshell_ocsf::OCSF_TARGET
                 })),
@@ -120,8 +119,7 @@ pub fn install(
         )
         .with(jsonl_layer)
         .with(
-            tracer_provider
-                .as_ref()
+            otlp.and_then(OtlpExport::tracer_provider)
                 .map(|provider| crate::otel_tracing::layer(provider, driver))
                 .with_filter(filter_from(filter_directives)),
         )
@@ -152,17 +150,15 @@ pub fn install(
 
     (
         TracingHandle {
-            tracer_provider,
             driver_tracer_provider,
         },
-        setup_error.or(driver_setup_error),
+        driver_setup_error,
     )
 }
 
 /// Build the OCSF JSONL audit layer for the gateway, plus the directory it
 /// writes into (for a one-line startup log). Returns `(None, None)` when
-/// the target is not Windows, the selected compute driver is not MXC, the sink
-/// was not explicitly enabled through `OPENSHELL_OCSF_JSON`, or the target
+/// the sink was not explicitly enabled through `OPENSHELL_OCSF_JSON`, or the target
 /// directory/appender cannot be opened.
 ///
 /// The appender is *synchronous* (not wrapped in `tracing_appender::non_blocking`)
@@ -171,31 +167,26 @@ pub fn install(
 /// its non-blocking guard on graceful shutdown), the gateway's ETW capture path
 /// can be force-killed by the harness, and we do not want to lose the tail of the
 /// audit trail.
-#[cfg(not(target_os = "windows"))]
-fn build_ocsf_jsonl_layer(
-    _compute_driver: Option<&str>,
-) -> (
-    Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
-    Option<std::path::PathBuf>,
-) {
-    // The gateway-local JSONL sink belongs to the Windows/MXC ETW path. A
-    // cross-platform sink needs an explicit storage and configuration contract.
-    (None, None)
-}
-
-#[cfg(target_os = "windows")]
-fn build_ocsf_jsonl_layer(
-    compute_driver: Option<&str>,
-) -> (
+fn build_ocsf_jsonl_layer() -> (
     Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
     Option<std::path::PathBuf>,
 ) {
     let requested = std::env::var("OPENSHELL_OCSF_JSON").ok();
-    if !mxc_ocsf_jsonl_requested(compute_driver, requested.as_deref()) {
+    if !ocsf_jsonl_requested(requested.as_deref()) {
         return (None, None);
     }
 
-    let dir = ocsf_log_dir();
+    open_ocsf_jsonl_layer(ocsf_log_dir())
+}
+
+/// Portable sink construction; environment and platform defaults are resolved
+/// separately so operators and tests can supply an explicit directory.
+fn open_ocsf_jsonl_layer(
+    dir: std::path::PathBuf,
+) -> (
+    Option<OcsfJsonlLayer<tracing_appender::rolling::RollingFileAppender>>,
+    Option<std::path::PathBuf>,
+) {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!(
             "openshell: could not create OCSF JSONL log dir {}: {e}",
@@ -222,24 +213,21 @@ fn build_ocsf_jsonl_layer(
     }
 }
 
-/// Whether this gateway explicitly requested the Windows/MXC JSONL sink.
+/// Whether this gateway explicitly requested the JSONL sink.
 /// Unknown values fail closed so a typo cannot unexpectedly retain audit data.
-#[cfg(any(target_os = "windows", test))]
-fn mxc_ocsf_jsonl_requested(compute_driver: Option<&str>, value: Option<&str>) -> bool {
-    compute_driver == Some("mxc")
-        && value.is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
+fn ocsf_jsonl_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
 /// Resolve the directory for the OCSF JSONL audit file.
 ///
 /// Precedence: `OPENSHELL_OCSF_LOG_DIR` (harness / operator override) then
-/// `%PROGRAMDATA%\OpenShell\logs`.
-#[cfg(target_os = "windows")]
+/// the platform's gateway audit directory.
 fn ocsf_log_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("OPENSHELL_OCSF_LOG_DIR") {
         let trimmed = dir.trim();
@@ -247,10 +235,7 @@ fn ocsf_log_dir() -> std::path::PathBuf {
             return std::path::PathBuf::from(trimmed);
         }
     }
-    if let Ok(pd) = std::env::var("ProgramData") {
-        return std::path::PathBuf::from(pd).join("OpenShell").join("logs");
-    }
-    std::env::temp_dir().join("openshell").join("logs")
+    openshell_core::paths::gateway_audit_log_dir()
 }
 
 #[cfg(test)]
@@ -264,7 +249,45 @@ mod tests {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::prelude::*;
 
-    use super::mxc_ocsf_jsonl_requested;
+    use super::ocsf_jsonl_requested;
+
+    #[test]
+    fn portable_gateway_audit_sink_writes_jsonl() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("audit");
+        let (layer, resolved) = super::open_ocsf_jsonl_layer(directory.clone());
+        assert_eq!(resolved, Some(directory.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer.expect("open audit sink"));
+        let ctx = EventContext {
+            sandbox_id: "portable-audit".into(),
+            sandbox_name: "portable-audit".into(),
+            container_image: String::new(),
+            hostname: "gateway-host".into(),
+            product_version: openshell_core::VERSION.into(),
+            proxy_ip: "127.0.0.1".parse().unwrap(),
+            proxy_port: 0,
+            origin: openshell_ocsf::EventOrigin::Supervisor,
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            emit_ocsf_event_routed("portable-audit", AppLifecycleBuilder::new(&ctx).build());
+        });
+        let files: Vec<_> = std::fs::read_dir(directory).unwrap().collect();
+        assert_eq!(files.len(), 1);
+        let contents = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+        let records: Vec<_> = contents.lines().collect();
+        assert_eq!(records.len(), 1);
+        assert!(serde_json::from_str::<serde_json::Value>(records[0]).is_ok());
+    }
+
+    #[test]
+    fn portable_gateway_audit_sink_rejects_a_file_as_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("file");
+        std::fs::write(&path, b"not a directory").unwrap();
+        let (layer, directory) = super::open_ocsf_jsonl_layer(path);
+        assert!(layer.is_none());
+        assert!(directory.is_none());
+    }
 
     #[derive(Clone)]
     struct SharedWriter(Arc<Mutex<Vec<u8>>>);
@@ -316,31 +339,18 @@ mod tests {
 
     #[test]
     fn gateway_ocsf_jsonl_requires_explicit_opt_in() {
-        assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), None));
-        assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), Some("")));
-        assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), Some("enabled")));
+        assert!(!ocsf_jsonl_requested(None));
+        assert!(!ocsf_jsonl_requested(Some("")));
+        assert!(!ocsf_jsonl_requested(Some("enabled")));
         for value in ["0", "false", "FALSE", " off ", "no"] {
-            assert!(!mxc_ocsf_jsonl_requested(Some("mxc"), Some(value)));
+            assert!(!ocsf_jsonl_requested(Some(value)));
         }
 
         for value in ["1", "true", "TRUE", " on ", "yes"] {
             assert!(
-                mxc_ocsf_jsonl_requested(Some("mxc"), Some(value)),
+                ocsf_jsonl_requested(Some(value)),
                 "expected {value:?} to opt in"
             );
-        }
-    }
-
-    #[test]
-    fn gateway_ocsf_jsonl_rejects_non_mxc_drivers() {
-        for driver in [
-            None,
-            Some("docker"),
-            Some("kubernetes"),
-            Some("podman"),
-            Some("vm"),
-        ] {
-            assert!(!mxc_ocsf_jsonl_requested(driver, Some("1")));
         }
     }
 }

@@ -129,6 +129,10 @@ pub async fn sandbox_provider_list(
     Ok(())
 }
 
+/// Attempts for an attach or detach whose resource version went stale between
+/// the command's read and its write.
+const PROVIDER_ATTACHMENT_CAS_ATTEMPTS: u32 = 5;
+
 /// Save a provider attachment and optionally wait for its installed authority.
 pub async fn sandbox_provider_attach(
     server: &str,
@@ -141,45 +145,53 @@ pub async fn sandbox_provider_attach(
     readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    // The resource version only guards this command's own read, so a
+    // conflict from a concurrent status write is retried with a fresh read.
+    let mut attempt = 1;
+    let (sandbox, response) = loop {
+        let sandbox = client
+            .get_sandbox(GetSandboxRequest {
+                name: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+            })
+            .await
+            .map_err(|status| miette!("provider attachment lookup failed ({})", status.code()))?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+        let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
 
-    let response = match client
-        .attach_sandbox_provider(AttachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        match client
+            .attach_sandbox_provider(AttachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to attach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break (sandbox, response.into_inner()),
+            // Explicit post-save uncertainty takes precedence over a generic retry hint.
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                if attempt < PROVIDER_ATTACHMENT_CAS_ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "Failed to attach provider: sandbox was modified by another operation.\n\
+                     Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "attachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "attachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| {
@@ -216,45 +228,53 @@ pub async fn sandbox_provider_detach(
     readiness.validate()?;
     let mut client = grpc_client(server, tls).await?;
 
-    // Fetch current sandbox to get resource_version for CAS
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-        })
-        .await
-        .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+    // The resource version only guards this command's own read, so a
+    // conflict from a concurrent status write is retried with a fresh read.
+    let mut attempt = 1;
+    let (sandbox, response) = loop {
+        let sandbox = client
+            .get_sandbox(GetSandboxRequest {
+                name: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+            })
+            .await
+            .map_err(|status| miette!("provider detachment lookup failed ({})", status.code()))?
+            .into_inner()
+            .sandbox
+            .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
-    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+        let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
 
-    let response = match client
-        .detach_sandbox_provider(DetachSandboxProviderRequest {
-            request_id: String::new(),
-            sandbox: (name).to_string(),
-            workspace_scope: Some(openshell_core::proto::workspace_selector(
-                (workspace).to_string(),
-            )),
-            provider: provider.to_string(),
-            expected_resource_version: resource_version,
-        })
-        .await
-    {
-        Ok(response) => response.into_inner(),
-        // Explicit post-save uncertainty takes precedence over a generic retry hint.
-        Err(status)
-            if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+        match client
+            .detach_sandbox_provider(DetachSandboxProviderRequest {
+                request_id: String::new(),
+                sandbox: (name).to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    (workspace).to_string(),
+                )),
+                provider: provider.to_string(),
+                expected_resource_version: resource_version,
+            })
+            .await
         {
-            return Err(miette::miette!(
-                "Failed to detach provider: sandbox was modified by another operation.\n\
-                 Please retry the command."
-            ));
+            Ok(response) => break (sandbox, response.into_inner()),
+            // Explicit post-save uncertainty takes precedence over a generic retry hint.
+            Err(status)
+                if status.code() == Code::Aborted && !provider_mutation_is_uncertain(&status) =>
+            {
+                if attempt < PROVIDER_ATTACHMENT_CAS_ATTEMPTS {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(miette::miette!(
+                    "Failed to detach provider: sandbox was modified by another operation.\n\
+                     Please retry the command."
+                ));
+            }
+            Err(error) => return Err(provider_mutation_error(&error, "detachment")),
         }
-        Err(error) => return Err(provider_mutation_error(&error, "detachment")),
     };
 
     let receipt = response.receipt.ok_or_else(|| miette!("gateway did not return a provider receipt; saved detachment cannot establish revocation"))?;
@@ -382,6 +402,7 @@ pub async fn ensure_required_providers(
         loop {
             let response = client
                 .list_providers(ListProvidersRequest {
+                    label_selector: String::new(),
                     page_size: 100,
                     page_token,
                     workspace_scope: Some(openshell_core::proto::workspace_selector(workspace)),
@@ -1046,6 +1067,7 @@ pub async fn provider_create(
         server,
         name,
         provider_type,
+        labels: &[],
         credentials,
         credential_source,
         config,
@@ -1060,6 +1082,7 @@ pub struct ProviderCreateOptions<'a> {
     pub server: &'a str,
     pub name: &'a str,
     pub provider_type: &'a str,
+    pub labels: &'a [String],
     pub credentials: &'a [String],
     pub credential_source: ProviderCreateCredentialSource,
     pub config: &'a [String],
@@ -1082,6 +1105,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         server,
         name,
         provider_type,
+        labels,
         credentials,
         credential_source,
         config,
@@ -1089,6 +1113,8 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
         profile_workspace,
         tls,
     } = options;
+
+    let labels = parse_key_value_pairs(labels, "--label")?;
 
     let from_existing = credential_source == ProviderCreateCredentialSource::Existing;
     let from_gcloud_adc = credential_source == ProviderCreateCredentialSource::GcloudAdc;
@@ -1209,7 +1235,7 @@ pub async fn provider_create_with_options(options: ProviderCreateOptions<'_>) ->
                     id: String::new(),
                     name: name.to_string(),
                     created_time: None,
-                    labels: HashMap::new(),
+                    labels,
                     resource_version: 0,
                     annotations: HashMap::new(),
                     workspace: workspace.to_string(),
@@ -1346,6 +1372,21 @@ pub async fn provider_get(
     println!("  {} {}", "Id:".dimmed(), provider.object_id());
     println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
+    if let Some(meta) = &provider.metadata
+        && !meta.labels.is_empty()
+    {
+        let mut labels: Vec<_> = meta.labels.iter().collect();
+        labels.sort_unstable_by_key(|(key, _)| *key);
+        println!(
+            "  {} {}",
+            "Labels:".dimmed(),
+            labels
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -1455,6 +1496,7 @@ pub async fn provider_list(
     server: &str,
     page_size: i32,
     page_token: &str,
+    label_selector: &str,
     names_only: bool,
     output: &str,
     workspace: &str,
@@ -1466,6 +1508,7 @@ pub async fn provider_list(
         .list_providers(ListProvidersRequest {
             page_size,
             page_token: page_token.to_string(),
+            label_selector: label_selector.to_string(),
             workspace_scope: Some(if all_workspaces {
                 openshell_core::proto::all_workspaces_selector()
             } else {
@@ -2095,7 +2138,7 @@ fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     )
 }
 
-fn provider_refresh_recovery_action_name(
+pub fn provider_refresh_recovery_action_name(
     action: ProviderCredentialRefreshRecoveryAction,
 ) -> &'static str {
     match action {
@@ -2206,7 +2249,7 @@ async fn load_profile_import_items_with_url(
             "provider profile URL must end in .yaml, .yml, or .json"
         ));
     }
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()

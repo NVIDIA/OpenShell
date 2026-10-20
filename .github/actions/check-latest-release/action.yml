@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Check Latest Release
+description: Check current remote stable tags before updating a shared latest channel
+
+inputs:
+  release-tag:
+    description: Stable version being published
+    required: true
+
+outputs:
+  make-latest:
+    description: Whether this is still the highest stable version in the repository
+    value: ${{ steps.latest.outputs.make-latest }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+      id: latest
+      env:
+        RELEASE_TAG: ${{ inputs.release-tag }}
+      with:
+        script: |
+          const tag = process.env.RELEASE_TAG;
+          const parse = value => /^v([0-9]+)\.([0-9]+)\.([0-9]+)$/.exec(value)?.slice(1).map(BigInt);
+          const version = parse(tag);
+          if (!version) {
+            throw new Error(`Invalid stable release tag: ${tag}`);
+          }
+          const tags = await github.paginate(github.rest.repos.listTags, {
+            ...context.repo,
+            per_page: 100,
+          });
+          if (!tags.some(candidate => candidate.name === tag)) {
+            throw new Error(`Stable release tag ${tag} is missing from the repository`);
+          }
+          const newer = tags.find(candidate => {
+            const other = parse(candidate.name);
+            if (!other) return false;
+            const index = other.findIndex((part, i) => part !== version[i]);
+            return index !== -1 && other[index] > version[index];
+          });
+          core.info(newer ? `${tag} is superseded by ${newer.name}; preserving latest` : `${tag} is the latest stable version`);
+          core.setOutput('make-latest', !newer);

@@ -5,7 +5,8 @@
 # One-time migration for installations that predate per-user snap gateways.
 # Existing installations retain the system gateway; fresh installations record
 # gateway-mode=user in the install hook and skip this migration. The configure
-# hook applies the selected service after this transaction commits.
+# hook applies system and disabled modes after this transaction commits. User
+# gateway activation remains owned by each user's systemd manager.
 
 set -eu
 

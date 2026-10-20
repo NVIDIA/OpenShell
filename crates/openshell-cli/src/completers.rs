@@ -63,6 +63,7 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
         let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
         let response = client
             .list_providers(ListProvidersRequest {
+                label_selector: String::new(),
                 page_size: 200,
                 page_token: String::new(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(

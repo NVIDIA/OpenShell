@@ -22,10 +22,16 @@ PROTO_FILES = [
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--no-pyi", action="store_true", help="Skip type-stub generation"
+        "--no-pyi",
+        action="store_true",
+        help=(
+            "Skip .pyi type stubs. Needed with protoc older than 3.20 "
+            "(e.g. Fedora's grpcio-tools 1.48), which has no --pyi_out."
+        ),
     )
     args = parser.parse_args()
     output_dir = Path("python/openshell/_proto")
+
     subprocess.run(
         [
             sys.executable,
