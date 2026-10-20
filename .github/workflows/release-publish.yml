@@ -19,6 +19,11 @@ on:
         required: false
         default: false
         type: boolean
+      generate-release-notes:
+        description: Whether stable publication generates notes instead of using a release-notes artifact from the calling run
+        required: false
+        default: true
+        type: boolean
       source-sha:
         description: Source commit of the built artifacts in the calling run
         required: true
@@ -329,7 +334,7 @@ jobs:
 
   release-notes:
     name: Write Release Notes
-    if: ${{ !inputs.is-prerelease }}
+    if: ${{ !inputs.is-prerelease && inputs.generate-release-notes }}
     permissions:
       contents: read
       pull-requests: read
@@ -342,7 +347,7 @@ jobs:
   release:
     name: Publish Release Assets
     needs: [assemble, release-helm, release-notes]
-    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.release-helm.result == 'success' && (inputs.is-prerelease || needs.release-notes.result == 'success') }}
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.release-helm.result == 'success' && (inputs.is-prerelease || !inputs.generate-release-notes || needs.release-notes.result == 'success') }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:

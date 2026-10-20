@@ -134,6 +134,7 @@ def select_candidate(tag: str, branch: str) -> dict:
             "tag": tag,
             "candidate_tag": candidate,
             "source_sha": sha,
+            "qualification_run_id": run["id"],
             "qualification_run_url": f"{run['html_url']}/attempts/{attempt}",
             "qualification_artifact_id": artifact["id"],
             "make_latest": is_latest(tag),
