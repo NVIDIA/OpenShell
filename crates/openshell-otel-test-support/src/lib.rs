@@ -76,6 +76,8 @@ pub struct ReceivedTraces {
     pub spans: Vec<Span>,
     /// String bodies of exported log records.
     pub log_bodies: Vec<String>,
+    /// `authorization` metadata of each log export request.
+    pub log_authorizations: Vec<String>,
     pub service_names: Vec<String>,
     pub gateway_names: Vec<String>,
     pub compute_drivers: Vec<String>,
@@ -149,6 +151,13 @@ impl LogsService for Collector {
                 .received
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received.log_authorizations.push(authorization.to_string());
+            }
             for resource_logs in request.into_inner().resource_logs {
                 received.record_resource(resource_logs.resource);
                 for scope_logs in resource_logs.scope_logs {

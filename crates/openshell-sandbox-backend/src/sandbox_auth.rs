@@ -361,7 +361,7 @@ mod tests {
         SessionTokenProfile, SessionVerificationKey,
     };
     use openshell_core::sandbox_generation::SandboxGenerationId;
-    use rcgen::{KeyPair, PKCS_ED25519};
+    use rcgen::PKCS_ED25519;
 
     use super::*;
 
@@ -380,12 +380,12 @@ mod tests {
         SandboxProtocolAuthenticator,
         openshell_core::jwt::MintedSessionToken,
     ) {
-        let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate key");
+        let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).expect("generate key");
         let public_key_pem = key.public_key_pem().into_bytes();
         let clock: Arc<dyn JwtClock> = Arc::new(FixedClock);
         let sandbox_id = SandboxId::parse("sandbox-a").expect("sandbox ID");
         let issuer = SessionJwtIssuer::from_ed25519_pem(
-            key.serialize_pem().as_bytes(),
+            key.serialize_pem().unwrap().as_bytes(),
             "current",
             "test",
             Some(DEFAULT_SESSION_TOKEN_TTL),
@@ -436,6 +436,24 @@ mod tests {
             format!("Bearer {token}").parse().expect("metadata value"),
         );
         metadata
+    }
+
+    #[test]
+    fn bearer_identity_must_match_the_provisioned_runtime() {
+        let (mut authenticator, token) = fixture(1);
+        let metadata = metadata(token.token.expose_secret());
+        authenticator.expected_sandbox_id = SandboxId::parse("sandbox-b").unwrap();
+        assert_eq!(
+            authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+            Err(SandboxAuthError::WrongSandbox)
+        );
+        authenticator.expected_sandbox_id = SandboxId::parse("sandbox-a").unwrap();
+        authenticator.expected_runtime_generation =
+            SandboxGenerationId::parse("generation-2").unwrap();
+        assert_eq!(
+            authenticator.authenticate(SandboxConnectionId::new(), &metadata),
+            Err(SandboxAuthError::WrongRuntimeGeneration)
+        );
     }
 
     #[test]

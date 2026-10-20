@@ -51,6 +51,19 @@ use openshell_server::config_file::OtlpConfig;
         feature = "compute-driver-podman"
     )
 ))]
+/// The OCSF event export that drivers pass to supervisors, from `[otlp.ocsf]`.
+fn supervisor_ocsf_export(
+    otlp: Option<&OtlpConfig>,
+) -> Option<openshell_core::sandbox_env::OcsfOtlpExport> {
+    let ocsf = otlp?.ocsf.as_ref()?;
+    Some(openshell_core::sandbox_env::OcsfOtlpExport {
+        endpoint: ocsf.endpoint.clone(),
+        schema_version: ocsf
+            .schema_version
+            .map(|version| version.as_str().to_string()),
+    })
+}
+
 fn prefer_environment<T>(configured: T, environment: Option<T>) -> T {
     environment.unwrap_or(configured)
 }
@@ -270,6 +283,8 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .otlp_config()
             .and_then(OtlpConfig::traces_endpoint)
             .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -334,6 +349,8 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             .otlp_config()
             .and_then(OtlpConfig::traces_endpoint)
             .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "docker")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
@@ -399,6 +416,8 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
             .otlp_config()
             .and_then(OtlpConfig::traces_endpoint)
             .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_podman::PodmanComputeDriver::new(config)

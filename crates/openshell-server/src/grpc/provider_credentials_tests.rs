@@ -747,16 +747,21 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
     let service = MultiplexService::new(state);
     let server = tokio::spawn(async move {
         loop {
-            let (stream, _) = listener.accept().await.unwrap();
+            let (stream, peer) = listener.accept().await.unwrap();
             openshell_core::net::set_tcp_nodelay_best_effort(&stream);
             let acceptor = acceptor.acceptor();
             let service = service.clone();
             tokio::spawn(async move {
                 if let Ok(stream) = acceptor.accept(stream).await {
                     let identity = extract_peer_identity(&stream);
-                    let fingerprint = extract_peer_certificate_sha256(&stream);
+                    let fingerprint = extract_peer_certificate_sha256(&stream).unwrap();
                     let _ = service
-                        .serve_with_verified_certificate(stream, identity, fingerprint)
+                        .serve_with_verified_certificate(
+                            stream,
+                            identity,
+                            fingerprint,
+                            crate::auth::audit::ConnectionSource::Peer(peer),
+                        )
                         .await;
                 }
             });
@@ -780,11 +785,11 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                 .distinguished_name
                 .push(rcgen::DnType::OrganizationalUnitName, role);
             params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-            let key = rcgen::KeyPair::generate().unwrap();
-            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            let key = openshell_crypto::pki::generate_keypair().unwrap();
+            let cert = openshell_crypto::pki::signed_by(params, &key, &ca, &ca_key).unwrap();
             tls = tls.identity(tonic::transport::Identity::from_pem(
                 cert.pem(),
-                key.serialize_pem(),
+                key.serialize_pem().unwrap(),
             ));
         }
         let channel = Endpoint::from_shared(format!("https://localhost:{}", address.port()))

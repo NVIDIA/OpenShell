@@ -1148,10 +1148,10 @@ async fn draft_receipts_replay_after_chunk_state_and_review_tokens_change() {
         request_id: id(),
         ..Default::default()
     };
-    let approved = run(&state, authed_request(all.clone()))
+    let approved = Box::pin(run(&state, authed_request(all.clone())))
         .await
         .unwrap()
         .into_inner();
     assert_eq!(approved.chunks_approved, 1);
-    assert_eq!(replay(&state, all).await, approved);
+    assert_eq!(Box::pin(replay(&state, all)).await, approved);
 }

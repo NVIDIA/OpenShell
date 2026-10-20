@@ -28,20 +28,19 @@ func newSandboxClient(conn grpc.ClientConnInterface) *sandboxClient {
 	return &sandboxClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
 	protoSpec, err := converter.SandboxSpecToProtoChecked(spec)
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	cfg := types.ApplyCreateOptions(opts)
 	req := &pb.CreateSandboxRequest{
-		Name:           name,
-		Spec:           protoSpec,
-		Labels:         labels,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-	}
-	if len(opts) > 0 {
-		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
-		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+		Name:             name,
+		Spec:             protoSpec,
+		Labels:           converter.CopyStringMap(cfg.Labels()),
+		Annotations:      converter.CopyStringMap(cfg.Annotations()),
+		WorkspaceScope:   namedWorkspaceScope(workspace),
+		ServiceExposures: serviceExposuresToProto(cfg.ServiceExposures()),
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {
@@ -54,7 +53,7 @@ func (s *sandboxClient) Create(ctx context.Context, workspace, name string, spec
 	return sandbox, nil
 }
 
-func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, labels map[string]string, opts ...CreateOptions) (*Sandbox, error) {
+func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name, templateName string, spec *SandboxSpec, opts ...CreateOption) (*Sandbox, error) {
 	if templateName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "template name is required"}
 	}
@@ -65,16 +64,15 @@ func (s *sandboxClient) CreateFromTemplate(ctx context.Context, workspace, name,
 	if err != nil {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: err.Error()}
 	}
+	cfg := types.ApplyCreateOptions(opts)
 	req := &pb.CreateSandboxRequest{
 		Name:             name,
 		Spec:             protoSpec,
-		Labels:           labels,
+		Labels:           converter.CopyStringMap(cfg.Labels()),
+		Annotations:      converter.CopyStringMap(cfg.Annotations()),
 		WorkspaceScope:   namedWorkspaceScope(workspace),
 		WorkloadTemplate: templateName,
-	}
-	if len(opts) > 0 {
-		req.Annotations = converter.CopyStringMap(opts[0].Annotations)
-		req.ServiceExposures = serviceExposuresToProto(opts[0].ServiceExposures)
+		ServiceExposures: serviceExposuresToProto(cfg.ServiceExposures()),
 	}
 	resp, err := s.client.CreateSandbox(ctx, req)
 	if err != nil {

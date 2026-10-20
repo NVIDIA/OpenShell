@@ -5,9 +5,10 @@
 //!
 //! Pattern: `<HH:MM:SS.mmm> <severity> <CLASS:ACTIVITY> <action> <key fields> [context]`
 
+use crate::enums::UserTypeId;
 use crate::events::OcsfEvent;
 use crate::events::base_event::BaseEventData;
-use crate::objects::Url;
+use crate::objects::{Endpoint, Url, User};
 
 /// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
 ///
@@ -127,6 +128,36 @@ fn reason_text(text: Option<&str>) -> Option<String> {
     Some(truncate_with_ellipsis(&text, MAX_REASON_LEN))
 }
 
+/// Render a principal as `type:id`, or just the id when its type is unknown.
+fn principal_label(user: &User) -> String {
+    let principal = user
+        .uid
+        .as_deref()
+        .or(user.name.as_deref())
+        .unwrap_or_default();
+    let principal = escape_context_field(&truncate_with_ellipsis(principal, MAX_REASON_LEN));
+    if user.type_id == UserTypeId::Unknown {
+        principal
+    } else {
+        format!(
+            "{}:{principal}",
+            escape_context_field(&user.type_label.to_lowercase())
+        )
+    }
+}
+
+/// Render a caller's endpoint as ` from host:port`.
+fn peer_label(endpoint: &Endpoint) -> String {
+    let port = endpoint.port.map_or(String::new(), |p| format!(":{p}"));
+    let host = endpoint
+        .domain
+        .as_deref()
+        .or(endpoint.ip.as_deref())
+        .or(endpoint.name.as_deref())
+        .unwrap_or("unknown");
+    format!(" from {}{port}", escape_context_field(host))
+}
+
 /// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
 /// for denied events. Returns an empty string if neither field is set.
 fn reason_tag(base: &BaseEventData) -> String {
@@ -208,7 +239,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", p.name, p.pid))
                     .unwrap_or_default();
                 let dst = e
                     .dst_endpoint
@@ -278,7 +310,8 @@ impl OcsfEvent {
                 let actor_str = e
                     .actor
                     .as_ref()
-                    .map(|a| format!("{}({})", a.process.name, a.process.pid))
+                    .and_then(|a| a.process.as_ref())
+                    .map(|p| format!("{}({})", p.name, p.pid))
                     .unwrap_or_default();
                 let url_str = e
                     .http_request
@@ -317,6 +350,46 @@ impl OcsfEvent {
                     String::new()
                 };
                 format!("HTTP:{method} {sev}{detail}{rule_ctx}{outcome_ctx}{message_ctx}")
+            }
+
+            Self::ApiActivity(e) if e.actor.user.is_some() => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e
+                    .action
+                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let principal = e
+                    .actor
+                    .user
+                    .as_ref()
+                    .map(principal_label)
+                    .unwrap_or_default();
+                let peer = peer_label(&e.src_endpoint);
+                let operation = e
+                    .http_request
+                    .as_ref()
+                    .and_then(|r| r.url.as_ref())
+                    .and_then(|u| u.path.as_deref())
+                    .unwrap_or(&e.api.operation);
+                let mut context = vec![format!(
+                    "op:{}",
+                    escape_context_field(&truncate_with_ellipsis(operation, MAX_REASON_LEN))
+                )];
+                for resource in e.resources.iter().flatten() {
+                    let Some(id) = resource.uid.as_deref().or(resource.name.as_deref()) else {
+                        continue;
+                    };
+                    context.push(format!(
+                        "{}:{}",
+                        escape_context_field(resource.type_label.as_deref().unwrap_or("resource")),
+                        escape_context_field(&truncate_with_ellipsis(id, MAX_REASON_LEN))
+                    ));
+                }
+                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
+                    context.push(format!("reason:{}", escape_context_field(&reason)));
+                }
+                let context = context.join(" ");
+
+                format!("API:{activity} {sev}{action} {principal}{peer} [{context}]")
             }
 
             Self::ApiActivity(e) => {
@@ -402,6 +475,44 @@ impl OcsfEvent {
                     format!(" {detail}")
                 };
                 format!("SSH:{activity} {sev}{detail}{auth_ctx}")
+            }
+
+            Self::Authentication(e) => {
+                let activity = e.base.activity_name.to_uppercase();
+                let action = e
+                    .action
+                    .map_or(String::new(), |a| format!(" {}", a.label().to_uppercase()));
+                let principal = principal_label(&e.user);
+                let peer = e.src_endpoint.as_ref().map(peer_label).unwrap_or_default();
+                let mut context = Vec::new();
+                if let Some(protocol) = e.auth_protocol.map(|p| {
+                    e.auth_protocol_label
+                        .as_deref()
+                        .unwrap_or_else(|| p.label())
+                }) {
+                    context.push(format!("protocol:{}", escape_context_field(protocol)));
+                }
+                if let Some(path) = e
+                    .http_request
+                    .as_ref()
+                    .and_then(|r| r.url.as_ref())
+                    .and_then(|u| u.path.as_deref())
+                {
+                    context.push(format!(
+                        "op:{}",
+                        escape_context_field(&truncate_with_ellipsis(path, MAX_REASON_LEN))
+                    ));
+                }
+                if let Some(reason) = reason_text(e.base.status_detail.as_deref()) {
+                    context.push(format!("reason:{}", escape_context_field(&reason)));
+                }
+                let context = if context.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", context.join(" "))
+                };
+
+                format!("AUTH:{activity} {sev}{action} {principal}{peer}{context}")
             }
 
             Self::ProcessActivity(e) => {
@@ -554,6 +665,7 @@ mod tests {
             profiles: vec!["security_control".to_string()],
             uid: Some("sandbox-abc123".to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -613,9 +725,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -642,9 +752,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_ip_str("93.184.216.34", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("node", 1234),
-            }),
+            actor: Some(Actor::process(Process::new("node", 1234))),
             firewall_rule: Some(FirewallRule::new("bypass-detect", "nftables")),
             connection_info: Some(ConnectionInfo::new("tcp")),
             action: Some(ActionId::Denied),
@@ -672,9 +780,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 88),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 88))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,
@@ -789,9 +895,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("169.254.169.254", 80)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("-", "ssrf")),
             connection_info: None,
             action: Some(ActionId::Denied),
@@ -818,9 +922,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: Some(Endpoint::from_domain("api.example.com", 443)),
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("python3", 42),
-            }),
+            actor: Some(Actor::process(Process::new("python3", 42))),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
             action: Some(ActionId::Allowed),
@@ -879,9 +981,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 1618),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 1618))),
             firewall_rule: Some(FirewallRule::new("aws_iam", "ssrf")),
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
@@ -1002,9 +1102,7 @@ mod tests {
             src_endpoint: None,
             dst_endpoint: None,
             proxy_endpoint: None,
-            actor: Some(Actor {
-                process: Process::new("curl", 68),
-            }),
+            actor: Some(Actor::process(Process::new("curl", 68))),
             firewall_rule: Some(FirewallRule::new("allow_host_9876", "mechanistic")),
             action: Some(ActionId::Allowed),
             disposition: None,
@@ -1037,6 +1135,68 @@ mod tests {
         assert_eq!(
             shorthand,
             "SSH:OPEN [INFO] ALLOWED 10.42.0.1:48201 [auth:NSSH1]"
+        );
+    }
+
+    #[test]
+    fn test_authentication_failure_shorthand() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .auth_protocol(crate::enums::AuthProtocolId::OpenId)
+        .action(ActionId::Denied)
+        .severity(crate::enums::SeverityId::Medium)
+        .status_detail("expired_credential")
+        .src_endpoint(Endpoint::from_ip_str("203.0.113.7", 51234))
+        .http_request(HttpRequest {
+            http_method: crate::enums::HttpMethod::Post,
+            url: Some(Url::from_path("/openshell.v1.OpenShell/ListSandboxes")),
+        })
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [MED] DENIED unknown from 203.0.113.7:51234 [protocol:OpenID op:/openshell.v1.OpenShell/ListSandboxes reason:expired_credential]"
+        );
+    }
+
+    #[test]
+    fn test_authentication_shorthand_names_an_unaddressed_source() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::unidentified(),
+            Service::new("openshell-gateway"),
+        )
+        .action(ActionId::Denied)
+        .severity(crate::enums::SeverityId::Low)
+        .src_endpoint(Endpoint::from_name("edge-tunnel"))
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [LOW] DENIED unknown from edge-tunnel"
+        );
+    }
+
+    #[test]
+    fn test_authentication_success_shorthand_labels_principal_type() {
+        let ctx = crate::builders::test_sandbox_context();
+        let event = crate::builders::AuthenticationBuilder::new(
+            &ctx,
+            User::other("sb 7f3a", "Sandbox"),
+            Service::new("openshell-gateway"),
+        )
+        .auth_protocol_other("sandbox_jwt")
+        .action(ActionId::Allowed)
+        .build();
+
+        assert_eq!(
+            event.format_shorthand(),
+            "AUTH:LOGON [INFO] ALLOWED sandbox:sb\\u{20}7f3a [protocol:sandbox_jwt]"
         );
     }
 

@@ -11,7 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
 E2E_TEST_SET="${OPENSHELL_E2E_PODMAN_TEST_SET:-}"
-E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES-e2e-podman}"
+# Unset or empty selects Rust defaults; e2e-conformance-only skips Rust tests.
+E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman}"
 DEFAULT_WORKLOAD_MANIFEST="${ROOT}/e2e/gpu/images/.build/workloads.yaml"
 RUN_WITH_GATEWAY_COMMAND="__openshell_run_podman_e2e"
 # shellcheck source=e2e/support/conformance.sh
@@ -72,7 +73,8 @@ fi
 
 if [ "${1:-}" = "${RUN_WITH_GATEWAY_COMMAND}" ]; then
   e2e_run_openshell_conformance "Podman"
-  if [ -z "${E2E_FEATURES}" ]; then
+  if [ "${E2E_FEATURES}" = "e2e-conformance-only" ]; then
+    echo "::notice::Skipping Rust e2e tests (e2e-conformance-only)"
     exit 0
   fi
 
@@ -98,7 +100,7 @@ if [ -n "${OPENSHELL_GATEWAY_ENDPOINT:-}" ] && [ -z "${OPENSHELL_BIN:-}" ]; then
   export OPENSHELL_BIN="${ROOT}/target/debug/openshell"
 fi
 
-if [ -n "${E2E_FEATURES}" ]; then
+if [ "${E2E_FEATURES}" != "e2e-conformance-only" ]; then
   CONTAINER_ENGINE=podman bash "${ROOT}/tasks/scripts/e2e-build-workload.sh"
 fi
 

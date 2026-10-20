@@ -3,6 +3,8 @@
 
 //! Retained I/O multiplexer for the canonical sandbox process.
 
+use crate::native_api::{BoundaryProcess, BoundaryTerminal, ProcessAttachment};
+
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -17,9 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::watch;
 
-use openshell_isolation_interface::contract::{
-    BoundaryProcess, BoundarySignal, BoundaryTerminal, ProcessAttachment,
-};
+use openshell_isolation_interface::contract::BoundarySignal;
 
 use crate::container_log::{AgentOutputSink, AgentStream};
 use crate::process::ProcessIo;

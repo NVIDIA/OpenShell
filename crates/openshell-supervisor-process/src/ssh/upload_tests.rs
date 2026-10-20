@@ -3,12 +3,15 @@
 
 //! Exercise the production upload handler over a real SSH session.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use super::tests::{AcceptAnyServerKey, RejectingExec, test_client};
 use openshell_core::upload::{SUBSYSTEM, UploadPlan, WINDOW_BYTES};
 use openshell_isolation_interface::contract::{
-    BackendError, BoundaryExec, BoundaryExitStatus, BoundaryProcess, BoundarySignal, ExecSession,
-    ExecSpec,
+    BackendError, BoundaryExitStatus, BoundarySignal, ExecSpec,
 };
+use rpc_test::ExecSession;
 use russh::ChannelMsg;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -29,7 +32,7 @@ struct Process {
 }
 
 #[async_trait::async_trait]
-impl BoundaryProcess for Process {
+impl rpc_test::BoundaryProcess for Process {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         let mut status = self.status.subscribe();
         let result = status
@@ -59,7 +62,7 @@ impl BoundaryProcess for Process {
 struct Exec(Mutex<VecDeque<ExecSession>>);
 
 #[async_trait::async_trait]
-impl BoundaryExec for Exec {
+impl rpc_test::BoundaryExec for Exec {
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
         assert!(!spec.pty);
         assert!(spec.runtime_helper.is_none());
@@ -121,7 +124,7 @@ fn exec_session() -> (ExecSession, Control) {
 async fn client_for(sessions: Vec<ExecSession>) -> russh::client::Handle<AcceptAnyServerKey> {
     test_client(
         None,
-        Arc::new(Exec(Mutex::new(sessions.into()))),
+        rpc_test::exec(Arc::new(Exec(Mutex::new(sessions.into())))),
         russh::client::Config::default(),
     )
     .await
@@ -200,18 +203,28 @@ async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
         let (mut channel, mut reader) = start(&client).await;
         let chunk = vec![42; CHUNK];
         let mut sent = 0;
-        while sent < WINDOW {
-            channel.data(chunk.as_slice()).await.unwrap();
-            sent += CHUNK;
+        let mut acknowledged = 0;
+        // The RPC transport can buffer input before the extractor reads it.
+        // Fill that bounded transport while respecting application credit.
+        while sent < 5 * WINDOW {
+            if sent + CHUNK > acknowledged + WINDOW {
+                match tokio::time::timeout(Duration::from_millis(50), reader.next(&mut channel))
+                    .await
+                {
+                    Ok(Some(total)) => acknowledged = usize::try_from(total).unwrap(),
+                    _ => break,
+                }
+            } else {
+                channel.data(chunk.as_slice()).await.unwrap();
+                sent += CHUNK;
+            }
         }
+        assert!(
+            sent < 5 * WINDOW,
+            "stalled extractor must bound transport buffering"
+        );
         channel.signal(russh::Sig::INT).await.unwrap();
         assert_eq!(control.signals.recv().await, Some(BoundarySignal::Int));
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), reader.next(&mut channel))
-                .await
-                .is_err(),
-            "credit returned before the extractor consumed input"
-        );
         // Stalled upload input must leave sibling channel requests responsive.
         let mut sibling = client.channel_open_session().await.unwrap();
         sibling.exec(true, "cat").await.unwrap();
@@ -242,7 +255,6 @@ async fn stalled_upload_preserves_controls_then_resumes_beyond_four_mib() {
                 .status
                 .send_replace(Some(BoundaryExitStatus::Exited(0)));
         });
-        let mut acknowledged = 0;
         while sent < 5 * WINDOW {
             if sent + CHUNK > acknowledged + WINDOW {
                 let total = reader.next(&mut channel).await.unwrap();
@@ -307,9 +319,9 @@ async fn invalid_plans_and_credit_violations_exit_74() {
             };
             match case {
                 "credit" => {
-                    for _ in 0..=WINDOW / CHUNK {
-                        channel.data(vec![7; CHUNK].as_slice()).await.unwrap();
-                    }
+                    // Exceed credit despite bounded buffering in the RPC writer.
+                    let mut writer=channel.make_writer();
+                    tokio::spawn(async move{let _=writer.write_all(&vec![7;8*WINDOW]).await;});
                 }
                 "eof" => {
                     channel.data(&b"{"[..]).await.unwrap();
@@ -321,10 +333,14 @@ async fn invalid_plans_and_credit_violations_exit_74() {
                     channel.data(&plan[..]).await.unwrap();
                 }
             }
+
             reader.close(&mut channel).await;
+
             assert_eq!(reader.statuses, [74]);
             if case == "credit" {
-                control.process.terminated().await;
+
+            control.process.terminated().await;
+
             } else {
                 let stderr = String::from_utf8_lossy(&reader.stderr);
                 assert!(stderr.contains("openshell: "), "{stderr}");
@@ -358,10 +374,13 @@ async fn extractor_failures_report_status_and_output() {
                 // Broken stdin wakes no credit; the extractor is stopped.
                 drop(control.stdin);
                 channel.data(vec![7; CHUNK].as_slice()).await.unwrap();
+
                 control.process.terminated().await;
             }
             drop((control.stdout, control.stderr));
+
             reader.close(&mut channel).await;
+
             if early_exit {
                 assert_eq!(reader.statuses, [2]);
                 assert_eq!(reader.stderr, diagnostic.as_bytes());
@@ -392,10 +411,12 @@ async fn close_and_disconnect_cancel_stalled_boundary_input() {
             } else {
                 channel.close().await.unwrap();
             }
+
             control.process.terminated().await;
+
             let mut received = Vec::new();
             control.stdin.read_to_end(&mut received).await.unwrap();
-            assert!(received.len() <= 1024);
+            assert!(received.len() <= CHUNK);
         })
         .await
         .expect("close or disconnect stranded upload input");
@@ -407,7 +428,7 @@ async fn upload_rejects_pty_and_duplicate_channel_requests() {
     tokio::time::timeout(DEADLINE, async {
         let client = test_client(
             None,
-            Arc::new(RejectingExec),
+            rpc_test::exec(Arc::new(RejectingExec)),
             russh::client::Config::default(),
         )
         .await;
@@ -443,7 +464,7 @@ struct DelayedExec {
 }
 
 #[async_trait::async_trait]
-impl BoundaryExec for DelayedExec {
+impl rpc_test::BoundaryExec for DelayedExec {
     async fn exec(&self, _: ExecSpec) -> Result<ExecSession, BackendError> {
         let release = self.release.lock().unwrap().take().unwrap();
         self.started.send_replace(true);
@@ -461,11 +482,11 @@ async fn cancellation_during_remote_startup_terminates_late_process() {
             let started = watch::channel(false).0;
             let client = test_client(
                 None,
-                Arc::new(DelayedExec {
+                rpc_test::exec(Arc::new(DelayedExec {
                     session: Mutex::new(Some(session)),
                     started: started.clone(),
                     release: Mutex::new(Some(receiver)),
-                }),
+                })),
                 russh::client::Config::default(),
             )
             .await;
@@ -487,6 +508,7 @@ async fn cancellation_during_remote_startup_terminates_late_process() {
                 channel.close().await.unwrap();
             }
             release.send(()).unwrap();
+
             control.process.terminated().await;
         })
         .await
@@ -514,9 +536,12 @@ async fn late_rejection_wins_until_the_result_is_reported() {
                 if pending_output_status {
                     // Output EOF leaves the exit task waiting for the backend's
                     // final status; dropped readers prove both drains finished.
+
                     control.stdout.shutdown().await.unwrap();
                     control.stderr.shutdown().await.unwrap();
+
                     assert_eq!(control.stdout.read(&mut [0]).await.unwrap(), 0);
+
                     assert_eq!(control.stderr.read(&mut [0]).await.unwrap(), 0);
                 } else {
                     control
@@ -540,7 +565,9 @@ async fn late_rejection_wins_until_the_result_is_reported() {
                 .unwrap();
             assert!(reader.close(&mut channel).await.is_empty());
             assert_eq!(reader.statuses, [74]);
+
             control.process.terminated().await;
+
             drop((control.stdout, control.stderr, output_status));
         })
         .await
@@ -551,7 +578,7 @@ async fn late_rejection_wins_until_the_result_is_reported() {
 struct LoginProbe(watch::Sender<Option<bool>>);
 
 #[async_trait::async_trait]
-impl BoundaryExec for LoginProbe {
+impl rpc_test::BoundaryExec for LoginProbe {
     async fn exec(&self, spec: ExecSpec) -> Result<ExecSession, BackendError> {
         self.0.send_replace(Some(spec.shell.unwrap().login));
         Err(BackendError::Process("login selection observed".into()))
@@ -565,7 +592,7 @@ async fn upload_preserves_login_shell_selection() {
             let login = watch::channel(None).0;
             let client = test_client(
                 None,
-                Arc::new(LoginProbe(login.clone())),
+                rpc_test::exec(Arc::new(LoginProbe(login.clone()))),
                 russh::client::Config::default(),
             )
             .await;

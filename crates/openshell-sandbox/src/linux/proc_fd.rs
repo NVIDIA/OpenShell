@@ -59,13 +59,36 @@ pub fn installed_socket_inodes_excluding(
 /// notification, task generation, and any retained socket cookie before a
 /// state-changing operation.
 pub fn socket_inode(tid: u32, fd: RawFd) -> io::Result<u64> {
+    socket_inode_if_socket(tid, fd)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "procfs descriptor is not a socket",
+        )
+    })
+}
+
+/// Return `None` only after procfs confirms that the descriptor is not a socket.
+///
+/// An unreadable or missing descriptor remains an error so callers cannot
+/// mistake failed inspection for a safe native socket operation.
+pub fn socket_inode_if_socket(tid: u32, fd: RawFd) -> io::Result<Option<u64>> {
     if tid == 0 || fd < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "TID must be nonzero and FD must be nonnegative",
         ));
     }
-    let target = fs::read_link(format!("/proc/{tid}/fd/{fd}"))?;
+    let target = match fs::read_link(format!("/proc/{tid}/fd/{fd}")) {
+        Ok(target) => target,
+        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            // A missing descriptor should keep the syscall's EBADF result.
+            // Check the parent so a vanished task or inaccessible procfs does
+            // not get mistaken for a closed descriptor.
+            fs::metadata(format!("/proc/{tid}/fd"))?;
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        Err(error) => return Err(error),
+    };
     let target = target.to_str().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -74,20 +97,24 @@ pub fn socket_inode(tid: u32, fd: RawFd) -> io::Result<u64> {
     })?;
     let digits = target
         .strip_prefix("socket:[")
-        .and_then(|value| value.strip_suffix(']'))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "procfs descriptor is not a socket",
-            )
-        })?;
+        .and_then(|value| value.strip_suffix(']'));
+    let Some(digits) = digits else {
+        return if target.starts_with("socket:") {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "procfs socket inode has an invalid representation",
+            ))
+        } else {
+            Ok(None)
+        };
+    };
     if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "procfs socket inode has an invalid representation",
         ));
     }
-    digits.parse::<u64>().map_err(|error| {
+    digits.parse::<u64>().map(Some).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("procfs socket inode does not fit u64: {error}"),
@@ -107,13 +134,37 @@ mod tests {
     fn identifies_socket_and_rejects_regular_file() {
         let (left, _right) = UnixStream::pair().expect("socketpair");
         assert!(socket_inode(std::process::id(), left.as_raw_fd()).unwrap() > 0);
+        assert_eq!(
+            socket_inode_if_socket(std::process::id(), left.as_raw_fd()).unwrap(),
+            Some(socket_inode(std::process::id(), left.as_raw_fd()).unwrap())
+        );
 
         let file = File::open("/dev/null").expect("open regular descriptor");
+        assert_eq!(
+            socket_inode_if_socket(std::process::id(), file.as_raw_fd()).unwrap(),
+            None
+        );
         assert_eq!(
             socket_inode(std::process::id(), file.as_raw_fd())
                 .expect_err("regular descriptor")
                 .kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn missing_descriptor_is_not_classified_as_non_socket() {
+        assert_eq!(
+            socket_inode_if_socket(std::process::id(), i32::MAX)
+                .expect_err("closed descriptor cannot be inspected")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            socket_inode_if_socket(u32::MAX, 3)
+                .expect_err("missing task must remain an inspection error")
+                .raw_os_error(),
+            Some(libc::ENOENT)
         );
     }
 

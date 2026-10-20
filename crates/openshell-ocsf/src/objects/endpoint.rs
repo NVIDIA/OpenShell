@@ -21,6 +21,10 @@ pub struct Endpoint {
     /// Port number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+
+    /// Short name for an endpoint with no address of its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl Endpoint {
@@ -31,6 +35,18 @@ impl Endpoint {
             domain: Some(name.to_string()),
             ip: None,
             port: Some(port),
+            name: None,
+        }
+    }
+
+    /// Create an endpoint identified only by a short name.
+    #[must_use]
+    pub fn from_name(name: &str) -> Self {
+        Self {
+            domain: None,
+            ip: None,
+            port: None,
+            name: Some(name.to_string()),
         }
     }
 
@@ -41,6 +57,7 @@ impl Endpoint {
             domain: None,
             ip: Some(addr.to_string()),
             port: Some(port),
+            name: None,
         }
     }
 
@@ -51,6 +68,7 @@ impl Endpoint {
             domain: None,
             ip: Some(addr.to_string()),
             port: Some(port),
+            name: None,
         }
     }
 

@@ -228,22 +228,27 @@ pub(super) async fn resolve_and_authorize_sandbox_name(
             .ok_or_else(|| Status::not_found("sandbox not found"));
     };
 
+    let not_owned = || Status::permission_denied("sandbox not found or not owned by caller");
+    // The caller's own record can disappear between authentication and this
+    // read when the sandbox is deleted; that is not misuse.
     let sandbox = state
         .store
         .get_message::<Sandbox>(&sandbox_principal.sandbox_id)
         .await
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .filter(|sandbox| {
-            sandbox.metadata.as_ref().is_some_and(|metadata| {
-                metadata.name == sandbox_name
-                    && (workspace.is_empty() || workspace == sandbox.object_workspace())
-            })
-        });
-    let Some(sandbox) = sandbox else {
-        return Err(Status::permission_denied(
-            "sandbox not found or not owned by caller",
-        ));
-    };
+        .ok_or_else(not_owned)?;
+    let names_itself = sandbox.metadata.as_ref().is_some_and(|metadata| {
+        metadata.name == sandbox_name
+            && (workspace.is_empty() || workspace == sandbox.object_workspace())
+    });
+    if !names_itself {
+        // A supervisor only ever names its own sandbox.
+        crate::auth::audit::emit_authorization_denial(
+            principal,
+            crate::auth::audit::AuthzDenial::CrossSandboxName { name: sandbox_name },
+        );
+        return Err(not_owned());
+    }
 
     authorize_sandbox_workspace(
         &state.store,
@@ -461,13 +466,6 @@ async fn handle_create_sandbox_inner(
     let workload_template_name = request.workload_template.trim().to_string();
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
-
-    // Validate labels (keys and values must meet Kubernetes requirements).
-    for (key, value) in &request.labels {
-        crate::grpc::validation::validate_label_key(key)?;
-        crate::grpc::validation::validate_label_value(value)?;
-    }
-    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
 
     let authz = authorize_workspace(
         &state.store,
@@ -791,7 +789,7 @@ fn validate_create_sandbox_request_pre_io(
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
-    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+    crate::grpc::validation::validate_caller_annotations(&request.annotations, "annotations")?;
 
     if request.service_exposures.len() > MAX_CREATE_SERVICE_EXPOSURES {
         return Err(Status::invalid_argument(format!(
@@ -1518,6 +1516,10 @@ pub(super) async fn handle_attach_sandbox_provider(
     .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
 
     let attached = attached.load(Ordering::Relaxed);
+    if attached {
+        crate::config_delivery::publish_sandbox(state, &sandbox_id);
+        state.sandbox_watch_bus.notify(&sandbox_id);
+    }
     let receipt = super::provider_readiness::record_provider_mutation(
         state,
         &sandbox,
@@ -1645,6 +1647,10 @@ pub(super) async fn handle_detach_sandbox_provider(
     .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
 
     let detached = detached.load(Ordering::Relaxed);
+    if detached {
+        crate::config_delivery::publish_sandbox(state, &sandbox_id);
+        state.sandbox_watch_bus.notify(&sandbox_id);
+    }
     let receipt = super::provider_readiness::record_provider_mutation(
         state,
         &sandbox,
@@ -7229,6 +7235,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_sandbox_rejects_reserved_annotations() {
+        let state = test_server_state().await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                request_id: String::new(),
+                name: "reserved".to_string(),
+                spec: Some(SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::from([(
+                    "internal.openshell.ai/compute-driver".to_string(),
+                    "x".to_string(),
+                )]),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                await_main_process_attachment: false,
+                workload_template: String::new(),
+                service_exposures: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("internal.openshell.ai/"));
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "reserved")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn single_replica_get_sandbox_sends_no_owner_hint() {
         let state = test_server_state().await;
         let mut sandbox = test_sandbox("hinted", Vec::new());
@@ -9677,6 +9721,93 @@ mod tests {
             first_page.sandboxes[0].object_id(),
             second_page.sandboxes[0].object_id()
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_naming_another_sandbox_is_recorded_as_cross_sandbox() {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+
+        let state = test_server_state().await;
+        for name in ["own", "victim"] {
+            state
+                .store
+                .put_message(&test_sandbox(name, vec![]))
+                .await
+                .unwrap();
+        }
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "sandbox-own".to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        resolve_and_authorize_sandbox_name(
+            &state,
+            &principal,
+            "own",
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await
+        .expect("a sandbox may name itself");
+        assert!(capture.events().is_empty(), "own sandbox is not a denial");
+
+        let err = resolve_and_authorize_sandbox_name(
+            &state,
+            &principal,
+            "victim",
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await
+        .expect_err("another sandbox must be refused");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        let events: Vec<_> = capture
+            .events()
+            .iter()
+            .map(|event| event.to_json().unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0]["status_detail"], "cross_sandbox");
+        assert_eq!(
+            events[0]["resources"],
+            serde_json::json!([{"name": "victim", "type": "sandbox"}])
+        );
+        assert_eq!(events[1]["class_uid"], 2004);
+    }
+
+    #[tokio::test]
+    async fn sandbox_whose_own_record_is_gone_is_denied_without_a_finding() {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+
+        let state = test_server_state().await;
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "sandbox-own".to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _guard = capture.install();
+
+        let err = resolve_and_authorize_sandbox_name(
+            &state,
+            &principal,
+            "own",
+            "default",
+            MinWorkspaceRole::User,
+        )
+        .await
+        .expect_err("a deleted sandbox must be refused");
+
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(capture.events().is_empty(), "deletion is not misuse");
     }
 
     /// Workspace collection operations reject non-members, while operations on

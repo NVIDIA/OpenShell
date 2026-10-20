@@ -9,6 +9,15 @@ The server owns control-plane RPCs, authentication, provider credential delivery
 and sandbox lifecycle orchestration. The `openshell-gateway` crate composes the
 server with selected compute drivers.
 
+## Sandbox launch identity
+
+A new start, including an automatic restart, commits a fresh runtime generation
+and an incremented authorization epoch before invoking the compute driver.
+The launch session ID is derived from the durable sandbox ID and generation.
+Retries reuse that generation and session, including after gateway restart.
+Credential renewal retains both; credentials for an older launch cannot
+authorize the new one.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

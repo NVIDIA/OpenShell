@@ -71,7 +71,6 @@ fn stream_unavailable(success: Success) -> Status {
     )
 }
 
-#[tonic::async_trait]
 impl Mutation for ExecSandboxRequest {
     type Output = ExecStream;
     const METHOD: &'static str = "ExecSandbox";
@@ -108,7 +107,6 @@ impl Mutation for ExecSandboxRequest {
     }
 }
 
-#[tonic::async_trait]
 impl Mutation for ExecSandboxInput {
     type Output = ExecStream;
     const METHOD: &'static str = "ExecSandboxInteractive";

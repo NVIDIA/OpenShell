@@ -26,6 +26,7 @@ enum Reply {
     /// Stop answering on the first connection once it is confirmed.
     Blackhole,
     Leaf(BoundaryErrorKind),
+    Deny,
     Idle,
 }
 
@@ -51,13 +52,13 @@ struct NetworkPeer {
 }
 
 #[tonic::async_trait]
-impl IsolationBoundary for NetworkPeer {
+impl SandboxProtocol for NetworkPeer {
     type ExchangeStream = TestGrpcStream;
-    type MediateStream = TestGrpcStream;
+    type MediateStream = TestGrpcStream<MediateFrame>;
 
     async fn exchange(
         &self,
-        request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        request: tonic::Request<tonic::Streaming<ExchangeFrame>>,
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         if request.metadata().get("authorization").unwrap()
             != format!("Bearer {}", "a".repeat(32)).as_str()
@@ -80,7 +81,7 @@ impl IsolationBoundary for NetworkPeer {
 
     async fn mediate(
         &self,
-        _request: tonic::Request<tonic::Streaming<BoundaryChunk>>,
+        _request: tonic::Request<tonic::Streaming<MediateFrame>>,
     ) -> Result<tonic::Response<Self::MediateStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("TCP fixture"))
     }
@@ -89,12 +90,15 @@ impl IsolationBoundary for NetworkPeer {
 impl NetworkPeer {
     async fn respond(
         &self,
-        mut inbound: tonic::Streaming<BoundaryChunk>,
-        outbound: tokio::sync::mpsc::Sender<Result<BoundaryChunk, tonic::Status>>,
+        mut inbound: tonic::Streaming<ExchangeFrame>,
+        outbound: tokio::sync::mpsc::Sender<Result<ExchangeFrame, tonic::Status>>,
     ) -> Result<(), tonic::Status> {
+        test_bind(&mut inbound).await;
         let mut frame = Vec::new();
         while !complete_control_frame(&frame) {
-            frame.extend_from_slice(&inbound.message().await?.expect("control request").data);
+            frame.extend_from_slice(&chunk_data(
+                inbound.message().await?.expect("control request"),
+            )?);
         }
         let envelope: RequestEnvelope = decode_frame(&frame).unwrap();
         if matches!(self.state.reply, Reply::Blackhole)
@@ -180,7 +184,8 @@ impl NetworkPeer {
                     | Reply::DisconnectLate
                     | Reply::DisconnectGated
                     | Reply::DropFirstAccept
-                    | Reply::Blackhole => network_response(),
+                    | Reply::Blackhole
+                    | Reply::Deny => network_response(),
                 }
             }
             _ => unreachable!(),
@@ -191,20 +196,24 @@ impl NetworkPeer {
             response,
         })
         .unwrap();
-        outbound
-            .send(Ok(BoundaryChunk { data: bytes }))
-            .await
-            .unwrap();
+        outbound.send(Ok(test_response_chunk(bytes))).await.unwrap();
         if connected {
             let state = self.state.clone();
             tokio::spawn(async move {
-                let (mut reader, writer) = tokio::io::duplex(4096);
-                let pump = tokio::spawn(pump_from_grpc(inbound, writer));
+                let mut reader = grpc_reader(inbound, crate::stream_adapter::Mode::Decision);
                 let result = tokio::time::timeout(Duration::from_secs(3), async {
                     let (channel, payload) = read_stream_frame(&mut reader).await.unwrap().unwrap();
                     assert_eq!(channel, STREAM_NETWORK_DECISION);
+                    if matches!(state.reply, Reply::Deny) {
+                        assert_eq!(
+                            crate::protobuf::decode::<TcpOpenDecision>(&payload).unwrap(),
+                            TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied)
+                        );
+                        state.decisions.fetch_add(1, Ordering::AcqRel);
+                        return;
+                    }
                     assert_eq!(
-                        serde_json::from_slice::<TcpOpenDecision>(&payload).unwrap(),
+                        crate::protobuf::decode::<TcpOpenDecision>(&payload).unwrap(),
                         TcpOpenDecision::RelayReady
                     );
                     state.decisions.fetch_add(1, Ordering::AcqRel);
@@ -212,14 +221,11 @@ impl NetworkPeer {
                     reader.read_exact(&mut ping).await.unwrap();
                     assert_eq!(&ping, b"ping");
                     outbound
-                        .send(Ok(BoundaryChunk {
-                            data: b"pong".to_vec(),
-                        }))
+                        .send(Ok(data_chunk(b"pong".to_vec())))
                         .await
                         .unwrap();
                 })
                 .await;
-                pump.abort();
                 result.expect("accepted network stream must receive its decision and payload");
             });
         }
@@ -238,11 +244,11 @@ fn network_response() -> Response {
             cmdline_paths: Vec::new(),
         },
         destination: "203.0.113.1:443".parse().unwrap(),
-        socket: NetworkSocketMetadata {
+        socket: Some(NetworkSocketMetadata {
             socket_cookie: 42,
             nonblocking: true,
             process_generation: 7,
-        },
+        }),
         policy_generation: 9,
         timing: MediationTimingWire {
             notification_to_queue_us: 11,
@@ -252,7 +258,7 @@ fn network_response() -> Response {
 }
 
 struct Fixture {
-    source: RemoteNetworkMediation,
+    source: NetworkMediationSource,
     state: Arc<PeerState>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -302,7 +308,8 @@ impl Fixture {
                     ))])
                     .chain(tokio_stream::pending());
                     let serving = tonic::transport::Server::builder()
-                        .add_service(IsolationBoundaryServer::new(peer))
+                        .add_service(IsolationBackendServer::new(TestIsolationBackend::default()))
+                        .add_service(SandboxProtocolServer::new(peer))
                         .serve_with_incoming(incoming);
                     tokio::select! {
                         result = serving => result.unwrap(),
@@ -338,7 +345,6 @@ impl Fixture {
                 .call_idempotent(Request::Attach {
                     supervisor_instance_id: client.supervisor_instance_id,
                     policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
-                    resource_claims: std::collections::BTreeMap::new(),
                 })
                 .await
                 .unwrap();
@@ -347,7 +353,7 @@ impl Fixture {
         .await
         .expect("fixture must attach and confirm");
         Self {
-            source: RemoteNetworkMediation { client },
+            source: NetworkMediationSource { client },
             state,
             server,
         }
@@ -367,7 +373,7 @@ async fn verify_connection(mut pending: PendingTcpOpen) {
         PathBuf::from("/usr/bin/curl")
     );
     assert_eq!(
-        pending.socket,
+        pending.socket.unwrap(),
         NetworkSocketMetadata {
             socket_cookie: 42,
             nonblocking: true,
@@ -385,6 +391,25 @@ async fn verify_connection(mut pending: PendingTcpOpen) {
     let mut pong = [0; 4];
     pending.stream.read_exact(&mut pong).await.unwrap();
     assert_eq!(&pong, b"pong");
+}
+
+#[tokio::test]
+async fn tcp_policy_denial_reaches_backend_before_stream_is_closed() {
+    let fixture = Fixture::new(Reply::Deny).await;
+    let pending = fixture.source.accept_tcp().await.unwrap();
+    pending
+        .decision
+        .send(TcpOpenDecision::Denied(TcpOpenDenial::PolicyDenied))
+        .unwrap();
+    drop(pending.stream);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.state.decisions.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("policy denial must reach the backend before the RPC is dropped");
+    assert_eq!(fixture.state.connections.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]
@@ -424,7 +449,7 @@ async fn concurrent_tcp_accepts_recover_a_lost_tls_connection() {
     .await;
     let mut accepts = tokio::task::JoinSet::new();
     for _ in 0..ACCEPTS {
-        let source = RemoteNetworkMediation {
+        let source = NetworkMediationSource {
             client: fixture.source.client.clone(),
         };
         accepts.spawn(async move { verify_connection(source.accept_tcp().await.unwrap()).await });
@@ -474,7 +499,7 @@ async fn tcp_accept_preserves_boundary_leaf_errors() {
 #[tokio::test]
 async fn tcp_accept_has_no_idle_operation_timeout() {
     let fixture = Fixture::new(Reply::Idle).await;
-    let source = RemoteNetworkMediation {
+    let source = NetworkMediationSource {
         client: fixture.source.client.clone(),
     };
     let pending = tokio::spawn(async move { source.accept_tcp().await });
@@ -561,7 +586,7 @@ async fn recovery_closes_an_unresponsive_connection_before_reattaching() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement() {
     let fixture = Fixture::new(Reply::DisconnectGated).await;
-    let first = RemoteNetworkMediation {
+    let first = NetworkMediationSource {
         client: fixture.source.client.clone(),
     };
     let first = tokio::spawn(async move { first.accept_tcp().await });
@@ -574,7 +599,7 @@ async fn requests_during_delayed_retirement_wait_for_the_confirmed_replacement()
     .expect("recovery must reach a same-epoch attach rejection");
 
     // Start an ordinary request while recovery waits for retirement.
-    let second = RemoteNetworkMediation {
+    let second = NetworkMediationSource {
         client: fixture.source.client.clone(),
     };
     let second = tokio::spawn(async move { second.accept_tcp().await });

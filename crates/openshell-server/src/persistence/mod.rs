@@ -316,6 +316,14 @@ impl Store {
         matches!(self, Self::Sqlite(_))
     }
 
+    /// Maximum number of pooled database connections for this backend.
+    pub fn max_connections(&self) -> u32 {
+        match self {
+            Self::Postgres(store) => store.max_connections(),
+            Self::Sqlite(store) => store.max_connections(),
+        }
+    }
+
     /// Configured size of the `PostgreSQL` mutation lock pool, or `None` on
     /// `SQLite`, which has no lock pool.
     pub fn mutation_lock_connections(&self) -> Option<u32> {
@@ -1499,6 +1507,14 @@ impl Store {
     pub(crate) async fn close_for_test(&self) {
         match self {
             Self::Sqlite(store) => store.close_for_test().await,
+            Self::Postgres(_) => unreachable!("tests use SQLite"),
+        }
+    }
+
+    /// Runs raw SQL against the test database.
+    pub(crate) async fn execute_for_test(&self, sql: &'static str) {
+        match self {
+            Self::Sqlite(store) => store.execute_for_test(sql).await,
             Self::Postgres(_) => unreachable!("tests use SQLite"),
         }
     }

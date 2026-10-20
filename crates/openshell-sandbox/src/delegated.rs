@@ -3,6 +3,8 @@
 
 //! Process and access-plane assembly for the capability-free sandbox boundary.
 
+use crate::native_api::{BoundaryExec, BoundaryLoopbackConnector};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -12,7 +14,6 @@ use miette::WrapErr as _;
 use miette::{IntoDiagnostic as _, Result};
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BoundaryExec, BoundaryLoopbackConnector};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
     ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,

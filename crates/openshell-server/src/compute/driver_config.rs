@@ -223,6 +223,26 @@ mod tests {
     }
 
     #[test]
+    fn driver_specific_decoder_does_not_receive_the_isolation_selector() {
+        #[derive(Default, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictDriverConfig {
+            socket_path: PathBuf,
+        }
+        let file: config_file::ConfigFile = toml::from_str(
+            "[openshell.drivers.external]\nsocket_path = '/run/compute.sock'\nisolation_backend = 'agent-substrate'",
+        )
+        .unwrap();
+        let decoded: StrictDriverConfig =
+            driver_config_from_context(test_context(Some(&file)), "external").unwrap();
+        assert_eq!(decoded.socket_path, PathBuf::from("/run/compute.sock"));
+        assert_eq!(
+            file.openshell.drivers["external"]["isolation_backend"].as_str(),
+            Some("agent-substrate")
+        );
+    }
+
+    #[test]
     fn common_admission_defaults_and_replacement_apply_to_every_driver() {
         for name in ["kubernetes", "docker", "podman", "vm", "mxc", "external"] {
             let defaults = admission_config_from_context(test_context(None), name).unwrap();
