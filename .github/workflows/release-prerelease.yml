@@ -50,6 +50,7 @@ jobs:
     permissions:
       actions: read
       contents: write
+      pull-requests: read
       packages: write
       id-token: write
       attestations: write
