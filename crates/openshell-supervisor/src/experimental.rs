@@ -10,7 +10,7 @@ use miette::Result;
 use std::net::SocketAddr;
 
 #[derive(Debug, Parser)]
-#[command(name = "openshell-supervisor experimental-host")]
+#[command(name = "openshell-supervisor shared")]
 #[command(about = "Start a shared supervisor placeholder; sandbox sessions are not implemented")]
 struct Args {
     /// Placeholder control listener; also accepts TCP process-health probes.
@@ -61,5 +61,5 @@ fn run_platform(args: Args) -> Result<()> {
 
 #[cfg(not(unix))]
 fn run_platform(_args: Args) -> Result<()> {
-    Err(miette::miette!("experimental-host requires Unix"))
+    Err(miette::miette!("shared requires Unix"))
 }

@@ -35,7 +35,7 @@ tests:
           value: example.com/supervisor:experiment
       - equal:
           path: spec.template.spec.containers[0].args
-          value: [experimental-host, --session-control-listen, "0.0.0.0:5501"]
+          value: [shared, --session-control-listen, "0.0.0.0:5501"]
       - equal:
           path: spec.template.spec.containers[0].ports
           value:

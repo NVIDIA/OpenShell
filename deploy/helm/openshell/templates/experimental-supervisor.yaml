@@ -51,7 +51,7 @@ spec:
           image: {{ get $kubernetes "supervisor_image" | quote }}
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
-            - experimental-host
+            - shared
             - --session-control-listen
             - 0.0.0.0:5501
           ports:

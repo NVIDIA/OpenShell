@@ -63,7 +63,7 @@ backend or enable a Windows workload runtime.
 
 ## Experimental shared host
 
-`openshell-supervisor experimental-host --session-control-listen 0.0.0.0:5501`
+`openshell-supervisor shared --session-control-listen 0.0.0.0:5501`
 starts a shared-host placeholder for the Kubernetes gateway topology experiment.
 Its future control listener accepts and closes connections, including kubelet
 `tcpSocket` probes, and reports process health only. No control RPCs, sandbox
