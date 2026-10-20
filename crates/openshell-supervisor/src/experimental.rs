@@ -3,28 +3,19 @@
 
 //! Shared-host placeholder: no sandbox admission, credentials, or session RPCs.
 
-use clap::Parser;
 #[cfg(unix)]
 use miette::IntoDiagnostic;
 use miette::Result;
 use std::net::SocketAddr;
 
-#[derive(Debug, Parser)]
-#[command(name = "openshell-supervisor shared")]
-#[command(about = "Start a shared supervisor placeholder; sandbox sessions are not implemented")]
-struct Args {
-    /// Placeholder control listener; also accepts TCP process-health probes.
-    #[arg(long)]
-    session_control_listen: SocketAddr,
-}
-
-pub fn run(raw_args: &[String]) -> Result<()> {
-    let args = Args::parse_from(raw_args);
-    run_platform(args)
+// The gateway endpoint is reserved for the shared supervisor's outbound session.
+// This plumbing stage only starts the local listener.
+pub fn run(address: SocketAddr, _gateway_endpoint: &str) -> Result<()> {
+    run_platform(address)
 }
 
 #[cfg(unix)]
-fn run_platform(args: Args) -> Result<()> {
+fn run_platform(address: SocketAddr) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -37,17 +28,19 @@ fn run_platform(args: Args) -> Result<()> {
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
-        let control = tokio::net::TcpListener::bind(args.session_control_listen)
+        let listener = tokio::net::TcpListener::bind(address)
             .await
             .into_diagnostic()?;
-        eprintln!("Shared supervisor started; sandbox sessions are not implemented");
+        eprintln!(
+            "Shared supervisor started; gateway connection and sandbox sessions are not implemented"
+        );
         loop {
             tokio::select! {
-                // This placeholder only accepts and closes connections. The same
-                // listener will serve session-control RPCs in the next stage.
-                result = control.accept() => {
+                // This placeholder only accepts and closes connections, including
+                // health probes. Session control will use an outbound gateway stream.
+                result = listener.accept() => {
                     if let Err(error) = result {
-                        eprintln!("shared supervisor control accept failed: {error}");
+                        eprintln!("shared supervisor listener accept failed: {error}");
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -60,6 +53,6 @@ fn run_platform(args: Args) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn run_platform(_args: Args) -> Result<()> {
-    Err(miette::miette!("shared requires Unix"))
+fn run_platform(_address: SocketAddr) -> Result<()> {
+    Err(miette::miette!("--mode=shared requires Unix"))
 }

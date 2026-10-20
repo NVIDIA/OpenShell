@@ -35,23 +35,28 @@ tests:
           value: example.com/supervisor:experiment
       - equal:
           path: spec.template.spec.containers[0].args
-          value: [shared, --session-control-listen, "0.0.0.0:5501"]
+          value:
+            - --mode=shared
+            - --gateway-endpoint
+            - https://openshell.gateway.svc.cluster.local:8080
+            - --address
+            - 0.0.0.0:5501
       - equal:
           path: spec.template.spec.containers[0].ports
           value:
-            - name: session-control
+            - name: supervisor
               containerPort: 5501
               protocol: TCP
       - equal:
           path: spec.template.spec.containers[0].readinessProbe
           value:
             tcpSocket:
-              port: session-control
+              port: supervisor
       - equal:
           path: spec.template.spec.containers[0].livenessProbe
           value:
             tcpSocket:
-              port: session-control
+              port: supervisor
       - notExists:
           path: spec.template.spec.containers[0].volumeMounts
       - notExists:

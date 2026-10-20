@@ -63,11 +63,13 @@ backend or enable a Windows workload runtime.
 
 ## Experimental shared host
 
-`openshell-supervisor shared --session-control-listen 0.0.0.0:5501`
+`openshell-supervisor --mode=shared --gateway-endpoint https://gateway:8080 --address 0.0.0.0:5501`
 starts a shared-host placeholder for the Kubernetes gateway topology experiment.
-Its future control listener accepts and closes connections, including kubelet
-`tcpSocket` probes, and reports process health only. No control RPCs, sandbox
-sessions, gateway authentication, or tenant routing are implemented yet.
+The listener at `--address` accepts and closes connections, including kubelet
+`tcpSocket` probes, and reports process health only. `--gateway-endpoint` selects
+the gateway the supervisor will dial for session control. The outbound connection,
+control RPCs, sandbox sessions, gateway authentication, and tenant routing are not
+implemented yet. Omitting `--mode` keeps the existing dedicated behavior.
 `experimental_supervisor_topology = "gateway"` deploys this placeholder; sandboxes
 continue using dedicated supervisors. SIGTERM and SIGINT close the listener.
-This subcommand is Unix-only.
+Shared mode is Unix-only.
