@@ -33,6 +33,15 @@ description: |
        same time. Every user gateway binds to 127.0.0.1:17670, so only one can
        run on the system at a time.
 
+       Older OpenShell snap revisions could enable the user gateway globally.
+       When upgrading such an installation, remove that global enablement so
+       the gateway does not start automatically for other users:
+
+         sudo systemctl disable --global snap.openshell.user-gateway.service
+
+       This does not stop gateways already running in other user sessions.
+       Those users must disable and stop the service from their own sessions.
+
        If the OpenShell snap was installed before Docker was running, its user
        service may have hit the systemd start limit. Resolve this from the
        affected user's session after Docker is available:

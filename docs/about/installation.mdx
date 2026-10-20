@@ -130,6 +130,19 @@ systemctl --user enable --now snap.openshell.user-gateway.service
 
 The user gateway is disabled globally by default. The install script enables it only for the user who ran the script. After a direct snap installation, choose one user account to run the gateway and enable it with the command above. Do not enable the gateway for multiple users who may be logged in at the same time: every user gateway binds to `127.0.0.1:17670`, so only one can run on the system at a time.
 
+Older OpenShell snap revisions could enable the user gateway globally, causing it to start for every user. Remove that global enablement once, then enable the gateway from the account that will run it:
+
+```shell
+sudo systemctl disable --global snap.openshell.user-gateway.service
+systemctl --user enable --now snap.openshell.user-gateway.service
+```
+
+The global command prevents automatic activation for other users but does not stop gateways already running in their user sessions. Run the following command from each other affected user's session:
+
+```shell
+systemctl --user disable --now snap.openshell.user-gateway.service
+```
+
 The snap installs the standalone policy prover as `openshell.prover`. The
 `openshell-prover` alias requires Snap Store approval and may not be available.
 The prover reads local policy files through the `home` interface and does not

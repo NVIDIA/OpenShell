@@ -233,9 +233,12 @@ assert_contains "$snap_install_docs" "systemctl --user reset-failed snap.openshe
 assert_contains "$snap_install_docs" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$snapcraft" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$ROOT/install.sh" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$ROOT/install.sh" "systemctl --global disable snap.openshell.user-gateway.service"
 assert_contains "$snap_install_docs" 'every user gateway binds to `127.0.0.1:17670`'
 assert_contains "$snap_install_docs" "systemctl --user disable --now snap.openshell.user-gateway.service"
 assert_contains "$snapcraft" "Every user gateway binds to 127.0.0.1:17670"
+assert_contains "$snap_install_docs" "sudo systemctl disable --global snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "sudo systemctl disable --global snap.openshell.user-gateway.service"
 for snap_file in "$ROOT/install.sh" "$snapcraft" "$snap_install_docs"; do
   assert_not_contains "$snap_file" "snap start --user openshell.user-gateway"
   assert_not_contains "$snap_file" "snap restart openshell.user-gateway"

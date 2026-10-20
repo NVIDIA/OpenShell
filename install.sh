@@ -1494,6 +1494,9 @@ Install Docker Engine from a system package or Docker's package repository, then
     warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
     as_root snap restart openshell.system-gateway
   else
+    # In case refreshing from an old snap which had a globally-enabled user
+    # gateway service, globally disable it, then just enable for the target user
+    as_root systemctl --global disable snap.openshell.user-gateway.service
     as_target_user systemctl --user daemon-reload
     as_target_user systemctl --user enable --now snap.openshell.user-gateway.service
     if [ "$_existing_snap" = true ]; then
