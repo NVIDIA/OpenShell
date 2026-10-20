@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::{OpenShellRunner, Poll, Scenario, ScenarioFuture};
+use openshell_conformance::{OpenShellRunner, Poll};
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
 const COMMAND_TIMEOUT: Duration = Duration::from_mins(2);
@@ -29,16 +29,21 @@ struct SandboxListPage {
 }
 
 /// Certify sandbox stop, start, and deletion lifecycle behavior.
-pub const SANDBOX_LIFECYCLE_SCENARIO: Scenario = Scenario {
-    name: "sandbox-lifecycle",
-    run: run_sandbox_lifecycle,
-};
 
-fn run_sandbox_lifecycle(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move {
+#[tokio::test]
+async fn sandbox_lifecycle() {
+    let mut runner = OpenShellRunner::from_env("sandbox-lifecycle")
+        .expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
         stop_start_preserves_workspace(runner).await?;
         stopped_can_be_deleted(runner).await
-    })
+    }
+    .await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("sandbox-lifecycle conformance scenario failed:\n{error}");
+    }
 }
 
 async fn stop_start_preserves_workspace(runner: &mut OpenShellRunner) -> Result<(), String> {

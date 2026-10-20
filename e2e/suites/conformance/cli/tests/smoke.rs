@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::{OpenShellRunner, STATUS_TIMEOUT, Scenario, ScenarioFuture};
+use openshell_conformance::{OpenShellRunner, STATUS_TIMEOUT};
 use serde::Deserialize;
 use tokio::time::sleep;
 
@@ -29,13 +29,20 @@ struct SandboxListPage {
 }
 
 /// Certify status -> create -> list Ready -> exec -> delete -> list empty.
-pub const SMOKE_SCENARIO: Scenario = Scenario {
-    name: "smoke",
-    run: run_smoke,
-};
 
-fn run_smoke(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
-    Box::pin(async move { run_smoke_inner(runner).await })
+#[tokio::test]
+async fn smoke() {
+    let mut runner =
+        OpenShellRunner::from_env("smoke").expect("candidate openshell CLI is available");
+    let result = async {
+        runner.check_gateway_status().await?;
+        let runner = &mut runner;
+        run_smoke_inner(runner).await
+    }
+    .await;
+    if let Err(error) = runner.finish(result).await {
+        panic!("smoke conformance scenario failed:\n{error}");
+    }
 }
 
 async fn run_smoke_inner(runner: &mut OpenShellRunner) -> Result<(), String> {

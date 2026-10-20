@@ -84,8 +84,8 @@ let
 
   conformanceTestArchive = mkTestArchive {
     name = "openshell-conformance";
-    workspacePath = "tests/suites/conformance";
-    manifestPath = "tests/suites/conformance/Cargo.toml";
+    workspacePath = "e2e/suites/conformance";
+    manifestPath = "e2e/suites/conformance/Cargo.toml";
     package = "openshell-test-conformance-cli";
     target = muslToolchain.target;
     output = "artifacts/test-archives/${muslToolchain.target}/openshell-conformance-tests.tar";

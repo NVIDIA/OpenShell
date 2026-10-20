@@ -1,17 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Reusable support for portable `OpenShell` CLI conformance scenarios.
+//! Command execution, polling, diagnostics, and cleanup for `OpenShell` conformance tests.
 
 pub mod executor;
-mod scenarios;
 
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::process::ExitStatus;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,28 +19,6 @@ use serde::de::DeserializeOwned;
 use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
-
-pub use scenarios::{
-    FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
-    FILE_TRANSFER_ROUND_TRIP_SCENARIO, MECHANISTIC_PROPOSAL_SCENARIO,
-    NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO,
-    SMOKE_SCENARIO,
-};
-
-/// A portable conformance scenario exercised by the Cargo test suite.
-#[derive(Debug)]
-pub struct Scenario {
-    pub name: &'static str,
-    run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
-}
-
-pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-
-impl Scenario {
-    pub async fn run(&self, runner: &mut OpenShellRunner) -> Result<(), String> {
-        (self.run)(runner).await
-    }
-}
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
