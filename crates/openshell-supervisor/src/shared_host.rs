@@ -27,7 +27,6 @@ use openshell_sandbox_backend::session_control::{
     MAX_REGISTRATION_BYTES, SESSIONS_PATH, SessionList, SessionPhaseReport, SessionRegistration,
     SessionStatusReport,
 };
-use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 
 use crate::session_host::{HostedSessionSpec, SessionHost, SessionPhase, SessionStatus};
@@ -361,7 +360,7 @@ impl SharedHost {
 fn registration_digest(registration: &SessionRegistration) -> Result<[u8; 32], ControlError> {
     let encoded = serde_json::to_vec(registration)
         .map_err(|error| ControlError::Invalid(format!("encode registration: {error}")))?;
-    Ok(Sha256::digest(&encoded).into())
+    openshell_crypto::sha256(&encoded).map_err(|error| ControlError::Unavailable(error.to_string()))
 }
 
 fn status_report(route: &str, sandbox_id: String, status: &SessionStatus) -> SessionStatusReport {

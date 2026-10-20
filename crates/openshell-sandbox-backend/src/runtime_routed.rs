@@ -386,9 +386,9 @@ mod tests {
         stream
             .write_all(&encode_route_preface(route).unwrap())
             .await?;
-        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
+        let mut config = rustls::ServerConfig::builder_with_provider(
+            openshell_crypto::tls::configuration_provider(),
+        )
         .with_protocol_versions(&[&rustls::version::TLS13])
         .unwrap()
         .with_no_client_auth()

@@ -44,7 +44,6 @@ rustls = { workspace = true }
 rustix = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 socket2 = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }

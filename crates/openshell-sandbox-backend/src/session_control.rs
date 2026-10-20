@@ -231,7 +231,7 @@ pub fn server_tls_config(
     private_key_pem: &[u8],
     client_ca_pem: &[u8],
 ) -> Result<Arc<rustls::ServerConfig>, BackendError> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = openshell_crypto::tls::configuration_provider();
     let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
         Arc::new(root_store(client_ca_pem)?),
         provider.clone(),
@@ -261,7 +261,7 @@ pub fn client_tls_config(
     private_key_pem: &[u8],
     server_ca_pem: &[u8],
 ) -> Result<Arc<rustls::ClientConfig>, BackendError> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = openshell_crypto::tls::configuration_provider();
     let config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| BackendError::Descriptor(error.to_string()))?

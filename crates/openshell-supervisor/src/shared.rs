@@ -57,7 +57,7 @@ fn run_platform(args: Args) -> Result<()> {
         .build()
         .into_diagnostic()?;
     runtime.block_on(async {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
         // Process-wide OCSF JSON output stays off; each session's own
