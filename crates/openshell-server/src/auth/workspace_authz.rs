@@ -8,7 +8,7 @@
 //! auth mode + scope + global role; this module validates workspace membership
 //! and workspace-level role.
 
-use super::audit::{AuthzDenial, emit_authorization_denial};
+use super::audit::{AuthzDenial, deny};
 use super::principal::Principal;
 use openshell_core::proto::{
     WorkspaceRole as ProtoWorkspaceRole, WorkspaceSelector,
@@ -159,39 +159,39 @@ pub async fn authorize_workspace(
                 .map_err(|e| Status::internal(format!("membership lookup failed: {e}")))?;
 
             let Some(member) = member else {
-                emit_authorization_denial(
+                let workspace_arg = shell_quote_for_hint(&workspace);
+                let subject_arg = shell_quote_for_hint(&user.identity.subject);
+                return Err(deny(
                     principal,
                     AuthzDenial::NotWorkspaceMember {
                         workspace: &workspace,
                     },
-                );
-                let workspace_arg = shell_quote_for_hint(&workspace);
-                let subject_arg = shell_quote_for_hint(&user.identity.subject);
-                return Err(Status::permission_denied(format!(
-                    "not a member of workspace '{workspace}'; ask a platform admin to run: \
-                     openshell workspace member add --workspace {workspace_arg} \
-                     --subject {subject_arg} --role user"
-                )));
+                    format!(
+                        "not a member of workspace '{workspace}'; ask a platform admin to run: \
+                         openshell workspace member add --workspace {workspace_arg} \
+                         --subject {subject_arg} --role user"
+                    ),
+                ));
             };
 
             let member_role = ProtoWorkspaceRole::try_from(member.role)
                 .unwrap_or(ProtoWorkspaceRole::Unspecified);
 
             if !role_satisfies(member_role, min_role) {
-                emit_authorization_denial(
+                let workspace_arg = shell_quote_for_hint(&workspace);
+                let subject_arg = shell_quote_for_hint(&user.identity.subject);
+                let role = min_role.as_str();
+                return Err(deny(
                     principal,
                     AuthzDenial::InsufficientWorkspaceRole {
                         workspace: &workspace,
                     },
-                );
-                let workspace_arg = shell_quote_for_hint(&workspace);
-                let subject_arg = shell_quote_for_hint(&user.identity.subject);
-                let role = min_role.as_str();
-                return Err(Status::permission_denied(format!(
-                    "workspace role '{role}' required in workspace '{workspace}'; ask a platform \
-                     admin to run: openshell workspace member add --workspace {workspace_arg} \
-                     --subject {subject_arg} --role {role}"
-                )));
+                    format!(
+                        "workspace role '{role}' required in workspace '{workspace}'; ask a \
+                         platform admin to run: openshell workspace member add --workspace \
+                         {workspace_arg} --subject {subject_arg} --role {role}"
+                    ),
+                ));
             }
 
             Ok(AuthorizedWorkspace {
@@ -207,12 +207,11 @@ pub async fn authorize_workspace(
             workspace,
             grant: AuthGrant::Sandbox,
         }),
-        Principal::Peer(_) => {
-            emit_authorization_denial(principal, AuthzDenial::MethodNotPermitted);
-            Err(Status::permission_denied(
-                "gateway peer principals cannot perform workspace operations",
-            ))
-        }
+        Principal::Peer(_) => Err(deny(
+            principal,
+            AuthzDenial::MethodNotPermitted,
+            "gateway peer principals cannot perform workspace operations",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
 }
@@ -248,8 +247,7 @@ pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result
         Principal::Peer(_) => "gateway peer principals cannot perform cross-workspace operations",
         Principal::Anonymous => return Err(Status::unauthenticated("authentication required")),
     };
-    emit_authorization_denial(principal, AuthzDenial::PlatformAdminRequired);
-    Err(Status::permission_denied(message))
+    Err(deny(principal, AuthzDenial::PlatformAdminRequired, message))
 }
 
 /// Check whether the caller's OIDC roles include the platform admin role.

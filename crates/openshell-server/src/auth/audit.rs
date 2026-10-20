@@ -9,14 +9,15 @@
 
 use openshell_ocsf::{
     ActionId, ActivityId, ApiActivityBuilder, AuthProtocolId, AuthenticationBuilder, ConfidenceId,
-    DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpMethod, HttpRequest,
-    ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
+    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo, HttpMethod,
+    HttpRequest, ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
 };
 use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+use tonic::Status;
 
 use super::identity::IdentityProvider;
 use super::principal::{Principal, SandboxIdentitySource};
@@ -60,21 +61,7 @@ impl RequestOrigin {
     }
 }
 
-use super::authenticator::{AuthFailureReason, AuthMechanism, bearer_credential};
-
-fn category(reason: AuthFailureReason) -> &'static str {
-    match reason {
-        AuthFailureReason::MissingCredential => "missing_credential",
-        AuthFailureReason::ConflictingCredentials => "conflicting_credentials",
-        AuthFailureReason::MalformedCredential => "malformed_credential",
-        AuthFailureReason::InvalidCredential => "invalid_credential",
-        AuthFailureReason::ExpiredCredential => "expired_credential",
-        AuthFailureReason::AudienceOrIssuerMismatch => "audience_or_issuer_mismatch",
-        AuthFailureReason::UnknownIdentity => "unknown_identity",
-        AuthFailureReason::StaleIdentity => "stale_identity",
-        AuthFailureReason::IdentityProviderUnavailable => "identity_provider_unavailable",
-    }
-}
+use super::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection, bearer_credential};
 
 fn severity(reason: AuthFailureReason) -> SeverityId {
     match reason {
@@ -91,18 +78,37 @@ fn severity(reason: AuthFailureReason) -> SeverityId {
     }
 }
 
-fn with_protocol(
-    builder: AuthenticationBuilder<'_>,
-    mechanism: AuthMechanism,
-) -> AuthenticationBuilder<'_> {
-    match mechanism {
-        AuthMechanism::Oidc => builder.auth_protocol(AuthProtocolId::OpenId),
-        AuthMechanism::Mtls => builder.auth_protocol_other("mtls"),
-        AuthMechanism::SandboxJwt => builder.auth_protocol_other("sandbox_jwt"),
-        AuthMechanism::ComputeDriver => builder.auth_protocol_other("compute_driver"),
-        AuthMechanism::GatewayPeer => builder.auth_protocol_other("k8s_service_account"),
-        AuthMechanism::SshSessionToken => builder.auth_protocol_other("ssh_session_token"),
+/// The request to `path` as an OCSF HTTP request; gRPC calls are POSTs.
+fn post(path: &str) -> HttpRequest {
+    HttpRequest {
+        http_method: HttpMethod::Post,
+        url: Some(Url::from_path(path)),
     }
+}
+
+/// An Authentication event for `user`'s request to `path` from `origin`,
+/// naming the protocol of `mechanism` when known.
+fn authentication<'a>(
+    ctx: &'a EventContext,
+    path: &str,
+    origin: &RequestOrigin,
+    user: User,
+    mechanism: Option<AuthMechanism>,
+) -> AuthenticationBuilder<'a> {
+    let mut builder = AuthenticationBuilder::new(ctx, user, Service::new("openshell-gateway"))
+        .http_request(post(path));
+    match mechanism {
+        Some(AuthMechanism::Oidc) => builder = builder.auth_protocol(AuthProtocolId::OpenId),
+        Some(mechanism) => builder = builder.auth_protocol_other(mechanism.as_str()),
+        None => {}
+    }
+    if let Some(source) = origin.source {
+        builder = builder.src_endpoint(source.endpoint());
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
+    }
+    builder
 }
 
 /// Emit an Authentication failure event for a gRPC request to `path`.
@@ -116,20 +122,21 @@ pub fn emit_authentication_failure(
 }
 
 /// Emit an Authentication failure event for a credential that a handler
-/// verifies itself, after the router established `principal`.
-pub fn emit_credential_failure(
-    principal: &Principal,
-    mechanism: AuthMechanism,
-    reason: AuthFailureReason,
-) {
+/// verifies itself, returning the status that refuses the current request.
+///
+/// The event names `principal`, the caller the router established from a
+/// separate credential, or leaves the user unidentified when the rejected
+/// credential is the one that named the caller.
+pub fn reject_credential(principal: Option<&Principal>, rejection: AuthRejection) -> Status {
     let (path, origin) = current_request();
     authentication_failure(
         &path,
         &origin,
-        principal_user(principal),
-        Some(mechanism),
-        reason,
+        principal.map_or_else(User::unidentified, principal_user),
+        Some(rejection.mechanism),
+        rejection.reason,
     );
+    rejection.status
 }
 
 fn authentication_failure(
@@ -140,26 +147,13 @@ fn authentication_failure(
     reason: AuthFailureReason,
 ) {
     let ctx = crate::gateway_ocsf::context("", "");
-    let mut builder = AuthenticationBuilder::new(&ctx, user, Service::new("openshell-gateway"))
+    let builder = authentication(&ctx, path, origin, user, mechanism)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
         .severity(severity(reason))
         .status(StatusId::Failure)
-        .status_detail(category(reason))
-        .http_request(HttpRequest {
-            http_method: HttpMethod::Post,
-            url: Some(Url::from_path(path)),
-        })
-        .message(format!("authentication failed: {}", category(reason)));
-    if let Some(mechanism) = mechanism {
-        builder = with_protocol(builder, mechanism);
-    }
-    if let Some(source) = origin.source {
-        builder = builder.src_endpoint(source.endpoint());
-    }
-    if let Some(request_id) = &origin.request_id {
-        builder = builder.correlation_uid(request_id);
-    }
+        .status_detail(reason.as_str())
+        .message(format!("authentication failed: {}", reason.as_str()));
     ocsf_emit!(builder.build());
 }
 
@@ -271,7 +265,7 @@ fn digest(
     let mut material = principal.audit_actor().into_bytes();
     material.push(0);
     if let Some(mechanism) = mechanism {
-        material.extend_from_slice(format!("{mechanism:?}").as_bytes());
+        material.extend_from_slice(mechanism.as_str().as_bytes());
         material.push(0);
     }
     material.extend_from_slice(credential.as_bytes());
@@ -355,29 +349,12 @@ fn logon(
     mechanism: Option<AuthMechanism>,
 ) {
     let ctx = crate::gateway_ocsf::context("", "");
-    let mut builder = AuthenticationBuilder::new(
-        &ctx,
-        principal_user(principal),
-        Service::new("openshell-gateway"),
-    )
-    .action(ActionId::Allowed)
-    .disposition(DispositionId::Allowed)
-    .severity(SeverityId::Informational)
-    .status(StatusId::Success)
-    .http_request(HttpRequest {
-        http_method: HttpMethod::Post,
-        url: Some(Url::from_path(path)),
-    })
-    .message("authentication succeeded");
-    if let Some(mechanism) = mechanism {
-        builder = with_protocol(builder, mechanism);
-    }
-    if let Some(source) = origin.source {
-        builder = builder.src_endpoint(source.endpoint());
-    }
-    if let Some(request_id) = &origin.request_id {
-        builder = builder.correlation_uid(request_id);
-    }
+    let builder = authentication(&ctx, path, origin, principal_user(principal), mechanism)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message("authentication succeeded");
     ocsf_emit!(builder.build());
 }
 
@@ -536,6 +513,13 @@ pub fn emit_authorization_denial(principal: &Principal, denial: AuthzDenial<'_>)
     emit_authorization_denial_for(&path, &origin, principal, denial);
 }
 
+/// Emit an authorization denial raised by a handler for the current request,
+/// returning the status that refuses it with `message`.
+pub fn deny(principal: &Principal, denial: AuthzDenial<'_>, message: impl Into<String>) -> Status {
+    emit_authorization_denial(principal, denial);
+    Status::permission_denied(message)
+}
+
 /// Emit an API Activity denial for a gRPC request to `path`, paired with a
 /// Detection Finding when a sandbox principal crossed its boundary.
 pub fn emit_authorization_denial_for(
@@ -573,10 +557,7 @@ pub fn emit_authorization_denial_for(
     if !service.is_empty() {
         builder = builder
             .api_service(Service::new(service))
-            .http_request(HttpRequest {
-                http_method: HttpMethod::Post,
-                url: Some(Url::from_path(path)),
-            });
+            .http_request(post(path));
     }
     if let Some(resource) = denial.resource() {
         builder = builder.resource(resource);

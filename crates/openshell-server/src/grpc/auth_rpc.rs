@@ -15,11 +15,10 @@
 //! ordinary RPCs or select another successor.
 
 use crate::ServerState;
-use crate::auth::audit::{self, AuthzDenial, ConnectionSource, RequestOrigin};
+use crate::auth::audit::{self, AuthzDenial};
 use crate::auth::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection};
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
-use crate::auth::sandbox_jwt::REFRESH_SANDBOX_TOKEN_PATH;
 use openshell_core::proto::{
     ExtensionServiceCredential, GetCurrentUserRequest, GetCurrentUserResponse,
     GetSandboxConfigRequest, IssueSandboxTokenRequest, IssueSandboxTokenResponse,
@@ -38,8 +37,9 @@ pub async fn handle_get_current_user(
 ) -> Result<Response<GetCurrentUserResponse>, Status> {
     let principal = super::extract_principal(&request)?;
     let Some(identity) = principal.user_identity().cloned() else {
-        audit::emit_authorization_denial(&principal, AuthzDenial::MethodNotPermitted);
-        return Err(Status::permission_denied(
+        return Err(audit::deny(
+            &principal,
+            AuthzDenial::MethodNotPermitted,
             "GetCurrentUser requires a user principal",
         ));
     };
@@ -71,8 +71,9 @@ pub async fn handle_issue_sandbox_token(
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
 
     let Principal::Sandbox(sandbox) = &principal else {
-        audit::emit_authorization_denial(&principal, AuthzDenial::MethodNotPermitted);
-        return Err(Status::permission_denied(
+        return Err(audit::deny(
+            &principal,
+            AuthzDenial::MethodNotPermitted,
             "IssueSandboxToken requires a sandbox principal",
         ));
     };
@@ -88,8 +89,9 @@ pub async fn handle_issue_sandbox_token(
             sandbox_id = %sandbox.sandbox_id,
             "IssueSandboxToken rejected: non-bootstrap principal source"
         );
-        audit::emit_authorization_denial(&principal, AuthzDenial::MethodNotPermitted);
-        return Err(Status::permission_denied(
+        return Err(audit::deny(
+            &principal,
+            AuthzDenial::MethodNotPermitted,
             "this principal cannot mint a sandbox token; use RefreshSandboxToken",
         ));
     };
@@ -107,24 +109,26 @@ pub async fn handle_issue_sandbox_token(
 
     // The driver vouched for a runtime; it must be the one recorded at
     // creation, so these refusals are authentication failures.
-    let reject = |reason, message: &str| {
-        audit::emit_credential_failure(&principal, AuthMechanism::ComputeDriver, reason);
-        Status::permission_denied(message)
+    let reject = |reason, status| {
+        audit::reject_credential(
+            Some(&principal),
+            AuthRejection::new(AuthMechanism::ComputeDriver, reason, status),
+        )
     };
     let sandbox_record = ensure_sandbox_exists(state, &sandbox.sandbox_id)
         .await
-        .inspect_err(|status| {
+        .map_err(|status| {
             let reason = if status.code() == tonic::Code::Internal {
                 AuthFailureReason::IdentityProviderUnavailable
             } else {
                 AuthFailureReason::UnknownIdentity
             };
-            audit::emit_credential_failure(&principal, AuthMechanism::ComputeDriver, reason);
+            reject(reason, status)
         })?;
     let metadata = sandbox_record.metadata.as_ref().ok_or_else(|| {
         reject(
             AuthFailureReason::UnknownIdentity,
-            "sandbox runtime identity is unavailable",
+            Status::permission_denied("sandbox runtime identity is unavailable"),
         )
     })?;
     let expected_driver = metadata
@@ -141,7 +145,7 @@ pub async fn handle_issue_sandbox_token(
         );
         return Err(reject(
             AuthFailureReason::StaleIdentity,
-            "compute runtime identity does not match the sandbox",
+            Status::permission_denied("compute runtime identity does not match the sandbox"),
         ));
     }
 
@@ -150,7 +154,7 @@ pub async fn handle_issue_sandbox_token(
             .map_err(|_| {
                 reject(
                     AuthFailureReason::UnknownIdentity,
-                    "sandbox runtime identity is invalid",
+                    Status::permission_denied("sandbox runtime identity is invalid"),
                 )
             })?;
     audit::emit_handler_logon(&state.logons, &principal, request.metadata().as_ref());
@@ -251,8 +255,9 @@ pub async fn handle_refresh_sandbox_token(
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
 
     let Principal::Sandbox(sandbox) = principal else {
-        audit::emit_authorization_denial(&principal, AuthzDenial::MethodNotPermitted);
-        return Err(Status::permission_denied(
+        return Err(audit::deny(
+            &principal,
+            AuthzDenial::MethodNotPermitted,
             "RefreshSandboxToken requires a sandbox principal",
         ));
     };
@@ -264,11 +269,9 @@ pub async fn handle_refresh_sandbox_token(
             sandbox_id = %sandbox.sandbox_id,
             "RefreshSandboxToken rejected: non-gateway-JWT principal source"
         );
-        audit::emit_authorization_denial(
+        return Err(audit::deny(
             &Principal::Sandbox(sandbox.clone()),
             AuthzDenial::MethodNotPermitted,
-        );
-        return Err(Status::permission_denied(
             "this principal cannot refresh; use IssueSandboxToken for bootstrap",
         ));
     };
@@ -299,18 +302,9 @@ pub async fn handle_refresh_sandbox_token(
         issued_at,
     )
     .await
-    .map_err(|rejection| {
-        audit::emit_authentication_failure(
-            REFRESH_SANDBOX_TOKEN_PATH,
-            &RequestOrigin::new(
-                request.extensions().get::<ConnectionSource>().copied(),
-                request.metadata().as_ref(),
-            ),
-            Some(rejection.mechanism),
-            rejection.reason,
-        );
-        rejection.status
-    })?;
+    // The rejected bearer is what named the principal, so the event leaves
+    // the user unidentified.
+    .map_err(|rejection| audit::reject_credential(None, rejection))?;
     audit::emit_handler_logon(
         &state.logons,
         &Principal::Sandbox(sandbox.clone()),
@@ -464,13 +458,11 @@ fn mint_extension_credentials(
         .iter()
         .map(|name| {
             let service = available.get(name.as_str()).ok_or_else(|| {
-                audit::emit_authorization_denial(
+                audit::deny(
                     &Principal::Sandbox(sandbox.clone()),
                     AuthzDenial::ExtensionServiceNotSelected { service: name },
-                );
-                Status::permission_denied(format!(
-                    "extension service '{name}' is not selected by the sandbox policy"
-                ))
+                    format!("extension service '{name}' is not selected by the sandbox policy"),
+                )
             })?;
             if service.allow_insecure_transport {
                 return Err(Status::failed_precondition(format!(
@@ -534,10 +526,13 @@ async fn ensure_sandbox_exists(
 mod tests {
     use super::*;
     use crate::ServerState;
+    use crate::auth::audit::{ConnectionSource, RequestOrigin};
     use crate::auth::compute_driver::ISSUE_SANDBOX_TOKEN_PATH;
     use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
-    use crate::auth::sandbox_jwt::{ExtensionJwtIssuer, SandboxSessionJwtAuthority};
+    use crate::auth::sandbox_jwt::{
+        ExtensionJwtIssuer, REFRESH_SANDBOX_TOKEN_PATH, SandboxSessionJwtAuthority,
+    };
     use crate::compute::new_test_runtime;
     use crate::persistence::Store;
     use crate::sandbox_index::SandboxIndex;
@@ -856,8 +851,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_with_a_consumed_bearer_emits_stale_identity() {
-        use openshell_ocsf::test_support::OcsfCapture;
-
         let state = state_with_issuer().await;
         let request = || {
             let mut request = Request::new(RefreshSandboxTokenRequest {
@@ -880,33 +873,20 @@ mod tests {
             .await
             .expect("successor refresh");
 
-        let capture = OcsfCapture::default();
-        let error = {
-            let _guard = capture.install();
-            let mut replay = request();
-            set_refresh_authorization(&mut replay, &first);
-            replay.extensions_mut().insert(ConnectionSource::Peer(
-                "203.0.113.7:51234".parse().expect("peer address"),
-            ));
-            replay.metadata_mut().insert(
-                "x-request-id",
-                "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f".parse().unwrap(),
-            );
-            handle_refresh_sandbox_token(&state, replay)
-                .await
-                .expect_err("consumed predecessor must be rejected")
-        };
+        let mut replay = request();
+        set_refresh_authorization(&mut replay, &first);
+        let (result, events) = audited(
+            REFRESH_SANDBOX_TOKEN_PATH,
+            Box::pin(handle_refresh_sandbox_token(&state, replay)),
+        )
+        .await;
+        let error = result.expect_err("consumed predecessor must be rejected");
 
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
         assert_eq!(
             error.message(),
             "gateway refresh retry does not match the active lineage"
         );
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["class_uid"], 3002);
         assert_eq!(events[0]["status_detail"], "stale_identity");
@@ -916,10 +896,7 @@ mod tests {
             REFRESH_SANDBOX_TOKEN_PATH
         );
         assert_eq!(events[0]["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(
-            events[0]["metadata"]["correlation_uid"],
-            "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f"
-        );
+        assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
         assert!(!events[0].to_string().contains(&first));
     }
 

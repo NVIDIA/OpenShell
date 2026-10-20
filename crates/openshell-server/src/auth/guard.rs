@@ -8,7 +8,7 @@
 //! `sandbox_id`. User principals retain the broad scope the RBAC layer
 //! already evaluated.
 
-use super::audit::{AuthzDenial, emit_authorization_denial};
+use super::audit::{AuthzDenial, deny};
 use super::principal::Principal;
 use super::principal::SandboxPrincipal;
 use tonic::Status;
@@ -30,23 +30,20 @@ use tonic::Status;
 pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> Result<(), Status> {
     match principal {
         Principal::User(_) | Principal::Operator(_) => Ok(()),
-        Principal::Peer(_) => {
-            emit_authorization_denial(principal, AuthzDenial::MethodNotPermitted);
-            Err(Status::permission_denied(
-                "gateway peer principals may not call sandbox-scoped methods",
-            ))
-        }
+        Principal::Peer(_) => Err(deny(
+            principal,
+            AuthzDenial::MethodNotPermitted,
+            "gateway peer principals may not call sandbox-scoped methods",
+        )),
         Principal::Sandbox(p) => {
             if p.sandbox_id == claimed_sandbox_id {
                 Ok(())
             } else {
-                emit_authorization_denial(
+                Err(deny(
                     principal,
                     AuthzDenial::CrossSandbox {
                         sandbox_id: claimed_sandbox_id,
                     },
-                );
-                Err(Status::permission_denied(
                     "cross-sandbox access denied: principal does not own this sandbox",
                 ))
             }
@@ -91,12 +88,11 @@ pub fn ensure_sandbox_principal_scope(
             ensure_sandbox_scope(principal, claimed_sandbox_id)?;
             Ok(p.clone())
         }
-        Principal::User(_) | Principal::Operator(_) | Principal::Peer(_) => {
-            emit_authorization_denial(principal, AuthzDenial::MethodNotPermitted);
-            Err(Status::permission_denied(
-                "supervisor RPCs require a sandbox principal",
-            ))
-        }
+        Principal::User(_) | Principal::Operator(_) | Principal::Peer(_) => Err(deny(
+            principal,
+            AuthzDenial::MethodNotPermitted,
+            "supervisor RPCs require a sandbox principal",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "supervisor RPCs require an authenticated sandbox principal",
         )),
@@ -123,10 +119,11 @@ pub fn require_operator<T>(
         None | Some(Principal::Anonymous) => {
             Err(Status::unauthenticated("operator authentication required"))
         }
-        Some(principal) => {
-            emit_authorization_denial(principal, AuthzDenial::OperatorRequired);
-            Err(Status::permission_denied("verified mTLS operator required"))
-        }
+        Some(principal) => Err(deny(
+            principal,
+            AuthzDenial::OperatorRequired,
+            "verified mTLS operator required",
+        )),
     }
 }
 

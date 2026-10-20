@@ -2747,13 +2747,13 @@ async fn acquire_forward_connection_guard(
     let token = init.authorization_token.trim();
     if token.is_empty() {
         if !matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))) {
-            crate::auth::audit::emit_credential_failure(
-                principal,
-                AuthMechanism::SshSessionToken,
-                AuthFailureReason::MissingCredential,
-            );
-            return Err(Status::unauthenticated(
-                "authorization_token is required for SSH targets",
+            return Err(crate::auth::audit::reject_credential(
+                Some(principal),
+                AuthRejection::new(
+                    AuthMechanism::SshSessionToken,
+                    AuthFailureReason::MissingCredential,
+                    Status::unauthenticated("authorization_token is required for SSH targets"),
+                ),
             ));
         }
         acquire_sandbox_connection_slot(&state.ssh_connections_by_sandbox, &sandbox_id)?;
@@ -2766,14 +2766,7 @@ async fn acquire_forward_connection_guard(
 
     validate_ssh_forward_token(state, token, &sandbox_id)
         .await
-        .map_err(|rejection| {
-            crate::auth::audit::emit_credential_failure(
-                principal,
-                rejection.mechanism,
-                rejection.reason,
-            );
-            rejection.status
-        })?;
+        .map_err(|rejection| crate::auth::audit::reject_credential(Some(principal), rejection))?;
     crate::auth::audit::emit_ssh_session_logon(&state.logons, principal, token);
     acquire_ssh_connection_slots(
         &state.ssh_connections_by_token,

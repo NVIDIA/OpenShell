@@ -91,6 +91,23 @@ pub enum AuthFailureReason {
     IdentityProviderUnavailable,
 }
 
+impl AuthFailureReason {
+    /// The category recorded in audit events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingCredential => "missing_credential",
+            Self::ConflictingCredentials => "conflicting_credentials",
+            Self::MalformedCredential => "malformed_credential",
+            Self::InvalidCredential => "invalid_credential",
+            Self::ExpiredCredential => "expired_credential",
+            Self::AudienceOrIssuerMismatch => "audience_or_issuer_mismatch",
+            Self::UnknownIdentity => "unknown_identity",
+            Self::StaleIdentity => "stale_identity",
+            Self::IdentityProviderUnavailable => "identity_provider_unavailable",
+        }
+    }
+}
+
 /// The mechanism a caller attempted to authenticate with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMechanism {
@@ -101,6 +118,21 @@ pub enum AuthMechanism {
     GatewayPeer,
     /// The `CreateSshSession` token an SSH relay presents.
     SshSessionToken,
+}
+
+impl AuthMechanism {
+    /// A stable label for the mechanism. Audit events record it as the
+    /// protocol, except OIDC, which they record as the OCSF `OpenID` protocol.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mtls => "mtls",
+            Self::Oidc => "oidc",
+            Self::SandboxJwt => "sandbox_jwt",
+            Self::ComputeDriver => "compute_driver",
+            Self::GatewayPeer => "k8s_service_account",
+            Self::SshSessionToken => "ssh_session_token",
+        }
+    }
 }
 
 /// A rejected authentication attempt: the status returned to the caller and
