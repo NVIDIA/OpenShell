@@ -44,6 +44,9 @@ on:
         required: false
       GITLAB_CI_TRIGGER_URL:
         required: false
+      LLM_INFERENCE_API_KEY:
+        description: NVIDIA Inference Hub API key for stable release notes
+        required: false
 
 permissions:
   contents: read
@@ -324,9 +327,22 @@ jobs:
           app-version: ${{ inputs.semver }}
           release-kind: public
 
+  release-notes:
+    name: Write Release Notes
+    if: ${{ !inputs.is-prerelease }}
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/release-notes.yml
+    with:
+      release-tag: ${{ inputs.release-tag }}
+    secrets:
+      LLM_INFERENCE_API_KEY: ${{ secrets.LLM_INFERENCE_API_KEY }}
+
   release:
     name: Publish Release Assets
-    needs: [assemble, release-helm]
+    needs: [assemble, release-helm, release-notes]
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.release-helm.result == 'success' && (inputs.is-prerelease || needs.release-notes.result == 'success') }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -372,6 +388,13 @@ jobs:
               }
             }
 
+      - name: Download release notes
+        if: ${{ !inputs.is-prerelease }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+          path: release/
+
       - name: Check current latest release
         id: latest
         if: ${{ !inputs.is-prerelease && inputs.make-latest }}
@@ -387,16 +410,7 @@ jobs:
           prerelease: false
           make_latest: ${{ steps.latest.outputs.make-latest == 'true' && 'true' || 'false' }}
           tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
-          body: |
-            ## OpenShell ${{ env.RELEASE_TAG }}
-
-            ### Quick install
-
-            ```bash
-            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
-            ```
-
+          body_path: release/release-notes.md
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz

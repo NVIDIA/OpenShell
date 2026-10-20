@@ -172,6 +172,17 @@ assert_contains "$snapcraft" 'daemon-scope: system'
 assert_contains "$snapcraft" 'daemon-scope: user'
 assert_contains "$snapcraft" 'install-mode: disable'
 assert_not_contains "$snapcraft" 'install-mode: enable'
+for app in system-gateway user-gateway; do
+  if ! awk -v app="$app" '
+    $0 == "  " app ":" { found = 1; in_app = 1; next }
+    in_app && /^  [[:alnum:]_-]+:$/ { exit !disabled }
+    in_app && /install-mode: disable/ { disabled = 1 }
+    END { exit !(found && disabled) }
+  ' "$snapcraft"; then
+    echo "FAIL: snap ${app} must use install-mode: disable" >&2
+    exit 1
+  fi
+done
 if grep -Eq '^  gateway:$' "$snapcraft"; then
   echo "FAIL: removed snap gateway app must not remain declared" >&2
   exit 1
@@ -219,8 +230,19 @@ assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
 assert_contains "$snap_install_docs" "systemctl --user reset-failed snap.openshell.user-gateway.service"
-assert_contains "$snap_install_docs" "snap start --user openshell.user-gateway"
-assert_contains "$snapcraft" "snap start --user openshell.user-gateway"
+assert_contains "$snap_install_docs" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$ROOT/install.sh" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$ROOT/install.sh" "systemctl --global disable snap.openshell.user-gateway.service"
+assert_contains "$snap_install_docs" 'every user gateway binds to `127.0.0.1:17670`'
+assert_contains "$snap_install_docs" "systemctl --user disable --now snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "Every user gateway binds to 127.0.0.1:17670"
+assert_contains "$snap_install_docs" "sudo systemctl disable --global snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "sudo systemctl disable --global snap.openshell.user-gateway.service"
+for snap_file in "$ROOT/install.sh" "$snapcraft" "$snap_install_docs"; do
+  assert_not_contains "$snap_file" "snap start --user openshell.user-gateway"
+  assert_not_contains "$snap_file" "snap restart openshell.user-gateway"
+done
 assert_contains "$snap_install_docs" "openshell.user-gateway"
 assert_contains "$snap_install_docs" "openshell.system-gateway"
 assert_contains "$snap_install_docs" "Existing HTTPS registrations continue to work"

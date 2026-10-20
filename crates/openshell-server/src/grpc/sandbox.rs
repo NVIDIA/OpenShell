@@ -462,13 +462,6 @@ async fn handle_create_sandbox_inner(
 
     validate_create_sandbox_request_pre_io(&request, &workload_template_name)?;
 
-    // Validate labels (keys and values must meet Kubernetes requirements).
-    for (key, value) in &request.labels {
-        crate::grpc::validation::validate_label_key(key)?;
-        crate::grpc::validation::validate_label_value(value)?;
-    }
-    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
-
     let authz = authorize_workspace(
         &state.store,
         &state.admin_role,
@@ -791,7 +784,7 @@ fn validate_create_sandbox_request_pre_io(
         crate::grpc::validation::validate_label_key(key)?;
         crate::grpc::validation::validate_label_value(value)?;
     }
-    crate::grpc::validation::validate_annotations(&request.annotations, "annotations")?;
+    crate::grpc::validation::validate_caller_annotations(&request.annotations, "annotations")?;
 
     if request.service_exposures.len() > MAX_CREATE_SERVICE_EXPOSURES {
         return Err(Status::invalid_argument(format!(
@@ -7233,6 +7226,44 @@ mod tests {
                 .as_ref()
                 .and_then(|metadata| metadata.annotations.get(&annotation_key)),
             Some(&annotation_value)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_reserved_annotations() {
+        let state = test_server_state().await;
+
+        let err = handle_create_sandbox(
+            &state,
+            authed_request(CreateSandboxRequest {
+                request_id: String::new(),
+                name: "reserved".to_string(),
+                spec: Some(SandboxSpec::default()),
+                labels: HashMap::new(),
+                annotations: HashMap::from([(
+                    "internal.openshell.ai/compute-driver".to_string(),
+                    "x".to_string(),
+                )]),
+                workspace_scope: Some(openshell_core::proto::workspace_selector(
+                    "default".to_string(),
+                )),
+                await_main_process_attachment: false,
+                workload_template: String::new(),
+                service_exposures: Vec::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("internal.openshell.ai/"));
+        assert!(
+            state
+                .store
+                .get_message_by_name::<Sandbox>("default", "reserved")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

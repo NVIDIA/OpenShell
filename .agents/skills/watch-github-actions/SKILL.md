@@ -125,6 +125,8 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
+
 `Pre-release` temporarily omits Codex Security from its `Security Scan` job.
 `Release` uses the passing prerelease qualification result. Other scanners and
 qualification gates still run. Use the standalone
@@ -180,6 +182,22 @@ artifacts remain available. The Pre-release failure notification includes the
 run link. Both callers share `release-build.yml` and `release-publish.yml`.
 Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
 Snap Store uploads happen only for stable releases after qualification passes.
+
+For a release notes preview, dispatch `release.yml` with `notes-only=true` and
+`tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
+only `release-notes.yml` exposes an optional `previous-stable-tag` override.
+This runs the same
+`release-notes.yml` generator as stable publication and retains the `release-notes`
+artifact. Promotion, tag creation, builds, qualification, and publication are
+skipped. Check the `Prepare release notes` step before diagnosing model or
+GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, and
+`ANTHROPIC_MODEL` in the repository Actions settings.
+
+Pre-release also runs `release-notes.yml` after building, alongside publication
+and qualification, and keeps the notes only in the `release-notes` artifact.
+This job is advisory: a notes failure emits a warning without failing the
+prerelease run or blocking promotion. Stable publication requires successful
+notes generation.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the

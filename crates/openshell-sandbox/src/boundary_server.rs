@@ -90,6 +90,9 @@ mod linux {
     const ENFORCEMENT_LOSS_TERMINATION_GRACE: Duration =
         Duration::from_secs(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS as u64);
     const FORCE_KILL_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+    /// Bound the wait for a flush before acknowledging termination. A timed-out
+    /// blocking task cannot be cancelled and may outlive the acknowledgement.
+    const FILESYSTEM_FLUSH_TIMEOUT: Duration = Duration::from_secs(3);
     const MAX_PENDING_HANDSHAKES: usize = 32;
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
@@ -1426,6 +1429,42 @@ mod linux {
         Ok(())
     }
 
+    /// Writes the sandbox's writable filesystem to its backing store.
+    type FlushFn = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
+
+    /// Filesystem flush operation and its termination wait bound.
+    struct FilesystemFlush {
+        run: FlushFn,
+        timeout: Duration,
+    }
+
+    impl FilesystemFlush {
+        /// VM page caches disappear at shutdown. Container page caches survive
+        /// in the host, where `syncfs` would flush the shared backing filesystem.
+        fn for_listener(listener: &BoundaryListenerConfig) -> Option<Self> {
+            match listener {
+                BoundaryListenerConfig::Vsock { .. } => Some(Self {
+                    run: Arc::new(flush_root_filesystem),
+                    timeout: FILESYSTEM_FLUSH_TIMEOUT,
+                }),
+                BoundaryListenerConfig::Unix { .. } | BoundaryListenerConfig::TlsTcp { .. } => None,
+            }
+        }
+    }
+
+    /// Flush the filesystem mounted at `/`, which in the VM holds the sandbox's
+    /// writable layer.
+    fn flush_root_filesystem() -> io::Result<()> {
+        sync_filesystem_at(Path::new("/"))
+    }
+
+    /// Write back the filesystem that contains `path`. `syncfs` is used instead
+    /// of a global `sync` so only that filesystem is flushed.
+    fn sync_filesystem_at(path: &Path) -> io::Result<()> {
+        let directory = File::open(path)?;
+        nix::unistd::syncfs(directory.as_raw_fd()).map_err(io::Error::from)
+    }
+
     struct BoundaryRuntime {
         config: BoundaryConfig,
         routing_handle: String,
@@ -1436,6 +1475,8 @@ mod linux {
         process_runtime: tokio::runtime::Handle,
         state: Mutex<RuntimeState>,
         supervisor_connection: Mutex<SupervisorConnectionState>,
+        /// VM-only termination flush.
+        filesystem_flush: Option<FilesystemFlush>,
         next_recovery_id: AtomicU64,
         /// The wire policy bound at first attach, so an idempotent attach retry
         /// carrying a different policy is denied instead of silently keeping
@@ -1721,6 +1762,7 @@ mod linux {
                 Arc::new(SystemJwtClock),
             )
             .map_err(|error| format!("configure Sandbox Protocol JWT verifier: {error}"))?;
+            let filesystem_flush = FilesystemFlush::for_listener(&config.listener);
             Ok(Self {
                 authenticator: SandboxProtocolAuthenticator::new(
                     verifier,
@@ -1738,6 +1780,7 @@ mod linux {
                 process_runtime,
                 state: Mutex::new(RuntimeState::AwaitingAttach),
                 supervisor_connection: Mutex::new(SupervisorConnectionState::AwaitingConfirmation),
+                filesystem_flush,
                 next_recovery_id: AtomicU64::new(1),
                 attached_policy: Mutex::new(None),
                 started_agent: Mutex::new(None),
@@ -1751,6 +1794,12 @@ mod linux {
                 workload_launcher,
                 qualification,
             })
+        }
+
+        #[cfg(test)]
+        fn with_filesystem_flush(mut self, filesystem_flush: FilesystemFlush) -> Self {
+            self.filesystem_flush = Some(filesystem_flush);
+            self
         }
 
         fn authenticate_request(
@@ -2023,13 +2072,42 @@ mod linux {
                     | RuntimeState::Ready(_) => None,
                 }
             };
-            if let Some(process) = process
-                && let Err(error) = Self::terminate_process_tree(&process, false).await
-            {
+            let terminated = match process {
+                Some(process) => Self::terminate_process_tree(&process, false).await,
+                None => Ok(()),
+            };
+            // The host may end the VM on acknowledgement. Flush dirty writes
+            // first, even if process termination failed.
+            self.flush_filesystem().await;
+            if let Err(error) = terminated {
                 return guest_error(BoundaryErrorKind::Process, error);
             }
             *lock(&self.supervisor_connection) = SupervisorConnectionState::Terminal;
             Response::BoundaryTerminated
+        }
+
+        /// Log flush failures and timeouts while allowing termination to finish.
+        async fn flush_filesystem(&self) {
+            let Some(filesystem_flush) = &self.filesystem_flush else {
+                return;
+            };
+            let run = Arc::clone(&filesystem_flush.run);
+            let flush = tokio::task::spawn_blocking(move || run());
+            match tokio::time::timeout(filesystem_flush.timeout, flush).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(%error, "Sandbox filesystem flush failed before termination");
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "Sandbox filesystem flush task failed before termination");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout = ?filesystem_flush.timeout,
+                        "Sandbox filesystem flush timed out before termination"
+                    );
+                }
+            }
         }
 
         async fn terminate_process_tree(
@@ -4328,37 +4406,52 @@ mod linux {
         }
 
         fn availability_test_runtime() -> (Arc<BoundaryRuntime>, String) {
+            availability_test_runtime_with(None)
+        }
+
+        fn availability_test_runtime_with_flush(
+            flush: FilesystemFlush,
+        ) -> (Arc<BoundaryRuntime>, String) {
+            availability_test_runtime_with(Some(flush))
+        }
+
+        /// Build a runtime over a TCP listener. `None` keeps the flush that the
+        /// listener kind selects in production.
+        fn availability_test_runtime_with(
+            flush: Option<FilesystemFlush>,
+        ) -> (Arc<BoundaryRuntime>, String) {
             let (broker, launcher) = test_network_broker();
             let (verification_key, token) = test_auth_material("availability");
-            let runtime = Arc::new(
-                BoundaryRuntime::new(
-                    BoundaryConfig {
-                        boundary_id: "availability".to_string(),
-                        generation: "generation-1".to_string(),
-                        session_id: test_session_id(),
-                        session_rotation: openshell_core::jwt::SessionRotation::new(1)
-                            .expect("session rotation"),
-                        auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
-                        gateway_id: "test-gateway".to_string(),
-                        verification_keys: vec![verification_key],
-                        listener: BoundaryListenerConfig::TlsTcp {
-                            address: "127.0.0.1:5500".parse().unwrap(),
-                            tls: placeholder_server_tls(),
-                        },
-                        resource_claims: std::collections::BTreeMap::new(),
-                        resource_claim_files: std::collections::BTreeMap::new(),
-                        workload_identity: test_workload_identity(),
-                        provisioning_evidence: test_provisioning_evidence(),
-                        child_env: std::collections::HashMap::new(),
+            let mut runtime = BoundaryRuntime::new(
+                BoundaryConfig {
+                    boundary_id: "availability".to_string(),
+                    generation: "generation-1".to_string(),
+                    session_id: test_session_id(),
+                    session_rotation: openshell_core::jwt::SessionRotation::new(1)
+                        .expect("session rotation"),
+                    auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+                    gateway_id: "test-gateway".to_string(),
+                    verification_keys: vec![verification_key],
+                    listener: BoundaryListenerConfig::TlsTcp {
+                        address: "127.0.0.1:5500".parse().unwrap(),
+                        tls: placeholder_server_tls(),
                     },
-                    tokio::runtime::Handle::current(),
-                    broker,
-                    launcher,
-                    test_runtime_qualification(),
-                )
-                .expect("test boundary runtime"),
-            );
-            (runtime, token)
+                    resource_claims: std::collections::BTreeMap::new(),
+                    resource_claim_files: std::collections::BTreeMap::new(),
+                    workload_identity: test_workload_identity(),
+                    provisioning_evidence: test_provisioning_evidence(),
+                    child_env: std::collections::HashMap::new(),
+                },
+                tokio::runtime::Handle::current(),
+                broker,
+                launcher,
+                test_runtime_qualification(),
+            )
+            .expect("test boundary runtime");
+            if let Some(flush) = flush {
+                runtime = runtime.with_filesystem_flush(flush);
+            }
+            (Arc::new(runtime), token)
         }
 
         #[tokio::test]
@@ -4548,6 +4641,165 @@ mod linux {
                 runtime
                     .commit_attach(&replacement, supervisor_instance_id)
                     .is_err()
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn termination_flushes_the_filesystem_before_the_terminal_acknowledgement() {
+            let runtime_cell: Arc<std::sync::OnceLock<std::sync::Weak<BoundaryRuntime>>> =
+                Arc::default();
+            let flushes = Arc::new(AtomicUsize::new(0));
+            let saw_terminating = Arc::new(AtomicBool::new(false));
+            let flush = {
+                let runtime_cell = Arc::clone(&runtime_cell);
+                let flushes = Arc::clone(&flushes);
+                let saw_terminating = Arc::clone(&saw_terminating);
+                FilesystemFlush {
+                    run: Arc::new(move || {
+                        // Flush before the terminal transition permits VM teardown.
+                        if let Some(runtime) = runtime_cell.get().and_then(std::sync::Weak::upgrade)
+                        {
+                            saw_terminating.store(
+                                matches!(
+                                    *lock(&runtime.supervisor_connection),
+                                    SupervisorConnectionState::Terminating
+                                ),
+                                Ordering::SeqCst,
+                            );
+                        }
+                        flushes.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }),
+                    timeout: FILESYSTEM_FLUSH_TIMEOUT,
+                }
+            };
+            let (runtime, _token) = availability_test_runtime_with_flush(flush);
+            runtime_cell
+                .set(Arc::downgrade(&runtime))
+                .expect("runtime cell is set once");
+
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+
+            assert_eq!(flushes.load(Ordering::SeqCst), 1);
+            assert!(
+                saw_terminating.load(Ordering::SeqCst),
+                "the flush must run before the boundary turns terminal"
+            );
+            // A repeated request is answered from the terminal state and does not
+            // flush again.
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+            assert_eq!(flushes.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn only_the_vm_listener_flushes_the_filesystem() {
+            let tls = placeholder_server_tls();
+            let vsock = BoundaryListenerConfig::Vsock {
+                control_port: 5500,
+                tls: tls.clone(),
+            };
+            let flush = FilesystemFlush::for_listener(&vsock).expect("the VM backend flushes");
+            assert_eq!(flush.timeout, FILESYSTEM_FLUSH_TIMEOUT);
+
+            let unix = BoundaryListenerConfig::Unix {
+                socket_path: "/run/openshell/control.sock".into(),
+                tls: tls.clone(),
+            };
+            let tcp = BoundaryListenerConfig::TlsTcp {
+                address: "127.0.0.1:5500".parse().unwrap(),
+                tls,
+            };
+            assert!(
+                FilesystemFlush::for_listener(&unix).is_none(),
+                "container sandboxes on a Unix socket must not flush"
+            );
+            assert!(
+                FilesystemFlush::for_listener(&tcp).is_none(),
+                "container sandboxes on a TCP listener must not flush"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn container_listener_termination_runs_no_flush() {
+            let (runtime, _token) = availability_test_runtime_with(None);
+            assert!(
+                runtime.filesystem_flush.is_none(),
+                "a TCP-listener boundary must not install a flush"
+            );
+
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+        }
+
+        /// Exercise the real syscall and open-error path; persistence requires
+        /// VM stop/start testing.
+        #[test]
+        fn real_filesystem_flush_syncs_an_existing_path_and_reports_a_missing_one() {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            std::fs::write(directory.path().join("data"), b"x").expect("write test data");
+            sync_filesystem_at(directory.path()).expect("sync the filesystem holding the path");
+            flush_root_filesystem().expect("sync the root filesystem");
+
+            let missing = directory.path().join("missing");
+            let error = sync_filesystem_at(&missing).expect_err("a missing path cannot be synced");
+            assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn termination_is_acknowledged_when_the_filesystem_flush_fails() {
+            let (runtime, _token) = availability_test_runtime_with_flush(FilesystemFlush {
+                run: Arc::new(|| Err(io::Error::other("flush failed"))),
+                timeout: FILESYSTEM_FLUSH_TIMEOUT,
+            });
+
+            assert_eq!(
+                runtime.terminate_boundary().await,
+                Response::BoundaryTerminated
+            );
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn termination_is_acknowledged_when_the_filesystem_flush_hangs() {
+            let (release, blocked) = std::sync::mpsc::channel::<()>();
+            let blocked = Mutex::new(blocked);
+            let (runtime, _token) = availability_test_runtime_with_flush(FilesystemFlush {
+                run: Arc::new(move || {
+                    let _ = lock(&blocked).recv();
+                    Ok(())
+                }),
+                timeout: Duration::from_millis(100),
+            });
+
+            let started = tokio::time::Instant::now();
+            let response = runtime.terminate_boundary().await;
+            let elapsed = started.elapsed();
+            // Let the blocked flush finish so the runtime can shut down.
+            release.send(()).expect("release the blocked flush");
+
+            assert_eq!(response, Response::BoundaryTerminated);
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "a hung flush must not hold the acknowledgement: {elapsed:?}"
+            );
+            assert_eq!(
+                *lock(&runtime.supervisor_connection),
+                SupervisorConnectionState::Terminal
             );
         }
 

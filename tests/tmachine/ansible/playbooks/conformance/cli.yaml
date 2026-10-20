@@ -6,8 +6,10 @@
   hosts: all
   gather_facts: false
   vars:
-    # Conformance is skipped when the gateway never connects.
-    conformance_failed: "{{ gateway_status is failed or conformance_result.rc != 0 }}"
+    conformance_failed: >-
+      {{ gateway_status is failed or
+         (controller_readiness_failed | default(false)) or
+         conformance_result.rc != 0 }}
   tasks:
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
@@ -72,6 +74,21 @@
       delay: 5
       ignore_errors: true
 
+    - name: Check for K3s
+      ansible.builtin.stat:
+        path: /usr/local/bin/k3s
+      register: conformance_k3s
+
+    - name: Prepare the Kubernetes controller
+      when: gateway_status is succeeded and conformance_k3s.stat.exists
+      block:
+        - name: Verify Agent Sandbox reconciliation
+          ansible.builtin.include_tasks: k3s-ready.yaml
+      rescue:
+        - name: Record controller readiness failure
+          ansible.builtin.set_fact:
+            controller_readiness_failed: true
+
     - name: Run OpenShell conformance archive
       ansible.builtin.command:
         argv:
@@ -94,7 +111,7 @@
       register: conformance_result
       changed_when: false
       failed_when: false
-      when: gateway_status is succeeded
+      when: gateway_status is succeeded and not (controller_readiness_failed | default(false))
 
     # Preserve both streams for failures without adding passing-test output to
     # every tmachine run.
@@ -113,6 +130,12 @@
         that:
           - gateway_status is succeeded
         fail_msg: OpenShell gateway did not connect before conformance; see gateway diagnostics
+
+    - name: Require a ready Kubernetes controller
+      ansible.builtin.assert:
+        that:
+          - not (controller_readiness_failed | default(false))
+        fail_msg: Agent Sandbox reconciliation did not become ready before conformance; see controller diagnostics
 
     - name: Require OpenShell conformance success
       ansible.builtin.assert:

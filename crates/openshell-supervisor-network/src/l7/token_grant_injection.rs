@@ -22,7 +22,7 @@ use openshell_core::token_grant_failure::{
 };
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
-    StatusId, Url as OcsfUrl, ctx::ctx as ocsf_ctx, ocsf_emit,
+    StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
 };
 use tracing::warn;
 
@@ -345,10 +345,7 @@ fn report_refused_grant(
             .disposition(DispositionId::Blocked)
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
-            .http_request(HttpRequest::new(
-                method,
-                OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
-            ))
+            .http_request(HttpRequest::new(method, ctx.ocsf_url(request_path)))
             .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
             .message(format!(
                 "Token grant failed for {credential} to {}:{}",
@@ -407,7 +404,7 @@ async fn inject_selected(
                 .severity(SeverityId::Informational)
                 .http_request(HttpRequest::new(
                     &req.action,
-                    OcsfUrl::new("http", &ctx.host, request_path(&req.target), ctx.port),
+                    ctx.ocsf_url(request_path(&req.target)),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .message(format!(

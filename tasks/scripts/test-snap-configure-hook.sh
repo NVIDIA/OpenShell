@@ -25,7 +25,7 @@ EOF
 }
 
 run_hook user
-expected=$'stop --disable openshell.system-gateway\nstart --enable openshell.user-gateway'
+expected='stop --disable openshell.system-gateway'
 [[ $(cat "$work/snapctl.log") == "$expected" ]]
 
 run_hook system
@@ -61,7 +61,7 @@ fi
 
 cat >"$work/failure-bin/snapctl" <<EOF
 #!/bin/sh
-if [ "\${1:-}" = get ]; then printf '%s\n' user; exit 0; fi
+if [ "\${1:-}" = get ]; then printf '%s\n' system; exit 0; fi
 printf '%s\n' "\$*" >>'$work/start-failure.log'
 [ "\${1:-}" != start ]
 EOF
@@ -70,7 +70,7 @@ if PATH="$work/failure-bin:$PATH" SNAP_INSTANCE_NAME=openshell "$hook"; then
   echo "FAIL: configure hook ignored selected-service start failure" >&2
   exit 1
 fi
-expected=$'stop --disable openshell.system-gateway\nstart --enable openshell.user-gateway'
+expected=$'stop --disable openshell.user-gateway\nstart --enable openshell.system-gateway'
 [[ $(cat "$work/start-failure.log") == "$expected" ]]
 
 echo "Snap configure hook tests passed"

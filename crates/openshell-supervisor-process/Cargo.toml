@@ -23,7 +23,7 @@ bytes = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
 rand = "0.10"
-russh = "0.63.1"
+russh = "0.64.1"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }

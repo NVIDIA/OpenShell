@@ -238,6 +238,12 @@ VM sandboxes have no network interface. All traffic flows through the OpenShell 
 
 If the gateway is briefly unavailable while a VM starts, its supervisor retries the session connection. The sandbox stays in provisioning until the gateway accepts the session.
 
+### MicroVM Stop Durability
+
+When you run `openshell sandbox stop` while the main process is running, OpenShell terminates the workload and flushes the guest root filesystem before acknowledging termination. The guest waits up to three seconds for the flush. The host allows up to 22 seconds for supervisor shutdown, then up to five seconds to stop the VM.
+
+Flush errors and timeouts produce warnings while shutdown continues. If a signal kills the supervisor, the driver warns that the guest flush was not confirmed and recent writes may be lost. A completed stop does not guarantee persistence after a failed or timed-out flush. This flush does not cover stops after the main process has already exited.
+
 ### MicroVM Mounts
 
 The VM driver shares gateway-host directories into the guest with virtiofs. Each entry in `mounts` takes `source` (absolute host directory), `target`, optional `read_only` (default `true`), and optional `type`, which must be `bind` so Docker and Podman bind entries work unchanged:

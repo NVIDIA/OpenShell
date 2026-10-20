@@ -34,7 +34,7 @@ In the log file, OCSF events appear in a shorthand format with an `OCSF` level l
 2026-04-01T04:04:13.074Z INFO openshell_sandbox: Creating OPA engine from proto policy data
 2026-04-01T04:04:13.078Z OCSF CONFIG:VALIDATED [INFO] Validated 'sandbox' user exists in image
 2026-04-01T04:04:32.118Z OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]
-2026-04-01T04:04:32.190Z OCSF HTTP:GET [INFO] ALLOWED GET http://api.github.com/zen [policy:github_api engine:opa]
+2026-04-01T04:04:32.190Z OCSF HTTP:GET [INFO] ALLOWED GET https://api.github.com/zen [policy:github_api engine:opa]
 2026-04-01T04:04:32.690Z OCSF NET:OPEN [MED] DENIED /usr/bin/curl(64) -> httpbin.org:443 [policy:- engine:opa] [reason:no matching policy]
 ```
 
@@ -122,7 +122,7 @@ OCSF NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:git
 An L7 read-only policy denying a POST:
 
 ```text
-OCSF HTTP:POST [MED] DENIED POST http://api.github.com/user/repos [policy:github_api engine:opa]
+OCSF HTTP:POST [MED] DENIED POST https://api.github.com/user/repos [policy:github_api engine:opa]
 ```
 
 A connection denied because no policy matched:
@@ -146,7 +146,7 @@ OCSF HTTP:GET [INFO] ALLOWED GET http://api.internal.corp:8080/v1/status [policy
 A supervisor middleware HTTP event records whether it transformed the request. If the middleware also emits a finding, that remains a separate event:
 
 ```text
-OCSF HTTP:POST [INFO] ALLOWED POST http://httpbin.org:443/anything [policy:httpbin engine:middleware] [failed:false transformed:true]
+OCSF HTTP:POST [INFO] ALLOWED POST https://httpbin.org/anything [policy:httpbin engine:middleware] [failed:false transformed:true]
 OCSF FINDING:CREATE [MED] "configured content matched" [type:content_guard.match count:1 middleware:prototype-content-guard]
 ```
 

@@ -1027,31 +1027,85 @@ pub(super) async fn resolve_provider_environment_with_credentials(
     resolve_provider_environment_from_records_with_credentials(catalog, &records, credentials).await
 }
 
+/// Loads one provider; `Ok(None)` means it does not exist.
+async fn load_provider_environment_record(
+    store: &Store,
+    workspace: &str,
+    name: &str,
+) -> Result<Option<ProviderEnvironmentRecord>, Status> {
+    let Some(record) = store
+        .get_by_name(Provider::object_type(), workspace, name)
+        .await
+        .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+    else {
+        return Ok(None);
+    };
+    let provider = Provider::decode(record.payload.as_slice())
+        .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
+    let refresh_states =
+        crate::provider_refresh::list_refresh_states_for_provider(store, &record.id).await?;
+    Ok(Some(ProviderEnvironmentRecord {
+        name: name.to_string(),
+        object_id: record.id,
+        resource_version: record.resource_version,
+        provider,
+        refresh_states,
+    }))
+}
+
+/// Loads providers concurrently, in `provider_names` order; a missing
+/// provider is `None`. Store errors short-circuit.
+async fn load_optional_provider_environment_records(
+    store: &Store,
+    workspace: &str,
+    provider_names: &[String],
+) -> Result<Vec<Option<ProviderEnvironmentRecord>>, Status> {
+    // Providers are independent, so load them concurrently.
+    futures::future::try_join_all(
+        provider_names
+            .iter()
+            .map(|name| load_provider_environment_record(store, workspace, name)),
+    )
+    .await
+}
+
 pub(super) async fn load_provider_environment_records(
     store: &Store,
     workspace: &str,
     provider_names: &[String],
 ) -> Result<Vec<ProviderEnvironmentRecord>, Status> {
-    // Providers are independent, so load them concurrently.
-    futures::future::try_join_all(provider_names.iter().map(|name| async move {
-        let record = store
-            .get_by_name(Provider::object_type(), workspace, name)
-            .await
-            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
-            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
-        let provider = Provider::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("failed to decode provider '{name}': {e}")))?;
-        let refresh_states =
-            crate::provider_refresh::list_refresh_states_for_provider(store, &record.id).await?;
-        Ok(ProviderEnvironmentRecord {
-            name: name.clone(),
-            object_id: record.id,
-            resource_version: record.resource_version,
-            provider,
-            refresh_states,
+    load_optional_provider_environment_records(store, workspace, provider_names)
+        .await?
+        .into_iter()
+        .zip(provider_names)
+        .map(|(record, name)| {
+            record
+                .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))
         })
-    }))
-    .await
+        .collect()
+}
+
+/// Like [`load_provider_environment_records`], but returns the names of
+/// missing providers instead of failing.
+pub(super) async fn load_existing_provider_environment_records<'a>(
+    store: &Store,
+    workspace: &str,
+    provider_names: &'a [String],
+) -> Result<(Vec<ProviderEnvironmentRecord>, Vec<&'a str>), Status> {
+    let mut records = Vec::with_capacity(provider_names.len());
+    let mut missing = Vec::new();
+    for (record, name) in
+        load_optional_provider_environment_records(store, workspace, provider_names)
+            .await?
+            .into_iter()
+            .zip(provider_names)
+    {
+        match record {
+            Some(record) => records.push(record),
+            None => missing.push(name.as_str()),
+        }
+    }
+    Ok((records, missing))
 }
 
 #[cfg(test)]
