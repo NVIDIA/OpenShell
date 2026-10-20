@@ -20,10 +20,10 @@ Ask for the part of the week you're in:
 
 | When | Ask | What happens |
 |---|---|---|
-| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists and Auto-Tag is cutting pre-releases. If not, ask this week's captain to start the train (Tuesday step 6). Nothing else is needed until Monday. |
+| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists and Auto-Tag is cutting pre-releases. If not, ask this week's captain to start the train (Tuesday step 7). Nothing else is needed until Monday. |
 | Monday | "Run the release captain Monday checklist." | Monday steps 1–6: candidate status, failure triage, compatibility review, canary, and a draft coordination post. |
 | A pre-release failed | "`vX.Y.Z-pre.N` failed, help me fix it." | Monday step 5 and Recovery: classify the failure, propose a rerun or fix, and draft the `#openshell-triage` reply. |
-| Tuesday | "Cut the release." | Tuesday steps 1–7: preview the candidate, dispatch `Release` after approval, verify, and start the next train. |
+| Tuesday | "Cut the release." | Tuesday steps 1–7: preview the candidate, dispatch `Release` after approval, verify, close the loop, and finish by starting the next train. |
 
 Every command that changes something is shown for approval first.
 
@@ -120,7 +120,7 @@ Finish these on Monday so Tuesday is only the cut.
    gh run view "$(gh run list --workflow release-auto-tag.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --log | grep -E 'Next tag:|— skipping' | grep -v echo
    ```
 
-   If the next version has no `-pre.1`, start the train (Tuesday step 6).
+   If the next version has no `-pre.1`, start the train (Tuesday step 7).
 
 2. **Check the candidate.** Run the preview from Setup. It shows the newest
    pre-release that would ship. If the latest `-pre.N` isn't the candidate,
@@ -184,7 +184,7 @@ Finish these on Monday so Tuesday is only the cut.
    - Let a failed run finish rather than cancelling it. Its other suites still
      show whether the rest of the commit is healthy.
    - Once the fix merges and its `Release Dev` run passes, tag the next
-     `-pre.N` on that commit by hand after approval (as in Tuesday step 6),
+     `-pre.N` on that commit by hand after approval (as in Tuesday step 7),
      instead of waiting a day for Auto-Tag.
 
 6. **Draft the coordination post.** The captain starts a thread on Monday in the
@@ -238,7 +238,7 @@ Finish these on Monday so Tuesday is only the cut.
 
 1. **Select the final candidate.** With a cutoff after Auto-Tag, first tag the
    final `-pre.N` by hand after approval, on the newest commit with a
-   successful `Release Dev` run (commands as in Tuesday step 6). Once the final
+   successful `Release Dev` run (commands as in Tuesday step 7). Once the final
    pre-release has finished, run the preview from Setup and repeat Monday
    step 3 for its run. If the newest pre-release failed, either fix it (Monday
    step 5) or confirm that shipping the earlier candidate without the later
@@ -292,10 +292,16 @@ Finish these on Monday so Tuesday is only the cut.
    `Trigger Wheel Publish` only starts the GitLab pipeline, so confirm that the
    wheel reached PyPI separately.
 
-6. **Start the next train.** This is this week's captain's job, not next
-   week's. Until the next `-pre.1` exists, Auto-Tag skips. Once it does,
-   Auto-Tag cuts `-pre.2` onward every weekday, so next week's captain starts
-   Monday with qualified pre-releases. Do it soon after the release.
+6. **Close the loop.** Draft a reply to the coordination thread with the release
+   link and any PRs deferred to the next train. After approval, move the
+   release milestone's open items to the next milestone.
+
+7. **Start the next train.** This is the last duty of this week's captain, not
+   the first of next week's. Until the next `-pre.1` exists, Auto-Tag skips.
+   Once it does, Auto-Tag cuts `-pre.2` onward every weekday, so next week's
+   captain starts Monday with qualified pre-releases. Do it the same day as
+   the release. Your week isn't done until the `-pre.1` `Pre-release` run
+   passes, or its failure is triaged and handed to next week's captain.
 
    Agree with the maintainers whether the next train is patch (the default) or
    minor (notable features or planned breaking changes; see the
@@ -329,8 +335,8 @@ Finish these on Monday so Tuesday is only the cut.
    gh run list --workflow release-prerelease.yml --branch "$NEXT"
    ```
 
-7. **Close the loop.** Draft a reply to the coordination thread with the release
-   link and any PRs deferred to the next train.
+   Watch the run to the end, then tell next week's captain the train is
+   running, and which `-pre.1` run to check on Monday.
 
 ## Recovery
 
