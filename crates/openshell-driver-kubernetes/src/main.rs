@@ -13,7 +13,8 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, KubernetesImagePullPolicy,
-    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, WorkspaceMode,
+    KubernetesPodAntiAffinity, KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig,
+    WorkspaceMode,
 };
 
 #[derive(Parser, Debug)]
@@ -157,6 +158,15 @@ struct Args {
     )]
     sandbox_runtime_boundary_port: u16,
 
+    /// Node separation for each sandbox workload and its own supervisor.
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_POD_ANTI_AFFINITY",
+        value_enum,
+        default_value = "off"
+    )]
+    pod_anti_affinity: KubernetesPodAntiAffinity,
+
     /// Corporate HTTP forward proxy for policy-approved TLS CONNECT egress.
     #[arg(long, env = "OPENSHELL_UPSTREAM_PROXY")]
     https_proxy: Option<String>,
@@ -286,6 +296,7 @@ async fn main() -> Result<()> {
             supervisor_image_pull_policy: args.supervisor_image_pull_policy,
             sandbox_runtime: KubernetesSandboxRuntimeConfig {
                 boundary_port: args.sandbox_runtime_boundary_port,
+                pod_anti_affinity: args.pod_anti_affinity,
             },
             https_proxy: args.https_proxy,
             no_proxy: args.no_proxy,

@@ -889,6 +889,16 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 
 The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
+When the Kubernetes driver's `sandbox_runtime.pod_anti_affinity` is `required`,
+each workload and its own supervisor need different eligible nodes. Check both
+pods' `FailedScheduling` events for insufficient nodes or conflicting placement
+constraints. `preferred` permits colocation; `off` is the default. This
+operator setting takes effect on create or stop/start and does not move running
+pods. Helm users configure it under
+`gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime`; the chart's
+top-level `affinity` controls the gateway pod. See the published gateway
+configuration reference for the full setting.
+
 For vulnerability reports, record the running image digest and scan that exact
 artifact. The gateway includes a pinned Distroless base; the supervisor includes
 Alpine packages updated at image build time. A dependency or base-image fix only

@@ -19,6 +19,11 @@ use crate::sandbox_runtime::{
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference,
     supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
+use crate::scheduling::{
+    BOOTSTRAP_SCHEDULING_GATE as SANDBOX_BOOTSTRAP_SCHEDULING_GATE, PairRole,
+    has_required_pair_anti_affinity, pair_pod_waiting_for_scheduling, reconcile_pair_anti_affinity,
+    validate_pair_scheduling, workload_affinity_patch,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
     TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo,
@@ -2058,6 +2063,7 @@ impl KubernetesComputeDriver {
             sandbox_uid: resolved_user_id,
             sandbox_gid: resolved_group_id,
             boundary_port: self.config.sandbox_runtime.boundary_port,
+            pod_anti_affinity: self.config.sandbox_runtime.pod_anti_affinity,
             sandbox_secret_name: &proxy_names.sandbox_secret,
         };
         let kube_name = self.config.kube_resource_name(workspace, name);
@@ -2262,6 +2268,27 @@ impl KubernetesComputeDriver {
                 Err(error) => return Err(KubernetesDriverError::from_kube(error)),
             }
         }
+    }
+
+    async fn validate_admitted_pair_scheduling(
+        &self,
+        pods: &Api<Pod>,
+        workload: &Pod,
+        supervisor_name: &str,
+        sandbox_id: &str,
+    ) -> Result<(), KubernetesDriverError> {
+        let mode = self.config.sandbox_runtime.pod_anti_affinity;
+        if mode == crate::KubernetesPodAntiAffinity::Required {
+            validate_pair_scheduling(workload, sandbox_id, PairRole::Workload, mode)
+                .map_err(KubernetesDriverError::Precondition)?;
+            let supervisor = pods
+                .get(supervisor_name)
+                .await
+                .map_err(KubernetesDriverError::from_kube)?;
+            validate_pair_scheduling(&supervisor, sandbox_id, PairRole::Supervisor, mode)
+                .map_err(KubernetesDriverError::Precondition)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2575,6 +2602,7 @@ impl KubernetesComputeDriver {
                     ),
                     dependent_owner.clone(),
                     &self.supervisor_otlp_environment(),
+                    self.config.sandbox_runtime.pod_anti_affinity,
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -2629,6 +2657,13 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        self.validate_admitted_pair_scheduling(
+            &pods,
+            &workload_pod,
+            &names.supervisor_pod,
+            &sandbox.id,
+        )
+        .await?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -2908,6 +2943,13 @@ impl KubernetesComputeDriver {
             agent_gid,
             &names.sandbox_secret,
         )?;
+        self.validate_admitted_pair_scheduling(
+            &pods,
+            &workload_pod,
+            &names.supervisor_pod,
+            sandbox_id,
+        )
+        .await?;
         let workload_pod_uid =
             workload_pod.metadata.uid.clone().ok_or_else(|| {
                 KubernetesDriverError::Message("workload Pod has no UID".to_string())
@@ -3324,6 +3366,12 @@ impl KubernetesComputeDriver {
             ));
         }
 
+        let affinity = workload_affinity_patch(
+            &object.data["spec"]["podTemplate"]["spec"]["affinity"],
+            sandbox_id,
+            self.config.sandbox_runtime.pod_anti_affinity,
+        )
+        .map_err(KubernetesDriverError::Precondition)?;
         let names = SandboxRuntimeNames::for_generation(sandbox_id, generation.as_str());
         self.create_sandbox_runtime_fence(&namespace, &names)
             .await?;
@@ -3397,6 +3445,7 @@ impl KubernetesComputeDriver {
                         false,
                     ),
                     &self.supervisor_otlp_environment(),
+                    self.config.sandbox_runtime.pod_anti_affinity,
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -3450,6 +3499,7 @@ impl KubernetesComputeDriver {
                         &volumes,
                         &init_containers,
                         &image_pull_secrets,
+                        &affinity,
                     );
                     running_patch
                 },
@@ -4285,6 +4335,83 @@ impl KubernetesComputeDriver {
         }
     }
 
+    async fn pair_generation_waiting_for_scheduling(
+        &self,
+        object: &DynamicObject,
+    ) -> Result<bool, KubernetesDriverError> {
+        if sandbox_runtime_bootstrap_phase(object) != Some(SandboxRuntimeBootstrapPhase::Released) {
+            return Ok(false);
+        }
+        let Ok(sandbox_id) = sandbox_id_from_object(object) else {
+            return Ok(false);
+        };
+        let affinity: Option<k8s_openapi::api::core::v1::Affinity> =
+            serde_json::from_value(object.data["spec"]["podTemplate"]["spec"]["affinity"].clone())
+                .map_err(|error| {
+                    KubernetesDriverError::Precondition(format!(
+                        "invalid stored workload affinity: {error}"
+                    ))
+                })?;
+        if !has_required_pair_anti_affinity(affinity.as_ref(), &sandbox_id, PairRole::Workload) {
+            return Ok(false);
+        }
+        let Some(name) = object.metadata.name.as_deref() else {
+            return Ok(false);
+        };
+        let annotations = object.metadata.annotations.as_ref();
+        let workload_uid = annotations.and_then(|a| a.get(ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID));
+        let supervisor_uid =
+            annotations.and_then(|a| a.get(ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID));
+        let (Some(workload_uid), Some(supervisor_uid)) = (workload_uid, supervisor_uid) else {
+            return Ok(false);
+        };
+        let namespace = object
+            .metadata
+            .namespace
+            .as_deref()
+            .unwrap_or(&self.config.namespace);
+        let pods: Api<Pod> = Api::namespaced(self.client.clone(), namespace);
+        let workload = pods
+            .get_opt(name)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        let supervisor = pods
+            .get_opt(&SandboxRuntimeNames::new(&sandbox_id).supervisor_pod)
+            .await
+            .map_err(KubernetesDriverError::from_kube)?;
+        let (Some(workload), Some(supervisor)) = (workload, supervisor) else {
+            return Ok(false);
+        };
+        if workload.metadata.uid.as_ref() != Some(workload_uid)
+            || supervisor.metadata.uid.as_ref() != Some(supervisor_uid)
+        {
+            return Ok(false);
+        }
+        let workload_waiting = pair_pod_waiting_for_scheduling(
+            &workload,
+            workload_uid,
+            &sandbox_id,
+            PairRole::Workload,
+        );
+        let supervisor_waiting = pair_pod_waiting_for_scheduling(
+            &supervisor,
+            supervisor_uid,
+            &sandbox_id,
+            PairRole::Supervisor,
+        );
+        let running = |pod: &Pod| {
+            pod.metadata.deletion_timestamp.is_none()
+                && pod
+                    .status
+                    .as_ref()
+                    .is_some_and(|status| status.phase.as_deref() == Some("Running"))
+        };
+        Ok(
+            (workload_waiting && (supervisor_waiting || running(&supervisor)))
+                || (supervisor_waiting && running(&workload)),
+        )
+    }
+
     async fn reap_stale_sandbox_runtime_bootstrap(
         &self,
         lookup_api: &AgentSandboxApi,
@@ -4296,6 +4423,14 @@ impl KubernetesComputeDriver {
             SANDBOX_RUNTIME_BOOTSTRAP_GRACE,
         ) {
             return;
+        }
+        match self.pair_generation_waiting_for_scheduling(object).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                debug!(%error, "could not verify pair scheduling wait; bootstrap cleanup will retry");
+                return;
+            }
         }
         if sandbox_runtime_bootstrap_operation(object) != Some("create") {
             warn!(
@@ -5063,8 +5198,10 @@ fn restart_pod_template_spec(
     volumes: &[serde_json::Value],
     init_containers: &[serde_json::Value],
     image_pull_secrets: &[String],
+    affinity: &serde_json::Value,
 ) -> serde_json::Value {
     serde_json::json!({
+        "affinity": affinity,
         "volumes": volumes,
         "initContainers": init_containers,
         "imagePullSecrets": image_pull_secret_refs(image_pull_secrets),
@@ -5782,6 +5919,12 @@ fn update_indexes(
     if !kube_name.is_empty() {
         sandbox_name_to_id.insert(kube_name.to_string(), sandbox.id.clone());
     }
+    if !sandbox.id.is_empty() {
+        agent_pod_to_id.insert(
+            SandboxRuntimeNames::new(&sandbox.id).supervisor_pod,
+            sandbox.id.clone(),
+        );
+    }
     if let Some(status) = sandbox.status.as_ref()
         && !status.instance_id.is_empty()
     {
@@ -5915,7 +6058,6 @@ const SANDBOX_POD_IDENTITY_MOUNT_PATH: &str = "/.openshell/pod-identity";
 const SANDBOX_POD_UID_PATH: &str = "/.openshell/pod-identity/uid";
 const SANDBOX_PROXY_CA_VOLUME_NAME: &str = "openshell-run";
 const SANDBOX_PROXY_CA_MOUNT_PATH: &str = "/run";
-const SANDBOX_BOOTSTRAP_SCHEDULING_GATE: &str = "openshell.ai/bootstrap";
 
 fn sandbox_bootstrap_secret_name(spec: &serde_json::Value) -> Option<&str> {
     spec["volumes"]
@@ -5995,6 +6137,16 @@ fn apply_supervisor_sandbox_runtime_boundary(
     else {
         return;
     };
+    let mut affinity = None;
+    reconcile_pair_anti_affinity(
+        &mut affinity,
+        params.sandbox_id,
+        PairRole::Workload,
+        params.pod_anti_affinity,
+    );
+    if let Some(affinity) = affinity {
+        spec.insert("affinity".to_string(), serde_json::json!(affinity));
+    }
     spec.insert("hostNetwork".to_string(), serde_json::json!(false));
     spec.insert("hostPID".to_string(), serde_json::json!(false));
     spec.insert("hostIPC".to_string(), serde_json::json!(false));
@@ -6360,6 +6512,7 @@ struct SandboxPodParams<'a> {
     sandbox_gid: u32,
     /// TLS listener port exposed only to the paired supervisor Pod.
     boundary_port: u16,
+    pod_anti_affinity: crate::KubernetesPodAntiAffinity,
     /// Immutable Secret name for this workload Pod generation.
     sandbox_secret_name: &'a str,
 }
@@ -6381,6 +6534,7 @@ impl Default for SandboxPodParams<'_> {
             sandbox_uid: DEFAULT_SANDBOX_UID,
             sandbox_gid: DEFAULT_SANDBOX_UID,
             boundary_port: 5500,
+            pod_anti_affinity: crate::KubernetesPodAntiAffinity::Off,
             sandbox_secret_name: "os-sandbox-test-generation",
         }
     }
@@ -12195,6 +12349,7 @@ mod tests {
             &volumes,
             &init_containers,
             &["os-pull-sandbox-1-gen7-0".to_string()],
+            &serde_json::Value::Null,
         );
         assert_eq!(spec["volumes"], serde_json::json!(volumes));
         assert_eq!(spec["initContainers"], serde_json::json!(init_containers));
@@ -12202,6 +12357,117 @@ mod tests {
             spec["imagePullSecrets"],
             serde_json::json!([{"name": "os-pull-sandbox-1-gen7-0"}])
         );
+    }
+
+    #[test]
+    fn operator_pair_anti_affinity_renders_in_workload() {
+        let params = SandboxPodParams {
+            sandbox_id: "sandbox-1",
+            pod_anti_affinity: crate::KubernetesPodAntiAffinity::Required,
+            ..Default::default()
+        };
+        let template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &params,
+        );
+        let pod: Pod = serde_json::from_value(template).unwrap();
+        validate_pair_scheduling(
+            &pod,
+            "sandbox-1",
+            PairRole::Workload,
+            crate::KubernetesPodAntiAffinity::Required,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn supervisor_failed_scheduling_events_are_forwarded() {
+        let sandbox = Sandbox {
+            id: "sandbox-1".into(),
+            ..Default::default()
+        };
+        let mut names = std::collections::HashMap::new();
+        let mut pods = std::collections::HashMap::new();
+        update_indexes(&mut names, &mut pods, "default--demo", &sandbox);
+        let event: KubeEventObj = serde_json::from_value(serde_json::json!({
+            "involvedObject": {"kind": "Pod", "name": SandboxRuntimeNames::new("sandbox-1").supervisor_pod},
+            "reason": "FailedScheduling", "type": "Warning",
+            "message": "0/1 nodes are available: pod anti-affinity rules",
+        })).unwrap();
+        let (id, mapped) =
+            map_kube_event_to_platform(&names, &pods, &event).expect("supervisor event forwarded");
+        assert_eq!(id, "sandbox-1");
+        assert_eq!(mapped.reason, "FailedScheduling");
+    }
+
+    #[tokio::test]
+    async fn required_pair_scheduling_is_not_reaped_after_bootstrap_grace() {
+        for operation in ["create", "restart"] {
+            for (pending_role, peer_phase) in [
+                ("workload", "Running"),
+                ("supervisor", "Running"),
+                ("workload", "Failed"),
+                ("supervisor", "Pending"),
+            ] {
+                let mut workload_affinity = None;
+                reconcile_pair_anti_affinity(
+                    &mut workload_affinity,
+                    "sandbox-1",
+                    PairRole::Workload,
+                    crate::KubernetesPodAntiAffinity::Required,
+                );
+                let object: DynamicObject = serde_json::from_value(serde_json::json!({
+                    "apiVersion": "agents.x-k8s.io/v1beta1", "kind": "Sandbox",
+                    "metadata": {"name": "demo", "namespace": "openshell", "uid": "cr-uid", "resourceVersion": "1", "labels": {LABEL_SANDBOX_ID: "sandbox-1"}, "annotations": {
+                        LABEL_SANDBOX_ID: "sandbox-1",
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAPPING: "true",
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_STARTED_AT: "1",
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_OPERATION: operation,
+                        ANNOTATION_SANDBOX_RUNTIME_BOOTSTRAP_PHASE: "released",
+                        ANNOTATION_SANDBOX_RUNTIME_WORKLOAD_UID: "workload-uid",
+                        ANNOTATION_SANDBOX_RUNTIME_SUPERVISOR_UID: "supervisor-uid",
+                    }},
+                    "spec": {"podTemplate": {"spec": {"affinity": workload_affinity}}},
+                })).unwrap();
+                let steps = [("demo", PairRole::Workload), ("os-supervisor-sandbox-1", PairRole::Supervisor)].into_iter().map(|(name, role)| {
+                    let mut affinity = None;
+                    reconcile_pair_anti_affinity(&mut affinity, "sandbox-1", role, crate::KubernetesPodAntiAffinity::Required);
+                    let mut pod = serde_json::json!({
+                        "metadata": {"name": name, "uid": format!("{}-uid", role.as_str()), "labels": {
+                            BOUNDARY_PAIR_LABEL: "sandbox-1", BOUNDARY_ROLE_LABEL: role.as_str(),
+                        }},
+                        "spec": {"containers": [], "affinity": affinity},
+                        "status": {"phase": "Pending", "conditions": [{"type": "PodScheduled", "status": "False", "reason": "Unschedulable"}]},
+                    });
+                    if role.as_str() != pending_role { pod["spec"]["nodeName"] = serde_json::json!("node-1"); pod["status"]["phase"] = serde_json::json!(peer_phase); }
+                    (http::Method::GET, if role.as_str() == "workload" { "/api/v1/namespaces/openshell/pods/demo" } else { "/api/v1/namespaces/openshell/pods/os-supervisor-sandbox-1" }, kube_test_response(http::StatusCode::OK, pod))
+                }).collect();
+                let (driver, remaining, _) =
+                    scripted_driver(KubernetesComputeConfig::default(), steps);
+                let api = KubernetesComputeDriver::agent_sandbox_api(
+                    driver.client.clone(),
+                    SANDBOX_VERSION_V1BETA1,
+                    "openshell",
+                );
+                if peer_phase == "Running" {
+                    driver
+                        .reap_stale_sandbox_runtime_bootstrap(&api, &object)
+                        .await;
+                } else {
+                    assert!(
+                        !driver
+                            .pair_generation_waiting_for_scheduling(&object)
+                            .await
+                            .unwrap(),
+                        "runtime failures must retain bootstrap cleanup"
+                    );
+                }
+                assert!(remaining.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[test]

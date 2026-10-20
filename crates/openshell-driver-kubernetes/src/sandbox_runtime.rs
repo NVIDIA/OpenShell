@@ -19,6 +19,8 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::core::ObjectMeta;
 use rcgen::{CertificateParams, DnType, IsCa, KeyUsagePurpose};
 
+use crate::scheduling::{BOOTSTRAP_SCHEDULING_GATE, PairRole, reconcile_pair_anti_affinity};
+
 use crate::isolation::{
     BOUNDARY_PAIR_LABEL, BOUNDARY_ROLE_LABEL, KubernetesSandboxRuntimeNetworkFence,
     KubernetesSandboxRuntimeNetworkFenceSpec,
@@ -236,8 +238,16 @@ pub fn supervisor_pod(
     provider_spiffe_socket_path: Option<&str>,
     owner: OwnerReference,
     tracing_environment: &[(&str, String)],
+    pod_anti_affinity: crate::KubernetesPodAntiAffinity,
 ) -> Result<Pod, String> {
     let labels = control_labels(sandbox_id, gateway_id);
+    let mut affinity = None;
+    reconcile_pair_anti_affinity(
+        &mut affinity,
+        sandbox_id,
+        PairRole::Supervisor,
+        pod_anti_affinity,
+    );
     let mut environment = vec![
         env_var(
             "OPENSHELL_ADMITTED_ISOLATION_BACKEND",
@@ -463,6 +473,7 @@ pub fn supervisor_pod(
             ..Default::default()
         },
         spec: Some(PodSpec {
+            affinity,
             termination_grace_period_seconds: Some(SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS),
             service_account_name: Some(service_account_name.to_string()),
             image_pull_secrets: Some(
@@ -473,7 +484,7 @@ pub fn supervisor_pod(
             ),
             automount_service_account_token: Some(false),
             scheduling_gates: Some(vec![PodSchedulingGate {
-                name: "openshell.ai/bootstrap".to_string(),
+                name: BOOTSTRAP_SCHEDULING_GATE.to_string(),
             }]),
             security_context: Some(PodSecurityContext {
                 fs_group: Some(i64::from(control_gid)),
@@ -838,6 +849,7 @@ mod tests {
             None,
             owner(),
             &[],
+            crate::KubernetesPodAntiAffinity::Off,
         )
         .expect("render supervisor Pod")
     }
@@ -903,6 +915,7 @@ mod tests {
                 ),
                 ("TRACEPARENT", TRACEPARENT.to_string()),
             ],
+            crate::KubernetesPodAntiAffinity::Off,
         )
         .expect("render supervisor Pod");
         let environment = pod.spec.expect("Pod spec").containers[0]
@@ -1023,8 +1036,16 @@ mod tests {
             None,
             owner(),
             &[],
+            crate::KubernetesPodAntiAffinity::Required,
         )
         .expect("render supervisor Pod");
+        crate::scheduling::validate_pair_scheduling(
+            &pod,
+            "pair",
+            PairRole::Supervisor,
+            crate::KubernetesPodAntiAffinity::Required,
+        )
+        .unwrap();
         let pod_spec = pod.spec.as_ref().expect("Pod spec");
         assert_eq!(
             pod.metadata
@@ -1281,6 +1302,7 @@ mod tests {
             None,
             owner(),
             &[],
+            crate::KubernetesPodAntiAffinity::Off,
         )
         .expect("render supervisor Pod")
     }

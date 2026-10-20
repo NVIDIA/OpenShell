@@ -87,6 +87,28 @@ The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.
 
+### Pair scheduling
+
+Operators can set `sandbox_runtime.pod_anti_affinity` to `off` (default),
+`preferred`, or `required`. The driver renders symmetric Pod anti-affinity
+terms selecting the peer role and reserved `openshell.ai/boundary-pair` value
+within the same namespace, with topology key `kubernetes.io/hostname`.
+Preferred terms have weight 100. Required mode leaves a pod Pending when no
+eligible separate node exists; it never falls back to colocation.
+
+Create and stop/start use the current gateway configuration for both pods.
+Restart replaces the driver's exact generated terms in the stored workload
+template, preserving unrelated affinity. Before releasing bootstrap gates in
+required mode, the driver verifies both admitted pods retain their pair labels,
+required term, and gate, have no `nodeName`, and use the default scheduler.
+Existing running pods are not moved. Pair scheduling does not prevent a workload
+from sharing a node with another sandbox's supervisor.
+
+The policy is operator-owned and independent of caller `driver_config`.
+The standalone driver accepts `--pod-anti-affinity` or
+`OPENSHELL_K8S_POD_ANTI_AFFINITY`. For gateway TOML and Helm examples, see the
+[gateway configuration reference](../../docs/how-it-works/gateways/configuration.mdx).
+
 When the gateway exports OTLP traces, the driver sets
 `OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
 `TRACEPARENT` to the trace context of the operation that created the Pod. The

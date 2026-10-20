@@ -105,6 +105,21 @@ registers the gateway under the worktree-specific k3d
 cluster name and selects it as the active gateway. Keep the forwarding
 task running while using those endpoints.
 
+### Testing sandbox/supervisor node separation
+
+Set `gatewayConfig.openshell.drivers.kubernetes.sandbox_runtime.pod_anti_affinity`
+to `required` or `preferred` in a Helm values overlay. The default is `off`.
+This is separate from the gateway pod's top-level `affinity` value.
+Required mode needs two eligible Kubernetes nodes for each sandbox/supervisor
+pair; the default single-node development cluster cannot run a complete pair.
+For an isolated multi-node test, create a named k3d cluster with `--agents 1`
+and `--kubeconfig-update-default=false`, then use that cluster with the existing
+Kubernetes e2e harness. Keep its kubeconfig separate from other clusters.
+Verify the admitted workload and supervisor carry symmetric rules and distinct
+`spec.nodeName` values, repeat after stop/start, and check `FailedScheduling`
+when only one node is eligible. Preferred mode should still start on one node.
+Unrelated pairs may share nodes.
+
 ### Viewing local traces
 
 The gateway exports OTLP/gRPC to
