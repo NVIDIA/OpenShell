@@ -16,7 +16,7 @@ merges, cuts the release, and starts the next train.
 
 | When | Ask | What happens |
 |---|---|---|
-| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists. If not, ask this week's captain to start the train (Tuesday step 6). Then watch `#openshell-triage` each weekday after Auto-Tag, and fix failures as they happen (Monday step 3) instead of on Monday. |
+| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists. If not, ask this week's captain to start the train (Tuesday step 6). Then check each weekday that Auto-Tag's pre-release ran and passed (`gh run list --workflow release-prerelease.yml --limit 3`), and fix failures as they happen (Monday step 3) instead of on Monday. |
 | Monday | "Run the release captain Monday checklist." | Monday steps 1–4. |
 | A pre-release failed | "`vX.Y.Z-pre.N` failed, help me fix it." | Monday step 3 and Recovery. |
 | Tuesday | "Cut the release." | Tuesday steps 1–6, ending with starting the next train. |
@@ -41,8 +41,6 @@ tag, or start a second `Pre-release` run for a tag; it has no concurrency guard.
 - `Release` (`release.yml`) is dispatched by hand with the stable version. It
   picks the highest `-pre.N` on `main` whose whole `Pre-release` run passed,
   creates the stable tag on that commit, and publishes without requalifying.
-- OpenShell TriageBot posts every failed `Pre-release` attempt in
-  `#openshell-triage` (`C0C20SDLDNW`), with links to the failed jobs.
 
 ## Setup
 
@@ -100,16 +98,15 @@ git worktree remove --force "$wt"
    fix, a revert, a minor train, or a maintainer-approved exception with upgrade
    steps in the release notes.
 
-3. **Fix forward.** A failed pre-release doesn't end the train. Draft a reply in
-   the failure's `#openshell-triage` thread with the cause and the fix. Let the
-   failed run finish rather than cancelling it. Once the fix merges and its
-   `Release Dev` run passes, tag the next `-pre.N` on it by hand (as in Tuesday
-   step 6). See Recovery for reruns.
+3. **Fix forward.** A failed pre-release doesn't end the train. Find the cause,
+   and let the failed run finish rather than cancelling it. Once the fix merges
+   and its `Release Dev` run passes, tag the next `-pre.N` on it by hand (as in
+   Tuesday step 6). See Recovery for reruns.
 
 4. **Draft the coordination post.** Start a thread in the OpenShell channel of
-   the CNCF Slack (`C0B6Y8WQHU1`) and link it in the internal team channel.
-   The release ships from `main` with no release branch, so the thread is for
-   getting ready PRs reviewed and merged before the cutoff. List approved PRs:
+   the CNCF Slack. The release ships from `main` with no release branch, so the
+   thread is for getting ready PRs reviewed and merged before the cutoff. List
+   approved PRs:
 
    ```shell
    gh pr list --base main --state open --search "review:approved" --json number,title,author --jq '.[] | "#\(.number) \(.title) (@\(.author.login))"'
