@@ -526,7 +526,9 @@ async fn ensure_sandbox_exists(
 mod tests {
     use super::*;
     use crate::ServerState;
-    use crate::auth::audit::{ConnectionSource, RequestOrigin};
+    use crate::auth::audit::test_support::{
+        self, REQUEST_ID, assert_boundary_finding, assert_origin, assert_redacted, audited,
+    };
     use crate::auth::compute_driver::ISSUE_SANDBOX_TOKEN_PATH;
     use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
@@ -675,36 +677,11 @@ mod tests {
     }
 
     const GET_CURRENT_USER_PATH: &str = "/openshell.v1.OpenShell/GetCurrentUser";
-    const REQUEST_ID: &str = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
 
-    /// Run `handler` as a routed request to `path`, returning its result and
-    /// the OCSF events it emitted.
-    async fn audited<F: Future>(path: &str, handler: F) -> (F::Output, Vec<serde_json::Value>) {
-        let capture = openshell_ocsf::test_support::OcsfCapture::default();
-        let output = {
-            let _guard = capture.install();
-            let mut headers = http::HeaderMap::new();
-            headers.insert("x-request-id", REQUEST_ID.parse().unwrap());
-            let origin = RequestOrigin::new(
-                Some(ConnectionSource::Peer("203.0.113.7:51234".parse().unwrap())),
-                &headers,
-            );
-            audit::with_request(path.to_string(), origin, handler).await
-        };
-        let events = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
-        (output, events)
-    }
-
-    fn assert_denial(event: &serde_json::Value, path: &str, reason: &str) {
-        assert_eq!(event["class_uid"], 6003, "{event}");
-        assert_eq!(event["status_detail"], reason);
-        assert_eq!(event["http_request"]["url"]["path"], path);
-        assert_eq!(event["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID);
+    /// Assert that `event` denies the request from the shared test origin.
+    fn assert_routed_denial(event: &serde_json::Value, path: &str, reason: &str) {
+        test_support::assert_denial(event, path, reason);
+        assert_origin(event);
     }
 
     fn compute_driver_principal(runtime_identity: &str) -> Principal {
@@ -895,9 +872,8 @@ mod tests {
             events[0]["http_request"]["url"]["path"],
             REFRESH_SANDBOX_TOKEN_PATH
         );
-        assert_eq!(events[0]["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
-        assert!(!events[0].to_string().contains(&first));
+        assert_origin(&events[0]);
+        assert_redacted(&events[0], &first);
     }
 
     #[tokio::test]
@@ -946,8 +922,8 @@ mod tests {
             REFRESH_SANDBOX_TOKEN_PATH
         );
         assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
-        assert!(!events[0].to_string().contains(&current));
-        assert_denial(
+        assert_redacted(&events[0], &current);
+        assert_routed_denial(
             &events[1],
             REFRESH_SANDBOX_TOKEN_PATH,
             "extension_service_not_selected",
@@ -1237,8 +1213,7 @@ mod tests {
             events[0]["http_request"]["url"]["path"],
             ISSUE_SANDBOX_TOKEN_PATH
         );
-        assert_eq!(events[0]["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
+        assert_origin(&events[0]);
     }
 
     #[tokio::test]
@@ -1255,9 +1230,8 @@ mod tests {
         let err = result.expect_err("a gateway JWT must refresh instead");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_denial(&events[0], ISSUE_SANDBOX_TOKEN_PATH, "method_not_permitted");
-        assert_eq!(events[1]["class_uid"], 2004);
-        assert_eq!(events[1]["metadata"]["correlation_uid"], REQUEST_ID);
+        assert_routed_denial(&events[0], ISSUE_SANDBOX_TOKEN_PATH, "method_not_permitted");
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -1269,8 +1243,8 @@ mod tests {
         let err = result.expect_err("sandboxes have no user identity");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_denial(&events[0], GET_CURRENT_USER_PATH, "method_not_permitted");
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_routed_denial(&events[0], GET_CURRENT_USER_PATH, "method_not_permitted");
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -1378,27 +1352,18 @@ mod tests {
             events[0]["http_request"]["url"]["path"],
             ISSUE_SANDBOX_TOKEN_PATH
         );
-        assert_eq!(events[0]["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
-        assert!(!events[0].to_string().contains("canary-driver-credential"));
+        assert_origin(&events[0]);
+        assert_redacted(&events[0], "canary-driver-credential");
     }
 
     #[tokio::test]
     async fn refresh_rejects_user_principal() {
-        use crate::auth::identity::{Identity, IdentityProvider};
         let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {
             extension_service_names: Vec::new(),
         });
-        req.extensions_mut().insert(Principal::User(UserPrincipal {
-            identity: Identity {
-                subject: "alice".to_string(),
-                display_name: None,
-                roles: vec![],
-                scopes: vec![],
-                provider: IdentityProvider::Oidc,
-            },
-        }));
+        req.extensions_mut()
+            .insert(crate::auth::principal::test_support::user("alice"));
         let (result, events) = audited(
             REFRESH_SANDBOX_TOKEN_PATH,
             Box::pin(handle_refresh_sandbox_token(&state, req)),
@@ -1407,7 +1372,7 @@ mod tests {
         let err = result.expect_err("user must not refresh");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert_eq!(events.len(), 1, "users raise no finding: {events:?}");
-        assert_denial(
+        assert_routed_denial(
             &events[0],
             REFRESH_SANDBOX_TOKEN_PATH,
             "method_not_permitted",
@@ -1434,12 +1399,12 @@ mod tests {
         let err = result.expect_err("K8s SA principal must not refresh");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_denial(
+        assert_routed_denial(
             &events[0],
             REFRESH_SANDBOX_TOKEN_PATH,
             "method_not_permitted",
         );
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]

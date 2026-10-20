@@ -4087,6 +4087,10 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::audit::test_support::{
+        assert_authentication_failure, assert_boundary_finding, assert_logon, assert_origin,
+        assert_redacted, audited,
+    };
     use crate::compute::NoopTestDriver;
 
     #[test]
@@ -4516,7 +4520,6 @@ mod tests {
     }
 
     const FORWARD_TCP_PATH: &str = "/openshell.v1.OpenShell/ForwardTcp";
-    const FORWARD_REQUEST_ID: &str = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
 
     fn forward_caller() -> crate::auth::principal::Principal {
         authed_request(())
@@ -4535,30 +4538,11 @@ mod tests {
         Result<ForwardConnectionGuard, Status>,
         Vec<serde_json::Value>,
     ) {
-        let capture = openshell_ocsf::test_support::OcsfCapture::default();
-        let result = {
-            let _guard = capture.install();
-            let mut headers = http::HeaderMap::new();
-            headers.insert("x-request-id", FORWARD_REQUEST_ID.parse().unwrap());
-            let origin = crate::auth::audit::RequestOrigin::new(
-                Some(crate::auth::audit::ConnectionSource::Peer(
-                    "203.0.113.7:51234".parse().unwrap(),
-                )),
-                &headers,
-            );
-            crate::auth::audit::with_request(
-                FORWARD_TCP_PATH.to_string(),
-                origin,
-                acquire_forward_connection_guard(state, &forward_caller(), init, sandbox),
-            )
-            .await
-        };
-        let events = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
-        (result, events)
+        audited(
+            FORWARD_TCP_PATH,
+            acquire_forward_connection_guard(state, &forward_caller(), init, sandbox),
+        )
+        .await
     }
 
     async fn store_ssh_session(
@@ -4595,15 +4579,13 @@ mod tests {
     fn assert_ssh_token_failure(events: &[serde_json::Value], reason: &str, token: &str) {
         assert_eq!(events.len(), 1, "{events:?}");
         let event = &events[0];
-        assert_eq!(event["class_uid"], 3002);
-        assert_eq!(event["status_id"], 2);
-        assert_eq!(event["status_detail"], reason);
+        assert_authentication_failure(event, FORWARD_TCP_PATH, reason);
         assert_eq!(event["auth_protocol"], "ssh_session_token");
         assert_eq!(event["user"]["uid"], "dev-user");
-        assert_eq!(event["http_request"]["url"]["path"], FORWARD_TCP_PATH);
-        assert_eq!(event["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(event["metadata"]["correlation_uid"], FORWARD_REQUEST_ID);
-        assert!(token.is_empty() || !event.to_string().contains(token));
+        assert_origin(event);
+        if !token.is_empty() {
+            assert_redacted(event, token);
+        }
     }
 
     #[tokio::test]
@@ -4728,9 +4710,9 @@ mod tests {
         result.expect("older clients still send a session token");
 
         assert_eq!(events.len(), 1, "{events:?}");
-        assert_eq!(events[0]["status_id"], 1);
+        assert_logon(&events[0], FORWARD_TCP_PATH);
         assert_eq!(events[0]["auth_protocol"], "ssh_session_token");
-        assert!(!events[0].to_string().contains("canary-ssh-token"));
+        assert_redacted(&events[0], "canary-ssh-token");
     }
 
     #[tokio::test]
@@ -4751,15 +4733,11 @@ mod tests {
         assert!(repeated.is_empty(), "{repeated:?}");
         assert_eq!(events.len(), 1, "{events:?}");
         let event = &events[0];
-        assert_eq!(event["class_uid"], 3002);
-        assert_eq!(event["status_id"], 1);
-        assert_eq!(event["severity_id"], 1);
+        assert_logon(event, FORWARD_TCP_PATH);
         assert_eq!(event["auth_protocol"], "ssh_session_token");
         assert_eq!(event["user"]["uid"], "dev-user");
-        assert_eq!(event["http_request"]["url"]["path"], FORWARD_TCP_PATH);
-        assert_eq!(event["src_endpoint"]["ip"], "203.0.113.7");
-        assert_eq!(event["metadata"]["correlation_uid"], FORWARD_REQUEST_ID);
-        assert!(!event.to_string().contains("canary-ssh-token"));
+        assert_origin(event);
+        assert_redacted(event, "canary-ssh-token");
     }
 
     #[tokio::test]
@@ -9973,8 +9951,6 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_naming_another_sandbox_is_recorded_as_cross_sandbox() {
-        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
-
         let state = test_server_state().await;
         for name in ["own", "victim"] {
             state
@@ -9983,13 +9959,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let principal = Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: "sandbox-own".to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test".to_string(),
-            },
-            trust_domain: Some("openshell".to_string()),
-        });
+        let principal = crate::auth::principal::test_support::sandbox("sandbox-own");
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _guard = capture.install();
 
@@ -10015,32 +9985,20 @@ mod tests {
         .expect_err("another sandbox must be refused");
 
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["status_detail"], "cross_sandbox");
         assert_eq!(
             events[0]["resources"],
             serde_json::json!([{"name": "victim", "type": "sandbox"}])
         );
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
     async fn sandbox_whose_own_record_is_gone_is_denied_without_a_finding() {
-        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
-
         let state = test_server_state().await;
-        let principal = Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: "sandbox-own".to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test".to_string(),
-            },
-            trust_domain: Some("openshell".to_string()),
-        });
+        let principal = crate::auth::principal::test_support::sandbox("sandbox-own");
         let capture = openshell_ocsf::test_support::OcsfCapture::default();
         let _guard = capture.install();
 

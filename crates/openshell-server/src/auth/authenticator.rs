@@ -269,20 +269,8 @@ pub mod test_support {
 mod tests {
     use super::test_support::MockAuthenticator;
     use super::*;
-    use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::UserPrincipal;
 
-    fn user_principal(subject: &str) -> Principal {
-        Principal::User(UserPrincipal {
-            identity: Identity {
-                subject: subject.to_string(),
-                display_name: None,
-                roles: vec![],
-                scopes: vec![],
-                provider: IdentityProvider::Oidc,
-            },
-        })
-    }
+    use crate::auth::principal::test_support::user;
 
     #[test]
     fn bearer_credential_matches_scheme_case_insensitively() {
@@ -303,10 +291,10 @@ mod tests {
     #[tokio::test]
     async fn chain_returns_first_match() {
         let first = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("alice"),
+            user("alice"),
         ))));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first.clone(), second.clone()]);
         let result = chain
@@ -333,7 +321,7 @@ mod tests {
             Authentication::NotApplicable,
         )));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first.clone(), second.clone()]);
         let result = chain
@@ -358,7 +346,7 @@ mod tests {
             Status::unauthenticated("bad token"),
         ))));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first.clone(), second.clone()]);
         let err = chain
@@ -416,7 +404,7 @@ mod tests {
             peer_decline(),
         ))));
         let second = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-            user_principal("bob"),
+            user("bob"),
         ))));
         let chain = AuthenticatorChain::new(vec![first, second]);
 

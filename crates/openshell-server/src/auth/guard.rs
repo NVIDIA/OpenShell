@@ -130,30 +130,8 @@ pub fn require_operator<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
 
-    fn user(subject: &str) -> Principal {
-        Principal::User(UserPrincipal {
-            identity: Identity {
-                subject: subject.to_string(),
-                display_name: None,
-                roles: vec![],
-                scopes: vec![],
-                provider: IdentityProvider::Oidc,
-            },
-        })
-    }
-
-    fn sandbox(id: &str) -> Principal {
-        Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test".to_string(),
-            },
-            trust_domain: Some("openshell".to_string()),
-        })
-    }
+    use crate::auth::principal::test_support::{sandbox, user};
 
     #[test]
     fn user_principal_bypasses_equality_check() {

@@ -22,6 +22,9 @@ use tonic::Status;
 use super::identity::IdentityProvider;
 use super::principal::{Principal, SandboxIdentitySource};
 
+#[cfg(test)]
+pub mod test_support;
+
 /// Where a gateway connection came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionSource {
