@@ -580,8 +580,10 @@ done
 
 PROMPT_TEMPLATE_PATH="$(resolve_manifest_path "$PROMPT_TEMPLATE")"
 [[ -f "$PROMPT_TEMPLATE_PATH" ]] || fail "missing prompt template: $PROMPT_TEMPLATE_PATH"
-ruby -ryaml -rshellwords - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$MANIFEST_FILE" "$PAYLOAD_IMAGE_DIR" "$HARNESS" "$RUN_MODE" "$POLL_INTERVAL_SECONDS" "$USER_PROMPT" <<'RUBY'
-template_path, output_path, manifest_path, payload_image_dir, harness, run_mode, poll_interval_seconds, user_prompt = ARGV
+# Compile tooling references only. Task, harness, and supervision settings are
+# launch inputs, never image contents (including Docker build context/layers).
+ruby -ryaml -rshellwords - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$MANIFEST_FILE" "$PAYLOAD_IMAGE_DIR" <<'RUBY'
+template_path, output_path, manifest_path, payload_image_dir = ARGV
 manifest = YAML.load_file(manifest_path) || {}
 subagents = manifest.fetch("subagents", [])
 
@@ -590,12 +592,9 @@ subagent_command = lambda do |id|
 end
 
 values = {
-  "HARNESS" => harness,
-  "RUN_MODE" => run_mode,
-  "POLL_INTERVAL_SECONDS" => poll_interval_seconds,
   "PAYLOAD_VERSION" => manifest.fetch("payload_version", 1).to_s,
-  "USER_PROMPT" => user_prompt,
 }
+runtime_variables = %w[HARNESS RUN_MODE POLL_INTERVAL_SECONDS USER_PROMPT]
 
 subagents.each do |subagent|
   next unless subagent.key?("expose_as")
@@ -604,14 +603,15 @@ subagents.each do |subagent|
   unless expose_as.match?(/\A[A-Z][A-Z0-9_]*\z/)
     abort "invalid subagent expose_as '#{expose_as}': expected [A-Z][A-Z0-9_]*"
   end
-  abort "prompt variable '#{expose_as}' is already defined" if values.key?(expose_as)
+  abort "prompt variable '#{expose_as}' is already defined" if values.key?(expose_as) || runtime_variables.include?(expose_as)
 
   values[expose_as] = subagent_command.call(subagent.fetch("id"))
 end
 
 template = File.read(template_path)
 rendered = template.gsub(/\{\{([A-Z0-9_]+)\}\}/) do
-  values.fetch(Regexp.last_match(1))
+  key = Regexp.last_match(1)
+  runtime_variables.include?(key) ? Regexp.last_match(0) : values.fetch(key)
 end
 File.write(output_path, rendered)
 RUBY
@@ -801,6 +801,7 @@ HARNESS_ENV_ARGS=(
     "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
     "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"
     "OPENSHELL_AGENT_PAYLOAD_VERSION=$AGENT_PAYLOAD_VERSION"
+    "OPENSHELL_AGENT_TASK=$USER_PROMPT"
 )
 
 case "$HARNESS" in

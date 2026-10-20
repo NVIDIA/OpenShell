@@ -82,6 +82,8 @@ If this fails, run the local Codex login flow outside the gator launch. If Codex
 
 The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID` for Codex's local workspace routing. The harness must not use the opaque `CODEX_AUTH_ACCOUNT_ID` credential placeholder for that comparison. Access tokens remain placeholders, and refresh material remains gateway-only.
 
+The image contains task-independent tooling and a prompt template, not the run's PR assignment or test authorization. The launcher supplies those instructions at runtime through `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor captures the assembled prompt in memory and supplies it on stdin for every cycle. Task text is non-secret and may appear in runtime command metadata; never put credentials in the task. Task-only changes reuse the same tooling build inputs, although the launcher still builds/tags an image per invocation.
+
 ### Step 5: Verify Gateway Is Registered And Alive
 
 Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.

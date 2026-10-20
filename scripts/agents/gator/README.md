@@ -20,7 +20,11 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox image source. It builds `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes rendered prompts, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
+By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox image source. It builds `scripts/agents/gator/` as the image context, so gator-specific image files such as `policy.yaml` and `bin/gh` stay with the gator agent. The launcher bakes a task-independent prompt template, skills, subagents, and shared runtime files into `/etc/openshell/agent-payload`, then passes the resulting image reference to `openshell sandbox create`.
+
+The PR assignment, operator test authorization, harness selection, watch mode, and polling interval are runtime inputs, not rendered image contents. The launcher supplies the non-secret assignment as `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor assembles the prompt once in memory and sends it to each harness cycle on stdin; cycles do not read task instructions from an agent-writable file. Assignment text is literal data, so shell syntax and template tokens inside it are not evaluated. Do not put credentials in assignments; use providers. Runtime command metadata can contain the assignment. This separates reusable tooling from per-run instructions; it does not make prompt instructions a security boundary.
+
+The launcher still builds and tags an image for each invocation, but task-only or supervision-setting changes reuse identical tooling build inputs. Publishing and selecting reusable images is a separate launcher capability.
 
 The launcher queries the selected gateway and builds with its Docker or Podman
 compute driver. If `CONTAINER_ENGINE` is set, it must match that driver. Other
@@ -75,4 +79,6 @@ bash scripts/agents/gator/bin/gh_guard_test.sh
 bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
 bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
 bash scripts/agents/runtime/harnesses/codex/exec_test.sh
+bash scripts/agents/run_test.sh
+bash scripts/agents/runtime/supervisor_test.sh
 ```
