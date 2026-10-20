@@ -21,7 +21,13 @@ the sandbox record and driver-supported persistent storage.
 | [Podman](#podman-driver) | `podman` | Rootless Linux workstations without a Docker daemon. |
 | [MicroVM](#microvm-driver) | `vm` | Workloads need a VM boundary instead of a container boundary. |
 | [Kubernetes](#kubernetes-driver) | `kubernetes` | Shared clusters, remote compute, and GPU scheduling. |
-| Windows MXC | `mxc` | Coming soon. |
+| [Windows MXC](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md) | `mxc` | Native Windows development on x64 or ARM64; implementation and releases stay on `windows`. Not production-qualified. |
+
+For MXC, follow the
+[`windows` branch configuration and limitations](https://github.com/NVIDIA/OpenShell/blob/windows/docs/how-it-works/gateways/configuration.mdx#mxc).
+Windows uses a host supervisor and a dedicated ProcessContainer boundary,
+requires proxy-aware workloads, and does not support foreground main-process
+attachment. The Linux runtime configuration below does not set up native Windows.
 
 ## Select a Compute Driver
 

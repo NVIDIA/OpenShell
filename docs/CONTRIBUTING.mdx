@@ -8,6 +8,13 @@ This guide covers how to write, edit, and review documentation for NVIDIA OpenSh
 
 The published docs live in `docs/`, navigation is defined in `docs/index.yml`, and `fern/` contains the site config, components, and theme assets.
 
+Native Windows implementation and releases remain on the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Shared documentation can also publish from `main`. Link Windows-only source,
+tasks, and runtime instructions explicitly to `blob/windows/` or `tree/windows/`
+so those links remain valid from either branch. Do not describe `main` release
+artifacts or `install.sh` as the native Windows distribution path.
+
 ## Use the Agent Skills
 
 If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo includes skills that automate doc work. Use them before writing from scratch.

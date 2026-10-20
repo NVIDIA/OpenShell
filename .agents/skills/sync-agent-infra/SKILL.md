@@ -28,6 +28,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | TUI behavior | `tui-development` |
 | Release artifacts or smoke coverage | `test-release-canary` |
 | CI diagnostics | `watch-github-actions` |
+| Native Windows builds, runtime, or release branch guidance | `build-openshell-mxc-windows`; keep Windows implementation links on `windows` even in docs merged to `main` |
 | Gator supervision | `launch-openshell-gator` |
 | SBOM workflow | `sbom` |
 | RFC workflow | `create-rfc` |

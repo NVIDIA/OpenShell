@@ -20,6 +20,17 @@ To report a potential security vulnerability in any NVIDIA product:
 
 While NVIDIA currently does not have a bug bounty program, we do offer acknowledgement when an externally reported security issue is addressed under our coordinated vulnerability disclosure policy. Please visit our [Product Security Incident Response Team (PSIRT)](https://www.nvidia.com/en-us/security/psirt-policies/) policies page for more information.
 
+## Native Windows reports
+
+Native Windows OpenShell is maintained on the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Use the same private disclosure process above for Windows findings. Include
+the Windows branch commit, OS architecture and build, MXC version and probe
+results, and relevant redacted configuration. See
+[Native Windows support](WINDOWS.md#runtime-and-current-limits) for known
+enforcement limitations; documentation appearing on `main` does not qualify
+the Windows runtime for production.
+
 ## NVIDIA Product Security
 
 For all security-related concerns, please visit NVIDIA's Product Security portal at https://www.nvidia.com/en-us/security

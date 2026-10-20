@@ -8,6 +8,15 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Architecture, Gateway, Sandb
 position: 2
 ---
 
+Native Windows has a separate implementation on the
+[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+It pairs a host supervisor with an MXC ProcessContainer boundary. See the
+[Windows architecture and limitations](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md#runtime-and-current-limits)
+before applying the guarantees below to that implementation. Exclusive
+supervisor-mediated egress and live access revocation are not yet verified
+for MXC. These Windows links remain on `windows` when this page is published
+from `main`.
+
 ![OpenShell system architecture showing a trusted supervisor separated from a network-isolated sandbox workload. The workload can connect only to the supervisor.](../images/openshell-system-architecture.svg)
 
 OpenShell governs what agents can do in two ways: it instruments the kernel to enforce policy on every file access, system call, and network connection at runtime, and it uses formal verification to check what a policy change would allow before it is applied.

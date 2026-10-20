@@ -10,6 +10,13 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 
 ## Skills
 
+Native Windows implementation and releases belong to the
+[`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+See [WINDOWS.md](WINDOWS.md) before Windows work. Base native Windows code
+changes on that branch. Shared documentation may merge into `main`; keep links
+to Windows-only implementation, tasks, and runtime guidance explicitly pinned
+to `windows`, and do not imply that documentation on `main` ships Windows support.
+
 OpenShell has two skill collections:
 
 - `skills/` contains public, installable skills for using and operating OpenShell. These skills must work outside a source checkout and use installed CLI help plus published documentation as their sources of truth.
@@ -25,7 +32,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
-| `crates/openshell-mxc-boundary/` | Windows sandbox boundary | Windows boundary library and dedicated openshell-windows-sandbox binary for MXC process operations, containment confirmation, and shared-protocol forwarding |
+| [`crates/openshell-mxc-boundary/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-mxc-boundary) (`windows` branch) | Windows sandbox boundary | Windows boundary library and dedicated openshell-windows-sandbox binary for MXC process operations, containment confirmation, and shared-protocol forwarding |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
 | `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
@@ -50,7 +57,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-docker/` | Docker compute driver | In-process `ComputeDriver` backend for local Docker sandbox containers |
 | `crates/openshell-driver-podman/` | Podman compute driver | In-process `ComputeDriver` backend for local Podman sandbox containers |
 | `crates/openshell-driver-vm/` | VM compute driver | Standalone libkrun-backed `ComputeDriver` subprocess (embeds its own rootfs + runtime) |
-| `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows ProcessContainer backend that pairs a host isolation-backend supervisor with `openshell-windows-sandbox` inside MXC |
+| [`crates/openshell-driver-mxc/`](https://github.com/NVIDIA/OpenShell/tree/windows/crates/openshell-driver-mxc) (`windows` branch) | Microsoft MXC compute driver | In-process Windows ProcessContainer backend that pairs a host isolation-backend supervisor with `openshell-windows-sandbox` inside MXC |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
 | `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |

@@ -10,6 +10,11 @@ This page lists the host platform, compute driver, software, runtime, and kernel
 
 ## Releases
 
+Native Windows MXC implementation and releases are maintained separately on
+the [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+The release train below describes `main`; publishing Windows documentation
+alongside it does not include native Windows in that release qualification.
+
 OpenShell publishes dev, pre-release, and stable builds for different stages of
 the release cycle. Use a stable release for production deployments.
 
@@ -54,6 +59,16 @@ OpenShell publishes multi-architecture gateway images for `linux/amd64` and `lin
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
+| Native Windows (MXC, `windows` branch) | x86_64 and ARM64 | Development; not production-qualified |
+
+Native Windows uses MXC ProcessContainer isolation rather than the Linux
+runtime under WSL 2. Build from `windows` and follow its
+[Windows guide](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md)
+for MSVC prerequisites, MXC host probing, artifacts, and current limitations.
+Exclusive supervisor-mediated egress and live access revocation remain
+unverified; the loopback exception can expose other host-local services.
+The Linux/macOS release assets listed below do not supply the native Windows
+runtime pair.
 
 On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
 

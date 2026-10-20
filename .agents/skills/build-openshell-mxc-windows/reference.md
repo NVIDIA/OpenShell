@@ -1,7 +1,10 @@
 # Reference: Windows MSVC maintenance lane
 
 Companion to [SKILL.md](SKILL.md). Use this file for quick lookup while
-maintaining the native Windows MSVC and MXC runtime lane.
+maintaining the native Windows MSVC and MXC runtime lane on the
+[`windows` development and release branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+Run the commands below from that branch or a branch based on it, including
+when reading this reference on `main`.
 
 ## Lane Files
 

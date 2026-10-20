@@ -8,9 +8,16 @@ metadata:
 # Build OpenShell-MXC for Windows
 
 This skill maintains the existing native Windows MSVC build lane in the
-OpenShell repository. The Windows lane is already present in `main`; do not
-treat this skill as a first-time porting recipe unless the user explicitly asks
-for a new fork or a from-scratch bring-up.
+OpenShell repository's [`windows` branch](https://github.com/NVIDIA/OpenShell/tree/windows).
+That branch owns native Windows implementation and releases. Shared docs may
+also appear on `main`; always direct Windows work to `windows` and use explicit
+Windows branch links for implementation details. See
+[Native Windows support](https://github.com/NVIDIA/OpenShell/blob/windows/WINDOWS.md).
+
+Before running the tasks below, use a `windows`-based checkout and read the
+[skill from that branch](https://github.com/NVIDIA/OpenShell/blob/windows/.agents/skills/build-openshell-mxc-windows/SKILL.md).
+The task and runtime descriptions refer to that checkout, not to any older
+Windows source snapshot retained on `main`.
 
 The lane validates that OpenShell can compile and test on Windows MSVC for the
 supported deliverables:
@@ -107,7 +114,7 @@ did not request.
 
 In scope:
 
-- Refreshing a local checkout to the latest upstream GitHub `main`.
+- Refreshing a Windows checkout to the latest upstream GitHub `windows`.
 - Maintaining `tasks/windows.toml` and `tasks/scripts/windows-msvc.ps1`.
 - Running x64 and ARM64 MSVC checks.
 - Building x64 and ARM64 release binaries for `openshell-gateway`, `openshell`,
@@ -153,10 +160,10 @@ From a fork checkout where `upstream` points to the official
 `NVIDIA/OpenShell` GitHub repository, use:
 
 ```powershell
-git fetch upstream main
-git switch main
-git merge --ff-only upstream/main
-git branch --set-upstream-to=upstream/main main
+git fetch upstream windows
+git switch windows
+git merge --ff-only upstream/windows
+git branch --set-upstream-to=upstream/windows windows
 git status --short --branch
 ```
 

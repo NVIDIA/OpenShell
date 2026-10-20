@@ -25,6 +25,12 @@ mise run lint
 mise run ci
 ```
 
+For native Windows changes, use a `windows`-based checkout and the
+[Windows validation commands](https://github.com/NVIDIA/OpenShell/blob/windows/TESTING.md#native-windows-validation)
+with the MSVC toolchain. Windows-specific documentation must link to the
+[`windows` implementation and release branch](https://github.com/NVIDIA/OpenShell/tree/windows),
+including when the document is published on `main`. See [WINDOWS.md](WINDOWS.md).
+
 ## CLI Output Style
 
 When printing structured CLI output:
