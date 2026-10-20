@@ -99,6 +99,8 @@ pub enum AuthMechanism {
     SandboxJwt,
     ComputeDriver,
     GatewayPeer,
+    /// The `CreateSshSession` token an SSH relay presents.
+    SshSessionToken,
 }
 
 /// A rejected authentication attempt: the status returned to the caller and

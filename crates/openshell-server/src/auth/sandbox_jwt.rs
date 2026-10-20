@@ -42,6 +42,10 @@ use openshell_core::jwt::{
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
 
+/// The method on which a sandbox renews its gateway JWT, and the only one that
+/// accepts a just-consumed bearer.
+pub const REFRESH_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/RefreshSandboxToken";
+
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
 /// reuse the same subject namespace without breaking handler equality
@@ -318,7 +322,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
         // Refresh performs its own lineage check so the immediately consumed
         // bearer can recover an already-committed successor after a lost
         // response. Every other RPC accepts only the current bearer.
-        if path != "/openshell.v1.OpenShell/RefreshSandboxToken" {
+        if path != REFRESH_SANDBOX_TOKEN_PATH {
             crate::auth::sandbox_session::authorize_persisted(&self.store, &authenticated).await?;
         }
         Ok(Authentication::Accepted(Principal::Sandbox(

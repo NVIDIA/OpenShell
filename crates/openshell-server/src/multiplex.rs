@@ -4641,15 +4641,73 @@ mod tests {
 
         #[tokio::test]
         async fn logon_names_the_protocol_that_established_the_principal() {
-            for (principal, principal_type, protocol) in [
-                (
-                    Principal::Peer(crate::auth::principal::PeerPrincipal {
-                        replica_id: "gateway-1".to_string(),
-                        pod_uid: "pod-1".to_string(),
-                    }),
-                    "Gateway Peer",
-                    "k8s_service_account",
-                ),
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "gateway-1".to_string(),
+                    pod_uid: "pod-1".to_string(),
+                })),
+            )))]);
+            let mut router = AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/PeerRelay";
+
+            router
+                .call(bearer_request(path, "peer-token", REQUEST_ID))
+                .await
+                .unwrap();
+
+            let events = captured_json(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_logon(&events[0], path);
+            assert_eq!(events[0]["user"]["type"], "Gateway Peer");
+            assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
+        }
+
+        #[tokio::test]
+        async fn verified_credentials_log_on_before_a_sandbox_token_method_denies_them() {
+            for path in [
+                "/openshell.v1.OpenShell/IssueSandboxToken",
+                "/openshell.v1.OpenShell/RefreshSandboxToken",
+            ] {
+                for (principal, principal_type) in [
+                    (user_principal("alice"), "User"),
+                    (Principal::Operator(operator_principal()), "Admin"),
+                    (
+                        Principal::Peer(crate::auth::principal::PeerPrincipal {
+                            replica_id: "gateway-1".to_string(),
+                            pod_uid: "pod-1".to_string(),
+                        }),
+                        "Gateway Peer",
+                    ),
+                ] {
+                    let capture = OcsfCapture::default();
+                    let _guard = capture.install();
+                    let chain = AuthenticatorChain::new(vec![Arc::new(
+                        MockAuthenticator::returning(Ok(Authentication::Accepted(principal))),
+                    )]);
+                    let (recorder, seen) = PrincipalRecorder::new();
+                    let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                    let res = router
+                        .call(bearer_request(path, "verified-token", REQUEST_ID))
+                        .await
+                        .unwrap();
+
+                    assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+                    assert!(seen.lock().unwrap().is_none(), "{path}");
+                    let events = captured_json(&capture);
+                    assert_eq!(events.len(), 2, "{principal_type} {path}: {events:?}");
+                    assert_logon(&events[0], path);
+                    assert_eq!(events[0]["user"]["type"], principal_type);
+                    assert_eq!(events[1]["class_uid"], 6003);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn handlers_that_finish_verification_record_their_own_logon() {
+            for (principal, path) in [
                 (
                     Principal::Sandbox(SandboxPrincipal {
                         sandbox_id: "sandbox-a".to_string(),
@@ -4659,8 +4717,17 @@ mod tests {
                         },
                         trust_domain: None,
                     }),
-                    "Sandbox",
-                    "compute_driver",
+                    "/openshell.v1.OpenShell/IssueSandboxToken",
+                ),
+                (
+                    Principal::Sandbox(SandboxPrincipal {
+                        sandbox_id: "sandbox-a".to_string(),
+                        source: SandboxIdentitySource::BootstrapJwt {
+                            issuer: "openshell-gateway:test".to_string(),
+                        },
+                        trust_domain: None,
+                    }),
+                    "/openshell.v1.OpenShell/RefreshSandboxToken",
                 ),
             ] {
                 let capture = OcsfCapture::default();
@@ -4668,22 +4735,17 @@ mod tests {
                 let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
                     Ok(Authentication::Accepted(principal)),
                 ))]);
-                let mut router = AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None);
-                let path = "/openshell.v1.OpenShell/IssueSandboxToken";
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
 
                 router
-                    .call(bearer_request(path, "driver-or-peer-token", REQUEST_ID))
+                    .call(bearer_request(path, "sandbox-token", REQUEST_ID))
                     .await
                     .unwrap();
 
-                let events: Vec<_> = captured_json(&capture)
-                    .into_iter()
-                    .filter(|event| event["class_uid"] == 3002)
-                    .collect();
-                assert_eq!(events.len(), 1, "{protocol}: {events:?}");
-                assert_logon(&events[0], path);
-                assert_eq!(events[0]["user"]["type"], principal_type);
-                assert_eq!(events[0]["auth_protocol"], protocol);
+                assert!(seen.lock().unwrap().is_some(), "{path} reached the handler");
+                let events = captured_json(&capture);
+                assert!(events.is_empty(), "{path}: {events:?}");
             }
         }
 
