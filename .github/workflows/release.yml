@@ -167,7 +167,7 @@ jobs:
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: false
       make-latest: ${{ needs.promote.outputs.make-latest == 'true' }}
-      generate-release-notes: ${{ needs.promote.outputs.notes-reused != 'true' }}
+      release-notes-reused: ${{ needs.promote.outputs.notes-reused == 'true' }}
     secrets:
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
