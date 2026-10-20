@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from .errors import ErrorInfo, FieldViolation, GatewayError, from_grpc_error
 from .mutations import DeletionOutcome, DeletionResult
+from .providers import ProviderClient, ProviderCredentialValue
 from .sandbox import (
     ClientCredentialsAuth,
     ExecChunk,
@@ -15,12 +16,14 @@ from .sandbox import (
     Pager,
     Sandbox,
     SandboxClient,
+    SandboxConditionRef,
     SandboxError,
     SandboxRef,
     SandboxSession,
     SandboxStatusRef,
     SandboxTemplateClient,
     SandboxWorkloadTemplateProvenanceRef,
+    ServiceAuthorizationMode,
     ServiceExposure,
     TlsConfig,
     WorkspaceClient,
@@ -45,14 +48,18 @@ __all__ = [
     "GatewayError",
     "Page",
     "Pager",
+    "ProviderClient",
+    "ProviderCredentialValue",
     "Sandbox",
     "SandboxClient",
+    "SandboxConditionRef",
     "SandboxError",
     "SandboxRef",
     "SandboxSession",
     "SandboxStatusRef",
     "SandboxTemplateClient",
     "SandboxWorkloadTemplateProvenanceRef",
+    "ServiceAuthorizationMode",
     "ServiceExposure",
     "TlsConfig",
     "WorkspaceClient",

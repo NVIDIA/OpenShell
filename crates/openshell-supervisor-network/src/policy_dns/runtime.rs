@@ -3,17 +3,19 @@
 
 //! Runtime-owned policy DNS listeners for combined Linux supervisors.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use crate::opa::OpaEngine;
 use crate::policy_dns::resolver::MAX_DNS_MESSAGE_BYTES;
 use crate::policy_dns::store::{ResolvedEndpointStore, StoreConfig, SyntheticPools};
-use crate::policy_dns::{PolicyDnsService, SocketTrustedResolver, wire};
+use crate::policy_dns::{POLICY_LOCAL_ADDRESS, PolicyDnsService, SocketTrustedResolver, wire};
 use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_isolation_interface::contract::{
-    DnsTransport, NetworkMediationSource, PendingDnsQuery,
-};
+use openshell_isolation_interface::contract::{DnsTransport, PendingDnsQuery};
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_sandbox_backend::NetworkMediationSource;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,7 +30,7 @@ const MEDIATION_ACCEPT_WINDOW: usize = 32;
 const MEDIATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 const MEDIATION_MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn accept_mediated_dns(source: Arc<dyn NetworkMediationSource>) -> PendingDnsQuery {
+async fn accept_mediated_dns(source: Arc<NetworkMediationSource>) -> PendingDnsQuery {
     let mut delay = MEDIATION_RETRY_DELAY;
     loop {
         match source.accept_dns().await {
@@ -65,8 +67,14 @@ impl PolicyDnsRuntimeConfig {
         let ipv6_cidr = ipnet::Ipv6Net::new(Ipv6Addr::from(ipv6_start), IPV6_POOL_PREFIX)
             .map_err(|error| miette::miette!(error.to_string()))?;
 
+        // Keep the sandbox-local API address out of the external mapping pool.
+        let ipv4_pool_start = if ipv4_cidr.contains(&POLICY_LOCAL_ADDRESS) {
+            Ipv4Addr::from(u32::from(POLICY_LOCAL_ADDRESS) + 1)
+        } else {
+            ipv4_cidr.network()
+        };
         let pools = SyntheticPools::new(
-            ipv4_cidr.network()..=ipv4_cidr.broadcast(),
+            ipv4_pool_start..=ipv4_cidr.broadcast(),
             ipv6_cidr.network()..=ipv6_cidr.broadcast(),
         )
         .map_err(|error| miette::miette!(error.to_string()))?;
@@ -88,7 +96,7 @@ impl PolicyDnsRuntime {
     /// TCP listener is bound in the supervisor namespace.
     pub(crate) fn start_mediated(
         policy: Arc<OpaEngine>,
-        source: Arc<dyn NetworkMediationSource>,
+        source: Arc<NetworkMediationSource>,
         trusted_host_gateway: Option<IpAddr>,
         config: PolicyDnsRuntimeConfig,
         mut engine_ready: tokio::sync::watch::Receiver<bool>,
@@ -325,7 +333,7 @@ fn trusted_resolver_from_resolv_conf() -> Result<SocketAddr> {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn mediated_dns_accept_retries_errors_with_backoff() {
         use openshell_isolation_interface::contract::{
             BackendError, MediationTiming, ResolveError,
@@ -335,7 +343,7 @@ mod tests {
         struct RecoveringSource(AtomicUsize);
 
         #[async_trait::async_trait]
-        impl NetworkMediationSource for RecoveringSource {
+        impl rpc_test::NetworkMediationSource for RecoveringSource {
             async fn accept_tcp(
                 &self,
             ) -> std::result::Result<
@@ -364,13 +372,19 @@ mod tests {
 
         let source = Arc::new(RecoveringSource(AtomicUsize::new(0)));
         let start = tokio::time::Instant::now();
-        let query = accept_mediated_dns(source.clone()).await;
+        let query = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            accept_mediated_dns(rpc_test::network(source.clone())),
+        )
+        .await
+        .expect("RPC DNS source did not recover");
         assert_eq!(query.message, b"recovered query");
-        assert_eq!(source.0.load(Ordering::Acquire), 3);
+        // The RPC mediation stream may prefetch additional bounded queries.
+        assert!(source.0.load(Ordering::Acquire) >= 3);
         assert!(start.elapsed() >= MEDIATION_RETRY_DELAY * 3);
         // The same source remains usable when the accept window replenishes.
         assert_eq!(
-            accept_mediated_dns(source).await.message,
+            accept_mediated_dns(rpc_test::network(source)).await.message,
             b"recovered query"
         );
     }

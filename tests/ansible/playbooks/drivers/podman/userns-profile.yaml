@@ -12,26 +12,28 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
-    - name: Require the rootless Podman gateway user
-      become: true
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - show
-          - openshell-gateway.service
-          - --property
-          - User
-          - --value
-      changed_when: false
-      register: openshell_gateway_service_user
+    - name: Detect tmachine container runtime
+      ansible.builtin.include_role:
+        name: tmachine_container_runtime
 
-    - name: Assert the rootless Podman gateway user
+    - name: Require a Podman gateway
       ansible.builtin.assert:
         that:
-          - openshell_gateway_service_user.stdout == "tmachine"
+          - tmachine_container_runtime_name == "podman"
         fail_msg: >-
-          The Podman {{ podman_userns_profile }} suite requires a rootless Podman gateway
-          running as tmachine, not {{ openshell_gateway_service_user.stdout | default("unknown") }}
+          The Podman {{ podman_userns_profile }} suite requires a Podman gateway, not
+          {{ tmachine_container_runtime_name }}
+
+    # podman_reference_user only selects who runs the direct `podman`
+    # reference command below; it must match the daemon's rootful/rootless
+    # mode. The captured reference file itself stays owned by tmachine
+    # (the inventory's ansible_user), since the archived test binary that
+    # later reads it always runs unprivileged as tmachine, in both modes.
+    - name: Resolve the Podman reference execution context
+      ansible.builtin.set_fact:
+        podman_reference_user: "{{ 'tmachine' if tmachine_container_runtime_is_rootless else 'root' }}"
+        podman_reference_home: "{{ '/home/tmachine' if tmachine_container_runtime_is_rootless else '/root' }}"
+        podman_reference_uid: "{{ tmachine_container_runtime_tmachine_uid.stdout if tmachine_container_runtime_is_rootless else '0' }}"
 
     - name: Apply the Podman user-namespace fixture
       become: true
@@ -52,23 +54,14 @@
         port: 17670
         timeout: 60
 
-    - name: Resolve tmachine UID
-      ansible.builtin.command:
-        argv:
-          - id
-          - -u
-          - tmachine
-      changed_when: false
-      register: tmachine_uid
-
     - name: Capture direct Podman user-namespace mapping
       become: true
-      become_user: tmachine
+      become_user: "{{ podman_reference_user }}"
       ansible.builtin.command:
         argv: "{{ [\"podman\", \"run\", \"--rm\", \"--pull\", \"never\"] + podman_userns_reference_args + [\"--entrypoint\", \"/bin/cat\", podman_reference_image, \"/proc/self/uid_map\"] }}"
       environment:
-        HOME: /home/tmachine
-        XDG_RUNTIME_DIR: "/run/user/{{ tmachine_uid.stdout }}"
+        HOME: "{{ podman_reference_home }}"
+        XDG_RUNTIME_DIR: "/run/user/{{ podman_reference_uid }}"
       changed_when: false
       register: podman_userns_uid_map
 
@@ -77,7 +70,7 @@
         that:
           - podman_userns_uid_map.stdout | trim | length > 0
         fail_msg: >-
-          Direct rootless Podman {{ podman_userns_profile }} reference container
+          Direct Podman {{ podman_userns_profile }} reference container
           returned no UID mapping
 
     - name: Create Podman test-input directory

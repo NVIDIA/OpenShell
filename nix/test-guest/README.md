@@ -78,10 +78,10 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
-The `snapd` configuration is available for Ubuntu and prepares snapd for
-local Snap lifecycle experiments. It does not install Docker, because the Snap
-gateway reproduction uses the Docker **Snap** and its `docker:docker-daemon`
-interface rather than the host-package Docker configuration.
+The `snapd` configuration is available for Ubuntu and prepares snapd for snap
+Store installation experiments. Combine it with `docker` to reproduce the
+system-Docker canary, or use it alone to verify that `install.sh` fails safely
+when Docker is absent.
 
 `podman-rootless` configures the explicit rootless Podman guest setup used by
 OpenShell tests. It supports Fedora and Ubuntu 26.04 or later. Ubuntu adds the
@@ -175,19 +175,18 @@ prepared guest image to a particular build or driver configuration.
 Compose it with `gateway-podman` after either Podman configuration. The role
 uses the recorded mode to select the corresponding service account. It
 generates configuration only for development artifacts; RPM installations
-retain their packaged service and first-start configuration. For example, run
-conformance after the rootless provisioners complete:
+retain their packaged service and first-start configuration. For example,
+check the development gateway after the rootless provisioners complete:
 
 ```shell
 nix run .#test-guest -- \
   --distro fedora --with podman-rootless --with selinux \
   --copy ./openshell:/usr/local/bin/openshell \
-  --copy ./openshell-conformance:/usr/local/bin/openshell-conformance \
   --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
   --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
   --provision openshell-development \
   --provision gateway-podman \
-  -- /usr/local/bin/openshell-conformance run smoke
+  -- /usr/local/bin/openshell status
 ```
 
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
@@ -295,29 +294,6 @@ nix run .#test-guest -- \
   --copy ./openshell:/usr/local/bin/openshell:755 \
   -- openshell --version
 ```
-
-## Reproduce Snap gateway startup
-
-The gateway Snap must be native to the guest architecture. Copy an existing
-Snap artifact and the reproduction script into a prepared Ubuntu guest, then
-run the script as root. It follows the Release Canary ordering exactly: install
-the Snap, connect Docker/log/system interfaces, and immediately query the
-gateway. On each failure it prints snapd and gateway journals.
-
-```shell
-nix run .#test-guest -- \
-  --distro ubuntu-24-04 \
-  --with snapd \
-  --keep \
-  --copy ./openshell_*.snap:/tmp/openshell.snap \
-  --copy ./nix/test-guest/scripts/snap-gateway-repro.sh:/usr/local/bin/snap-gateway-repro \
-  -- sudo /usr/local/bin/snap-gateway-repro /tmp/openshell.snap 10 30
-```
-
-`--keep` retains the overlay and serial log when diagnosing a failure. The
-runner prints their location after shutdown. The final `30` accepts automatic
-recovery for up to 30 seconds; omit it to require the canary's immediate check.
-
 
 The destination must be an absolute guest path. Use bare octal permission bits
 from `000` through `777` for explicit modes.

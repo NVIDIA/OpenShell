@@ -223,6 +223,7 @@ artifacts/
 mise.local.toml
 
 # Ignore plans for now
+/plans
 architecture/plans
 
 rfc.md
@@ -245,3 +246,6 @@ scripts/lint-mermaid/node_modules/
 # Nix
 /result
 /result-*
+
+# Local triage-duty reports, checkpoint, actions, and inbox
+/.agents/triage-duty/

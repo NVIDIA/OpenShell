@@ -317,8 +317,8 @@ impl tracing::field::Visit for LogVisitor {
 mod tests {
     use super::*;
     use openshell_ocsf::{
-        ActionId, ActivityId, DispositionId, Endpoint, EventContext, NetworkActivityBuilder,
-        SeverityId, StatusId, ocsf_emit,
+        ActionId, ActivityId, DispositionId, Endpoint, EventContext, EventOrigin,
+        NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
     };
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -326,6 +326,7 @@ mod tests {
         EventContext {
             sandbox_id: "sb-test".to_string(),
             sandbox_name: "test-sandbox".to_string(),
+            origin: EventOrigin::Supervisor,
             container_image: "openshell/sandbox:test".to_string(),
             hostname: "test-host".to_string(),
             product_version: "0.0.0".to_string(),

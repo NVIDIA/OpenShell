@@ -6,7 +6,40 @@
 //! Transforms serialized OCSF JSON events to conform to older schema versions
 //! by stripping fields and profiles that don't exist in the target version.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// An older OCSF schema version that events can be downgraded to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OcsfSchemaVersion {
+    #[serde(rename = "1.1")]
+    V1_1,
+    #[serde(rename = "1.3")]
+    V1_3,
+}
+
+impl OcsfSchemaVersion {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::V1_1 => "1.1",
+            Self::V1_3 => "1.3",
+        }
+    }
+}
+
+impl std::str::FromStr for OcsfSchemaVersion {
+    type Err = String;
+
+    fn from_str(version: &str) -> Result<Self, Self::Err> {
+        match version {
+            "1.1" => Ok(Self::V1_1),
+            "1.3" => Ok(Self::V1_3),
+            other => Err(format!(
+                "unsupported OCSF schema version {other:?}; expected 1.1 or 1.3"
+            )),
+        }
+    }
+}
 
 /// Fields to strip when downgrading to v1.3.0 or earlier.
 const STRIP_FOR_V1_3: &[&str] = &["ai_model", "container", "observation_point_id"];
@@ -95,6 +128,15 @@ fn parse_version(v: &str) -> (u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schema_versions_parse_from_their_names() {
+        for version in [OcsfSchemaVersion::V1_1, OcsfSchemaVersion::V1_3] {
+            assert_eq!(version.as_str().parse(), Ok(version));
+        }
+        assert!("1.6".parse::<OcsfSchemaVersion>().is_err());
+        assert!("".parse::<OcsfSchemaVersion>().is_err());
+    }
 
     fn test_event() -> Value {
         serde_json::json!({

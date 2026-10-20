@@ -161,12 +161,12 @@ impl ContainerHttpServer {
         let engine = ContainerEngine::from_env()?;
         let host_port = find_free_port();
         let network = e2e_network_name();
-        // A host-networked Docker supervisor cannot use a Docker network's DNS
-        // aliases, but it can route directly to containers on the bridge. Use
-        // the fixture's bridge address instead of overloading the reserved
-        // host alias, which may point at the CI job container. Podman keeps the
-        // shared-network alias path.
-        let use_host_port = network.is_none();
+        // Host-networked supervisors cannot use a container network's DNS
+        // aliases. Docker can route directly to a fixture's bridge address,
+        // while rootless Podman's host network cannot reliably reach its
+        // rootless bridge. Publish Podman fixtures on the host and use the
+        // driver-neutral host alias instead.
+        let use_host_port = network.is_none() || is_e2e_driver("podman");
         let mut host = if use_host_port {
             "host.openshell.internal".to_string()
         } else {
@@ -243,7 +243,7 @@ impl ContainerHttpServer {
     async fn wait_until_ready(&self) -> Result<(), String> {
         let container_id = self.container_id.clone();
         let engine = self.engine.clone();
-        timeout(Duration::from_secs(60), async move {
+        timeout(Duration::from_mins(1), async move {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
@@ -288,11 +288,12 @@ pub struct SupportContainer {
     engine: ContainerEngine,
 }
 
-/// A TCP fixture published on the test host for Kubernetes sandbox e2e tests.
+/// A TCP fixture reachable from host-networked sandbox infrastructure.
 ///
-/// Kubernetes sandboxes reach it through the chart-provided
-/// `host.openshell.internal` alias. Unlike [`SupportContainer`], this does not
-/// require the Docker e2e network used by local-container driver tests.
+/// Kubernetes sandboxes reach published fixtures through the chart-provided
+/// `host.openshell.internal` alias. Local Podman supervisors can instead run
+/// fixtures in the host network. Unlike [`SupportContainer`], neither mode
+/// requires the Docker e2e network used by local-container driver tests.
 pub struct HostSupportContainer {
     pub port: u16,
     container_id: String,
@@ -344,6 +345,45 @@ impl HostSupportContainer {
             engine,
         };
         fixture.wait_until_listening(container_port).await?;
+        Ok(fixture)
+    }
+
+    /// Start a Python fixture in the host network on a caller-selected port.
+    ///
+    /// Local Podman supervisors also use host networking. Matching that mode
+    /// avoids a nested rootless port-forward when one host fixture (such as a
+    /// forward proxy) must dial another by its validated host-gateway address.
+    pub async fn start_python_on_host_network(script: &str, port: u16) -> Result<Self, String> {
+        let engine = ContainerEngine::from_env()?;
+        let output = engine
+            .command()
+            .args([
+                "run",
+                "--detach",
+                "--network",
+                "host",
+                "--entrypoint",
+                "python3",
+                E2E_WORKLOAD_IMAGE,
+                "-c",
+                script,
+            ])
+            .output()
+            .map_err(|err| format!("start {} host-network fixture: {err}", engine.name()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "{} run failed (exit {:?}):\n{}",
+                engine.name(),
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let fixture = Self {
+            port,
+            container_id: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            engine,
+        };
+        fixture.wait_until_listening(port).await?;
         Ok(fixture)
     }
 
@@ -406,7 +446,7 @@ impl HostSupportContainer {
     }
 
     async fn wait_until_listening(&self, container_port: u16) -> Result<(), String> {
-        let deadline = timeout(Duration::from_secs(60), async {
+        let deadline = timeout(Duration::from_mins(1), async {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;
@@ -527,7 +567,7 @@ impl SupportContainer {
         let probe = format!(
             "import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1).close()"
         );
-        let deadline = timeout(Duration::from_secs(60), async {
+        let deadline = timeout(Duration::from_mins(1), async {
             let mut tick = interval(Duration::from_millis(500));
             loop {
                 tick.tick().await;

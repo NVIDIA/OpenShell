@@ -122,7 +122,7 @@ fn https_client_mtls(
             .expect("failed to parse client key pem")
             .expect("no private key found")
     };
-    let tls_config = rustls::ClientConfig::builder()
+    let tls_config = openshell_crypto::tls::client_builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(client_certs, client_key)
         .expect("failed to build client TLS config with client cert");
@@ -142,7 +142,7 @@ fn https_client_no_cert(
     Empty<Bytes>,
 > {
     let roots = build_tls_root(ca_pem);
-    let tls_config = rustls::ClientConfig::builder()
+    let tls_config = openshell_crypto::tls::client_builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
     let https = HttpsConnectorBuilder::new()

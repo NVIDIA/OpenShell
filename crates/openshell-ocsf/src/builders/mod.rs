@@ -99,7 +99,7 @@ macro_rules! impl_actor_process_setter {
             /// Set the acting process.
             #[must_use]
             pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
-                self.actor = Some($crate::objects::Actor { process });
+                self.actor = Some($crate::objects::Actor::process(process));
                 self
             }
         }
@@ -135,6 +135,7 @@ macro_rules! impl_src_endpoint_addr_setter {
 }
 
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
 mod finding;
@@ -145,6 +146,7 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
 pub use finding::DetectionFindingBuilder;
@@ -160,6 +162,18 @@ use crate::OCSF_VERSION;
 use crate::enums::StatusId;
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
+
+/// Which `OpenShell` component produced an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventOrigin {
+    /// The supervisor process enforcing sandbox policy.
+    Supervisor,
+    /// The gateway process, which has no sandbox or container of its own.
+    Gateway {
+        /// Operator-assigned gateway name (`[openshell.gateway] name`).
+        name: String,
+    },
+}
 
 /// Immutable context created once at sandbox startup.
 ///
@@ -181,18 +195,25 @@ pub struct EventContext {
     pub proxy_ip: IpAddr,
     /// Proxy listen port.
     pub proxy_port: u16,
+    /// Which component is emitting.
+    pub origin: EventOrigin,
 }
 
 impl EventContext {
     /// Build the OCSF `Metadata` object for any event.
     #[must_use]
     pub fn metadata(&self, profiles: &[&str]) -> Metadata {
+        let product = match self.origin {
+            EventOrigin::Supervisor => Product::openshell_sandbox(&self.product_version),
+            EventOrigin::Gateway { .. } => Product::openshell_gateway(&self.product_version),
+        };
         Metadata {
             version: OCSF_VERSION.to_string(),
-            product: Product::openshell_sandbox(&self.product_version),
+            product,
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -215,7 +236,10 @@ impl EventContext {
     /// on (Linux for the in-sandbox supervisor, Windows for the MXC gateway).
     #[must_use]
     pub fn device(&self) -> Device {
-        Device::for_current_os(&self.hostname)
+        match &self.origin {
+            EventOrigin::Supervisor => Device::for_current_os(&self.hostname),
+            EventOrigin::Gateway { name } => Device::gateway(&self.hostname, name),
+        }
     }
 
     /// Build the `proxy_endpoint` object for the Network Proxy profile.
@@ -255,6 +279,23 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         product_version: "0.1.0".to_string(),
         proxy_ip: "10.42.0.1".parse().unwrap(),
         proxy_port: 3128,
+        origin: EventOrigin::Supervisor,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_gateway_context() -> EventContext {
+    EventContext {
+        sandbox_id: String::new(),
+        sandbox_name: String::new(),
+        container_image: String::new(),
+        hostname: "openshell-gateway-0".to_string(),
+        product_version: "0.1.0".to_string(),
+        proxy_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+        origin: EventOrigin::Gateway {
+            name: "openshell".to_string(),
+        },
     }
 }
 

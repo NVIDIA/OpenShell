@@ -9,7 +9,7 @@
 //! the common control and boundary behavior.
 
 use openshell_isolation_interface::contract::{
-    BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
+    BackendError, ProvisioningEvidence, ResolvedWorkloadIdentity,
 };
 use openshell_sandbox_backend::GPU_RESOURCE_CLAIM;
 use openshell_sandbox_backend::boundary_protocol::{
@@ -26,29 +26,17 @@ struct VmOuterFenceEvidence<'a> {
 }
 
 impl VmOuterFenceEvidence<'_> {
-    fn project(&self) -> Result<OuterFenceGuarantees, BackendError> {
-        if self.generation.is_empty() {
+    fn project(&self) -> Result<ProvisioningEvidence, BackendError> {
+        if self.generation.is_empty() || self.network_device_count != 0 {
             return Err(BackendError::Descriptor(
-                "VM outer fence evidence is incomplete".to_string(),
+                "VM provisioning evidence is incomplete".to_string(),
             ));
         }
-        let established = (self.network_device_count == 0).then_some([
-            // A guest with no NIC has no kernel network path. Closing the
-            // supervisor-owned channel revokes access, and controller loss
-            // cannot introduce a device.
-            OuterFenceGuarantee::DefaultDenyEgress,
-            OuterFenceGuarantee::NoUnmanagedEgressPath,
-            OuterFenceGuarantee::RevocationVerified,
-            OuterFenceGuarantee::ControllerLossFailsClosed,
-        ]);
         let encoded = serde_json::to_vec(self).map_err(|error| {
             BackendError::Descriptor(format!("encode VM outer fence evidence: {error}"))
         })?;
-        let projection = OuterFenceGuarantees::from_enforcement_evidence(
-            self.generation,
-            established.into_iter().flatten(),
-            &encoded,
-        )?;
+        let projection =
+            ProvisioningEvidence::from_enforcement_evidence(self.generation, &encoded)?;
         projection.validate(self.generation)?;
         Ok(projection)
     }
@@ -98,7 +86,7 @@ impl VmBoundarySpec {
         if self.gpu_requested {
             resource_claims.insert(GPU_RESOURCE_CLAIM.to_string(), "true".to_string());
         }
-        let outer_fence = VmOuterFenceEvidence {
+        let provisioning_evidence = VmOuterFenceEvidence {
             generation: &self.generation,
             network_device_count: 0,
         }
@@ -119,7 +107,7 @@ impl VmBoundarySpec {
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),
                 workload_identity: workload_identity.clone(),
-                outer_fence: outer_fence.clone(),
+                provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
@@ -134,7 +122,7 @@ impl VmBoundarySpec {
                 // after crossing the authenticated boundary channel.
                 host_gateway_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
                 resource_claims,
-                outer_fence,
+                provisioning_evidence,
             },
         })
     }
@@ -232,13 +220,13 @@ mod tests {
             Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
         );
         assert_eq!(
-            provisioned.boundary_config.outer_fence,
-            provisioned.runtime_descriptor.outer_fence
+            provisioned.boundary_config.provisioning_evidence,
+            provisioned.runtime_descriptor.provisioning_evidence
         );
         assert!(
             provisioned
                 .runtime_descriptor
-                .outer_fence
+                .provisioning_evidence
                 .validate("generation-1")
                 .is_ok()
         );

@@ -9,6 +9,18 @@
     - name: Wait for SSH
       ansible.builtin.wait_for_connection:
 
+    # Rootful Podman's --userns auto allocates IDs from the "containers"
+    # subordinate ranges, which the Fedora cloud image does not define.
+    - name: Configure rootful Podman subordinate IDs
+      become: true
+      ansible.builtin.lineinfile:
+        path: "{{ item }}"
+        regexp: '^containers:'
+        line: 'containers:1000000:65536'
+      loop:
+        - /etc/subuid
+        - /etc/subgid
+
     - name: Enable rootful Podman socket
       become: true
       ansible.builtin.systemd_service:

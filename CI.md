@@ -8,15 +8,153 @@ For local test commands see [TESTING.md](TESTING.md). For PR conventions see [CO
 
 PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot mirrors trusted PR commits to internal `pull-request/<N>` branches in this repository. The gated workflows trigger on pushes to those branches, not on the original PR.
 
+When a PR is not mirrored automatically, anyone with Write, Maintain, or Admin
+access to this repository can admit its current revision with
+`/ok to test <SHA>`. This includes external maintainers with repository access.
+Manual admission does not change the bot's automatic trust policy for ready PRs.
+
 `Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
 
 Merge queue validation is a second integration gate for `main`. After a PR has passed the required PR-head statuses, a maintainer adds it to the merge queue. GitHub creates a temporary merge-group branch that combines the latest `main`, the queued PR, and any earlier queued PRs. The same required `OpenShell / ...` status contexts are then published against the merge-group SHA before GitHub merges it.
+
+### Protobuf API compatibility
+
+`Protobuf Compatibility` runs in Branch Checks and Pre-release through the shared
+`check-protobuf-compatibility` action and Nix app. The app supplies Python, Buf,
+and Git from the flake lockfile.
+It uses Buf's `FILE` policy for the `proto/`
+module, covering SDK descriptors and extension contracts. Storage-only protobufs
+remain subject to their separate durability checks.
+
+Branch Checks compares the prospective merge tree with the PR target commit,
+so additions on the target do not look like deletions in an outdated PR. Merge
+queues use their base commit. Both paths resolve the train from tags reachable
+from that target, preventing a PR from selecting its own train. The checkout
+must contain full history and tags; the checker leaves HEAD and working files
+unchanged.
+
+The current train's version is compared with the latest stable release. During
+`0.x`, a minor increment permits breaking changes: for example, `0.2.0-pre.N`
+after stable `0.1.2`. A patch increment such as `0.1.3-pre.N` rejects them.
+Commit messages do not affect this decision. No active train also rejects
+breaking changes. Allowed findings remain visible as warnings; schema errors,
+missing baselines, merge conflicts, and tool failures always fail the check.
+
+Release qualification compares the tagged candidate cumulatively against the previous
+stable release, using the same minor-versus-patch policy. Its result is part
+of the qualification profile: failure blocks stable publication and fails the
+Pre-release workflow without blocking pre-release publication. Qualification evidence
+remains in Actions. This checks
+protobuf compatibility; SDK/configuration compatibility and migration review
+remain separate qualification work.
+
+Fetch the target and tags to check committed branch changes locally, replacing
+`origin/main` for another target:
+
+```shell
+git fetch origin main --tags
+nix run .#check-protobuf-compatibility -- origin/main
+```
+
+The same command accepts a release tag to qualify it against the previous stable
+release. Branch names and commit SHAs select the branch comparison instead:
+
+```shell
+nix run .#check-protobuf-compatibility -- refs/tags/v0.2.0-pre.1
+```
+
+For an intentional minor-train incompatibility, record the Buf finding,
+linked issue, consumer impact, and migration plan in the PR. Keep the finding
+visible; do not disable the job or add a broad Buf ignore rule.
 
 Windows PR checks are opt-in: add `test:windows`, then select **Re-run all jobs**
 on the current Windows MSVC run. Subsequent mirrored commits run them automatically.
 Windows checks are not required for merging and do not run in merge queues.
 Main and manual runs also build release binaries, with `continue-on-error: true`
 so Windows failures do not fail the workflow.
+
+### Advisory compatibility review
+
+`Codex Compatibility Review` runs in Branch Checks and alongside tagged release
+qualification. Branch checks compare the prospective merge tree with its target,
+using workflow-revision review tooling and the target's tag-derived train policy.
+Release qualification reviews the cumulative diff from the previous reachable
+stable release to the exact candidate commit, using the same tag-derived
+patch/minor policy as the protobuf check. It reviews public Rust, Python, Go,
+and TypeScript SDKs, API behavior, CLI contracts, configuration, policy, Helm,
+and persisted state.
+Both Codex workflows share the `codex-release-review` concurrency group with
+`queue: max`, so only one review runs at a time and up to 100 pending reviews
+are retained across branch, release, and manual runs. The release compatibility
+review is scheduled independently of Security Scan; other security scanners run
+in parallel.
+It does not replace Buf or change the release train's version.
+
+The agent inspects code first, then uses `gh` with a read-only GitHub token to
+look up the introducing PR and its discussion for each finding. Release reviews
+resolve introducing PRs from commit associations. Findings show `ACKED`
+only for explicit acceptance of the specific risk by the PR author or a verified
+maintainer. Missing context produces `UNKNOWN` when acceptance cannot be
+established; acknowledgement does not override release policy. Reports lead with
+the concrete change, consumer impact, action, and PR, with coverage details
+collapsed.
+
+Mirrored PR branch runs with findings post a fresh PR comment on every run,
+including reruns. Runs without findings post no comment. The publisher checks
+that the PR is still open at the reviewed head before commenting. Merge-group
+and manual branch runs retain reports without posting PR comments. The reviewer
+has read access; a separate branch job has permission to publish comments.
+
+The reviewer uses the Python Codex SDK (`openai-codex==0.160.0`) and its bundled
+runtime through the same NVIDIA endpoint, model, medium reasoning effort, and
+`CODEX_SECURITY_API_KEY` as Codex Security. The workflow uses `uv run` from the
+existing Nix devShell; the SDK is not an OpenShell package dependency.
+It runs on a GitHub-hosted runner with a read-only sandbox and reads a bare Git
+repository; candidate-side agent configuration and instructions are not loaded.
+Its permission profile keeps files read-only and routes shell network access
+through the Codex network proxy, allowing only `api.github.com` for GitHub
+lookups. Upstream proxy chaining and SOCKS access are disabled.
+Only the GitHub token and tool/certificate paths are passed to
+agent shell commands; the inference credential is excluded.
+It does not run candidate builds or tests. The review has a 30-minute execution
+limit inside a 40-minute job timeout.
+
+This rollout is report-only: findings and review failures remain advisory.
+The qualification caller waits for the review to finish, but its result does not
+affect the required profile. Its summary distinguishes complete, incomplete, and failed execution
+from the agent's compatibility assessment. Missing credentials, invalid
+baselines, source mismatches, malformed reports, and timeouts are not clean
+reviews. A completed review still does not prove that no breaks exist.
+
+Each run retains `report.json` and `report.md` for 90 days in
+`compatibility-review-run-<run-id>-attempt-<attempt>`. The report records both
+revisions, the train, tool/model metadata, coverage gaps, and actionable
+findings. Raw agent transcripts and PR discussions are not published.
+The qualification summary links this separate advisory evidence without waiting
+for it; compatibility
+review remains missing from the blocking RFC profile during this rollout.
+
+After the workflow is available on the default branch, run a review without
+building or publishing a release:
+
+```shell
+gh workflow run codex-compatibility.yml -f candidate_ref=v0.1.3-pre.1
+```
+
+Use an existing release tag appropriate to the train being reviewed. Inspect
+the report before deciding whether to fix a finding, document an intentional
+minor-release break, or investigate an uncertain result. Enabling a blocking
+agent gate is separate work after calibration.
+
+`Branch E2E Checks` builds binaries and images only when an E2E suite is
+selected. DEB and RPM packages build only when integration qualification is selected. Core integration qualification builds and installs
+the DEB on Ubuntu with Docker and installs the CLI and gateway RPMs on Fedora with
+rootful and rootless Podman. These lanes run conformance using the matching runtime
+images. Release Dev, Release, and Pre-release use the same package installers.
+Fedora provider-refresh tests also use RPMs. The Podman driver-specific suites
+retain the binary installer because their fixtures configure its system service,
+local HTTP gateway, and CLI path. The manual Integration Tests workflow defaults
+to the package installers and downloads the packages selected by its matrix.
 
 Three opt-in labels enable the long-running E2E suites:
 
@@ -33,6 +171,39 @@ The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by
 `Required CI Gates` plus the direct `OpenShell / Trivy Changes` result, not the
 push-triggered workflow jobs themselves.
+
+### K3s conformance version baseline
+
+The tmachine `ubuntu-k3s` conformance lanes pin Agent Sandbox v0.5.0 as the
+compatibility baseline for the v1beta1 Sandbox API. They do not track the local
+K3s development default, currently v1.0.3. OpenShell also supports v0.4.6 through
+its v1alpha1 fallback, so v0.5.0 is not the overall minimum supported version.
+
+The `ubuntu-k3s` lanes register the gateway's ClusterIP Service directly, so
+recreating the Service requires reprovisioning the fixture. The `k3s` lane runs
+one plaintext gateway. The `k3s-ha` lane runs the supported HA configuration:
+three gateway replicas sharing PostgreSQL, serving TLS, with the CLI connecting
+over mTLS. Before conformance, every installer waits up to five minutes for a
+connected gateway; interactive shells skip the wait. K3s failures upload
+diagnostics as `tmachine-diagnostics-*` artifacts.
+
+### Run only the policy advisor conformance tests
+
+Manually dispatch `Integration Tests` on the candidate branch with an
+`artifact-run-id` from a build of the same commit. When a `Release` or `Pre-release` run was
+dispatched from a different commit, also set `source-sha` to the release tag's
+resolved commit so runtime images and test inputs match the candidate binaries.
+Otherwise, `source-sha` defaults to the artifact run's head SHA. Set `category`
+to `policy-advisor` and `test-matrix` to:
+
+```json
+[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
+```
+
+This runs the `mechanistic-proposal`, `new-hostname-proposal`, and
+`policy-local` conformance tests in the installed-artifact suite. The artifact run must contain the candidate CLI and
+gateway binaries and runtime images. This manual run does not replace the
+required PR E2E gate.
 
 ## Informational security reports
 
@@ -60,9 +231,10 @@ scanners upload results directly:
   E2E test code are excluded. It runs nightly on `main`, remains manually
   dispatchable for diagnostics, uploads results to Code Scanning, and retains
   workflow artifacts.
-- `Codex Security Release Qualification` analyzes each `vX.Y.Z-pre.N`
-  candidate against the previous stable release. Every candidate in a release
-  train therefore rescans the cumulative stable-to-candidate diff. It calls
+- `Codex Security Release Qualification` can manually analyze a `vX.Y.Z-pre.N`
+  candidate against the previous stable release. It is temporarily excluded
+  from tagged-release qualification. Each scan reviews the cumulative
+  stable-to-candidate diff. It calls
   `https://inference-api.nvidia.com/v1` with
   `openai/openai/gpt-5.6-sol` at medium reasoning effort. The
   `CODEX_SECURITY_API_KEY` secret must contain an API key authorized for that
@@ -91,26 +263,40 @@ nix develop --command zizmor --offline --persona=regular --min-severity=high --n
 
 `Security Scan` (`.github/workflows/security-scan.yml`) calls CodeQL, Trivy,
 Cargo Deny, and Workflow Security Reports (Actionlint/Zizmor) in parallel for a
-release tag. It additionally calls Codex Security for `vX.Y.Z-pre.N` tags, which
-Codex compares with the previous stable release. Run the parent manually from
+release tag. Codex Security is temporarily excluded; its standalone workflow
+remains available for manual investigation. Run the parent manually from
 Actions or call it from another workflow. All applicable children analyze the
 candidate snapshot. Cargo Deny uses its existing NVIDIA self-hosted runner and
 CI container.
 
-Tagged releases treat CodeQL, Trivy, Zizmor, Cargo Deny, and Codex Security
-findings as failures of the currently implemented qualification profile. A
-profile failure does not prevent a pre-release candidate's complete artifact
-set from being published, but it does prevent stable publication.
+Tagged releases treat Cargo Deny findings as failures of the
+currently implemented qualification profile. A profile failure prevents stable
+publication. Pre-release publication runs alongside qualification; failed qualification fails the parent
+workflow and sends the failure notification while published artifacts remain
+available. CodeQL, Trivy, and Zizmor findings are
+temporarily informational for tagged releases: the existing findings were
+reviewed and accepted for v0.1.0 and will be addressed in 0.1.x releases.
+Scanner failures still fail qualification.
+
+Failed pre-release builds, publication, or qualification send notifications via Slack using a webhook and
+at-mentioning the triage engineer, with links to each failed job and to the run. The webhook is
+stored in the repository secret `SLACK_OPENSHELL_TRIAGE_WEBHOOK_URL` and the
+mention is stored in the repository secret `SLACK_OPENSHELL_TRIAGE_MENTION`.
+Successful pre-release builds post a top-level message to the same webhook
+without a mention, so a recovery after failures is visible in the channel.
+Notifications are non-blocking and do not affect release results; an unset
+webhook skips sending; an unset mention sends without a mention.
 
 ```shell
 gh workflow run security-scan.yml --ref main \
   -f candidate_ref=v0.1.1-pre.1 \
-  -F fail-on-codex-findings=false \
   -F fail-on-static-findings=false
 ```
 
-To integrate it into a larger workflow, run it after the job that pushes the
-candidate tag and publishes the artifacts. This example assumes an existing
+To integrate it into a larger workflow, run it after the job that creates the
+candidate tag and stages source-addressed artifacts for scanning. Stable
+publication follows successful qualification; pre-release publication runs alongside it.
+This example assumes an existing
 `build` job with outputs named `candidate_tag`, `gateway_image`, `sandbox_image`,
 and `chart_ref`; adapt those names to your workflow:
 
@@ -126,57 +312,107 @@ jobs:
       security-events: write
     with:
       candidate_ref: ${{ needs.build.outputs.candidate_tag }}
-      stable_ref: v0.1.0 # Optional; otherwise resolved automatically.
       images: |
         ${{ needs.build.outputs.gateway_image }}
         ${{ needs.build.outputs.sandbox_image }}
       charts: ${{ needs.build.outputs.chart_ref }}
-      fail-on-codex-findings: true
       fail-on-static-findings: true
     secrets:
-      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
       CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
 ```
 
 Set `needs: security` on a downstream promotion job to require successful scans.
-The tagged release workflow records security and integration outcomes in a
-qualification job after publishing its commit-addressed OCI images. A failed
-check remains visible in the workflow, but pre-release artifact assembly and
-publication continue. Stable publication currently requires the implemented
-`release-tag-v1` profile to pass; that profile is an incremental subset of RFC
-0014 qualification.
+`Release` and `Pre-release` share `release-build.yml` and `release-publish.yml`.
+Pre-release builds, then publishes and calls `release-qualification.yml` in
+parallel within the same run, using native job dependencies.
+Its platform package artifacts are uploaded after versioned images and the chart,
+so the installer can use them while qualification runs or after it fails.
+The implemented `release-tag-v1` profile is an incremental subset of RFC 0014
+qualification. Failed checks fail the parent workflow and retain evidence in Actions.
 
 Each qualification attempt writes its result to the Actions run summary and
-uploads `qualification-summary.json` as a 90-day workflow artifact. After the
-candidate release is published, the workflow publishes the same summary to
+uploads `qualification-summary.json` as a 90-day workflow artifact. The qualification
+workflow attempts to publish passing and failing summaries to
 `ghcr.io/nvidia/openshell/qualification:<version>-run-<run-id>-attempt-<run-attempt>`.
 The summary contains qualification results and policy coverage only; artifact
 identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
-`CODEX_SECURITY_API_KEY` is required; `CACHIX_AUTH_TOKEN` is optional. The parent
-publishes SARIF, including Codex results for manual parent runs. Codex keeps its
-release-train category on `main`; CodeQL, Trivy, and workflow reports publish
-against the candidate tag and commit. Existing standalone triggers stay active.
+`release-notes.yml` uses Claude Code Action through NVIDIA Inference Hub to
+summarize PRs since the previous stable tag. Stable releases require successful
+generation and publish the notes; prereleases retain a `release-notes` artifact,
+with advisory failures. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
+the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` Actions variables.
 
-The parent fails on Codex findings when `fail-on-codex-findings` is `true` and
-on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
-`fail-on-static-findings` is `true`. Both inputs default to `true`. Set either
-input to `false` to make only that finding class informational. Scanner setup,
+To preview notes without building or publishing:
+
+```shell
+gh workflow run release.yml --ref main \
+  -f tag=v0.1.4 -f notes-only=true
+```
+
+Dispatch Release from the intended release branch with a stable version:
+
+```shell
+gh workflow run release.yml --ref main -f tag=v0.4.3
+```
+
+For a support release, replace `main` with its support branch. Release chooses
+the highest-numbered `v0.4.3-pre.N` reachable from the selected branch with a
+successful Pre-release run triggered by the tag or dispatched on that branch.
+The entire Pre-release run must succeed, including publication. If qualification
+passes but publication fails, rerun the failed jobs before promoting the candidate.
+It verifies the qualification summary's
+tag, commit, profile, run, attempt, and passing result before creating `v0.4.3`
+at the same commit. Missing or expired evidence blocks promotion. The promotion
+summary and `stable-promotion-*` artifact retain the selected candidate and evidence link.
+Successful reruns can retain passing evidence from an earlier attempt of the
+same run; the promotion record links to the attempt that produced that evidence.
+Release rebuilds all stable artifacts with the stable version and publishes
+without rerunning qualification. These artifacts have different embedded versions
+from the qualified prerelease. Existing stable tags are never moved; a retry must
+resolve to the same qualified candidate.
+
+Stable image builds save multi-platform OCI archives as workflow artifacts without
+pushing to GHCR. Publication copies those archives, including their attestations,
+to the stable version tags and verifies their SBOMs before updating `latest`.
+The qualified prerelease's commit-SHA image tags remain unchanged.
+
+Release is manually dispatched; pushing a stable tag does not trigger publication.
+Stable runs serialize across branches. A version older than the highest stable
+Git tag publishes versioned artifacts while preserving shared latest channels:
+GHCR `latest`, GitHub's latest release, npm `latest`, and snap `latest/stable`.
+Each publisher rechecks the current remote stable tags immediately before
+updating its shared channel, including when a past publishing job is rerun.
+This protection applies to runs created with these workflow definitions.
+Its npm package uses a `release-X.Y` dist-tag, and its snap files remain in the
+GitHub Release rather than updating a Snap Store support track.
+Docs publish an immutable version and already prevent latest from moving
+backward. Release Auto-Tag continues on `main`; support branch prereleases can
+use tag pushes or manual Pre-release dispatch from that branch.
+
+`CACHIX_AUTH_TOKEN` is optional. The parent publishes SARIF from CodeQL, Trivy,
+and workflow reports against the candidate tag and commit. Existing standalone
+triggers stay active.
+
+The parent fails on HIGH/CRITICAL findings from CodeQL, Trivy, and Zizmor when
+`fail-on-static-findings` is `true`, which is the default. Set it to `false`
+to make those findings informational. Scanner setup,
 execution, and report publication errors still fail. Reports are published
 before the finding threshold is enforced.
 
-Codex uses each finding's severity; CodeQL uses the rule's security score
+CodeQL uses the rule's security score
 (at least 7.0); Trivy uses `HIGH,CRITICAL`, including vulnerabilities without an
 upstream fix; Zizmor uses its High severity. Actionlint remains informational.
 Existing scanner exceptions still apply.
 
 Cargo Deny runs only `cargo deny check advisories` in the parent. It keeps its
-native failure behavior and configured exceptions regardless of either finding
+native failure behavior and configured exceptions regardless of the finding
 threshold input; it has no HIGH/CRITICAL filter. Its standalone runs still check
 all dependency policies.
 
-Codex scans the cumulative diff from `stable_ref` to `candidate_ref`. Both inputs
+The standalone Codex workflow scans the cumulative diff from `stable_ref` to
+`candidate_ref`. Both inputs
 are tag names, not arbitrary commit SHAs. Omit `stable_ref` to resolve the previous
 stable automatically; set `allow_full_bootstrap: true` to permit a full scan when
 no previous stable exists.
@@ -313,29 +549,27 @@ Flow:
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
 7. When the PR is ready to merge, use **Add to merge queue** instead of merging directly. The queue validates the final integration state before updating `main`.
 
-### Forked PR
+### PR requiring manual admission
 
 Prerequisites:
 
-- DCO sign-off (`git commit -s`) on every commit. Commit signing is not required for forks - copy-pr-bot trusts forks based on maintainer review, not signing.
-- A maintainer must vouch you. See the [Vouch System](AGENTS.md#vouch-system).
+- DCO sign-off (`git commit -s`) on every commit. Manual admission does not require cryptographic commit signing.
+- First-time external contributors must be vouched. See the [First-Time Contributors](CONTRIBUTING.md#first-time-contributors).
 
 Flow:
 
-1. Open the PR. The vouch check confirms you are vouched (otherwise the PR is auto-closed).
-2. copy-pr-bot does not mirror forks automatically. A maintainer reviews the diff and comments `/ok to test <SHA>` with your latest commit SHA.
-3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to internal PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
+1. Open the PR. The vouch check confirms first-time external contributors are vouched (otherwise their PRs are auto-closed).
+2. If copy-pr-bot does not mirror it automatically, a maintainer with Write access or greater reviews the diff and comments `/ok to test <SHA>` with the latest commit SHA. Fork location alone does not determine whether a PR is mirrored automatically.
+3. After `/ok to test`, copy-pr-bot mirrors to `pull-request/<N>`. From here the flow is identical to automatically admitted PRs: `Required CI Gates` verifies the mirror and required push workflows, and maintainers apply the E2E label when the extra suites are needed.
 4. When the PR is ready to merge, maintainers add it to the merge queue so the queued integration state is tested before it reaches `main`.
 
-Important: every new commit you push requires another `/ok to test <new-SHA>` from a maintainer before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
+Important: if a PR requires manual admission, every new commit needs another `/ok to test <new-SHA>` from a maintainer with Write access or greater before push-based CI will run on it. If a label is applied while the mirror is stale, `E2E Label Help` will post a comment explaining what's needed.
 
 ## Merge queue
 
 GitHub merge queue is required for `main`. Repository administrators must enable **Require merge queue** in the branch ruleset for `main` and keep these required status contexts aligned with the PR gates:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
 
@@ -346,7 +580,7 @@ its own stable result status.
 Merge-group runs use the `merge_group` event. The event is distinct from `pull_request` and `push`, and GitHub will not report required checks for queued PRs unless the workflows include it. In this repository:
 
 - `Branch Checks` runs the standard non-E2E gates on the merge-group SHA.
-- `Branch E2E Checks` runs core E2E and GPU E2E for merge groups. Kubernetes HA E2E remains optional and label-driven on PRs.
+- `Branch E2E Checks` does not run for merge groups. E2E suites remain opt-in on PRs. `Required CI Gates` publishes successful not-applicable statuses for both E2E contexts on merge-group events and subsequent merge-group workflow completions.
 - `Helm Lint` runs for merge groups without the PR diff optimization, because the merge-group branch is the final integration state.
 - `Trivy Changes` compares the merge-group configuration with its base and rejects new High or Critical findings.
 - `Required CI Gates` posts the same `OpenShell / ...` statuses to the merge-group SHA and does not require a `pull-request/<N>` mirror for merge-group events.
@@ -372,7 +606,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E checks. Triggers on `push: pull-request/[0-9]+` for PR mirrors and `merge_group` for queued merges. |
-| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups run core and GPU E2E. |
+| `.github/workflows/branch-e2e.yml` | Standard, GPU, Kubernetes HA, and Kubernetes credential-driver E2E. PR mirror pushes use `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels; merge groups do not run E2E. |
 | `.github/workflows/build-binaries.yml`, `build-vm-driver.yml` | Shared binary matrices used by branch and release workflows. The VM driver remains separate because its build consumes the runtime binaries. |
 | `.github/workflows/build-images.yml` | Builds and pushes multi-platform images, then uploads the same OCI images as workflow artifacts. |
 | `.github/workflows/package-release-binaries.yml` | Packages raw build artifacts into release tarballs without rebuilding them. |
@@ -388,6 +622,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/dependency-review.yml` | Reports dependency changes when GitHub Dependency Graph is available; otherwise publishes a neutral warning. |
 | `.github/workflows/codeql.yml` | Runs nightly informational CodeQL analysis on `main` for Rust and the Go, Python, and TypeScript SDKs and retains SARIF artifacts. |
 | `.github/workflows/codex-security.yml` | Scans the cumulative diff from the previous stable release to each pre-release candidate and publishes train-scoped SARIF on `main`. |
+| `.github/workflows/codex-compatibility.yml` | Reviews branch and cumulative tagged-release compatibility with Codex and retains advisory findings, PR acknowledgements, and coverage; it does not gate merging or publication. |
 | `.github/workflows/trivy-changes.yml` | Blocks pull requests and merge groups that introduce new High or Critical Helm or Dockerfile misconfigurations. |
 | `.github/workflows/trivy-scan.yml` | Manual or reusable scan of supplied OCI image/chart references and deployment configuration. Findings are informational by default and can be configured to fail the workflow. |
 
@@ -398,18 +633,28 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release-tag.yml` | Publishes tagged stable releases and manually dispatched pre-releases. Its automatic tag trigger excludes `-pre.*`. Security and integration failures do not block pre-release artifact publication. Stable publication requires the currently implemented qualification profile to pass; the summary identifies the remaining RFC 0014 coverage. |
-| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Each job reaches its gateway and creates, exercises, and deletes a sandbox. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
+| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. The notes-only mode generates a release notes preview artifact. |
+| `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually: build, then publish and qualify in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
+| `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
+| `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by stable publication and notes-only previews. |
+| `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
+| `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
+| `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published dev artifacts in the `macos`, `ubuntu-deb`, `ubuntu-snap-system-docker`, `fedora`, and `kubernetes` (kind + Helm) jobs. Each job reaches its gateway and creates, exercises, and deletes a sandbox. The `ubuntu-snap-system-docker` job verifies a compatible system Docker lifecycle, while `ubuntu-snap-docker-preflight` tests fail-fast behavior when Docker is absent or supplied by the Docker snap. The positive snap lane also runs a local policy containment check with the packaged prover. It runs automatically after `Release Dev` succeeds and supports manual dispatch (`gh workflow run release-canary.yml --ref <branch>`). See the `test-release-canary` skill for the playbook and local kind reproduction. |
 
 ## Required status contexts
 
 Require these statuses in the branch ruleset for PR and merge-queue CI:
 
 - `OpenShell / Branch Checks`
-- `OpenShell / E2E`
-- `OpenShell / GPU E2E`
 - `OpenShell / Helm Lint`
 - `OpenShell / Trivy Changes`
+
+The following statuses are opt-in and controlled by labels:
+
+- `OpenShell / E2E`: `test:e2e`
+- `OpenShell / GPU E2E`: `test:e2e-gpu`
 
 For mirror-based workflows, require the statuses published by
 `Required CI Gates`, not their underlying jobs. `OpenShell / Trivy Changes` is
@@ -419,3 +664,24 @@ merge.
 
 Do not add the informational Actionlint, Zizmor, Dependency Review, or CodeQL
 jobs to the required status list while they remain in observation mode.
+
+## Nix download recovery
+
+Jobs that enter the development shell enable `prepare-shell: "true"` on
+`setup-nix`. After configuring Cachix, the action prepares the shell with
+`nix develop -c true` and retries once on failure. Use `shell-installable`
+to select a different development shell. Rust setup assumes this preparation
+has completed. Jobs that only use Nix apps leave shell preparation disabled.
+
+Nix can report a transport error after receiving a complete cache download,
+then resume at EOF and receive HTTP 416. A fresh invocation restarts the
+operation. Both attempts appear in the job log; a second failure fails the
+step. Any preparation failure is retried once, including deterministic errors.
+Cargo, lint, and test commands are not retried.
+
+Direct `nix build` commands retry once. Before each `nix run`, CI builds the
+app's package with `nix build --no-link`, retrying preparation once, then runs
+the app once. The artifact and protobuf-check apps expose matching package
+outputs for this preparation. Runtime failures from tests, artifact generation,
+and compatibility checks are not retried. Downloads initiated inside an app
+are outside this preparation retry.

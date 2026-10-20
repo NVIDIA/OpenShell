@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Example provider profile. OpenShell does not load it; import it explicitly:
+#   openshell provider profile lint   -f providers/openrouter.yaml
+#   openshell provider profile import -f providers/openrouter.yaml --global
+#
+# Copy and edit this file rather than importing it unchanged. `binaries` is the
+# least-privilege control that decides which processes may reach the endpoints
+# below, so it has to name the paths in *your* image.
+#
+# Client binaries:   OpenCode.
+# Reference layout:  OpenCode at /usr/local/bin/opencode, as in
+#                    ghcr.io/anomalyco/opencode. Add curl or an SDK interpreter
+#                    if the workload calls the API another way.
+# Credential scope:  OPENROUTER_API_KEY, sent as a bearer token to
+#                    openrouter.ai and nowhere else.
+# Endpoint access:   openrouter.ai, read-write, L7 enforced.
+# Smoke test:        openshell sandbox create --provider <name> \
+#                      --from ghcr.io/anomalyco/opencode:latest -- \
+#                      opencode run -m openrouter/nvidia/nemotron-3.5-lightning:free 'reply with OK'
+
+id: openrouter
+display_name: OpenRouter
+description: OpenRouter inference API
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: OpenRouter API key
+    env_vars: [OPENROUTER_API_KEY]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: openrouter.ai
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/local/bin/opencode]

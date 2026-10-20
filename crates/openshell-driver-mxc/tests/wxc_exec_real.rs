@@ -760,14 +760,14 @@ async fn pc_https_egress_reads_injected_ca_bundle() {
         ..Default::default()
     };
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    openshell_crypto::tls::ensure_default_provider();
     let config = MxcComputeConfig {
         wxc_exec_path: wxc.to_string_lossy().into_owned(),
         egress_proxy: true,
         egress_proxy_addr: "127.0.0.1:18080".to_string(),
         ..Default::default()
     };
-    let backend = MxcComputeBackend::new(config);
+    let backend = MxcComputeBackend::new(openshell_core::config::DEFAULT_GATEWAY_NAME, config);
     backend
         .create_sandbox(&sandbox)
         .await

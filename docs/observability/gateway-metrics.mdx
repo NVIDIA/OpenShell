@@ -1,0 +1,357 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Metrics"
+sidebar-title: "Gateway Metrics"
+description: "Scrape Prometheus metrics from the OpenShell gateway, including supervisor session, relay capacity, peer routing, and mutation lock signals for multi-replica deployments."
+keywords: "Generative AI, Cybersecurity, Observability, Metrics, Prometheus, Gateway, Kubernetes, High Availability"
+position: 3
+---
+
+The gateway exports Prometheus metrics for API requests, database readiness,
+gateway interceptors, the OCSF log file, and multi-replica capacity. Use them
+to alert on saturation, to follow rollouts, and to choose autoscaling signals.
+
+## Enable the Metrics Endpoint
+
+The gateway serves `GET /metrics` in the Prometheus text format on its own
+listener, separate from the API and health ports. When the listener is
+disabled, the gateway records no metrics. Enable it in one of these ways:
+
+- In `gateway.toml`, set `metrics_bind_address` under `[openshell.gateway]`,
+  for example `metrics_bind_address = "0.0.0.0:9090"`. Refer to
+  [Gateway Configuration](/how-it-works/gateways/configuration).
+- On the command line, pass `--metrics-port` or set `OPENSHELL_METRICS_PORT`.
+  The standalone gateway binary defaults to `0`, which disables the endpoint.
+- In the Helm chart, set `service.metricsPort`, which defaults to `9090`. The
+  chart renders the TOML key, a container port named `metrics`, and a
+  `metrics` port on the gateway Service. Set it to `0` to disable the
+  endpoint.
+
+A stopping gateway keeps serving metrics until the process exits.
+
+<Warning>
+The metrics endpoint uses plaintext HTTP with no authentication. Anyone who
+can reach the port can read the metrics. The Helm chart publishes the port on
+the gateway Service, so a `LoadBalancer` or `NodePort` Service exposes it
+outside the cluster. Keep the Service internal, and restrict the port to your
+monitoring system.
+</Warning>
+
+The following NetworkPolicy keeps the API and health ports open and accepts
+metrics scrapes only from the `monitoring` namespace. Adjust the ports if you
+changed `service.port`, `service.healthPort`, or `service.metricsPort`.
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openshell-gateway-metrics
+  namespace: openshell
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: openshell
+      app.kubernetes.io/instance: openshell
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8080
+        - port: 8081
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+```
+
+## Scrape Each Replica
+
+Capacity metrics describe one gateway replica, so scrape every gateway pod
+rather than the Service, and keep the `namespace` and `pod` labels on each
+series. With the Prometheus Operator, a PodMonitor adds those labels
+automatically:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: openshell-gateway
+  namespace: openshell
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openshell
+      app.kubernetes.io/instance: openshell
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+```
+
+With a plain Prometheus configuration, use pod discovery and copy the labels
+yourself:
+
+```yaml
+scrape_configs:
+  - job_name: openshell-gateway
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [openshell]
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_instance]
+        regex: openshell
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: metrics
+        action: keep
+      - source_labels: [__meta_kubernetes_namespace]
+        target_label: namespace
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+```
+
+To check one pod without Prometheus, read its metrics through the Kubernetes
+API server proxy:
+
+```shell
+kubectl get --raw "/api/v1/namespaces/openshell/pods/<pod>:9090/proxy/metrics" \
+  | grep '^openshell_server_supervisor_sessions'
+```
+
+The API server connects to the pod from the control plane. A NetworkPolicy
+like the one above blocks that connection unless it also allows the control
+plane on the metrics port. `kubectl port-forward` reaches the pod through the
+kubelet instead, and NetworkPolicy does not block it. Start the port-forward:
+
+```shell
+kubectl -n openshell port-forward pod/<pod> 9090:9090
+```
+
+Then read the metrics from another terminal:
+
+```shell
+curl -s http://localhost:9090/metrics | grep '^openshell_server_supervisor_sessions'
+```
+
+## Metric Names
+
+Every metric name starts with `openshell_`, followed by the subsystem that
+records it:
+
+| Prefix | Covers |
+|---|---|
+| `openshell_server_` | API requests, readiness, supervisor sessions, relays, and requests forwarded between replicas |
+| `openshell_gateway_interceptor_` | Gateway interceptor evaluations, failures, and latency |
+| `openshell_ocsf_log_` | The gateway's OCSF JSONL file |
+| `openshell_ocsf_otlp_` | OCSF log export over OTLP |
+
+Names follow Prometheus conventions. Counters end in `_total`, and names with a
+unit end in that unit, such as `_seconds` or `_bytes`. Metrics carry no gateway
+name label, so use your scrape configuration to tell installations apart.
+
+## Histograms and Summaries
+
+The multi-replica latency metrics and the configuration build and apply
+durations are Prometheus histograms with `_bucket`, `_sum`, and `_count` series
+and buckets from 1 millisecond to 15 seconds, so `histogram_quantile` can
+aggregate them across replicas. The older
+`*_duration_seconds` metrics and the interceptor latency metric are summaries
+with `quantile` labels that each replica computes on its own. Do not average
+summary quantiles across pods.
+
+## Multi-Replica Capacity Metrics
+
+These metrics describe how much work one replica holds and how the replicas
+interact. No metric carries a sandbox, channel, endpoint, or replica
+identifier, because the scrape target already identifies the replica.
+
+Supervisor sessions:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_supervisor_sessions` | Gauge | None | Supervisor control sessions held by this replica. After a rollout settles, the sum across pods equals the number of connected sandboxes. |
+
+Relays:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_relay_pending` | Gauge | None | Relay channels on this replica waiting for the supervisor to connect back, including channels opened for peer replicas. A channel whose caller gave up stays counted until it is claimed or cleaned up, up to about 40 seconds. |
+| `openshell_server_relay_pending_capacity` | Gauge | None | Pending relay limit per replica, `256`. |
+| `openshell_server_relay_rejected_total` | Counter | `reason` | Relay opens rejected at a limit. Rejected relays fail the client request, so use this counter, not client error codes, to detect saturation. |
+| `openshell_server_relay_expired_total` | Counter | None | Pending relays dropped because the supervisor did not connect back within 10 seconds. |
+| `openshell_server_relay_claim_duration_seconds` | Histogram | None | Time from opening a relay to the supervisor claiming it. |
+
+Routed requests include local relay setup and outbound requests to the replica
+that owns a sandbox's supervisor session:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_routed_request_attempts_total` | Counter | `operation`, `route`, `relay_kind`, `outcome`, `grpc_code` | Local relay setup and outbound peer attempts, counted once when they finish or are cancelled. Each retry counts separately. |
+| `openshell_server_peer_request_duration_seconds` | Histogram | `operation`, `outcome` | Latency of outbound peer requests only (`route="peer"`). For relays, until the owner's supervisor claimed the relay. |
+
+Mutation locks:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_mutation_lock_wait_seconds` | Histogram | `scope` | Time to acquire a mutation lock, recorded for successful acquisitions. |
+| `openshell_server_mutation_lock_hold_seconds` | Histogram | `scope` | Time a mutation lock was held, recorded when it is released, including requests cancelled while they held it. A conflicting acquisition times out after 10 seconds, so the gateway also logs `mutation lock held longer than the lock wait timeout` with `scope` and `held_ms` when it releases a lock held longer than that. |
+| `openshell_server_mutation_lock_timeouts_total` | Counter | `scope` | Acquisitions that waited longer than 10 seconds, including background work such as supervisor disconnect handling and provider credential refresh. API requests fail with `UNAVAILABLE` and reason `MUTATION_LOCK_TIMEOUT`, and [API Errors](/sdk/api-errors) describes how to retry them. A lock connection that PostgreSQL does not open, although at least a second of the wait remained, counts in `openshell_server_mutation_lock_errors_total` instead. |
+| `openshell_server_mutation_lock_errors_total` | Counter | `scope` | Acquisitions that failed without timing out: PostgreSQL did not open a lock connection, or a lock statement failed. API requests fail with `INTERNAL`. |
+| `openshell_server_mutation_lock_connections_in_use` | Gauge | None | PostgreSQL lock-pool connections checked out on this replica: holding mutation locks, waiting for a PostgreSQL lock, or being returned to the pool, which can take up to 5 seconds. Exported only with PostgreSQL. |
+| `openshell_server_mutation_lock_connections_capacity` | Gauge | None | Lock-pool size per replica, `4` unless [`database_lock_max_connections`](/how-it-works/gateways/configuration#database-pool) sets it. Exported only with PostgreSQL. |
+
+The labels take these values:
+
+- `operation` is `relay`, `report_provider_readiness`, `report_endpoint_status`,
+  or `get_sandbox_provider_status`. Only relay setup includes the local route;
+  the other operations count outbound peer calls, not local API handling. On the
+  owning replica, `openshell_server_grpc_requests_total` records the matching
+  `method`, such as `PeerRelay` for `relay`.
+- `relay_kind` is `ssh` or `tcp` for relays, and `none` for other operations. An
+  omitted relay target counts as `ssh`, matching the protocol's compatibility
+  behavior. TCP hostnames and ports are not labels.
+- `route` is `local` when this replica tries its own supervisor session, or
+  `peer` when it tries another replica. A routed retry counts again, including a
+  change from local to peer routing. Waiting for an owner does not count. Incoming
+  `PeerRelay` requests do not increment this counter on the receiving replica;
+  they appear in that replica's gRPC request counter instead. This counter does
+  not measure active connections, unique client requests, or unfinished attempts.
+- `reason` is `replica_capacity` when the gateway replica's pending-relay budget
+  is full, or `sandbox_capacity` when one sandbox's budget on that replica, 32
+  pending relays, is full.
+- `outcome` is `success`, `local_error`, or `remote_error`. A relay succeeds
+  when the supervisor claims it; this does not measure the data stream.
+  `local_error` means the attempt failed on this replica, and `remote_error`
+  means the owning replica returned an error or the open connection to it
+  failed. On `route="local"` this replica is the owner, so failures that appear
+  as `remote_error` on the peer route, such as an unclaimed relay
+  (`deadline_exceeded`) or a full relay budget (`resource_exhausted`), appear as
+  `local_error`. A cancelled attempt records `local_error` with
+  `grpc_code="cancelled"`, even when the owner was already handling it.
+- `grpc_code` is the lowercase gRPC status name, such as `ok`, `unavailable`,
+  or `resource_exhausted`, from local setup, the local supervisor claim, or the
+  peer RPC. For a peer relay, the gateway then reports a failure to the client
+  as `UNAVAILABLE`. The other RPCs return the owner's status to the client
+  unchanged. The label is not named `code` because
+  `openshell_server_grpc_requests_total` uses that name for the numeric status
+  code.
+- `scope` is `global`, `workspace`, or `sandbox`.
+
+Gauges and counters exist from startup. They start at `0`, except
+`openshell_server_relay_pending_capacity` and
+`openshell_server_mutation_lock_connections_capacity`, which start at their
+limits. `openshell_server_routed_request_attempts_total` starts with seven
+`outcome="success", grpc_code="ok"` series: four relay kind and route
+combinations, and three other peer operations with `relay_kind="none"`. Other outcomes and codes,
+and every histogram, appear after their first sample, so write alert expressions
+that tolerate absent series.
+
+## Request and Readiness Metrics
+
+The gateway also records every API request and its background database check:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_server_grpc_requests_total` | Counter | `method`, `code` | gRPC requests by method name and numeric status code, including internal peer requests. Streaming RPCs record the status known when the response headers are sent. |
+| `openshell_server_grpc_request_duration_seconds` | Summary | `method`, `code` | Time until the response headers are sent. For streaming RPCs this covers setup only. |
+| `openshell_server_http_requests_total` | Counter | `path`, `status` | HTTP requests on the API port. `path` is `/_ws_tunnel`, `/auth`, or `unknown`. |
+| `openshell_server_http_request_duration_seconds` | Summary | `path`, `status` | Duration of those HTTP requests. |
+| `openshell_server_readiness_database_healthy` | Gauge | None | `1` when the last background database check succeeded, otherwise `0`. |
+| `openshell_server_readiness_database_probe_duration_seconds` | Summary | `outcome` | Duration of the background database check. `outcome` is `success`, `db_error`, or `timeout`. |
+
+## Configuration Delivery Metrics
+
+With `config_delivery_mode = "push"`, the gateway builds each supervisor's
+configuration and sends it over the supervisor session. These metrics stay
+empty in poll mode, where `GetSandboxConfig` and
+`GetSandboxProviderEnvironment` in the request metrics carry the same work.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_supervisor_config_builds_total` | Counter | `outcome` | Configuration builds for sessions on this replica. |
+| `openshell_supervisor_config_build_duration_seconds` | Histogram | `outcome` | Time to build one configuration, including store reads and credential resolution. |
+| `openshell_supervisor_config_queue_wait_seconds` | Summary | None | Time from a session needing a rebuild to its build starting. |
+| `openshell_supervisor_config_dirty_sessions` | Gauge | None | Sessions with a rebuild pending. |
+| `openshell_supervisor_config_deliveries_total` | Counter | `outcome` | What happened to each built configuration. |
+| `openshell_supervisor_config_apply_results_total` | Counter | `outcome` | Apply results that supervisors reported. |
+| `openshell_supervisor_config_apply_duration_seconds` | Histogram | `outcome` | Time from queuing an update on the supervisor session to receiving its apply result. |
+| `openshell_supervisor_policy_apply_results_total` | Counter | `source`, `outcome` | Sandbox policy load results that supervisors reported. `source` is `polling` or `stream`, and `outcome` is `loaded` or `failed`. |
+| `openshell_supervisor_config_bootstrap_total` | Counter | `outcome` | Session bootstraps: `built`, `rejected` (stored configuration invalid), `provider_environment_failed` (delivered unresolved and rebuilt), `build_failed`, or `payload_too_large`. |
+| `openshell_supervisor_config_peer_notifications_total` | Counter | `outcome` | Notifications sent to the replica that owns a sandbox's session. |
+
+The labels take these values:
+
+- Each configuration carries the sandbox configuration and the provider
+  environment it names. Credentials are resolved only when that provider
+  environment changed.
+- On builds, `outcome` is `ok`, `failed`, or `timeout`. A failed build retries
+  with a per-session backoff from 1 to 30 seconds. Each session also rebuilds
+  its configuration every 30 seconds to repair a missed change.
+- On deliveries, `outcome` is `queued`, `coalesced` (held until the
+  supervisor answers its previous update), `unchanged`, `no_active_session`,
+  `unsupported_session`, `payload_too_large`, `stream_closed` (the session's
+  stream stopped draining, so the session was closed for the supervisor to
+  reconnect), `owner_moved`, or `owner_lookup_failed`.
+- On `apply_results_total` and `apply_duration_seconds`, `outcome` is a
+  `ConfigApplyOutcome` name, such as `CONFIG_APPLY_OUTCOME_APPLIED`.
+- On peer notifications, `outcome` is `accepted`, `stale_owner`,
+  `unsupported_peer`, `peer_error`, or `timeout`.
+
+## Gateway Interceptor Metrics
+
+Gateways with [gateway interceptors](/extensibility/gateway-interceptors)
+record their evaluations:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_gateway_interceptor_latency_seconds` | Summary | None | Duration of interceptor calls. |
+| `openshell_gateway_interceptor_evaluations_total` | Counter | `decision`, `interceptor`, `binding_id` | Interceptor evaluations by decision. |
+| `openshell_gateway_interceptor_patches_total` | Counter | `interceptor`, `binding_id` | Patches that interceptors applied. |
+| `openshell_gateway_interceptor_fail_open_total` | Counter | None | Interceptor failures that let the request continue. |
+| `openshell_gateway_interceptor_fail_closed_total` | Counter | None | Interceptor failures that rejected the request. |
+| `openshell_gateway_interceptor_post_commit_observation_failures_total` | Counter | `stage` | Failed post-commit observations. `stage` is `response_body` or `evaluation`. |
+| `openshell_server_provider_profile_source_refreshes_total` | Counter | `outcome` | Refreshes of interceptor provider-profile snapshots. `outcome` is `ok` or `failed`. |
+| `openshell_server_provider_profile_source_snapshot_age_seconds` | Gauge | None | Age of the oldest cached provider-profile snapshot after the last refresh. Reads fail closed past three refresh intervals. |
+
+## OCSF Log Metrics
+
+Gateways that write an
+[OCSF JSONL file](/how-it-works/gateways/configuration#ocsf-jsonl-output)
+record its queue and writer:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_ocsf_log_queued_total` | Counter | None | Records queued for the file. |
+| `openshell_ocsf_log_written_total` | Counter | None | Records written to the file. |
+| `openshell_ocsf_log_dropped_total` | Counter | `reason` | Records discarded, by bounded reason. |
+| `openshell_ocsf_log_writer_errors_total` | Counter | None | Failed writes, reopens, and retention cleanups. |
+| `openshell_ocsf_log_recovery_discarded_bytes_total` | Counter | None | Bytes of an incomplete trailing line removed when the writer opens the file. |
+| `openshell_ocsf_log_queue_records` | Gauge | None | Records waiting to be written. |
+| `openshell_ocsf_log_queue_bytes` | Gauge | None | Encoded bytes waiting to be written. |
+
+## OCSF Log Export Metrics
+
+Gateways with
+[OCSF log export](/how-it-works/gateways/configuration#ocsf-log-export)
+enabled record its queue and exporter:
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `openshell_ocsf_otlp_queued_total` | Counter | None | Records queued for export. |
+| `openshell_ocsf_otlp_exported_total` | Counter | None | Records in batches the collector acknowledged, including records it rejected in a partial success. |
+| `openshell_ocsf_otlp_dropped_total` | Counter | `reason` | Records the gateway discarded: `queue_capacity`, `queue_bytes`, `oversized`, `export_failed`, `serialization`, or `closed`. |
+| `openshell_ocsf_otlp_export_errors_total` | Counter | None | Failed export attempts, including attempts that are retried. |
+| `openshell_ocsf_otlp_retries_total` | Counter | None | Export attempts retried after a failure. |
+
+## Next Steps
+
+- See the [Observability Overview](/observability/overview) for traces and OCSF events.
+- To monitor capacity and choose autoscaling signals for multiple gateway
+  replicas, refer to
+  [High Availability](/kubernetes/high-availability#monitor-capacity).
+- To configure the metrics listener in `gateway.toml`, refer to
+  [Gateway Configuration](/how-it-works/gateways/configuration).

@@ -448,7 +448,7 @@ class Openshell < Formula
       # Keep any user-edited config untouched.
       if gateway_config.read == legacy_empty_gateway_config_contents ||
          gateway_config.read == legacy_ipv6_gateway_config_contents
-        gateway_config.write gateway_config_contents
+        gateway_config.atomic_write gateway_config_contents
       end
     end
 
@@ -552,7 +552,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--deb", action="store_true", help="Print Debian package version only."
     )
     get_version_parser.add_argument(
-        "--snap", action="store_true", help="Print Snap package version only."
+        "--snap", action="store_true", help="Print snap package version only."
     )
     get_version_parser.add_argument(
         "--rpm-version", action="store_true", help="Print RPM Version only."

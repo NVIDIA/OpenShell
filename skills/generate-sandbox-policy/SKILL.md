@@ -30,15 +30,18 @@ The user's input falls into one of three tiers. Work with whatever the user prov
 The user provides API endpoints and a broad intent. No API docs needed.
 
 Examples:
+
 - "Allow curl to hit api.github.com, read-only"
 - "Give claude full access to api.anthropic.com"
 - "Let /usr/bin/myapp talk to internal-svc:8080 but only for reading"
 
 This is sufficient for:
-- **L4-only** policies (allow all traffic to host:port, no HTTP inspection)
+
+- **L4-only** policies (host:port + binary checks, no method or path rules)
 - **Preset-based L7** policies (`read-only`, `read-write`, `full` on all paths)
 
 For this tier, default to:
+
 - `access: read-only` when the user says "read", "browse", "view", "query", "fetch"
 - `access: read-write` when the user says "read-write", "create", "update" (but not "delete")
 - `access: full` when the user says "full access", "everything", "unrestricted"
@@ -53,8 +56,9 @@ For this tier, default to:
 The user knows some API paths but doesn't have full docs.
 
 Examples:
+
 - "Allow GET on /api/v1/models and POST on /api/v1/completions at integrate.api.nvidia.com"
-- "Read-only on /repos/** at api.github.com, but also allow POST on /repos/*/issues"
+- "Read-only on /repos/** at api.github.com, but also allow POST on /repos/*/*/issues"
 
 Generate explicit `rules` for the known paths. If the user also wants broader access beyond the specific paths, combine with a catch-all rule or suggest a preset instead.
 
@@ -109,23 +113,25 @@ Ask these when the user's intent is broad and more specificity is possible:
 |-----------|--------------|
 | "Full access" / "allow everything" | "Do you actually need DELETE access, or would read-write (everything except DELETE) be enough?" |
 | "Allow access to api.example.com" (no method/path detail) | "Do you know which specific API paths or operations you need? If so, I can lock the policy down to just those. Otherwise I'll use a broad preset." |
-| L4-only / "just pass it through" | "L4-only means the proxy won't inspect HTTP traffic at all — any method and path will be allowed. Are you sure you don't want at least read-only or read-write restriction?" |
+| L4-only / "just pass it through" | "L4-only means the proxy applies no method or path rules — any method and path will be allowed. Are you sure you don't want at least read-only or read-write restriction?" |
 | Wildcard binary (`/usr/bin/*`) | "A wildcard binary pattern means any binary in that directory can use this policy. Can you narrow it to specific binaries?" |
 | Multiple hosts in one policy | "Do all of these hosts need the same access level? If some need tighter restrictions, I can split them into separate policies." |
 | `access: full` with `enforcement: audit` | "Full access in audit mode means nothing is actually restricted — all traffic flows through and violations are only logged. Is that intentional, or did you want to enforce restrictions?" |
 | `**` path glob on all rules | "Using `**` on all paths allows any URL path. Do you know the specific API path prefixes you need (e.g., `/api/v1/`)?" |
-| Private/internal IP destination | "Does this service resolve to a private IP (10.x, 172.16.x, 192.168.x)? If so, you'll need `allowed_ips` to permit access — what CIDR range should be allowed?" |
+| Private/internal IP destination | "Does this service resolve to a private IP (10.x, 172.16.x, 192.168.x)? An exact hostname can reach its private addresses without `allowed_ips`, but a wildcard or hostless endpoint needs it. Should I pin the endpoint to a specific CIDR range?" |
 
 ### Auto-Discovery of API Docs for Well-Known Services
 
 When the user mentions a recognizable API host but hasn't provided docs, and the current tier is **Minimal**, attempt to upgrade to **Full** by searching for the API documentation online.
 
 **When to trigger:**
+
 - The host is a well-known public API (e.g., `api.github.com`, `api.anthropic.com`, `api.openai.com`, `integrate.api.nvidia.com`, `api.stripe.com`, `api.slack.com`, `api.gitlab.com`)
 - The user has NOT already provided API docs
 - The user has NOT explicitly asked for a broad preset ("just read-only, nothing fancy")
 
 **How to do it:**
+
 1. Tell the user: "I can look up the REST API docs for [service] to help generate a more precise policy. Want me to do that?"
 2. If the user agrees (or hasn't declined), search for the docs:
    - Search the web with a query like `"[service name] REST API documentation endpoints"` or `"[service name] OpenAPI spec"`
@@ -134,6 +140,7 @@ When the user mentions a recognizable API host but hasn't provided docs, and the
 4. Use the discovered endpoints to offer tighter scoping: "I found [N] endpoints in the [service] API. Based on your intent, I can narrow the policy to just [subset]. Want me to do that, or keep the broader preset?"
 
 **When to skip:**
+
 - The user explicitly asked for a broad preset or said "don't bother with docs"
 - The API is internal, private, or not publicly documented
 - The host is not recognizable as a well-known service
@@ -148,6 +155,7 @@ If the user confirms the policy must stay broad (they don't know the paths, need
 ### Iteration
 
 You may need to go back and forth a few times. Keep the loop tight:
+
 1. Ask one batch of clarifying questions (group related questions together)
 2. Update your understanding based on the answer
 3. If the answer reveals further scoping opportunities, ask a follow-up
@@ -157,9 +165,10 @@ You may need to go back and forth a few times. Keep the loop tight:
 
 ## Step 3: Read the Policy Schema
 
-Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/reference/policy-schema.md) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
+Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
 
 Key sections to reference:
+
 - **Policy Schema Reference** — top-level structure
 - **`network_policies`** — rule structure
 - **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules, allowed_ips
@@ -171,7 +180,7 @@ Key sections to reference:
 
 When middleware is requested, also read the published [supervisor middleware guide](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md).
 
-For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md) and the [default policy reference](https://docs.nvidia.com/openshell/latest/reference/default-policy.md). The default policy is built into the OpenShell runtime and applies when no explicit policy is supplied.
+For enforcement concepts and the shipped baseline, read [sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview) and the [default policy reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy). The default policy is built into the OpenShell runtime and applies when no explicit policy is supplied.
 
 Validate the intended provider combination as well as the authored policy.
 An image endpoint can become credentialed after provider composition and block
@@ -230,15 +239,21 @@ Only needed for the **Moderate** and **Full** tiers. Translate API path paramete
 | API path | Glob pattern |
 |----------|-------------|
 | `/repos/{owner}/{repo}` | `/repos/*/*` |
-| `/repos/{owner}/{repo}/issues` | `/repos/*/issues` |
-| `/repos/{owner}/{repo}/issues/{id}` | `/repos/*/issues/*` |
+| `/repos/{owner}/{repo}/issues` | `/repos/*/*/issues` |
+| `/repos/{owner}/{repo}/issues/{id}` | `/repos/*/*/issues/*` |
 | `/api/v1/models/{model_id}/versions/{version}` | `/api/v1/models/*/versions/*` |
 | All sub-paths under `/api/v1/` | `/api/v1/**` |
 
-Path matching uses the runtime `glob` engine. Both `*` and `**` may cross `/`
-boundaries; `?` matches one character, and bracket classes such as `[0-9]` and
-`[!0]` are supported. Prefer segment-shaped patterns such as
-`/repos/*/issues` for readability, but do not rely on `*` to stop at `/`.
+In REST rule paths, `*` stops at `/`, while a whole-segment `**` crosses `/`.
+For example, `/api/v1/**` covers descendants but not `/api/v1` itself; add an
+explicit rule for that path when needed. `?` matches one character except `/`,
+and bracket classes such as `[0-9]` are supported.
+
+The endpoint `path` selector has separate semantics: `/api/v1/**` includes
+`/api/v1` itself, and `*` in other patterns can cross `/`. These semantics apply
+both to selecting the endpoint's configuration and to deciding which endpoints'
+allow and deny rules apply. See the published policy schema's
+[matcher semantics](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema#matcher-semantics).
 
 ### Building the Explicit Rules List
 
@@ -278,7 +293,8 @@ network_policies:
           - allow:
               method: <METHOD>
               path: "<glob_pattern>"
-        # Optional: allow private IP destinations (CIDR or exact IP)
+        # Optional: restrict resolved addresses (CIDR or exact IP). Required
+        # for private IPs on wildcard or hostless endpoints.
         # allowed_ips:
         #   - "10.0.5.0/24"
     binaries:
@@ -327,19 +343,28 @@ github_api:
     - { path: /usr/bin/curl }
 ```
 
-Deny rules support the same matching capabilities as allow rules: `method`, `path`, `command` (SQL), and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
+Deny rules support the same matching capabilities as allow rules: `method`, `path`, and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
 
 ### Private IP Destinations
 
-When the endpoint resolves to a private IP (RFC 1918), the proxy's SSRF protection blocks the connection by default. Use `allowed_ips` to selectively allow specific private IP ranges:
+The proxy's SSRF protection treats private (RFC 1918) destinations differently depending on how the endpoint names its host:
+
+- **Exact hostname** (`host: api.internal.corp`) — the connection may reach the private addresses the hostname resolves to without `allowed_ips`.
+- **Wildcard host, hostless endpoint, or policy-advisor proposal** — private resolved addresses are blocked unless `allowed_ips` covers them.
+
+Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, every resolved address must fall within the list, including public addresses:
 
 - **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
 - **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
 
-Loopback (`127.0.0.0/8`) and link-local (`169.254.0.0/16`) are **always blocked** regardless of `allowed_ips`.
+The supervisor resolver is authoritative for hostname-only authorization. When a Linux explicit-proxy deployment exposes the workload process namespace to the supervisor, a sandbox `/etc/hosts` entry such as a Kubernetes `hostAliases` mapping is honored for an ordinary endpoint only if it sets `allowed_ips` to the exact IP or a narrow CIDR. OpenShell's driver-managed host-gateway aliases use a separate trusted IP pin.
+
+Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.
+
+The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. OpenShell handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/google.md).
 
 ```yaml
-# Example: Allow access to internal service at a known private IP range
+# Example: Pin an internal service to a known private IP range
 internal_api:
   name: internal_api
   endpoints:
@@ -375,7 +400,6 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
       hostless, an IP literal, a trailing-dot name, or a malformed DNS selector
 - [ ] `tls` is either omitted or set to `skip`; no other value is accepted
 - [ ] `rules` list is not empty when present
-- [ ] If `protocol: sql`, `enforcement` is not `enforce`
 - [ ] Every middleware config has a non-empty `middleware` name and non-empty `endpoints.include`
 - [ ] Middleware `order` values are unique and no selected chain exceeds 10 stages
 - [ ] No fail-closed middleware selector can cover a `tls: skip` endpoint
@@ -405,7 +429,7 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 
 | Condition | Warning to show |
 |-----------|----------------|
-| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths without inspection. An omitted protocol uses explicit-proxy behavior. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
+| **L4-only** (no `protocol`, or `protocol: tcp`) | "This policy allows all application methods and paths. An omitted protocol uses explicit-proxy behavior and applies no method or path rules. With default TLS handling, the proxy terminates detected TLS and checks the authority of the HTTP requests it parses, but other CONNECT payloads, such as HTTP/2 prior knowledge or non-HTTP protocols, can pass through a raw relay; `tls: skip` also bypasses termination and parsing. `protocol: tcp` enables policy DNS and transparent TCP only on a runtime that advertises the complete substrate (currently Docker and Podman); its hostname constrains connection routing, not application authority, so compatible shared infrastructure may expose other tenants or services. Consider `protocol: rest` with a preset if you want HTTP method-level or authority control." |
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |
@@ -507,6 +531,8 @@ When the user explicitly requests `process.run_as_user` or
 (`4294967295`). Warn that a low numeric identity inherits permissions granted
 to the same ID on image files, mounted volumes, or devices.
 
+For MicroVM, numeric selectors must match the resolved owner of the sandbox's writable overlay. User and group are checked independently; either mismatch prevents startup. If the owner UID:GID is unknown, omit the selectors or use `sandbox` so the driver retains that identity. Do not choose another numeric identity or suggest that the policy can change an existing overlay's owner. For example, with an owner of `1000:1000`, a request for UID `10000` must be rejected with an explanation and the omission/`sandbox` alternatives, rather than generating a policy that the VM cannot start.
+
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 
 ### Mode C: Present Only (no file write)
@@ -523,6 +549,7 @@ Show the generated policy YAML with:
 ## Step 8: Confirm and Refine
 
 After presenting or applying the policy, ask if the user wants to:
+
 - Tighten or loosen any rules
 - Add more endpoints or binaries
 - Switch between enforce/audit mode
@@ -532,7 +559,7 @@ After presenting or applying the policy, ask if the user wants to:
 
 ## Quick Reference: Common Patterns
 
-### L4-Only (no HTTP inspection)
+### L4-Only (no method or path rules)
 
 ```yaml
 my_api:
@@ -631,9 +658,9 @@ private_services:
 
 ## Additional Resources
 
-- [Policy schema](https://docs.nvidia.com/openshell/latest/reference/policy-schema.md)
-- [Sandbox policies](https://docs.nvidia.com/openshell/latest/sandboxes/policies.md)
-- [Default policy](https://docs.nvidia.com/openshell/latest/reference/default-policy.md)
+- [Policy schema](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema)
+- [Sandbox policies](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview)
+- [Default policy](https://docs.nvidia.com/openshell/latest/how-it-works/policies/default-policy)
 - [Supervisor middleware](https://docs.nvidia.com/openshell/latest/extensibility/supervisor-middleware.md)
 - Default policy: built into the OpenShell runtime
 - For translation examples from real API docs, see [examples.md](examples.md)

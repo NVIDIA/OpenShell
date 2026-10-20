@@ -23,13 +23,17 @@ use tokio::time::sleep;
 
 use self::executor::{CliExecutionError, CliExecutor, ProcessCli};
 
-pub use scenarios::{SANDBOX_LIFECYCLE_SCENARIO, SMOKE_SCENARIO};
+pub use scenarios::{
+    FILE_TRANSFER_GIT_FILTERING_SCENARIO, FILE_TRANSFER_PATH_SAFETY_SCENARIO,
+    FILE_TRANSFER_ROUND_TRIP_SCENARIO, MECHANISTIC_PROPOSAL_SCENARIO,
+    NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO,
+    SMOKE_SCENARIO,
+};
 
-/// An installed conformance scenario.
+/// A portable conformance scenario exercised by the Cargo test suite.
 #[derive(Debug)]
 pub struct Scenario {
     pub name: &'static str,
-    pub description: &'static str,
     run: for<'a> fn(&'a mut OpenShellRunner) -> ScenarioFuture<'a>,
 }
 
@@ -39,18 +43,6 @@ impl Scenario {
     pub async fn run(&self, runner: &mut OpenShellRunner) -> Result<(), String> {
         (self.run)(runner).await
     }
-}
-
-const SCENARIOS: &[Scenario] = &[SMOKE_SCENARIO, SANDBOX_LIFECYCLE_SCENARIO];
-
-/// Returns every scenario compiled into this distribution.
-pub fn scenarios() -> &'static [Scenario] {
-    SCENARIOS
-}
-
-/// Finds a scenario by its stable command-line name.
-pub fn scenario(name: &str) -> Option<&'static Scenario> {
-    scenarios().iter().find(|candidate| candidate.name == name)
 }
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_mins(2);
@@ -269,13 +261,6 @@ pub struct OpenShellCommand<'a> {
 }
 
 impl OpenShellRunner {
-    pub fn new(scenario: &str) -> Result<Self, RunnerError> {
-        Ok(Self::with_executor(
-            Arc::new(ProcessCli::new(PathBuf::from("openshell"))),
-            scenario,
-        ))
-    }
-
     /// Uses an explicit `openshell` binary rather than resolving it on `PATH`.
     pub fn with_binary(binary: PathBuf, scenario: &str) -> Result<Self, RunnerError> {
         if !binary.is_file() {
@@ -321,10 +306,6 @@ impl OpenShellRunner {
 
     pub fn id(&self) -> &str {
         &self.run_id
-    }
-
-    pub fn scenario(&self) -> &str {
-        &self.scenario
     }
 
     pub fn step(&self, step: impl Into<String>) -> CommandStep<'_> {
@@ -859,7 +840,6 @@ mod tests {
         let (mut runner, _cli) = test_runner(Vec::new());
 
         assert_eq!(runner.id().len(), 10);
-        assert_eq!(runner.scenario(), "smoke");
         runner.finished = true;
     }
 

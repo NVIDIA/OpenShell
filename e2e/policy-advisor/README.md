@@ -53,20 +53,25 @@ Requires Docker, `agent_policy_proposals_enabled=true`, and a GitHub token with
 contents write on the repository. The test auto-resolves the token from
 `DEMO_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`.
 
-## Mechanistic smoke
+## Conformance coverage
 
-Lightweight regression for the L4 CONNECT deny → mechanistic chunk pipeline.
-No GitHub token or LLM required.
+The portable CLI conformance suite may include policy-related scenarios. The
+current coverage checks draft generation for denied IP addresses and hostnames
+absent from policy, plus sandbox-local policy inspection and permission
+requests through `policy.local`. See [TESTING.md](../../TESTING.md#rust-cli-e2e)
+for the supported source and installed-artifact test paths.
 
-```bash
-mise run e2e:mechanistic-smoke
+A manual `Integration Tests` workflow run can select the `policy-advisor`
+testsuite to run the policy-related subset against an installed candidate. Set
+`artifact-run-id` to the candidate build's workflow run ID and `test-matrix`
+to:
+
+```json
+[{"environment":"ubuntu-docker-rootful","installer":"binaries","testsuite":"policy-advisor"}]
 ```
 
-Or manually against a running gateway with `agent_policy_proposals_enabled=true`:
-
-```bash
-OPENSHELL_BIN=target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh
-```
+The GitHub write test above and the regressions below still exercise distinct
+proposal review, approval, and hot-reload behavior.
 
 The #2821 regression additionally verifies that a denial on an existing
 inspected endpoint becomes a binary expansion, auto-approves, hot-reloads, and

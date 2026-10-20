@@ -115,7 +115,7 @@ port_is_in_use() {
 append_local_otlp_config_if_available() {
   local config_path=$1
   if ! port_is_in_use 4317; then
-    echo "OTLP collector not detected on 127.0.0.1:4317; trace export disabled."
+    echo "OTLP collector not detected on 127.0.0.1:4317; trace and OCSF log export disabled."
     return
   fi
 
@@ -123,8 +123,11 @@ append_local_otlp_config_if_available() {
 
 [openshell.gateway.otlp]
 endpoint = "http://127.0.0.1:4317"
+
+[openshell.gateway.otlp.ocsf]
+enabled = true
 EOF
-  echo "OTLP trace export enabled for http://127.0.0.1:4317."
+  echo "OTLP trace and OCSF log export enabled for http://127.0.0.1:4317."
 }
 
 register_gateway_metadata() {
@@ -214,7 +217,6 @@ signing_key_path = "${TLS_DIR}/jwt/signing.pem"
 public_key_path = "${TLS_DIR}/jwt/public.pem"
 kid_path = "${TLS_DIR}/jwt/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
 
 [openshell.drivers.podman]
 default_image = "${SANDBOX_IMAGE}"

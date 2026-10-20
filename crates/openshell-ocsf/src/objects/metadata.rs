@@ -25,6 +25,10 @@ pub struct Metadata {
     /// Log source path (e.g., "/dev/kmsg" for bypass detection).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_source: Option<String>,
+
+    /// Identifier shared by events about the same request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub correlation_uid: Option<String>,
 }
 
 /// OCSF Product object — identifies the software generating events.
@@ -51,6 +55,16 @@ impl Product {
             version: Some(version.to_string()),
         }
     }
+
+    /// Create the `OpenShell` Gateway product, for control-plane events.
+    #[must_use]
+    pub fn openshell_gateway(version: &str) -> Self {
+        Self {
+            name: "OpenShell Gateway".to_string(),
+            vendor_name: "OpenShell".to_string(),
+            version: Some(version.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -65,6 +79,7 @@ mod tests {
             profiles: vec!["security_control".to_string(), "container".to_string()],
             uid: Some("sandbox-abc123".to_string()),
             log_source: None,
+            correlation_uid: None,
         };
 
         let json = serde_json::to_value(&metadata).unwrap();
@@ -82,6 +97,7 @@ mod tests {
             profiles: vec![],
             uid: None,
             log_source: Some("/dev/kmsg".to_string()),
+            correlation_uid: None,
         };
 
         let json = serde_json::to_value(&metadata).unwrap();

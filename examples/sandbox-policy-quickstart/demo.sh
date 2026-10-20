@@ -8,7 +8,7 @@
 # Runs the full walkthrough non-interactively:
 #   1. Creates a sandbox with default-deny networking
 #   2. Attempts a request (denied)
-#   3. Applies a read-only GitHub API policy
+#   3. Adds a read-only GitHub API network rule
 #   4. Retries the request (allowed)
 #   5. Attempts a POST (blocked by L7)
 #   6. Shows logs and cleans up
@@ -18,8 +18,6 @@
 set -euo pipefail
 
 SANDBOX_NAME="policy-demo"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-POLICY_FILE="${SCRIPT_DIR}/policy.yaml"
 SSH_CONFIG=$(mktemp)
 
 cleanup() {
@@ -52,17 +50,19 @@ run() {
     return "${PIPESTATUS[0]}"
 }
 
+# Keep only OCSF network and HTTP policy decisions from `openshell logs`.
+policy_events() {
+    grep -E '(NET|HTTP):[A-Z]+ .*(ALLOWED|DENIED)'
+}
+
 colorize_logs() {
     sed \
-        -e "s/action=deny/$(printf '\033[1;31m')action=deny$(printf '\033[0m')/g" \
-        -e "s/action=allow/$(printf '\033[1;32m')action=allow$(printf '\033[0m')/g" \
-        -e "s/dst_host=[^ ]*/$(printf '\033[36m')&$(printf '\033[0m')/g" \
-        -e "s/dst_port=[^ ]*/$(printf '\033[36m')&$(printf '\033[0m')/g" \
-        -e "s/binary=[^ ]*/$(printf '\033[1m')&$(printf '\033[0m')/g" \
-        -e "s/reason=[^\"]*/$(printf '\033[33m')&$(printf '\033[0m')/g" \
-        -e "s/policy=[^ ]*/$(printf '\033[35m')&$(printf '\033[0m')/g" \
-        -e "s/\[CONNECT\]/$(printf '\033[1m')[CONNECT]$(printf '\033[0m')/g" \
-        -e "s/\[FORWARD\]/$(printf '\033[1m')[FORWARD]$(printf '\033[0m')/g"
+        -e "s/DENIED/$(printf '\033[1;31m')DENIED$(printf '\033[0m')/g" \
+        -e "s/ALLOWED/$(printf '\033[1;32m')ALLOWED$(printf '\033[0m')/g" \
+        -e "s/NET:[A-Z]*/$(printf '\033[1m')&$(printf '\033[0m')/g" \
+        -e "s/HTTP:[A-Z]*/$(printf '\033[1m')&$(printf '\033[0m')/g" \
+        -e "s/\[policy:[^]]*\]/$(printf '\033[35m')&$(printf '\033[0m')/g" \
+        -e "s/\[reason:[^]]*\]/$(printf '\033[33m')&$(printf '\033[0m')/g"
 }
 
 sandbox_exec() {
@@ -109,18 +109,19 @@ printf "  ${RED}✗ Blocked by default-deny policy.${RESET}\n"
 
 step "3/7  Checking deny log"
 sleep 2
-printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --since 1m -n 10${RESET}\n"
-openshell logs "$SANDBOX_NAME" --since 1m -n 10 2>&1 \
-    | grep -i 'connect\|forward\|deny\|allow' \
+printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --since 1m --source sandbox -n 10${RESET}\n"
+openshell logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
+    | policy_events \
     | colorize_logs \
     | sed 's/^/  /'
 
 # ------------------------------------------------------------------
 
-step "4/7  Applying read-only GitHub API policy"
-printf "  Policy file: %s\n\n" "$POLICY_FILE"
-run openshell policy set "$SANDBOX_NAME" \
-    --policy "$POLICY_FILE" \
+step "4/7  Adding a read-only GitHub API rule"
+run openshell policy update "$SANDBOX_NAME" \
+    --rule-name github_api \
+    --binary /usr/bin/curl \
+    --add-endpoint api.github.com:443:read-only:rest:enforce \
     --wait
 
 # ------------------------------------------------------------------
@@ -149,9 +150,10 @@ printf "  ${YELLOW}%s${RESET}\n" "$RESPONSE"
 
 step "7/7  Checking L7 deny log"
 sleep 2
-printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --level warn --since 1m -n 10${RESET}\n"
-openshell logs "$SANDBOX_NAME" --level warn --since 1m -n 10 2>&1 \
-    | grep -i 'connect\|forward\|deny\|allow\|l7\|rest' \
+# Policy events are INFO-level OCSF records, so a --level warn filter hides them.
+printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --since 1m --source sandbox -n 10${RESET}\n"
+openshell logs "$SANDBOX_NAME" --since 1m --source sandbox -n 10 2>&1 \
+    | policy_events \
     | colorize_logs \
     | sed 's/^/  /'
 
@@ -162,4 +164,4 @@ printf "  What you saw:\n"
 printf "    1. Default deny  — minimal outbound access, explicit approval required\n"
 printf "    2. L7 read-only  — GET allowed, POST blocked at the HTTP method level\n"
 printf "    3. Audit trail   — every request logged with method, path, and decision\n\n"
-printf "  The policy is %s lines of YAML.\n" "$(wc -l < "$POLICY_FILE" | tr -d ' ')"
+printf "  The rule took one command and no restart.\n"

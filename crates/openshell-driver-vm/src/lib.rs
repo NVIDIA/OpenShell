@@ -11,6 +11,9 @@ compile_error!(
      build a telemetry-free VM driver with `--no-default-features --features defaults-without-telemetry`"
 );
 
+#[cfg(feature = "allocation-tracking")]
+pub mod allocation_tracking;
+
 #[cfg(feature = "compute-driver")]
 pub mod driver;
 #[cfg(feature = "compute-driver")]
@@ -21,6 +24,8 @@ mod ffi;
 pub mod gpu;
 #[cfg(feature = "compute-driver")]
 mod isolation;
+#[cfg(feature = "compute-driver")]
+mod layer_applier;
 #[cfg(feature = "compute-driver")]
 pub mod lifecycle;
 #[cfg(feature = "compute-driver")]
@@ -42,5 +47,6 @@ pub use lifecycle::{
 };
 #[cfg(feature = "compute-driver")]
 pub use runtime::{
-    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, VsockPortMap, configured_runtime_dir, run_vm,
+    VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, VmMount, VsockPortMap, configured_runtime_dir,
+    run_vm,
 };

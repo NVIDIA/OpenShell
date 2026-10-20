@@ -3,7 +3,7 @@
 
 //! Shared supervisor-session ownership index for HA gateway replicas.
 
-use crate::persistence::{PersistenceError, Store, WriteCondition};
+use crate::persistence::{ObjectRecord, PersistenceError, Store, WriteCondition};
 use openshell_core::time::now_ms;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,6 +13,8 @@ use thiserror::Error;
 const OWNER_OBJECT_TYPE: &str = "supervisor_session_owner";
 
 pub const OWNER_TTL: Duration = Duration::from_secs(45);
+
+const PUBLISH_ATTEMPTS: u32 = 3;
 
 fn owner_object_id(sandbox_id: &str) -> String {
     format!("supervisor-owner:{sandbox_id}")
@@ -47,6 +49,16 @@ struct OwnerPayload {
     connected_at_ms: i64,
 }
 
+/// Marks an owner record written by a gateway that advertises no peer endpoint.
+/// Only that gateway can serve such a session, so no peer should dial it.
+pub const LOCAL_OWNER_ENDPOINT_SCHEME: &str = "local://";
+
+/// `endpoint`, unless it is empty or a `local://` placeholder that no other
+/// replica can dial.
+pub fn dialable_peer_endpoint(endpoint: &str) -> Option<&str> {
+    (!endpoint.is_empty() && !endpoint.starts_with(LOCAL_OWNER_ENDPOINT_SCHEME)).then_some(endpoint)
+}
+
 #[derive(Debug, Clone)]
 pub struct OwnerRecord {
     pub session_id: String,
@@ -65,6 +77,11 @@ impl OwnerRecord {
     pub fn is_fresh(&self, ttl: Duration) -> bool {
         let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
         now_ms().saturating_sub(self.updated_at_ms).max(0) < ttl_ms
+    }
+
+    /// The endpoint other replicas dial to reach this owner, if it has one.
+    pub fn peer_endpoint(&self) -> Option<&str> {
+        dialable_peer_endpoint(&self.owner_peer_endpoint)
     }
 }
 
@@ -119,22 +136,31 @@ impl SupervisorOwnerIndex {
             connected_at_ms,
         };
 
-        let condition = match self.read(sandbox_id).await? {
-            None => WriteCondition::MustCreate,
-            Some(existing)
-                if can_supersede(
-                    &existing,
-                    supervisor_instance_id,
-                    connection_epoch,
-                    self.ttl,
-                ) =>
-            {
-                WriteCondition::MatchResourceVersion(existing.resource_version)
+        // A previous owner releasing its record between our read and write
+        // (as a replica does while handing sessions off on shutdown) shows up
+        // as a conflict; re-read and decide again.
+        let mut attempts = 0;
+        let result = loop {
+            attempts += 1;
+            let condition = match self.read(sandbox_id).await? {
+                None => WriteCondition::MustCreate,
+                Some(existing)
+                    if can_supersede(
+                        &existing,
+                        supervisor_instance_id,
+                        connection_epoch,
+                        self.ttl,
+                    ) =>
+                {
+                    WriteCondition::MatchResourceVersion(existing.resource_version)
+                }
+                Some(_) => return Err(OwnerError::AlreadyOwned),
+            };
+            match self.write_payload(sandbox_id, &payload, condition).await {
+                Err(OwnerError::Conflict) if attempts < PUBLISH_ATTEMPTS => {}
+                other => break other?,
             }
-            Some(_) => return Err(OwnerError::AlreadyOwned),
         };
-
-        let result = self.write_payload(sandbox_id, &payload, condition).await?;
         Ok(OwnerGuard {
             sandbox_id: sandbox_id.to_string(),
             session_id: session_id.to_string(),
@@ -211,18 +237,7 @@ impl SupervisorOwnerIndex {
             return Ok(None);
         };
 
-        let payload: OwnerPayload = serde_json::from_slice(&record.payload)
-            .map_err(|err| PersistenceError::Decode(err.to_string()))?;
-        Ok(Some(OwnerRecord {
-            session_id: payload.session_id,
-            supervisor_instance_id: payload.supervisor_instance_id,
-            connection_epoch: payload.connection_epoch,
-            owner_replica_id: payload.owner_replica_id,
-            owner_peer_endpoint: payload.owner_peer_endpoint,
-            connected_at_ms: payload.connected_at_ms,
-            updated_at_ms: record.updated_at_ms,
-            resource_version: record.resource_version,
-        }))
+        Ok(Some(decode_owner_record(&record)?.1))
     }
 
     async fn write_payload(
@@ -255,7 +270,30 @@ impl SupervisorOwnerIndex {
     }
 }
 
-fn can_supersede(
+fn decode_owner_record(record: &ObjectRecord) -> Result<(String, OwnerRecord), OwnerError> {
+    let payload: OwnerPayload = serde_json::from_slice(&record.payload)
+        .map_err(|err| PersistenceError::Decode(err.to_string()))?;
+    if payload.sandbox_id != record.name || record.id != owner_object_id(&payload.sandbox_id) {
+        return Err(OwnerError::Store(PersistenceError::Decode(
+            "supervisor owner identity mismatch".to_string(),
+        )));
+    }
+    Ok((
+        payload.sandbox_id,
+        OwnerRecord {
+            session_id: payload.session_id,
+            supervisor_instance_id: payload.supervisor_instance_id,
+            connection_epoch: payload.connection_epoch,
+            owner_replica_id: payload.owner_replica_id,
+            owner_peer_endpoint: payload.owner_peer_endpoint,
+            connected_at_ms: payload.connected_at_ms,
+            updated_at_ms: record.updated_at_ms,
+            resource_version: record.resource_version,
+        },
+    ))
+}
+
+pub fn can_supersede(
     existing: &OwnerRecord,
     supervisor_instance_id: &str,
     connection_epoch: u64,
@@ -395,6 +433,25 @@ mod tests {
         let record = index.read("sbx").await.unwrap().unwrap();
         assert_eq!(record.session_id, guard.session_id);
         assert_eq!(record.owner_replica_id, "gw-2");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn publish_survives_the_previous_owner_releasing_concurrently() {
+        let index = Arc::new(test_index(OWNER_TTL).await);
+        for i in 0..200u64 {
+            let sandbox = format!("sbx-{i}");
+            let old = index
+                .publish(&sandbox, "s1", "inst", 1, "gw-1", "http://gw-1")
+                .await
+                .unwrap();
+            let releaser = Arc::clone(&index);
+            let release = tokio::spawn(async move { releaser.release_if_current(&old).await });
+            let publish = index
+                .publish(&sandbox, "s2", "inst", 2, "gw-2", "http://gw-2")
+                .await;
+            let _ = release.await.unwrap();
+            assert!(publish.is_ok(), "iteration {i}: {:?}", publish.err());
+        }
     }
 
     #[tokio::test]

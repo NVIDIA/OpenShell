@@ -67,7 +67,7 @@ fn membership_filter_subject<'a>(
                 Ok(Some(&u.identity.subject))
             }
         }
-        Principal::Sandbox(_) => Ok(None),
+        Principal::Sandbox(_) | Principal::Operator(_) => Ok(None),
         Principal::Peer(_) => Err(Status::permission_denied(
             "gateway peer principals cannot list workspaces",
         )),
@@ -457,7 +457,11 @@ pub(super) async fn handle_delete_workspace(
     }))
 }
 
-pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), Status> {
+pub(super) fn authorize_member_role(
+    role: i32,
+    grant: AuthGrant,
+    principal: &Principal,
+) -> Result<(), Status> {
     let role = WorkspaceRole::try_from(role).unwrap_or(WorkspaceRole::Unspecified);
     if role == WorkspaceRole::Unspecified {
         return Err(Status::invalid_argument(
@@ -465,6 +469,10 @@ pub(super) fn authorize_member_role(role: i32, grant: AuthGrant) -> Result<(), S
         ));
     }
     if role == WorkspaceRole::Admin && grant != AuthGrant::PlatformAdmin {
+        crate::auth::audit::emit_authorization_denial(
+            principal,
+            crate::auth::audit::AuthzDenial::PlatformAdminRequired,
+        );
         return Err(Status::permission_denied(
             "only platform admins can assign the workspace admin role",
         ));
@@ -495,7 +503,7 @@ pub(super) async fn handle_add_workspace_member(
         return Err(Status::invalid_argument("principal_subject is required"));
     }
 
-    authorize_member_role(req.role, authz.grant)?;
+    authorize_member_role(req.role, authz.grant, &principal)?;
 
     let count = state
         .store

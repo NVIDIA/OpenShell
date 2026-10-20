@@ -9,7 +9,9 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
-use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
+use openshell_ocsf::{
+    ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit, sanitize_reason_for_audit,
+};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -73,11 +75,8 @@ const MAX_DENIALS_LIMIT: usize = 100;
 /// denials.
 const DENIAL_LOG_FILES_TO_SCAN: usize = 2;
 const LOG_DIR: &str = "/var/log";
-/// Shorthand log filenames are `openshell.YYYY-MM-DD.log`. The trailing dot in
-/// the prefix is intentional: it disambiguates from the OCSF JSONL appender's
-/// `openshell-ocsf.YYYY-MM-DD.log`, which we never want to surface here (the
-/// JSONL is opt-in via `ocsf_json_enabled` and not the source of truth for
-/// `/v1/denials`).
+/// `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files,
+/// which are opt-in via `ocsf_json_enabled`.
 const SHORTHAND_LOG_PREFIX: &str = "openshell.";
 /// Defensive cap on per-line length returned to the agent so a pathological
 /// log entry (very long URL path, etc.) cannot blow up the response.
@@ -469,8 +468,7 @@ fn collect_shorthand_log_files(log_dir: &Path, max_files: usize) -> std::io::Res
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            // `openshell.YYYY-MM-DD.log` only — the trailing dot in the prefix
-            // disambiguates from `openshell-ocsf.YYYY-MM-DD.log`.
+            // `/v1/denials` reads `openshell.YYYY-MM-DD.log`, not the OCSF `.jsonl` files.
             if !name.starts_with(SHORTHAND_LOG_PREFIX) || !name.ends_with(".log") {
                 return None;
             }
@@ -671,48 +669,45 @@ fn emit_policy_decision_event(chunk: &PolicyChunk) {
     }
 }
 
-/// Sanitize a free-form reviewer-typed string before it lands in the OCSF
-/// audit surface. The agent still reads the raw text via the API — this is
-/// audit-side defense only.
-fn sanitize_reason_for_audit(raw: &str) -> String {
-    const MAX_CHARS: usize = 200;
-    let cleaned: String = raw
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .take(MAX_CHARS)
-        .collect();
-    if raw.chars().count() > MAX_CHARS {
-        format!("{cleaned}…")
-    } else {
-        cleaned
-    }
-}
-
 /// One-line audit description of a chunk's target: binary, host, port, and
-/// L7 method/path if present. Used by both the propose and approve/reject
-/// audit events so the trace can be grepped by endpoint without parsing
-/// JSON.
+/// L7 method/path allows for every endpoint. Used by both the propose and
+/// approve/reject audit events so the trace can be grepped by endpoint
+/// without parsing JSON.
 fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
     let Some(rule) = chunk.proposed_rule.as_ref() else {
         return format!("rule_name:{}", chunk.rule_name);
     };
-    let endpoint = rule.endpoints.first().map_or_else(
-        || "unknown".to_string(),
-        |ep| format!("{}:{}", ep.host, ep.port),
-    );
-    let l7 = rule
-        .endpoints
-        .first()
-        .and_then(|ep| ep.rules.first())
-        .and_then(|r| r.allow.as_ref())
-        .map(|a| format!(" {} {}", a.method, a.path))
-        .unwrap_or_default();
+    let endpoints = if rule.endpoints.is_empty() {
+        "unknown".to_string()
+    } else {
+        rule.endpoints
+            .iter()
+            .map(summarize_endpoint_for_audit)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     let binary = if chunk.binary.is_empty() {
         String::new()
     } else {
         format!(" by {}", chunk.binary)
     };
-    format!("on {endpoint}{l7}{binary}")
+    format!("on {endpoints}{binary}")
+}
+
+fn summarize_endpoint_for_audit(endpoint: &NetworkEndpoint) -> String {
+    let allows = endpoint
+        .rules
+        .iter()
+        .filter_map(|r| r.allow.as_ref())
+        .map(|a| format!("{} {}", a.method, a.path))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let target = format!("{}:{}", endpoint.host, endpoint.port);
+    if allows.is_empty() {
+        target
+    } else {
+        format!("{target} [{allows}]")
+    }
 }
 
 /// `GET /v1/proposals/{chunk_id}` — immediate state. One gateway call, no loop.
@@ -1191,6 +1186,7 @@ fn network_endpoint_from_json(
         .collect();
 
     Ok(NetworkEndpoint {
+        token_grant_owner: String::new(),
         host: endpoint.host,
         port,
         protocol: endpoint.protocol,
@@ -1654,11 +1650,11 @@ mod tests {
 
     #[tokio::test]
     async fn recent_denials_skips_jsonl_log_files() {
-        // The shorthand reader must not surface `openshell-ocsf.*.log` content
+        // The shorthand reader must not surface `openshell-ocsf.*.jsonl` content
         // even if a deny-looking line is present, so the response stays
         // independent of the JSONL appender's enabled state.
         let dir = tempfile::tempdir().unwrap();
-        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.log");
+        let jsonl = dir.path().join("openshell-ocsf.2026-05-06.jsonl");
         std::fs::write(
             &jsonl,
             r#"{"class_uid":4002,"action_id":2,"message":"DENIED","time":1}"#,
@@ -2052,6 +2048,42 @@ mod tests {
         assert!(summary.contains("/usr/bin/curl"));
     }
 
+    #[test]
+    fn summarize_chunk_for_audit_lists_every_endpoint_and_allow() {
+        let allow = |method: &str, path: &str| L7Rule {
+            allow: Some(L7Allow {
+                method: method.to_string(),
+                path: path.to_string(),
+                ..Default::default()
+            }),
+        };
+        let chunk = PolicyChunk {
+            binary: "/usr/bin/perl".to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: "two".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "ports.ubuntu.com".to_string(),
+                        port: 80,
+                        rules: vec![allow("GET", "/ubuntu-ports/**"), allow("HEAD", "/x")],
+                        ..Default::default()
+                    },
+                    NetworkEndpoint {
+                        host: "169.254.169.254".to_string(),
+                        port: 80,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            summarize_chunk_for_audit(&chunk),
+            "on ports.ubuntu.com:80 [GET /ubuntu-ports/**, HEAD /x], 169.254.169.254:80 by /usr/bin/perl"
+        );
+    }
+
     // Helpers — synthetic proposed rule + policy with that rule already
     // merged. Both reused across reload-readiness tests.
     fn proposed_curl_rule_for_github() -> NetworkPolicyRule {
@@ -2303,29 +2335,6 @@ mod tests {
             3,
             "initial, identical replacement, and covering snapshots need one check each"
         );
-    }
-
-    #[test]
-    fn sanitize_reason_for_audit_strips_control_chars_and_caps_length() {
-        // Tabs and newlines are stripped; ordinary printable chars survive;
-        // multi-byte characters count as one char in the cap.
-        let raw = "line one\nline\ttwo\u{0001}\u{0007}";
-        let cleaned = sanitize_reason_for_audit(raw);
-        assert!(!cleaned.contains('\n'));
-        assert!(!cleaned.contains('\t'));
-        assert!(!cleaned.contains('\u{0001}'));
-        assert!(cleaned.contains("line one"));
-        assert!(cleaned.contains("linetwo"));
-
-        // Length cap with ellipsis marker so a downstream reader can tell
-        // the audit string is truncated.
-        let long: String = "x".repeat(500);
-        let capped = sanitize_reason_for_audit(&long);
-        assert!(capped.chars().count() <= 201);
-        assert!(capped.ends_with('…'));
-
-        // Empty input maps to empty output (caller renders "(no guidance)").
-        assert_eq!(sanitize_reason_for_audit(""), "");
     }
 
     #[test]

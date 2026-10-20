@@ -1,0 +1,89 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+- name: Check Agent Sandbox reconciliation after boot
+  become: true
+  block:
+    - name: Choose a unique controller probe name
+      ansible.builtin.set_fact:
+        controller_probe_name: "conformance-startup-{{ 9999999999999999 | random }}"
+
+    - name: Apply a scheduling-gated controller probe
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - 15s
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=10s
+          - apply
+          - --filename=-
+          - --output=json
+        stdin: |
+          apiVersion: agents.x-k8s.io/v1beta1
+          kind: Sandbox
+          metadata:
+            name: "{{ controller_probe_name }}"
+            namespace: openshell
+          spec:
+            podTemplate:
+              spec:
+                automountServiceAccountToken: false
+                schedulingGates:
+                  - name: openshell.ai/conformance-startup
+                containers:
+                  - name: probe
+                    image: registry.k8s.io/pause:3.9
+      register: controller_probe
+      until: controller_probe.rc == 0
+      retries: 60
+      delay: 5
+
+    # Deployment readiness does not establish leadership or reconciliation.
+    # The gate keeps this probe from running or pulling its image.
+    - name: Wait for the controller-owned gated Pod
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - 10s
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=5s
+          - --namespace=openshell
+          - get
+          - pod
+          - "{{ controller_probe_name }}"
+          - --output=json
+      register: controller_probe_pod
+      changed_when: false
+      until: >-
+        controller_probe_pod.rc == 0 and
+        ((controller_probe_pod.stdout | from_json).metadata.ownerReferences | default([]) |
+         selectattr('controller', 'defined') | selectattr('controller', 'equalto', true) |
+         selectattr('kind', 'equalto', 'Sandbox') |
+         selectattr('uid', 'equalto', (controller_probe.stdout | from_json).metadata.uid) | list | length) == 1 and
+        ((controller_probe_pod.stdout | from_json).spec.schedulingGates | default([]) |
+         selectattr('name', 'equalto', 'openshell.ai/conformance-startup') | list | length) == 1 and
+        not ((controller_probe_pod.stdout | from_json).spec.nodeName | default(''))
+      retries: 60
+      delay: 5
+
+  always:
+    - name: Remove the controller probe and its dependent resources
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - 30s
+          - /usr/local/bin/k3s
+          - kubectl
+          - --request-timeout=5s
+          - --namespace=openshell
+          - delete
+          - sandboxes.agents.x-k8s.io
+          - "{{ controller_probe_name }}"
+          - --ignore-not-found=true
+          - --cascade=foreground
+          - --wait=true
+          - --timeout=20s
+      when: controller_probe_name is defined

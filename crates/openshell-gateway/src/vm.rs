@@ -105,14 +105,8 @@ pub struct VmComputeConfig {
     /// Maximum accepted rootfs tar size, in bytes, before and after decompression.
     pub rootfs_tar_max_bytes: Option<u64>,
 
-    /// Host-side CA certificate for the guest's mTLS client bundle.
+    /// Host-side CA certificate used to authenticate the gateway.
     pub guest_tls_ca: Option<PathBuf>,
-
-    /// Host-side client certificate for the guest's mTLS client bundle.
-    pub guest_tls_cert: Option<PathBuf>,
-
-    /// Host-side private key for the guest's mTLS client bundle.
-    pub guest_tls_key: Option<PathBuf>,
 
     /// Corporate forward-proxy settings passed to the VM driver. Flattening
     /// preserves the shared local-driver TOML field names.
@@ -128,6 +122,10 @@ pub struct VmComputeConfig {
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     #[serde(default)]
     pub provider_spiffe_allow_guest_tcp: bool,
+
+    /// Allow bind-mounting host directories into VM sandboxes.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl VmComputeConfig {
@@ -171,6 +169,11 @@ impl VmComputeConfig {
         if self.grpc_endpoint.trim().is_empty() {
             return Err(Error::config(
                 "grpc_endpoint is required when using the vm compute driver",
+            ));
+        }
+        if self.bootstrap_image.trim().is_empty() && self.default_image.trim().is_empty() {
+            return Err(Error::config(
+                "bootstrap_image or default_image is required when using the vm compute driver; sandbox images cannot be used as VM bootstrap images",
             ));
         }
         validate_vm_sandbox_identity(self)?;
@@ -251,12 +254,11 @@ impl Default for VmComputeConfig {
             rootfs_tar_staging_dir: None,
             rootfs_tar_max_bytes: None,
             guest_tls_ca: None,
-            guest_tls_cert: None,
-            guest_tls_key: None,
             upstream_proxy: UpstreamProxyConfig::default(),
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -265,8 +267,6 @@ impl Default for VmComputeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmGuestTlsPaths {
     pub ca: PathBuf,
-    pub cert: PathBuf,
-    pub key: PathBuf,
 }
 
 /// Resolve the `openshell-driver-vm` binary path.
@@ -499,14 +499,9 @@ pub fn compute_driver_guest_tls_paths(
         return Ok(None);
     }
 
-    let provided = [
-        vm_config.guest_tls_ca.as_ref(),
-        vm_config.guest_tls_cert.as_ref(),
-        vm_config.guest_tls_key.as_ref(),
-    ];
-    if provided.iter().all(Option::is_none) {
+    if vm_config.guest_tls_ca.is_none() {
         return Err(Error::config(
-            "vm compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
+            "vm compute driver requires guest_tls_ca when grpc_endpoint uses https://",
         ));
     }
 
@@ -515,18 +510,7 @@ pub fn compute_driver_guest_tls_paths(
             "guest_tls_ca is required when VM guest TLS materials are configured",
         ));
     };
-    let Some(cert) = vm_config.guest_tls_cert.clone() else {
-        return Err(Error::config(
-            "guest_tls_cert is required when VM guest TLS materials are configured",
-        ));
-    };
-    let Some(key) = vm_config.guest_tls_key.clone() else {
-        return Err(Error::config(
-            "guest_tls_key is required when VM guest TLS materials are configured",
-        ));
-    };
-
-    for path in [&ca, &cert, &key] {
+    for path in [&ca] {
         if !path.is_file() {
             return Err(Error::config(format!(
                 "vm guest TLS material '{}' does not exist or is not a file",
@@ -535,7 +519,7 @@ pub fn compute_driver_guest_tls_paths(
         }
     }
 
-    Ok(Some(VmGuestTlsPaths { ca, cert, key }))
+    Ok(Some(VmGuestTlsPaths { ca }))
 }
 
 /// Launch the VM compute-driver subprocess, wait for its UDS to come up,
@@ -594,10 +578,11 @@ pub async fn spawn(
     append_vm_rootfs_tar_args(&mut command, vm_config);
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
-        command.arg("--guest-tls-cert").arg(tls.cert);
-        command.arg("--guest-tls-key").arg(tls.key);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
+    if vm_config.enable_bind_mounts {
+        command.arg("--enable-bind-mounts");
+    }
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(
@@ -683,8 +668,22 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
 }
 
 fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
-    if let Some(config) = otlp_config {
-        command.arg("--otlp-endpoint").arg(&config.endpoint);
+    let traces_endpoint = otlp_config.and_then(OtlpConfig::traces_endpoint);
+    let ocsf = otlp_config.and_then(|config| config.ocsf.as_ref());
+    if let Some(endpoint) = traces_endpoint {
+        command.arg("--otlp-endpoint").arg(endpoint);
+    }
+    if let Some(ocsf) = ocsf {
+        command.arg("--otlp-ocsf-endpoint").arg(&ocsf.endpoint);
+        if let Some(version) = ocsf.schema_version {
+            command
+                .arg("--otlp-ocsf-schema-version")
+                .arg(version.as_str());
+        }
+    }
+    // The driver names its own spans with the gateway name, and supervisors
+    // name their spans and OCSF records with it.
+    if traces_endpoint.is_some() || ocsf.is_some() {
         command.arg("--gateway-name").arg(gateway_name);
     }
 }
@@ -783,7 +782,9 @@ mod tests {
         validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
-    use openshell_server::config_file::OtlpConfig;
+    use openshell_server::config_file::{
+        OcsfOtlpConfig, OcsfSchemaVersion, OtlpConfig, OtlpTracesConfig,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -798,13 +799,44 @@ mod tests {
     }
 
     #[test]
+    fn vm_gateway_requires_a_trusted_bootstrap_image_source() {
+        let config = VmComputeConfig {
+            grpc_endpoint: "http://127.0.0.1:50051".to_string(),
+            default_image: String::new(),
+            bootstrap_image: String::new(),
+            ..Default::default()
+        };
+        let error = config
+            .validate_configuration()
+            .expect_err("the gateway must reject an empty bootstrap configuration");
+        assert!(error.to_string().contains("sandbox images cannot be used"));
+
+        VmComputeConfig {
+            default_image: "openshell/sandbox:default".to_string(),
+            ..config.clone()
+        }
+        .validate_configuration()
+        .expect("the operator-controlled default image is a valid fallback");
+
+        VmComputeConfig {
+            bootstrap_image: "openshell/sandbox-bootstrap:latest".to_string(),
+            ..config
+        }
+        .validate_configuration()
+        .expect("an explicit bootstrap image is valid");
+    }
+
+    #[test]
     fn vm_driver_command_includes_gateway_otlp_configuration() {
         let mut command = tokio::process::Command::new("openshell-driver-vm");
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
-                endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
+                traces: Some(OtlpTracesConfig {
+                    endpoint: "http://collector.internal:4317".to_string(),
+                }),
+                ocsf: None,
             }),
             "production-us-west",
         );
@@ -819,6 +851,40 @@ mod tests {
             [
                 "--otlp-endpoint",
                 "http://collector.internal:4317",
+                "--gateway-name",
+                "production-us-west"
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_includes_gateway_ocsf_export() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                service_name: None,
+                traces: None,
+                ocsf: Some(OcsfOtlpConfig {
+                    endpoint: "http://siem.internal:4317".to_string(),
+                    schema_version: Some(OcsfSchemaVersion::V1_3),
+                }),
+            }),
+            "production-us-west",
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--otlp-ocsf-endpoint",
+                "http://siem.internal:4317",
+                "--otlp-ocsf-schema-version",
+                "1.3",
                 "--gateway-name",
                 "production-us-west"
             ]
@@ -1072,47 +1138,26 @@ mod tests {
         };
 
         let err = compute_driver_guest_tls_paths(&vm_config)
-            .expect_err("https vm endpoints should require an explicit guest client bundle");
-        assert!(
-            err.to_string()
-                .contains("guest_tls_ca, guest_tls_cert, and guest_tls_key")
-        );
+            .expect_err("https vm endpoints should require an explicit gateway CA");
+        assert!(err.to_string().contains("guest_tls_ca"));
     }
 
     #[test]
-    fn vm_compute_driver_tls_uses_guest_bundle_not_gateway_server_identity() {
+    fn vm_compute_driver_tls_uses_only_gateway_ca() {
         let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
         let guest_ca = dir.path().join("guest-ca.crt");
-        let guest_cert = dir.path().join("guest.crt");
-        let guest_key = dir.path().join("guest.key");
-        for path in [
-            &server_cert,
-            &server_key,
-            &guest_ca,
-            &guest_cert,
-            &guest_key,
-        ] {
-            std::fs::write(path, path.display().to_string()).unwrap();
-        }
+        std::fs::write(&guest_ca, guest_ca.display().to_string()).unwrap();
 
         let vm_config = VmComputeConfig {
             grpc_endpoint: "https://gateway.internal:8443".to_string(),
             guest_tls_ca: Some(guest_ca.clone()),
-            guest_tls_cert: Some(guest_cert.clone()),
-            guest_tls_key: Some(guest_key.clone()),
             ..Default::default()
         };
 
         let guest_paths = compute_driver_guest_tls_paths(&vm_config)
             .unwrap()
-            .expect("https vm endpoints should pass an explicit guest client bundle");
+            .expect("https vm endpoints should pass an explicit gateway CA");
         assert_eq!(guest_paths.ca, guest_ca);
-        assert_eq!(guest_paths.cert, guest_cert);
-        assert_eq!(guest_paths.key, guest_key);
-        assert_ne!(guest_paths.cert, server_cert);
-        assert_ne!(guest_paths.key, server_key);
     }
 
     #[test]

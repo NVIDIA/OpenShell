@@ -67,6 +67,8 @@ message MiddlewareManifest {
   // this post-authentication consistency check.
   string expected_audience = 4;
   // Supervisor-middleware protocol metadata. Required for negotiation.
+  // Declare protocol 1.0 and list "openshell.supervisor-middleware.contract"
+  // in supported_capabilities.
   openshell.extension.v1.PeerMetadata extension = 5;
 }
 

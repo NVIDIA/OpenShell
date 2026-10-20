@@ -6,6 +6,7 @@ Deploy or register an OpenShell gateway, verify it is reachable, and run your fi
 
 - OpenShell CLI installed (`openshell`)
 - A reachable gateway endpoint, or access to a Kubernetes cluster where you can install the Helm chart
+- For Kubernetes installs, a CNI that enforces ingress and egress `NetworkPolicy` in sandbox namespaces
 
 ## Helm Deployment
 
@@ -15,7 +16,6 @@ Install the gateway into a Kubernetes cluster you manage:
 kubectl create namespace openshell
 helm upgrade --install openshell deploy/helm/openshell \
   --namespace openshell \
-  --set supervisor.sandboxRuntime.networkPolicyEnforced=true \
   --set server.disableTls=true \
   --set service.type=ClusterIP
 ```

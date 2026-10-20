@@ -22,7 +22,7 @@ func newFakeServiceClient(closedFunc func() bool) *fakeServiceClient {
 }
 
 // Expose returns Unimplemented.
-func (c *fakeServiceClient) Expose(_ context.Context, _, _, _ string, _ uint32, _ bool) (*types.ServiceEndpoint, error) {
+func (c *fakeServiceClient) Expose(_ context.Context, _, _, _ string, _ uint32, _ bool, _ ...v1.ExposeServiceOptions) (*types.ServiceEndpoint, error) {
 	if c.closedFunc() {
 		return nil, &types.StatusError{Code: types.ErrorUnavailable, Message: "client is closed"}
 	}

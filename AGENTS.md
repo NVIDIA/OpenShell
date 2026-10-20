@@ -17,32 +17,18 @@ OpenShell has two skill collections:
 
 Do not rely on this file for a full inventory. The detailed public and contributor skill tables are in [CONTRIBUTING.md](CONTRIBUTING.md) (for humans).
 
-## Workflow Chains
-
-These pipelines connect skills into end-to-end workflows. Individual skill files don't describe these relationships.
-
-- **Community inflow:** `triage-issue` → human disposition and roadmap placement → `create-spike` when needed → `build-from-issue`
-  - Triage establishes facts and marks technically valid issues `state:validated`. A human signals that the project should pursue the work by applying `state:accepted` or placing the issue on the roadmap. The `agent:*` labels support unattended agents that scan for queued work: a human queues a plan with `agent:plan-requested`, the agent returns `agent:plan-ready`, and a human queues implementation with `agent:implementation-requested`. A direct user request to an agent authorizes the requested phase even when the expected lifecycle or workflow labels are missing or incomplete; the agent warns about the discrepancies and continues without changing the labels.
-- **Internal development:** `create-spike` → human disposition and roadmap placement → `build-from-issue`
-  - Spike explores feasibility and marks its issue `state:validated` when sufficient evidence exists. A human accepts it with `state:accepted` or roadmap placement, or declines it, and optionally queues it through the `agent:*` workflow or directs an agent to it. A direct request proceeds after warning about missing or incomplete expected labels.
-- **Security:** `review-security-issue` → `fix-security-issue`
-  - General build agents must not process `topic:security` issues. For unattended processing, a human queues specialized review with `agent:plan-requested`; review produces a severity assessment and remediation plan; a human queues remediation with `agent:implementation-requested`. On direct requests to the specialized skills, missing workflow labels produce a warning rather than blocking the requested phase.
-- **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
-  - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
-
 ## Architecture Overview
 
 | Path | Components | Purpose |
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
-| `crates/openshell-conformance-cli/` | Conformance CLI | Distributable `list` and `run` entrypoint for gateway conformance |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
-| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
-| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
+| `crates/openshell-isolation-interface/` | Isolation backend interface | Shared data and validation for the Isolation Backend RPC contracts |
+| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
@@ -50,6 +36,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
@@ -80,38 +67,13 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
 | `skills/` | Public agent skills | Installable workflows for using and operating OpenShell |
 | `.agents/skills/` | Contributor agent skills | Repository-aware workflows for developing OpenShell |
-| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
-| `architecture/` | Architecture docs | Design decisions and component documentation |
+| `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer) |
 
 ## Public API Conventions
 
 Follow [proto/README.md](proto/README.md) for public protobuf API design. It is
 the canonical source for entity-reference naming, workspace selectors, field
 design, and schema evolution.
-
-## Vouch System
-
-- First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
-- Org members and collaborators bypass the vouch gate automatically.
-- Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED.td`.
-- Skills that create PRs (`create-github-pr`, `build-from-issue`) should note this requirement when operating on behalf of external contributors.
-
-## Issue and PR Conventions
-
-- **Bug reports and feature requests** must include a User Story, Problem Statement, Impact / Why This Matters, and Acceptance Criteria. The impact should explain the consequences of the current behavior, the current workaround, and why that workaround is insufficient. Bug reports additionally require reproduction steps and environment details and may include concise, redacted logs.
-- **Feature requests** must also include a Proposed Design and Alternatives Considered. The design should define the user-facing workflow and externally observable behavior while leaving internal implementation choices open. Agent investigation is optional.
-- **New features** must start as GitHub issues using the feature request template. Open an RFC only after an issue exists; maintainers decide when one is needed and assign RFC numbers from the issue.
-- **Issue triage** establishes technical validity and impact evidence. Agents never decide acceptance, apply `state:accepted`, place issues on the roadmap, or apply `agent:plan-requested` or `agent:implementation-requested`. Humans accept or decline validated work; `state:accepted` or roadmap placement records acceptance, and roadmap association additionally carries sequencing. Lifecycle and request labels gate unattended queue pickup. An explicit user instruction authorizes an agent to plan or implement the specified issue even when expected labels are missing or incomplete; the agent warns the user and continues without changing those labels. OpenShell has no `priority:*` labels.
-- **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist. Contributors should use their agent to investigate the current code and behavior for accepted issue-backed work, verify any diagnostics already on the issue, understand the change they submit, and report the resulting implementation and verification—not paste an earlier issue-filing diagnostic.
-- **PRs for features, user-visible behavior, public APIs, architecture, or multi-PR efforts** must link an accepted issue. Small docs fixes, mechanical maintenance, and obvious localized bug fixes may state why no issue is required.
-- **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
-- **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
-- Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.
-
-## Plans
-
-- Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
-- When asked to write a plan, write it there without asking for the location.
 
 ## Sandbox Logging (OCSF)
 
@@ -209,6 +171,14 @@ ocsf_emit!(event);
   test-only connections, though using it on any non-UDS TCP stream — tests
   included — is fine and preferred.
 
+## Branch Names
+
+Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-names).
+
+## Pull Requests
+
+Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must link at least one issue with `state:accepted`, and every issue they implement must have that label. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without the acceptance label. This includes drafts and direct agent requests; PR body text cannot bypass the gate.
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
@@ -216,18 +186,6 @@ ocsf_emit!(event);
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
 - Sign off on each commit for DCO compliance. Use the `--signoff` option to `git commit` to add the `Signed-off-by` footer to ensure the user's configured email address is used.
 - Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
-
-## Pre-commit
-
-- Run `mise run pre-commit` before committing.
-- Install the git hook when working locally: `mise generate git-pre-commit --write --task=pre-commit`
-
-## Testing
-
-- `mise run pre-commit` — Lint, format, license headers. Run before every commit.
-- `mise run test` — Unit test suite. Run after code changes.
-- `mise run e2e` — End-to-end tests against a running gateway. Run for infrastructure, sandbox, or policy changes.
-- `mise run ci` — Full local CI (lint + compile/type checks + tests). Run before opening a PR.
 
 ## Go SDK (`sdk/go/`)
 
@@ -264,27 +222,21 @@ When behavior, commands, or development workflows change, review the related age
 
 ## Documentation
 
-- When making changes, update the relevant documentation in the `architecture/` directory.
-- When changes affect user-facing behavior, update the relevant published docs pages under `docs/` and navigation in `docs/index.yml`.
-- When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the same branch.
+- Put crate-specific implementation details in the relevant crate `README.md` and design proposals in `rfc/`.
+- When changes affect user-facing behavior, make the smallest necessary changes to the relevant published docs pages under `docs/` and navigation in `docs/index.yml`. Explain exactly what users need to know; avoid repeating information across pages or exhaustively describing internals that do not affect users.
+- When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
 
-### Architecture Docs
+## Terminology
 
-- Architecture docs are short canonical subsystem overviews, not exhaustive implementation notes.
-- Update one of the existing top-level architecture docs before adding a new file.
-- Put useful crate-specific details in the relevant crate `README.md`.
-- Add a new top-level architecture doc only when explicitly requested or when an RFC-level design needs a stable home.
-- Keep architecture docs focused on stable boundaries, data/control flow, invariants, and operational constraints.
-- Remove stale detail instead of preserving it by default.
-- Do not include testing transcripts, historical debugging notes, long source-file inventories, or field-by-field schema references.
-- Put user-facing instructions in `docs/`, broad design proposals in `rfc/`, and temporary plans in ignored `architecture/plans/`.
+- Treat `snap` as a common noun. Lowercase it in ordinary prose, but capitalize it where normal English sentence or title casing requires. Preserve proper names such as Snap Store, Snapcraft, and snapd.
 
 ## Security
 
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

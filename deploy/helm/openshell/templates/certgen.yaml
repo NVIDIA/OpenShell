@@ -75,7 +75,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "openshell.selectorLabels" . | nindent 8 }}
+        {{- include "openshell.certgenPodLabels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}
@@ -88,10 +88,7 @@ spec:
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pkiInitJob.securityContext | nindent 12 }}
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -146,7 +143,7 @@ spec:
   template:
     metadata:
       labels:
-        {{- include "openshell.selectorLabels" . | nindent 8 }}
+        {{- include "openshell.certgenPodLabels" . | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       serviceAccountName: {{ $hookName }}
@@ -159,10 +156,7 @@ spec:
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
           securityContext:
-            allowPrivilegeEscalation: false
-            capabilities:
-              drop:
-                - ALL
+            {{- toYaml .Values.pkiInitJob.securityContext | nindent 12 }}
           env:
             - name: POD_NAMESPACE
               valueFrom:

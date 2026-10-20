@@ -51,6 +51,21 @@ editing the TOML file, add them to `~/.config/openshell/gateway.env`:
 OPENSHELL_BIND_ADDRESS=192.168.1.10
 ```
 
+To select exact trusted runtime artifacts across the built-in Docker, Podman,
+or Kubernetes driver, set complete tagged or digest-pinned references:
+
+```shell
+OPENSHELL_SANDBOX_RUNTIME_IMAGE=registry.example.com/openshell/sandbox@sha256:<digest>
+OPENSHELL_SUPERVISOR_IMAGE=registry.example.com/openshell/supervisor@sha256:<digest>
+```
+
+`OPENSHELL_SANDBOX_RUNTIME_IMAGE` and `OPENSHELL_SUPERVISOR_IMAGE` take
+precedence over explicit image fields in the selected driver's TOML table; the
+driver TOML takes precedence over the compiled release default. Preflight and
+startup use the same resolution. These values are trusted operator inputs, not
+sandbox request fields. Keep registry credentials in Podman's credential store
+rather than embedding them in image references.
+
 To override the path to the TOML config file entirely:
 
 ```shell
@@ -66,8 +81,8 @@ systemctl --user edit openshell-gateway
 
 ## TLS (mTLS)
 
-The RPM enables mutual TLS by default. The gateway requires a valid
-client certificate for all API connections. Its primary listener uses
+The RPM enables mTLS user authentication by default. CLI clients present a valid
+client certificate; supervisors use the gateway CA and sandbox-scoped bearer tokens. Its primary listener uses
 `127.0.0.1:17670`; Podman supervisor sessions use that same listener.
 
 ### Auto-generated certificates
@@ -176,25 +191,20 @@ To disable TLS (not recommended for production):
 
 ## Sandbox TLS
 
-When mTLS is enabled, the Podman driver bind-mounts the client
-certificates into each sandbox container so the supervisor process can
-establish an mTLS connection back to the gateway.
+When TLS is enabled, the Podman driver bind-mounts the gateway CA into each
+supervisor container to authenticate the gateway. Supervisors authenticate their
+RPCs with sandbox-scoped bearer tokens. The user client certificate and private
+key are not mounted into supervisor or workload containers.
 
-The following TOML fields control the host-side paths of the client
-certificates that are mounted into sandbox containers:
+The following TOML field controls the host-side CA path:
 
 ```toml
 [openshell.gateway]
 guest_tls_ca = "/home/user/.local/state/openshell/tls/ca.crt"
-guest_tls_cert = "/home/user/.local/state/openshell/tls/client/tls.crt"
-guest_tls_key = "/home/user/.local/state/openshell/tls/client/tls.key"
 ```
 
-Inside the container, the supervisor reads them from:
-
-- `/etc/openshell/tls/client/ca.crt`
-- `/etc/openshell/tls/client/tls.crt`
-- `/etc/openshell/tls/client/tls.key`
+Inside the supervisor container, the CA is mounted at
+`/etc/openshell/tls/client/ca.crt`.
 
 On SELinux-enabled systems, the Podman driver automatically applies the
 `:z` relabel option to these bind mounts. No manual SELinux
@@ -221,14 +231,18 @@ overrides that persist across package upgrades.
 | `bind_address` | `127.0.0.1:17670` (gateway default) | Address for the primary gRPC/HTTP API listener. |
 | `compute_driver` | `"podman"` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman; legacy `compute_drivers` lists are rejected. |
 | `[openshell.drivers.podman].default_image` | `nvcr.io/nvidia/base/ubuntu:24.04` | Default sandbox image. |
-| `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Static musl sandbox runtime image mounted into Podman workloads. |
-| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Dynamic glibc supervisor image used outside the workload. |
-| `[openshell.gateway].guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Gateway-owned client TLS material injected into the selected local driver and mounted into sandbox containers. |
+| `[openshell.drivers.podman].sandbox_runtime_image` | `ghcr.io/nvidia/openshell/sandbox:latest` | Trusted sandbox runtime image. `OPENSHELL_SANDBOX_RUNTIME_IMAGE` overrides this field. |
+| `[openshell.drivers.podman].supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Trusted supervisor image. `OPENSHELL_SUPERVISOR_IMAGE` overrides this field. |
+| `[openshell.gateway].guest_tls_ca` | auto-generated path | Gateway CA injected into the selected local driver for supervisor-to-gateway TLS. Sandbox identity uses a bearer token. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 
 The database URL is not accepted in TOML. When `OPENSHELL_DB_URL` is unset,
 the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
+The SQLite database runs in WAL mode with `synchronous=FULL` (SSH session
+issuance alone uses `NORMAL`), so
+`openshell.db-wal` and `openshell.db-shm` sit next to it and must be kept
+together with it; back it up with `sqlite3 openshell.db ".backup <copy>"`.
 
 ### Driver TOML settings
 

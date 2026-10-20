@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Tracing layer that writes OCSF JSONL to a writer.
+//! Tracing layer that writes OCSF JSONL or marked console records to a writer.
 
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use chrono::Utc;
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
@@ -33,6 +34,7 @@ pub struct OcsfJsonlLayer<W: Write + Send + 'static> {
     writer: Mutex<W>,
     enabled: Option<Arc<AtomicBool>>,
     target_version: Option<Arc<Mutex<String>>>,
+    console_format: bool,
 }
 
 impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
@@ -43,6 +45,7 @@ impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
             writer: Mutex::new(writer),
             enabled: None,
             target_version: None,
+            console_format: false,
         }
     }
 
@@ -63,6 +66,16 @@ impl<W: Write + Send + 'static> OcsfJsonlLayer<W> {
     #[must_use]
     pub fn with_target_version(mut self, version: Arc<Mutex<String>>) -> Self {
         self.target_version = Some(version);
+        self
+    }
+
+    /// Prefix each compact JSON record with a UTC timestamp and `OCSF-JSON`.
+    ///
+    /// Console collectors can match the marker and decode the remainder as
+    /// JSON. File sinks retain plain JSONL unless this option is selected.
+    #[must_use]
+    pub fn with_console_format(mut self) -> Self {
+        self.console_format = true;
         self
     }
 }
@@ -108,6 +121,13 @@ where
                     Err(_) => return,
                 }
             };
+            let line = if self.console_format {
+                let ts = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+                format!("{ts} OCSF-JSON {line}")
+            } else {
+                line
+            };
+            // Submit the entire record in one write, including its newline.
             let _ = w.write_all(line.as_bytes());
         }
     }

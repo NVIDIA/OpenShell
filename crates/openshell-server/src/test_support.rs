@@ -112,6 +112,8 @@ pub enum FakeComputeDriverCall {
     StartSandbox {
         sandbox_id: String,
         sandbox_name: String,
+        isolation_backend: Option<openshell_core::proto::compute::v1::IsolationBackendRegistration>,
+        launch_authentication: Vec<u8>,
     },
     DeleteSandbox {
         sandbox_id: String,
@@ -140,6 +142,13 @@ impl Default for FakeComputeDriver {
 }
 
 impl FakeComputeDriver {
+    /// Override the handshake response to exercise gateway capability admission.
+    #[must_use]
+    pub fn with_capabilities(self, capabilities: GetCapabilitiesResponse) -> Self {
+        self.with_state(|state| state.capabilities = capabilities);
+        self
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -192,6 +201,20 @@ impl FakeComputeDriver {
     #[must_use]
     pub fn with_gateway_manages_lifecycle(self) -> Self {
         self.with_state(|state| state.capabilities.gateway_manages_lifecycle = true);
+        self
+    }
+
+    #[must_use]
+    pub fn with_isolation_backend_registration(self) -> Self {
+        self.with_state(|state| {
+            state
+                .capabilities
+                .extension
+                .as_mut()
+                .unwrap()
+                .supported_capabilities
+                .push(openshell_core::extension_protocol::COMPUTE_ISOLATION_BACKEND.into());
+        });
         self
     }
 
@@ -403,6 +426,8 @@ impl ComputeDriver for FakeComputeDriver {
             state.calls.push(FakeComputeDriverCall::StartSandbox {
                 sandbox_id: request.sandbox_id,
                 sandbox_name: request.name,
+                isolation_backend: request.isolation_backend,
+                launch_authentication: request.launch_authentication,
             });
         });
         Ok(Response::new(StartSandboxResponse::default()))

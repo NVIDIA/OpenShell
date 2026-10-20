@@ -4,7 +4,7 @@
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
-  name: {{ default (include "openshell.fullname" .) .Values.grpcRoute.gateway.name }}
+  name: {{ include "openshell.grpcRouteGatewayName" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}

@@ -41,6 +41,32 @@ use openshell_core::telemetry::TelemetryComputeDriver;
 ))]
 use openshell_server::ComputeDriverRegistration;
 use openshell_server::ComputeDriverRegistry;
+use openshell_server::config_file::OtlpConfig;
+
+#[cfg(all(
+    not(target_os = "windows"),
+    any(
+        feature = "compute-driver-docker",
+        feature = "compute-driver-kubernetes",
+        feature = "compute-driver-podman"
+    )
+))]
+/// The OCSF event export that drivers pass to supervisors, from `[otlp.ocsf]`.
+fn supervisor_ocsf_export(
+    otlp: Option<&OtlpConfig>,
+) -> Option<openshell_core::sandbox_env::OcsfOtlpExport> {
+    let ocsf = otlp?.ocsf.as_ref()?;
+    Some(openshell_core::sandbox_env::OcsfOtlpExport {
+        endpoint: ocsf.endpoint.clone(),
+        schema_version: ocsf
+            .schema_version
+            .map(|version| version.as_str().to_string()),
+    })
+}
+
+fn prefer_environment<T>(configured: T, environment: Option<T>) -> T {
+    environment.unwrap_or(configured)
+}
 
 /// Install every first-party compute driver linked into the standard gateway.
 #[must_use]
@@ -158,7 +184,7 @@ impl openshell_server::ComputeDriverFactory for MxcFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let config: openshell_driver_mxc::MxcComputeConfig = context.driver_config()?;
-        let backend = openshell_driver_mxc::MxcComputeBackend::new(config);
+        let backend = openshell_driver_mxc::MxcComputeBackend::new(context.gateway_name(), config);
         let driver = openshell_driver_mxc::ComputeDriverService::new(backend);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
@@ -187,7 +213,6 @@ fn install_in_tree_compute_drivers(registry: &mut ComputeDriverRegistry) {
         .map(|registration| {
             registration
                 .with_telemetry_category(TelemetryComputeDriver::anonymous_category("kubernetes"))
-                .without_mtls_user_auth()
                 .with_in_process_tracing(openshell_driver_kubernetes::otel_tracing::TRACING)
         }),
         #[cfg(feature = "compute-driver-podman")]
@@ -253,7 +278,13 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let config = kubernetes_config(context.config_context())?;
+        let mut config = kubernetes_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
             config,
             context.shutdown_receiver(),
@@ -273,6 +304,14 @@ fn kubernetes_config(
 ) -> openshell_core::Result<openshell_driver_kubernetes::KubernetesComputeConfig> {
     let mut config: openshell_driver_kubernetes::KubernetesComputeConfig =
         context.driver_config()?;
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+    );
     if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
         config.workspace_default_storage_size = size;
     }
@@ -297,7 +336,7 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverConfigContext<'_>,
     ) -> openshell_core::Result<()> {
-        let config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let config = docker_config(context)?;
         config.validate_configuration(context.gateway_bind_address())
     }
 
@@ -305,14 +344,15 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
         &self,
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
-        let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+        let mut config = docker_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "docker")?;
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
+        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_docker::DockerComputeDriver::new(
             context.gateway_bind_address(),
             context.gateway_log_level(),
@@ -325,6 +365,26 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             std::sync::Arc::new(driver),
         ))
     }
+}
+
+#[cfg(all(not(target_os = "windows"), feature = "compute-driver-docker"))]
+fn docker_config(
+    context: openshell_server::ComputeDriverConfigContext<'_>,
+) -> openshell_core::Result<openshell_driver_docker::DockerComputeConfig> {
+    let mut config: openshell_driver_docker::DockerComputeConfig = context.driver_config()?;
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)
+            .ok()
+            .map(Some),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV)
+            .ok()
+            .map(Some),
+    );
+    Ok(config)
 }
 
 #[cfg(all(not(target_os = "windows"), feature = "compute-driver-podman"))]
@@ -352,13 +412,14 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         context: openshell_server::ComputeDriverBuildContext<'_>,
     ) -> openshell_core::Result<openshell_server::ComputeDriverInstance> {
         let mut config = podman_config(context.config_context())?;
+        config.supervisor_otlp_endpoint = context
+            .otlp_config()
+            .and_then(OtlpConfig::traces_endpoint)
+            .map(str::to_string);
+        config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
+        config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
+        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let driver = openshell_driver_podman::PodmanComputeDriver::new(config)
             .await
             .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -375,14 +436,16 @@ fn podman_config(
 ) -> openshell_core::Result<openshell_driver_podman::PodmanComputeConfig> {
     let mut config: openshell_driver_podman::PodmanComputeConfig = context.driver_config()?;
     config.gateway_port = context.gateway_port();
+    config.sandbox_runtime_image = prefer_environment(
+        config.sandbox_runtime_image,
+        std::env::var(openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+    );
+    config.supervisor_image = prefer_environment(
+        config.supervisor_image,
+        std::env::var(openshell_core::config::SUPERVISOR_IMAGE_ENV).ok(),
+    );
     if let Ok(path) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
         config.socket_path = Some(path.into());
-    }
-    if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
-        config.host_gateway_ip = ip;
-    }
-    if let Ok(mode) = std::env::var("OPENSHELL_PODMAN_USERNS") {
-        config.userns = Some(mode);
     }
     Ok(config)
 }
@@ -396,6 +459,15 @@ struct VmFactory;
 impl openshell_server::ComputeDriverFactory for VmFactory {
     fn supports_config_preflight(&self) -> bool {
         true
+    }
+
+    async fn preflight_host_tools(
+        &self,
+        cancellation: tokio::sync::watch::Receiver<bool>,
+    ) -> openshell_core::Result<Vec<String>> {
+        openshell_core::e2fsprogs::preflight(cancellation)
+            .await
+            .map_err(openshell_core::Error::config)
     }
 
     fn validate_config(
@@ -421,7 +493,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
         let mut config = vm_config(context.config_context())?;
         require_guest_tls_for_local_driver(&context, "vm")?;
         if config.grpc_endpoint.trim().is_empty()
-            && (!context.gateway_tls_enabled() || context.guest_tls_paths().is_some())
+            && (!context.gateway_tls_enabled() || context.guest_tls_ca().is_some())
         {
             let scheme = if context.gateway_tls_enabled() {
                 "https"
@@ -430,12 +502,7 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             };
             config.grpc_endpoint = format!("{scheme}://127.0.0.1:{}", context.gateway_port());
         }
-        apply_guest_tls(
-            &mut config.guest_tls_ca,
-            &mut config.guest_tls_cert,
-            &mut config.guest_tls_key,
-            context.guest_tls_paths(),
-        );
+        apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
         let endpoint = vm::spawn(
             context.gateway_log_level(),
             context.gateway_name(),
@@ -474,7 +541,7 @@ fn require_guest_tls_for_local_driver(
 ) -> openshell_core::Result<()> {
     validate_local_driver_guest_tls(
         context.gateway_tls_enabled(),
-        context.guest_tls_paths().is_some(),
+        context.guest_tls_ca().is_some(),
         driver_name,
     )
 }
@@ -494,7 +561,7 @@ fn validate_local_driver_guest_tls(
 ) -> openshell_core::Result<()> {
     if gateway_tls_enabled && !has_guest_tls {
         return Err(openshell_core::Error::config(format!(
-            "gateway TLS requires guest_tls_ca, guest_tls_cert, and guest_tls_key in [openshell.gateway] when using the {driver_name} compute driver"
+            "gateway TLS requires guest_tls_ca in [openshell.gateway] when using the {driver_name} compute driver"
         )));
     }
     Ok(())
@@ -508,20 +575,11 @@ fn validate_local_driver_guest_tls(
         feature = "compute-driver-vm"
     )
 ))]
-fn apply_guest_tls(
-    ca: &mut Option<std::path::PathBuf>,
-    cert: &mut Option<std::path::PathBuf>,
-    key: &mut Option<std::path::PathBuf>,
-    defaults: Option<(&std::path::Path, &std::path::Path, &std::path::Path)>,
-) {
+fn apply_guest_tls(ca: &mut Option<std::path::PathBuf>, default_ca: Option<&std::path::Path>) {
     if ca.is_none()
-        && cert.is_none()
-        && key.is_none()
-        && let Some((default_ca, default_cert, default_key)) = defaults
+        && let Some(default_ca) = default_ca
     {
         *ca = Some(default_ca.to_owned());
-        *cert = Some(default_cert.to_owned());
-        *key = Some(default_key.to_owned());
     }
 }
 
@@ -550,7 +608,7 @@ mod local_driver_tests {
     }
 
     #[test]
-    fn tls_enabled_local_drivers_require_a_guest_bundle() {
+    fn tls_enabled_local_drivers_require_a_gateway_ca() {
         for driver_name in ["docker", "podman", "vm"] {
             let error = validate_local_driver_guest_tls(true, false, driver_name)
                 .expect_err("TLS-enabled local driver must require guest TLS");
@@ -559,29 +617,16 @@ mod local_driver_tests {
             assert!(message.contains("guest_tls_ca"));
         }
         validate_local_driver_guest_tls(true, true, "docker")
-            .expect("a complete guest bundle satisfies the requirement");
+            .expect("a gateway CA satisfies the requirement");
         validate_local_driver_guest_tls(false, false, "docker")
             .expect("plaintext gateways do not require guest TLS");
     }
 
     #[test]
-    fn package_managed_guest_bundle_is_injected_when_driver_paths_are_absent() {
+    fn package_managed_gateway_ca_is_injected_when_driver_path_is_absent() {
         let mut ca = None;
-        let mut cert = None;
-        let mut key = None;
-        apply_guest_tls(
-            &mut ca,
-            &mut cert,
-            &mut key,
-            Some((
-                Path::new("/managed/ca.pem"),
-                Path::new("/managed/client.pem"),
-                Path::new("/managed/client-key.pem"),
-            )),
-        );
+        apply_guest_tls(&mut ca, Some(Path::new("/managed/ca.pem")));
         assert_eq!(ca, Some(PathBuf::from("/managed/ca.pem")));
-        assert_eq!(cert, Some(PathBuf::from("/managed/client.pem")));
-        assert_eq!(key, Some(PathBuf::from("/managed/client-key.pem")));
     }
 }
 
@@ -608,6 +653,23 @@ mod windows_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(all(
+        not(target_os = "windows"),
+        any(
+            feature = "compute-driver-docker",
+            feature = "compute-driver-kubernetes",
+            feature = "compute-driver-podman"
+        )
+    ))]
+    fn runtime_image_environment_overrides_configured_value() {
+        assert_eq!(
+            prefer_environment("driver-toml", Some("process-environment")),
+            "process-environment"
+        );
+        assert_eq!(prefer_environment("driver-toml", None), "driver-toml");
+    }
 
     #[test]
     fn default_registry_contains_exactly_the_enabled_compute_drivers() {

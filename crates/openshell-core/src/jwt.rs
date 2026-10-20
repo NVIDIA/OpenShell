@@ -18,7 +18,7 @@
 #[must_use]
 pub fn parse_exp_secs(token: &str) -> Option<i64> {
     use base64::Engine;
-    let raw = token.strip_prefix("Bearer ").unwrap_or(token);
+    let raw = crate::auth::strip_bearer_scheme(token).unwrap_or(token);
     let mut parts = raw.splitn(3, '.');
     let _header = parts.next()?;
     let payload_b64 = parts.next()?;
@@ -36,9 +36,8 @@ mod session {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use jsonwebtoken::{
-        Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
-    };
+    use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode_header};
+    use openshell_crypto::jwt::{decode, encode};
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
     use zeroize::Zeroizing;
@@ -229,6 +228,88 @@ mod session {
         }
     }
 
+    /// Private SSH key material is redacted from diagnostics and cleared on drop.
+    #[derive(Clone)]
+    pub struct SecretSshHostKey(Zeroizing<String>);
+
+    impl SecretSshHostKey {
+        #[must_use]
+        pub fn new(value: String) -> Self {
+            Self(Zeroizing::new(value))
+        }
+
+        #[must_use]
+        pub fn expose_secret(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for SecretSshHostKey {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SecretSshHostKey([REDACTED])")
+        }
+    }
+
+    impl Serialize for SecretSshHostKey {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretSshHostKey {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            String::deserialize(deserializer).map(Self::new)
+        }
+    }
+
+    /// OTLP collector request headers, such as an authorization token, in
+    /// the `OTEL_EXPORTER_OTLP_HEADERS` format. Redacted from diagnostics and
+    /// cleared on drop.
+    #[derive(Clone)]
+    pub struct SecretOtlpHeaders(Zeroizing<String>);
+
+    impl SecretOtlpHeaders {
+        #[must_use]
+        pub fn new(value: String) -> Self {
+            Self(Zeroizing::new(value))
+        }
+
+        #[must_use]
+        pub fn expose_secret(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl fmt::Debug for SecretOtlpHeaders {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("SecretOtlpHeaders([REDACTED])")
+        }
+    }
+
+    impl Serialize for SecretOtlpHeaders {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.serialize_str(self.expose_secret())
+        }
+    }
+
+    impl<'de> Deserialize<'de> for SecretOtlpHeaders {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            String::deserialize(deserializer).map(Self::new)
+        }
+    }
+
     /// Trusted launch input delivered only to `openshell-supervisor`.
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -244,6 +325,13 @@ mod session {
         pub gateway_expires_at: i64,
         pub sandbox_token: SecretJwt,
         pub sandbox_expires_at: i64,
+        /// Never delivered to the workload. Missing only in older bundles.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ssh_host_private_key: Option<SecretSshHostKey>,
+        /// Headers for the OCSF OTLP collector, present only when the gateway
+        /// has them. Never delivered to the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ocsf_otlp_headers: Option<SecretOtlpHeaders>,
     }
 
     /// Gateway-created authentication input trusted by a compute driver.
@@ -299,7 +387,7 @@ mod session {
 
     impl SupervisorAuthBundle {
         pub fn validate(&self) -> Result<(), SessionJwtError> {
-            if self.gateway_expires_at <= 0 || self.sandbox_expires_at <= 0 {
+            if self.gateway_expires_at < 0 || self.sandbox_expires_at < 0 {
                 return Err(SessionJwtError::InvalidLifetime);
             }
             SandboxGenerationId::parse(self.runtime_generation.to_string())
@@ -329,6 +417,8 @@ mod session {
                 .field("gateway_expires_at", &self.gateway_expires_at)
                 .field("sandbox_token", &"[REDACTED]")
                 .field("sandbox_expires_at", &self.sandbox_expires_at)
+                .field("ssh_host_private_key", &self.ssh_host_private_key)
+                .field("ocsf_otlp_headers", &self.ocsf_otlp_headers)
                 .finish()
         }
     }
@@ -385,7 +475,7 @@ mod session {
             expires_at: i64,
             credential_epoch: CredentialEpoch,
         ) -> Result<(), SessionJwtError> {
-            if expires_at <= 0 {
+            if expires_at < 0 {
                 return Err(SessionJwtError::InvalidLifetime);
             }
             let mut stored = self
@@ -439,7 +529,7 @@ mod session {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let stored = stored.as_ref().ok_or(SessionJwtError::TokenUnavailable)?;
-            if stored.expires_at <= SystemJwtClock.now_unix_seconds() {
+            if stored.expires_at > 0 && stored.expires_at <= SystemJwtClock.now_unix_seconds() {
                 return Err(SessionJwtError::Expired);
             }
             format!("Bearer {}", stored.token.expose_secret())
@@ -487,7 +577,7 @@ mod session {
         encoding_key: EncodingKey,
         key_id: String,
         issuer: String,
-        ttl: Duration,
+        ttl: Option<Duration>,
         clock: Arc<dyn JwtClock>,
     }
 
@@ -507,11 +597,13 @@ mod session {
             signing_key_pem: &[u8],
             key_id: impl Into<String>,
             gateway_id: &str,
-            ttl: Duration,
+            ttl: Option<Duration>,
             clock: Arc<dyn JwtClock>,
         ) -> Result<Self, SessionJwtError> {
             install_crypto_provider();
-            validate_ttl(ttl)?;
+            if let Some(ttl) = ttl {
+                validate_ttl(ttl)?;
+            }
             let key_id = validate_key_id(key_id.into())?;
             let gateway_id = validate_gateway_id(gateway_id)?;
             let encoding_key = EncodingKey::from_ed_pem(signing_key_pem)
@@ -583,9 +675,9 @@ mod session {
             token_id: Uuid,
             issued_at: i64,
         ) -> Result<MintedSessionToken, SessionJwtError> {
-            let expires_at = issued_at.saturating_add(
-                i64::try_from(self.ttl.as_secs()).map_err(|_| SessionJwtError::InvalidLifetime)?,
-            );
+            let expires_at = self.ttl.map_or(0, |ttl| {
+                issued_at.saturating_add(i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX))
+            });
             let claims = SessionClaims {
                 iss: self.issuer.clone(),
                 sub: format!("{SANDBOX_SUBJECT_PREFIX}{}", identity.sandbox_id),
@@ -718,20 +810,22 @@ mod session {
             SandboxGenerationId::parse(claims.runtime_generation.to_string())
                 .map_err(|_| SessionJwtError::InvalidRuntimeIdentity)?;
             let token_id = Uuid::parse_str(&claims.jti).map_err(|_| SessionJwtError::InvalidJti)?;
-            if claims.exp <= claims.iat {
-                return Err(SessionJwtError::InvalidLifetime);
-            }
-            let lifetime = claims.exp.saturating_sub(claims.iat);
-            if lifetime > i64::try_from(MAX_SESSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
-                return Err(SessionJwtError::InvalidLifetime);
-            }
             let now = self.clock.now_unix_seconds();
             let leeway = i64::try_from(MAX_SESSION_CLOCK_LEEWAY.as_secs()).unwrap_or(30);
             if claims.iat > now.saturating_add(leeway) {
                 return Err(SessionJwtError::IssuedInFuture);
             }
-            if claims.exp < now.saturating_sub(leeway) {
-                return Err(SessionJwtError::Expired);
+            if claims.exp != 0 {
+                if claims.exp <= claims.iat {
+                    return Err(SessionJwtError::InvalidLifetime);
+                }
+                let lifetime = claims.exp.saturating_sub(claims.iat);
+                if lifetime > i64::try_from(MAX_SESSION_TOKEN_TTL.as_secs()).unwrap_or(i64::MAX) {
+                    return Err(SessionJwtError::InvalidLifetime);
+                }
+                if claims.exp < now.saturating_sub(leeway) {
+                    return Err(SessionJwtError::Expired);
+                }
             }
             Ok(AuthenticatedSandboxSession {
                 sandbox_id: claims.sandbox_id,
@@ -772,7 +866,7 @@ mod session {
         InvalidSigningKey,
         #[error("Ed25519 verification key is invalid")]
         InvalidVerificationKey,
-        #[error("session token lifetime must be between 60 and 3600 seconds")]
+        #[error("session token lifetime must be non-expiring or between 60 and 3600 seconds")]
         InvalidLifetime,
         #[error("session token profile does not match its claims")]
         ProfileMismatch,
@@ -807,7 +901,7 @@ mod session {
     }
 
     fn install_crypto_provider() {
-        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+        openshell_crypto::install_jwt_provider();
     }
 
     fn validate_ttl(ttl: Duration) -> Result<(), SessionJwtError> {
@@ -875,6 +969,7 @@ mod tests {
             sub: None,
         });
         assert_eq!(parse_exp_secs(&format!("Bearer {token}")), Some(42));
+        assert_eq!(parse_exp_secs(&format!("bearer {token}")), Some(42));
     }
 
     #[test]
@@ -894,8 +989,9 @@ mod tests {
     mod session_tests {
         use std::sync::Arc;
 
-        use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
-        use rcgen::{KeyPair, PKCS_ED25519};
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        use openshell_crypto::jwt::encode;
+        use rcgen::PKCS_ED25519;
         use serde::Serialize;
 
         use super::super::session::*;
@@ -917,14 +1013,15 @@ mod tests {
             SessionJwtVerifier,
             SandboxRuntimeIdentity,
         ) {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate Ed25519 key");
             let public_key_pem = key.public_key_pem().into_bytes();
             let clock: Arc<dyn JwtClock> = Arc::new(FixedClock(1_900_000_000));
             let issuer = SessionJwtIssuer::from_ed25519_pem(
-                key.serialize_pem().as_bytes(),
+                key.serialize_pem().unwrap().as_bytes(),
                 "current",
                 "test",
-                DEFAULT_SESSION_TOKEN_TTL,
+                Some(DEFAULT_SESSION_TOKEN_TTL),
                 clock.clone(),
             )
             .expect("issuer");
@@ -977,6 +1074,67 @@ mod tests {
         }
 
         #[test]
+        fn non_expiring_session_tokens_remain_usable() {
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate Ed25519 key");
+            let public_key_pem = key.public_key_pem().into_bytes();
+            let issuer = SessionJwtIssuer::from_ed25519_pem(
+                key.serialize_pem().unwrap().as_bytes(),
+                "current",
+                "test",
+                None,
+                Arc::new(FixedClock(1_900_000_000)),
+            )
+            .expect("issuer");
+            let verifier = SessionJwtVerifier::new(
+                "test",
+                SessionTokenProfile::Sandbox,
+                [SessionVerificationKey {
+                    key_id: "current".to_string(),
+                    public_key_pem,
+                }],
+                Arc::new(FixedClock(2_000_000_000)),
+            )
+            .expect("verifier");
+            let identity = SandboxRuntimeIdentity {
+                sandbox_id: SandboxId::parse("sandbox-a").expect("sandbox ID"),
+                runtime_generation: SandboxGenerationId::parse("generation-1")
+                    .expect("runtime generation"),
+                auth_epoch: CredentialEpoch::new(1).expect("auth epoch"),
+            };
+            let pair = issuer.mint_pair(&identity).expect("token pair");
+
+            assert_eq!(pair.gateway.expires_at, 0);
+            assert_eq!(pair.sandbox.expires_at, 0);
+            verifier
+                .verify(pair.sandbox.token.expose_secret())
+                .expect("non-expiring token remains valid");
+
+            let slot = SessionBearerTokenSlot::new(
+                pair.sandbox.token.clone(),
+                pair.sandbox.expires_at,
+                pair.auth_epoch,
+            )
+            .expect("non-expiring bearer slot");
+            slot.authorization_metadata()
+                .expect("non-expiring bearer remains available");
+
+            let bundle = SupervisorAuthBundle {
+                session_id: SandboxSessionId::new(),
+                session_rotation: SessionRotation::new(1).expect("session rotation"),
+                runtime_generation: identity.runtime_generation,
+                auth_epoch: pair.auth_epoch,
+                gateway_token: pair.gateway.token,
+                gateway_expires_at: pair.gateway.expires_at,
+                sandbox_token: pair.sandbox.token,
+                sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: None,
+                ocsf_otlp_headers: None,
+            };
+            bundle.validate().expect("non-expiring auth bundle");
+        }
+
+        #[test]
         fn token_debug_is_redacted() {
             let (issuer, _gateway, _sandbox, identity) = fixture();
             let pair = issuer.mint_pair(&identity).expect("token pair");
@@ -998,6 +1156,12 @@ mod tests {
                 gateway_expires_at: pair.gateway.expires_at,
                 sandbox_token: pair.sandbox.token,
                 sandbox_expires_at: pair.sandbox.expires_at,
+                ssh_host_private_key: Some(SecretSshHostKey::new(
+                    "private-ssh-host-key".to_string(),
+                )),
+                ocsf_otlp_headers: Some(SecretOtlpHeaders::new(
+                    "authorization=collector-token".to_string(),
+                )),
             };
 
             let encoded = serde_json::to_vec(&bundle).expect("serialize auth bundle");
@@ -1016,7 +1180,24 @@ mod tests {
             let debug = format!("{bundle:?}");
             assert!(!debug.contains(bundle.gateway_token.expose_secret()));
             assert!(!debug.contains(bundle.sandbox_token.expose_secret()));
-            assert_eq!(debug.matches("[REDACTED]").count(), 2);
+            assert!(!debug.contains("private-ssh-host-key"));
+            assert!(!debug.contains("collector-token"));
+            assert_eq!(debug.matches("[REDACTED]").count(), 4);
+            assert_eq!(
+                decoded.ssh_host_private_key.unwrap().expose_secret(),
+                "private-ssh-host-key"
+            );
+            assert_eq!(
+                decoded.ocsf_otlp_headers.unwrap().expose_secret(),
+                "authorization=collector-token"
+            );
+            let mut legacy = serde_json::to_value(&bundle).unwrap();
+            let fields = legacy.as_object_mut().unwrap();
+            fields.remove("ssh_host_private_key");
+            fields.remove("ocsf_otlp_headers");
+            let legacy: SupervisorAuthBundle = serde_json::from_value(legacy).unwrap();
+            assert!(legacy.ssh_host_private_key.is_none());
+            assert!(legacy.ocsf_otlp_headers.is_none());
         }
 
         #[derive(Serialize)]
@@ -1035,7 +1216,8 @@ mod tests {
 
         #[test]
         fn audience_arrays_are_rejected() {
-            let key = KeyPair::generate_for(&PKCS_ED25519).expect("generate Ed25519 key");
+            let key = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519)
+                .expect("generate Ed25519 key");
             let clock: Arc<dyn JwtClock> = Arc::new(FixedClock(1_900_000_000));
             let verifier = SessionJwtVerifier::new(
                 "test",
@@ -1065,7 +1247,8 @@ mod tests {
             let token = encode(
                 &header,
                 &claims,
-                &EncodingKey::from_ed_pem(key.serialize_pem().as_bytes()).expect("encoding key"),
+                &EncodingKey::from_ed_pem(key.serialize_pem().unwrap().as_bytes())
+                    .expect("encoding key"),
             )
             .expect("token");
             assert_eq!(verifier.verify(&token), Err(SessionJwtError::InvalidToken));

@@ -15,6 +15,7 @@ name = "openshell"
 path = "src/main.rs"
 
 [dependencies]
+openshell-crypto = { workspace = true }
 openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-core = { path = "../openshell-core", default-features = false }
 openshell-policy = { path = "../openshell-policy" }
@@ -24,6 +25,7 @@ openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 
 # Async runtime
@@ -49,7 +51,7 @@ bytes = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging", "aws-lc-rs"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
@@ -87,7 +89,7 @@ tracing-subscriber = { workspace = true }
 workspace = true
 
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+nix = { workspace = true, features = ["poll"] }
 
 [dev-dependencies]
 # Tests import the example profiles from providers/ the way an operator

@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::enums::DeviceTypeId;
+use crate::enums::{DeviceTypeId, OsTypeId};
 
 /// OCSF Device object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +38,43 @@ pub struct Device {
 pub struct OsInfo {
     /// OS name (e.g., "Linux").
     pub name: String,
+
+    /// OS type id. Required by the OCSF schema.
+    pub type_id: OsTypeId,
+
+    /// Sibling label for `type_id`; the platform name when `type_id` is Other.
+    #[serde(rename = "type")]
+    pub type_label: String,
+}
+
+impl OsInfo {
+    /// OS info for a `std::env::consts::OS` value.
+    #[must_use]
+    pub fn for_target(os: &str) -> Self {
+        let type_id = match os {
+            "linux" => OsTypeId::Linux,
+            "windows" => OsTypeId::Windows,
+            "macos" => OsTypeId::MacOs,
+            _ => OsTypeId::Other,
+        };
+        let name = Self::pretty_name(os).to_string();
+        Self {
+            type_label: name.clone(),
+            name,
+            type_id,
+        }
+    }
+
+    /// Display name for a `std::env::consts::OS` value.
+    #[must_use]
+    pub fn pretty_name(os: &str) -> &str {
+        match os {
+            "linux" => "Linux",
+            "windows" => "Windows",
+            "macos" => "macOS",
+            other => other,
+        }
+    }
 }
 
 impl Device {
@@ -50,9 +87,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo {
-                name: "Linux".to_string(),
-            }),
+            os: Some(OsInfo::for_target("linux")),
         }
     }
 
@@ -65,9 +100,7 @@ impl Device {
             uid: None,
             type_id: DeviceTypeId::Other,
             type_label: "Sandbox".to_string(),
-            os: Some(OsInfo {
-                name: "Windows".to_string(),
-            }),
+            os: Some(OsInfo::for_target("windows")),
         }
     }
 
@@ -85,6 +118,20 @@ impl Device {
         #[cfg(not(target_os = "windows"))]
         {
             Self::linux(hostname)
+        }
+    }
+
+    /// Create the device for a gateway replica.
+    #[must_use]
+    pub fn gateway(hostname: &str, name: &str) -> Self {
+        Self {
+            hostname: hostname.to_string(),
+            type_id: DeviceTypeId::Server,
+            type_label: DeviceTypeId::Server.to_string(),
+            name: Some(name.to_string()),
+            // Operators assign a unique name per installation; replicas share this UID.
+            uid: Some(name.to_string()),
+            os: Some(OsInfo::for_target(std::env::consts::OS)),
         }
     }
 }
@@ -139,5 +186,82 @@ mod tests {
         let decoded: Device = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(decoded, device);
         assert_eq!(serde_json::to_value(&decoded).unwrap(), json);
+    }
+
+    #[test]
+    fn os_pretty_names_capitalize_known_platforms() {
+        for (os, expected) in [
+            ("linux", "Linux"),
+            ("windows", "Windows"),
+            ("macos", "macOS"),
+            ("freebsd", "freebsd"),
+        ] {
+            assert_eq!(OsInfo::pretty_name(os), expected);
+        }
+    }
+
+    #[test]
+    fn os_type_follows_the_target_os() {
+        for (target, name, type_id, type_label) in [
+            ("linux", "Linux", 200, "Linux"),
+            ("windows", "Windows", 100, "Windows"),
+            ("macos", "macOS", 300, "macOS"),
+            ("freebsd", "freebsd", 99, "freebsd"),
+        ] {
+            let json = serde_json::to_value(OsInfo::for_target(target)).unwrap();
+            assert_eq!(json["name"], name);
+            assert_eq!(json["type_id"], type_id);
+            assert_eq!(json["type"], type_label);
+        }
+    }
+
+    #[test]
+    fn device_os_matches_vendored_schema() {
+        use crate::validation::schema::{
+            load_object_schema, validate_enum_value, validate_known_fields,
+            validate_required_fields,
+        };
+
+        let schema = load_object_schema("os");
+        for device in [
+            Device::linux("sandbox"),
+            Device::windows("sandbox"),
+            Device::for_current_os("sandbox"),
+            Device::gateway("gateway-0", "production"),
+        ] {
+            let os = serde_json::to_value(device.os).unwrap();
+            validate_required_fields(&os, &schema);
+            validate_known_fields(&os, &schema);
+            validate_enum_value(&os, "type_id", &schema);
+        }
+    }
+
+    #[test]
+    fn gateway_device_does_not_inherit_the_sandbox_type() {
+        let json = serde_json::to_value(Device::gateway("gateway-0", "production")).unwrap();
+
+        assert_eq!(json["type_id"], 1);
+        assert_eq!(json["type"], "Server");
+    }
+
+    #[test]
+    fn gateway_installations_with_identical_hostnames_have_distinct_uids() {
+        let first = Device::gateway("openshell-gateway-0", "production");
+        let second = Device::gateway("openshell-gateway-0", "staging");
+
+        assert_eq!(first.uid.as_deref(), Some("production"));
+        assert_eq!(second.uid.as_deref(), Some("staging"));
+        assert_ne!(first.uid, second.uid);
+        assert_eq!(first.hostname, second.hostname);
+    }
+
+    #[test]
+    fn gateway_replicas_share_the_installation_uid() {
+        let first = Device::gateway("openshell-gateway-0", "production");
+        let second = Device::gateway("openshell-gateway-1", "production");
+
+        assert_eq!(first.uid.as_deref(), Some("production"));
+        assert_eq!(first.uid, second.uid);
+        assert_ne!(first.hostname, second.hostname);
     }
 }

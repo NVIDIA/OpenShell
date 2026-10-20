@@ -21,6 +21,18 @@ Windows MSVC for the supported deliverables:
 It intentionally does not make Windows a Docker, Kubernetes, Podman, or VM
 runtime host.
 
+The supervisor and supervisor-process libraries participate in native Windows
+checks and tests. Their gateway session, boundary attachment, and TCP readiness
+are portable; only the optional Unix SSH/readiness socket adapters are gated.
+This is compile and control-plane coverage, not Windows isolation qualification.
+Preserve readiness gating on authenticated gateway acceptance and reconnection.
+The supervisor process-access multiplexer consumes boundary-provided streams;
+do not restore local PID, PTY, or process-group operations there. Native process
+mechanics belong to the sandbox or isolation backend. Keep the optional Unix
+SSH access adapter separate from portable session orchestration.
+Shared Sandbox Protocol audit validation defaults to strict Linux evidence;
+concrete platform validators must be selected by the implementing backend.
+
 ## Current Repository Shape
 
 The Windows build lane is implemented by these tracked files:
@@ -31,7 +43,6 @@ The Windows build lane is implemented by these tracked files:
 | `tasks/rust.toml`, `tasks/test.toml`, and `tasks/markdown.toml` | Windows routing for compiler-bearing checks, explicit Unix-only test skips, and Markdown dependency setup. |
 | `tasks/scripts/windows-msvc.ps1` | PowerShell wrapper that enters the Visual Studio developer environment and invokes Cargo. |
 | `.github/workflows/windows-msvc.yml` | Opt-in PR lint and test plus advisory `windows` branch cache seeding and dependent binary builds on native x64 and ARM64 runners. |
-| `architecture/windows-msvc-build.md` | Design notes and validation contract. |
 | `.agents/skills/build-openshell-mxc-windows/` | This skill and companion reference material. |
 
 Use the code that is already in the repo. Do not generate a parallel Windows
@@ -216,8 +227,8 @@ compatibility under emulation is not part of these tasks. The aggregate
 commands above on an ARM64 host.
 
 The repository-wide `mise run pre-commit` task is also supported on Windows.
-Run `rust:lockfiles:check`, `sdk:ts:ci`, `go:ci`, and `test:e2e-parity` through
-the Windows-aware tasks when validating those surfaces. Do not count the Go
+Run `rust:lockfiles:check`, `sdk:ts:ci`, and `go:ci` through the Windows-aware
+tasks when validating those surfaces. Do not count the Go
 Windows ARM64 race-detector exclusion or POSIX permission-bit skips as security
 coverage. SDK test dependencies must remain at their lockfile versions.
 Its Rust check, Clippy, and test dependencies enter the same MSVC environment
@@ -266,7 +277,7 @@ MXC on Windows. Each other `compute-driver-*` feature installs its own Windows
 rejection stub without linking that driver crate. The default
 `in-tree-compute-drivers` alias enables all five features. An MXC-only build
 uses `--no-default-features --features compute-driver-mxc` (add `telemetry`
-and `bundled-z3` as needed).
+and `openshell-server/prebuilt-z3` as needed).
 
 | Driver | Windows build behavior | Runtime behavior |
 |---|---|---|

@@ -21,19 +21,8 @@ import time
 from collections import namedtuple
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Generic,
-    Never,
-    SupportsIndex,
-    TypeVar,
-    cast,
-)
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+from enum import Enum, IntEnum
+from typing import TYPE_CHECKING, Any, Generic, Never, SupportsIndex, TypeVar, cast
 from urllib.parse import urlparse
 
 import grpc
@@ -131,6 +120,12 @@ def _service_exposure_messages(
         openshell_pb2.SandboxServiceExposure(
             service=exposure.service,
             target_port=exposure.target_port,
+            authorization_mode=(
+                openshell_pb2.SERVICE_AUTHORIZATION_MODE_BEARER_PASSTHROUGH
+                if exposure.authorization_mode
+                == ServiceAuthorizationMode.BEARER_PASSTHROUGH
+                else openshell_pb2.SERVICE_AUTHORIZATION_MODE_STRIP
+            ),
         )
         for exposure in exposures or ()
     ]
@@ -142,7 +137,9 @@ class _ClientCallDetails(_ClientCallDetailsBase, grpc.ClientCallDetails):
 
 if TYPE_CHECKING:
     import builtins
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
+
+    from .providers import ProviderClient
 
 
 @dataclass(frozen=True)
@@ -460,10 +457,30 @@ class ClientCredentialsAuth:
 
 
 @dataclass(frozen=True)
+class SandboxConditionRef:
+    type: str
+    status: str
+    reason: str = ""
+    message: str = ""
+    transition_time_ms: int | None = None
+
+
+@dataclass(frozen=True)
 class SandboxStatusRef:
     phase: int
     current_policy_version: int
     exit_code: int | None = None
+    restart_count: int = 0
+    next_restart_at_ms: int | None = None
+    main_process_started_at_ms: int | None = None
+    conditions: tuple[SandboxConditionRef, ...] = ()
+
+
+class ServiceAuthorizationMode(IntEnum):
+    """Handling for an incoming application Authorization header."""
+
+    STRIP = 1
+    BEARER_PASSTHROUGH = 2
 
 
 @dataclass(frozen=True)
@@ -472,6 +489,7 @@ class ServiceExposure:
 
     target_port: int
     service: str = ""
+    authorization_mode: ServiceAuthorizationMode = ServiceAuthorizationMode.STRIP
 
 
 class _ImmutableLabels(dict[str, str]):
@@ -519,6 +537,8 @@ class SandboxRef:
     service_urls: Mapping[str, str] = field(
         default_factory=_ImmutableLabels, compare=False
     )
+    # Stable SSH host identity; absent on older runtimes.
+    host_key_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "labels", _ImmutableLabels(self.labels))
@@ -531,6 +551,10 @@ class SandboxRef:
     @property
     def current_policy_version(self) -> int:
         return self.status.current_policy_version
+
+    @property
+    def conditions(self) -> tuple[SandboxConditionRef, ...]:
+        return self.status.conditions
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1085,12 @@ class SandboxClient:
 
     def sandbox_templates(self) -> SandboxTemplateClient:
         return SandboxTemplateClient(self._channel, timeout=self._timeout)
+
+    def providers(self) -> ProviderClient:
+        """Reuse this transport for provider operations; no sandbox is required."""
+        from .providers import ProviderClient
+
+        return ProviderClient(self._channel, timeout=self._timeout)
 
     def get(self, name: str, *, workspace: str) -> SandboxRef:
         response = self._stub.GetSandbox(
@@ -1911,7 +1941,7 @@ class Sandbox:
                 "name, labels, and workload_template cannot be set when attaching to an existing sandbox"
             )
 
-        client = SandboxClient.from_active_cluster(
+        self._client = SandboxClient.from_active_cluster(
             cluster=self._cluster,
             timeout=self._timeout,
             auto_refresh=self._auto_refresh,
@@ -1919,8 +1949,17 @@ class Sandbox:
             insecure=self._insecure,
             client_credentials=self._client_credentials,
         )
-        self._client = client
+        try:
+            self._open_session(self._client)
+        except BaseException:
+            # Python skips __exit__ when __enter__ raises, so release here
+            # and keep the original error even if the close fails.
+            with contextlib.suppress(Exception):
+                self._release()
+            raise
+        return self
 
+    def _open_session(self, client: SandboxClient) -> None:
         if self._sandbox_input is None and self._workload_template is not None:
             self._session = client.create_session_from_template(
                 workspace=self._workspace,
@@ -1952,7 +1991,12 @@ class Sandbox:
         )
         self._session = SandboxSession(client, ready)
 
-        return self
+    def _release(self) -> None:
+        client = self._client
+        self._session = None
+        self._client = None
+        if client is not None:
+            client.close()
 
     def __exit__(self, *args: object) -> None:
         try:
@@ -1976,10 +2020,7 @@ class Sandbox:
                         f"unsupported deletion outcome: {result.outcome}"
                     )
         finally:
-            if self._client is not None:
-                self._client.close()
-            self._session = None
-            self._client = None
+            self._release()
 
     def exec(
         self,
@@ -2054,6 +2095,25 @@ def _serialize_python_callable(
     return base64.b64encode(payload).decode("ascii")
 
 
+def _sandbox_conditions(
+    status: openshell_pb2.SandboxStatus | None,
+) -> tuple[SandboxConditionRef, ...]:
+    if status is None:
+        return ()
+    return tuple(
+        SandboxConditionRef(
+            type=condition.type,
+            status=condition.status,
+            reason=condition.reason,
+            message=condition.message,
+            transition_time_ms=condition.transition_time.ToMilliseconds()
+            if condition.HasField("transition_time")
+            else None,
+        )
+        for condition in status.conditions
+    )
+
+
 def _sandbox_ref(
     sandbox: openshell_pb2.Sandbox,
     service_urls: Mapping[str, str] | None = None,
@@ -2077,10 +2137,19 @@ def _sandbox_ref(
             exit_code=status.exit_code
             if status is not None and status.HasField("exit_code")
             else None,
+            restart_count=status.restart_count if status is not None else 0,
+            next_restart_at_ms=status.next_restart_time.ToMilliseconds()
+            if status is not None and status.HasField("next_restart_time")
+            else None,
+            main_process_started_at_ms=status.main_process_started_time.ToMilliseconds()
+            if status is not None and status.HasField("main_process_started_time")
+            else None,
+            conditions=_sandbox_conditions(status),
         ),
         labels=sandbox.metadata.labels if sandbox.metadata else {},
         created_from_workload_template=provenance,
         service_urls=service_urls or {},
+        host_key_fingerprint=sandbox.host_key_fingerprint or None,
     )
 
 
