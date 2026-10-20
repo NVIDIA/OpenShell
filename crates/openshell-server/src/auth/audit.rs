@@ -12,10 +12,14 @@ use openshell_ocsf::{
     DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpMethod, HttpRequest,
     ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
 };
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use super::principal::Principal;
+use super::identity::IdentityProvider;
+use super::principal::{Principal, SandboxIdentitySource};
 
 /// Where a gateway connection came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +60,7 @@ impl RequestOrigin {
     }
 }
 
-use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthFailureReason, AuthMechanism, bearer_credential};
 
 fn category(reason: AuthFailureReason) -> &'static str {
     match reason {
@@ -124,6 +128,159 @@ pub fn emit_authentication_failure(
     })
     .message(format!("authentication failed: {}", category(reason)));
     if let Some(mechanism) = mechanism {
+        builder = with_protocol(builder, mechanism);
+    }
+    if let Some(source) = origin.source {
+        builder = builder.src_endpoint(source.endpoint());
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
+    }
+    ocsf_emit!(builder.build());
+}
+
+/// How long a credential stays logged on before its next use records a new
+/// logon.
+const LOGON_WINDOW: Duration = Duration::from_hours(1);
+
+/// Credentials tracked at once. When full, the oldest logon is forgotten
+/// early, so a busy gateway records some credentials more than once an hour.
+const MAX_LOGONS: usize = 16_384;
+
+/// Credentials that have recently authenticated, shared by every connection
+/// to this gateway replica.
+///
+/// Every request authenticates, so recording each one would bury user logons
+/// under supervisor polling. A credential instead records one logon when the
+/// replica first accepts it, and again after [`LOGON_WINDOW`] if still in use.
+#[derive(Debug, Clone, Default)]
+pub struct Logons(Arc<Mutex<LogonState>>);
+
+#[derive(Debug, Default)]
+struct LogonState {
+    active: HashSet<[u8; 32]>,
+    by_age: VecDeque<([u8; 32], Instant)>,
+}
+
+impl Logons {
+    /// Record a logon for `credential` at `now`, returning whether it is new.
+    fn log_on(&self, credential: [u8; 32], now: Instant) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let LogonState { active, by_age } = &mut *state;
+        while let Some(&(oldest, at)) = by_age.front() {
+            if now.saturating_duration_since(at) < LOGON_WINDOW {
+                break;
+            }
+            by_age.pop_front();
+            active.remove(&oldest);
+        }
+        if active.contains(&credential) {
+            return false;
+        }
+        // Only a new credential makes room, so polling a full record of
+        // credentials that are still logged on records nothing.
+        if by_age.len() >= MAX_LOGONS
+            && let Some((oldest, _)) = by_age.pop_front()
+        {
+            active.remove(&oldest);
+        }
+        active.insert(credential);
+        by_age.push_back((credential, now));
+        true
+    }
+}
+
+/// Whether the gateway verified a credential to establish `principal`.
+fn authenticated(principal: &Principal) -> bool {
+    match principal {
+        Principal::User(user) => user.identity.provider != IdentityProvider::LocalDev,
+        Principal::Anonymous => false,
+        Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => true,
+    }
+}
+
+/// The mechanism that established `principal`, when it has an audit label.
+fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
+    match principal {
+        Principal::Operator(_) => Some(AuthMechanism::Mtls),
+        Principal::User(user) => match user.identity.provider {
+            IdentityProvider::Oidc => Some(AuthMechanism::Oidc),
+            IdentityProvider::Mtls => Some(AuthMechanism::Mtls),
+            IdentityProvider::CloudflareAccess | IdentityProvider::LocalDev => None,
+        },
+        Principal::Sandbox(sandbox) => Some(match sandbox.source {
+            SandboxIdentitySource::BootstrapJwt { .. } => AuthMechanism::SandboxJwt,
+            SandboxIdentitySource::ComputeDriver { .. } => AuthMechanism::ComputeDriver,
+        }),
+        Principal::Peer(_) => Some(AuthMechanism::GatewayPeer),
+        Principal::Anonymous => None,
+    }
+}
+
+/// A digest identifying the credential that established `principal`: the
+/// operator's or mTLS user's certificate, or the bearer token.
+///
+/// Only verified material goes in, so headers the authenticator ignored
+/// cannot make a new logon.
+fn credential_digest(
+    principal: &Principal,
+    headers: &http::HeaderMap,
+    peer_certificate_sha256: Option<&str>,
+) -> Option<[u8; 32]> {
+    let mut material = principal.audit_actor().into_bytes();
+    material.push(0);
+    match principal {
+        Principal::Operator(operator) => {
+            material.extend_from_slice(operator.certificate_sha256.as_bytes());
+        }
+        Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
+            material.extend_from_slice(peer_certificate_sha256.unwrap_or_default().as_bytes());
+        }
+        _ => {
+            if let Some(token) = bearer_credential(headers) {
+                material.extend_from_slice(token.as_bytes());
+            }
+        }
+    }
+    openshell_crypto::sha256(&material).ok()
+}
+
+/// Emit an Authentication logon event for a request to `path` that
+/// authenticated as `principal`, unless its credential is already logged on.
+///
+/// `peer_certificate_sha256` fingerprints the connection's verified client
+/// certificate, which identifies an mTLS user's credential.
+pub fn emit_logon(
+    logons: &Logons,
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    headers: &http::HeaderMap,
+    peer_certificate_sha256: Option<&str>,
+) {
+    // Without a digest the credential cannot be deduplicated, so it logs on.
+    if !authenticated(principal)
+        || credential_digest(principal, headers, peer_certificate_sha256)
+            .is_some_and(|digest| !logons.log_on(digest, Instant::now()))
+    {
+        return;
+    }
+    let ctx = crate::gateway_ocsf::context("", "");
+    let mut builder = AuthenticationBuilder::new(
+        &ctx,
+        principal_user(principal),
+        Service::new("openshell-gateway"),
+    )
+    .action(ActionId::Allowed)
+    .disposition(DispositionId::Allowed)
+    .severity(SeverityId::Informational)
+    .status(StatusId::Success)
+    .http_request(HttpRequest {
+        http_method: HttpMethod::Post,
+        url: Some(Url::from_path(path)),
+    })
+    .message("authentication succeeded");
+    if let Some(mechanism) = mechanism(principal) {
         builder = with_protocol(builder, mechanism);
     }
     if let Some(source) = origin.source {
@@ -372,5 +529,45 @@ pub fn emit_authorization_denial_for(
             finding = finding.correlation_uid(uid);
         }
         ocsf_emit!(finding.build());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_logs_on_again_after_the_window() {
+        let logons = Logons::default();
+        let start = Instant::now();
+
+        assert!(logons.log_on([1; 32], start));
+        assert!(!logons.log_on([1; 32], start + Duration::from_mins(59)));
+        assert!(logons.log_on([1; 32], start + LOGON_WINDOW));
+    }
+
+    #[test]
+    fn oldest_credential_is_forgotten_when_full() {
+        let logons = Logons::default();
+        let now = Instant::now();
+        let credential = |n: usize| {
+            let mut digest = [0; 32];
+            digest[..8].copy_from_slice(&n.to_le_bytes());
+            digest
+        };
+        for n in 0..MAX_LOGONS {
+            assert!(logons.log_on(credential(n), now));
+        }
+        // Polling every credential in turn while full is not a new logon.
+        for n in 0..MAX_LOGONS {
+            assert!(!logons.log_on(credential(n), now), "credential {n}");
+        }
+
+        assert!(logons.log_on(credential(MAX_LOGONS), now));
+        assert!(logons.log_on(credential(0), now), "oldest was evicted");
+        assert!(
+            !logons.log_on(credential(MAX_LOGONS), now),
+            "newest was kept"
+        );
     }
 }

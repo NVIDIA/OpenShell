@@ -60,7 +60,7 @@ OpenShell maps sandbox events to these OCSF classes:
 | `SSH:` | SSH Activity | 4007 | SSH handshakes, authentication, channel operations |
 | `PROC:` | Process Activity | 1007 | Process start, exit, timeout, signal failures |
 | `FINDING:` | Detection Finding | 2004 | Security findings (nonce replay, proxy bypass, unsafe policy) |
-| `AUTH:` | Authentication | 3002 | Gateway authentication failures |
+| `AUTH:` | Authentication | 3002 | Gateway authentication failures and credential logons |
 | `API:` | API Activity | 6003 | Inference calls, gateway authorization denials |
 | `CONFIG:` | Device Config State Change | 5019 | Policy load/reload, Landlock, TLS setup, provider and settings changes |
 | `LIFECYCLE:` | Application Lifecycle | 6002 | Sandbox supervisor start, SSH server ready |
@@ -113,6 +113,12 @@ A gateway request rejected because it presented no credential:
 
 ```text
 OCSF AUTH:LOGON [LOW] DENIED unknown [op:/openshell.v1.OpenShell/ListSandboxes reason:missing_credential]
+```
+
+The first request a gateway replica accepts with a user's OIDC token:
+
+```text
+OCSF AUTH:LOGON [INFO] ALLOWED user:8d2f6b1c-3e4a-4f5b-9c7d-0a1b2c3d4e5f from 203.0.113.7:51234 [protocol:OpenID op:/openshell.v1.OpenShell/ListSandboxes]
 ```
 
 A sandbox credential used to read another sandbox's configuration:
