@@ -16,7 +16,7 @@ merges, cuts the release, and starts the next train.
 
 | When | Ask | What happens |
 |---|---|---|
-| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists. If not, ask this week's captain to start the train (Tuesday step 6). |
+| The week before your turn | "I'm release captain next week. Is the train ready?" | Checks that the next version's `-pre.1` exists. If not, ask this week's captain to start the train (Tuesday step 6). Then watch `#openshell-triage` each weekday after Auto-Tag, and fix failures as they happen (Monday step 3) instead of on Monday. |
 | Monday | "Run the release captain Monday checklist." | Monday steps 1–4. |
 | A pre-release failed | "`vX.Y.Z-pre.N` failed, help me fix it." | Monday step 3 and Recovery. |
 | Tuesday | "Cut the release." | Tuesday steps 1–6, ending with starting the next train. |
