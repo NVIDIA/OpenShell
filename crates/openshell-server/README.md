@@ -42,6 +42,15 @@ have committed refresh effects. Missing refresh-owned stored outputs trigger
 refresh-on-read; missing static outputs and other credential-backend errors fail
 closed without falling back to inline values.
 
+## Credential disclosure audit
+
+`GetSandboxProviderEnvironment` and `GetProviderCredentials` each emit one OCSF
+event per attempt through `DisclosureAudit` in `auth/audit.rs`. The record names
+the authenticated principal, the disclosed identifiers, and the outcome, never
+a credential value or a status message. A new RPC that returns secret-bearing
+material must begin a `DisclosureAudit` before it authorizes the caller, and its
+tests must assert that a canary secret never appears in the emitted events.
+
 ## Refresh coordination
 
 Explicit rotation, background refresh, and operator refresh-on-read share the

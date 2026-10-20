@@ -15,7 +15,7 @@
 //! ordinary RPCs or select another successor.
 
 use crate::ServerState;
-use crate::auth::audit::{self, ConnectionSource, RequestOrigin};
+use crate::auth::audit::{self, RequestOrigin};
 use crate::auth::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection};
 use crate::auth::identity::IdentityProvider;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
@@ -272,10 +272,7 @@ pub async fn handle_refresh_sandbox_token(
     .map_err(|rejection| {
         audit::emit_authentication_failure(
             REFRESH_SANDBOX_TOKEN_PATH,
-            &RequestOrigin::new(
-                request.extensions().get::<ConnectionSource>().copied(),
-                request.metadata().as_ref(),
-            ),
+            &RequestOrigin::from_request(&request),
             Some(rejection.mechanism),
             rejection.reason,
         );
@@ -495,6 +492,7 @@ async fn ensure_sandbox_exists(
 mod tests {
     use super::*;
     use crate::ServerState;
+    use crate::auth::audit::ConnectionSource;
     use crate::auth::identity::Identity;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
     use crate::auth::sandbox_jwt::{ExtensionJwtIssuer, SandboxSessionJwtAuthority};

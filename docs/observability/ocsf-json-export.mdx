@@ -39,6 +39,8 @@ The gateway emits an Authentication (`class_uid: 3002`) event when it rejects a 
 
 These events never include presented credentials, other request headers, or verification error text.
 
+The gateway also emits a Device Config State Change (`class_uid: 5019`) event for each attempt to read secret-bearing material through `GetSandboxProviderEnvironment`, which a sandbox supervisor calls to load its provider environment, or `GetProviderCredentials`, the operator credential export. The state is `disclosed`, `denied`, `failed`, or `cancelled`. `unmapped` holds `operation`, `actor` (the authenticated principal as `type:id`, or `unknown`), `outcome`, and `status_code` for denied or failed attempts. It also names what was requested: `requested_sandbox_id` and `providers` for the sandbox environment, or `workspace`, `provider`, and `credential_keys` for the export. Events about a sandbox carry it in `container`, and `metadata.correlation_uid` holds the request ID as described above. These events never include credential values or error text.
+
 Without JSONL enabled, gateway OCSF events still appear as shorthand in console output, subject to the diagnostic log filter. Events associated with a sandbox also appear in its gateway log stream; gateway-wide events have no sandbox association.
 
 ## Enable Sandbox JSON Export
