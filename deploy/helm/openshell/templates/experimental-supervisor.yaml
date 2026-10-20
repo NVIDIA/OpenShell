@@ -52,8 +52,12 @@ spec:
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
             - experimental-bootstrap
-            - --health-socket
-            - /run/openshell/health.sock
+            - --health-port
+            - "5502"
+          ports:
+            - name: health
+              containerPort: 5502
+              protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -66,15 +70,9 @@ spec:
             limits:
               memory: 128Mi
           readinessProbe:
-            exec:
-              command: [/openshell-supervisor, health, --socket, /run/openshell/health.sock]
+            tcpSocket:
+              port: health
           livenessProbe:
-            exec:
-              command: [/openshell-supervisor, health, --socket, /run/openshell/health.sock]
-          volumeMounts:
-            - name: health
-              mountPath: /run/openshell
-      volumes:
-        - name: health
-          emptyDir: {}
+            tcpSocket:
+              port: health
 {{- end }}

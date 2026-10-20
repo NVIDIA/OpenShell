@@ -55,8 +55,8 @@ When the installed gateway configuration enables
 `[openshell.drivers.kubernetes].experimental_supervisor_topology = "gateway"`,
 Helm creates `<fullname>-experimental-supervisor` in the gateway namespace.
 Inspect that Deployment separately from per-sandbox supervisor Pods. This applies
-to shared, managed, and operator workspace modes. Its probes report idle process
-health, not sandbox session readiness; it does not serve sandboxes yet. Consult
+to shared, managed, and operator workspace modes. Its TCP probes on container
+port `health` (5502) report idle process health, not sandbox session readiness; it does not serve sandboxes yet. Consult
 the published gateway configuration reference for the installed version. Omit
 the setting and upgrade the release to remove the experimental Deployment.
 

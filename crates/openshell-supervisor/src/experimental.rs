@@ -7,15 +7,15 @@ use clap::Parser;
 #[cfg(unix)]
 use miette::IntoDiagnostic;
 use miette::Result;
-use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(name = "openshell-supervisor experimental-bootstrap")]
 #[command(about = "Start an idle experimental supervisor; does not accept sandbox sessions")]
 struct Args {
-    /// Private socket reporting process health, not sandbox readiness.
+    /// TCP port accepting connections while the process runs; reports process
+    /// health, not sandbox readiness.
     #[arg(long)]
-    health_socket: PathBuf,
+    health_port: u16,
 }
 
 pub fn run(raw_args: &[String]) -> Result<()> {
@@ -37,28 +37,24 @@ fn run_platform(args: Args) -> Result<()> {
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
-        // The private emptyDir survives a container restart after an unclean exit.
-        match std::fs::remove_file(&args.health_socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).into_diagnostic(),
-        }
-        let listener = tokio::net::UnixListener::bind(&args.health_socket).into_diagnostic()?;
+        let health = openshell_supervisor::bind_readiness_tcp(args.health_port)
+            .and_then(tokio::net::TcpListener::from_std)
+            .into_diagnostic()?;
         eprintln!("Experimental supervisor bootstrap started; sandbox sessions are disabled");
-        let result = loop {
+        loop {
             tokio::select! {
-                result = listener.accept() => {
+                // A connection is the whole check; nothing is exchanged.
+                result = health.accept() => {
                     if let Err(error) = result {
-                        break Err(error).into_diagnostic();
+                        eprintln!("experimental supervisor health accept failed: {error}");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
-                _ = terminate.recv() => break Ok(()),
-                _ = interrupt.recv() => break Ok(()),
+                _ = terminate.recv() => break,
+                _ = interrupt.recv() => break,
             }
-        };
-        drop(listener);
-        std::fs::remove_file(&args.health_socket).into_diagnostic()?;
-        result
+        }
+        Ok(())
     })
 }
 

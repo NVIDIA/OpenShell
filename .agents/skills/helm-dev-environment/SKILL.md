@@ -71,8 +71,8 @@ gatewayConfig:
 The gateway chart creates a separate, single-replica idle supervisor Deployment
 in the release namespace, regardless of shared/managed/operator workspace mode.
 Use a supervisor image built from this branch: the bootstrap subcommand is new.
-Check its rollout and exec health probes separately; no sandbox sessions route
-through it. `workspace` is reserved and rejected. Omit the field to disable it.
+Check its rollout and TCP health probes (container port `health`, 5502)
+separately; no sandbox sessions route through it. `workspace` is reserved and rejected. Omit the field to disable it.
 
 ### 2. Deploy OpenShell
 

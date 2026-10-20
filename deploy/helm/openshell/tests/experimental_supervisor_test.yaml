@@ -34,8 +34,28 @@ tests:
           path: spec.template.spec.containers[0].image
           value: example.com/supervisor:experiment
       - equal:
-          path: spec.template.spec.containers[0].args[0]
-          value: experimental-bootstrap
+          path: spec.template.spec.containers[0].args
+          value: [experimental-bootstrap, --health-port, "5502"]
+      - equal:
+          path: spec.template.spec.containers[0].ports
+          value:
+            - name: health
+              containerPort: 5502
+              protocol: TCP
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe
+          value:
+            tcpSocket:
+              port: health
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe
+          value:
+            tcpSocket:
+              port: health
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+      - notExists:
+          path: spec.template.spec.volumes
       - equal:
           path: spec.template.spec.automountServiceAccountToken
           value: false

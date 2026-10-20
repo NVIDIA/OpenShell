@@ -63,8 +63,9 @@ backend or enable a Windows workload runtime.
 
 ## Experimental deployment bootstrap
 
-`openshell-supervisor experimental-bootstrap --health-socket /run/openshell/health.sock`
-starts an idle process for the Kubernetes gateway topology experiment. The private
-Unix socket supports the existing `health --socket` command. No sandbox session
-listener, gateway authentication, or tenant routing is started. SIGTERM and SIGINT
-close the listener and remove the socket. This subcommand is Unix-only.
+`openshell-supervisor experimental-bootstrap --health-port 5502` starts an idle
+process for the Kubernetes gateway topology experiment. The wildcard TCP health
+port accepts and closes connections for kubelet `tcpSocket` probes and reports
+process health only; it keeps no filesystem state. No sandbox session listener,
+gateway authentication, or tenant routing is started. SIGTERM and SIGINT close
+the listener. This subcommand is Unix-only.
