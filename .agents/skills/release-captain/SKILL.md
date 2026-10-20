@@ -164,9 +164,20 @@ git worktree remove --force "$wt"
    gh release view "$VERSION" --json isPrerelease,publishedAt,assets --jq '{isPrerelease, publishedAt, assets: (.assets | length)}'
    ```
 
-5. **Close the loop.** Draft a reply to the coordination thread with the release
-   link and the PRs deferred to the next train. After approval, move the
-   milestone's open items to the next milestone.
+5. **Close the loop.** Draft a short reply to the coordination thread. Point
+   to the release notes rather than repeating them:
+
+   ```text
+   :white_check_mark: :ship: OpenShell vX.Y.Z is out: https://github.com/NVIDIA/OpenShell/releases/tag/vX.Y.Z
+
+   It shipped from vX.Y.Z-pre.N (<commit>). I'll be starting the <next version>-pre.* jobs shortly for next week.
+
+   Please check the release notes for upgrade notes that operators might care about. I'm also moving everything still open in the X.Y.Z milestone to <next milestone>.
+
+   Thanks everyone!
+   ```
+
+   After approval, move the milestone's open items to the next milestone.
 
 6. **Start the next train.** This is this week's captain's last duty. Until the
    next `-pre.1` exists, Auto-Tag skips. Agree with the maintainers on patch
