@@ -50,3 +50,36 @@ diff -r "$tmp/first" "$tmp/second"
 grep -Fq '{{USER_PROMPT}}' "$tmp/first/openshell-agent-payload/agent-prompt.md"
 grep -Fq '{{RUN_MODE}}' "$tmp/first/openshell-agent-payload/agent-prompt.md"
 echo 'ok - different assignments and runtime settings produce identical tooling build contexts'
+
+# Exercise the complete launcher with a credential-free agent fixture. All
+# external commands remain mocked; the runtime task must reach sandbox create.
+mkdir -p "$tmp/agent"
+cat > "$tmp/agent/agent.yaml" <<'YAML'
+id: fixture
+payload_version: 1
+prompt_template: agent://prompt.md
+harness:
+  default: codex
+  supported:
+    codex: {}
+YAML
+printf '%s\n' '{{USER_PROMPT}}' > "$tmp/agent/prompt.md"
+cat > "$tmp/bin/openshell" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+    *'gateway info --output json') echo '{"compute_drivers":[{"name":"kubernetes"}]}' ;;
+    *'sandbox create'*) printf '%s\n' "$@" > "$LAUNCH_ARGS" ;;
+    *) exit 90 ;;
+esac
+SH
+image="registry.test/team/gator@sha256:$(printf 'a%.0s' {1..64})"
+PATH="$tmp/bin:$PATH" OPENSHELL_BIN="$tmp/bin/openshell" \
+    CODEX_AUTH_ACCOUNT_ID=fixture-account LAUNCH_ARGS="$tmp/launch.args" \
+    bash "$SCRIPT_DIR/run.sh" --agent "$tmp/agent" --gateway test --name fixture \
+    --image "$image" --watch 'RUNTIME_ONLY_TASK; /ok to test' > "$tmp/launch.log" 2>&1
+grep -Fxq "$image" "$tmp/launch.args"
+grep -Fxq 'OPENSHELL_AGENT_TASK=RUNTIME_ONLY_TASK; /ok to test' "$tmp/launch.args"
+grep -Fxq 'OPENSHELL_AGENT_RUN_MODE=watch' "$tmp/launch.args"
+grep -Fxq '/etc/openshell/agent-payload/runtime/launch.sh' "$tmp/launch.args"
+echo 'ok - prebuilt Kubernetes launch carries task and watch mode at runtime'

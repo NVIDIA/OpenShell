@@ -84,6 +84,20 @@ The launcher passes the non-secret host account ID as literal `CODEX_ACCOUNT_ID`
 
 The image contains task-independent tooling and a prompt template, not the run's PR assignment or test authorization. The launcher supplies those instructions at runtime through `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor captures the assembled prompt in memory and supplies it on stdin for every cycle. Task text is non-secret and may appear in runtime command metadata; never put credentials in the task. Task-only changes reuse the same tooling build inputs, although the launcher still builds/tags an image per invocation.
 
+For Kubernetes gateways, select image delivery explicitly: `--k3d-cluster NAME`
+builds with Docker and imports into a running local cluster with the matching
+current kube context; `--publish-image REGISTRY/REPOSITORY:TAG` builds and pushes,
+then launches by resolved digest; `--image REGISTRY/REPOSITORY@sha256:DIGEST`
+reuses trusted compatible tooling without local image tools. Do not infer
+locality from a loopback endpoint. The k3d selection asserts which cluster
+serves the gateway; imported images require `if_not_present` or `never` pull
+policy. Registry builds use the builder's platform and existing registry auth;
+nodes need their own pull access. `--build-only` builds/delivers without
+gateway mutations, provider credential reads, or a sandbox launch. Reused
+images must match the local manifest's agent ID and payload version and support
+the runtime task contract; legacy baked-task images fail startup. See
+`scripts/agents/gator/README.md` for examples and option compatibility.
+
 ### Step 5: Verify Gateway Is Registered And Alive
 
 Use the target gateway from the operator request or current session context. Do not assume a gateway name. If the operator did not specify one, list registered gateways and ask before launching when the correct target is ambiguous.
@@ -165,7 +179,7 @@ sandbox_name="gtr-pr-${pr_number}-watch"
   "Review and monitor PR #${pr_number} through the gator-gate workflow. Scope this invocation only to PR #${pr_number}."
 ```
 
-The launcher queries the gateway's selected compute driver, builds the gator image in the matching Docker or Podman image store, stages the immutable payload, imports provider profiles, configures provider credentials and refresh, and starts the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match the gateway driver.
+The launcher queries the gateway's selected compute driver and prepares the image through the selected build/import/publish or prebuilt path before importing provider profiles, configuring provider credentials and refresh, and starting the agent supervisor as the sandbox's canonical main process. The detached main process survives loss of the host CLI connection and reconnects to a restarted gateway. Unless `--keep` is set, the sandbox is marked ephemeral so the gateway deletes it after the canonical main process exits and its terminal result is finalized. `CONTAINER_ENGINE`, when set, must match Docker/Podman gateways or Docker for k3d imports; registry builds for Kubernetes may use either local engine.
 
 The launcher streams image-build and provisioning output until the detached workload is ready, then exits. Use `openshell logs <sandbox-name>` or the TUI for runtime output.
 

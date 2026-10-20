@@ -7,8 +7,8 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
 - `gh` is authenticated on the host and has access to `NVIDIA/OpenShell`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
 - For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
-- A local gateway and either Docker or Podman are available to build the
-  default sandbox image.
+- A Docker, Podman, or Kubernetes gateway is available. Local builds require
+  Docker or Podman; a prebuilt image does not require a local container engine.
 
 ## Usage
 
@@ -24,11 +24,75 @@ By default the launcher uses `scripts/agents/gator/Dockerfile` as the sandbox im
 
 The PR assignment, operator test authorization, harness selection, watch mode, and polling interval are runtime inputs, not rendered image contents. The launcher supplies the non-secret assignment as `OPENSHELL_AGENT_TASK` in the canonical process command. The supervisor assembles the prompt once in memory and sends it to each harness cycle on stdin; cycles do not read task instructions from an agent-writable file. Assignment text is literal data, so shell syntax and template tokens inside it are not evaluated. Do not put credentials in assignments; use providers. Runtime command metadata can contain the assignment. This separates reusable tooling from per-run instructions; it does not make prompt instructions a security boundary.
 
-The launcher still builds and tags an image for each invocation, but task-only or supervision-setting changes reuse identical tooling build inputs. Publishing and selecting reusable images is a separate launcher capability.
+Without `--image`, the launcher builds and tags an image for each invocation,
+but task-only or supervision-setting changes reuse identical tooling build
+inputs. Docker and Podman builds use the gateway's engine; an explicit
+`CONTAINER_ENGINE` must match it.
 
-The launcher queries the selected gateway and builds with its Docker or Podman
-compute driver. If `CONTAINER_ENGINE` is set, it must match that driver. Other
-gateway drivers cannot run this local-image launcher.
+## Kubernetes image delivery
+
+The launcher discovers the compute driver from the selected gateway. It does
+not infer a local cluster from a loopback gateway endpoint: that endpoint could
+be a port-forward to a remote deployment. Select one of these image paths for
+a Kubernetes gateway.
+
+For local k3d, explicitly identify the cluster serving the gateway. The launcher
+requires the matching current kube context and a running local cluster, builds
+with Docker, and imports the image into that cluster before creating a sandbox:
+
+```shell
+OPENSHELL_WORKSPACE=gator mise exec k3d@5.9.0 -- ./scripts/agents/run.sh \
+  --agent gator --gateway openshell-dev-main \
+  --k3d-cluster openshell-dev-main --name gtr-pr-1234 --watch \
+  "Review and monitor PR #1234 through the gator-gate workflow."
+```
+
+The cluster selection is an operator assertion that the gateway uses that
+cluster; it is not inferred from the gateway name. Its workload image pull
+policy must allow imported images (`if_not_present` or `never`). The local
+Skaffold configuration uses `if_not_present`.
+
+For a registry-backed deployment, build and publish tooling once without
+changing gateway settings, importing providers, reading provider credentials,
+or launching a sandbox:
+
+```shell
+./scripts/agents/run.sh --agent gator --gateway remote-kube \
+  --publish-image registry.example.com/team/gator:payload-13 --build-only
+```
+
+The builder uses existing Docker/Podman registry authentication. Both local and
+remote Kubernetes nodes must be able to pull from the chosen registry; private
+registries require the deployment's image-pull credential configuration. Builds
+target the local builder's platform, so build on a matching platform for the
+target nodes. Multi-platform builds are not provided by this launcher.
+
+The launcher prints `Tooling image: REGISTRY/REPOSITORY@sha256:DIGEST` after a
+successful push. Reuse that full reference for subsequent tasks:
+
+```shell
+OPENSHELL_WORKSPACE=gator ./scripts/agents/run.sh \
+  --agent gator --gateway remote-kube --name gtr-pr-1234 --watch \
+  --image "$GATOR_IMAGE" \
+  "Review and monitor PR #1234 through the gator-gate workflow."
+```
+
+Set `GATOR_IMAGE` to the printed digest-pinned reference, not a mutable tag.
+`--image` skips local builds and cluster imports and works with Docker/Podman
+gateways too. It cannot be combined with `--from`, `--codex-bin`,
+`--k3d-cluster`, `--publish-image`, or `--build-only`. The image must contain
+tooling built by this launcher with the same agent ID and payload version as
+the local manifest. Startup validates that contract before running the agent;
+legacy images with baked assignments are incompatible. Only reuse trusted
+tooling images: the contract check does not authenticate their contents.
+
+Omit `--build-only` from `--publish-image` to build, push, and launch in one
+invocation. A failed push, missing repository digest, or failed k3d import
+stops the launcher before gateway settings, provider configuration, or sandbox
+creation. Kubernetes launches without an explicit image-delivery choice fail
+with guidance rather than guessing a cluster or registry.
+
+## Runtime and providers
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `scripts/agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
@@ -80,5 +144,7 @@ bash scripts/agents/gator/bin/review_feedback_ledger_test.sh
 bash scripts/agents/gator/bin/resolve_gator_review_threads_test.sh
 bash scripts/agents/runtime/harnesses/codex/exec_test.sh
 bash scripts/agents/run_test.sh
+bash scripts/agents/image_test.sh
+bash scripts/agents/runtime/launch_test.sh
 bash scripts/agents/runtime/supervisor_test.sh
 ```
