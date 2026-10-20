@@ -12,16 +12,12 @@ use std::path::PathBuf;
 #[command(name = "openshell-supervisor experimental-host")]
 #[command(about = "Supervise the sandboxes a gateway registers with this process")]
 struct Args {
-    /// TCP port accepting connections while the process runs; reports process
-    /// health, not session readiness.
-    #[arg(long)]
-    health_port: u16,
-
     /// Gateway gRPC endpoint; each session authenticates with its own credentials.
     #[arg(long, env = openshell_core::sandbox_env::ENDPOINT)]
     openshell_endpoint: String,
 
     /// Mutually authenticated session-control listener used by the gateway.
+    /// Kubernetes TCP probes connect to it without completing TLS.
     #[arg(long)]
     session_control_listen: SocketAddr,
 
@@ -82,7 +78,8 @@ fn run_platform(args: Args) -> Result<()> {
             )
             .init();
 
-        // Install shutdown handlers before publishing health.
+        // Install shutdown handlers before the control listener starts
+        // answering health probes.
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .into_diagnostic()?;
@@ -113,11 +110,6 @@ fn run_platform(args: Args) -> Result<()> {
             .await
             .into_diagnostic()
             .wrap_err("bind session-control listener")?;
-
-        let health = openshell_supervisor::bind_readiness_tcp(args.health_port)
-            .and_then(tokio::net::TcpListener::from_std)
-            .into_diagnostic()
-            .wrap_err("bind health listener")?;
         tracing::info!(
             runtime = %host.runtime_addr(),
             control = %args.session_control_listen,
@@ -133,20 +125,10 @@ fn run_platform(args: Args) -> Result<()> {
                 let _ = stopped.wait_for(|stop| *stop).await;
             },
         ));
-        loop {
-            tokio::select! {
-                // A connection is the whole check; nothing is exchanged.
-                result = health.accept() => {
-                    if let Err(error) = result {
-                        tracing::warn!(%error, "health accept failed; retrying");
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-                _ = terminate.recv() => break,
-                _ = interrupt.recv() => break,
-            }
+        tokio::select! {
+            _ = terminate.recv() => {}
+            _ = interrupt.recv() => {}
         }
-        drop(health);
         stop.send_replace(true);
         let _ = serve.await;
         // Sandboxes lose supervision with this process and fail closed.

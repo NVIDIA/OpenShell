@@ -57,8 +57,6 @@ spec:
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
             - experimental-host
-            - --health-port
-            - "5502"
             - --session-control-listen
             - 0.0.0.0:{{ get $shared "control_port" }}
             - --session-control-tls-dir
@@ -87,9 +85,6 @@ spec:
             - name: session-control
               containerPort: {{ get $shared "control_port" }}
               protocol: TCP
-            - name: health
-              containerPort: 5502
-              protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -101,14 +96,15 @@ spec:
               memory: 64Mi
             limits:
               memory: 1Gi
-          # Process health only; each session reports its own readiness to
-          # the gateway through the session-control API.
+          # Process health only: the probes open and close a TCP connection
+          # to the mTLS session-control listener. Each session reports its own
+          # readiness to the gateway through the session-control API.
           readinessProbe:
             tcpSocket:
-              port: health
+              port: session-control
           livenessProbe:
             tcpSocket:
-              port: health
+              port: session-control
           volumeMounts:
             - name: run
               mountPath: /run/openshell

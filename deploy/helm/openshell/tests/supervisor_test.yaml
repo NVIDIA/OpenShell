@@ -47,8 +47,6 @@ tests:
           path: spec.template.spec.containers[0].args
           value:
             - experimental-host
-            - --health-port
-            - "5502"
             - --session-control-listen
             - 0.0.0.0:5501
             - --session-control-tls-dir
@@ -58,24 +56,21 @@ tests:
             - --session-root
             - /run/openshell/sessions
         documentIndex: 0
-      - contains:
+      - lengthEqual:
           path: spec.template.spec.containers[0].ports
-          content:
-            name: health
-            containerPort: 5502
-            protocol: TCP
+          count: 2
         documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].readinessProbe
           value:
             tcpSocket:
-              port: health
+              port: session-control
         documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].livenessProbe
           value:
             tcpSocket:
-              port: health
+              port: session-control
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
