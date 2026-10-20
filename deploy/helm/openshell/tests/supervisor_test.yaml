@@ -47,8 +47,8 @@ tests:
           path: spec.template.spec.containers[0].args
           value:
             - experimental-host
-            - --health-socket
-            - /run/openshell/health.sock
+            - --health-port
+            - "5502"
             - --session-control-listen
             - 0.0.0.0:5501
             - --session-control-tls-dir
@@ -58,6 +58,35 @@ tests:
             - --session-root
             - /run/openshell/sessions
         documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].ports
+          content:
+            name: health
+            containerPort: 5502
+            protocol: TCP
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe
+          value:
+            tcpSocket:
+              port: health
+        documentIndex: 0
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe
+          value:
+            tcpSocket:
+              port: health
+        documentIndex: 0
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: run
+            mountPath: /run/openshell
+        documentIndex: 0
+      - lengthEqual:
+          path: spec.ports
+          count: 2
+        documentIndex: 1
       - equal:
           path: spec.template.spec.automountServiceAccountToken
           value: false

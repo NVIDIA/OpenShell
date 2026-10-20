@@ -57,8 +57,8 @@ spec:
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
             - experimental-host
-            - --health-socket
-            - /run/openshell/health.sock
+            - --health-port
+            - "5502"
             - --session-control-listen
             - 0.0.0.0:{{ get $shared "control_port" }}
             - --session-control-tls-dir
@@ -87,6 +87,9 @@ spec:
             - name: session-control
               containerPort: {{ get $shared "control_port" }}
               protocol: TCP
+            - name: health
+              containerPort: 5502
+              protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -101,11 +104,11 @@ spec:
           # Process health only; each session reports its own readiness to
           # the gateway through the session-control API.
           readinessProbe:
-            exec:
-              command: [/openshell-supervisor, health, --socket, /run/openshell/health.sock]
+            tcpSocket:
+              port: health
           livenessProbe:
-            exec:
-              command: [/openshell-supervisor, health, --socket, /run/openshell/health.sock]
+            tcpSocket:
+              port: health
           volumeMounts:
             - name: run
               mountPath: /run/openshell

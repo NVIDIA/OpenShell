@@ -119,7 +119,9 @@ one process for the Kubernetes gateway supervisor topology. It is Unix-only.
 - **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
   session's runtime-initiated Sandbox Protocol connections; see
   `openshell-sandbox-backend` for the routing preface.
-- **Health.** `--health-socket` serves the existing `health --socket` check and
+- **Health.** `--health-port` (5502 in the chart) binds a wildcard TCP listener
+  after the session-control and runtime listeners. It accepts and closes
+  connections for kubelet `tcpSocket` probes, keeps no filesystem state, and
   reports process health only. Session readiness is reported per session over
   session control. SIGTERM and SIGINT stop every session, which ends their
   workloads' supervision.

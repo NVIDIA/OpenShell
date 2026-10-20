@@ -72,7 +72,8 @@ The gateway chart creates a single-replica shared supervisor Deployment,
 Service, and NetworkPolicy in the release namespace, regardless of
 shared/managed/operator workspace mode, and the certgen hook issues its
 session-control Secrets. New sandbox generations run as sessions in that
-process. Build the gateway, supervisor, and sandbox images from the same branch:
+process. Its process-health `tcpSocket` probes use container port `health`
+(5502); session control stays on 5501. Build the gateway, supervisor, and sandbox images from the same branch:
 all three must support the routed runtime connection. `workspace` is reserved
 and rejected. Omit the field to disable it. `mise run
 e2e:kubernetes:shared-supervisor` runs the focused e2e

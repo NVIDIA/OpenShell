@@ -12,9 +12,10 @@ use std::path::PathBuf;
 #[command(name = "openshell-supervisor experimental-host")]
 #[command(about = "Supervise the sandboxes a gateway registers with this process")]
 struct Args {
-    /// Private socket reporting process health, not session readiness.
+    /// TCP port accepting connections while the process runs; reports process
+    /// health, not session readiness.
     #[arg(long)]
-    health_socket: PathBuf,
+    health_port: u16,
 
     /// Gateway gRPC endpoint; each session authenticates with its own credentials.
     #[arg(long, env = openshell_core::sandbox_env::ENDPOINT)]
@@ -113,13 +114,10 @@ fn run_platform(args: Args) -> Result<()> {
             .into_diagnostic()
             .wrap_err("bind session-control listener")?;
 
-        // The private emptyDir survives a container restart after an unclean exit.
-        match std::fs::remove_file(&args.health_socket) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).into_diagnostic(),
-        }
-        let health = tokio::net::UnixListener::bind(&args.health_socket).into_diagnostic()?;
+        let health = openshell_supervisor::bind_readiness_tcp(args.health_port)
+            .and_then(tokio::net::TcpListener::from_std)
+            .into_diagnostic()
+            .wrap_err("bind health listener")?;
         tracing::info!(
             runtime = %host.runtime_addr(),
             control = %args.session_control_listen,
@@ -135,24 +133,25 @@ fn run_platform(args: Args) -> Result<()> {
                 let _ = stopped.wait_for(|stop| *stop).await;
             },
         ));
-        let result = loop {
+        loop {
             tokio::select! {
+                // A connection is the whole check; nothing is exchanged.
                 result = health.accept() => {
                     if let Err(error) = result {
-                        break Err(error).into_diagnostic();
+                        tracing::warn!(%error, "health accept failed; retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
-                _ = terminate.recv() => break Ok(()),
-                _ = interrupt.recv() => break Ok(()),
+                _ = terminate.recv() => break,
+                _ = interrupt.recv() => break,
             }
-        };
+        }
         drop(health);
-        let _ = std::fs::remove_file(&args.health_socket);
         stop.send_replace(true);
         let _ = serve.await;
         // Sandboxes lose supervision with this process and fail closed.
         host.remove_all().await;
-        result
+        Ok(())
     })
 }
 
