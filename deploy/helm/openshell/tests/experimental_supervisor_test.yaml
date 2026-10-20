@@ -35,23 +35,23 @@ tests:
           value: example.com/supervisor:experiment
       - equal:
           path: spec.template.spec.containers[0].args
-          value: [experimental-bootstrap, --health-port, "5502"]
+          value: [experimental-host, --session-control-listen, "0.0.0.0:5501"]
       - equal:
           path: spec.template.spec.containers[0].ports
           value:
-            - name: health
-              containerPort: 5502
+            - name: session-control
+              containerPort: 5501
               protocol: TCP
       - equal:
           path: spec.template.spec.containers[0].readinessProbe
           value:
             tcpSocket:
-              port: health
+              port: session-control
       - equal:
           path: spec.template.spec.containers[0].livenessProbe
           value:
             tcpSocket:
-              port: health
+              port: session-control
       - notExists:
           path: spec.template.spec.containers[0].volumeMounts
       - notExists:

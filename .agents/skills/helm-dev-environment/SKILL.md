@@ -68,11 +68,13 @@ gatewayConfig:
     experimental_supervisor_topology: gateway
 ```
 
-The gateway chart creates a separate, single-replica idle supervisor Deployment
+The gateway chart creates a separate, single-replica shared-host placeholder Deployment
 in the release namespace, regardless of shared/managed/operator workspace mode.
-Use a supervisor image built from this branch: the bootstrap subcommand is new.
-Check its rollout and TCP health probes (container port `health`, 5502)
-separately; no sandbox sessions route through it. `workspace` is reserved and rejected. Omit the field to disable it.
+Use a supervisor image built from this branch: the `experimental-host` subcommand is new.
+Check its rollout and TCP health probes on the placeholder control listener
+(container port `session-control`, 5501). It implements no session RPCs; sandboxes
+still use dedicated supervisors. `workspace` is reserved and rejected. Omit the
+field to disable it.
 
 ### 2. Deploy OpenShell
 

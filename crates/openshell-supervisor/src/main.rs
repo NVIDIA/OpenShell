@@ -366,7 +366,7 @@ fn main() -> Result<()> {
         return openshell_supervisor::check_control_readiness(&args.socket);
     }
 
-    if raw_args.get(1).map(String::as_str) == Some("experimental-bootstrap") {
+    if raw_args.get(1).map(String::as_str) == Some("experimental-host") {
         return experimental::run(&raw_args[1..]);
     }
 

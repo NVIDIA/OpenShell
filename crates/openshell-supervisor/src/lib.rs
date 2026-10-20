@@ -175,9 +175,8 @@ impl ReadinessEndpoint {
     }
 }
 
-/// Binds a nonblocking wildcard listener reachable at the Pod IP. Falls back to
-/// IPv4 when the network namespace has IPv6 disabled.
-pub fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
+/// Falls back to IPv4 when the network namespace has IPv6 disabled.
+fn bind_readiness_tcp(port: u16) -> std::io::Result<std::net::TcpListener> {
     use socket2::{Domain, Socket, Type};
 
     let bind = |domain: Domain, address: std::net::SocketAddr| {

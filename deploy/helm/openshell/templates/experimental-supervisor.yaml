@@ -51,12 +51,12 @@ spec:
           image: {{ get $kubernetes "supervisor_image" | quote }}
           imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
           args:
-            - experimental-bootstrap
-            - --health-port
-            - "5502"
+            - experimental-host
+            - --session-control-listen
+            - 0.0.0.0:5501
           ports:
-            - name: health
-              containerPort: 5502
+            - name: session-control
+              containerPort: 5501
               protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
@@ -71,8 +71,8 @@ spec:
               memory: 128Mi
           readinessProbe:
             tcpSocket:
-              port: health
+              port: session-control
           livenessProbe:
             tcpSocket:
-              port: health
+              port: session-control
 {{- end }}

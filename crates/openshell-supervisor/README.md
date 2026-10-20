@@ -61,11 +61,13 @@ belong to the sandbox or isolation backend. Signals use `BoundarySignal`.
 These portable control-plane foundations do not qualify a platform isolation
 backend or enable a Windows workload runtime.
 
-## Experimental deployment bootstrap
+## Experimental shared host
 
-`openshell-supervisor experimental-bootstrap --health-port 5502` starts an idle
-process for the Kubernetes gateway topology experiment. The wildcard TCP health
-port accepts and closes connections for kubelet `tcpSocket` probes and reports
-process health only; it keeps no filesystem state. No sandbox session listener,
-gateway authentication, or tenant routing is started. SIGTERM and SIGINT close
-the listener. This subcommand is Unix-only.
+`openshell-supervisor experimental-host --session-control-listen 0.0.0.0:5501`
+starts a shared-host placeholder for the Kubernetes gateway topology experiment.
+Its future control listener accepts and closes connections, including kubelet
+`tcpSocket` probes, and reports process health only. No control RPCs, sandbox
+sessions, gateway authentication, or tenant routing are implemented yet.
+`experimental_supervisor_topology = "gateway"` deploys this placeholder; sandboxes
+continue using dedicated supervisors. SIGTERM and SIGINT close the listener.
+This subcommand is Unix-only.

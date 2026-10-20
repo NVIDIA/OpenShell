@@ -1,21 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Deployment bootstrap only: no sandbox admission, credentials, or session listener.
+//! Shared-host placeholder: no sandbox admission, credentials, or session RPCs.
 
 use clap::Parser;
 #[cfg(unix)]
 use miette::IntoDiagnostic;
 use miette::Result;
+use std::net::SocketAddr;
 
 #[derive(Debug, Parser)]
-#[command(name = "openshell-supervisor experimental-bootstrap")]
-#[command(about = "Start an idle experimental supervisor; does not accept sandbox sessions")]
+#[command(name = "openshell-supervisor experimental-host")]
+#[command(about = "Start a shared supervisor placeholder; sandbox sessions are not implemented")]
 struct Args {
-    /// TCP port accepting connections while the process runs; reports process
-    /// health, not sandbox readiness.
+    /// Placeholder control listener; also accepts TCP process-health probes.
     #[arg(long)]
-    health_port: u16,
+    session_control_listen: SocketAddr,
 }
 
 pub fn run(raw_args: &[String]) -> Result<()> {
@@ -37,16 +37,17 @@ fn run_platform(args: Args) -> Result<()> {
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
-        let health = openshell_supervisor::bind_readiness_tcp(args.health_port)
-            .and_then(tokio::net::TcpListener::from_std)
+        let control = tokio::net::TcpListener::bind(args.session_control_listen)
+            .await
             .into_diagnostic()?;
-        eprintln!("Experimental supervisor bootstrap started; sandbox sessions are disabled");
+        eprintln!("Shared supervisor started; sandbox sessions are not implemented");
         loop {
             tokio::select! {
-                // A connection is the whole check; nothing is exchanged.
-                result = health.accept() => {
+                // This placeholder only accepts and closes connections. The same
+                // listener will serve session-control RPCs in the next stage.
+                result = control.accept() => {
                     if let Err(error) = result {
-                        eprintln!("experimental supervisor health accept failed: {error}");
+                        eprintln!("shared supervisor control accept failed: {error}");
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
@@ -60,5 +61,5 @@ fn run_platform(args: Args) -> Result<()> {
 
 #[cfg(not(unix))]
 fn run_platform(_args: Args) -> Result<()> {
-    Err(miette::miette!("experimental-bootstrap requires Unix"))
+    Err(miette::miette!("experimental-host requires Unix"))
 }
