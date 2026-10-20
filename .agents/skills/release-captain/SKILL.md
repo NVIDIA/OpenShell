@@ -99,9 +99,20 @@ git worktree remove --force "$wt"
    steps in the release notes.
 
 3. **Fix forward.** A failed pre-release doesn't end the train. Find the cause,
-   and let the failed run finish rather than cancelling it. Once the fix merges
-   and its `Release Dev` run passes, tag the next `-pre.N` on it by hand (as in
-   Tuesday step 6). See Recovery for reruns.
+   and let the failed run finish rather than cancelling it.
+
+   A rerun repeats the same commit and workflow, so it only helps with a
+   transient failure (see Recovery). Anything that needs a code or workflow
+   fix ships in a new number: that `-pre.N` stays failed, and `Release` skips
+   it. Merge the fix, then cut the next `-pre.N` from the tip of `main` after
+   approval:
+
+   ```shell
+   gh workflow run release-auto-tag.yml --ref main
+   ```
+
+   Tag a specific commit by hand (as in Tuesday step 6) only when the tip of
+   `main` isn't the commit you want.
 
 4. **Draft the coordination post.** Start a thread in the OpenShell channel of
    the CNCF Slack. The release ships from `main` with no release branch, so the
@@ -130,9 +141,9 @@ git worktree remove --force "$wt"
 
 ## Tuesday: cut the release
 
-1. **Select the final candidate.** For a late cutoff, tag the final `-pre.N` by
-   hand on the newest commit with a passing `Release Dev` run. When it
-   finishes, run the preview and repeat Monday step 2 for its run.
+1. **Select the final candidate.** For a late cutoff, cut the final `-pre.N`
+   after the cutoff as in Monday step 3. When it finishes, run the preview and
+   repeat Monday step 2 for its run.
 
 2. **Request approval.** Present the candidate tag, commit, qualification run,
    compatibility assessment, commits since `$PREV`, and release notes preview:
@@ -206,8 +217,8 @@ git worktree remove --force "$wt"
 | Symptom | Action |
 |---|---|
 | Transient infrastructure failure in a pre-release, including a registry push | After approval, `gh run rerun <run-id> --failed`. `Release` won't select the run until all of it passes. |
-| Pre-release run ends in `startup_failure` | The workflow file is invalid at that commit. Merge the fix, then tag the next `-pre.N`. |
-| Code defect or `Cargo Deny` advisory | Rerunning won't help. Merge a fix, then tag the next `-pre.N` (Monday step 3). |
+| Pre-release run ends in `startup_failure` | The workflow file is invalid at that commit. Fix it in a new `-pre.N` (Monday step 3). |
+| Code defect or `Cargo Deny` advisory | Rerunning won't help. Fix it in a new `-pre.N` (Monday step 3). |
 | `Release` fails after selection | After approval, rerun only the failed jobs that haven't published. |
 
 ## Related
