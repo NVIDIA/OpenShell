@@ -3,6 +3,7 @@
 
 """Generate Python protobuf stubs and make their imports package-relative."""
 
+import argparse
 import re
 import subprocess
 import sys
@@ -13,65 +14,18 @@ PROTO_FILES = [
     "proto/datamodel.proto",
     "proto/options.proto",
     "proto/sandbox.proto",
+    "proto/extension.proto",
+    "proto/credential_driver.proto",
 ]
-
-LINE_REWRITES = {
-    "python/openshell/_proto/openshell_pb2_grpc.py": [
-        (
-            r"^import openshell_pb2 as openshell__pb2$",
-            "from . import openshell_pb2 as openshell__pb2",
-        ),
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-    "python/openshell/_proto/openshell_pb2.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-        (
-            r"^import options_pb2 as options__pb2$",
-            "from . import options_pb2 as options__pb2",
-        ),
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-    "python/openshell/_proto/datamodel_pb2.py": [
-        (
-            r"^import options_pb2 as options__pb2$",
-            "from . import options_pb2 as options__pb2",
-        ),
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-    "python/openshell/_proto/datamodel_pb2_grpc.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-    ],
-    "python/openshell/_proto/sandbox_pb2.py": [
-        (
-            r"^import datamodel_pb2 as datamodel__pb2$",
-            "from . import datamodel_pb2 as datamodel__pb2",
-        ),
-    ],
-    "python/openshell/_proto/sandbox_pb2_grpc.py": [
-        (
-            r"^import sandbox_pb2 as sandbox__pb2$",
-            "from . import sandbox_pb2 as sandbox__pb2",
-        ),
-    ],
-}
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--no-pyi", action="store_true", help="Skip type-stub generation"
+    )
+    args = parser.parse_args()
+    output_dir = Path("python/openshell/_proto")
     subprocess.run(
         [
             sys.executable,
@@ -79,20 +33,26 @@ def main() -> None:
             "grpc_tools.protoc",
             "-Iproto",
             "--python_out=python/openshell/_proto",
-            "--pyi_out=python/openshell/_proto",
+            *([] if args.no_pyi else ["--pyi_out=python/openshell/_proto"]),
             "--grpc_python_out=python/openshell/_proto",
             *PROTO_FILES,
         ],
         check=True,
     )
 
-    for path, rules in LINE_REWRITES.items():
-        file_path = Path(path)
-        text = file_path.read_text()
-        text = text.replace("from . from . import", "from . import")
-        for pattern, replacement in rules:
-            text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
-        file_path.write_text(text)
+    # Rewrite only imports of our generated modules, leaving google.protobuf
+    # imports intact. The same rule covers runtime modules and type stubs.
+    modules = "|".join(re.escape(f"{Path(path).stem}_pb2") for path in PROTO_FILES)
+    pattern = rf"^import ({modules})( as \w+)?$"
+    suffixes = ["_pb2.py", "_pb2_grpc.py"]
+    if not args.no_pyi:
+        suffixes.append("_pb2.pyi")
+    for proto in PROTO_FILES:
+        for suffix in suffixes:
+            file_path = output_dir / f"{Path(proto).stem}{suffix}"
+            text = file_path.read_text()
+            text = re.sub(pattern, r"from . import \1\2", text, flags=re.MULTILINE)
+            file_path.write_text(text)
 
 
 if __name__ == "__main__":
