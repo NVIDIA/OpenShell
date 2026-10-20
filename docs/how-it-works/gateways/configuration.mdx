@@ -1526,24 +1526,3 @@ Replace the executable and configuration paths with your installation's paths, a
 The command reports each selected executable path and version. Each tool receives only `-V`, with a five-second deadline and an 8 KiB output limit per stream. Missing, non-executable, outdated, or failing tools return a nonzero exit status with corrective guidance and the selected tool's error. The checks create no gateway state or images and do not start a driver or VM. Version checks confirm the installation; they do not test image creation or filesystem recovery.
 
 Other drivers do not require these VM tools. A VM configuration table alone does not select the VM driver. When a remote driver socket is configured, preflight reports that host tool checks were not performed; run the check on that host in the driver service's environment with a local VM configuration.
-
-## Experimental
-
-### Kubernetes supervisor topology
-
-For experimental deployment plumbing, set
-`[openshell.drivers.kubernetes].experimental_supervisor_topology = "gateway"`.
-With Helm, use the existing gateway configuration:
-
-```yaml
-gatewayConfig:
-  openshell.drivers.kubernetes:
-    experimental_supervisor_topology: gateway
-```
-
-The chart deploys one idle supervisor in the gateway namespace for all workspace
-modes (`shared`, `managed`, and `operator`). Its health checks report process
-health only. It does not accept sandbox sessions; sandboxes retain their dedicated
-supervisors. Omit the field to disable the experiment. The `workspace` value is
-reserved and currently returns an unsupported error. Helm owns this Deployment;
-setting the field in a standalone TOML file does not provision infrastructure.
