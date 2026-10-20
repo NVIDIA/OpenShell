@@ -99,11 +99,15 @@ backend or enable a Windows workload runtime.
 
 ## Shared supervisor host
 
-`openshell-supervisor experimental-host` hosts the sessions of many sandboxes in
+`openshell-supervisor --mode=shared --gateway-endpoint <gateway-url> --address <ip:port>` hosts the sessions of many sandboxes in
 one process for the Kubernetes gateway supervisor topology. It is Unix-only.
 
+`--gateway-endpoint` selects the gateway each sandbox session dials. The current
+admission RPCs still arrive from the gateway at `--address`; moving admission
+onto a supervisor-initiated stream is a separate implementation step.
+
 - **Admission.** A mutually authenticated TLS 1.3 listener
-  (`--session-control-listen`, credentials in `--session-control-tls-dir`)
+  (`--address`, credentials in `--session-control-tls-dir`)
   serves `PUT`, `GET`, and `DELETE /v1/sessions/{route}` and `GET /v1/sessions`
   as JSON. Only a client holding the admission certificate, which Helm gives
   only the gateway, can register sessions. A registration carries one

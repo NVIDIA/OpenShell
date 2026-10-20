@@ -46,8 +46,10 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].args
           value:
-            - experimental-host
-            - --session-control-listen
+            - --mode=shared
+            - --gateway-endpoint
+            - https://openshell.gateway.svc.cluster.local:8080
+            - --address
             - 0.0.0.0:5501
             - --session-control-tls-dir
             - /etc/openshell/session-control

@@ -3,52 +3,34 @@
 
 //! Supervisor shared by the sandboxes of one gateway (experimental).
 
-use clap::Parser;
 use miette::Result;
-use std::net::SocketAddr;
-use std::path::PathBuf;
 
-#[derive(Debug, Parser)]
-#[command(name = "openshell-supervisor experimental-host")]
-#[command(about = "Supervise the sandboxes a gateway registers with this process")]
-struct Args {
-    /// Gateway gRPC endpoint; each session authenticates with its own credentials.
-    #[arg(long, env = openshell_core::sandbox_env::ENDPOINT)]
-    openshell_endpoint: String,
-
-    /// Mutually authenticated session-control listener used by the gateway.
-    /// Kubernetes TCP probes connect to it without completing TLS.
-    #[arg(long)]
-    session_control_listen: SocketAddr,
-
-    /// Directory with the session-control `tls.crt`, `tls.key`, and client `ca.crt`.
-    #[arg(long)]
-    session_control_tls_dir: PathBuf,
-
-    /// Listener for routed runtime-initiated Sandbox Protocol connections.
-    #[arg(long)]
-    runtime_listen: SocketAddr,
-
-    /// Private directory for per-session files.
-    #[arg(long)]
-    session_root: PathBuf,
-
-    #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
-    log_level: String,
-}
-
-pub fn run(raw_args: &[String]) -> Result<()> {
-    let args = Args::parse_from(raw_args);
+pub fn run(args: crate::Args) -> Result<()> {
     run_platform(args)
 }
 
 #[cfg(unix)]
-fn run_platform(args: Args) -> Result<()> {
+fn run_platform(args: crate::Args) -> Result<()> {
     use miette::{IntoDiagnostic as _, WrapErr as _};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+    let address = args
+        .address
+        .ok_or_else(|| miette::miette!("--address is required for --mode=shared"))?;
+    let gateway_endpoint = args
+        .gateway_endpoint
+        .ok_or_else(|| miette::miette!("--gateway-endpoint is required for --mode=shared"))?;
+    let session_control_tls_dir = args.session_control_tls_dir.ok_or_else(|| {
+        miette::miette!("--session-control-tls-dir is required for --mode=shared")
+    })?;
+    let runtime_listen = args
+        .runtime_listen
+        .ok_or_else(|| miette::miette!("--runtime-listen is required for --mode=shared"))?;
+    let session_root = args
+        .session_root
+        .ok_or_else(|| miette::miette!("--session-root is required for --mode=shared"))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -87,7 +69,7 @@ fn run_platform(args: Args) -> Result<()> {
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
         let tls_file = |name: &str| {
-            let path = args.session_control_tls_dir.join(name);
+            let path = session_control_tls_dir.join(name);
             std::fs::read(&path)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("read session-control TLS file {}", path.display()))
@@ -100,19 +82,19 @@ fn run_platform(args: Args) -> Result<()> {
         .map_err(|error| miette::miette!("{error}"))?;
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {
-                gateway_endpoint: args.openshell_endpoint.clone(),
-                session_root: args.session_root.clone(),
-                runtime_listen: args.runtime_listen,
+                gateway_endpoint,
+                session_root,
+                runtime_listen,
                 removal_grace: openshell_sandbox_backend::session_control::SESSION_REMOVAL_GRACE,
             },
         )?;
-        let control = tokio::net::TcpListener::bind(args.session_control_listen)
+        let control = tokio::net::TcpListener::bind(address)
             .await
             .into_diagnostic()
             .wrap_err("bind session-control listener")?;
         tracing::info!(
             runtime = %host.runtime_addr(),
-            control = %args.session_control_listen,
+            control = %address,
             "Shared supervisor ready for sessions"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);
@@ -138,6 +120,6 @@ fn run_platform(args: Args) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn run_platform(_args: Args) -> Result<()> {
-    Err(miette::miette!("experimental-host requires Unix"))
+fn run_platform(_args: crate::Args) -> Result<()> {
+    Err(miette::miette!("--mode=shared requires Unix"))
 }
