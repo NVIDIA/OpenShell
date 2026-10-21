@@ -231,11 +231,24 @@ impl BackendSetup for OpenShellBackendSetup {
                     gid: descriptor.workload_identity.gid,
                 }),
         };
-        Ok((identity, Box::new(OpenShellLaunch(descriptor))))
+        let transport = openshell_sandbox_backend::BoundaryTransport::for_descriptor(&descriptor)?;
+        Ok((
+            identity,
+            Box::new(OpenShellLaunch {
+                descriptor,
+                transport,
+            }),
+        ))
     }
 }
 
-struct OpenShellLaunch(openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor);
+/// Launch data plus the transport chosen for it. Discovery and the attached
+/// backend use clones of one transport, so a runtime-initiated descriptor binds
+/// its control listener once for the supervisor's lifetime.
+struct OpenShellLaunch {
+    descriptor: openshell_sandbox_backend::boundary_protocol::SandboxRuntimeDescriptor,
+    transport: openshell_sandbox_backend::BoundaryTransport,
+}
 
 #[tonic::async_trait]
 impl PreparedBackend for OpenShellLaunch {
@@ -243,23 +256,30 @@ impl PreparedBackend for OpenShellLaunch {
         &self,
         bearer: SessionBearerTokenSlot,
     ) -> std::result::Result<(Option<String>, bool), BackendError> {
-        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(self.0.clone(), bearer)
-            .await
+        openshell_sandbox_backend::OpenShellRuntimeBackend::discover_policy(
+            self.descriptor.clone(),
+            bearer,
+            self.transport.clone(),
+        )
+        .await
     }
 
     fn build(
         self: Box<Self>,
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
-        let payload = self.0.backend_descriptor()?.payload;
+        let payload = self.descriptor.backend_descriptor()?.payload;
         Ok(BuiltBackend {
             payload,
             proxy_listener: None,
-            backend: Arc::new(openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                services.ca_file_paths,
-                services.provider_credentials,
-                services.sandbox_bearer,
-            )),
+            backend: Arc::new(
+                openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+                    services.ca_file_paths,
+                    services.provider_credentials,
+                    services.sandbox_bearer,
+                )
+                .with_transport(self.transport),
+            ),
         })
     }
 }

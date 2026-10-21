@@ -103,6 +103,61 @@ them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
 sandbox namespace. Kubernetes accepts policy objects without confirming
 enforcement, so operators must verify CNI support before running sandboxes.
 
+### Control connection direction
+
+Every new runtime generation uses `runtime-initiated` control. The Sandbox
+annotation `openshell.ai/sandbox-runtime-control-connection` records the mode,
+bound to `openshell.ai/sandbox-runtime-control-generation`. A missing marker or
+a different current runtime generation identifies a legacy,
+`supervisor-initiated` generation, which keeps working until replaced. Stop/start
+upgrades it automatically: with both old Pods removed, the driver adds the
+supervisor Service and records the new mode and generation
+before releasing the replacement workload. Gateway recovery that recreates both
+Pods also upgrades the generation. Reconciliation never migrates a running
+generation. An unknown annotation value fails closed; there is no rollout flag.
+
+Only the dial direction differs. In both modes the sandbox runtime presents the
+generation-pinned TLS server identity and serves gRPC, and the supervisor
+verifies that identity, acts as the gRPC client, and sends the Sandbox Protocol
+JWT. The per-sandbox Service `os-boundary-<id>` always selects the paired
+workload Pod. A separate `os-supervisor-<id>` Service always selects the paired
+supervisor Pod. New gateways create both Services, retaining the legacy
+Service's UID, ClusterIP, and selector across restarts so an older gateway can
+still replace the generation during a rolling upgrade.
+
+For `runtime-initiated`:
+
+- The bootstrap Secret gives the runtime the Service ClusterIP and port. The
+  runtime retries with capped backoff until the supervisor listens, so neither
+  Pod waits on the other during bootstrap. The Service sets
+  `publishNotReadyAddresses` because the supervisor becomes Ready only after
+  the runtime attaches through it. The workload still cannot reach the control
+  port.
+- A per-sandbox `NetworkPolicy` `os-control-<id>` selects only this sandbox's
+  two Pods and admits one flow, from its workload Pod to its supervisor Pod on
+  `boundary_port` over TCP, as workload egress and supervisor ingress.
+  Supervisors may already be ingress-isolated by the managed SSH ingress policy;
+  when that policy is disabled, this one isolates them. Exec, file sync, and
+  logs need no other supervisor ingress because the supervisor opens those
+  connections. The CNI must still allow kubelet readiness probes. The
+  namespace-wide policies are unchanged.
+- The policy's UID and resourceVersion are bound into the boundary resource
+  claims and outer-fence evidence. Reconciliation suspends the workload if the
+  policy disappears, diverges, or changes generation, or if the active control
+  Service no longer selects the role the recorded mode requires.
+- Both Services and the control policy are owned by the Sandbox resource and are
+  deleted only with that sandbox.
+
+Deploy a gateway, supervisor image, and sandbox runtime image that all support
+`runtime-initiated` before using it. Older binaries reject the new descriptor
+shapes and fail closed.
+
+During a mixed-version rollout, an old gateway can restart a sandbox by
+creating its own compatible supervisor/runtime pair through the legacy
+Service. It preserves unknown annotations, so the mode marker is accepted only
+for its recorded generation. Do not replace an individual generation's
+supervisor or runtime binary with one that cannot read its descriptor.
+
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
@@ -110,7 +165,8 @@ supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
 corporate proxy CA bundle, which the gateway reads from its own filesystem so
 the anchor stays in the gateway's trust domain rather than the sandbox
 namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
-supervisor Pod, and shared network-policy identities. Stop deletes the workload
+supervisor Pod, and shared network-policy identities, plus the per-sandbox
+control policy for `runtime-initiated` sandboxes. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
 Pod before releasing a new workload Pod. It also renders the trusted init
 container again from gateway config, so a sandbox created by an older gateway

@@ -371,7 +371,7 @@ Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
 gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
 guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
 

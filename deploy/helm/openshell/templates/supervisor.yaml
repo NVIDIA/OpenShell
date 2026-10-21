@@ -1,0 +1,80 @@
+{{- include "openshell.validateValues" . }}
+{{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $imagePullSecrets := get $kubernetes "image_pull_secrets" | default list -}}
+{{- range .Values.imagePullSecrets -}}
+{{- $imagePullSecrets = append $imagePullSecrets .name -}}
+{{- end -}}
+{{- if eq (get $kubernetes "supervisor_topology" | default "") "gateway" }}
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "openshell.fullname" . }}-supervisor
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: openshell-supervisor
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: supervisor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: openshell-supervisor
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: supervisor
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      {{- with ($imagePullSecrets | uniq) }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . | quote }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: supervisor
+          image: {{ get $kubernetes "supervisor_image" | quote }}
+          imagePullPolicy: {{ get (dict "always" "Always" "if_not_present" "IfNotPresent" "never" "Never") (get $kubernetes "supervisor_image_pull_policy" | default "if_not_present") | quote }}
+          args:
+            - --mode=shared
+            - --gateway-endpoint
+            - {{ include "openshell.grpcEndpoint" . | quote }}
+            - --address
+            - 0.0.0.0:5501
+          ports:
+            - name: supervisor
+              containerPort: 5501
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          readinessProbe:
+            tcpSocket:
+              port: supervisor
+          livenessProbe:
+            tcpSocket:
+              port: supervisor
+{{- end }}

@@ -264,6 +264,9 @@ struct Args {
     vm_vsock_control_socket: Option<PathBuf>,
 
     #[arg(long, hide = true)]
+    vm_vsock_runtime_initiated: bool,
+
+    #[arg(long, hide = true)]
     vm_mount: Vec<String>,
 }
 
@@ -673,7 +676,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
             (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
                 guest_port,
                 host_socket,
-                host_initiated: true,
+                host_initiated: !args.vm_vsock_runtime_initiated,
             }),
             (None, None) => None,
             _ => {

@@ -1677,6 +1677,12 @@ pub fn build_isolation_specs(
         options: vec!["rw".into(), "z".into()],
     });
 
+    workload.volumes.push(NamedVolume {
+        name: crate::isolation::control_volume_name(&input.sandbox.id),
+        dest: crate::isolation::CONTROL_ROOT.into(),
+        options: vec!["rw".into(), "z".into()],
+    });
+
     supervisor.name = crate::isolation::supervisor_name(&input.sandbox.id);
     supervisor
         .labels
@@ -1732,6 +1738,11 @@ pub fn build_isolation_specs(
         dest: crate::isolation::CHANNEL_ROOT.into(),
         options: vec!["ro".into(), "z".into()],
     }];
+    supervisor.volumes.push(NamedVolume {
+        name: crate::isolation::control_volume_name(&input.sandbox.id),
+        dest: crate::isolation::CONTROL_ROOT.into(),
+        options: vec!["rw".into(), "z".into()],
+    });
     supervisor.mounts.retain(|mount| {
         trusted_mount(&mount.destination)
             && mount.destination != openshell_core::container_paths::NETNS_MOUNT_ROOT
@@ -2061,7 +2072,7 @@ mod tests {
         assert_eq!(specs.supervisor.secrets.len(), 1);
         assert_eq!(specs.supervisor.secrets[0].source, "jwt");
         assert_eq!(specs.supervisor.secrets[0].uid, 1000);
-        assert_eq!(specs.supervisor.volumes.len(), 1);
+        assert_eq!(specs.supervisor.volumes.len(), 2);
         assert!(specs.workload.volumes[0].options.contains(&"rw".into()));
         assert!(!specs.workload.volumes[0].options.contains(&"nocopy".into()));
         assert!(specs.supervisor.volumes[0].options.contains(&"ro".into()));

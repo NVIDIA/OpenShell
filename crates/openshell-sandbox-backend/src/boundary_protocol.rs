@@ -237,7 +237,88 @@ impl<'de> Deserialize<'de> for SupervisorInstanceId {
 #[error("supervisor instance ID must be a non-nil canonical lowercase UUID")]
 pub struct SupervisorInstanceIdError;
 
-pub use openshell_core::isolation_registration::SandboxTransport;
+/// Backend-owned transport for a driver-provisioned runtime. The serialized
+/// variants preserve existing runtime descriptors independently of operator
+/// endpoint registration in core.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum SandboxTransport {
+    Unix {
+        socket_path: PathBuf,
+    },
+    Tcp {
+        /// Logical HTTP authority used for routing.
+        authority: String,
+        /// Concrete connection candidates pinned by the operator or driver.
+        addresses: Vec<std::net::SocketAddr>,
+    },
+    Vsock {
+        guest_cid: u32,
+        port: u32,
+    },
+    /// The supervisor accepts a connection from its sandbox runtime. TLS and
+    /// gRPC roles stay unchanged.
+    RuntimeInitiatedTcp {
+        authority: String,
+        listen_address: std::net::SocketAddr,
+    },
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+    },
+    RuntimeInitiatedVsock {
+        guest_cid: u32,
+        port: u32,
+    },
+}
+
+impl SandboxTransport {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let valid = match self {
+            Self::Unix { socket_path } | Self::RuntimeInitiatedUnix { socket_path } => {
+                socket_path.is_absolute()
+            }
+            Self::Tcp {
+                authority,
+                addresses,
+            } => {
+                !authority.is_empty()
+                    && !addresses.is_empty()
+                    && addresses
+                        .iter()
+                        .all(|address| address.port() != 0 && !address.ip().is_unspecified())
+            }
+            Self::RuntimeInitiatedTcp {
+                authority,
+                listen_address,
+            } => !authority.is_empty() && listen_address.port() != 0,
+            Self::Vsock { guest_cid, port } | Self::RuntimeInitiatedVsock { guest_cid, port } => {
+                *guest_cid >= 3 && *guest_cid != u32::MAX && *port != 0 && *port != u32::MAX
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err("invalid boundary control transport endpoint")
+        }
+    }
+}
+
+impl From<openshell_core::isolation_registration::SandboxTransport> for SandboxTransport {
+    fn from(endpoint: openshell_core::isolation_registration::SandboxTransport) -> Self {
+        use openshell_core::isolation_registration::SandboxTransport as RegisteredEndpoint;
+        match endpoint {
+            RegisteredEndpoint::Unix { socket_path } => Self::Unix { socket_path },
+            RegisteredEndpoint::Tcp {
+                authority,
+                addresses,
+            } => Self::Tcp {
+                authority,
+                addresses,
+            },
+            RegisteredEndpoint::Vsock { guest_cid, port } => Self::Vsock { guest_cid, port },
+        }
+    }
+}
 
 /// Supervisor-side, generation-pinned TLS server authentication.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,6 +434,25 @@ pub enum BoundaryListener {
     /// TLS over guest `AF_VSOCK`.
     Vsock {
         control_port: u32,
+        tls: SandboxTlsServerConfig,
+    },
+    /// The boundary dials the supervisor's listener and serves TLS and gRPC
+    /// over that outbound connection. Only driver-resolved addresses are used.
+    RuntimeInitiatedTlsTcp {
+        /// Stable logical Service authority, for diagnostics.
+        authority: String,
+        /// Driver-resolved supervisor endpoints, tried in order.
+        addresses: Vec<std::net::SocketAddr>,
+        tls: SandboxTlsServerConfig,
+    },
+    /// Dial the supervisor over the driver's protected shared Unix socket.
+    RuntimeInitiatedUnix {
+        socket_path: PathBuf,
+        tls: SandboxTlsServerConfig,
+    },
+    /// Dial the host supervisor through the VM's vsock device.
+    RuntimeInitiatedVsock {
+        host_port: u32,
         tls: SandboxTlsServerConfig,
     },
 }

@@ -345,6 +345,10 @@ pub struct ServerState {
     /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
     pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
 
+    /// Credentials that have recently logged on, so each records one
+    /// authentication success rather than one per request.
+    pub(crate) logons: auth::audit::Logons,
+
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 
@@ -463,6 +467,7 @@ impl ServerState {
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
             peer_authenticator: None,
+            logons: auth::audit::Logons::default(),
             grpc_rate_limiter,
             reflection_service,
             gateway_interceptors: None,

@@ -196,8 +196,10 @@ GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, 
 Pre-release also runs `release-notes.yml` after building, alongside publication
 and qualification, and keeps the notes only in the `release-notes` artifact.
 This job is advisory: a notes failure emits a warning without failing the
-prerelease run or blocking promotion. Stable publication requires successful
-notes generation.
+prerelease run or blocking promotion. Stable publication reuses the promoted
+prerelease's `release-notes` artifact, retagged, and generates notes only when
+that preview is unavailable. The `Select Qualified Prerelease` summary says
+which happened.
 
 For `Codex Compatibility Review`, inspect its job summary and the
 `compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the

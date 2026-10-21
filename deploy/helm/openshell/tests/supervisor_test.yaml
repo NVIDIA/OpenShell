@@ -1,0 +1,105 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+suite: supervisor deployment
+templates:
+  - templates/supervisor.yaml
+  - templates/gateway-config.yaml
+release:
+  name: openshell
+  namespace: gateway
+tests:
+  - it: adds no supervisor by default
+    template: templates/supervisor.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: deploys one isolated idle process in the gateway namespace
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          supervisor_image: example.com/supervisor:shared
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: gateway
+      - equal:
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: openshell-supervisor
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: example.com/supervisor:shared
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - --mode=shared
+            - --gateway-endpoint
+            - https://openshell.gateway.svc.cluster.local:8080
+            - --address
+            - 0.0.0.0:5501
+      - equal:
+          path: spec.template.spec.containers[0].ports
+          value:
+            - name: supervisor
+              containerPort: 5501
+              protocol: TCP
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe
+          value:
+            tcpSocket:
+              port: supervisor
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe
+          value:
+            tcpSocket:
+              port: supervisor
+      - notExists:
+          path: spec.template.spec.containers[0].volumeMounts
+      - notExists:
+          path: spec.template.spec.volumes
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+  - it: renders the same setting into gateway TOML
+    template: templates/gateway-config.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'supervisor_topology = "gateway"'
+  - it: rejects workspace until implemented
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: workspace
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_topology=workspace is not implemented
+  - it: rejects invalid topology
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: invalid
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_topology must be gateway or workspace; omit it to disable the shared supervisor
+  - it: rejects enabled topology for another compute driver
+    template: templates/supervisor.yaml
+    set:
+      gatewayConfig:
+        openshell.gateway:
+          compute_driver: docker
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - failedTemplate:
+          errorMessage: supervisor_topology requires the kubernetes compute driver

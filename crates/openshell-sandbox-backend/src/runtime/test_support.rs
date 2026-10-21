@@ -722,7 +722,7 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
     .unwrap();
     let mut client =
         BoundaryClient::with_backend(descriptor, bearer, crate::BACKEND_NAME.into(), vec![]);
-    client.connector = Some(Arc::new(Connector {
+    client.transport = crate::BoundaryTransport::connector(Arc::new(Connector {
         peer,
         address,
         task,
@@ -860,7 +860,7 @@ pub fn backend(
     )
     .unwrap();
     let mut backend = crate::OpenShellRuntimeBackend::new(ca, credentials, bearer);
-    backend.connector.clone_from(&peer.connector);
+    backend.transport.clone_from(&peer.transport);
     backend.delegated = Some(crate::runtime::DelegatedRuntime {
         backend_name: name,
         descriptor,
