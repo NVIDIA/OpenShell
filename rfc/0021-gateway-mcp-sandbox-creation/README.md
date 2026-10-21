@@ -18,6 +18,10 @@ grant that the user sets when starting the tree's first sandbox or attaches to
 it later, and recorded in a lineage so that stopping a parent stops its children
 first.
 
+The MCP endpoint is meant to expose more of OpenShell's control plane to
+harnesses over time. Creating child sandboxes is its first use case, and the
+only one this RFC designs.
+
 The contract is a gRPC API for child sandboxes, exposed through the SDKs, the
 CLI and an MCP endpoint, so a harness can integrate at whichever level suits it.
 Agents inside a sandbox reach the gateway through a door in their own supervisor
@@ -81,6 +85,8 @@ sandbox, for whom, and was it allowed".
 
 ## Non-goals
 
+- **Other control-plane tools on the MCP endpoint.** Each later set of tools
+  gets its own proposal that names its RPCs and who may call them.
 - **Agent-to-agent messaging and shared task boards.** How agents in a tree
   talk to each other is a separate proposal.
 - **Per-tool permissions for other MCP servers**, such as "GitHub MCP, read
