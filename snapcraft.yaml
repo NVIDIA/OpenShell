@@ -28,8 +28,9 @@ description: |
 
          sudo usermod -aG kvm "$USER"
 
-       To use a different driver, such as Docker, set `compute_driver` under
-       `[openshell.gateway]` in gateway.toml.
+       To use a different installed driver, such as Docker or rootless Podman,
+       set `compute_driver` under `[openshell.gateway]` in gateway.toml. Start
+       `podman.socket` as the gateway user before selecting Podman.
 
        Enable and start the gateway from the single user account that will run
        it:
@@ -87,10 +88,10 @@ description: |
 base: core24
 grade: stable
 confinement: strict
-# The system :docker slot was added in snapd 2.76, so this is the minimum
-# required version. Snapd 2.77 allowed manual connection to that slot without
-# snap-declaration overrides from the store, such as when installing a locally-
-# built snap, but that is not required for installations from the snap store.
+# The system :docker slot and podman interface were added in snapd 2.76, so
+# this is the minimum required version. Snapd 2.77 allowed manual connection
+# to :docker without snap-declaration overrides from the store, such as when
+# installing a locally-built snap, but that is not required for store installs.
 assumes: [snapd2.76]
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
@@ -179,6 +180,7 @@ apps:
       - log-observe
       - network
       - network-bind
+      - podman
       - system-observe
 
 parts:

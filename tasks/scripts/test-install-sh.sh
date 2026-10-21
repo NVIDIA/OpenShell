@@ -467,7 +467,7 @@ if ! (
   exit 1
 fi
 if ! grep -Fq 'sudo usermod -aG kvm "test-user"' "$out" || \
-  ! grep -Fq 'set compute_driver to another installed driver, such as docker' "$out"; then
+  ! grep -Fq 'set compute_driver to another installed driver, such as docker or podman' "$out"; then
   echo "FAIL: missing KVM access guidance" >&2
   cat "$out" >&2
   exit 1

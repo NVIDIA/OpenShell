@@ -150,8 +150,8 @@ assert_not_contains "$snap_wrapper" "CANONICAL_CONFIG_FILE"
 bash "$ROOT/tasks/scripts/test-snap-gateway-wrapper.sh" "$snap_wrapper"
 
 # Store installs autoconnect all required interfaces and require snapd 2.76 for
-# the system Docker slot. Manual connection for locally-built snaps requires
-# snapd 2.77.
+# the system Docker slot and Podman interface. Manual connection to :docker for
+# locally-built snaps requires snapd 2.77.
 assert_contains "$snapcraft" "assumes: [snapd2.76]"
 for snap_file in \
   "$snapcraft" \
@@ -165,6 +165,10 @@ for snap_file in \
 done
 if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
   echo "FAIL: obsolete snap Docker connection hook must not exist" >&2
+  exit 1
+fi
+if [[ -e "${ROOT}/snap/hooks/connect-plug-podman" ]]; then
+  echo "FAIL: snap Podman connection hook must not exist" >&2
   exit 1
 fi
 if [[ ! -x "$snap_install_hook" ]]; then
@@ -228,6 +232,21 @@ if [[ $(grep -c '^      - kvm$' "$snapcraft") -ne 2 ]]; then
   echo "FAIL: both snap gateway apps must plug kvm" >&2
   exit 1
 fi
+if [[ $(grep -c '^      - podman$' "$snapcraft") -ne 1 ]]; then
+  echo "FAIL: only the snap user gateway must plug podman" >&2
+  exit 1
+fi
+if ! awk '
+  /^  system-gateway:$/ { app = "system"; next }
+  /^  user-gateway:$/ { app = "user"; next }
+  /^  [[:alnum:]_-]+:$/ { app = "" }
+  app == "system" && /^      - podman$/ { system_podman = 1 }
+  app == "user" && /^      - podman$/ { user_podman = 1 }
+  END { exit !(!system_podman && user_podman) }
+' "$snapcraft"; then
+  echo "FAIL: podman must be plugged only by the snap user gateway" >&2
+  exit 1
+fi
 if ! awk '
   /^  prover:$/ { in_prover = 1; next }
   in_prover && /^  [[:alnum:]_-]+:$/ { finished = 1; exit }
@@ -248,7 +267,9 @@ assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:kvm"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
+assert_contains "$snap_install_docs" "snap connect openshell:podman :podman"
 assert_contains "$snap_install_docs" 'compute_driver = "docker"'
+assert_contains "$snap_install_docs" 'compute_driver = "podman"'
 assert_contains "$snap_install_docs" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$snapcraft" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$ROOT/install.sh" "systemctl --user enable --now snap.openshell.user-gateway.service"
@@ -279,12 +300,16 @@ assert_not_contains "$snap_install_docs" "snap services --user"
 assert_contains "$snap_canary" "install.sh | sh"
 assert_contains "$snap_canary" "ubuntu-snap-vm:"
 assert_contains "$snap_canary" "ubuntu-snap-docker:"
+assert_contains "$snap_canary" "ubuntu-snap-podman:"
 assert_contains "$snap_canary" "OPENSHELL_COMPUTE_DRIVER=docker"
+assert_contains "$snap_canary" "OPENSHELL_COMPUTE_DRIVER=podman"
 assert_contains "$snap_canary" "^docker +openshell:docker +:docker +"
+assert_contains "$snap_canary" "^podman +openshell:podman +:podman +"
 assert_contains "$snap_canary" "openshell-driver-vm"
 assert_contains "$snap_canary" "snap connections openshell"
 assert_contains "$snap_canary" "openshell.prover check"
 assert_not_contains "$snap_canary" "--dangerous"
+assert_not_contains "$snap_canary" "snap connect openshell:podman"
 assert_not_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 if ! awk '
   /^  ubuntu-snap-vm:$/ { in_job = 1; next }
@@ -313,6 +338,30 @@ if ! awk '
   END { exit !(set_env && checked_env && checked_plug && checked_log && checked_driver && created_sandbox) }
 ' "$snap_canary"; then
   echo "FAIL: snap Docker canary must select and verify Docker before creating a sandbox" >&2
+  exit 1
+fi
+if ! awk '
+  /^  ubuntu-snap-podman:$/ { in_job = 1; next }
+  in_job && /^  [[:alnum:]_-]+:$/ { in_job = 0 }
+  in_job && /runs-on: ubuntu-26\.04/ { correct_runner = 1 }
+  in_job && /apt-get install -y podman/ { installed_podman = 1 }
+  in_job && /systemctl --user enable --now podman\.socket/ { started_socket = 1 }
+  in_job && /Host\.Security\.Rootless/ { checked_rootless = 1 }
+  in_job && /Host\.CgroupsVersion/ { checked_cgroups = 1 }
+  in_job && /systemctl --user set-environment/ { set_env = 1 }
+  in_job && set_env && /grep -Fx '\''OPENSHELL_COMPUTE_DRIVER=podman'\''/ { checked_env = 1 }
+  in_job && checked_env && /grep -E '\''\^podman \+openshell:podman \+:podman \+'\''/ { checked_plug = 1 }
+  in_job && checked_plug && /grep -F '\''Using compute driver'\''/ { checked_log = 1 }
+  in_job && checked_log && /grep -F '\''driver=podman'\''/ { checked_driver = 1 }
+  in_job && checked_driver && /gateway info --output json/ { checked_info = 1 }
+  in_job && checked_info && /openshell sandbox create/ { created_sandbox = 1 }
+  in_job && created_sandbox && /label=openshell\.managed=true/ { checked_owner = 1 }
+  in_job && checked_owner && /openshell sandbox exec/ { executed_sandbox = 1 }
+  in_job && executed_sandbox && /openshell sandbox delete/ { deleted_sandbox = 1 }
+  in_job && deleted_sandbox && /Podman resources remain after deleting/ { checked_cleanup = 1 }
+  END { exit !(correct_runner && installed_podman && started_socket && checked_rootless && checked_cgroups && set_env && checked_env && checked_plug && checked_log && checked_driver && checked_info && created_sandbox && checked_owner && executed_sandbox && deleted_sandbox && checked_cleanup) }
+' "$snap_canary"; then
+  echo "FAIL: snap Podman canary must select and verify Podman before creating a sandbox" >&2
   exit 1
 fi
 if ! awk '/config preflight/ { seen = 1 } /generate-certs/ { exit !seen }' "$service"; then

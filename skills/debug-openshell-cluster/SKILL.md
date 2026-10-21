@@ -1240,6 +1240,21 @@ When `gateway.toml` has no `compute_driver`, the snap wrapper selects `vm`.
 Set `[openshell.gateway].compute_driver` explicitly to choose another installed
 driver. Snap VM support is CPU-only and does not include VFIO passthrough.
 
+For a snap user gateway configured with rootless Podman, verify the privileged
+interface connection and the same user's API socket before debugging sandbox
+startup:
+
+```bash
+snap connections openshell | grep podman
+systemctl --user status podman.socket podman.service
+test -S "/run/user/$(id -u)/podman/podman.sock"
+podman info --format '{{.Host.Security.Rootless}} {{.Host.CgroupsVersion}}'
+journalctl --user -u snap.openshell.user-gateway.service --no-pager | grep 'driver=podman'
+```
+
+The `podman` interface grants the user gateway access to that user's Podman API.
+The snap does not install Podman or start `podman.socket`.
+
 Then run:
 
 ```bash

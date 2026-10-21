@@ -161,7 +161,16 @@ version = 2
 compute_driver = "docker"
 ```
 
-Its database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
+To use rootless Podman, install Podman 5.x, verify that the host uses cgroups v2, and enable its API socket from the same user account that runs the snap gateway:
+
+```shell
+podman info
+systemctl --user enable --now podman.socket
+```
+
+Then set `compute_driver = "podman"` in the same gateway table and restart the gateway with `systemctl restart --user snap.openshell.user-gateway.service`. The snap does not install, configure, or start Podman.
+
+OpenShell's database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
 
 ```shell
 snap services openshell.user-gateway
@@ -257,6 +266,7 @@ sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:kvm
 sudo snap connect openshell:docker :docker
+sudo snap connect openshell:podman :podman
 systemctl --user enable --now snap.openshell.user-gateway.service
 ```
 

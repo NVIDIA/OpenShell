@@ -1281,7 +1281,7 @@ check_snap_kvm_access() {
   else
     warn "The kvm group is unavailable; grant ${TARGET_USER} read/write access to ${_kvm_device} before using the VM driver."
   fi
-  warn "Alternatively, set compute_driver to another installed driver, such as docker, in the snap gateway TOML configuration."
+  warn "Alternatively, set compute_driver to another installed driver, such as docker or podman, in the snap gateway TOML configuration."
 }
 
 snap_gateway_mode() {
