@@ -15,7 +15,8 @@
 //!
 //! The attribute expands to a `#[tokio::test]` wrapper with the same name, so
 //! the nextest test name is the function name. The original function is nested
-//! in the wrapper and passed to `testkit::run`.
+//! in the wrapper and passed to `testkit::run`. Other attributes, such as
+//! `#[ignore]` or `#[cfg(...)]`, move to the wrapper.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -49,6 +50,12 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
             "testkit tests take exactly one argument: `cx: &mut testkit::Context`",
         ));
     }
+    if let Some(attr) = body.attrs.iter().find(|attr| is_test_attr(attr)) {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "`#[testkit::test]` already makes this a test; remove this attribute",
+        ));
+    }
     let description = doc_comment(&body.attrs);
     if description.is_empty() {
         return Err(syn::Error::new(
@@ -62,18 +69,12 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
     let description = LitStr::new(&description, name.span());
 
     let vis = body.vis.clone();
-    let doc_attrs: Vec<_> = body
-        .attrs
-        .iter()
-        .filter(|attr| attr.path().is_ident("doc"))
-        .cloned()
-        .collect();
-    body.attrs.retain(|attr| !attr.path().is_ident("doc"));
+    let attrs = std::mem::take(&mut body.attrs);
     body.vis = syn::Visibility::Inherited;
     body.sig.ident = format_ident!("body");
 
     Ok(quote! {
-        #(#doc_attrs)*
+        #(#attrs)*
         #[::testkit::__private::tokio::test(crate = "::testkit::__private::tokio")]
         #vis async fn #name() {
             #body
@@ -87,6 +88,14 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
             .await;
         }
     })
+}
+
+/// `#[test]`, `#[tokio::test]`, or another test attribute.
+fn is_test_attr(attr: &Attribute) -> bool {
+    attr.path()
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == "test")
 }
 
 /// The doc comment, joined into one line. Empty if there is none.
@@ -157,6 +166,38 @@ mod tests {
         let err =
             expand_str("", "/// Doc.\nasync fn t() -> testkit::Result { Ok(()) }").unwrap_err();
         assert!(err.to_string().contains("exactly one argument"), "{err}");
+    }
+
+    #[test]
+    fn forwards_other_attributes_to_the_wrapper() {
+        let out = expand_str(
+            "",
+            "/// Doc.\n#[ignore = \"needs persistent workspaces\"]\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
+        )
+        .unwrap();
+        let (wrapper, body) = out.split_once("async fn body").unwrap();
+        assert!(
+            wrapper.contains("# [ignore = \"needs persistent workspaces\"]"),
+            "{out}"
+        );
+        assert!(!body.contains("ignore"), "{out}");
+    }
+
+    #[test]
+    fn rejects_another_test_attribute() {
+        for attr in ["#[test]", "#[tokio::test]"] {
+            let err = expand_str(
+                "",
+                &format!(
+                    "/// Doc.\n{attr}\nasync fn t(cx: &mut Context) -> testkit::Result {{ Ok(()) }}"
+                ),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("already makes this a test"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
