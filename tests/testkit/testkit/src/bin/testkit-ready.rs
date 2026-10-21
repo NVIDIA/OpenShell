@@ -14,16 +14,23 @@ use std::time::Duration;
 use testkit::{Cli, Gateway};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+const USAGE: &str = "usage: testkit-ready [TIMEOUT_SECS] (default 60)";
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
-    let timeout = match std::env::args().nth(1).map(|arg| arg.parse::<u64>()) {
+    let timeout = match std::env::args().nth(1).as_deref() {
         None => DEFAULT_TIMEOUT_SECS,
-        Some(Ok(secs)) => secs,
-        Some(Err(error)) => {
-            eprintln!("testkit-ready: invalid timeout: {error}");
-            return ExitCode::from(2);
+        Some("-h" | "--help") => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
         }
+        Some(arg) => match arg.parse::<u64>() {
+            Ok(secs) => secs,
+            Err(_) => {
+                eprintln!("testkit-ready: invalid timeout {arg:?}; {USAGE}");
+                return ExitCode::from(2);
+            }
+        },
     };
     let result = async {
         let gateway = Gateway::from_env()?;
