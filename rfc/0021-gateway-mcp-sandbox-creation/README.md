@@ -109,10 +109,10 @@ sandbox, for whom, and was it allowed".
   [Asking for more than the parent has](#asking-for-more-than-the-parent-has)).
   A single prompt that shows the child's request and approves it in one step is
   future work.
-- **Large or streamed results.** A child returns one final result of at most
-  32 KiB (see [Returning results](#returning-results)). Bigger output stays in
-  files the parent reads with `get_file` while the child runs; progress updates
-  and messages between running agents are future work (see
+- **Storing results or streaming them.** The gateway never keeps a child's
+  output. A child leaves its result in its own files, says it is done, and the
+  parent reads the files with `get_file` (see [Returning results](#returning-results)).
+  Progress updates and messages between running agents are future work (see
   [Agent-to-agent communication through the gateway](#agent-to-agent-communication-through-the-gateway)).
 
 ## Proposal
@@ -792,14 +792,14 @@ made.
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
 | `create_sandbox` | users and sandboxes | `name`, `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`; users only: `image`, `grant` | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `PROVER_INCONCLUSIVE`, `PROGRAM_NOT_ALLOWED`, `GLOBAL_POLICY_ACTIVE`, `EXCEEDS_GLOBAL_POLICY`, `IN_PROGRESS`, `STALE_ADMISSION`, `INVALID_ARGUMENT` (request_id reused with different arguments) |
-| `wait` | sandboxes | `handle`, `timeout_s`, `for_result` | `phase`, `exit_code`, `result` (direct parent only) | `NOT_YOUR_CHILD`, `NOT_DIRECT_CHILD` (`for_result` on a grandchild) |
+| `wait` | sandboxes | `handle`, `timeout_s`, `for_done` | `phase`, `exit_code`, `done` | `NOT_YOUR_CHILD` |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
 | `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
 | `stop_sandbox` | sandboxes | `handle` | `stopped` | `NOT_YOUR_CHILD` |
 | `get_output` | sandboxes | `handle` | recent log lines of the child; not a durable result, and a child's own standard output is not included | `NOT_YOUR_CHILD` |
 | `list_children` | sandboxes | none | children with kind, lifetime, depth | none |
 | `get_limits` | sandboxes | none | depth, children and total used and allowed; `can_create_children` (agents) and `can_create_tools` | none |
-| `submit_result` | sandboxes | `result` (at most 32 KiB) | `saved`, `repeated` | `NOT_A_CHILD`, `TOO_LARGE`, `ALREADY_SUBMITTED` (different text) |
+| `mark_done` | sandboxes | none | `done`, `repeated` | `NOT_A_CHILD` |
 | `grant_list` | users | none | grants in the caller's workspace | none |
 | `grant_create` | users | `handle` of a running top-level sandbox, grant fields | the grant | `NOT_ALLOWED`, `ALREADY_EXISTS` |
 | `grant_update` | users | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits, or `revoked` | `NOT_FOUND`, `NOT_ALLOWED` |
@@ -866,31 +866,28 @@ to pass on, are the only point at which the user may be prompted during a run.
 
 ### Returning results
 
-**A child hands one final result to its parent, and the parent's `wait`
-returns it.** This is how harnesses already return a sub-agent's answer: the
-spawn call's result. Without it, a parent has to poll a result file with
-`get_file`, and the child has to keep running until the file is read, because
-its files go when it exits.
+**A child leaves its result in its own files and says it is done; the parent's
+`wait` returns, and the parent reads the files with `get_file`.** The gateway
+keeps a "done" flag, never the result: it is the control plane, and agent output
+stays in the sandboxes. Without the flag, a parent cannot tell a child that is
+still working from one whose result is ready, and has to poll `get_file`, which
+costs model turns and can read a half-written file.
 
-- **`submit_result { result }`** is called by the child through its own door.
-  The gateway takes the child's identity from the door's token, so a child can
-  submit only its own result. A sandbox with no parent gets `NOT_A_CHILD`.
-- **One result per child.** The same text again is a no-op; different text is
-  refused with `ALREADY_SUBMITTED`.
-- **At most 32 KiB**, so the request stays under the door's 64 KiB body limit
-  after JSON escaping and an oversized result gets the gateway's `TOO_LARGE`.
-  The door answers a body over its own limit with HTTP 413 and the size.
-- **Saved before the child is told "saved"**, as a `sandbox_result` object keyed
-  by the child's id, so the child can exit at once and the result survives a
-  gateway restart.
-- **`wait` with `for_result: true`** keeps waiting past READY until the child
-  submits or exits, and returns `result` with the phase and exit code. A child
-  that exits without submitting returns `result: null` and its exit code. A
-  `wait` that times out leaves the result for the next `wait`.
-- **Only the direct parent gets it.** A grandparent may still `wait` for a
-  grandchild, but `for_result` on it is refused with `NOT_DIRECT_CHILD` and a
-  plain `wait` shows no result. Each level decides what to pass up.
-- **Deleted with the child**, including by cascade stop.
+- **`mark_done {}`** is called by the child through its own door, after its
+  result file is complete. The gateway takes the child's identity from the
+  door's token, so a child can mark only itself. A sandbox with no parent gets
+  `NOT_A_CHILD`. Calling it again is a no-op.
+- **`wait` with `for_done: true`** keeps waiting past READY until the child is
+  done or exits, and returns `done` with the phase and exit code. A child that
+  exits without marking done returns `done: false` and its exit code. A `wait`
+  that times out can be repeated.
+- **The parent reads the result with `get_file`** while the child runs. The
+  bytes pass through the gateway's relay and are not stored. Any ancestor may
+  see the flag and read the files, as it may today.
+- **The child keeps running until the parent stops it**, because its files go
+  when it exits. A harness wrapper can write the agent's final answer to a
+  file and call `mark_done`, so the model does not have to remember to.
+- **The flag is deleted with the child**, including by cascade stop.
 
 A result is text written by the child, so the parent's harness must treat it as
 data, not instructions (see [Risks](#risks)).
@@ -1072,8 +1069,7 @@ The work is phased so that each phase is usable and testable on its own:
   callers. Carrying gRPC through the door comes in a later phase (see
   [Open questions](#open-questions)).
 - **Phase 3: Tool sandboxes and results.** `kind: tool`, `exec` with command
-  audit, and the idle timeout; `submit_result`, the `sandbox_result` object and
-  `wait`'s `result` and `for_result`.
+  audit, and the idle timeout; `mark_done` and `wait`'s `done` and `for_done`.
 - **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
   proof of every grant holder's policy (at create and when a grant is
   attached), child policy and policy write against the global policy in
@@ -1098,7 +1094,7 @@ A proof of concept of phases 1 to 3 exists on the branch
 [tutorials](https://github.com/patkraw/OpenShell/tree/gateway-mcp-poc/examples/gateway-mcp-poc/tutorials)
 that run as written. Returning results is in
 [tutorial 02](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result),
-and `run-pi-result-demo.sh` runs it with a real Pi lead and Pi worker. Its
+and `run-pi-done-demo.sh` runs it with a real Pi lead and Pi worker. Its
 current end-to-end result, tied to a commit, is in
 [`examples/gateway-mcp-poc/README.md`](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/README.md#results)
 under Results. The proof of concept keeps grants, lineage and results in memory and forwards the supervisor's main session
@@ -1153,10 +1149,10 @@ and 5 add.
 
 ### Larger results and progress
 
-A result is one final message of at most 32 KiB. Larger outputs could be kept
-as artifacts the parent reads by reference after the child exits, and a running
-child could report progress. Both build on the result object and on
-agent-to-agent communication.
+A result lives only in the child's files, so it is lost if the child exits
+before the parent reads it. Keeping outputs as artifacts that outlive the child,
+and letting a running child report progress, need a decision on where that data
+lives; both build on agent-to-agent communication.
 
 ### Agent-to-agent communication through the gateway
 
@@ -1402,14 +1398,16 @@ UpdateSandboxGrant { grant_id, max_breadth: 3, max_total: 4 }
 **8. The lead collects the result and stops the worker.**
 
 `wait` reaching READY means the worker's sandbox is up, not that its agent has
-finished. The worker hands its answer back with `submit_result` and exits; the
-lead's `wait` with `for_result` returns as soon as the result is saved.
+finished. The worker writes its answer to a file and calls `mark_done`; the
+lead's `wait` with `for_done` returns, and the lead reads the file.
 
 ```text
-worker: submit_result { result: "review: LGTM, 2 nits" }
-→ door adds the worker's token → gateway saves sandbox_result for the worker → saved
-lead: wait { handle: worker, for_result: true }
-→ caller is the worker's direct parent → { phase: COMPLETED, exit_code: 0, result: "review: LGTM, 2 nits" }
+worker: writes /tmp/result.txt, then mark_done {}
+→ door adds the worker's token → gateway sets the worker's done flag → done
+lead: wait { handle: worker, for_done: true }
+→ { phase: READY, done: true }
+lead: get_file { handle: worker, path: "/tmp/result.txt" }
+→ read through the relay, not stored → "review: LGTM, 2 nits"
 stop_sandbox { handle: worker }
 → worker's descendants (none) stopped first, then worker; identity revoked first
 ```
