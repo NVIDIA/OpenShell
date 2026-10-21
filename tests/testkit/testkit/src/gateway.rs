@@ -3,8 +3,10 @@
 
 //! The gateway under test, found the same way the `openshell` CLI finds it:
 //!
-//! 1. `OPENSHELL_GATEWAY_ENDPOINT`: a gateway URL. Plaintext, or TLS without
-//!    a client certificate.
+//! 1. `OPENSHELL_GATEWAY_ENDPOINT`: a gateway URL. Its credentials come from
+//!    the gateway named by `OPENSHELL_GATEWAY`, or else the registered gateway
+//!    with that endpoint. A URL no gateway is registered for is used as is:
+//!    plaintext, or TLS without a client certificate.
 //! 2. `OPENSHELL_GATEWAY`: the name of a gateway registered with the CLI.
 //! 3. The CLI's active gateway, set by `openshell gateway select`.
 //!
@@ -33,12 +35,14 @@ const READY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct Gateway {
-    /// The registered name, or `None` for a raw endpoint.
+    /// The registered name, or `None` for an unregistered endpoint.
     pub name: Option<String>,
     pub endpoint: String,
     pub workspace: String,
     /// The directory holding `ca.crt`, `tls.crt`, and `tls.key` for mTLS.
     mtls_dir: Option<PathBuf>,
+    /// The endpoint came from [`ENDPOINT_ENV`], so the CLI must get it too.
+    pub(crate) endpoint_from_env: bool,
 }
 
 impl Gateway {
@@ -46,7 +50,21 @@ impl Gateway {
     pub fn from_env() -> Result<Self> {
         let workspace = env(WORKSPACE_ENV).unwrap_or_else(|| DEFAULT_WORKSPACE.to_string());
         if let Some(endpoint) = env(ENDPOINT_ENV) {
-            return Ok(Self::from_endpoint(endpoint, workspace));
+            let Some(name) = env(GATEWAY_ENV).or_else(|| find_registered(&endpoint)) else {
+                return Ok(Self::from_endpoint(endpoint, workspace));
+            };
+            // Like the CLI, a named gateway need not be registered yet.
+            let auth_mode = openshell_bootstrap::get_gateway_metadata(&name)
+                .and_then(|metadata| metadata.auth_mode);
+            let mtls_dir = mtls_dir(&name)?;
+            return Self::registered(
+                name,
+                endpoint,
+                auth_mode.as_deref(),
+                mtls_dir,
+                workspace,
+                true,
+            );
         }
         let name = env(GATEWAY_ENV)
             .or_else(openshell_bootstrap::load_active_gateway)
@@ -60,12 +78,15 @@ impl Gateway {
         let metadata = openshell_bootstrap::load_gateway_metadata(&name)
             .map_err(Error::from_display)
             .context(format!("load gateway {name}"))?;
-        let mtls_dir = openshell_core::paths::openshell_config_dir()
-            .map_err(Error::from_display)?
-            .join("gateways")
-            .join(&name)
-            .join("mtls");
-        Self::from_metadata(name, &metadata, mtls_dir, workspace)
+        let mtls_dir = mtls_dir(&name)?;
+        Self::registered(
+            name,
+            metadata.gateway_endpoint,
+            metadata.auth_mode.as_deref(),
+            mtls_dir,
+            workspace,
+            false,
+        )
     }
 
     fn from_endpoint(endpoint: String, workspace: String) -> Self {
@@ -74,17 +95,19 @@ impl Gateway {
             endpoint,
             workspace,
             mtls_dir: None,
+            endpoint_from_env: true,
         }
     }
 
-    fn from_metadata(
+    fn registered(
         name: String,
-        metadata: &GatewayMetadata,
+        endpoint: String,
+        auth_mode: Option<&str>,
         mtls_dir: PathBuf,
         workspace: String,
+        endpoint_from_env: bool,
     ) -> Result<Self> {
-        let endpoint = metadata.gateway_endpoint.clone();
-        let mtls_dir = match metadata.auth_mode.as_deref() {
+        let mtls_dir = match auth_mode {
             None | Some("mtls") if endpoint.starts_with("https://") => Some(mtls_dir),
             None | Some("mtls" | "plaintext") => None,
             Some(mode) => {
@@ -98,6 +121,7 @@ impl Gateway {
             endpoint,
             workspace,
             mtls_dir,
+            endpoint_from_env,
         })
     }
 
@@ -108,6 +132,7 @@ impl Gateway {
             endpoint: "https://127.0.0.1:1".to_string(),
             workspace: DEFAULT_WORKSPACE.to_string(),
             mtls_dir: None,
+            endpoint_from_env: false,
         }
     }
 
@@ -196,6 +221,36 @@ impl Gateway {
     }
 }
 
+fn mtls_dir(name: &str) -> Result<PathBuf> {
+    Ok(openshell_core::paths::openshell_config_dir()
+        .map_err(Error::from_display)?
+        .join("gateways")
+        .join(name)
+        .join("mtls"))
+}
+
+/// The registered gateway with `endpoint`, preferring the active one, as the
+/// CLI does.
+fn find_registered(endpoint: &str) -> Option<String> {
+    let active = openshell_bootstrap::load_active_gateway()
+        .and_then(|name| openshell_bootstrap::get_gateway_metadata(&name));
+    let all = openshell_bootstrap::list_gateways().unwrap_or_default();
+    match_endpoint(endpoint, active, all)
+}
+
+fn match_endpoint(
+    endpoint: &str,
+    active: Option<GatewayMetadata>,
+    all: Vec<GatewayMetadata>,
+) -> Option<String> {
+    let endpoint = endpoint.trim_end_matches('/');
+    active
+        .into_iter()
+        .chain(all)
+        .find(|metadata| metadata.gateway_endpoint.trim_end_matches('/') == endpoint)
+        .map(|metadata| metadata.name)
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -212,9 +267,9 @@ fn read(path: &Path) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    fn metadata(endpoint: &str, auth_mode: Option<&str>) -> GatewayMetadata {
+    fn metadata(name: &str, endpoint: &str, auth_mode: Option<&str>) -> GatewayMetadata {
         serde_json::from_value(serde_json::json!({
-            "name": "gw",
+            "name": name,
             "gateway_endpoint": endpoint,
             "is_remote": false,
             "gateway_port": 0,
@@ -224,11 +279,13 @@ mod tests {
     }
 
     fn from_metadata(endpoint: &str, auth_mode: Option<&str>) -> Result<Gateway> {
-        Gateway::from_metadata(
+        Gateway::registered(
             "gw".to_string(),
-            &metadata(endpoint, auth_mode),
+            endpoint.to_string(),
+            auth_mode,
             PathBuf::from("/config/gateways/gw/mtls"),
             "default".to_string(),
+            false,
         )
     }
 
@@ -274,6 +331,47 @@ mod tests {
         assert_eq!(
             gateway.describe(),
             "gateway from OPENSHELL_GATEWAY_ENDPOINT at http://127.0.0.1:1 (plaintext), workspace ws"
+        );
+    }
+
+    #[test]
+    fn endpoint_finds_the_registered_gateway() {
+        let all = vec![
+            metadata("other", "https://127.0.0.1:2", None),
+            metadata("gw", "https://127.0.0.1:1/", None),
+        ];
+        assert_eq!(
+            match_endpoint("https://127.0.0.1:1", None, all.clone()),
+            Some("gw".to_string())
+        );
+        assert_eq!(
+            match_endpoint("https://127.0.0.1:3", None, all.clone()),
+            None
+        );
+        // The active gateway wins when two share an endpoint.
+        let active = metadata("active", "https://127.0.0.1:2", None);
+        assert_eq!(
+            match_endpoint("https://127.0.0.1:2", Some(active), all),
+            Some("active".to_string())
+        );
+    }
+
+    #[test]
+    fn endpoint_from_env_keeps_the_gateway_credentials() {
+        let gateway = Gateway::registered(
+            "gw".to_string(),
+            "https://localhost:1".to_string(),
+            None,
+            PathBuf::from("/config/gateways/gw/mtls"),
+            "default".to_string(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(gateway.endpoint, "https://localhost:1");
+        assert!(gateway.endpoint_from_env);
+        assert_eq!(
+            gateway.mtls_dir,
+            Some(PathBuf::from("/config/gateways/gw/mtls"))
         );
     }
 

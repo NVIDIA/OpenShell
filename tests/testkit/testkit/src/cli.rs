@@ -100,11 +100,14 @@ impl Cli {
             .kill_on_drop(true);
         // Select exactly the gateway the SDK connected to.
         match &self.gateway.name {
-            Some(name) => process.env(GATEWAY_ENV, name).env_remove(ENDPOINT_ENV),
-            None => process
-                .env(ENDPOINT_ENV, &self.gateway.endpoint)
-                .env_remove(GATEWAY_ENV),
+            Some(name) => process.env(GATEWAY_ENV, name),
+            None => process.env_remove(GATEWAY_ENV),
         };
+        if self.gateway.endpoint_from_env {
+            process.env(ENDPOINT_ENV, &self.gateway.endpoint);
+        } else {
+            process.env_remove(ENDPOINT_ENV);
+        }
         if let Some(dir) = dir {
             process.current_dir(dir);
         }

@@ -53,8 +53,10 @@ test creates, such as providers, in the test itself.
 
 Tests find the gateway the same way the `openshell` CLI does:
 
-1. `OPENSHELL_GATEWAY_ENDPOINT`: a gateway URL. Plaintext, or TLS without a
-   client certificate.
+1. `OPENSHELL_GATEWAY_ENDPOINT`: a gateway URL. Its credentials come from the
+   gateway named by `OPENSHELL_GATEWAY`, or else the registered gateway with
+   that endpoint. A URL no gateway is registered for is used as is:
+   plaintext, or TLS without a client certificate.
 2. `OPENSHELL_GATEWAY`: the name of a gateway registered with the CLI.
 3. The CLI's active gateway, set by `openshell gateway select`.
 
