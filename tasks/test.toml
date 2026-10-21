@@ -15,6 +15,7 @@ depends = [
   "test:postgres-runner",
   "test:gateway-pull-policy",
   "test:e2e-image-overrides",
+  "test:multi-agent-notepad",
   "test:gateway-config",
   "test:packaging-assets",
   "test:qualification-summary",
@@ -62,6 +63,12 @@ hide = true
 description = "Test E2E gateway and supervisor image override resolution"
 run = "tasks/scripts/test-e2e-image-overrides.sh"
 run_windows = "echo Skipping test:e2e-image-overrides: Unix E2E wrappers do not apply on Windows."
+hide = true
+
+["test:multi-agent-notepad"]
+description = "Test the multi-agent notepad demo orchestration"
+run = "tasks/scripts/test-multi-agent-notepad.sh"
+run_windows = "echo Skipping test:multi-agent-notepad: the demo is a Bash script."
 hide = true
 
 ["test:packaging-assets"]
