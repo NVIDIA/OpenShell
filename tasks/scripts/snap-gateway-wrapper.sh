@@ -14,11 +14,13 @@ then
     export OPENSHELL_GATEWAY_CONFIG="$OPENSHELL_SNAP_CONFIG_FILE"
 fi
 
-# The snap defaults to the bundled VM driver. Preserve an explicit service
-# environment selector, then a selector in the effective gateway TOML.
+# The snap prefers the bundled VM driver when KVM is usable. Preserve an
+# explicit service environment selector, then a selector in the effective
+# gateway TOML.
 if [ -z "${OPENSHELL_COMPUTE_DRIVER+x}" ] \
     && [ -z "${OPENSHELL_DRIVERS+x}" ]
 then
+    kvm_device=/dev/kvm
     config_file=""
     expect_config_path=false
     for arg in "$@"; do
@@ -38,12 +40,14 @@ then
     if [ -z "$config_file" ] && [ -n "${XDG_CONFIG_HOME:-}" ]; then
         config_file="${XDG_CONFIG_HOME}/openshell/gateway.toml"
     fi
-    if [ -z "$config_file" ] \
-        || [ ! -f "$config_file" ] \
-        || ! grep -Eq \
-            -e "^[[:space:]]*(compute_driver|\"compute_driver\"|'compute_driver')[[:space:]]*=" \
-            -e "^[[:space:]]*(openshell|\"openshell\"|'openshell')[[:space:]]*\.[[:space:]]*(gateway|\"gateway\"|'gateway')[[:space:]]*\.[[:space:]]*(compute_driver|\"compute_driver\"|'compute_driver')[[:space:]]*=" \
-            "$config_file"
+    if { [ -z "$config_file" ] \
+            || [ ! -f "$config_file" ] \
+            || ! grep -Eq \
+                -e "^[[:space:]]*(compute_driver|\"compute_driver\"|'compute_driver')[[:space:]]*=" \
+                -e "^[[:space:]]*(openshell|\"openshell\"|'openshell')[[:space:]]*\.[[:space:]]*(gateway|\"gateway\"|'gateway')[[:space:]]*\.[[:space:]]*(compute_driver|\"compute_driver\"|'compute_driver')[[:space:]]*=" \
+                "$config_file"; } \
+        && [ -r "$kvm_device" ] \
+        && [ -w "$kvm_device" ]
     then
         export OPENSHELL_COMPUTE_DRIVER=vm
     fi

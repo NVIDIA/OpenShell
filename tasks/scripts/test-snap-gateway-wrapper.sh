@@ -5,7 +5,7 @@
 set -euo pipefail
 unset OPENSHELL_COMPUTE_DRIVER OPENSHELL_DRIVERS
 
-wrapper=${1:?Usage: test-snap-gateway-wrapper.sh <wrapper>}
+wrapper_source=${1:?Usage: test-snap-gateway-wrapper.sh <wrapper>}
 work=$(mktemp -d "${TMPDIR:-/tmp}/openshell snap wrapper.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 
@@ -14,6 +14,26 @@ common="$work/common"
 log="$work/calls"
 expected="$work/expected"
 mkdir -p "$snap/bin" "$common"
+
+# Use regular files as deterministic stand-ins for /dev/kvm, including
+# inaccessible and single-permission cases.
+kvm_device="$work/kvm"
+: >"$kvm_device"
+read_only_kvm="$work/read-only-kvm"
+write_only_kvm="$work/write-only-kvm"
+: >"$read_only_kvm"
+: >"$write_only_kvm"
+chmod 0400 "$read_only_kvm"
+chmod 0200 "$write_only_kvm"
+wrapper="$work/openshell-gateway-wrapper"
+unavailable_wrapper="$work/openshell-gateway-wrapper-no-kvm"
+read_only_wrapper="$work/openshell-gateway-wrapper-read-only-kvm"
+write_only_wrapper="$work/openshell-gateway-wrapper-write-only-kvm"
+sed "s|kvm_device=/dev/kvm|kvm_device='$kvm_device'|" "$wrapper_source" >"$wrapper"
+sed "s|kvm_device=/dev/kvm|kvm_device='$work/missing-kvm'|" "$wrapper_source" >"$unavailable_wrapper"
+sed "s|kvm_device=/dev/kvm|kvm_device='$read_only_kvm'|" "$wrapper_source" >"$read_only_wrapper"
+sed "s|kvm_device=/dev/kvm|kvm_device='$write_only_kvm'|" "$wrapper_source" >"$write_only_wrapper"
+chmod +x "$wrapper" "$unavailable_wrapper" "$read_only_wrapper" "$write_only_wrapper"
 
 cat >"$snap/bin/openshell-gateway" <<'EOF'
 #!/bin/sh
@@ -57,6 +77,24 @@ assert_log "config preflight -- --trace|config=|db=sqlite:$common/gateway.db?mod
 generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=vm
 --trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=vm"
 
+# Without read/write KVM access, leave selection unset so the gateway can run
+# its normal driver detection.
+: >"$log"
+wrapper=$unavailable_wrapper run_system_wrapper --trace
+assert_log "config preflight -- --trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
+--trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver="
+
+if [ "$(id -u)" -ne 0 ]; then
+  for restricted_wrapper in "$read_only_wrapper" "$write_only_wrapper"; do
+    : >"$log"
+    wrapper=$restricted_wrapper run_system_wrapper --trace
+    assert_log "config preflight -- --trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
+--trace|config=|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver="
+  done
+fi
+
 # An existing compatibility config is exposed through the standard gateway
 # config environment variable for both preflight and startup.
 printf 'valid schema-v2\n' >"$common/gateway.toml"
@@ -70,6 +108,13 @@ generate-certs --output-dir $common/tls --server-san host.openshell.internal|con
 printf '[openshell.gateway]\n  compute_driver = "docker"\n' >"$common/gateway.toml"
 : >"$log"
 run_system_wrapper --trace
+assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
+--trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver="
+
+# An explicit TOML selector remains authoritative without KVM access.
+: >"$log"
+wrapper=$unavailable_wrapper run_system_wrapper --trace
 assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
 generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=
 --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver="
@@ -103,6 +148,13 @@ printf '[openshell.gateway]\ncompute_driver = "docker"\n' >"$common/gateway.toml
 # A service-level environment selector takes precedence without reading TOML.
 : >"$log"
 OPENSHELL_COMPUTE_DRIVER=docker run_system_wrapper --trace
+assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=docker
+generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=docker
+--trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=docker"
+
+# An explicit environment selector remains authoritative without KVM access.
+: >"$log"
+OPENSHELL_COMPUTE_DRIVER=docker wrapper=$unavailable_wrapper run_system_wrapper --trace
 assert_log "config preflight -- --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=docker
 generate-certs --output-dir $common/tls --server-san host.openshell.internal|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=docker
 --trace|config=$common/gateway.toml|db=sqlite:$common/gateway.db?mode=rwc|tls=$common/tls|driver=docker"

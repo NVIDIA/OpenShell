@@ -18,11 +18,13 @@ description: |
 
   **Setup instructions**
 
-    1. The snap uses the VM compute driver unless `compute_driver` is set in
-       gateway.toml or OPENSHELL_COMPUTE_DRIVER is set in the service
-       environment. The VM driver requires access to /dev/kvm. Desktop sessions
-       commonly receive access automatically; otherwise add the gateway user to
-       the kvm group and start a new login session:
+    1. The snap uses the VM compute driver when the gateway user has read/write
+       access to /dev/kvm, unless `compute_driver` is set in gateway.toml or
+       OPENSHELL_COMPUTE_DRIVER is set in the service environment. Without that
+       access, the gateway tries to detect another runtime and fails to start if
+       none is available. Desktop sessions commonly receive access
+       automatically; otherwise add the gateway user to the kvm group and start
+       a new login session:
 
          sudo usermod -aG kvm "$USER"
 

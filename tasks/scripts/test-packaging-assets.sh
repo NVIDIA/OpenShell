@@ -142,6 +142,8 @@ assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_COMPUTE_DRIVER+x}" ]'
 assert_contains "$snap_wrapper" '[ -z "${OPENSHELL_DRIVERS+x}" ]'
 assert_contains "$snap_wrapper" "(compute_driver|\\\"compute_driver\\\"|'compute_driver')"
 assert_contains "$snap_wrapper" "(openshell|\\\"openshell\\\"|'openshell')"
+assert_contains "$snap_wrapper" '[ -r "$kvm_device" ]'
+assert_contains "$snap_wrapper" '[ -w "$kvm_device" ]'
 assert_contains "$snap_wrapper" 'export OPENSHELL_COMPUTE_DRIVER=vm'
 assert_contains "$snap_wrapper" 'config preflight -- "$@"'
 assert_not_contains "$snap_wrapper" "CANONICAL_CONFIG_FILE"

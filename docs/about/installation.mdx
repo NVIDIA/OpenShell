@@ -141,17 +141,17 @@ The global command prevents automatic activation for other users but does not st
 systemctl --user disable --now snap.openshell.user-gateway.service
 ```
 
-The snap bundles the VM compute driver and uses it by default. The VM driver requires KVM on Linux and read/write access to `/dev/kvm`. Active desktop sessions commonly receive access through a systemd-logind ACL. On systems where this is not the case, add the gateway user to the `kvm` group and start a new login session:
+The snap bundles the VM compute driver and selects it when the gateway user has read/write access to `/dev/kvm`. Without that access, the gateway tries to detect another accessible runtime, such as Docker. If none is available, the gateway fails to start until KVM access is restored or `compute_driver` selects an available runtime. Active desktop sessions commonly receive KVM access through a systemd-logind ACL. On systems where this is not the case, add the gateway user to the `kvm` group and start a new login session:
 
 ```shell
 sudo usermod -aG kvm "$USER"
 ```
 
-The installer connects the `kvm` interface and warns without blocking gateway registration when the user cannot access `/dev/kvm`. A registered gateway can report status without KVM access, but creating or restoring a VM sandbox fails until access is available.
+The installer connects the `kvm` interface and warns without blocking installation when the user cannot access `/dev/kvm`.
 
 The snap installs the standalone policy prover as `openshell.prover`. The `openshell-prover` alias requires Snap Store approval and may not be available.  The prover reads local policy files through the `home` interface and does not connect to the gateway.
 
-The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. When neither the service environment nor this file selects a compute driver, the snap selects `vm`. To use a different installed driver, set `compute_driver` explicitly; for example:
+The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. When neither the service environment nor this file selects a compute driver, the snap selects `vm` if the gateway user can read and write `/dev/kvm`; otherwise the gateway tries to detect another available runtime. To use a different installed driver, set `compute_driver` explicitly; for example:
 
 ```toml
 [openshell]
