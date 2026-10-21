@@ -24,13 +24,13 @@ use http_body_util::{BodyExt as _, Full, Limited};
 use miette::Result;
 use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
 use openshell_sandbox_backend::session_control::{
-    MAX_REGISTRATION_BYTES, SESSIONS_PATH, SandboxInstanceList, SandboxInstancePhaseReport,
-    SandboxInstanceRegistration, SandboxInstanceStatusReport,
+    MAX_REGISTRATION_BYTES, SESSIONS_PATH, SandboxInstanceList, SandboxInstanceRegistration,
+    SandboxInstanceStatusReport,
 };
 
 use crate::sandbox_instance_host::{
     SandboxInstanceAdmission, SandboxInstanceAdmitted, SandboxInstanceBody, SandboxInstanceHost,
-    SandboxInstanceHostError, SandboxInstancePhase, SandboxInstanceStatus,
+    SandboxInstanceHostError,
 };
 
 /// Concurrent session-control connections; the only client is the gateway,
@@ -128,30 +128,20 @@ impl SharedHost {
     /// Status of one registered sandbox instance.
     #[must_use]
     pub fn status(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
-        self.host
-            .status(route)
-            .map(|status| status_report(route, status))
+        self.host.status(route)
     }
 
     /// Status of every registered sandbox instance.
     #[must_use]
     pub fn list(&self) -> SandboxInstanceList {
         SandboxInstanceList {
-            sessions: self
-                .host
-                .list()
-                .into_iter()
-                .map(|(route, status)| status_report(&route, status))
-                .collect(),
+            sessions: self.host.list(),
         }
     }
 
     /// Stop one sandbox instance, delete its private files, and forget it.
     pub async fn remove(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
-        self.host
-            .remove(route, self.removal_grace)
-            .await
-            .map(|status| status_report(route, status))
+        self.host.remove(route, self.removal_grace).await
     }
 
     /// Stop every sandbox instance, for process shutdown.
@@ -216,12 +206,7 @@ impl SharedHost {
             auth_bundle: registration.auth,
             admitted_isolation_backend: Some(openshell_sandbox_backend::BACKEND_NAME.to_string()),
             main_exit_marker: None,
-            trace_context: registration
-                .trace_context
-                .map(|context| crate::TraceContext {
-                    traceparent: context.traceparent,
-                    tracestate: context.tracestate,
-                }),
+            trace_context: registration.trace_context,
             // One process cannot hold a per-sandbox workload identity, so
             // providers that need one fail closed.
             provider_workload_api_socket: None,
@@ -249,23 +234,6 @@ fn registration_digest(
     let encoded = serde_json::to_vec(registration)
         .map_err(|error| ControlError::Invalid(format!("encode registration: {error}")))?;
     openshell_crypto::sha256(&encoded).map_err(|error| ControlError::Unavailable(error.to_string()))
-}
-
-fn status_report(route: &str, status: SandboxInstanceStatus) -> SandboxInstanceStatusReport {
-    SandboxInstanceStatusReport {
-        route: route.to_string(),
-        sandbox_id: status.sandbox_id,
-        phase: match status.phase {
-            SandboxInstancePhase::Starting => SandboxInstancePhaseReport::Starting,
-            SandboxInstancePhase::Supervising => SandboxInstancePhaseReport::Supervising,
-            SandboxInstancePhase::Stopping => SandboxInstancePhaseReport::Stopping,
-            SandboxInstancePhase::Exited(exit_code) => {
-                SandboxInstancePhaseReport::Exited { exit_code }
-            }
-            SandboxInstancePhase::Failed(error) => SandboxInstancePhaseReport::Failed { error },
-        },
-        ready: status.ready,
-    }
 }
 
 #[cfg(unix)]

@@ -28,6 +28,9 @@ use std::time::Duration;
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use openshell_core::grpc_client::GatewayCredentials;
 use openshell_ocsf::OcsfJsonSettings;
+use openshell_sandbox_backend::session_control::{
+    SandboxInstancePhaseReport, SandboxInstanceStatusReport,
+};
 use openshell_supervisor_network::policy_local::{DenialLogSource, SandboxInstanceDenialLog};
 use openshell_supervisor_process::log_push::LogSink;
 use tokio::sync::watch;
@@ -91,38 +94,6 @@ impl std::io::Write for SandboxInstanceDenialWriter {
     }
 }
 
-/// Observable lifecycle of one hosted sandbox instance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SandboxInstancePhase {
-    /// Startup has not yet produced an accepted gateway session.
-    Starting,
-    /// The workload started and the gateway accepted supervision at least once.
-    Supervising,
-    /// The owner asked the instance to stop.
-    Stopping,
-    /// Supervision ended with the workload's exit status.
-    Exited(i32),
-    /// Startup or supervision failed; the workload is no longer supervised.
-    Failed(String),
-}
-
-impl SandboxInstancePhase {
-    #[must_use]
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Exited(_) | Self::Failed(_))
-    }
-}
-
-/// Current state of one hosted sandbox instance.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SandboxInstanceStatus {
-    /// Sandbox the instance was admitted for.
-    pub sandbox_id: String,
-    pub phase: SandboxInstancePhase,
-    /// Gateway supervision is currently accepted for this instance.
-    pub ready: bool,
-}
-
 /// Body of a hosted sandbox instance, constructed on its own runtime.
 pub type SandboxInstanceBody = Box<
     dyn FnOnce(SandboxInstanceControls) -> Pin<Box<dyn Future<Output = Result<i32>>>>
@@ -165,7 +136,7 @@ pub enum SandboxInstanceHostError {
 }
 
 /// Final status of one removal, shared by every remover.
-type RemovalReport = watch::Receiver<Option<SandboxInstanceStatus>>;
+type RemovalReport = watch::Receiver<Option<SandboxInstanceStatusReport>>;
 
 struct HostedSandboxInstance {
     /// Distinguishes this instance from a later one that reuses its key.
@@ -174,7 +145,7 @@ struct HostedSandboxInstance {
     sandbox_id: String,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
-    phase: watch::Receiver<SandboxInstancePhase>,
+    phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// The removal in progress, or the report of one that could not delete
@@ -183,7 +154,8 @@ struct HostedSandboxInstance {
 }
 
 impl HostedSandboxInstance {
-    fn status(&self) -> SandboxInstanceStatus {
+    /// Status of the instance hosted under `key`, which is its route.
+    fn status(&self, key: &str) -> SandboxInstanceStatusReport {
         if let Some(reported) = self
             .removal
             .as_ref()
@@ -195,15 +167,17 @@ impl HostedSandboxInstance {
         // The runner always reports a terminal phase, even while unwinding;
         // a closed channel without one still means supervision has ended.
         if !phase.is_terminal() && self.phase.has_changed().is_err() {
-            return SandboxInstanceStatus {
+            return SandboxInstanceStatusReport {
+                route: key.to_string(),
                 sandbox_id: self.sandbox_id.clone(),
-                phase: SandboxInstancePhase::Failed(
-                    "sandbox instance thread ended unexpectedly".to_string(),
-                ),
+                phase: SandboxInstancePhaseReport::Failed {
+                    error: "sandbox instance thread ended unexpectedly".to_string(),
+                },
                 ready: false,
             };
         }
-        SandboxInstanceStatus {
+        SandboxInstanceStatusReport {
+            route: key.to_string(),
             sandbox_id: self.sandbox_id.clone(),
             phase,
             ready: *self.ready.borrow(),
@@ -320,20 +294,20 @@ impl SandboxInstanceHost {
     }
 
     /// Status of a hosted sandbox instance, including one that ended but has
-    /// not been removed.
+    /// not been removed. The report's route is the instance's key.
     #[must_use]
-    pub fn status(&self, key: &str) -> Option<SandboxInstanceStatus> {
+    pub fn status(&self, key: &str) -> Option<SandboxInstanceStatusReport> {
         lock(&self.instances)
             .get(key)
-            .map(HostedSandboxInstance::status)
+            .map(|instance| instance.status(key))
     }
 
-    /// Key and status of every hosted sandbox instance.
+    /// Status of every hosted sandbox instance.
     #[must_use]
-    pub fn list(&self) -> Vec<(String, SandboxInstanceStatus)> {
+    pub fn list(&self) -> Vec<SandboxInstanceStatusReport> {
         lock(&self.instances)
             .iter()
-            .map(|(key, instance)| (key.clone(), instance.status()))
+            .map(|(key, instance)| instance.status(key))
             .collect()
     }
 
@@ -349,7 +323,7 @@ impl SandboxInstanceHost {
     /// the directory cannot be deleted, the key stays reserved and the next
     /// removal tries again. Returns the final status, or `None` when `key` is
     /// not hosted.
-    pub async fn remove(&self, key: &str, grace: Duration) -> Option<SandboxInstanceStatus> {
+    pub async fn remove(&self, key: &str, grace: Duration) -> Option<SandboxInstanceStatusReport> {
         let (mut removed, sandbox_id) = self.begin_removal(key, grace)?;
         // The removal task ends without a report only with its runtime.
         let reported = removed
@@ -357,11 +331,12 @@ impl SandboxInstanceHost {
             .await
             .ok()
             .and_then(|status| status.clone());
-        Some(reported.unwrap_or_else(|| SandboxInstanceStatus {
+        Some(reported.unwrap_or_else(|| SandboxInstanceStatusReport {
+            route: key.to_string(),
             sandbox_id,
-            phase: SandboxInstancePhase::Failed(
-                "sandbox instance removal did not finish".to_string(),
-            ),
+            phase: SandboxInstancePhaseReport::Failed {
+                error: "sandbox instance removal did not finish".to_string(),
+            },
             ready: false,
         }))
     }
@@ -382,7 +357,7 @@ impl SandboxInstanceHost {
             return Some((removed.clone(), instance.sandbox_id.clone()));
         }
         instance.stop.send_replace(true);
-        if *instance.phase.borrow() == SandboxInstancePhase::Starting {
+        if *instance.phase.borrow() == SandboxInstancePhaseReport::Starting {
             instance.abort.send_replace(true);
         }
         let (report, removed) = watch::channel(None);
@@ -409,18 +384,18 @@ struct Removal {
     instances: Instances,
     key: String,
     serial: u64,
-    phase: watch::Receiver<SandboxInstancePhase>,
+    phase: watch::Receiver<SandboxInstancePhaseReport>,
     thread: Option<std::thread::JoinHandle<()>>,
     dir: PathBuf,
     grace: Duration,
-    report: watch::Sender<Option<SandboxInstanceStatus>>,
+    report: watch::Sender<Option<SandboxInstanceStatusReport>>,
 }
 
 impl Removal {
     async fn run(mut self) {
         let finished = tokio::time::timeout(
             self.grace,
-            self.phase.wait_for(SandboxInstancePhase::is_terminal),
+            self.phase.wait_for(SandboxInstancePhaseReport::is_terminal),
         )
         .await
         .is_ok();
@@ -448,7 +423,7 @@ impl Removal {
         else {
             return;
         };
-        let mut status = instance.status();
+        let mut status = instance.status(&self.key);
         status.ready = false;
         match cleanup {
             Ok(()) => {
@@ -456,9 +431,11 @@ impl Removal {
             }
             Err(error) => {
                 tracing::warn!(%error, "could not delete removed sandbox instance files; keeping its key reserved");
-                status.phase = SandboxInstancePhase::Failed(format!(
-                    "sandbox instance stopped, but its private files remain: {error}"
-                ));
+                status.phase = SandboxInstancePhaseReport::Failed {
+                    error: format!(
+                        "sandbox instance stopped, but its private files remain: {error}"
+                    ),
+                };
             }
         }
         self.report.send_replace(Some(status));
@@ -469,7 +446,7 @@ impl Removal {
 struct RunningInstance {
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
-    phase: watch::Receiver<SandboxInstancePhase>,
+    phase: watch::Receiver<SandboxInstancePhaseReport>,
     ready: watch::Receiver<bool>,
     thread: std::thread::JoinHandle<()>,
 }
@@ -480,7 +457,7 @@ fn spawn_instance(
 ) -> std::result::Result<RunningInstance, SandboxInstanceHostError> {
     let (stop, stop_requested) = watch::channel(false);
     let (abort, abort_requested) = watch::channel(false);
-    let (phase_tx, phase) = watch::channel(SandboxInstancePhase::Starting);
+    let (phase_tx, phase) = watch::channel(SandboxInstancePhaseReport::Starting);
     let (ready_tx, ready) = watch::channel(false);
     let credentials = bindings.gateway_credentials.clone();
     let thread = std::thread::Builder::new()
@@ -513,7 +490,7 @@ fn spawn_instance(
 struct SandboxInstanceSignals {
     stop_requested: watch::Receiver<bool>,
     abort_requested: watch::Receiver<bool>,
-    phase: watch::Sender<SandboxInstancePhase>,
+    phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
 }
 
@@ -521,20 +498,21 @@ struct SandboxInstanceSignals {
 /// including when the instance thread unwinds.
 struct SandboxInstanceExit {
     credentials: GatewayCredentials,
-    phase: watch::Sender<SandboxInstancePhase>,
+    phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
-    outcome: Option<SandboxInstancePhase>,
+    outcome: Option<SandboxInstancePhaseReport>,
 }
 
 impl Drop for SandboxInstanceExit {
     fn drop(&mut self) {
         self.credentials.revoke();
         self.ready.send_replace(false);
-        let outcome = self.outcome.take().unwrap_or_else(|| {
-            SandboxInstancePhase::Failed(
-                "sandbox instance thread ended without reporting a result".to_string(),
-            )
-        });
+        let outcome = self
+            .outcome
+            .take()
+            .unwrap_or_else(|| SandboxInstancePhaseReport::Failed {
+                error: "sandbox instance thread ended without reporting a result".to_string(),
+            });
         self.phase.send_replace(outcome);
         unbind_thread();
     }
@@ -579,9 +557,10 @@ fn run_hosted_sandbox_instance(
                             mirror_ready.send_replace(is_ready);
                             if is_ready {
                                 mirror_phase.send_if_modified(|current| {
-                                    let promote = *current == SandboxInstancePhase::Starting;
+                                    let promote =
+                                        *current == SandboxInstancePhaseReport::Starting;
                                     if promote {
-                                        *current = SandboxInstancePhase::Supervising;
+                                        *current = SandboxInstancePhaseReport::Supervising;
                                     }
                                     promote
                                 });
@@ -596,7 +575,7 @@ fn run_hosted_sandbox_instance(
                     let stop_phase = phase.clone();
                     let shutdown = Box::pin(async move {
                         let _ = stop.wait_for(|requested| *requested).await;
-                        stop_phase.send_replace(SandboxInstancePhase::Stopping);
+                        stop_phase.send_replace(SandboxInstancePhaseReport::Stopping);
                     });
                     let instance = body(SandboxInstanceControls {
                         shutdown,
@@ -618,8 +597,10 @@ fn run_hosted_sandbox_instance(
         Err(error) => Err(miette::miette!("build sandbox instance runtime: {error}")),
     };
     exit.outcome = Some(match outcome {
-        Ok(code) => SandboxInstancePhase::Exited(code),
-        Err(error) => SandboxInstancePhase::Failed(error.to_string()),
+        Ok(exit_code) => SandboxInstancePhaseReport::Exited { exit_code },
+        Err(error) => SandboxInstancePhaseReport::Failed {
+            error: error.to_string(),
+        },
     });
 }
 
@@ -891,7 +872,7 @@ mod tests {
     async fn wait_supervising(host: &SandboxInstanceHost, key: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
             while host.status(key).map(|status| status.phase)
-                != Some(SandboxInstancePhase::Supervising)
+                != Some(SandboxInstancePhaseReport::Supervising)
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -995,7 +976,7 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(10), async {
             while host.status("generation").map(|status| status.phase)
-                != Some(SandboxInstancePhase::Stopping)
+                != Some(SandboxInstancePhaseReport::Stopping)
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -1011,7 +992,10 @@ mod tests {
         for remover in removers {
             let status = remover.await.unwrap().expect("instance was hosted");
             assert_eq!(status.sandbox_id, "sandbox-1");
-            assert_eq!(status.phase, SandboxInstancePhase::Exited(3));
+            assert_eq!(
+                status.phase,
+                SandboxInstancePhaseReport::Exited { exit_code: 3 }
+            );
         }
         assert!(host.status("generation").is_none());
         assert!(!dir.exists());
@@ -1022,7 +1006,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             host.status("generation").map(|status| status.phase),
-            Some(SandboxInstancePhase::Supervising)
+            Some(SandboxInstancePhaseReport::Supervising)
         );
         assert_eq!(std::fs::read(dir.join("launch")).unwrap(), [4]);
 
@@ -1039,7 +1023,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                matches!(&status.phase, SandboxInstancePhase::Failed(error) if error.contains("private files remain")),
+                matches!(&status.phase, SandboxInstancePhaseReport::Failed { error } if error.contains("private files remain")),
                 "{status:?}"
             );
             assert_eq!(host.status("generation"), Some(status));
@@ -1049,7 +1033,7 @@ mod tests {
         let status = host.remove("generation", Duration::from_secs(10)).await;
         assert_eq!(
             status.map(|status| status.phase),
-            Some(SandboxInstancePhase::Exited(4))
+            Some(SandboxInstancePhaseReport::Exited { exit_code: 4 })
         );
         assert!(!dir.exists());
         host.remove_all(Duration::from_secs(10)).await;
@@ -1093,9 +1077,12 @@ mod tests {
         .expect("panicking instance reports an end");
         assert_eq!(
             status,
-            SandboxInstanceStatus {
+            SandboxInstanceStatusReport {
+                route: "panicking".to_string(),
                 sandbox_id: "sandbox-panicking".to_string(),
-                phase: SandboxInstancePhase::Failed("sandbox instance panicked".to_string()),
+                phase: SandboxInstancePhaseReport::Failed {
+                    error: "sandbox instance panicked".to_string(),
+                },
                 ready: false,
             }
         );
@@ -1156,7 +1143,10 @@ mod tests {
             .remove("sandbox-alpha", Duration::from_secs(10))
             .await
             .expect("alpha was hosted");
-        assert_eq!(stopped.phase, SandboxInstancePhase::Exited(0));
+        assert_eq!(
+            stopped.phase,
+            SandboxInstancePhaseReport::Exited { exit_code: 0 }
+        );
         assert!(!stopped.ready);
         assert!(host.status("sandbox-alpha").is_none());
         assert_eq!(alpha.alive.recv().await, None, "alpha's tasks stopped");
@@ -1180,7 +1170,7 @@ mod tests {
         );
         assert_eq!(
             host.status("sandbox-beta").map(|status| status.phase),
-            Some(SandboxInstancePhase::Supervising)
+            Some(SandboxInstancePhaseReport::Supervising)
         );
         assert!(
             beta.alive
@@ -1191,7 +1181,7 @@ mod tests {
         let stopped = host.remove("sandbox-beta", Duration::from_secs(10)).await;
         assert_eq!(
             stopped.map(|status| status.phase),
-            Some(SandboxInstancePhase::Exited(0))
+            Some(SandboxInstancePhaseReport::Exited { exit_code: 0 })
         );
     }
 }

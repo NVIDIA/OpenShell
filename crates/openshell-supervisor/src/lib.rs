@@ -38,6 +38,7 @@ use std::time::Duration;
 use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
+use openshell_sandbox_backend::session_control::RegistrationTraceContext;
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,
@@ -741,27 +742,18 @@ pub fn sandbox_instance_event_context(
     }
 }
 
-/// W3C trace context of the operation that launched a sandbox generation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TraceContext {
-    pub traceparent: String,
-    pub tracestate: Option<String>,
-}
-
-impl TraceContext {
-    /// The context a driver passed to a dedicated supervisor process.
-    #[must_use]
-    pub fn from_environment() -> Option<Self> {
-        let traceparent = std::env::var(openshell_otel::TRACEPARENT_ENV)
+/// The trace context a driver passed to a dedicated supervisor process.
+#[must_use]
+pub fn trace_context_from_environment() -> Option<RegistrationTraceContext> {
+    let traceparent = std::env::var(openshell_otel::TRACEPARENT_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())?;
+    Some(RegistrationTraceContext {
+        traceparent,
+        tracestate: std::env::var(openshell_otel::TRACESTATE_ENV)
             .ok()
-            .filter(|value| !value.is_empty())?;
-        Some(Self {
-            traceparent,
-            tracestate: std::env::var(openshell_otel::TRACESTATE_ENV)
-                .ok()
-                .filter(|value| !value.is_empty()),
-        })
-    }
+            .filter(|value| !value.is_empty()),
+    })
 }
 
 /// Trusted launch inputs of one supervised sandbox instance.
@@ -795,7 +787,7 @@ pub struct SandboxInstanceConfig {
     pub admitted_isolation_backend: Option<String>,
     pub main_exit_marker: Option<std::path::PathBuf>,
     /// Parent of the startup span.
-    pub trace_context: Option<TraceContext>,
+    pub trace_context: Option<RegistrationTraceContext>,
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
     pub provider_workload_api_socket: Option<std::path::PathBuf>,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
