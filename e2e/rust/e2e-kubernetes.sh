@@ -16,7 +16,8 @@
 # cluster where the test host is unreachable from pods? Set
 # OPENSHELL_E2E_KUBERNETES_FEATURES=e2e to drop the alias-dependent tests.
 #
-# Results: `run_suite` writes a JUnit + HTML report under `results/`. Set
+# Results: `run_suite` writes a JUnit + HTML report under `results/` when
+# Nextest produces XML. Conformance-only runs do not produce these reports. Set
 # `OPENSHELL_E2E_REPORT_NAME` to name it per run when invoking this script repeatedly.
 
 set -euo pipefail
@@ -80,12 +81,20 @@ run_suite() {
   local name="${OPENSHELL_E2E_REPORT_NAME:-e2e-kubernetes}"
   local report="${ROOT}/results/${name}.xml"
   local status=0
+
+  # Nextest writes to a fixed path. Clear it and this invocation's reports so
+  # skipped tests or gateway setup failures cannot publish a previous result.
+  rm -f -- "${JUNIT_XML}" "${report}" "${report%.xml}.html" || return $?
+
   "${ROOT}/e2e/with-kube-gateway.sh" \
     bash "${BASH_SOURCE[0]}" "${RUN_WITH_GATEWAY_COMMAND}" || status=$?
-  if [ "${report}" != "${JUNIT_XML}" ]; then
-    mv -f "${JUNIT_XML}" "${report}" 2>/dev/null || true
+  if [ -f "${JUNIT_XML}" ]; then
+    if [ "${report}" != "${JUNIT_XML}" ] && ! mv -f "${JUNIT_XML}" "${report}"; then
+      echo "WARNING: failed to move JUnit report to ${report}; skipping HTML report" >&2
+      return "${status}"
+    fi
+    render_html "${report}" "${name}"
   fi
-  render_html "${report}" "${name}"
   return "${status}"
 }
 
