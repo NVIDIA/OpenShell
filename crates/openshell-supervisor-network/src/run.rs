@@ -39,7 +39,7 @@ use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
 use crate::opa::OpaEngine;
 use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
-use crate::token_grant::SessionTokenGrants;
+use crate::token_grant::SandboxInstanceTokenGrants;
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::grpc_client::GatewayEndpoint;
 
@@ -194,14 +194,14 @@ fn append_additional_ca_bundle(
 
 /// Identity and authority of the one sandbox a [`run_networking`] call serves.
 ///
-/// A process hosting several sandboxes builds one per session; no value is
-/// read from the process environment, so sessions cannot share gateway
+/// A process hosting several sandboxes builds one per sandbox instance; no value
+/// is read from the process environment, so instances cannot share gateway
 /// credentials, provider token grants, denial history, or proxy CA files.
 #[derive(Debug, Default)]
-pub struct NetworkSession {
+pub struct SandboxInstanceNetwork {
     pub sandbox_id: Option<String>,
     pub sandbox_name: Option<String>,
-    /// Gateway access with this session's credentials.
+    /// Gateway access with this instance's credentials.
     pub gateway: Option<GatewayEndpoint>,
     /// SPIFFE Workload API socket for provider token grants. Without one,
     /// grants fail closed.
@@ -284,7 +284,7 @@ pub async fn run_networking(
     entrypoint_pid: Arc<AtomicU32>,
     process_enabled: bool,
     provider_credentials: &ProviderCredentialState,
-    session: NetworkSession,
+    instance: SandboxInstanceNetwork,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
@@ -300,15 +300,15 @@ pub async fn run_networking(
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
     // it can publish updated policy snapshots after a successful reload.
-    let NetworkSession {
+    let SandboxInstanceNetwork {
         sandbox_id,
         sandbox_name,
         gateway,
         provider_workload_api_socket,
         denial_log,
         proxy_tls,
-    } = session;
-    let token_grants = SpiffeTokenGrantResolver::new(SessionTokenGrants::new(
+    } = instance;
+    let token_grants = SpiffeTokenGrantResolver::new(SandboxInstanceTokenGrants::new(
         gateway.clone(),
         sandbox_id.clone(),
         provider_workload_api_socket,

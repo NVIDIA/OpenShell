@@ -27,9 +27,9 @@
 //! - `scopes` — `OAuth2` scopes to request (optional)
 //! - `cache_ttl` — Optional exact cache override; zero disables caching
 //!
-//! ## Session scope
+//! ## Sandbox instance scope
 //!
-//! Each supervised sandbox owns a [`SessionTokenGrants`]: its token cache,
+//! Each sandbox instance owns a [`SandboxInstanceTokenGrants`]: its token cache,
 //! HTTP client, gateway credentials, sandbox ID, and SPIFFE Workload API
 //! socket. A token is never served to another sandbox. Without a configured
 //! Workload API socket, grants fail closed with a configuration failure.
@@ -103,9 +103,9 @@ impl TokenCache {
 /// Provider token grants owned by one supervised sandbox.
 ///
 /// The cache, HTTP connection pool, gateway credentials, sandbox ID, and
-/// workload identity socket all belong to this session, so a token acquired
+/// workload identity socket all belong to this sandbox instance, so a token acquired
 /// for one sandbox is never served to another.
-pub struct SessionTokenGrants {
+pub struct SandboxInstanceTokenGrants {
     cache: TokenCache,
     // Initialization failures stay bounded and typed; acquisition must not panic.
     http_client: Result<TokenGrantClient, TokenGrantFailure>,
@@ -114,7 +114,7 @@ pub struct SessionTokenGrants {
     workload_api_socket: Option<PathBuf>,
 }
 
-impl SessionTokenGrants {
+impl SandboxInstanceTokenGrants {
     /// Grants authenticated as `sandbox_id` through `gateway`. A missing
     /// Workload API socket makes every grant fail closed.
     #[must_use]
@@ -134,12 +134,12 @@ impl SessionTokenGrants {
 
     /// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
     ///
-    /// This fetches the sandbox's SPIFFE JWT-SVID from the session's Workload
+    /// This fetches the sandbox's SPIFFE JWT-SVID from the instance's Workload
     /// API socket, then exchanges it for an access token with a POST request to
     /// the provider's token endpoint with the JWT client assertion grant flow
     /// (RFC 7523).
     ///
-    /// Tokens are cached per provider name with TTL in this session's cache.
+    /// Tokens are cached per provider name with TTL in this instance's cache.
     /// Subsequent calls return the cached token if it has not expired.
     ///
     /// # Errors
@@ -247,7 +247,7 @@ impl SessionTokenGrants {
     }
 }
 
-/// One provider token request; see [`SessionTokenGrants::obtain_provider_token`].
+/// One provider token request; see [`SandboxInstanceTokenGrants::obtain_provider_token`].
 pub struct ObtainProviderTokenRequest<'a> {
     pub provider_name: &'a str,
     pub token_endpoint: &'a str,

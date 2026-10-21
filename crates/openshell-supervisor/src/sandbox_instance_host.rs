@@ -1,16 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Several supervisor sessions in one process.
+//! Several sandbox instances in one supervisor process.
 //!
-//! Each session runs on its own Tokio runtime. Every thread that runtime
-//! starts, and the thread driving it, is bound to the session's OCSF context,
+//! A sandbox instance is one running generation of a stable Sandbox
+//! resource. Gateway transport connections, and the gateway supervisor
+//! sessions carried over them, may reconnect within one instance without
+//! creating another.
+//!
+//! Each instance runs on its own Tokio runtime. Every thread that runtime
+//! starts, and the thread driving it, is bound to the instance's OCSF context,
 //! OCSF JSON settings, log sink, and denial log, so tasks, callbacks,
-//! reconnects, and credential renewal that the session spawns inherit its
+//! reconnects, and credential renewal that the instance spawns inherit its
 //! identity. Unbound threads carry no sandbox identity and push no logs.
-//! Gateway credentials are never bound to threads; each session passes its
-//! own explicitly. Stopping a session shuts down only its runtime and revokes
-//! its gateway credentials.
+//! Gateway credentials are never bound to threads; each instance passes its
+//! own explicitly. Stopping an instance shuts down only its runtime and
+//! revokes its gateway credentials.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,27 +27,27 @@ use std::time::Duration;
 use miette::Result;
 use openshell_core::grpc_client::GatewayCredentials;
 use openshell_ocsf::{EventContext, OcsfJsonSettings};
-use openshell_supervisor_network::policy_local::SessionDenialLog;
+use openshell_supervisor_network::policy_local::SandboxInstanceDenialLog;
 use openshell_supervisor_process::log_push::LogSink;
 use tokio::sync::watch;
 
-use crate::SessionControls;
+use crate::SandboxInstanceControls;
 
-/// Worker threads in each session runtime.
-const SESSION_WORKER_THREADS: usize = 2;
-/// Bound on joining a session thread after its runtime is told to stop.
+/// Worker threads in each sandbox instance runtime.
+const INSTANCE_WORKER_THREADS: usize = 2;
+/// Bound on joining an instance thread after its runtime is told to stop.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Per-session values bound to every thread of the session's runtime.
+/// Per-instance values bound to every thread of the instance's runtime.
 #[derive(Clone)]
-pub struct SessionBinding {
+pub struct SandboxInstanceBinding {
     pub event_context: Arc<EventContext>,
     pub ocsf_json: OcsfJsonSettings,
     pub log_sink: Option<LogSink>,
-    pub denial_log: SessionDenialLog,
+    pub denial_log: SandboxInstanceDenialLog,
 }
 
-impl SessionBinding {
+impl SandboxInstanceBinding {
     fn bind(&self) {
         openshell_ocsf::ctx::bind_thread_ctx(Some(self.event_context.clone()));
         openshell_ocsf::bind_thread_json_settings(Some(self.ocsf_json.clone()));
@@ -59,23 +64,23 @@ impl SessionBinding {
 }
 
 std::thread_local! {
-    static THREAD_DENIAL_LOG: std::cell::RefCell<Option<SessionDenialLog>> =
+    static THREAD_DENIAL_LOG: std::cell::RefCell<Option<SandboxInstanceDenialLog>> =
         const { std::cell::RefCell::new(None) };
 }
 
-fn bind_thread_denial_log(log: Option<SessionDenialLog>) {
+fn bind_thread_denial_log(log: Option<SandboxInstanceDenialLog>) {
     THREAD_DENIAL_LOG.with(|current| *current.borrow_mut() = log);
 }
 
-/// Shorthand-log destination for hosted sessions' recent denials.
+/// Shorthand-log destination for hosted sandbox instances' recent denials.
 ///
-/// Each line goes to the denial log of the session bound to the emitting
-/// thread. Lines from unbound threads are dropped, so no session can read
+/// Each line goes to the denial log of the instance bound to the emitting
+/// thread. Lines from unbound threads are dropped, so no instance can read
 /// another's denials through `policy.local`.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SessionDenialWriter;
+pub struct SandboxInstanceDenialWriter;
 
-impl std::io::Write for SessionDenialWriter {
+impl std::io::Write for SandboxInstanceDenialWriter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         THREAD_DENIAL_LOG.with(|log| {
             if let Some(log) = log.borrow().as_ref() {
@@ -92,14 +97,14 @@ impl std::io::Write for SessionDenialWriter {
     }
 }
 
-/// Observable lifecycle of one hosted session.
+/// Observable lifecycle of one hosted sandbox instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionPhase {
+pub enum SandboxInstancePhase {
     /// Startup has not yet produced an accepted gateway session.
     Starting,
     /// The workload started and the gateway accepted supervision at least once.
     Supervising,
-    /// The owner asked the session to stop.
+    /// The owner asked the instance to stop.
     Stopping,
     /// Supervision ended with the workload's exit status.
     Exited(i32),
@@ -107,80 +112,85 @@ pub enum SessionPhase {
     Failed(String),
 }
 
-impl SessionPhase {
+impl SandboxInstancePhase {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Exited(_) | Self::Failed(_))
     }
 }
 
-/// Current state of one hosted session.
+/// Current state of one hosted sandbox instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionStatus {
-    pub phase: SessionPhase,
-    /// Gateway supervision is currently accepted for this session.
+pub struct SandboxInstanceStatus {
+    pub phase: SandboxInstancePhase,
+    /// Gateway supervision is currently accepted for this instance.
     pub ready: bool,
 }
 
-/// Body of a hosted session, constructed on its own runtime.
-pub type SessionBody =
-    Box<dyn FnOnce(SessionControls) -> Pin<Box<dyn Future<Output = Result<i32>>>> + Send + 'static>;
+/// Body of a hosted sandbox instance, constructed on its own runtime.
+pub type SandboxInstanceBody = Box<
+    dyn FnOnce(SandboxInstanceControls) -> Pin<Box<dyn Future<Output = Result<i32>>>>
+        + Send
+        + 'static,
+>;
 
-/// The hosted-session registration was rejected.
+/// The hosted sandbox instance registration was rejected.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum SessionHostError {
-    #[error("a session with this key is already hosted")]
+pub enum SandboxInstanceHostError {
+    #[error("a sandbox instance with this key is already hosted")]
     Duplicate,
-    #[error("start session thread: {0}")]
+    #[error("start sandbox instance thread: {0}")]
     Thread(String),
 }
 
-struct HostedSession {
-    /// Distinguishes this session from a later one that reuses its key.
+struct HostedSandboxInstance {
+    /// Distinguishes this instance from a later one that reuses its key.
     serial: u64,
     stop: watch::Sender<bool>,
     abort: watch::Sender<bool>,
-    phase: watch::Receiver<SessionPhase>,
+    phase: watch::Receiver<SandboxInstancePhase>,
     ready: watch::Receiver<bool>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// Final status of the removal in progress, shared by every remover.
-    removal: Option<watch::Receiver<Option<SessionStatus>>>,
+    removal: Option<watch::Receiver<Option<SandboxInstanceStatus>>>,
 }
 
-impl HostedSession {
-    fn status(&self) -> SessionStatus {
+impl HostedSandboxInstance {
+    fn status(&self) -> SandboxInstanceStatus {
         let phase = self.phase.borrow().clone();
         // The runner always reports a terminal phase, even while unwinding;
         // a closed channel without one still means supervision has ended.
         if !phase.is_terminal() && self.phase.has_changed().is_err() {
-            return SessionStatus {
-                phase: SessionPhase::Failed("session thread ended unexpectedly".to_string()),
+            return SandboxInstanceStatus {
+                phase: SandboxInstancePhase::Failed(
+                    "sandbox instance thread ended unexpectedly".to_string(),
+                ),
                 ready: false,
             };
         }
-        SessionStatus {
+        SandboxInstanceStatus {
             phase,
             ready: *self.ready.borrow(),
         }
     }
 }
 
-type Sessions = Arc<Mutex<HashMap<String, HostedSession>>>;
+type Instances = Arc<Mutex<HashMap<String, HostedSandboxInstance>>>;
 
-fn lock(sessions: &Sessions) -> MutexGuard<'_, HashMap<String, HostedSession>> {
-    sessions
+fn lock(instances: &Instances) -> MutexGuard<'_, HashMap<String, HostedSandboxInstance>> {
+    instances
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Runs and stops supervisor sessions, each on its own bound runtime.
+/// Runs and stops sandbox instances, each on its own bound runtime.
 #[derive(Default)]
-pub struct SessionHost {
-    sessions: Sessions,
+pub struct SandboxInstanceHost {
+    instances: Instances,
     next_serial: AtomicU64,
 }
 
-impl SessionHost {
+impl SandboxInstanceHost {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -188,36 +198,36 @@ impl SessionHost {
 
     /// Start `body` on a new runtime bound to `binding`.
     ///
-    /// `credentials`, when present, are revoked once the session's runtime has
-    /// stopped, so nothing can reuse them after the session ends.
+    /// `credentials`, when present, are revoked once the instance's runtime
+    /// has stopped, so nothing can reuse them after the instance ends.
     ///
     /// # Errors
     ///
-    /// Returns [`SessionHostError::Duplicate`] when `key` is already hosted,
-    /// including a session that ended but has not been removed.
+    /// Returns [`SandboxInstanceHostError::Duplicate`] when `key` is already hosted,
+    /// including an instance that ended but has not been removed.
     pub fn start(
         &self,
         key: &str,
-        binding: SessionBinding,
+        binding: SandboxInstanceBinding,
         credentials: Option<GatewayCredentials>,
-        body: SessionBody,
-    ) -> std::result::Result<(), SessionHostError> {
-        let mut sessions = lock(&self.sessions);
-        if sessions.contains_key(key) {
-            return Err(SessionHostError::Duplicate);
+        body: SandboxInstanceBody,
+    ) -> std::result::Result<(), SandboxInstanceHostError> {
+        let mut instances = lock(&self.instances);
+        if instances.contains_key(key) {
+            return Err(SandboxInstanceHostError::Duplicate);
         }
         let (stop, stop_requested) = watch::channel(false);
         let (abort, abort_requested) = watch::channel(false);
-        let (phase_tx, phase) = watch::channel(SessionPhase::Starting);
+        let (phase_tx, phase) = watch::channel(SandboxInstancePhase::Starting);
         let (ready_tx, ready) = watch::channel(false);
         let thread = std::thread::Builder::new()
-            .name("openshell-session".to_string())
+            .name("openshell-instance".to_string())
             .spawn(move || {
-                run_hosted_session(
+                run_hosted_sandbox_instance(
                     &binding,
                     credentials,
                     body,
-                    SessionSignals {
+                    SandboxInstanceSignals {
                         stop_requested,
                         abort_requested,
                         phase: phase_tx,
@@ -225,10 +235,10 @@ impl SessionHost {
                     },
                 );
             })
-            .map_err(|error| SessionHostError::Thread(error.to_string()))?;
-        sessions.insert(
+            .map_err(|error| SandboxInstanceHostError::Thread(error.to_string()))?;
+        instances.insert(
             key.to_string(),
-            HostedSession {
+            HostedSandboxInstance {
                 serial: self.next_serial.fetch_add(1, Ordering::Relaxed),
                 stop,
                 abort,
@@ -241,30 +251,32 @@ impl SessionHost {
         Ok(())
     }
 
-    /// Status of a hosted session, including one that ended but has not been
-    /// removed.
+    /// Status of a hosted sandbox instance, including one that ended but has
+    /// not been removed.
     #[must_use]
-    pub fn status(&self, key: &str) -> Option<SessionStatus> {
-        lock(&self.sessions).get(key).map(HostedSession::status)
+    pub fn status(&self, key: &str) -> Option<SandboxInstanceStatus> {
+        lock(&self.instances)
+            .get(key)
+            .map(HostedSandboxInstance::status)
     }
 
-    /// Keys of every hosted session.
+    /// Keys of every hosted sandbox instance.
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
-        lock(&self.sessions).keys().cloned().collect()
+        lock(&self.instances).keys().cloned().collect()
     }
 
-    /// Stop one session and forget it. Other sessions keep running.
+    /// Stop one sandbox instance and forget it. Other instances keep running.
     ///
-    /// A supervising session terminates its workload gracefully within
+    /// A supervising instance terminates its workload gracefully within
     /// `grace`; one still starting is cancelled at once, because startup has
     /// no safe intermediate state to wind down. Removal runs on its own task,
     /// so it completes even when the caller stops waiting, and concurrent
     /// callers share it and its result. The key stays registered until the
-    /// session's thread has finished, so the same key cannot start a second
+    /// instance's thread has finished, so the same key cannot start a second
     /// owner while this one is stopping. Returns the final status, or `None`
     /// when `key` is not hosted.
-    pub async fn remove(&self, key: &str, grace: Duration) -> Option<SessionStatus> {
+    pub async fn remove(&self, key: &str, grace: Duration) -> Option<SandboxInstanceStatus> {
         let (mut removed, phase) = self.begin_removal(key, grace)?;
         // The removal task ends without a report only with its runtime.
         removed
@@ -278,126 +290,132 @@ impl SessionHost {
         key: &str,
         grace: Duration,
     ) -> Option<(
-        watch::Receiver<Option<SessionStatus>>,
-        watch::Receiver<SessionPhase>,
+        watch::Receiver<Option<SandboxInstanceStatus>>,
+        watch::Receiver<SandboxInstancePhase>,
     )> {
-        let mut sessions = lock(&self.sessions);
-        let session = sessions.get_mut(key)?;
-        if let Some(removed) = &session.removal {
-            return Some((removed.clone(), session.phase.clone()));
+        let mut instances = lock(&self.instances);
+        let instance = instances.get_mut(key)?;
+        if let Some(removed) = &instance.removal {
+            return Some((removed.clone(), instance.phase.clone()));
         }
-        session.stop.send_replace(true);
-        if *session.phase.borrow() == SessionPhase::Starting {
-            session.abort.send_replace(true);
+        instance.stop.send_replace(true);
+        if *instance.phase.borrow() == SandboxInstancePhase::Starting {
+            instance.abort.send_replace(true);
         }
         let (report, removed) = watch::channel(None);
-        session.removal = Some(removed.clone());
+        instance.removal = Some(removed.clone());
         tokio::spawn(
             Removal {
-                sessions: self.sessions.clone(),
+                instances: self.instances.clone(),
                 key: key.to_string(),
-                serial: session.serial,
-                phase: session.phase.clone(),
-                thread: session.thread.take(),
+                serial: instance.serial,
+                phase: instance.phase.clone(),
+                thread: instance.thread.take(),
                 grace,
                 report,
             }
             .run(),
         );
-        Some((removed, session.phase.clone()))
+        Some((removed, instance.phase.clone()))
     }
 }
 
-fn terminal_status(phase: &watch::Receiver<SessionPhase>) -> SessionStatus {
-    SessionStatus {
+fn terminal_status(phase: &watch::Receiver<SandboxInstancePhase>) -> SandboxInstanceStatus {
+    SandboxInstanceStatus {
         phase: phase.borrow().clone(),
         ready: false,
     }
 }
 
-/// The single owner of one session's removal.
+/// The single owner of one sandbox instance's removal.
 struct Removal {
-    sessions: Sessions,
+    instances: Instances,
     key: String,
     serial: u64,
-    phase: watch::Receiver<SessionPhase>,
+    phase: watch::Receiver<SandboxInstancePhase>,
     thread: Option<std::thread::JoinHandle<()>>,
     grace: Duration,
-    report: watch::Sender<Option<SessionStatus>>,
+    report: watch::Sender<Option<SandboxInstanceStatus>>,
 }
 
 impl Removal {
     async fn run(mut self) {
-        let finished =
-            tokio::time::timeout(self.grace, self.phase.wait_for(SessionPhase::is_terminal))
-                .await
-                .is_ok();
+        let finished = tokio::time::timeout(
+            self.grace,
+            self.phase.wait_for(SandboxInstancePhase::is_terminal),
+        )
+        .await
+        .is_ok();
         if !finished
-            && let Some(session) = lock(&self.sessions)
+            && let Some(instance) = lock(&self.instances)
                 .get(&self.key)
-                .filter(|session| session.serial == self.serial)
+                .filter(|instance| instance.serial == self.serial)
         {
-            session.abort.send_replace(true);
+            instance.abort.send_replace(true);
         }
         if let Some(thread) = self.thread.take() {
             let _ = tokio::task::spawn_blocking(move || thread.join()).await;
         }
         let removed = {
-            let mut sessions = lock(&self.sessions);
-            match sessions.get(&self.key) {
-                Some(session) if session.serial == self.serial => sessions.remove(&self.key),
+            let mut instances = lock(&self.instances);
+            match instances.get(&self.key) {
+                Some(instance) if instance.serial == self.serial => instances.remove(&self.key),
                 _ => None,
             }
         };
-        let status =
-            removed.map_or_else(|| terminal_status(&self.phase), |session| session.status());
+        let status = removed.map_or_else(
+            || terminal_status(&self.phase),
+            |instance| instance.status(),
+        );
         self.report.send_replace(Some(status));
     }
 }
 
-struct SessionSignals {
+struct SandboxInstanceSignals {
     stop_requested: watch::Receiver<bool>,
     abort_requested: watch::Receiver<bool>,
-    phase: watch::Sender<SessionPhase>,
+    phase: watch::Sender<SandboxInstancePhase>,
     ready: watch::Sender<bool>,
 }
 
-/// Reports a hosted session's end and revokes its credentials, including when
-/// the session thread unwinds.
-struct SessionExit {
+/// Reports a hosted sandbox instance's end and revokes its credentials,
+/// including when the instance thread unwinds.
+struct SandboxInstanceExit {
     credentials: Option<GatewayCredentials>,
-    phase: watch::Sender<SessionPhase>,
+    phase: watch::Sender<SandboxInstancePhase>,
     ready: watch::Sender<bool>,
-    outcome: Option<SessionPhase>,
+    outcome: Option<SandboxInstancePhase>,
 }
 
-impl Drop for SessionExit {
+impl Drop for SandboxInstanceExit {
     fn drop(&mut self) {
         if let Some(credentials) = self.credentials.take() {
             credentials.revoke();
         }
         self.ready.send_replace(false);
         let outcome = self.outcome.take().unwrap_or_else(|| {
-            SessionPhase::Failed("session thread ended without reporting a result".to_string())
+            SandboxInstancePhase::Failed(
+                "sandbox instance thread ended without reporting a result".to_string(),
+            )
         });
         self.phase.send_replace(outcome);
-        SessionBinding::unbind();
+        SandboxInstanceBinding::unbind();
     }
 }
 
-fn run_hosted_session(
-    binding: &SessionBinding,
+fn run_hosted_sandbox_instance(
+    binding: &SandboxInstanceBinding,
     credentials: Option<GatewayCredentials>,
-    body: SessionBody,
-    signals: SessionSignals,
+    body: SandboxInstanceBody,
+    signals: SandboxInstanceSignals,
 ) {
-    let SessionSignals {
+    let SandboxInstanceSignals {
         stop_requested,
         mut abort_requested,
         phase,
         ready,
     } = signals;
-    let mut exit = SessionExit {
+    let mut exit = SandboxInstanceExit {
         credentials,
         phase: phase.clone(),
         ready: ready.clone(),
@@ -406,11 +424,11 @@ fn run_hosted_session(
     binding.bind();
     let thread_binding = binding.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(SESSION_WORKER_THREADS)
-        .thread_name("openshell-session-worker")
+        .worker_threads(INSTANCE_WORKER_THREADS)
+        .thread_name("openshell-instance-worker")
         .enable_all()
         .on_thread_start(move || thread_binding.bind())
-        .on_thread_stop(SessionBinding::unbind)
+        .on_thread_stop(SandboxInstanceBinding::unbind)
         .build();
     let outcome = match runtime {
         Ok(runtime) => {
@@ -425,9 +443,9 @@ fn run_hosted_session(
                             mirror_ready.send_replace(is_ready);
                             if is_ready {
                                 mirror_phase.send_if_modified(|current| {
-                                    let promote = *current == SessionPhase::Starting;
+                                    let promote = *current == SandboxInstancePhase::Starting;
                                     if promote {
-                                        *current = SessionPhase::Supervising;
+                                        *current = SandboxInstancePhase::Supervising;
                                     }
                                     promote
                                 });
@@ -442,16 +460,16 @@ fn run_hosted_session(
                     let stop_phase = phase.clone();
                     let shutdown = Box::pin(async move {
                         let _ = stop.wait_for(|requested| *requested).await;
-                        stop_phase.send_replace(SessionPhase::Stopping);
+                        stop_phase.send_replace(SandboxInstancePhase::Stopping);
                     });
-                    let session = body(SessionControls {
+                    let instance = body(SandboxInstanceControls {
                         shutdown,
                         readiness,
                     });
                     let outcome = tokio::select! {
-                        result = session => result,
+                        result = instance => result,
                         _ = abort_requested.wait_for(|requested| *requested) => {
-                            Err(miette::miette!("session was cancelled before it finished"))
+                            Err(miette::miette!("sandbox instance was cancelled before it finished"))
                         }
                     };
                     mirror.abort();
@@ -459,43 +477,43 @@ fn run_hosted_session(
                 })
             }));
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-            outcome.unwrap_or_else(|_| Err(miette::miette!("session panicked")))
+            outcome.unwrap_or_else(|_| Err(miette::miette!("sandbox instance panicked")))
         }
-        Err(error) => Err(miette::miette!("build session runtime: {error}")),
+        Err(error) => Err(miette::miette!("build sandbox instance runtime: {error}")),
     };
     exit.outcome = Some(match outcome {
-        Ok(code) => SessionPhase::Exited(code),
-        Err(error) => SessionPhase::Failed(error.to_string()),
+        Ok(code) => SandboxInstancePhase::Exited(code),
+        Err(error) => SandboxInstancePhase::Failed(error.to_string()),
     });
 }
 
-/// Trusted inputs for one supervisor session hosted with others.
-pub struct HostedSessionSpec {
+/// Trusted inputs for one sandbox instance hosted with others.
+pub struct SandboxInstanceSpec {
     /// Unique key for this generation within the host.
     pub key: String,
     pub backend_setup: Box<dyn crate::backend_setup::BackendSetup + Send>,
-    pub config: crate::SessionConfig,
-    /// Workload image recorded in this session's OCSF events.
+    pub config: crate::SandboxInstanceConfig,
+    /// Workload image recorded in this instance's OCSF events.
     pub container_image: String,
 }
 
-impl SessionHost {
-    /// Start a supervisor session with its own OCSF identity, OCSF JSON
+impl SandboxInstanceHost {
+    /// Start a sandbox instance with its own OCSF identity, OCSF JSON
     /// settings, log push stream, denial log, and gateway credentials.
     ///
     /// # Errors
     ///
     /// Fails when the launch credentials are invalid or the key is hosted.
-    pub fn start_supervisor_session(&self, spec: HostedSessionSpec) -> Result<()> {
-        let HostedSessionSpec {
+    pub fn start_sandbox_instance(&self, spec: SandboxInstanceSpec) -> Result<()> {
+        let SandboxInstanceSpec {
             key,
             backend_setup,
             mut config,
             container_image,
         } = spec;
         let credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
-        // Sessions must never share proxy trust files; give one a private
-        // directory that lives exactly as long as the session.
+        // Instances must never share proxy trust files; give one a private
+        // directory that lives exactly as long as the instance.
         let private_tls_dir = if config.proxy_tls.directory.is_none() {
             let prepared = crate::prepare_network_proxy_tls_dir(None)?;
             config.proxy_tls.directory = Some(prepared.path.clone());
@@ -510,8 +528,8 @@ impl SessionHost {
             openshell_supervisor_process::log_push::LOG_PUSH_QUEUE_LINES,
         );
         let log_push = config.sandbox_id.clone().zip(gateway);
-        let binding = SessionBinding {
-            event_context: Arc::new(crate::session_event_context(
+        let binding = SandboxInstanceBinding {
+            event_context: Arc::new(crate::sandbox_instance_event_context(
                 config.sandbox_id.as_deref(),
                 config.sandbox.as_deref(),
                 container_image,
@@ -520,14 +538,15 @@ impl SessionHost {
             log_sink: log_push
                 .as_ref()
                 .map(|(sandbox_id, _)| LogSink::new(sandbox_id.as_str(), log_tx)),
-            denial_log: SessionDenialLog::default(),
+            denial_log: SandboxInstanceDenialLog::default(),
         };
         config.gateway_credentials = Some(credentials.clone());
         config.ocsf_json = binding.ocsf_json.clone();
-        config.denial_log = openshell_supervisor_network::policy_local::DenialLogSource::Session(
-            binding.denial_log.clone(),
-        );
-        let body: SessionBody = Box::new(move |controls| {
+        config.denial_log =
+            openshell_supervisor_network::policy_local::DenialLogSource::SandboxInstance(
+                binding.denial_log.clone(),
+            );
+        let body: SandboxInstanceBody = Box::new(move |controls| {
             Box::pin(async move {
                 let _private_tls_dir = private_tls_dir;
                 let _log_push = log_push.map(|(sandbox_id, gateway)| {
@@ -535,7 +554,12 @@ impl SessionHost {
                         gateway, sandbox_id, log_rx,
                     )
                 });
-                Box::pin(crate::run_session(backend_setup.as_ref(), config, controls)).await
+                Box::pin(crate::run_sandbox_instance(
+                    backend_setup.as_ref(),
+                    config,
+                    controls,
+                ))
+                .await
             })
         });
         self.start(&key, binding, Some(credentials), body)
@@ -613,7 +637,7 @@ mod tests {
             .collect()
     }
 
-    struct Session {
+    struct Instance {
         identity: tokio::sync::oneshot::Receiver<String>,
         logs: mpsc::Receiver<SandboxLogLine>,
         call_again: mpsc::Sender<()>,
@@ -621,31 +645,35 @@ mod tests {
         credentials: GatewayCredentials,
     }
 
-    fn start_session(host: &SessionHost, gateway_url: &str, sandbox: &'static str) -> Session {
+    fn start_instance(
+        host: &SandboxInstanceHost,
+        gateway_url: &str,
+        sandbox: &'static str,
+    ) -> Instance {
         let credentials =
             GatewayCredentials::from_gateway_token(&format!("token-{sandbox}")).unwrap();
         let gateway = GatewayEndpoint::new(gateway_url, credentials.clone());
         let (log_tx, logs) = mpsc::channel(16);
-        let binding = SessionBinding {
-            event_context: Arc::new(crate::session_event_context(
+        let binding = SandboxInstanceBinding {
+            event_context: Arc::new(crate::sandbox_instance_event_context(
                 Some(sandbox),
                 Some(sandbox),
                 String::new(),
             )),
             ocsf_json: OcsfJsonSettings::default(),
             log_sink: Some(LogSink::new(sandbox, log_tx)),
-            denial_log: SessionDenialLog::default(),
+            denial_log: SandboxInstanceDenialLog::default(),
         };
         let (identity_tx, identity) = tokio::sync::oneshot::channel();
         let (call_again, mut calls) = mpsc::channel(1);
         let (alive_tx, alive) = mpsc::channel::<()>(1);
-        let body: SessionBody = Box::new(move |controls| {
+        let body: SandboxInstanceBody = Box::new(move |controls| {
             Box::pin(async move {
-                let SessionControls {
+                let SandboxInstanceControls {
                     shutdown,
                     readiness,
                 } = controls;
-                // Nested tasks and the blocking pool inherit the session identity.
+                // Nested tasks and the blocking pool inherit the instance identity.
                 let observed = tokio::spawn(async {
                     tokio::task::spawn_blocking(|| openshell_ocsf::ctx::ctx().sandbox_id.clone())
                         .await
@@ -662,12 +690,12 @@ mod tests {
                 );
                 tokio::spawn(async move {
                     tracing::dispatcher::with_default(&dispatch, || {
-                        tracing::info!(target: "session_test", "emitted by {sandbox}");
+                        tracing::info!(target: "instance_test", "emitted by {sandbox}");
                     });
                 })
                 .await
                 .unwrap();
-                // A long-lived task the session never stops itself.
+                // A long-lived task the instance never stops itself.
                 tokio::spawn(async move {
                     let _alive = alive_tx;
                     std::future::pending::<()>().await;
@@ -689,7 +717,7 @@ mod tests {
         });
         host.start(sandbox, binding, Some(credentials.clone()), body)
             .unwrap();
-        Session {
+        Instance {
             identity,
             logs,
             call_again,
@@ -698,29 +726,35 @@ mod tests {
         }
     }
 
-    async fn wait_supervising(host: &SessionHost, key: &str) {
+    async fn wait_supervising(host: &SandboxInstanceHost, key: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
-            while host.status(key).map(|status| status.phase) != Some(SessionPhase::Supervising) {
+            while host.status(key).map(|status| status.phase)
+                != Some(SandboxInstancePhase::Supervising)
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("session reaches supervision");
+        .expect("instance reaches supervision");
     }
 
-    fn unbound() -> SessionBinding {
-        SessionBinding {
-            event_context: Arc::new(crate::session_event_context(None, None, String::new())),
+    fn unbound() -> SandboxInstanceBinding {
+        SandboxInstanceBinding {
+            event_context: Arc::new(crate::sandbox_instance_event_context(
+                None,
+                None,
+                String::new(),
+            )),
             ocsf_json: OcsfJsonSettings::default(),
             log_sink: None,
-            denial_log: SessionDenialLog::default(),
+            denial_log: SandboxInstanceDenialLog::default(),
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn stopping_and_panicking_sessions_keep_their_key_and_fail_closed() {
-        let host = Arc::new(SessionHost::new());
-        let body: SessionBody = Box::new(|controls| {
+    async fn stopping_and_panicking_instances_keep_their_key_and_fail_closed() {
+        let host = Arc::new(SandboxInstanceHost::new());
+        let body: SandboxInstanceBody = Box::new(|controls| {
             Box::pin(async move {
                 controls.readiness.send_replace(true);
                 controls.shutdown.await;
@@ -737,28 +771,28 @@ mod tests {
         });
         tokio::time::timeout(Duration::from_secs(10), async {
             while host.status("generation").map(|status| status.phase)
-                != Some(SessionPhase::Stopping)
+                != Some(SandboxInstancePhase::Stopping)
             {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await
-        .expect("session observes the stop request");
-        let replacement: SessionBody = Box::new(|_| Box::pin(async { Ok(0) }));
+        .expect("instance observes the stop request");
+        let replacement: SandboxInstanceBody = Box::new(|_| Box::pin(async { Ok(0) }));
         assert_eq!(
             host.start("generation", unbound(), None, replacement),
-            Err(SessionHostError::Duplicate)
+            Err(SandboxInstanceHostError::Duplicate)
         );
-        let stopped = removal.await.unwrap().expect("session was hosted");
-        assert_eq!(stopped.phase, SessionPhase::Exited(0));
+        let stopped = removal.await.unwrap().expect("instance was hosted");
+        assert_eq!(stopped.phase, SandboxInstancePhase::Exited(0));
         assert!(host.status("generation").is_none());
 
         let credentials = GatewayCredentials::from_gateway_token("panicking-token").unwrap();
-        let panicking: SessionBody = Box::new(|controls| {
+        let panicking: SandboxInstanceBody = Box::new(|controls| {
             Box::pin(async move {
                 controls.readiness.send_replace(true);
                 tokio::task::yield_now().await;
-                panic!("hosted session failure");
+                panic!("hosted sandbox instance failure");
             })
         });
         host.start("panicking", unbound(), Some(credentials.clone()), panicking)
@@ -774,11 +808,11 @@ mod tests {
             }
         })
         .await
-        .expect("panicking session reports an end");
+        .expect("panicking instance reports an end");
         assert_eq!(
             status,
-            SessionStatus {
-                phase: SessionPhase::Failed("session panicked".to_string()),
+            SandboxInstanceStatus {
+                phase: SandboxInstancePhase::Failed("sandbox instance panicked".to_string()),
                 ready: false,
             }
         );
@@ -796,8 +830,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn removal_outlives_its_caller_and_reports_to_every_remover() {
-        let host = Arc::new(SessionHost::new());
-        let winding_down = |code| -> SessionBody {
+        let host = Arc::new(SandboxInstanceHost::new());
+        let winding_down = |code| -> SandboxInstanceBody {
             Box::new(move |controls| {
                 Box::pin(async move {
                     controls.readiness.send_replace(true);
@@ -824,8 +858,8 @@ mod tests {
             tokio::spawn(async move { host.remove("generation", Duration::from_secs(10)).await })
         });
         for remover in removers {
-            let status = remover.await.unwrap().expect("session was hosted");
-            assert_eq!(status.phase, SessionPhase::Exited(3));
+            let status = remover.await.unwrap().expect("instance was hosted");
+            assert_eq!(status.phase, SandboxInstancePhase::Exited(3));
         }
         assert!(host.status("generation").is_none());
 
@@ -836,46 +870,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             host.status("generation").map(|status| status.phase),
-            Some(SessionPhase::Supervising)
+            Some(SandboxInstancePhase::Supervising)
         );
         let status = host.remove("generation", Duration::from_secs(10)).await;
         assert_eq!(
             status.map(|status| status.phase),
-            Some(SessionPhase::Exited(4))
+            Some(SandboxInstancePhase::Exited(4))
         );
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn hosted_sessions_keep_identity_credentials_and_lifecycle_separate() {
+    async fn hosted_instances_keep_identity_credentials_and_lifecycle_separate() {
         let (gateway_url, captured) = capture_gateway().await;
-        let host = SessionHost::new();
-        let mut alpha = start_session(&host, &gateway_url, "sandbox-alpha");
-        let mut beta = start_session(&host, &gateway_url, "sandbox-beta");
+        let host = SandboxInstanceHost::new();
+        let mut alpha = start_instance(&host, &gateway_url, "sandbox-alpha");
+        let mut beta = start_instance(&host, &gateway_url, "sandbox-beta");
         wait_supervising(&host, "sandbox-alpha").await;
         wait_supervising(&host, "sandbox-beta").await;
         assert!(matches!(
             host.start(
                 "sandbox-alpha",
-                SessionBinding {
-                    event_context: Arc::new(crate::session_event_context(
+                SandboxInstanceBinding {
+                    event_context: Arc::new(crate::sandbox_instance_event_context(
                         None,
                         None,
                         String::new()
                     )),
                     ocsf_json: OcsfJsonSettings::default(),
                     log_sink: None,
-                    denial_log: SessionDenialLog::default(),
+                    denial_log: SandboxInstanceDenialLog::default(),
                 },
                 None,
                 Box::new(|_| Box::pin(async { Ok(0) })),
             ),
-            Err(SessionHostError::Duplicate)
+            Err(SandboxInstanceHostError::Duplicate)
         ));
 
         assert_eq!((&mut alpha.identity).await.unwrap(), "sandbox-alpha");
         assert_eq!((&mut beta.identity).await.unwrap(), "sandbox-beta");
         // Other tests in this process may set the process-wide context; a
-        // thread outside every session must still carry no session identity.
+        // thread outside every instance must still carry no instance identity.
         let outside = openshell_ocsf::ctx::ctx().sandbox_id.clone();
         assert!(!["sandbox-alpha", "sandbox-beta"].contains(&outside.as_str()));
         assert_eq!(
@@ -886,18 +920,18 @@ mod tests {
             bearers_for(&captured, "sandbox-beta"),
             ["Bearer token-sandbox-beta"]
         );
-        for (session, sandbox) in [(&mut alpha, "sandbox-alpha"), (&mut beta, "sandbox-beta")] {
-            let line = session.logs.try_recv().expect("session log line");
+        for (instance, sandbox) in [(&mut alpha, "sandbox-alpha"), (&mut beta, "sandbox-beta")] {
+            let line = instance.logs.try_recv().expect("instance log line");
             assert_eq!(line.sandbox_id, sandbox);
             assert_eq!(line.message, format!("emitted by {sandbox}"));
-            assert!(session.logs.try_recv().is_err());
+            assert!(instance.logs.try_recv().is_err());
         }
 
         let stopped = host
             .remove("sandbox-alpha", Duration::from_secs(10))
             .await
             .expect("alpha was hosted");
-        assert_eq!(stopped.phase, SessionPhase::Exited(0));
+        assert_eq!(stopped.phase, SandboxInstancePhase::Exited(0));
         assert!(!stopped.ready);
         assert!(host.status("sandbox-alpha").is_none());
         assert_eq!(alpha.alive.recv().await, None, "alpha's tasks stopped");
@@ -921,7 +955,7 @@ mod tests {
         );
         assert_eq!(
             host.status("sandbox-beta").map(|status| status.phase),
-            Some(SessionPhase::Supervising)
+            Some(SandboxInstancePhase::Supervising)
         );
         assert!(
             beta.alive
@@ -932,7 +966,7 @@ mod tests {
         let stopped = host.remove("sandbox-beta", Duration::from_secs(10)).await;
         assert_eq!(
             stopped.map(|status| status.phase),
-            Some(SessionPhase::Exited(0))
+            Some(SandboxInstancePhase::Exited(0))
         );
     }
 }

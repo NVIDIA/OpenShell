@@ -124,8 +124,8 @@ pub fn set_parent_from_environment(span: &tracing::Span) {
 /// Parent `span` under an explicit W3C `traceparent` and `tracestate`.
 ///
 /// A process supervising several sandboxes receives each launch's context
-/// with its session instead of through process environment. Leaves `span`
-/// unchanged when the values carry no valid context.
+/// with its sandbox instance instead of through process environment. Leaves
+/// `span` unchanged when the values carry no valid context.
 pub fn set_parent_from_trace_context(
     span: &tracing::Span,
     traceparent: Option<&str>,

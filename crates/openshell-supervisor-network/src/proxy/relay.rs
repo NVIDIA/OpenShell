@@ -58,7 +58,7 @@ pub(super) fn http_context(
         .is_none()
         .then_some(secret_resolver)
         .flatten();
-    // Grants use the owning session's resolver; without one they fail closed.
+    // Grants use the owning sandbox instance's resolver; without one they fail closed.
     let token_grant_resolver = provider_credentials
         .as_ref()
         .and(policy_local)

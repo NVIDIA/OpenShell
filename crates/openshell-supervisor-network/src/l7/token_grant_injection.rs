@@ -53,14 +53,14 @@ pub trait TokenGrantResolver: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>>;
 }
 
-/// Resolves provider tokens through one session's authenticated grant flow.
+/// Resolves provider tokens through one sandbox instance's authenticated grant flow.
 pub struct SpiffeTokenGrantResolver {
-    grants: crate::token_grant::SessionTokenGrants,
+    grants: crate::token_grant::SandboxInstanceTokenGrants,
 }
 
 impl SpiffeTokenGrantResolver {
     #[must_use]
-    pub fn new(grants: crate::token_grant::SessionTokenGrants) -> Self {
+    pub fn new(grants: crate::token_grant::SandboxInstanceTokenGrants) -> Self {
         Self { grants }
     }
 }
