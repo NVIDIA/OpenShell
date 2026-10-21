@@ -18,11 +18,19 @@ description: |
 
   **Setup instructions**
 
-    1. Install and start Docker using your preferred package source before
-       installing the OpenShell snap. Use a system package or Docker's package
-       repository. The Docker snap is not currently compatible with OpenShell.
+    1. The snap uses the VM compute driver when the gateway user has read/write
+       access to /dev/kvm, unless `compute_driver` is set in gateway.toml or
+       OPENSHELL_COMPUTE_DRIVER is set in the service environment. Without that
+       access, the gateway tries to detect another runtime and fails to start if
+       none is available. Desktop sessions commonly receive access
+       automatically; otherwise add the gateway user to the kvm group and start
+       a new login session:
 
-       Snap Store installations automatically connect the required interfaces.
+         sudo usermod -aG kvm "$USER"
+
+       To use a different installed driver, such as Docker or rootless Podman,
+       set `compute_driver` under `[openshell.gateway]` in gateway.toml. Start
+       `podman.socket` as the gateway user before selecting Podman.
 
        Enable and start the gateway from the single user account that will run
        it:
@@ -41,13 +49,6 @@ description: |
 
        This does not stop gateways already running in other user sessions.
        Those users must disable and stop the service from their own sessions.
-
-       If the OpenShell snap was installed before Docker was running, its user
-       service may have hit the systemd start limit. Resolve this from the
-       affected user's session after Docker is available:
-
-         systemctl --user reset-failed snap.openshell.user-gateway.service
-         systemctl --user restart snap.openshell.user-gateway.service
 
     2. Register the per-user gateway after it provisions its mTLS credentials:
 
@@ -87,10 +88,10 @@ description: |
 base: core24
 grade: stable
 confinement: strict
-# The system :docker slot was added in snapd 2.76, so this is the minimum
-# required version. Snapd 2.77 allowed manual connection to that slot without
-# snap-declaration overrides from the store, such as when installing a locally-
-# built snap, but that is not required for installations from the snap store.
+# The system :docker slot and podman interface were added in snapd 2.76, so
+# this is the minimum required version. Snapd 2.77 allowed manual connection
+# to :docker without snap-declaration overrides from the store, such as when
+# installing a locally-built snap, but that is not required for store installs.
 assumes: [snapd2.76]
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
@@ -156,6 +157,7 @@ apps:
       OPENSHELL_LOCAL_TLS_DIR: "$SNAP_COMMON/tls"
     plugs:
       - docker
+      - kvm
       - log-observe
       - network
       - network-bind
@@ -174,9 +176,11 @@ apps:
       XDG_STATE_HOME: "$SNAP_USER_COMMON/.local/state"
     plugs:
       - docker
+      - kvm
       - log-observe
       - network
       - network-bind
+      - podman
       - system-observe
 
 parts:
@@ -190,7 +194,7 @@ parts:
       set -euo pipefail
 
       MISSING=()
-      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-gateway-wrapper; do
+      for bin in openshell openshell-prover openshell-gateway openshell-sandbox openshell-driver-vm openshell-gateway-wrapper; do
         if [ ! -f "$CRAFT_PART_SRC/$bin" ]; then
           MISSING+=("$bin")
         fi
@@ -214,6 +218,8 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
+      install -D -m 0755 "$CRAFT_PART_SRC/openshell-driver-vm" \
+        "$CRAFT_PART_INSTALL/bin/openshell-driver-vm"
       install -D -m 0755 "$CRAFT_PART_SRC/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
       install -D -m 0644 "$CRAFT_PART_SRC/meta/gui/term.desktop" \
@@ -235,3 +241,10 @@ parts:
       - openssh-client
     prime:
       - usr/bin/ssh
+
+  e2fsprogs:
+    # The VM driver formats and modifies file-backed ext4 disks with these
+    # tools. Vendor them because strict snaps cannot execute host sbin tools.
+    plugin: nil
+    stage-packages:
+      - e2fsprogs
