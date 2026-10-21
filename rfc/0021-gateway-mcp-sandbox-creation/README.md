@@ -1,9 +1,10 @@
 ---
 authors:
   - "@patkraw"
-state: draft
+state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/4574
+  - https://github.com/NVIDIA/OpenShell/pull/4721
 ---
 
 # RFC 0021 - OpenShell MCP Server for Creating Sandboxes
