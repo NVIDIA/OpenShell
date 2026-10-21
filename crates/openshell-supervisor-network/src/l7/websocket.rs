@@ -1449,6 +1449,7 @@ fn inspect_websocket_text_message(
         decision,
         &reason,
         None,
+        Some(inspector.engine.captured_generation()),
     );
     if !allowed && inspector.enforcement == EnforcementMode::Enforce {
         return Err(terminate(
@@ -1482,6 +1483,7 @@ fn inspect_graphql_websocket_message(
                 &request_info,
                 "allow",
                 &format!("GraphQL WebSocket control message {message_type}"),
+                None,
                 None,
             );
             Ok(())
@@ -1523,6 +1525,7 @@ fn inspect_graphql_websocket_message(
                 decision,
                 &reason,
                 Some(&graphql),
+                Some(inspector.engine.captured_generation()),
             );
             if (!allowed && inspector.enforcement == EnforcementMode::Enforce) || force_deny {
                 return Err(terminate(
@@ -2096,6 +2099,9 @@ fn rewrite_event_message(host: &str, port: u16, replacements: usize) -> String {
     )
 }
 
+/// `policy_generation` is the tunnel policy generation that evaluated the
+/// message, or `None` for messages passed without policy evaluation.
+#[allow(clippy::too_many_arguments)]
 fn emit_websocket_l7_event(
     host: &str,
     port: u16,
@@ -2104,6 +2110,7 @@ fn emit_websocket_l7_event(
     decision: &str,
     reason: &str,
     graphql: Option<&crate::l7::graphql::GraphqlRequestInfo>,
+    policy_generation: Option<u64>,
 ) {
     let policy_name = if policy_name.is_empty() {
         "-"
@@ -2127,14 +2134,20 @@ fn emit_websocket_l7_event(
         .map(crate::l7::graphql::log_summary)
         .map(|summary| format!(" {summary}"))
         .unwrap_or_default();
-    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
         .disposition(disposition_id)
         .severity(severity)
         .status(StatusId::Success)
-        .dst_endpoint(Endpoint::from_domain(host, port))
-        .firewall_rule(policy_name, "l7-websocket")
+        .dst_endpoint(Endpoint::from_domain(host, port));
+    let builder = match policy_generation {
+        Some(generation) => {
+            builder.firewall_rule_at_generation(policy_name, "l7-websocket", generation)
+        }
+        None => builder.firewall_rule(policy_name, "l7-websocket"),
+    };
+    let event = builder
         .message(format!(
             "WEBSOCKET_L7_REQUEST {decision} {} {host}:{port}{}{} reason={reason}",
             request_info.action, request_info.target, summary

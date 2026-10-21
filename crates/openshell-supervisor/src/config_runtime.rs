@@ -468,6 +468,7 @@ impl ConfigRuntime {
                         result.config_revision,
                         generation.clone(),
                     );
+                    let active_generation = generation.captured_generation();
                     self.policy_generation = Some(generation);
                     let policy = result
                         .policy
@@ -485,6 +486,7 @@ impl ConfigRuntime {
                                 .status(StatusId::Success)
                                 .state(StateId::Enabled, "loaded")
                                 .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .unmapped("active_generation", serde_json::json!(active_generation))
                                 .unmapped("global_version", serde_json::json!(result.global_policy_version))
                                 .message(format!(
                                     "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
@@ -499,6 +501,10 @@ impl ConfigRuntime {
                                     .status(StatusId::Success)
                                     .state(StateId::Enabled, "loaded")
                                     .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                    .unmapped(
+                                        "active_generation",
+                                        serde_json::json!(active_generation)
+                                    )
                                     .message(format!(
                                         "Policy reloaded successfully [policy_hash:{}]",
                                         result.policy_hash
@@ -520,6 +526,7 @@ impl ConfigRuntime {
                                 .status(StatusId::Success)
                                 .state(StateId::Enabled, "loaded")
                                 .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .unmapped("active_generation", serde_json::json!(active_generation))
                                 .message(format!(
                                     "Policy reloaded successfully and fail-closed quarantine cleared [policy_hash:{}]",
                                     result.policy_hash
@@ -539,6 +546,7 @@ impl ConfigRuntime {
                                 "supervisor_middleware_service_count",
                                 serde_json::json!(result.supervisor_middleware_services.len())
                             )
+                            .unmapped("active_generation", serde_json::json!(active_generation))
                             .message(format!(
                                 "Supervisor policy runtime reloaded atomically [service_count:{}]",
                                 result.supervisor_middleware_services.len()
@@ -1327,7 +1335,10 @@ async fn run_policy_poll_loop_with_client<C: PolicyGatewayClient>(
                     runtime.settings = result.settings;
                     enqueue_policy_status(
                         &status_sender,
-                        PolicyStatusUpdate::initial_loaded(&candidate),
+                        PolicyStatusUpdate::initial_loaded(
+                            &candidate,
+                            generation.captured_generation(),
+                        ),
                     );
                     debug!(
                         config_revision = runtime.config_revision,

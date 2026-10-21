@@ -171,6 +171,22 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
         self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
+
+    /// Set the firewall rule and the policy generation that evaluated it.
+    ///
+    /// Use this for allow and deny decisions so the event names the exact
+    /// policy generation, not only the rule name.
+    #[must_use]
+    pub fn firewall_rule_at_generation(
+        mut self,
+        name: &str,
+        rule_type: &str,
+        generation: u64,
+    ) -> Self {
+        self.firewall_rule =
+            Some(FirewallRule::new(name, rule_type).with_policy_generation(generation));
+        self
+    }
 }
 
 impl_activity_setter!(HttpActivityBuilder<Context>);
@@ -271,5 +287,28 @@ mod tests {
         assert_eq!(json["unmapped"]["attempt"], 2);
         assert_eq!(json["unmapped"]["cached"], true);
         assert_eq!(json["action_id"], 2); // Denied
+    }
+
+    #[test]
+    fn test_http_decision_records_policy_generation() {
+        let ctx = test_sandbox_context();
+        let event = HttpActivityBuilder::new(&ctx)
+            .activity(ActivityId::Other)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain("api.github.com", 443))
+            .http_request(HttpRequest::new(
+                "GET",
+                Url::new("https", "api.github.com", "/zen", 443),
+            ))
+            .firewall_rule_at_generation("github_api", "l7", 12)
+            .build();
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["firewall_rule"]["name"], "github_api");
+        assert_eq!(json["firewall_rule"]["version"], "12");
+        openshell_ocsf_validate::validate_event(&json)
+            .unwrap_or_else(|e| panic!("firewall_rule.version must stay schema-valid: {e}"));
     }
 }
