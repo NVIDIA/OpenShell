@@ -43,9 +43,20 @@ where
         .unwrap_or_else(|error| panic!("[{name}] {error}"));
     let mut cx = Context::new(&client, &gateway.workspace, Cli::from_env(&gateway));
     eprintln!("[{name}] run id {}", cx.run_id());
+    run_with_cleanup(name, &mut cx, body, async |cx: &mut Context| {
+        cx.cleanup().await
+    })
+    .await;
+}
 
-    let outcome = AssertUnwindSafe(body(&mut cx)).catch_unwind().await;
-    let cleanup_failures = cx.cleanup().await;
+/// Run `body`, then `cleanup` whether the body passed, failed, or panicked.
+async fn run_with_cleanup<C, F, G>(name: &str, cx: &mut C, body: F, cleanup: G)
+where
+    F: AsyncFnOnce(&mut C) -> Result,
+    G: AsyncFnOnce(&mut C) -> Vec<String>,
+{
+    let outcome = AssertUnwindSafe(body(cx)).catch_unwind().await;
+    let cleanup_failures = cleanup(cx).await;
     for failure in &cleanup_failures {
         eprintln!("[{name}] cleanup failed: {failure}");
     }
@@ -58,5 +69,71 @@ where
             "[{name}] passed, but cleanup failed: {}",
             cleanup_failures.join("; ")
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::Error;
+
+    /// Runs `body` with a cleanup that records it ran and fails with
+    /// `cleanup_failures`. Returns whether cleanup ran and the panic message.
+    async fn run_test(
+        body: impl AsyncFnOnce(&mut bool) -> Result,
+        cleanup_failures: Vec<String>,
+    ) -> (bool, Option<String>) {
+        let mut cleaned_up = false;
+        let outcome = AssertUnwindSafe(run_with_cleanup(
+            "t",
+            &mut cleaned_up,
+            body,
+            async |cleaned_up: &mut bool| {
+                *cleaned_up = true;
+                cleanup_failures
+            },
+        ))
+        .catch_unwind()
+        .await;
+        let message = outcome.err().map(|panic| {
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(ToString::to_string))
+                .unwrap_or_default()
+        });
+        (cleaned_up, message)
+    }
+
+    #[tokio::test]
+    async fn passes_after_cleanup() {
+        let (cleaned_up, panic) = run_test(async |_| Ok(()), vec![]).await;
+        assert!(cleaned_up);
+        assert_eq!(panic, None);
+    }
+
+    #[tokio::test]
+    async fn cleans_up_after_failure() {
+        let (cleaned_up, panic) = run_test(async |_| Err(Error::msg("boom")), vec![]).await;
+        assert!(cleaned_up);
+        assert_eq!(panic.as_deref(), Some("[t] boom"));
+    }
+
+    #[tokio::test]
+    async fn cleans_up_after_panic() {
+        let (cleaned_up, panic) = run_test(async |_| panic!("kaboom"), vec![]).await;
+        assert!(cleaned_up);
+        assert_eq!(panic.as_deref(), Some("kaboom"));
+    }
+
+    #[tokio::test]
+    async fn fails_when_cleanup_fails_after_pass() {
+        let failures = vec!["delete sandbox a: gone wrong".to_string()];
+        let (cleaned_up, panic) = run_test(async |_| Ok(()), failures).await;
+        assert!(cleaned_up);
+        assert_eq!(
+            panic.as_deref(),
+            Some("[t] passed, but cleanup failed: delete sandbox a: gone wrong")
+        );
     }
 }
