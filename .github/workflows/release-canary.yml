@@ -259,6 +259,12 @@ jobs:
           ! systemctl is-active --quiet snap.openshell.system-gateway.service
           journalctl --user -u snap.openshell.user-gateway.service --no-pager |
             grep -F "mTLS user authentication enabled"
+          invocation_id=$(systemctl --user show snap.openshell.user-gateway.service \
+            --property=InvocationID --value)
+          test -n "$invocation_id"
+          journalctl --user "_SYSTEMD_INVOCATION_ID=${invocation_id}" --no-pager |
+            grep -F 'Using compute driver' |
+            grep -F 'driver=vm'
           openshell gateway list | grep -F "https://127.0.0.1:17670"
           openshell status
 

@@ -287,6 +287,21 @@ assert_contains "$snap_canary" "openshell.prover check"
 assert_not_contains "$snap_canary" "--dangerous"
 assert_not_contains "$snap_canary" "ubuntu-snap-docker-preflight:"
 if ! awk '
+  /^  ubuntu-snap-vm:$/ { in_job = 1; next }
+  in_job && /^  [[:alnum:]_-]+:$/ { in_job = 0 }
+  in_job && /journalctl --user .*_SYSTEMD_INVOCATION_ID=/ { checked_journal = 1 }
+  in_job && checked_journal && /grep -F '\''Using compute driver'\''/ { checked_log = 1 }
+  in_job && checked_log && /grep -F '\''driver=vm'\''/ { checked_driver = 1 }
+  in_job && /openshell sandbox create/ {
+    if (!checked_driver) premature_sandbox = 1
+    created_sandbox = 1
+  }
+  END { exit !(checked_journal && checked_log && checked_driver && created_sandbox && !premature_sandbox) }
+' "$snap_canary"; then
+  echo "FAIL: snap VM canary must verify VM selection before creating a sandbox" >&2
+  exit 1
+fi
+if ! awk '
   /^  ubuntu-snap-docker:$/ { in_job = 1; next }
   in_job && /^  [[:alnum:]_-]+:$/ { in_job = 0 }
   in_job && /systemctl --user set-environment/ { set_env = 1 }
