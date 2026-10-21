@@ -16,7 +16,9 @@
 //! The attribute expands to a `#[tokio::test]` wrapper with the same name, so
 //! the nextest test name is the function name. The original function is nested
 //! in the wrapper and passed to `testkit::run`. Other attributes, such as
-//! `#[ignore]` or `#[cfg(...)]`, move to the wrapper.
+//! `#[ignore]` or `#[cfg(...)]`, move to the wrapper. `#[should_panic]` is
+//! rejected: a testkit test panics on any failure, so it would pass for the
+//! wrong reason. Check the expected failure in the body instead.
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -54,6 +56,18 @@ fn expand(attr: TokenStream2, item: TokenStream2) -> syn::Result<TokenStream2> {
         return Err(syn::Error::new_spanned(
             attr,
             "`#[testkit::test]` already makes this a test; remove this attribute",
+        ));
+    }
+    if let Some(attr) = body
+        .attrs
+        .iter()
+        .find(|attr| attr.path().is_ident("should_panic"))
+    {
+        return Err(syn::Error::new_spanned(
+            attr,
+            "testkit tests panic on any failure, so `#[should_panic]` would pass for the \
+             wrong reason; check the expected failure in the body, for example with \
+             `CliOutput::failure` and `testkit::ensure!`",
         ));
     }
     let description = doc_comment(&body.attrs);
@@ -198,6 +212,16 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_should_panic() {
+        let err = expand_str(
+            "",
+            "/// Doc.\n#[should_panic(expected = \"denied\")]\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("`#[should_panic]`"), "{err}");
     }
 
     #[test]

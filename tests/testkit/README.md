@@ -32,7 +32,10 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 - **The doc comment is required.** It is the test's description.
 - **The function name is the nextest test name.**
 - **Other attributes apply to the test.** For example, `#[ignore = "reason"]`
-  skips it unless run with `--run-ignored`.
+  skips it unless run with `--run-ignored`. `#[should_panic]` is rejected,
+  because a testkit test panics on any failure. To check that something is
+  refused, assert the failure in the body, for example with
+  `cx.cli([...]).await?.failure()?` and `testkit::ensure!`.
 
 Cleanup runs after every test, whether it passes, fails, or panics. It only
 deletes sandboxes created through `cx.sandbox(...)`. Delete anything else a
