@@ -67,7 +67,7 @@ use openshell_ocsf::{
 ///
 /// The singleton lives in `openshell-ocsf` so both supervisor leaves can
 /// reach it without depending on `openshell-sandbox`. Initialised once during
-/// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
+/// `run_sandbox_with_backend()` startup via `openshell_ocsf::ctx::set_ctx`.
 pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
 /// The sandbox rejected the image working directory while starting the agent.
@@ -388,7 +388,10 @@ use provider_readiness::{EnvironmentIdentity, Tracker as ProviderReadinessTracke
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
-fn shared_ssh_socket_from_env() -> bool {
+/// Whether a dedicated supervisor's environment grants the SSH socket to its
+/// group rather than its owner.
+#[must_use]
+pub fn shared_ssh_socket_from_env() -> bool {
     std::env::var(openshell_core::sandbox_env::SSH_SOCKET_SHARED)
         .is_ok_and(|value| shared_ssh_socket_value(&value))
 }
@@ -661,146 +664,35 @@ pub async fn run_network_proxy(
     }
 }
 
-/// Run a command in the sandbox.
-///
-/// # Errors
-///
-/// Returns an error if the command fails to start or encounters a fatal error.
-#[allow(
-    clippy::too_many_arguments,
-    clippy::implicit_hasher,
-    clippy::similar_names,
-    clippy::fn_params_excessive_bools
-)]
-pub async fn run_sandbox(
-    command: Vec<String>,
-    workdir: Option<String>,
-    timeout_secs: u64,
-    interactive: bool,
-    await_main_process_attachment: bool,
-    sandbox_id: Option<String>,
-    sandbox: Option<String>,
-    openshell_endpoint: Option<String>,
-    policy_rules: Option<String>,
-    policy_data: Option<String>,
-    ssh_socket_path: Option<String>,
-    health_socket_path: Option<std::path::PathBuf>,
-    health_port: Option<u16>,
-    ocsf_enabled: Arc<AtomicBool>,
-    ocsf_schema_version: Arc<std::sync::Mutex<String>>,
-    upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    additional_ca_bundle: Option<String>,
-    backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
-    auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    admitted_isolation_backend: Option<String>,
-    main_exit_marker: Option<std::path::PathBuf>,
-) -> Result<i32> {
-    // Shared startup retains policy and networking state; box it to keep callers' futures small.
-    Box::pin(run_sandbox_with_backend(
-        &backend_setup::OpenShellBackendSetup,
-        SandboxRunConfig {
-            command,
-            workdir,
-            timeout_secs,
-            interactive,
-            await_main_process_attachment,
-            sandbox_id,
-            sandbox,
-            openshell_endpoint,
-            policy_rules,
-            policy_data,
-            ssh_socket_path,
-            health_socket_path,
-            health_port,
-            ocsf_enabled,
-            ocsf_schema_version,
-            upstream_proxy_args,
-            additional_ca_bundle,
-            backend_descriptor,
-            auth_bundle,
-            gateway_credentials: None,
-            admitted_isolation_backend,
-            main_exit_marker,
-        },
-    ))
-    .await
-}
-
-/// Trusted inputs for one supervisor launch.
-pub struct SandboxRunConfig {
-    pub command: Vec<String>,
-    pub workdir: Option<String>,
-    pub timeout_secs: u64,
-    pub interactive: bool,
-    pub await_main_process_attachment: bool,
-    pub sandbox_id: Option<String>,
-    pub sandbox: Option<String>,
-    pub openshell_endpoint: Option<String>,
-    pub policy_rules: Option<String>,
-    pub policy_data: Option<String>,
-    pub ssh_socket_path: Option<String>,
-    pub health_socket_path: Option<std::path::PathBuf>,
-    pub health_port: Option<u16>,
-    pub ocsf_enabled: Arc<AtomicBool>,
-    pub ocsf_schema_version: Arc<std::sync::Mutex<String>>,
-    pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
-    pub additional_ca_bundle: Option<String>,
-    pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
-    pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    /// Credentials issued from `auth_bundle` and shared with other gateway
-    /// clients of this process, such as log push. Created when absent.
-    pub gateway_credentials: Option<openshell_core::grpc_client::GatewayCredentials>,
-    pub admitted_isolation_backend: Option<String>,
-    pub main_exit_marker: Option<std::path::PathBuf>,
-}
-
 /// Supervise the one sandbox instance this process was launched for.
 ///
-/// The process-wide OCSF context, SIGTERM/SIGINT handling, readiness
-/// endpoints, and the environment-provided launch inputs belong to the
-/// dedicated process; [`run_sandbox_instance`] owns everything else.
+/// This is the dedicated process wrapper. It sets the process-wide OCSF
+/// context from `bindings`, publishes instance readiness on the health socket
+/// and port, and stops the instance on SIGTERM or SIGINT;
+/// [`run_sandbox_instance`] owns everything else. The caller loads `config`
+/// from the process's arguments and environment and prepares `bindings` once,
+/// sharing their gateway credentials and OCSF JSON settings with the
+/// process's log push and logging layers.
 ///
 /// Trusted composition chooses the setup before shared admission, policy, and
 /// lifecycle handling. Payload contents never select a backend implementation.
-#[allow(clippy::similar_names)]
+///
+/// # Errors
+///
+/// Returns an error if a readiness endpoint cannot be prepared or the
+/// instance fails to start or supervise its workload.
 pub async fn run_sandbox_with_backend(
     backend_setup: &dyn backend_setup::BackendSetup,
-    config: SandboxRunConfig,
+    config: SandboxInstanceConfig,
+    bindings: SandboxInstanceBindings,
+    health_socket_path: Option<std::path::PathBuf>,
+    health_port: Option<u16>,
 ) -> Result<i32> {
-    let SandboxRunConfig {
-        command,
-        workdir,
-        timeout_secs,
-        interactive,
-        await_main_process_attachment,
-        sandbox_id,
-        sandbox,
-        openshell_endpoint,
-        policy_rules,
-        policy_data,
-        ssh_socket_path,
-        health_socket_path,
-        health_port,
-        ocsf_enabled,
-        ocsf_schema_version,
-        upstream_proxy_args,
-        additional_ca_bundle,
-        backend_descriptor,
-        auth_bundle,
-        gateway_credentials,
-        admitted_isolation_backend,
-        main_exit_marker,
-    } = config;
-
     // Initialize the process-wide OCSF context early so that events emitted
     // during policy loading (filesystem config, validation) have a context.
     // Proxy IP/port use defaults here; the boundary mediation source carries
     // workload-side connection metadata.
-    if !openshell_ocsf::ctx::set_ctx(sandbox_instance_event_context(
-        sandbox_id.as_deref(),
-        sandbox.as_deref(),
-        std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-    )) {
+    if !openshell_ocsf::ctx::set_ctx((*bindings.event_context).clone()) {
         debug!("OCSF context already initialized, keeping existing");
     }
 
@@ -813,39 +705,8 @@ pub async fn run_sandbox_with_backend(
         .collect::<Result<Vec<_>>>()?;
     let result = Box::pin(run_sandbox_instance(
         backend_setup,
-        SandboxInstanceConfig {
-            command,
-            workdir,
-            timeout_secs,
-            interactive,
-            await_main_process_attachment,
-            sandbox_id,
-            sandbox,
-            openshell_endpoint,
-            policy_rules,
-            policy_data,
-            ssh_socket_path,
-            shared_ssh_socket: shared_ssh_socket_from_env(),
-            ocsf_json: openshell_ocsf::OcsfJsonSettings {
-                enabled: ocsf_enabled,
-                target_version: ocsf_schema_version,
-            },
-            upstream_proxy_args,
-            additional_ca_bundle,
-            backend_descriptor,
-            auth_bundle,
-            gateway_credentials,
-            admitted_isolation_backend,
-            main_exit_marker,
-            trace_context: TraceContext::from_environment(),
-            provider_workload_api_socket: std::env::var_os(
-                openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
-            )
-            .filter(|path| !path.is_empty())
-            .map(std::path::PathBuf::from),
-            proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
-            denial_log: openshell_supervisor_network::policy_local::DenialLogSource::default(),
-        },
+        config,
+        bindings,
         SandboxInstanceControls {
             shutdown: Box::pin(wait_for_control_shutdown_signal()),
             readiness,
@@ -902,13 +763,14 @@ impl TraceContext {
     }
 }
 
-/// Trusted inputs owned by one supervised sandbox instance.
+/// Trusted launch inputs of one supervised sandbox instance.
 ///
 /// A sandbox instance is one running generation of a stable Sandbox resource;
 /// gateway connections may reconnect within it without creating another.
-/// Nothing in an instance reads process-wide sandbox state: identity,
-/// credentials, policy inputs, logging settings, and file locations all come
-/// from here, so one process can host several instances.
+/// Nothing in an instance reads process-wide sandbox state: identity, policy
+/// inputs, and file locations come from here, and live per-instance state
+/// from its [`SandboxInstanceBindings`], so one process can host several
+/// instances.
 pub struct SandboxInstanceConfig {
     pub command: Vec<String>,
     pub workdir: Option<String>,
@@ -917,20 +779,18 @@ pub struct SandboxInstanceConfig {
     pub await_main_process_attachment: bool,
     pub sandbox_id: Option<String>,
     pub sandbox: Option<String>,
+    /// Workload image recorded in this instance's OCSF events.
+    pub container_image: String,
     pub openshell_endpoint: Option<String>,
     pub policy_rules: Option<String>,
     pub policy_data: Option<String>,
     pub ssh_socket_path: Option<String>,
     /// Grant the SSH socket to the supervisor's group rather than its owner.
     pub shared_ssh_socket: bool,
-    /// OCSF JSON output settings this instance's gateway configuration controls.
-    pub ocsf_json: openshell_ocsf::OcsfJsonSettings,
     pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     pub additional_ca_bundle: Option<String>,
     pub backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor,
     pub auth_bundle: openshell_core::jwt::SupervisorAuthBundle,
-    /// Credentials issued from `auth_bundle`; created from it when absent.
-    pub gateway_credentials: Option<openshell_core::grpc_client::GatewayCredentials>,
     pub admitted_isolation_backend: Option<String>,
     pub main_exit_marker: Option<std::path::PathBuf>,
     /// Parent of the startup span.
@@ -938,8 +798,57 @@ pub struct SandboxInstanceConfig {
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
     pub provider_workload_api_socket: Option<std::path::PathBuf>,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
+}
+
+impl SandboxInstanceConfig {
+    /// OCSF identity of this sandbox instance.
+    #[must_use]
+    pub fn event_context(&self) -> EventContext {
+        sandbox_instance_event_context(
+            self.sandbox_id.as_deref(),
+            self.sandbox.as_deref(),
+            self.container_image.clone(),
+        )
+    }
+}
+
+/// Live state bound to one sandbox instance, prepared once by its owner.
+///
+/// A dedicated supervisor shares these with its process-wide logging and log
+/// push; a hosted instance binds them to every thread of its runtime. Every
+/// gateway client of the instance, including log push and credential renewal,
+/// uses the same `gateway_credentials`, so renewal by one keeps all current.
+#[derive(Clone)]
+pub struct SandboxInstanceBindings {
+    /// Gateway credentials issued from the instance's auth bundle.
+    pub gateway_credentials: openshell_core::grpc_client::GatewayCredentials,
+    pub event_context: Arc<EventContext>,
+    /// OCSF JSON output settings this instance's gateway configuration controls.
+    pub ocsf_json: openshell_ocsf::OcsfJsonSettings,
+    /// Log push destination of a hosted instance's threads. A dedicated
+    /// process pushes through its process-wide layer instead.
+    pub log_sink: Option<openshell_supervisor_process::log_push::LogSink>,
     /// Source of `policy.local` recent denials.
     pub denial_log: openshell_supervisor_network::policy_local::DenialLogSource,
+}
+
+impl SandboxInstanceBindings {
+    /// Bindings of a process dedicated to the instance `config` launches. Its
+    /// process-wide log push and shorthand log files serve the instance.
+    #[must_use]
+    pub fn dedicated(
+        config: &SandboxInstanceConfig,
+        gateway_credentials: openshell_core::grpc_client::GatewayCredentials,
+        ocsf_json: openshell_ocsf::OcsfJsonSettings,
+    ) -> Self {
+        Self {
+            gateway_credentials,
+            event_context: Arc::new(config.event_context()),
+            ocsf_json,
+            log_sink: None,
+            denial_log: openshell_supervisor_network::policy_local::DenialLogSource::default(),
+        }
+    }
 }
 
 /// How the owner of a sandbox instance stops it and observes its readiness.
@@ -1011,6 +920,7 @@ impl Drop for SandboxInstanceReadiness {
 pub async fn run_sandbox_instance(
     backend_setup: &dyn backend_setup::BackendSetup,
     config: SandboxInstanceConfig,
+    bindings: SandboxInstanceBindings,
     controls: SandboxInstanceControls,
 ) -> Result<i32> {
     let SandboxInstanceConfig {
@@ -1021,24 +931,30 @@ pub async fn run_sandbox_instance(
         await_main_process_attachment,
         sandbox_id,
         sandbox,
+        container_image: _,
         openshell_endpoint,
         policy_rules,
         policy_data,
         ssh_socket_path,
         shared_ssh_socket,
-        ocsf_json,
         upstream_proxy_args,
         additional_ca_bundle,
         backend_descriptor,
         auth_bundle,
-        gateway_credentials,
         admitted_isolation_backend,
         main_exit_marker,
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
-        denial_log,
     } = config;
+    // The owner binds the event context and log sink to the instance's
+    // threads; the instance itself uses the rest.
+    let SandboxInstanceBindings {
+        gateway_credentials,
+        ocsf_json,
+        denial_log,
+        ..
+    } = bindings;
     let SandboxInstanceControls {
         shutdown: shutdown_requested,
         readiness,
@@ -1071,10 +987,6 @@ pub async fn run_sandbox_instance(
         sandbox_id.as_deref(),
         &auth_bundle,
     )?;
-    let gateway_credentials = match gateway_credentials {
-        Some(credentials) => credentials,
-        None => openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&auth_bundle)?,
-    };
     let sandbox_bearer = gateway_credentials.sandbox_bearer().ok_or_else(|| {
         miette::miette!("supervisor gateway credentials carry no Sandbox Protocol credential")
     })?;
@@ -4435,29 +4347,44 @@ mod tests {
             ssh_host_private_key: None,
             ocsf_otlp_headers: None,
         };
-        let error = run_sandbox(
-            vec!["true".to_string()],
-            None,
-            0,
-            false,
-            false,
-            Some("sandbox-1".to_string()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(std::sync::Mutex::new(String::new())),
-            openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
-            None,
-            openshell_isolation_interface::contract::BackendDescriptor {
+        let config = SandboxInstanceConfig {
+            command: vec!["true".to_string()],
+            workdir: None,
+            timeout_secs: 0,
+            interactive: false,
+            await_main_process_attachment: false,
+            sandbox_id: Some("sandbox-1".to_string()),
+            sandbox: None,
+            container_image: String::new(),
+            openshell_endpoint: None,
+            policy_rules: None,
+            policy_data: None,
+            ssh_socket_path: None,
+            shared_ssh_socket: false,
+            upstream_proxy_args:
+                openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs::default(),
+            additional_ca_bundle: None,
+            backend_descriptor: openshell_isolation_interface::contract::BackendDescriptor {
                 backend_name: "in-process-test".to_string(),
                 payload: b"in-process-only-launch-data".to_vec(),
             },
             auth_bundle,
+            admitted_isolation_backend: None,
+            main_exit_marker: None,
+            trace_context: None,
+            provider_workload_api_socket: None,
+            proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
+        };
+        let bindings = SandboxInstanceBindings::dedicated(
+            &config,
+            openshell_core::grpc_client::GatewayCredentials::from_auth_bundle(&config.auth_bundle)
+                .expect("credentials"),
+            openshell_ocsf::OcsfJsonSettings::default(),
+        );
+        let error = run_sandbox_with_backend(
+            &backend_setup::OpenShellBackendSetup,
+            config,
+            bindings,
             None,
             None,
         )

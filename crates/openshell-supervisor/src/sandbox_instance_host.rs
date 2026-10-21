@@ -9,13 +9,13 @@
 //! creating another.
 //!
 //! Each instance runs on its own Tokio runtime. Every thread that runtime
-//! starts, and the thread driving it, is bound to the instance's OCSF context,
-//! OCSF JSON settings, log sink, and denial log, so tasks, callbacks,
-//! reconnects, and credential renewal that the instance spawns inherit its
-//! identity. Unbound threads carry no sandbox identity and push no logs.
-//! Gateway credentials are never bound to threads; each instance passes its
-//! own explicitly. Stopping an instance shuts down only its runtime and
-//! revokes its gateway credentials.
+//! starts, and the thread driving it, is bound to the instance's
+//! [`SandboxInstanceBindings`]: OCSF context, OCSF JSON settings, log sink, and
+//! denial log, so tasks, callbacks, reconnects, and credential renewal that the
+//! instance spawns inherit its identity. Unbound threads carry no sandbox
+//! identity and push no logs. Gateway credentials are never bound to threads;
+//! each instance passes its own explicitly. Stopping an instance shuts down
+//! only its runtime and revokes its gateway credentials.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -26,41 +26,34 @@ use std::time::Duration;
 
 use miette::Result;
 use openshell_core::grpc_client::GatewayCredentials;
-use openshell_ocsf::{EventContext, OcsfJsonSettings};
-use openshell_supervisor_network::policy_local::SandboxInstanceDenialLog;
+use openshell_ocsf::OcsfJsonSettings;
+use openshell_supervisor_network::policy_local::{DenialLogSource, SandboxInstanceDenialLog};
 use openshell_supervisor_process::log_push::LogSink;
 use tokio::sync::watch;
 
-use crate::SandboxInstanceControls;
+use crate::{SandboxInstanceBindings, SandboxInstanceControls};
 
 /// Worker threads in each sandbox instance runtime.
 const INSTANCE_WORKER_THREADS: usize = 2;
 /// Bound on joining an instance thread after its runtime is told to stop.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Per-instance values bound to every thread of the instance's runtime.
-#[derive(Clone)]
-pub struct SandboxInstanceBinding {
-    pub event_context: Arc<EventContext>,
-    pub ocsf_json: OcsfJsonSettings,
-    pub log_sink: Option<LogSink>,
-    pub denial_log: SandboxInstanceDenialLog,
+/// Bind the calling thread to one instance's bindings.
+fn bind_thread(bindings: &SandboxInstanceBindings) {
+    openshell_ocsf::ctx::bind_thread_ctx(Some(bindings.event_context.clone()));
+    openshell_ocsf::bind_thread_json_settings(Some(bindings.ocsf_json.clone()));
+    openshell_supervisor_process::log_push::bind_thread_sink(bindings.log_sink.clone());
+    bind_thread_denial_log(match &bindings.denial_log {
+        DenialLogSource::SandboxInstance(log) => Some(log.clone()),
+        DenialLogSource::ShorthandFiles(_) => None,
+    });
 }
 
-impl SandboxInstanceBinding {
-    fn bind(&self) {
-        openshell_ocsf::ctx::bind_thread_ctx(Some(self.event_context.clone()));
-        openshell_ocsf::bind_thread_json_settings(Some(self.ocsf_json.clone()));
-        openshell_supervisor_process::log_push::bind_thread_sink(self.log_sink.clone());
-        bind_thread_denial_log(Some(self.denial_log.clone()));
-    }
-
-    fn unbind() {
-        openshell_ocsf::ctx::bind_thread_ctx(None);
-        openshell_ocsf::bind_thread_json_settings(None);
-        openshell_supervisor_process::log_push::bind_thread_sink(None);
-        bind_thread_denial_log(None);
-    }
+fn unbind_thread() {
+    openshell_ocsf::ctx::bind_thread_ctx(None);
+    openshell_ocsf::bind_thread_json_settings(None);
+    openshell_supervisor_process::log_push::bind_thread_sink(None);
+    bind_thread_denial_log(None);
 }
 
 std::thread_local! {
@@ -196,10 +189,10 @@ impl SandboxInstanceHost {
         Self::default()
     }
 
-    /// Start `body` on a new runtime bound to `binding`.
+    /// Start `body` on a new runtime bound to `bindings`.
     ///
-    /// `credentials`, when present, are revoked once the instance's runtime
-    /// has stopped, so nothing can reuse them after the instance ends.
+    /// The bindings' gateway credentials are revoked once the instance's
+    /// runtime has stopped, so nothing can reuse them after the instance ends.
     ///
     /// # Errors
     ///
@@ -208,8 +201,7 @@ impl SandboxInstanceHost {
     pub fn start(
         &self,
         key: &str,
-        binding: SandboxInstanceBinding,
-        credentials: Option<GatewayCredentials>,
+        bindings: SandboxInstanceBindings,
         body: SandboxInstanceBody,
     ) -> std::result::Result<(), SandboxInstanceHostError> {
         let mut instances = lock(&self.instances);
@@ -224,8 +216,7 @@ impl SandboxInstanceHost {
             .name("openshell-instance".to_string())
             .spawn(move || {
                 run_hosted_sandbox_instance(
-                    &binding,
-                    credentials,
+                    &bindings,
                     body,
                     SandboxInstanceSignals {
                         stop_requested,
@@ -381,7 +372,7 @@ struct SandboxInstanceSignals {
 /// Reports a hosted sandbox instance's end and revokes its credentials,
 /// including when the instance thread unwinds.
 struct SandboxInstanceExit {
-    credentials: Option<GatewayCredentials>,
+    credentials: GatewayCredentials,
     phase: watch::Sender<SandboxInstancePhase>,
     ready: watch::Sender<bool>,
     outcome: Option<SandboxInstancePhase>,
@@ -389,9 +380,7 @@ struct SandboxInstanceExit {
 
 impl Drop for SandboxInstanceExit {
     fn drop(&mut self) {
-        if let Some(credentials) = self.credentials.take() {
-            credentials.revoke();
-        }
+        self.credentials.revoke();
         self.ready.send_replace(false);
         let outcome = self.outcome.take().unwrap_or_else(|| {
             SandboxInstancePhase::Failed(
@@ -399,13 +388,12 @@ impl Drop for SandboxInstanceExit {
             )
         });
         self.phase.send_replace(outcome);
-        SandboxInstanceBinding::unbind();
+        unbind_thread();
     }
 }
 
 fn run_hosted_sandbox_instance(
-    binding: &SandboxInstanceBinding,
-    credentials: Option<GatewayCredentials>,
+    bindings: &SandboxInstanceBindings,
     body: SandboxInstanceBody,
     signals: SandboxInstanceSignals,
 ) {
@@ -416,19 +404,19 @@ fn run_hosted_sandbox_instance(
         ready,
     } = signals;
     let mut exit = SandboxInstanceExit {
-        credentials,
+        credentials: bindings.gateway_credentials.clone(),
         phase: phase.clone(),
         ready: ready.clone(),
         outcome: None,
     };
-    binding.bind();
-    let thread_binding = binding.clone();
+    bind_thread(bindings);
+    let thread_bindings = bindings.clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(INSTANCE_WORKER_THREADS)
         .thread_name("openshell-instance-worker")
         .enable_all()
-        .on_thread_start(move || thread_binding.bind())
-        .on_thread_stop(SandboxInstanceBinding::unbind)
+        .on_thread_start(move || bind_thread(&thread_bindings))
+        .on_thread_stop(unbind_thread)
         .build();
     let outcome = match runtime {
         Ok(runtime) => {
@@ -493,8 +481,6 @@ pub struct SandboxInstanceSpec {
     pub key: String,
     pub backend_setup: Box<dyn crate::backend_setup::BackendSetup + Send>,
     pub config: crate::SandboxInstanceConfig,
-    /// Workload image recorded in this instance's OCSF events.
-    pub container_image: String,
 }
 
 impl SandboxInstanceHost {
@@ -509,9 +495,7 @@ impl SandboxInstanceHost {
             key,
             backend_setup,
             mut config,
-            container_image,
         } = spec;
-        let credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
         // Instances must never share proxy trust files; give one a private
         // directory that lives exactly as long as the instance.
         let private_tls_dir = if config.proxy_tls.directory.is_none() {
@@ -521,31 +505,30 @@ impl SandboxInstanceHost {
         } else {
             None
         };
-        let gateway = config.openshell_endpoint.as_deref().map(|endpoint| {
-            openshell_core::grpc_client::GatewayEndpoint::new(endpoint, credentials.clone())
-        });
+        // Log push, supervision, and renewal share these credentials.
+        let gateway_credentials = GatewayCredentials::from_auth_bundle(&config.auth_bundle)?;
+        let log_push = config
+            .sandbox_id
+            .clone()
+            .zip(config.openshell_endpoint.as_deref().map(|endpoint| {
+                openshell_core::grpc_client::GatewayEndpoint::new(
+                    endpoint,
+                    gateway_credentials.clone(),
+                )
+            }));
         let (log_tx, log_rx) = tokio::sync::mpsc::channel(
             openshell_supervisor_process::log_push::LOG_PUSH_QUEUE_LINES,
         );
-        let log_push = config.sandbox_id.clone().zip(gateway);
-        let binding = SandboxInstanceBinding {
-            event_context: Arc::new(crate::sandbox_instance_event_context(
-                config.sandbox_id.as_deref(),
-                config.sandbox.as_deref(),
-                container_image,
-            )),
+        let bindings = SandboxInstanceBindings {
+            gateway_credentials,
+            event_context: Arc::new(config.event_context()),
             ocsf_json: OcsfJsonSettings::default(),
             log_sink: log_push
                 .as_ref()
                 .map(|(sandbox_id, _)| LogSink::new(sandbox_id.as_str(), log_tx)),
-            denial_log: SandboxInstanceDenialLog::default(),
+            denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
         };
-        config.gateway_credentials = Some(credentials.clone());
-        config.ocsf_json = binding.ocsf_json.clone();
-        config.denial_log =
-            openshell_supervisor_network::policy_local::DenialLogSource::SandboxInstance(
-                binding.denial_log.clone(),
-            );
+        let instance_bindings = bindings.clone();
         let body: SandboxInstanceBody = Box::new(move |controls| {
             Box::pin(async move {
                 let _private_tls_dir = private_tls_dir;
@@ -557,12 +540,13 @@ impl SandboxInstanceHost {
                 Box::pin(crate::run_sandbox_instance(
                     backend_setup.as_ref(),
                     config,
+                    instance_bindings,
                     controls,
                 ))
                 .await
             })
         });
-        self.start(&key, binding, Some(credentials), body)
+        self.start(&key, bindings, body)
             .map_err(|error| miette::miette!("{error}"))
     }
 }
@@ -654,7 +638,8 @@ mod tests {
             GatewayCredentials::from_gateway_token(&format!("token-{sandbox}")).unwrap();
         let gateway = GatewayEndpoint::new(gateway_url, credentials.clone());
         let (log_tx, logs) = mpsc::channel(16);
-        let binding = SandboxInstanceBinding {
+        let bindings = SandboxInstanceBindings {
+            gateway_credentials: credentials.clone(),
             event_context: Arc::new(crate::sandbox_instance_event_context(
                 Some(sandbox),
                 Some(sandbox),
@@ -662,7 +647,7 @@ mod tests {
             )),
             ocsf_json: OcsfJsonSettings::default(),
             log_sink: Some(LogSink::new(sandbox, log_tx)),
-            denial_log: SandboxInstanceDenialLog::default(),
+            denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
         };
         let (identity_tx, identity) = tokio::sync::oneshot::channel();
         let (call_again, mut calls) = mpsc::channel(1);
@@ -715,8 +700,7 @@ mod tests {
                 }
             })
         });
-        host.start(sandbox, binding, Some(credentials.clone()), body)
-            .unwrap();
+        host.start(sandbox, bindings, body).unwrap();
         Instance {
             identity,
             logs,
@@ -738,8 +722,9 @@ mod tests {
         .expect("instance reaches supervision");
     }
 
-    fn unbound() -> SandboxInstanceBinding {
-        SandboxInstanceBinding {
+    fn unbound() -> SandboxInstanceBindings {
+        SandboxInstanceBindings {
+            gateway_credentials: GatewayCredentials::from_gateway_token("unbound-token").unwrap(),
             event_context: Arc::new(crate::sandbox_instance_event_context(
                 None,
                 None,
@@ -747,7 +732,7 @@ mod tests {
             )),
             ocsf_json: OcsfJsonSettings::default(),
             log_sink: None,
-            denial_log: SandboxInstanceDenialLog::default(),
+            denial_log: DenialLogSource::SandboxInstance(SandboxInstanceDenialLog::default()),
         }
     }
 
@@ -763,7 +748,7 @@ mod tests {
                 Ok(0)
             })
         });
-        host.start("generation", unbound(), None, body).unwrap();
+        host.start("generation", unbound(), body).unwrap();
         wait_supervising(&host, "generation").await;
         let removal = tokio::spawn({
             let host = host.clone();
@@ -780,7 +765,7 @@ mod tests {
         .expect("instance observes the stop request");
         let replacement: SandboxInstanceBody = Box::new(|_| Box::pin(async { Ok(0) }));
         assert_eq!(
-            host.start("generation", unbound(), None, replacement),
+            host.start("generation", unbound(), replacement),
             Err(SandboxInstanceHostError::Duplicate)
         );
         let stopped = removal.await.unwrap().expect("instance was hosted");
@@ -795,8 +780,15 @@ mod tests {
                 panic!("hosted sandbox instance failure");
             })
         });
-        host.start("panicking", unbound(), Some(credentials.clone()), panicking)
-            .unwrap();
+        host.start(
+            "panicking",
+            SandboxInstanceBindings {
+                gateway_credentials: credentials.clone(),
+                ..unbound()
+            },
+            panicking,
+        )
+        .unwrap();
         let status = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if let Some(status) = host.status("panicking")
@@ -841,7 +833,7 @@ mod tests {
                 })
             })
         };
-        host.start("generation", unbound(), None, winding_down(3))
+        host.start("generation", unbound(), winding_down(3))
             .unwrap();
         wait_supervising(&host, "generation").await;
         // A caller that gives up, such as an expired RPC, strands nothing.
@@ -864,7 +856,7 @@ mod tests {
         assert!(host.status("generation").is_none());
 
         // The key is free again, and the earlier removal cannot touch its new owner.
-        host.start("generation", unbound(), None, winding_down(4))
+        host.start("generation", unbound(), winding_down(4))
             .unwrap();
         wait_supervising(&host, "generation").await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -890,17 +882,7 @@ mod tests {
         assert!(matches!(
             host.start(
                 "sandbox-alpha",
-                SandboxInstanceBinding {
-                    event_context: Arc::new(crate::sandbox_instance_event_context(
-                        None,
-                        None,
-                        String::new()
-                    )),
-                    ocsf_json: OcsfJsonSettings::default(),
-                    log_sink: None,
-                    denial_log: SandboxInstanceDenialLog::default(),
-                },
-                None,
+                unbound(),
                 Box::new(|_| Box::pin(async { Ok(0) })),
             ),
             Err(SandboxInstanceHostError::Duplicate)

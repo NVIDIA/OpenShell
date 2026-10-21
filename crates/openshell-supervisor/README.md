@@ -4,7 +4,7 @@ The supervisor loads and reconciles policy, maintains provider credentials, appl
 
 ## Backend startup
 
-The public `run_sandbox` entry point selects the OpenShell Sandbox Protocol backend and collects its startup inputs into a public `SandboxRunConfig`. Shared startup receives that config and the trusted backend setup separately. The `backend_setup` module owns that backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.
+The supervisor binary selects a backend setup and collects its launch inputs into a public `SandboxInstanceConfig`. Shared startup receives that config and the trusted backend setup separately. The `backend_setup` module owns that backend's launch-data decoder, workload policy discovery, and client construction. Descriptor contents cannot select an implementation.
 
 Shared startup checks the admitted backend name before passing the opaque payload to its decoder. It then compares the decoded sandbox, session, and runtime generation with the trusted launch inputs before installing credentials or discovering workload policy. A mismatch stops startup.
 
@@ -14,7 +14,7 @@ The supervisor admits policy and prepares credentials before constructing and at
 
 The client receives the supervisor's live provider state, bearer-token slot, and CA-path slot. Provider refresh, token rotation, and later CA publication must remain visible through those shared handles. Startup does not create independent copies of their current values.
 
-`backend_setup`, `SandboxRunConfig`, and `run_sandbox_with_backend` are public so the supervisor binary can select a registered backend. External backends should implement the `IsolationBackend` and `SandboxProtocol` services rather than link this crate.
+`backend_setup`, `SandboxInstanceConfig`, `SandboxInstanceBindings`, and `run_sandbox_with_backend` are public so the supervisor binary can select a registered backend. External backends should implement the `IsolationBackend` and `SandboxProtocol` services rather than link this crate.
 
 The startup result separates the backend transport payload from optional
 authenticated CONNECT listener settings. Shared networking starts the listener
@@ -29,27 +29,32 @@ Gateway connections, and the gateway supervisor sessions carried over them,
 can reconnect within an instance without creating another one; the generation
 remains the fencing identifier.
 
-`run_sandbox_instance` supervises one sandbox instance from a
-`SandboxInstanceConfig` and `SandboxInstanceControls`. Everything that belongs
-to that instance is an input or is created by the instance: gateway
-credentials and their renewal, the Sandbox Protocol credential, policy,
-provider credentials and token grants, middleware credentials, OCSF JSON
-settings, proxy trust files, the denial history served by `policy.local`, the
-backend connection, access plane, readiness, and stop signal. Gateway clients
-receive a `GatewayEndpoint`, which pairs the URL with that instance's
-`GatewayCredentials`; nothing is installed process-wide.
+`run_sandbox_instance` supervises one sandbox instance from three inputs.
+`SandboxInstanceConfig` is the single launch configuration: identity, command,
+policy inputs, auth bundle, backend descriptor, and file locations.
+`SandboxInstanceBindings` is the live state its owner prepares once: the
+`GatewayCredentials` issued from the auth bundle, the OCSF context and JSON
+settings, the log sink, and the denial history served by `policy.local`.
+`SandboxInstanceControls` carries the owner's stop signal and readiness.
+Everything else, including credential renewal, policy, provider credentials and
+token grants, middleware credentials, the backend connection, and the access
+plane, is created by the instance. Gateway clients receive a `GatewayEndpoint`,
+which pairs the URL with that instance's `GatewayCredentials`; nothing is
+installed process-wide.
 
-`run_sandbox_with_backend` is the dedicated wrapper. It keeps the existing
-process contract: it sets the process-wide OCSF context, reads launch inputs
-from the environment, binds the readiness socket and port to instance
-readiness, and stops the instance on SIGTERM or SIGINT. The binary shares one
-`GatewayCredentials` between log push and supervision, so renewal by either
-keeps both current.
+The dedicated process wrapper keeps the existing process contract. The binary
+loads the launch configuration from its arguments and environment and prepares
+`SandboxInstanceBindings::dedicated`, sharing one `GatewayCredentials` with log
+push and the OCSF JSON settings with its logging layers, so renewal by either
+gateway client keeps both current. `run_sandbox_with_backend` sets the
+process-wide OCSF context, binds the readiness socket and port to instance
+readiness, and stops the instance on SIGTERM or SIGINT.
 
 `sandbox_instance_host::SandboxInstanceHost` runs several sandbox instances in
 one process. Each instance gets its own Tokio runtime; every thread of that
-runtime, and the thread driving it, is bound to the instance's OCSF context,
-OCSF JSON settings, log sink, and denial log. Spawned tasks, blocking work,
+runtime, and the thread driving it, is bound to the instance's
+`SandboxInstanceBindings`: OCSF context, OCSF JSON settings, log sink, and
+denial log. Spawned tasks, blocking work,
 callbacks, reconnects, and renewal therefore inherit the instance's identity,
 and threads outside an instance carry none and push no logs. The OCSF context
 also supplies the sandbox identity in middleware requests.
