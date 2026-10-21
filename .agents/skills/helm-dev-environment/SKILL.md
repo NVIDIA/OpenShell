@@ -57,15 +57,15 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
-### Experimental supervisor plumbing
+### Shared supervisor plumbing
 
-Set `gatewayConfig.openshell.drivers.kubernetes.experimental_supervisor_topology`
+Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`
 using a values file (the table key is literally `openshell.drivers.kubernetes`):
 
 ```yaml
 gatewayConfig:
   openshell.drivers.kubernetes:
-    experimental_supervisor_topology: gateway
+    supervisor_topology: gateway
 ```
 
 The gateway chart creates a separate, single-replica shared-host placeholder Deployment
