@@ -80,8 +80,15 @@ gateway, supervisor, and sandbox images from the same branch:
 all three must support the routed runtime connection. `workspace` is reserved
 and rejected. Omit the field to disable it. `mise run
 e2e:kubernetes:shared-supervisor` runs the focused e2e
-(`ci/values-supervisor.yaml`); layer a workspace-mode overlay
-through `OPENSHELL_E2E_KUBE_EXTRA_VALUES` to cover managed namespaces.
+(`ci/values-supervisor.yaml`). The task prepends that overlay to any
+colon-separated `OPENSHELL_E2E_KUBE_EXTRA_VALUES` list, so layer a
+workspace-mode overlay to cover managed namespaces:
+
+```bash
+OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-workspace-managed.yaml \
+OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
+  mise run e2e:kubernetes:shared-supervisor
+```
 
 ### 2. Deploy OpenShell
 
