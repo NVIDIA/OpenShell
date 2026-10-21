@@ -53,7 +53,7 @@ impl Context {
         }
     }
 
-    /// Run the environment's `openshell` CLI against the target's gateway.
+    /// Run the `openshell` CLI against the test's gateway and workspace.
     /// A non-zero exit is returned, not raised.
     pub async fn cli<I, S>(&self, args: I) -> Result<CliOutput>
     where
@@ -258,10 +258,11 @@ impl SandboxBuilder {
                         && self.spec.providers.is_empty()
                         && !self.spec.gpu
                         && self.spec.service_exposures.is_empty(),
-                    "testkit creates a sandbox with a policy from its name, command, restart policy, and policy only"
+                    "testkit creates a sandbox with a policy from its name, labels, command, restart policy, and policy only"
                 );
                 let request = proto::CreateSandboxRequest {
                     name: name.clone(),
+                    labels: self.spec.labels,
                     workspace_scope: self.grpc.scope(),
                     spec: Some(proto::SandboxSpec {
                         command: self.spec.command,
