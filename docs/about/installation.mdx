@@ -256,6 +256,7 @@ sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:kvm
+sudo snap connect openshell:docker :docker
 systemctl --user enable --now snap.openshell.user-gateway.service
 ```
 

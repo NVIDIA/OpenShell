@@ -245,6 +245,7 @@ assert_not_contains "$snap_install_docs" "snap connect openshell:home"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:kvm"
+assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
 assert_contains "$snap_install_docs" 'compute_driver = "docker"'
 assert_contains "$snap_install_docs" "systemctl --user enable --now snap.openshell.user-gateway.service"
 assert_contains "$snapcraft" "systemctl --user enable --now snap.openshell.user-gateway.service"

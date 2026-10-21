@@ -1261,12 +1261,6 @@ openshell_snap_channel() {
   esac
 }
 
-connect_snap_kvm() {
-  if ! as_root snap connect openshell:kvm; then
-    warn "could not connect the OpenShell kvm interface; connect it manually with: sudo snap connect openshell:kvm"
-  fi
-}
-
 snap_kvm_device() {
   printf '%s\n' /dev/kvm
 }
@@ -1278,14 +1272,14 @@ check_snap_kvm_access() {
     return 0
   fi
 
-  warn "${TARGET_USER} cannot access /dev/kvm, so the default VM compute driver cannot create sandboxes."
+  warn "${TARGET_USER} cannot access ${_kvm_device}, so the default VM compute driver cannot create sandboxes."
   if [ -e "$_kvm_device" ] && getent group kvm >/dev/null 2>&1; then
     warn "To use the VM driver, run: sudo usermod -aG kvm \"${TARGET_USER}\""
     warn "Then log out and back in so the new group membership takes effect."
   elif [ ! -e "$_kvm_device" ]; then
-    warn "/dev/kvm is unavailable; enable host virtualization before using the VM driver."
+    warn "${_kvm_device} is unavailable; enable host virtualization before using the VM driver."
   else
-    warn "The kvm group is unavailable; grant ${TARGET_USER} read/write access to /dev/kvm before using the VM driver."
+    warn "The kvm group is unavailable; grant ${TARGET_USER} read/write access to ${_kvm_device} before using the VM driver."
   fi
   warn "Alternatively, set compute_driver to another installed driver, such as docker, in the snap gateway TOML configuration."
 }
@@ -1462,8 +1456,6 @@ install_linux_snap() {
     info "installing OpenShell snap from ${_channel}..."
     as_root snap install openshell --channel="$_channel"
   fi
-
-  connect_snap_kvm
 
   _gateway_mode="$(snap_gateway_mode)"
   if [ "$_gateway_mode" = user ]; then

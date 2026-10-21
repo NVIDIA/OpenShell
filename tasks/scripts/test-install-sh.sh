@@ -362,7 +362,6 @@ assert_snap_user_refresh_flow() {
   ) >"$out"
   calls="$(cat "$out")"
   expected="root:snap refresh openshell --channel=latest/stable
-root:snap connect openshell:kvm
 check:kvm-access
 root:systemctl --global disable snap.openshell.user-gateway.service
 target:systemctl --user daemon-reload
@@ -382,7 +381,6 @@ assert_snap_install_flow \
   "fresh snap defaults to VM without Docker" \
   0 "" \
   "root:snap install openshell --channel=latest/stable
-root:snap connect openshell:kvm
 check:kvm-access
 root:systemctl --global disable snap.openshell.user-gateway.service
 target:systemctl --user daemon-reload
@@ -397,7 +395,6 @@ assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
   1 "" \
   "root:snap refresh openshell --channel=latest/stable
-root:snap connect openshell:kvm
 root:snap restart openshell.system-gateway
 wait:system-gateway-listener
 register:system-gateway
