@@ -134,8 +134,9 @@ driver configuration boundary.
 
 `testkit` is the support library for SDK-driven end-to-end suites. Tests are
 `#[testkit::test]` functions with a required doc comment. They find the
-gateway the same way the CLI does, through `OPENSHELL_GATEWAY`,
-`OPENSHELL_GATEWAY_ENDPOINT`, or the active gateway. See
+gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
+`OPENSHELL_GATEWAY`, or the active gateway, and `cx.cli` runs the CLI named
+by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
 
