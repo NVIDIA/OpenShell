@@ -19,7 +19,7 @@ from check_proto_compatibility import git, train_policy
 from codex_compatibility_report import validate_review, write_report
 
 ASSETS = Path(__file__).resolve().parents[2] / ".github" / "prompts"
-MODEL = "openai/openai/gpt-5.6-sol"
+MODEL = "openai/openai/gpt-6.1-sol"
 ENDPOINT = "https://inference-api.nvidia.com/v1"
 
 
