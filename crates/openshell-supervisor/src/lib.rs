@@ -24,7 +24,7 @@ mod denial_aggregator;
 mod endpoint_status;
 mod mechanistic_mapper;
 mod provider_readiness;
-pub mod session_host;
+pub mod sandbox_instance_host;
 pub mod shared_host;
 
 use config_runtime::{agent_proposals_enabled_from_settings, run_policy_poll_loop};
@@ -613,7 +613,7 @@ pub async fn run_network_proxy(
         Arc::new(AtomicU32::new(0)),
         false,
         &provider_credentials,
-        openshell_supervisor_network::run::NetworkSession {
+        openshell_supervisor_network::run::SandboxInstanceNetwork {
             sandbox_name: Some("network-proxy".to_string()),
             proxy_tls,
             ..Default::default()
@@ -755,11 +755,11 @@ pub struct SandboxRunConfig {
     pub main_exit_marker: Option<std::path::PathBuf>,
 }
 
-/// Supervise the one sandbox generation this process was launched for.
+/// Supervise the one sandbox instance this process was launched for.
 ///
 /// The process-wide OCSF context, SIGTERM/SIGINT handling, readiness
 /// endpoints, and the environment-provided launch inputs belong to the
-/// dedicated process; [`run_session`] owns everything else.
+/// dedicated process; [`run_sandbox_instance`] owns everything else.
 ///
 /// Trusted composition chooses the setup before shared admission, policy, and
 /// lifecycle handling. Payload contents never select a backend implementation.
@@ -797,7 +797,7 @@ pub async fn run_sandbox_with_backend(
     // during policy loading (filesystem config, validation) have a context.
     // Proxy IP/port use defaults here; the boundary mediation source carries
     // workload-side connection metadata.
-    if !openshell_ocsf::ctx::set_ctx(session_event_context(
+    if !openshell_ocsf::ctx::set_ctx(sandbox_instance_event_context(
         sandbox_id.as_deref(),
         sandbox.as_deref(),
         std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
@@ -805,16 +805,16 @@ pub async fn run_sandbox_with_backend(
         debug!("OCSF context already initialized, keeping existing");
     }
 
-    let (readiness, session_readiness) = tokio::sync::watch::channel(false);
+    let (readiness, instance_readiness) = tokio::sync::watch::channel(false);
     let control_readiness = health_socket_path
         .map(ReadinessEndpoint::Unix)
         .into_iter()
         .chain(health_port.map(ReadinessEndpoint::Tcp))
-        .map(|endpoint| ControlReadiness::start(endpoint, Some(session_readiness.clone())))
+        .map(|endpoint| ControlReadiness::start(endpoint, Some(instance_readiness.clone())))
         .collect::<Result<Vec<_>>>()?;
-    let result = Box::pin(run_session(
+    let result = Box::pin(run_sandbox_instance(
         backend_setup,
-        SessionConfig {
+        SandboxInstanceConfig {
             command,
             workdir,
             timeout_secs,
@@ -847,7 +847,7 @@ pub async fn run_sandbox_with_backend(
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
             denial_log: openshell_supervisor_network::policy_local::DenialLogSource::default(),
         },
-        SessionControls {
+        SandboxInstanceControls {
             shutdown: Box::pin(wait_for_control_shutdown_signal()),
             readiness,
         },
@@ -859,7 +859,7 @@ pub async fn run_sandbox_with_backend(
 
 /// OCSF identity of one supervised sandbox.
 #[must_use]
-pub fn session_event_context(
+pub fn sandbox_instance_event_context(
     sandbox_id: Option<&str>,
     sandbox: Option<&str>,
     container_image: String,
@@ -903,12 +903,14 @@ impl TraceContext {
     }
 }
 
-/// Trusted inputs owned by one supervised sandbox generation.
+/// Trusted inputs owned by one supervised sandbox instance.
 ///
-/// Nothing in a session reads process-wide sandbox state: identity,
+/// A sandbox instance is one running generation of a stable Sandbox resource;
+/// gateway connections may reconnect within it without creating another.
+/// Nothing in an instance reads process-wide sandbox state: identity,
 /// credentials, policy inputs, logging settings, and file locations all come
-/// from here, so one process can host several sessions.
-pub struct SessionConfig {
+/// from here, so one process can host several instances.
+pub struct SandboxInstanceConfig {
     pub command: Vec<String>,
     pub workdir: Option<String>,
     pub timeout_secs: u64,
@@ -922,7 +924,7 @@ pub struct SessionConfig {
     pub ssh_socket_path: Option<String>,
     /// Grant the SSH socket to the supervisor's group rather than its owner.
     pub shared_ssh_socket: bool,
-    /// OCSF JSON output settings this session's gateway configuration controls.
+    /// OCSF JSON output settings this instance's gateway configuration controls.
     pub ocsf_json: openshell_ocsf::OcsfJsonSettings,
     pub upstream_proxy_args: openshell_supervisor_network::upstream_proxy::UpstreamProxyArgs,
     pub additional_ca_bundle: Option<String>,
@@ -941,24 +943,24 @@ pub struct SessionConfig {
     pub denial_log: openshell_supervisor_network::policy_local::DenialLogSource,
 }
 
-/// How the owner of a session stops it and observes its readiness.
-pub struct SessionControls {
-    /// Completes when the owner asks the session to stop its workload. It is
+/// How the owner of a sandbox instance stops it and observes its readiness.
+pub struct SandboxInstanceControls {
+    /// Completes when the owner asks the instance to stop its workload. It is
     /// first polled once the workload has started.
     pub shutdown: Pin<Box<dyn Future<Output = ()> + Send>>,
-    /// True while the gateway has accepted this session's supervision and its
+    /// True while the gateway has accepted this instance's supervision and its
     /// access plane is retained; false otherwise.
     pub readiness: tokio::sync::watch::Sender<bool>,
 }
 
 /// Mirrors gateway session acceptance into the owner's readiness until the
 /// access plane is released.
-struct SessionReadiness {
+struct SandboxInstanceReadiness {
     readiness: tokio::sync::watch::Sender<bool>,
     forward: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl SessionReadiness {
+impl SandboxInstanceReadiness {
     fn start(
         readiness: tokio::sync::watch::Sender<bool>,
         accepted: Option<tokio::sync::watch::Receiver<bool>>,
@@ -995,24 +997,24 @@ impl SessionReadiness {
     }
 }
 
-impl Drop for SessionReadiness {
+impl Drop for SandboxInstanceReadiness {
     fn drop(&mut self) {
         self.release();
     }
 }
 
-/// Supervise one sandbox generation until its workload exits or the owner
+/// Supervise one sandbox instance until its workload exits or the owner
 /// stops it.
 ///
 /// Trusted composition chooses the setup before shared admission, policy, and
 /// lifecycle handling. Payload contents never select a backend implementation.
 #[allow(clippy::similar_names)]
-pub async fn run_session(
+pub async fn run_sandbox_instance(
     backend_setup: &dyn backend_setup::BackendSetup,
-    config: SessionConfig,
-    controls: SessionControls,
+    config: SandboxInstanceConfig,
+    controls: SandboxInstanceControls,
 ) -> Result<i32> {
-    let SessionConfig {
+    let SandboxInstanceConfig {
         command,
         workdir,
         timeout_secs,
@@ -1038,7 +1040,7 @@ pub async fn run_session(
         proxy_tls,
         denial_log,
     } = config;
-    let SessionControls {
+    let SandboxInstanceControls {
         shutdown: shutdown_requested,
         readiness,
     } = controls;
@@ -1057,7 +1059,7 @@ pub async fn run_session(
         |(program, args)| (program.clone(), args.to_vec()),
     );
 
-    // Extension credentials are owned by this supervisor session and shared
+    // Extension credentials are owned by this sandbox instance and shared
     // by every gateway connection it opens, so the middleware registry's
     // bearer slots and the policy poll loop that rotates them stay the same
     // objects.
@@ -1077,7 +1079,7 @@ pub async fn run_session(
     let sandbox_bearer = gateway_credentials.sandbox_bearer().ok_or_else(|| {
         miette::miette!("supervisor gateway credentials carry no Sandbox Protocol credential")
     })?;
-    // Every gateway client of this session uses its own credentials.
+    // Every gateway client of this instance uses its own credentials.
     let gateway = openshell_endpoint.as_deref().map(|endpoint| {
         openshell_core::grpc_client::GatewayEndpoint::new(endpoint, gateway_credentials.clone())
     });
@@ -1367,7 +1369,7 @@ pub async fn run_session(
             // unnecessarily delay DNS and network readiness.
             false,
             &provider_credentials,
-            openshell_supervisor_network::run::NetworkSession {
+            openshell_supervisor_network::run::SandboxInstanceNetwork {
                 sandbox_id: sandbox_id.clone(),
                 sandbox_name: sandbox_name_for_agg.clone(),
                 gateway: gateway.clone(),
@@ -1619,8 +1621,8 @@ pub async fn run_session(
                     running.exec(),
                 )
             });
-        let mut session_readiness =
-            SessionReadiness::start(readiness, boundary_access.session_readiness());
+        let mut instance_readiness =
+            SandboxInstanceReadiness::start(readiness, boundary_access.session_readiness());
         let instance_id = boundary_access.instance_id().to_string();
         let wait_agent = agent.clone();
         let mut shutdown_requested = shutdown_requested;
@@ -1673,7 +1675,7 @@ pub async fn run_session(
             }
         };
         if !retain_access {
-            session_readiness.release();
+            instance_readiness.release();
         }
         boundary_access
             .publish_main_exit(exit_code, await_main_process_attachment)
@@ -1716,13 +1718,13 @@ pub async fn run_session(
         }
         if completion_cancelled {
             retain_access = false;
-            session_readiness.release();
+            instance_readiness.release();
         }
         if retain_access {
             info!(backend = %backend_name, "Canonical process exited; retaining control-mode access plane");
             retain_remote_access_plane(&mut proxy_exited, &mut shutdown_requested).await?;
         }
-        drop(session_readiness);
+        drop(instance_readiness);
         drop(running);
         drop(boundary_access);
         exit_code

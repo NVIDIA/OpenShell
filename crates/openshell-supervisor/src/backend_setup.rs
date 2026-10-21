@@ -242,11 +242,12 @@ impl BackendSetup for OpenShellBackendSetup {
     }
 }
 
-/// The built-in Sandbox Protocol for one session of a shared supervisor.
+/// The built-in Sandbox Protocol for one sandbox instance of a shared
+/// supervisor.
 ///
 /// The descriptor must use the routed transport for exactly `route`;
 /// decoding claims that route on the shared listener for as long as the
-/// session's backend exists.
+/// instance's backend exists.
 pub struct RoutedBackendSetup {
     router: Arc<openshell_sandbox_backend::runtime_routed::RuntimeRouter>,
     route: String,

@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Process-wide and session-bound [`EventContext`].
+//! Process-wide and sandbox-instance-bound [`EventContext`].
 //!
 //! A dedicated supervisor initialises the process-wide context once via
-//! [`set_ctx`]. A process hosting several supervisor sessions instead binds
-//! each session's context to the threads of that session's runtime with
+//! [`set_ctx`]. A process hosting several sandbox instances instead binds
+//! each instance's context to the threads of that instance's runtime with
 //! [`bind_thread_ctx`]; a bound context takes precedence. [`ctx`] falls back
 //! to a default context when neither is set (e.g. unit tests that exercise
 //! builders without booting the sandbox).
@@ -28,7 +28,7 @@ static OCSF_CTX_FALLBACK: LazyLock<EventContext> = LazyLock::new(|| EventContext
 });
 
 std::thread_local! {
-    /// Context of the hosted session whose runtime owns this thread.
+    /// Context of the hosted sandbox instance whose runtime owns this thread.
     static THREAD_CTX: RefCell<Option<Arc<EventContext>>> = const { RefCell::new(None) };
 }
 
@@ -40,16 +40,17 @@ pub fn set_ctx(ctx: EventContext) -> bool {
     OCSF_CTX.set(ctx).is_ok()
 }
 
-/// Attribute events emitted on the calling thread to one hosted session.
+/// Attribute events emitted on the calling thread to one hosted sandbox
+/// instance.
 ///
-/// Session runtimes bind every thread they start; `None` unbinds it.
+/// Instance runtimes bind every thread they start; `None` unbinds it.
 pub fn bind_thread_ctx(ctx: Option<Arc<EventContext>>) {
     THREAD_CTX.with(|current| *current.borrow_mut() = ctx);
 }
 
 /// Return the context for events emitted on the calling thread.
 ///
-/// A session-bound context wins over the process-wide one. Falls back to a
+/// An instance-bound context wins over the process-wide one. Falls back to a
 /// default context if neither is set.
 #[must_use]
 pub fn ctx() -> ContextRef<'static> {

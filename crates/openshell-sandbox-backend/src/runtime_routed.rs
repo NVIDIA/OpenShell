@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! One supervisor listener for many sessions' runtime-initiated connections.
+//! One supervisor listener for many sandbox instances' runtime-initiated
+//! connections.
 //!
 //! A runtime that dials a shared supervisor first sends a fixed, bounded
 //! routing preface naming an opaque route handle. The handle is only a hint:
-//! it selects which session's generation-pinned TLS identity the supervisor
-//! expects, and the supervisor then completes the same pinned TLS client
-//! handshake as for a dedicated listener. A peer that names another session's
-//! handle cannot present that session's TLS identity, so it is rejected before
-//! any request is carried. Every Sandbox Protocol request still carries the
-//! session's bearer token. Unknown, removed, and replaced handles are closed
-//! without a handshake, and authenticated connections only fill the target
-//! session's bounded spare queue, so no peer can displace a live channel.
+//! it selects which sandbox instance's generation-pinned TLS identity the
+//! supervisor expects, and the supervisor then completes the same pinned TLS
+//! client handshake as for a dedicated listener. A peer that names another
+//! instance's handle cannot present that instance's TLS identity, so it is
+//! rejected before any request is carried. Every Sandbox Protocol request
+//! still carries the instance's session bearer token. Unknown, removed, and
+//! replaced handles are closed without a handshake, and authenticated
+//! connections only fill the target instance's bounded spare queue, so no
+//! peer can displace a live channel.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -34,14 +36,15 @@ pub const ROUTE_PREFACE_VERSION: u8 = 1;
 pub const MAX_ROUTE_HANDLE_LEN: usize = 64;
 const MIN_ROUTE_HANDLE_LEN: usize = 16;
 
-/// Unauthenticated sockets the listener handshakes at once, across sessions.
+/// Unauthenticated sockets the listener handshakes at once, across sandbox
+/// instances.
 const MAX_PENDING_HANDSHAKES: usize = 64;
 /// Unauthenticated sockets naming one handle; one handle cannot exhaust the
-/// listener for every other session.
+/// listener for every other sandbox instance.
 const MAX_PENDING_HANDSHAKES_PER_ROUTE: usize = 4;
 /// Bound on reading the preface and completing TLS for one socket.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Authenticated connections queued for a session but not yet claimed.
+/// Authenticated connections queued for a sandbox instance but not yet claimed.
 const MAX_QUEUED_CONNECTIONS: usize = 2;
 
 /// Validate an opaque route handle: 16 to 64 lowercase ASCII letters, digits,
@@ -116,7 +119,8 @@ struct Routes {
     by_handle: HashMap<String, Route>,
 }
 
-/// Shared listener that routes runtime connections to registered sessions.
+/// Shared listener that routes runtime connections to registered sandbox
+/// instances.
 pub struct RuntimeRouter {
     routes: Arc<Mutex<Routes>>,
     local_addr: SocketAddr,
@@ -163,7 +167,7 @@ impl RuntimeRouter {
     }
 
     /// Accept connections for `handle`, authenticated with `tls`. A handle
-    /// that is already registered is refused; the existing session keeps it.
+    /// that is already registered is refused; the existing instance keeps it.
     pub fn register(
         &self,
         handle: &str,
@@ -206,7 +210,7 @@ impl Drop for RuntimeRouter {
     }
 }
 
-/// One session's claim on a route handle. Dropping it unregisters the handle
+/// One sandbox instance's claim on a route handle. Dropping it unregisters the handle
 /// and closes connections queued for it.
 pub struct RouteRegistration {
     routes: std::sync::Weak<Mutex<Routes>>,
@@ -233,14 +237,15 @@ impl RouteRegistration {
         &self.handle
     }
 
-    /// Wait for one authenticated connection for `descriptor`'s session.
+    /// Wait for one authenticated connection for `descriptor`'s sandbox
+    /// instance.
     pub(crate) async fn accept(
         &self,
         tls: &SandboxTlsClientConfig,
     ) -> Result<BoundaryDuplexStream, BackendError> {
         if *tls != self.tls {
             return Err(BackendError::Descriptor(
-                "runtime route is registered for a different sandbox session".to_string(),
+                "runtime route is registered for a different sandbox instance".to_string(),
             ));
         }
         let stream = self
@@ -254,7 +259,7 @@ impl RouteRegistration {
         Ok(stream)
     }
 
-    /// Whether the runtime has connected for this session before.
+    /// Whether the runtime has connected for this sandbox instance before.
     pub(crate) fn has_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
@@ -421,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn routes_only_authenticated_runtimes_to_their_own_live_session() {
+    async fn routes_only_authenticated_runtimes_to_their_own_live_instance() {
         let router = RuntimeRouter::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let address = router.local_addr();
         let alpha = generate_sandbox_tls_material(openshell_core::SandboxSessionId::new()).unwrap();
@@ -434,7 +439,7 @@ mod tests {
             "a live route cannot be claimed again"
         );
 
-        // A runtime holding the named session's identity is delivered to it.
+        // A runtime holding the named instance's identity is delivered to it.
         let alpha_tls = client_tls(&alpha);
         let (runtime, accepted) = tokio::join!(
             runtime_dial(address, &alpha_route, &alpha),
@@ -442,8 +447,8 @@ mod tests {
         );
         assert!(runtime.is_ok() && accepted.is_ok());
 
-        // Naming another session without its identity fails TLS, and
-        // nothing reaches either session.
+        // Naming another instance without its identity fails TLS, and
+        // nothing reaches either instance.
         assert!(runtime_dial(address, &beta_route, &alpha).await.is_err());
         assert!(!delivered(&beta_registration, &client_tls(&beta)).await);
         assert!(!delivered(&alpha_registration, &client_tls(&alpha)).await);
@@ -457,7 +462,7 @@ mod tests {
         drop(alpha_registration);
         assert!(runtime_dial(address, &alpha_route, &alpha).await.is_err());
 
-        // The other session is unaffected and keeps accepting its runtime.
+        // The other instance is unaffected and keeps accepting its runtime.
         let beta_tls = client_tls(&beta);
         let (runtime, accepted) = tokio::join!(
             runtime_dial(address, &beta_route, &beta),

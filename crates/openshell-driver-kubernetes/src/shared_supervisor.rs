@@ -13,7 +13,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use kube::core::DynamicObject;
 use openshell_sandbox_backend::session_control::{
-    SESSION_REMOVAL_TIMEOUT, SESSIONS_PATH, SessionList, SessionRegistration, SessionStatusReport,
+    INSTANCE_REMOVAL_TIMEOUT, SESSIONS_PATH, SandboxInstanceList, SandboxInstanceRegistration,
+    SandboxInstanceStatusReport,
 };
 
 use crate::config::SharedSupervisorConfig;
@@ -22,13 +23,14 @@ use crate::driver::KubernetesDriverError;
 /// Supervisor placement of the current generation; absent means a dedicated
 /// supervisor Pod.
 pub const ANNOTATION_SUPERVISOR_TOPOLOGY: &str = "openshell.ai/sandbox-runtime-supervisor-topology";
-/// Route of a generation's session on the shared supervisor.
+/// Route of a generation's sandbox instance on the shared supervisor. The
+/// annotation key keeps its established `-session` name.
 pub const ANNOTATION_SUPERVISOR_SESSION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 pub const GATEWAY_TOPOLOGY: &str = "gateway";
 
 /// Bound on one session-control request, including connection and TLS.
-/// Removals wait for the session's workload to stop and use the contract's
-/// longer bound instead.
+/// Removals wait for the sandbox instance's workload to stop and use the
+/// contract's longer bound instead.
 const SESSION_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where a generation's supervisor runs, as recorded when it started.
@@ -36,7 +38,7 @@ const SESSION_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum SupervisorPlacement {
     /// A supervisor Pod paired with this generation's workload Pod.
     Dedicated,
-    /// A session on the gateway's shared supervisor.
+    /// A sandbox instance on the gateway's shared supervisor.
     Shared { route: String },
 }
 
@@ -55,7 +57,8 @@ pub fn supervisor_placement(
                 })
                 .ok_or_else(|| {
                     KubernetesDriverError::Precondition(
-                        "shared supervisor generation has no valid session route".to_string(),
+                        "shared supervisor generation has no valid sandbox instance route"
+                            .to_string(),
                     )
                 })?;
             Ok(SupervisorPlacement::Shared {
@@ -87,10 +90,10 @@ impl SharedSupervisor {
     /// Register a generation; an identical registration is accepted again.
     pub async fn register(
         &self,
-        registration: &SessionRegistration,
-    ) -> Result<SessionStatusReport, KubernetesDriverError> {
+        registration: &SandboxInstanceRegistration,
+    ) -> Result<SandboxInstanceStatusReport, KubernetesDriverError> {
         let body = serde_json::to_vec(registration).map_err(|error| {
-            KubernetesDriverError::Message(format!("encode session registration: {error}"))
+            KubernetesDriverError::Message(format!("encode sandbox instance registration: {error}"))
         })?;
         let (status, body) = self
             .request(
@@ -105,26 +108,27 @@ impl SharedSupervisor {
                 "shared supervisor already hosts this route with different launch material"
                     .to_string(),
             )),
-            status => Err(rejected("register session", status, &body)),
+            status => Err(rejected("register sandbox instance", status, &body)),
         }
     }
 
-    /// Status of one session, or `None` when it is not registered.
+    /// Status of one sandbox instance, or `None` when it is not registered.
     pub async fn status(
         &self,
         route: &str,
-    ) -> Result<Option<SessionStatusReport>, KubernetesDriverError> {
+    ) -> Result<Option<SandboxInstanceStatusReport>, KubernetesDriverError> {
         let (status, body) = self
             .request(http::Method::GET, &format!("{SESSIONS_PATH}/{route}"), None)
             .await?;
         match status {
             http::StatusCode::OK => decode(&body).map(Some),
             http::StatusCode::NOT_FOUND => Ok(None),
-            status => Err(rejected("read session status", status, &body)),
+            status => Err(rejected("read sandbox instance status", status, &body)),
         }
     }
 
-    /// Stop and forget one session. A missing session is already removed.
+    /// Stop and forget one sandbox instance. A missing instance is already
+    /// removed.
     pub async fn remove(&self, route: &str) -> Result<(), KubernetesDriverError> {
         let (status, body) = self
             .request(
@@ -135,16 +139,16 @@ impl SharedSupervisor {
             .await?;
         match status {
             http::StatusCode::OK | http::StatusCode::NOT_FOUND => Ok(()),
-            status => Err(rejected("remove session", status, &body)),
+            status => Err(rejected("remove sandbox instance", status, &body)),
         }
     }
 
-    /// Every session the shared supervisor hosts.
-    pub async fn list(&self) -> Result<SessionList, KubernetesDriverError> {
+    /// Every sandbox instance the shared supervisor hosts.
+    pub async fn list(&self) -> Result<SandboxInstanceList, KubernetesDriverError> {
         let (status, body) = self.request(http::Method::GET, SESSIONS_PATH, None).await?;
         match status {
             http::StatusCode::OK => decode(&body),
-            status => Err(rejected("list sessions", status, &body)),
+            status => Err(rejected("list sandbox instances", status, &body)),
         }
     }
 
@@ -155,7 +159,7 @@ impl SharedSupervisor {
         body: Option<Vec<u8>>,
     ) -> Result<(http::StatusCode, Bytes), KubernetesDriverError> {
         let deadline = if method == http::Method::DELETE {
-            SESSION_REMOVAL_TIMEOUT
+            INSTANCE_REMOVAL_TIMEOUT
         } else {
             SESSION_CONTROL_TIMEOUT
         };

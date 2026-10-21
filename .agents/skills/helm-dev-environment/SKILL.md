@@ -71,8 +71,8 @@ gatewayConfig:
 The gateway chart creates a single-replica shared supervisor Deployment,
 Service, and NetworkPolicy in the release namespace, regardless of
 shared/managed/operator workspace mode, and the certgen hook issues its
-session-control Secrets. New sandbox generations run as sessions in that
-process. Its process-health `tcpSocket` probes connect to the mTLS
+session-control Secrets. New sandbox generations run as sandbox instances in
+that process. Its process-health `tcpSocket` probes connect to the mTLS
 session-control port (5501); there is no separate health port. The chart starts
 `--mode=shared`, sets `--gateway-endpoint` to the gateway gRPC URL, and binds
 `--address` to this control/probe listener. Build the

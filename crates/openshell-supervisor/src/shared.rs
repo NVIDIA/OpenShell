@@ -28,7 +28,8 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let runtime_listen = args
         .runtime_listen
         .ok_or_else(|| miette::miette!("--runtime-listen is required for --mode=shared"))?;
-    let session_root = args
+    // `--session-root` keeps its established flag name.
+    let instance_root = args
         .session_root
         .ok_or_else(|| miette::miette!("--session-root is required for --mode=shared"))?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -39,7 +40,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
         openshell_crypto::tls::ensure_default_provider();
         let console_filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
-        // Process-wide OCSF JSON output stays off; each session's own
+        // Process-wide OCSF JSON output stays off; each sandbox instance's own
         // settings apply to the events its threads emit.
         let (logging_layers, _logging_guards, _) = crate::logging::layers(
             std::io::stderr(),
@@ -53,7 +54,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
             .with(openshell_supervisor_process::log_push::LogPushLayer::thread_bound())
             .with(
                 openshell_ocsf::OcsfShorthandLayer::new(
-                    openshell_supervisor::session_host::SessionDenialWriter,
+                    openshell_supervisor::sandbox_instance_host::SandboxInstanceDenialWriter,
                 )
                 .with_non_ocsf(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
@@ -83,9 +84,9 @@ fn run_platform(args: crate::Args) -> Result<()> {
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {
                 gateway_endpoint,
-                session_root,
+                instance_root,
                 runtime_listen,
-                removal_grace: openshell_sandbox_backend::session_control::SESSION_REMOVAL_GRACE,
+                removal_grace: openshell_sandbox_backend::session_control::INSTANCE_REMOVAL_GRACE,
             },
         )?;
         let control = tokio::net::TcpListener::bind(address)
@@ -95,7 +96,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
         tracing::info!(
             runtime = %host.runtime_addr(),
             control = %address,
-            "Shared supervisor ready for sessions"
+            "Shared supervisor ready for sandbox instances"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);
         let serve = tokio::spawn(openshell_supervisor::shared_host::serve_session_control(

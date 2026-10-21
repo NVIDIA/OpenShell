@@ -35,13 +35,14 @@ impl LogSink {
 }
 
 std::thread_local! {
-    /// Sink of the hosted session whose runtime owns this thread.
+    /// Sink of the hosted sandbox instance whose runtime owns this thread.
     static THREAD_SINK: RefCell<Option<LogSink>> = const { RefCell::new(None) };
 }
 
-/// Route events emitted on the calling thread to a hosted session's sink.
+/// Route events emitted on the calling thread to a hosted sandbox instance's
+/// sink.
 ///
-/// Hosted sessions bind every thread of their runtime. Unbound threads push
+/// Hosted instances bind every thread of their runtime. Unbound threads push
 /// nothing, so an event cannot reach another sandbox's log stream.
 pub fn bind_thread_sink(sink: Option<LogSink>) {
     THREAD_SINK.with(|current| *current.borrow_mut() = sink);
@@ -51,7 +52,7 @@ pub fn bind_thread_sink(sink: Option<LogSink>) {
 enum Route {
     /// The process supervises one sandbox; every event belongs to it.
     Fixed(LogSink),
-    /// Events belong to the session bound to the emitting thread, if any.
+    /// Events belong to the sandbox instance bound to the emitting thread, if any.
     ThreadBound,
 }
 

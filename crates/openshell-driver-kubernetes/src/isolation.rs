@@ -290,8 +290,8 @@ pub fn runtime_control_policy(namespace: &str, name: &str, pair: &str, port: u16
 /// It selects only this pair's workload Pod and admits one egress flow, to the
 /// shared supervisor Pods in their namespace on the runtime port. The
 /// namespace fence keeps denying every other workload connection. Which
-/// session a connection reaches is decided by its routing preface and pinned
-/// TLS identity, not by this policy.
+/// sandbox instance a connection reaches is decided by its routing preface
+/// and pinned TLS identity, not by this policy.
 #[must_use]
 pub fn shared_runtime_control_policy(
     namespace: &str,
@@ -343,8 +343,8 @@ pub fn shared_runtime_control_policy(
 pub enum KubernetesSupervisorClaim {
     /// UID of the generation's dedicated supervisor Pod.
     Pod(String),
-    /// Route of the generation's session on the shared supervisor.
-    Session(String),
+    /// Route of the generation's sandbox instance on the shared supervisor.
+    SandboxInstance(String),
 }
 
 /// Which side opens the Sandbox Protocol connection, with the verified
@@ -434,7 +434,8 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 KubernetesSupervisorClaim::Pod(uid) => {
                     ("kubernetes.supervisor_pod_uid".to_string(), uid)
                 }
-                KubernetesSupervisorClaim::Session(route) => {
+                // The claim key keeps its established `supervisor_session` name.
+                KubernetesSupervisorClaim::SandboxInstance(route) => {
                     ("kubernetes.supervisor_session".to_string(), route)
                 }
             },

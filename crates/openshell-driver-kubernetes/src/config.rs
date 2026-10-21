@@ -525,8 +525,9 @@ impl KubernetesComputeConfig {
         self.validate_allowed_pod_labels()
     }
 
-    /// The shared supervisor serves only sessions it can isolate: it holds no
-    /// per-sandbox workload identity, upstream proxy credential, or proxy CA.
+    /// The shared supervisor serves only sandbox instances it can isolate: it
+    /// holds no per-sandbox workload identity, upstream proxy credential, or
+    /// proxy CA.
     pub fn validate_supervisor_topology(&self) -> Result<(), String> {
         match self.supervisor_topology {
             None => {

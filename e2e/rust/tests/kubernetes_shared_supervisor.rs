@@ -8,7 +8,7 @@
 //!
 //! Each sandbox keeps its own policy and provider credential, stopping one
 //! leaves the other supervised, and the shared runtime listener refuses
-//! connections that name a stale or unknown session route.
+//! connections that name a stale or unknown sandbox instance route.
 
 use std::fmt::Write as _;
 use std::io::Write as _;
@@ -27,7 +27,8 @@ const ALPHA: &str = "e2e-shared-alpha";
 const BETA: &str = "e2e-shared-beta";
 const TOKEN_ENV: &str = "E2E_SHARED_SUPERVISOR_TOKEN";
 const TOPOLOGY_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-topology";
-const SESSION_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
+/// Instance route annotation; the key keeps its established `-session` name.
+const INSTANCE_ROUTE_ANNOTATION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 const SUPERVISOR_COMPONENT: &str = "app.kubernetes.io/component=supervisor";
 const RUNTIME_PORT: u16 = 5500;
 
@@ -99,18 +100,18 @@ async fn sandbox_resource(name: &str) -> serde_json::Value {
     resource.clone()
 }
 
-/// The shared-supervisor session route recorded for a sandbox's current
-/// generation.
-async fn session_route(name: &str) -> String {
+/// The shared-supervisor sandbox instance route recorded for a sandbox's
+/// current generation.
+async fn instance_route(name: &str) -> String {
     let resource = sandbox_resource(name).await;
     let annotations = &resource["metadata"]["annotations"];
     assert_eq!(
         annotations[TOPOLOGY_ANNOTATION], "gateway",
         "{name} is not supervised by the shared supervisor: {annotations}"
     );
-    annotations[SESSION_ANNOTATION]
+    annotations[INSTANCE_ROUTE_ANNOTATION]
         .as_str()
-        .unwrap_or_else(|| panic!("{name} has no session route: {annotations}"))
+        .unwrap_or_else(|| panic!("{name} has no sandbox instance route: {annotations}"))
         .to_string()
 }
 
@@ -594,7 +595,7 @@ const TLS_HANDSHAKE_RECORD: u8 = 0x16;
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
+async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_instances() {
     let nonce = format!("{:08x}", rand::random::<u32>());
     let (alpha_secret, beta_secret) = (format!("alpha-{nonce}"), format!("beta-{nonce}"));
     let alpha_endpoint = CredentialEndpoint::start(&alpha_secret, &beta_secret).await;
@@ -629,14 +630,15 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
     let mut alpha = alpha.expect("create alpha sandbox");
     let mut beta = beta.expect("create beta sandbox");
 
-    // Both generations are sessions on the one shared supervisor process.
-    let alpha_route = session_route(&alpha.name).await;
-    let beta_route = session_route(&beta.name).await;
+    // Both generations are sandbox instances on the one shared supervisor
+    // process.
+    let alpha_route = instance_route(&alpha.name).await;
+    let beta_route = instance_route(&beta.name).await;
     assert_ne!(alpha_route, beta_route);
     assert_no_dedicated_supervisors().await;
     assert_eq!(shared_supervisor_pod().await.0, supervisor_uid);
 
-    // Each session injects only its own credential and enforces only its own
+    // Each instance injects only its own credential and enforces only its own
     // policy, including the endpoint its own provider contributes.
     assert_eq!(call(&alpha, alpha_endpoint.port).await, "SAW_ALPHA");
     assert_eq!(call(&beta, beta_endpoint.port).await, "SAW_BETA");
@@ -651,13 +653,13 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
     assert_eq!(beta_endpoint.seen(), [Seen::Beta]);
     assert_eq!(plain_endpoint.seen(), [Seen::Other]);
 
-    // Stopping alpha removes only its session.
+    // Stopping alpha removes only its sandbox instance.
     let (stopped, output) = cli(&["sandbox", "stop", &alpha.name]).await;
     assert!(stopped, "sandbox stop failed:\n{output}");
     assert_eq!(call(&beta, beta_endpoint.port).await, "SAW_BETA");
 
-    // A peer naming a live route must present that session's pinned TLS
-    // identity, and failing to does not displace the session. Stale and
+    // A peer naming a live route must present that instance's pinned TLS
+    // identity, and failing to does not displace the instance. Stale and
     // unknown routes are refused before any handshake.
     let mut listener = RuntimeListener::forward().await;
     for _ in 0..3 {
@@ -665,23 +667,23 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
             RouteAnswer::Challenged(answer) => assert_eq!(
                 answer.first(),
                 Some(&TLS_HANDSHAKE_RECORD),
-                "a live route should start the session's pinned TLS handshake"
+                "a live route should start the instance's pinned TLS handshake"
             ),
             RouteAnswer::Refused => {
-                panic!("a live route should demand the session's pinned TLS identity")
+                panic!("a live route should demand the instance's pinned TLS identity")
             }
         }
     }
     assert_eq!(
         listener.probe(&alpha_route, &[]).await,
         RouteAnswer::Refused,
-        "stale route reached a session"
+        "stale route reached a sandbox instance"
     );
     let unknown = format!("rt-{:032x}", rand::random::<u128>());
     assert_eq!(
         listener.probe(&unknown, &[]).await,
         RouteAnswer::Refused,
-        "unknown route reached a session"
+        "unknown route reached a sandbox instance"
     );
     assert!(matches!(
         listener.probe(&beta_route, TLS_HANDSHAKE_FAILURE).await,
@@ -691,10 +693,10 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
     drop(listener);
     assert_eq!(call(&beta, beta_endpoint.port).await, "SAW_BETA");
 
-    // Restarting alpha registers a fresh session on the same process.
+    // Restarting alpha registers a fresh sandbox instance on the same process.
     let (started, output) = cli(&["sandbox", "start", &alpha.name]).await;
     assert!(started, "sandbox start failed:\n{output}");
-    let restarted_route = session_route(&alpha.name).await;
+    let restarted_route = instance_route(&alpha.name).await;
     assert_ne!(restarted_route, alpha_route);
     let restarted_call = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
@@ -717,7 +719,7 @@ async fn one_supervisor_isolates_and_outlives_concurrent_sandbox_sessions() {
     assert_eq!(
         listener.probe(&alpha_route, &[]).await,
         RouteAnswer::Refused,
-        "the replaced route reached a session"
+        "the replaced route reached a sandbox instance"
     );
     assert!(matches!(
         listener

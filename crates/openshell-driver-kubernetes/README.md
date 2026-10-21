@@ -182,40 +182,41 @@ still enforced by TLS, JWT claims, session generation, and recorded Pod UIDs.
 ### Shared supervisor topology
 
 With `supervisor_topology = "gateway"`, each new runtime
-generation becomes a session on one supervisor process that Helm deploys in the
-gateway namespace, instead of a supervisor Pod and boundary Service of its own.
-The generation's placement is recorded on the Sandbox resource
-(`openshell.ai/sandbox-runtime-supervisor-topology: gateway` and the session
-route in `openshell.ai/sandbox-runtime-supervisor-session`) when the generation
-starts. Every later lifecycle decision reads the record, so changing the setting
+generation becomes a sandbox instance on one supervisor process that Helm
+deploys in the gateway namespace, instead of a supervisor Pod and boundary
+Service of its own. A sandbox instance is one running generation of a stable
+Sandbox resource. The generation's placement is recorded on the Sandbox
+resource (`openshell.ai/sandbox-runtime-supervisor-topology: gateway` and the
+instance route in `openshell.ai/sandbox-runtime-supervisor-session`, whose key
+keeps its established name) when the generation starts. Every later lifecycle decision reads the record, so changing the setting
 never reinterprets a running generation, and an unknown or incomplete record
 fails closed.
 
 - **Create and start.** The driver creates a per-sandbox egress allowance
   `os-shared-control-<id>` from the workload Pod to the Pods the shared
   supervisor's Service selects, on the runtime port, binds its UID and
-  resourceVersion into the boundary evidence, and registers the session over
-  session control before releasing the workload Pod. Registration does not wait
-  for the runtime, so create still returns before the gateway persists the
-  generation. The runtime identity's last component is the session route, which
-  no Pod UID can equal, so `authenticate_sandbox` cannot vouch for a shared
+  resourceVersion into the boundary evidence, and registers the sandbox
+  instance over session control before releasing the workload Pod.
+  Registration does not wait for the runtime, so create still returns before
+  the gateway persists the generation. The runtime identity's last component is
+  the instance route, which no Pod UID can equal, so `authenticate_sandbox` cannot vouch for a shared
   generation.
-- **Readiness.** A shared generation is available while its session is
-  registered for the sandbox and accepted by the gateway and its fence and
-  egress allowance exist. A missing or ended session is unavailable, and
+- **Readiness.** A shared generation is available while its sandbox instance
+  is registered for the sandbox and accepted by the gateway and its fence and
+  egress allowance exist. A missing or ended instance is unavailable, and
   reconciliation suspends the workload; an unreachable supervisor is unknown.
-- **Stop and delete.** The driver removes the session before suspending or
-  deleting the workload. Removal is best effort because ending the workload ends
-  supervision anyway. Reconciliation removes sessions that no Sandbox's current
-  generation may run; it lists sessions before Sandboxes, because a generation
-  records its route before registering it.
-- **Isolation.** The admission credential is separate from every session's
+- **Stop and delete.** The driver removes the sandbox instance before
+  suspending or deleting the workload. Removal is best effort because ending the
+  workload ends supervision anyway. Reconciliation removes instances that no
+  Sandbox's current generation may run; it lists instances before Sandboxes,
+  because a generation records its route before registering it.
+- **Isolation.** The admission credential is separate from every instance's
   credentials. Sandboxes cannot reach session control, and the routing preface
   only selects which generation-pinned TLS identity the supervisor demands.
 
 The topology does not support upstream proxies or provider SPIFFE identity, and
 the shared supervisor is a single point of failure for the sandboxes it hosts.
-Shared sessions export no supervisor OTLP traces or OCSF events; the driver
+Shared sandbox instances export no supervisor OTLP traces or OCSF events; the driver
 warns at startup when the gateway configures that export.
 When the setting is removed, reconciliation suspends shared generations, and a
 restart creates the dedicated generation's boundary Service the shared one never

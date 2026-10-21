@@ -50,9 +50,9 @@ const ATTACH_REQUEST_TIMEOUT: Duration = Duration::from_mins(5);
 /// callers retry whole calls above this; past boot, exhausting this window
 /// means the remote boundary (or its launcher) is gone rather than still starting.
 const CONNECT_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bound on a routed session's first connection. The session is registered
-/// before its workload Pod is scheduled and its image pulled; the driver
-/// reaps a bootstrap that is still incomplete after the same interval.
+/// Bound on a routed sandbox instance's first connection. The instance is
+/// registered before its workload Pod is scheduled and its image pulled; the
+/// driver reaps a bootstrap that is still incomplete after the same interval.
 const ROUTED_FIRST_CONNECT_TIMEOUT: Duration = Duration::from_mins(5);
 /// Bounds the liveness check that decides whether a stream failure lost the
 /// whole connection.
@@ -100,7 +100,7 @@ enum TransportSource {
     Connector(Arc<dyn BoundaryTransportConnector>),
     /// Accept streams the sandbox runtime opens to this supervisor.
     RuntimeInitiated(Arc<crate::runtime_initiated::RuntimeInitiatedListener>),
-    /// Accept streams routed to this session by a shared listener.
+    /// Accept streams routed to this sandbox instance by a shared listener.
     Routed(Arc<crate::runtime_routed::RouteRegistration>),
 }
 
@@ -125,8 +125,8 @@ impl BoundaryTransport {
         }))
     }
 
-    /// Accept the connections a shared listener routes to one session. The
-    /// registration's handle must be the descriptor's route.
+    /// Accept the connections a shared listener routes to one sandbox
+    /// instance. The registration's handle must be the descriptor's route.
     pub fn routed(
         descriptor: &SandboxRuntimeDescriptor,
         registration: Arc<crate::runtime_routed::RouteRegistration>,
@@ -138,7 +138,7 @@ impl BoundaryTransport {
                 Ok(Self(TransportSource::Routed(registration)))
             }
             _ => Err(BackendError::Descriptor(
-                "runtime descriptor does not use this session's route".to_string(),
+                "runtime descriptor does not use this sandbox instance's route".to_string(),
             )),
         }
     }

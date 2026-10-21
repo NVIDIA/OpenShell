@@ -269,8 +269,9 @@ pub enum SandboxTransport {
         guest_cid: u32,
         port: u32,
     },
-    /// The runtime dials a supervisor shared by several sessions and names
-    /// this session's opaque route handle before the pinned TLS handshake.
+    /// The runtime dials a supervisor shared by several sandbox instances and
+    /// names this instance's opaque route handle before the pinned TLS
+    /// handshake.
     /// Only a host that owns the shared listener can serve this transport.
     RuntimeInitiatedRouted {
         authority: String,
@@ -455,7 +456,7 @@ pub enum BoundaryListener {
         addresses: Vec<std::net::SocketAddr>,
         tls: SandboxTlsServerConfig,
         /// Route handle sent before TLS to a supervisor shared by several
-        /// sessions. Absent for a dedicated supervisor.
+        /// sandbox instances. Absent for a dedicated supervisor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<String>,
     },

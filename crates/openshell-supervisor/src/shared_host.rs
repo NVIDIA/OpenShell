@@ -3,13 +3,14 @@
 
 //! Supervisor shared by the sandboxes of one gateway.
 //!
-//! A compute driver registers each runtime generation over the
-//! session-control API, which accepts only mutually authenticated TLS clients
-//! holding the admission certificate. A registration carries exactly the
-//! gateway-issued credentials of that generation; the host never acts with
-//! any other identity. Each registration becomes a [`SessionHost`] session
-//! whose runtime connections arrive through one routed listener. Removing a
-//! registration stops only that session.
+//! A compute driver registers each sandbox instance, one running generation
+//! of a stable Sandbox resource, over the session-control API, which accepts
+//! only mutually authenticated TLS clients holding the admission certificate.
+//! A registration carries exactly the gateway-issued credentials of that
+//! generation; the host never acts with any other identity. Each registration
+//! becomes a [`SandboxInstanceHost`] instance whose runtime connections arrive
+//! through one routed listener. Removing a registration stops only that
+//! instance.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -24,12 +25,14 @@ use http_body_util::{BodyExt as _, Full, Limited};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
 use openshell_sandbox_backend::session_control::{
-    MAX_REGISTRATION_BYTES, SESSIONS_PATH, SessionList, SessionPhaseReport, SessionRegistration,
-    SessionStatusReport,
+    MAX_REGISTRATION_BYTES, SESSIONS_PATH, SandboxInstanceList, SandboxInstancePhaseReport,
+    SandboxInstanceRegistration, SandboxInstanceStatusReport,
 };
 use tokio::sync::watch;
 
-use crate::session_host::{HostedSessionSpec, SessionHost, SessionPhase, SessionStatus};
+use crate::sandbox_instance_host::{
+    SandboxInstanceHost, SandboxInstancePhase, SandboxInstanceSpec, SandboxInstanceStatus,
+};
 
 /// Concurrent session-control connections; the only client is the gateway,
 /// whose removals hold a connection while a workload stops.
@@ -39,13 +42,14 @@ const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Process-level inputs of a shared supervisor.
 pub struct SharedHostConfig {
-    /// Gateway gRPC endpoint every session uses with its own credentials.
+    /// Gateway gRPC endpoint every sandbox instance uses with its own
+    /// credentials.
     pub gateway_endpoint: String,
-    /// Private directory for per-session files.
-    pub session_root: PathBuf,
+    /// Private directory for per-instance files (`--session-root`).
+    pub instance_root: PathBuf,
     /// Listener for runtime-initiated Sandbox Protocol connections.
     pub runtime_listen: SocketAddr,
-    /// Time a removed session may take to stop its workload.
+    /// Time a removed sandbox instance may take to stop its workload.
     pub removal_grace: Duration,
 }
 
@@ -55,7 +59,7 @@ struct Registered {
     digest: [u8; 32],
     sandbox_id: String,
     /// Final status of the removal in progress, shared by every remover.
-    removal: Option<watch::Receiver<Option<SessionStatusReport>>>,
+    removal: Option<watch::Receiver<Option<SandboxInstanceStatusReport>>>,
 }
 
 type Registrations = Mutex<HashMap<String, Registered>>;
@@ -66,9 +70,10 @@ fn lock(registrations: &Registrations) -> MutexGuard<'_, HashMap<String, Registe
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Registered sessions, their runtime router, and their private files.
+/// Registered sandbox instances, their runtime router, and their private
+/// files.
 pub struct SharedHost {
-    host: SessionHost,
+    host: SandboxInstanceHost,
     router: Arc<RuntimeRouter>,
     registrations: Registrations,
     next_serial: AtomicU64,
@@ -97,13 +102,13 @@ pub enum ControlError {
 }
 
 impl SharedHost {
-    /// Bind the routed runtime listener and prepare the session root.
+    /// Bind the routed runtime listener and prepare the instance root.
     pub fn start(config: SharedHostConfig) -> Result<Arc<Self>> {
-        prepare_private_dir(&config.session_root)?;
+        prepare_private_dir(&config.instance_root)?;
         let router = RuntimeRouter::bind(config.runtime_listen)
             .map_err(|error| miette::miette!("{error}"))?;
         Ok(Arc::new(Self {
-            host: SessionHost::new(),
+            host: SandboxInstanceHost::new(),
             router,
             registrations: Mutex::default(),
             next_serial: AtomicU64::new(0),
@@ -117,10 +122,11 @@ impl SharedHost {
         self.router.local_addr()
     }
 
-    /// Start a session for `registration`, or confirm an identical one.
+    /// Start a sandbox instance for `registration`, or confirm an identical
+    /// one.
     pub fn register(
         &self,
-        registration: SessionRegistration,
+        registration: SandboxInstanceRegistration,
     ) -> Result<RegisterOutcome, ControlError> {
         registration
             .validate()
@@ -128,15 +134,15 @@ impl SharedHost {
         let digest = registration_digest(&registration)?;
         let route = registration.route.clone();
         let sandbox_id = registration.sandbox_id.clone();
-        self.admit(&route, digest, sandbox_id, |session_dir| {
-            let spec = self.session_spec(registration, session_dir)?;
+        self.admit(&route, digest, sandbox_id, |instance_dir| {
+            let spec = self.instance_spec(registration, instance_dir)?;
             self.host
-                .start_supervisor_session(spec)
+                .start_sandbox_instance(spec)
                 .map_err(|error| ControlError::Unavailable(error.to_string()))
         })
     }
 
-    /// Reserve `route` and run `start` with the session's private directory.
+    /// Reserve `route` and run `start` with the instance's private directory.
     fn admit(
         &self,
         route: &str,
@@ -154,9 +160,9 @@ impl SharedHost {
                 Err(ControlError::Conflict)
             };
         }
-        let session_dir = self.config.session_root.join(route);
-        if let Err(error) = start(&session_dir) {
-            let _ = std::fs::remove_dir_all(&session_dir);
+        let instance_dir = self.config.instance_root.join(route);
+        if let Err(error) = start(&instance_dir) {
+            let _ = std::fs::remove_dir_all(&instance_dir);
             return Err(error);
         }
         registrations.insert(
@@ -171,22 +177,22 @@ impl SharedHost {
         Ok(RegisterOutcome::Created)
     }
 
-    /// Status of one registered session.
+    /// Status of one registered sandbox instance.
     #[must_use]
-    pub fn status(&self, route: &str) -> Option<SessionStatusReport> {
+    pub fn status(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
         let sandbox_id = lock(&self.registrations).get(route)?.sandbox_id.clone();
         let status = self.host.status(route)?;
         Some(status_report(route, sandbox_id, &status))
     }
 
-    /// Status of every registered session.
+    /// Status of every registered sandbox instance.
     #[must_use]
-    pub fn list(&self) -> SessionList {
+    pub fn list(&self) -> SandboxInstanceList {
         let routes = lock(&self.registrations)
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        SessionList {
+        SandboxInstanceList {
             sessions: routes
                 .iter()
                 .filter_map(|route| self.status(route))
@@ -194,13 +200,13 @@ impl SharedHost {
         }
     }
 
-    /// Stop one session, delete its private files, and forget it.
+    /// Stop one sandbox instance, delete its private files, and forget it.
     ///
     /// Removal runs on a task the host owns, so it completes even when the
     /// caller disconnects, and concurrent callers share its result. The
-    /// route stays reserved until the session has ended and its files are
+    /// route stays reserved until the instance has ended and its files are
     /// gone, so a new registration of the route can never meet them.
-    pub async fn remove(self: &Arc<Self>, route: &str) -> Option<SessionStatusReport> {
+    pub async fn remove(self: &Arc<Self>, route: &str) -> Option<SandboxInstanceStatusReport> {
         let mut removed = self.begin_removal(route)?;
         removed
             .wait_for(Option::is_some)
@@ -212,7 +218,7 @@ impl SharedHost {
     fn begin_removal(
         self: &Arc<Self>,
         route: &str,
-    ) -> Option<watch::Receiver<Option<SessionStatusReport>>> {
+    ) -> Option<watch::Receiver<Option<SandboxInstanceStatusReport>>> {
         let mut registrations = lock(&self.registrations);
         let registered = registrations.get_mut(route)?;
         if let Some(removed) = &registered.removal {
@@ -229,15 +235,17 @@ impl SharedHost {
                 .host
                 .remove(&route, shared.config.removal_grace)
                 .await
-                .unwrap_or_else(|| SessionStatus {
-                    phase: SessionPhase::Failed("session was not running".to_string()),
+                .unwrap_or_else(|| SandboxInstanceStatus {
+                    phase: SandboxInstancePhase::Failed(
+                        "sandbox instance was not running".to_string(),
+                    ),
                     ready: false,
                 });
-            let session_dir = shared.config.session_root.join(&route);
+            let instance_dir = shared.config.instance_root.join(&route);
             let _ =
-                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&session_dir) {
+                tokio::task::spawn_blocking(move || match std::fs::remove_dir_all(&instance_dir) {
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                        tracing::warn!(%error, "could not delete removed session files");
+                        tracing::warn!(%error, "could not delete removed sandbox instance files");
                     }
                     _ => {}
                 })
@@ -256,7 +264,7 @@ impl SharedHost {
         Some(removed)
     }
 
-    /// Stop every session, for process shutdown.
+    /// Stop every sandbox instance, for process shutdown.
     pub async fn remove_all(self: &Arc<Self>) {
         let routes = lock(&self.registrations)
             .keys()
@@ -265,11 +273,11 @@ impl SharedHost {
         futures::future::join_all(routes.iter().map(|route| self.remove(route))).await;
     }
 
-    fn session_spec(
+    fn instance_spec(
         &self,
-        registration: SessionRegistration,
-        session_dir: &Path,
-    ) -> Result<HostedSessionSpec, ControlError> {
+        registration: SandboxInstanceRegistration,
+        instance_dir: &Path,
+    ) -> Result<SandboxInstanceSpec, ControlError> {
         let failure = |error: miette::Report| ControlError::Unavailable(error.to_string());
         let main_process =
             openshell_core::sandbox_env::MainProcessConfig::decode(&registration.main_process_spec)
@@ -278,14 +286,14 @@ impl SharedHost {
             .runtime_descriptor
             .backend_descriptor()
             .map_err(|error| ControlError::Invalid(error.to_string()))?;
-        if session_dir.exists() {
-            std::fs::remove_dir_all(session_dir)
+        if instance_dir.exists() {
+            std::fs::remove_dir_all(instance_dir)
                 .into_diagnostic()
                 .map_err(failure)?;
         }
-        prepare_private_dir(session_dir).map_err(failure)?;
-        let ca_certificate = session_dir.join("proxy-ca.crt");
-        let ca_private_key = session_dir.join("proxy-ca.key");
+        prepare_private_dir(instance_dir).map_err(failure)?;
+        let ca_certificate = instance_dir.join("proxy-ca.crt");
+        let ca_private_key = instance_dir.join("proxy-ca.key");
         write_private_file(
             &ca_certificate,
             registration.proxy_ca.certificate_pem.as_bytes(),
@@ -300,16 +308,16 @@ impl SharedHost {
                 .as_bytes(),
         )
         .map_err(failure)?;
-        let trust_dir = session_dir.join("trust");
+        let trust_dir = instance_dir.join("trust");
         prepare_private_dir(&trust_dir).map_err(failure)?;
-        let ssh_socket = session_dir.join("ssh.sock");
-        Ok(HostedSessionSpec {
+        let ssh_socket = instance_dir.join("ssh.sock");
+        Ok(SandboxInstanceSpec {
             key: registration.route.clone(),
             backend_setup: Box::new(crate::backend_setup::RoutedBackendSetup::new(
                 self.router.clone(),
                 registration.route,
             )),
-            config: crate::SessionConfig {
+            config: crate::SandboxInstanceConfig {
                 command: main_process.command,
                 workdir: registration.workdir,
                 timeout_secs: 0,
@@ -357,22 +365,30 @@ impl SharedHost {
     }
 }
 
-fn registration_digest(registration: &SessionRegistration) -> Result<[u8; 32], ControlError> {
+fn registration_digest(
+    registration: &SandboxInstanceRegistration,
+) -> Result<[u8; 32], ControlError> {
     let encoded = serde_json::to_vec(registration)
         .map_err(|error| ControlError::Invalid(format!("encode registration: {error}")))?;
     openshell_crypto::sha256(&encoded).map_err(|error| ControlError::Unavailable(error.to_string()))
 }
 
-fn status_report(route: &str, sandbox_id: String, status: &SessionStatus) -> SessionStatusReport {
-    SessionStatusReport {
+fn status_report(
+    route: &str,
+    sandbox_id: String,
+    status: &SandboxInstanceStatus,
+) -> SandboxInstanceStatusReport {
+    SandboxInstanceStatusReport {
         route: route.to_string(),
         sandbox_id,
         phase: match &status.phase {
-            SessionPhase::Starting => SessionPhaseReport::Starting,
-            SessionPhase::Supervising => SessionPhaseReport::Supervising,
-            SessionPhase::Stopping => SessionPhaseReport::Stopping,
-            SessionPhase::Exited(code) => SessionPhaseReport::Exited { exit_code: *code },
-            SessionPhase::Failed(error) => SessionPhaseReport::Failed {
+            SandboxInstancePhase::Starting => SandboxInstancePhaseReport::Starting,
+            SandboxInstancePhase::Supervising => SandboxInstancePhaseReport::Supervising,
+            SandboxInstancePhase::Stopping => SandboxInstancePhaseReport::Stopping,
+            SandboxInstancePhase::Exited(code) => {
+                SandboxInstancePhaseReport::Exited { exit_code: *code }
+            }
+            SandboxInstancePhase::Failed(error) => SandboxInstancePhaseReport::Failed {
                 error: error.clone(),
             },
         },
@@ -390,7 +406,7 @@ fn prepare_private_dir(path: &Path) -> Result<()> {
             let metadata = std::fs::symlink_metadata(path).into_diagnostic()?;
             if !metadata.is_dir() {
                 return Err(miette::miette!(
-                    "session path is not a directory: {}",
+                    "sandbox instance path is not a directory: {}",
                     path.display()
                 ));
             }
@@ -461,7 +477,12 @@ async fn handle_control(
             json_response(http::StatusCode::OK, &host.list())
         }
         (http::Method::GET, Some(route)) => host.status(route).map_or_else(
-            || error_response(http::StatusCode::NOT_FOUND, "session is not registered"),
+            || {
+                error_response(
+                    http::StatusCode::NOT_FOUND,
+                    "sandbox instance is not registered",
+                )
+            },
             |status| json_response(http::StatusCode::OK, &status),
         ),
         (http::Method::PUT, Some(route)) => {
@@ -480,7 +501,7 @@ async fn handle_control(
                     );
                 }
             };
-            let registration = match serde_json::from_slice::<SessionRegistration>(&body) {
+            let registration = match serde_json::from_slice::<SandboxInstanceRegistration>(&body) {
                 Ok(registration) if registration.route == route => registration,
                 Ok(_) => {
                     return error_response(
@@ -492,7 +513,7 @@ async fn handle_control(
                 Err(_) => {
                     return error_response(
                         http::StatusCode::BAD_REQUEST,
-                        "registration body is not a valid session registration",
+                        "registration body is not a valid sandbox instance registration",
                     );
                 }
             };
@@ -504,7 +525,12 @@ async fn handle_control(
                         http::StatusCode::OK
                     };
                     host.status(&route).map_or_else(
-                        || error_response(http::StatusCode::CONFLICT, "session was removed"),
+                        || {
+                            error_response(
+                                http::StatusCode::CONFLICT,
+                                "sandbox instance was removed",
+                            )
+                        },
                         |report| json_response(status, &report),
                     )
                 }
@@ -520,7 +546,12 @@ async fn handle_control(
             }
         }
         (http::Method::DELETE, Some(route)) => host.remove(route).await.map_or_else(
-            || error_response(http::StatusCode::NOT_FOUND, "session is not registered"),
+            || {
+                error_response(
+                    http::StatusCode::NOT_FOUND,
+                    "sandbox instance is not registered",
+                )
+            },
             |status| json_response(http::StatusCode::OK, &status),
         ),
         _ => error_response(http::StatusCode::NOT_FOUND, "unknown session-control route"),
@@ -582,25 +613,26 @@ pub async fn serve_session_control(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_host::{SessionBinding, SessionBody};
+    use crate::sandbox_instance_host::{SandboxInstanceBinding, SandboxInstanceBody};
 
     fn shared_host(root: &Path) -> Arc<SharedHost> {
         SharedHost::start(SharedHostConfig {
             gateway_endpoint: "http://127.0.0.1:9".to_string(),
-            session_root: root.to_path_buf(),
+            instance_root: root.to_path_buf(),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
         })
         .unwrap()
     }
 
-    /// Admit a session that keeps a private file and takes a while to stop.
+    /// Admit a sandbox instance that keeps a private file and takes a while to
+    /// stop.
     fn admit(host: &SharedHost, route: &str, launch: u8) -> Result<RegisterOutcome, ControlError> {
         host.admit(route, [launch; 32], format!("sandbox-{launch}"), |dir| {
             let unavailable = |error: miette::Report| ControlError::Unavailable(error.to_string());
             prepare_private_dir(dir).map_err(unavailable)?;
             write_private_file(&dir.join("launch"), &[launch]).map_err(unavailable)?;
-            let body: SessionBody = Box::new(|controls| {
+            let body: SandboxInstanceBody = Box::new(|controls| {
                 Box::pin(async move {
                     controls.readiness.send_replace(true);
                     controls.shutdown.await;
@@ -608,11 +640,16 @@ mod tests {
                     Ok(0)
                 })
             });
-            let binding = SessionBinding {
-                event_context: Arc::new(crate::session_event_context(None, None, String::new())),
+            let binding = SandboxInstanceBinding {
+                event_context: Arc::new(crate::sandbox_instance_event_context(
+                    None,
+                    None,
+                    String::new(),
+                )),
                 ocsf_json: openshell_ocsf::OcsfJsonSettings::default(),
                 log_sink: None,
-                denial_log: openshell_supervisor_network::policy_local::SessionDenialLog::default(),
+                denial_log:
+                    openshell_supervisor_network::policy_local::SandboxInstanceDenialLog::default(),
             };
             host.host
                 .start(route, binding, None, body)
@@ -627,7 +664,7 @@ mod tests {
             }
         })
         .await
-        .expect("session becomes ready");
+        .expect("instance becomes ready");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -643,7 +680,7 @@ mod tests {
         ));
         wait_ready(&host, route).await;
 
-        // A disconnected caller still removes the session.
+        // A disconnected caller still removes the instance.
         assert!(
             tokio::time::timeout(Duration::from_millis(20), host.remove(route))
                 .await
@@ -660,12 +697,15 @@ mod tests {
         for remover in removers {
             let report = remover.await.unwrap().expect("route was registered");
             assert_eq!(report.sandbox_id, "sandbox-1");
-            assert_eq!(report.phase, SessionPhaseReport::Exited { exit_code: 0 });
+            assert_eq!(
+                report.phase,
+                SandboxInstancePhaseReport::Exited { exit_code: 0 }
+            );
         }
         assert!(host.status(route).is_none());
         assert!(!root.path().join(route).exists());
 
-        // Nothing from the removed session reaches the route's next owner.
+        // Nothing from the removed instance reaches the route's next owner.
         assert_eq!(admit(&host, route, 3).unwrap(), RegisterOutcome::Created);
         wait_ready(&host, route).await;
         tokio::time::sleep(Duration::from_millis(50)).await;

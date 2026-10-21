@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Contract between a compute driver and a supervisor shared by sessions.
+//! Contract between a compute driver and a supervisor shared by sandbox
+//! instances.
 //!
-//! The driver registers one runtime generation with trusted launch material
-//! the gateway issued for it, reads that session's status, and removes it.
-//! The exchange runs over mutually authenticated TLS with a credential
-//! reserved for session admission; it is never available to a sandbox. A
-//! registration grants the supervisor exactly the per-generation gateway and
-//! Sandbox Protocol credentials it carries; it confers no other identity.
+//! A sandbox instance is one running generation of a stable Sandbox resource.
+//! The driver registers one instance with trusted launch material the gateway
+//! issued for its generation, reads that instance's status, and removes it.
+//! "Session control" and the `/v1/sessions` paths and JSON fields are the
+//! protocol's established wire names; each entry they address is a sandbox
+//! instance. The exchange runs over mutually authenticated TLS with a
+//! credential reserved for instance admission; it is never available to a
+//! sandbox. A registration grants the supervisor exactly the per-generation
+//! gateway and Sandbox Protocol credentials it carries; it confers no other
+//! identity.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,17 +23,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::boundary_protocol::{SandboxRuntimeDescriptor, SandboxTransport};
 
-/// Collection path of the session-control API; a session is `{prefix}/{route}`.
+/// Collection path of the session-control API; a sandbox instance is
+/// `{prefix}/{route}`. The path keeps its established wire name.
 pub const SESSIONS_PATH: &str = "/v1/sessions";
 /// Largest registration body a supervisor accepts.
 pub const MAX_REGISTRATION_BYTES: usize = 256 * 1024;
-/// Time a shared supervisor gives a removed session's workload to stop
-/// before cancelling the session.
-pub const SESSION_REMOVAL_GRACE: Duration = Duration::from_secs(20);
-/// Bound on answering a removal request: the grace period, the session
+/// Time a shared supervisor gives a removed sandbox instance's workload to
+/// stop before cancelling the instance.
+pub const INSTANCE_REMOVAL_GRACE: Duration = Duration::from_secs(20);
+/// Bound on answering a removal request: the grace period, the instance
 /// runtime's shutdown, file cleanup, and the connection itself. A removal
 /// continues on the supervisor if its caller stops waiting.
-pub const SESSION_REMOVAL_TIMEOUT: Duration = Duration::from_secs(45);
+pub const INSTANCE_REMOVAL_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// PEM private key that never appears in `Debug` output.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,11 +76,11 @@ pub struct RegistrationTraceContext {
     pub tracestate: Option<String>,
 }
 
-/// Trusted launch material for one runtime generation on a shared supervisor.
+/// Trusted launch material for one sandbox instance on a shared supervisor.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionRegistration {
-    /// Route handle the runtime names; also the session's key on the host.
+pub struct SandboxInstanceRegistration {
+    /// Route handle the runtime names; also the instance's key on the host.
     pub route: String,
     pub sandbox_id: String,
     pub sandbox_name: String,
@@ -86,7 +92,7 @@ pub struct SessionRegistration {
     pub main_process_spec: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
-    /// Workload image recorded in the session's OCSF events.
+    /// Workload image recorded in the instance's OCSF events.
     #[serde(default)]
     pub container_image: String,
     pub proxy_ca: ProxyCaMaterial,
@@ -94,10 +100,10 @@ pub struct SessionRegistration {
     pub trace_context: Option<RegistrationTraceContext>,
 }
 
-impl std::fmt::Debug for SessionRegistration {
+impl std::fmt::Debug for SandboxInstanceRegistration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("SessionRegistration")
+            .debug_struct("SandboxInstanceRegistration")
             .field("route", &self.route)
             .field("sandbox_id", &self.sandbox_id)
             .field("sandbox_name", &self.sandbox_name)
@@ -109,7 +115,7 @@ impl std::fmt::Debug for SessionRegistration {
     }
 }
 
-impl SessionRegistration {
+impl SandboxInstanceRegistration {
     /// Check that every part of the registration names the same sandbox,
     /// generation, launch session, and route.
     pub fn validate(&self) -> Result<(), BackendError> {
@@ -119,7 +125,8 @@ impl SessionRegistration {
             SandboxTransport::RuntimeInitiatedRouted { route, .. } if *route == self.route => {}
             _ => {
                 return Err(BackendError::Descriptor(
-                    "shared supervisor sessions require this route's routed transport".to_string(),
+                    "shared supervisor sandbox instances require this route's routed transport"
+                        .to_string(),
                 ));
             }
         }
@@ -152,10 +159,10 @@ impl SessionRegistration {
     }
 }
 
-/// Lifecycle phase of a hosted session.
+/// Lifecycle phase of a hosted sandbox instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
-pub enum SessionPhaseReport {
+pub enum SandboxInstancePhaseReport {
     Starting,
     Supervising,
     Stopping,
@@ -163,7 +170,7 @@ pub enum SessionPhaseReport {
     Failed { error: String },
 }
 
-impl SessionPhaseReport {
+impl SandboxInstancePhaseReport {
     /// Supervision has ended and cannot resume for this generation.
     #[must_use]
     pub fn is_terminal(&self) -> bool {
@@ -171,22 +178,23 @@ impl SessionPhaseReport {
     }
 }
 
-/// Status of one hosted session.
+/// Status of one hosted sandbox instance.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionStatusReport {
+pub struct SandboxInstanceStatusReport {
     pub route: String,
     pub sandbox_id: String,
     #[serde(flatten)]
-    pub phase: SessionPhaseReport,
-    /// The gateway currently accepts this session's supervision.
+    pub phase: SandboxInstancePhaseReport,
+    /// The gateway currently accepts this instance's supervision.
     pub ready: bool,
 }
 
-/// Every session a shared supervisor hosts.
+/// Every sandbox instance a shared supervisor hosts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionList {
-    pub sessions: Vec<SessionStatusReport>,
+pub struct SandboxInstanceList {
+    /// Hosted sandbox instances; `sessions` is the established wire name.
+    pub sessions: Vec<SandboxInstanceStatusReport>,
 }
 
 fn pem_certificates(

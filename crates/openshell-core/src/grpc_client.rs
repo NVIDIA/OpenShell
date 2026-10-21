@@ -5,7 +5,7 @@
 //! `OpenShell` server.
 //!
 //! Every request carries a sandbox bearer credential in the `Authorization`
-//! header. Each supervisor session owns its [`GatewayCredentials`], usually
+//! header. Each sandbox instance owns its [`GatewayCredentials`], usually
 //! built from the trusted launch bundle with
 //! [`GatewayCredentials::from_auth_bundle`]. Diagnostic tools can instead
 //! resolve a token with [`GatewayCredentials::from_environment`] from one of:
@@ -16,8 +16,8 @@
 //!    caller exchanges it for a gateway JWT via `IssueSandboxToken`.
 //!
 //! Callers reach the gateway through a [`GatewayEndpoint`], which pairs the
-//! URL with one session's credentials. No credential is installed
-//! process-wide, so sessions hosted by one supervisor process cannot use or
+//! URL with one sandbox instance's credentials. No credential is installed
+//! process-wide, so instances hosted by one supervisor process cannot use or
 //! rotate each other's identity.
 
 use std::collections::HashMap;
@@ -65,7 +65,7 @@ pub const MAX_SUPERVISOR_STREAM_MESSAGE_BYTES: usize = 9 * 1024 * 1024;
 
 /// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
 /// the same slot, so the renewal task can replace the token in place without
-/// rebuilding the channel. `None` means the owning session revoked it.
+/// rebuilding the channel. `None` means the owning sandbox instance revoked it.
 type TokenSlot = Arc<RwLock<Option<AsciiMetadataValue>>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +75,7 @@ enum TokenSource {
     K8sServiceAccount,
 }
 
-/// Gateway credentials owned by one supervisor session.
+/// Gateway credentials owned by one sandbox instance.
 ///
 /// Clients built from a [`GatewayEndpoint`] read only these slots, and the
 /// renewal task started by the first connection updates only them. Dropping
@@ -200,7 +200,7 @@ impl GatewayCredentials {
     }
 
     /// Start the renewal task once for these credentials, on the caller's
-    /// runtime, so a hosted session's renewal stops with that session.
+    /// runtime, so a hosted sandbox instance's renewal stops with that instance.
     fn start_renewal(&self, channel: &AuthedChannel, plain_channel: &Channel, endpoint: &str) {
         let mut renewal = self
             .inner
@@ -239,14 +239,16 @@ impl GatewayCredentials {
             .bearer
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A revoked session must not be revived by an in-flight response.
+        // Revoked instance credentials must not be revived by an in-flight
+        // response.
         if slot.is_some() {
             *slot = Some(bearer);
         }
     }
 }
 
-/// The gateway URL a session uses, paired with that session's credentials.
+/// The gateway URL a sandbox instance uses, paired with that instance's
+/// credentials.
 #[derive(Clone)]
 pub struct GatewayEndpoint {
     url: Arc<str>,
@@ -271,7 +273,7 @@ impl GatewayEndpoint {
         &self.credentials
     }
 
-    /// Reach another gateway address with the same session credentials.
+    /// Reach another gateway address with the same sandbox instance credentials.
     #[must_use]
     pub fn with_url(&self, url: impl Into<Arc<str>>) -> Self {
         Self::new(url, self.credentials.clone())
@@ -357,7 +359,9 @@ impl tonic::service::Interceptor for AuthInterceptor {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .ok_or_else(|| Status::unauthenticated("gateway session credentials were revoked"))?;
+            .ok_or_else(|| {
+                Status::unauthenticated("sandbox instance gateway credentials were revoked")
+            })?;
         req.metadata_mut().insert("authorization", bearer);
         #[cfg(feature = "trace-context")]
         let req =
@@ -458,11 +462,14 @@ impl Drop for ClientSpanStatus {
     }
 }
 
-/// Build a Bearer-authenticated channel to the gateway with one session's
-/// credentials. The first connection starts that session's renewal task.
+/// Build a Bearer-authenticated channel to the gateway with one sandbox
+/// instance's credentials. The first connection starts that instance's
+/// renewal task.
 async fn connect_channel(gateway: &GatewayEndpoint) -> Result<AuthedChannel> {
     if gateway.credentials.is_revoked() {
-        return Err(miette::miette!("gateway session credentials were revoked"));
+        return Err(miette::miette!(
+            "sandbox instance gateway credentials were revoked"
+        ));
     }
     let channel = build_plain_channel(gateway.url()).await?;
     let intercepted = InterceptedService::new(
@@ -577,8 +584,9 @@ pub async fn report_provider_readiness(
         .into_diagnostic()
 }
 
-/// Slots and transport retained by one session's renewal task. It holds no
-/// reference to [`GatewayCredentials`], so dropping them still stops it.
+/// Slots and transport retained by one sandbox instance's renewal task. It
+/// holds no reference to [`GatewayCredentials`], so dropping them still stops
+/// it.
 struct RenewalTarget {
     channel: AuthedChannel,
     bearer: TokenSlot,
@@ -590,10 +598,10 @@ struct RenewalTarget {
 }
 
 /// Background task that renews the sandbox JWT at ~80% of its remaining
-/// lifetime. The new token replaces the value in the session's slot, so all
-/// in-flight and future clients of that session pick it up on their next
-/// request. The loop never panics: every failure is logged and re-attempted
-/// after a bounded backoff.
+/// lifetime. The new token replaces the value in the sandbox instance's slot,
+/// so all in-flight and future clients of that instance pick it up on their
+/// next request. The loop never panics: every failure is logged and
+/// re-attempted after a bounded backoff.
 async fn refresh_token_loop(target: RenewalTarget) {
     let RenewalTarget {
         channel,
@@ -832,7 +840,7 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Option<Duration> {
         let current = slot
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A revoked session has nothing to renew.
+        // Revoked instance credentials have nothing to renew.
         current.as_ref()?.to_str().ok().map(str::to_string)
     }
     .unwrap_or_default();
@@ -1058,7 +1066,7 @@ mod workspace_tests {
     }
 }
 
-/// Connect to the `OpenShell` server with one session's credentials.
+/// Connect to the `OpenShell` server with one sandbox instance's credentials.
 async fn connect(gateway: &GatewayEndpoint) -> Result<OpenShellClient<AuthedChannel>> {
     let channel = connect_channel(gateway).await?;
     Ok(OpenShellClient::new(channel))
@@ -1711,7 +1719,8 @@ mod token_grant_exchange_tests {
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
     client: OpenShellClient<AuthedChannel>,
-    /// Session credentials rotated alongside extension credentials.
+    /// Sandbox instance gateway credentials rotated alongside extension
+    /// credentials.
     credentials: GatewayCredentials,
     workspace: Arc<tokio::sync::OnceCell<String>>,
     /// Extension credentials for this supervisor. Cloning the client shares

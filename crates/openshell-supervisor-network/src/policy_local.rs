@@ -84,8 +84,8 @@ const SHORTHAND_LOG_PREFIX: &str = "openshell.";
 /// log entry (very long URL path, etc.) cannot blow up the response.
 const MAX_DENIAL_LINE_BYTES: usize = 4096;
 
-/// Most recent denial lines retained for one hosted session.
-const MAX_SESSION_DENIAL_LINES: usize = 256;
+/// Most recent denial lines retained for one hosted sandbox instance.
+const MAX_INSTANCE_DENIAL_LINES: usize = 256;
 
 /// Where `/v1/denials` reads this sandbox's recent denials.
 #[derive(Clone, Debug)]
@@ -93,9 +93,9 @@ pub enum DenialLogSource {
     /// Shorthand log files written by a supervisor process that serves one
     /// sandbox.
     ShorthandFiles(PathBuf),
-    /// Denials recorded for this session alone. A process hosting several
+    /// Denials recorded for this sandbox instance alone. A process hosting several
     /// sandboxes cannot expose its shared log files to any one of them.
-    Session(SessionDenialLog),
+    SandboxInstance(SandboxInstanceDenialLog),
 }
 
 impl Default for DenialLogSource {
@@ -104,13 +104,13 @@ impl Default for DenialLogSource {
     }
 }
 
-/// Bounded recent OCSF denial lines recorded for one hosted session.
+/// Bounded recent OCSF denial lines recorded for one hosted sandbox instance.
 #[derive(Clone, Default)]
-pub struct SessionDenialLog {
+pub struct SandboxInstanceDenialLog {
     lines: Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
-impl std::fmt::Debug for SessionDenialLog {
+impl std::fmt::Debug for SandboxInstanceDenialLog {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let retained = self
             .lines
@@ -118,13 +118,13 @@ impl std::fmt::Debug for SessionDenialLog {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .len();
         formatter
-            .debug_struct("SessionDenialLog")
+            .debug_struct("SandboxInstanceDenialLog")
             .field("retained", &retained)
             .finish()
     }
 }
 
-impl SessionDenialLog {
+impl SandboxInstanceDenialLog {
     /// Retain `line` when it is a rendered OCSF denial; ignore anything else.
     pub fn record(&self, line: &str) {
         let line = line.trim_end();
@@ -135,7 +135,7 @@ impl SessionDenialLog {
             .lines
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lines.len() == MAX_SESSION_DENIAL_LINES {
+        if lines.len() == MAX_INSTANCE_DENIAL_LINES {
             lines.pop_front();
         }
         lines.push_back(line.to_string());
@@ -227,7 +227,7 @@ impl PolicyLocalContext {
         self
     }
 
-    /// The session's provider token grant resolver, absent when grants are
+    /// The sandbox instance's provider token grant resolver, absent when grants are
     /// unavailable and must fail closed.
     pub(crate) fn token_grant_resolver(&self) -> Option<Arc<dyn TokenGrantResolver>> {
         self.token_grants.clone()
@@ -425,7 +425,7 @@ async fn recent_denials_response(
     let limit = parse_last_query(query).unwrap_or(DEFAULT_DENIALS_LIMIT);
     let log_dir = match &ctx.denials {
         DenialLogSource::ShorthandFiles(log_dir) => log_dir.clone(),
-        DenialLogSource::Session(log) => {
+        DenialLogSource::SandboxInstance(log) => {
             return (
                 200,
                 serde_json::json!({

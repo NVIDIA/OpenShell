@@ -200,10 +200,11 @@ pub struct EventContext {
     pub origin: EventOrigin,
 }
 
-/// Event context borrowed from the caller or shared by a hosted session.
+/// Event context borrowed from the caller or shared by a hosted sandbox
+/// instance.
 ///
-/// Builders accept either form, so events attributed to a hosted supervisor
-/// session need not leak a `'static` context for each session.
+/// Builders accept either form, so events attributed to a hosted sandbox
+/// instance need not leak a `'static` context for each instance.
 #[derive(Debug, Clone)]
 pub enum ContextRef<'a> {
     Borrowed(&'a EventContext),

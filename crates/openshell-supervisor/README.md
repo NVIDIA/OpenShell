@@ -22,41 +22,47 @@ only after boundary attachment and confirmation; the supervisor owns policy
 evaluation, live credentials, and listener lifetime. These settings do not add
 a proxy hook to the isolation interface or the shared Sandbox Protocol descriptor.
 
-## Session ownership
+## Sandbox instance ownership
 
-`run_session` supervises one sandbox generation from a `SessionConfig` and
-`SessionControls`. Everything that belongs to that generation is an input or
-is created by the session: gateway credentials and their renewal, the Sandbox
-Protocol credential, policy, provider credentials and token grants, middleware
-credentials, OCSF JSON settings, proxy trust files, the denial history served
-by `policy.local`, the backend connection, access plane, readiness, and stop
-signal. Gateway clients receive a `GatewayEndpoint`, which pairs the URL with
-that session's `GatewayCredentials`; nothing is installed process-wide.
+A sandbox instance is one running generation of a stable Sandbox resource.
+Gateway connections, and the gateway supervisor sessions carried over them,
+can reconnect within an instance without creating another one; the generation
+remains the fencing identifier.
+
+`run_sandbox_instance` supervises one sandbox instance from a
+`SandboxInstanceConfig` and `SandboxInstanceControls`. Everything that belongs
+to that instance is an input or is created by the instance: gateway
+credentials and their renewal, the Sandbox Protocol credential, policy,
+provider credentials and token grants, middleware credentials, OCSF JSON
+settings, proxy trust files, the denial history served by `policy.local`, the
+backend connection, access plane, readiness, and stop signal. Gateway clients
+receive a `GatewayEndpoint`, which pairs the URL with that instance's
+`GatewayCredentials`; nothing is installed process-wide.
 
 `run_sandbox_with_backend` is the dedicated wrapper. It keeps the existing
 process contract: it sets the process-wide OCSF context, reads launch inputs
-from the environment, binds the readiness socket and port to session
-readiness, and stops the session on SIGTERM or SIGINT. The binary shares one
+from the environment, binds the readiness socket and port to instance
+readiness, and stops the instance on SIGTERM or SIGINT. The binary shares one
 `GatewayCredentials` between log push and supervision, so renewal by either
 keeps both current.
 
-`session_host::SessionHost` runs several sessions in one process. Each session
-gets its own Tokio runtime; every thread of that runtime, and the thread
-driving it, is bound to the session's OCSF context, OCSF JSON settings, log
-sink, and denial log. Spawned tasks, blocking work, callbacks, reconnects, and
-renewal therefore inherit the session's identity, and threads outside a
-session carry none and push no logs. The OCSF context also supplies the
-sandbox identity in middleware requests.
+`sandbox_instance_host::SandboxInstanceHost` runs several sandbox instances in
+one process. Each instance gets its own Tokio runtime; every thread of that
+runtime, and the thread driving it, is bound to the instance's OCSF context,
+OCSF JSON settings, log sink, and denial log. Spawned tasks, blocking work,
+callbacks, reconnects, and renewal therefore inherit the instance's identity,
+and threads outside an instance carry none and push no logs. The OCSF context
+also supplies the sandbox identity in middleware requests.
 
-Removing a session stops its workload, shuts down only its runtime, and
-revokes its gateway credentials; the key stays registered until the session's
-thread has finished. A session that panics reports a failure and is revoked
-the same way. A session that is still starting is cancelled at once; the
-sandbox runtime then loses supervision and fails closed, as it does when a
-dedicated supervisor exits. A hosted session without an explicit proxy trust
-directory receives a private one for its lifetime. Hosted processes must
+Removing an instance stops its workload, shuts down only its runtime, and
+revokes its gateway credentials; the key stays registered until the
+instance's thread has finished. An instance that panics reports a failure and
+is revoked the same way. An instance that is still starting is cancelled at
+once; the sandbox runtime then loses supervision and fails closed, as it does
+when a dedicated supervisor exits. A hosted instance without an explicit proxy
+trust directory receives a private one for its lifetime. Hosted processes must
 install `LogPushLayer::thread_bound` and an `OcsfShorthandLayer` writing to
-`SessionDenialWriter`.
+`SandboxInstanceDenialWriter`.
 
 ## Console logging
 
@@ -99,41 +105,42 @@ backend or enable a Windows workload runtime.
 
 ## Shared supervisor host
 
-`openshell-supervisor --mode=shared --gateway-endpoint <gateway-url> --address <ip:port>` hosts the sessions of many sandboxes in
+`openshell-supervisor --mode=shared --gateway-endpoint <gateway-url> --address <ip:port>` hosts the sandbox instances of many sandboxes in
 one process for the Kubernetes gateway supervisor topology. It is Unix-only.
 
-`--gateway-endpoint` selects the gateway each sandbox session dials. The current
+`--gateway-endpoint` selects the gateway each sandbox instance dials. The current
 admission RPCs still arrive from the gateway at `--address`; moving admission
 onto a supervisor-initiated stream is a separate implementation step.
 
 - **Admission.** A mutually authenticated TLS 1.3 listener
   (`--address`, credentials in `--session-control-tls-dir`)
   serves `PUT`, `GET`, and `DELETE /v1/sessions/{route}` and `GET /v1/sessions`
-  as JSON. Only a client holding the admission certificate, which Helm gives
-  only the gateway, can register sessions. A registration carries one
+  as JSON; these established session-control paths and fields address sandbox
+  instances. Only a client holding the admission certificate, which Helm gives
+  only the gateway, can register instances. A registration carries one
   generation's runtime descriptor and gateway-issued credentials; the host
   never acts with any other identity and has no Kubernetes identity. An
   identical registration is accepted again; a different one for a registered
   route returns `409`.
-- **Sessions.** `shared_host::SharedHost` starts each registration as a
-  `SessionHost` session with private files under `--session-root` (proxy CA,
-  trust directory, SSH socket). Removal runs on a task the host owns, so it
-  completes when the caller disconnects, and the route stays reserved until the
-  session has ended and its files are deleted.
+- **Sandbox instances.** `shared_host::SharedHost` starts each registration
+  as a `SandboxInstanceHost` instance with private files under `--session-root`
+  (proxy CA, trust directory, SSH socket). Removal runs on a task the host
+  owns, so it completes when the caller disconnects, and the route stays
+  reserved until the instance has ended and its files are deleted.
 - **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
-  session's runtime-initiated Sandbox Protocol connections; see
+  instance's runtime-initiated Sandbox Protocol connections; see
   `openshell-sandbox-backend` for the routing preface.
 - **Health.** The chart's kubelet `tcpSocket` probes connect to the
   session-control port (5501) and close without completing TLS, so they report
   only that the process is listening; every request still requires mTLS.
-  Session readiness is reported per session over session control. SIGTERM and
-  SIGINT stop every session, which ends their workloads' supervision.
+  Instance readiness is reported per instance over session control. SIGTERM
+  and SIGINT stop every instance, which ends their workloads' supervision.
 
-Sessions get no upstream proxy, extra CA bundle, or provider workload identity:
+Sandbox instances get no upstream proxy, extra CA bundle, or provider workload identity:
 the Kubernetes driver refuses the topology when an upstream proxy or provider
 SPIFFE identity is configured, so a workload never silently loses them. The
 host also initializes no OTLP trace or OCSF exporters, because one process
-cannot export each session's records with that session's collector headers and
-identity. Its console logs and each session's gateway log push remain, and the
+cannot export each instance's records with that instance's collector headers and
+identity. Its console logs and each instance's gateway log push remain, and the
 Kubernetes driver warns at startup when the gateway configures supervisor
 export.

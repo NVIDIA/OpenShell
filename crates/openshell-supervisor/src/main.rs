@@ -76,7 +76,7 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     runtime_listen: Option<std::net::SocketAddr>,
 
-    /// Private directory for shared-host session files.
+    /// Private directory for shared-host sandbox instance files.
     #[arg(long, required_if_eq("mode", "shared"))]
     session_root: Option<PathBuf>,
 
