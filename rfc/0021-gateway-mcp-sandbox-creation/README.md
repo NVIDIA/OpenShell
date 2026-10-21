@@ -6,12 +6,13 @@ links:
   - https://github.com/NVIDIA/OpenShell/issues/4574
 ---
 
-# RFC 0021 - Gateway MCP for Creating Sandboxes
+# RFC 0021 - OpenShell MCP Server for Creating Sandboxes
 
 ## Summary
 
-This RFC proposes letting agents create sandboxes through an MCP endpoint hosted
-in the OpenShell gateway. An agent running in a sandbox can create sub-agents
+This RFC proposes letting agents create sandboxes through the OpenShell MCP
+server, an MCP endpoint served by the OpenShell gateway at `/mcp`. It is one MCP
+server, not a gateway or proxy for other MCP servers. An agent running in a sandbox can create sub-agents
 (`kind: agent`) and tool sandboxes (`kind: tool`). Every request is identified
 by OpenShell, proved against a ceiling with the policy prover, limited by a
 grant that the user sets when starting the tree's first sandbox or attaches to
@@ -389,7 +390,7 @@ same sandbox (see Replacing a grant). Changes
 apply to the next call: a sandbox that had no depth left can create children as
 soon as the user raises `max_depth`, with no policy change, and an existing
 child keeps its policy. No sandbox can change a grant, including through the
-gateway MCP, and every change is audited. If an agent could widen its own grant,
+OpenShell MCP server, and every change is audited. If an agent could widen its own grant,
 the grant would mean nothing.
 
 ```proto
@@ -964,7 +965,7 @@ while lineage records which sandbox asked.
 | Attach a grant later (`grant create`) | top-level sandboxes without a grant | no | no | no |
 | List grants | grants the user set, or in workspaces it administers | no | no | no |
 | Update, revoke or replace a grant | own grants; Workspace Admin for the workspace | no | no | no |
-| Call the gateway MCP | not applicable | grant's program only (gateway checks) | grant's program only (gateway checks) | grant's program only (gateway checks) |
+| Call the OpenShell MCP server | not applicable | grant's program only (gateway checks) | grant's program only (gateway checks) | grant's program only (gateway checks) |
 | `create_sandbox` | top-level sandboxes, as with the CLI | within limits | tool sandboxes only, within breadth and total | refused |
 | `wait`, `get_file`, `stop_sandbox`, `exec` | not applicable | own descendants | own descendants | none (no children) |
 
@@ -1023,7 +1024,7 @@ openshell sandbox list --tree
 openshell sandbox children <sandbox>
 ```
 
-A harness needs one setting: the gateway MCP server's address. For Pi, which
+A harness needs one setting: the OpenShell MCP server's address. For Pi, which
 has built-in MCP support since 0.99, that is `~/.pi/agent/mcp.json`:
 
 ```json
@@ -1062,7 +1063,7 @@ The work is phased so that each phase is usable and testable on its own:
   CLI, and the prover call at create time and on every later policy write to a
   sandbox with a lineage. Validate with the existing Pi and OpenWorker
   prototypes by replacing their host creation services with these RPCs.
-- **Phase 2: Gateway MCP endpoint and supervisor door.** Add `/mcp` over the
+- **Phase 2: OpenShell MCP server and supervisor door.** Add `/mcp` over the
   same API, with authentication, the program check and a per-sandbox rate
   limit, and the startup configuration that turns the endpoint off. Add the door
   at `openshell.local` for MCP, open in every sandbox, and the
@@ -1121,7 +1122,7 @@ and 5 add.
   use the door. Such a script still receives only what the gateway would give
   the harness, but operators should not read `program` as "only the harness".
 
-- **Every sandbox reaches the gateway MCP.** The door is open in every sandbox,
+- **Every sandbox reaches the OpenShell MCP server.** The door is open in every sandbox,
   so the gateway's authentication and refusals are the only barrier, and every
   sandbox can learn that the endpoint exists. The rate limit bounds the load a
   sandbox can cause; turning the endpoint off in the gateway configuration
@@ -1236,7 +1237,7 @@ truth for who may create what. It remains useful for prototyping.
 
 ### Policy rules decide who may call which gateway tool
 
-Each sandbox's policy would carry MCP tool rules for the gateway MCP, for
+Each sandbox's policy would carry MCP tool rules for the OpenShell MCP server, for
 example "only the lead may call `create_*`".
 
 This was rejected because the prover cannot check MCP rules, a policy rule
