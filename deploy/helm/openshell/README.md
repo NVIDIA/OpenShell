@@ -585,6 +585,11 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
+| supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

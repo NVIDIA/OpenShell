@@ -39,13 +39,10 @@ spec:
         - name: {{ . | quote }}
         {{- end }}
       {{- end }}
+      {{- with .Values.supervisor.podSecurityContext }}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 65534
-        runAsGroup: 65534
-        fsGroup: 65534
-        seccompProfile:
-          type: RuntimeDefault
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: supervisor
           image: {{ get $kubernetes "supervisor_image" | quote }}
