@@ -205,7 +205,8 @@ Each JSONL file line, or the payload after the stderr marker, is a complete OCSF
   },
   "firewall_rule": {
     "name": "github_api",
-    "type": "opa"
+    "type": "opa",
+    "version": "3"
   }
 }
 ```
@@ -274,6 +275,11 @@ And a denied connection, produced when `curl https://github.com` runs in a sandb
       "cmd_line": "curl https://github.com"
     }
   },
+  "firewall_rule": {
+    "name": "-",
+    "type": "opa",
+    "version": "3"
+  },
   "action_id": 2,
   "action": "Denied",
   "disposition_id": 2,
@@ -316,6 +322,31 @@ With OTLP trace export enabled on a dedicated supervisor, denied HTTP requests c
 To bound telemetry volume when a workload retries blocked destinations, the supervisor creates at most 10 deny spans per destination at once and one more per second after that. A process-wide budget also allows at most 100 spans at once and refills at 100 per second across destinations. Rate-limited decisions create no additional deny span, while all audit records are still emitted. Records can retain correlation to an already active sampled span, including a connect span at debug level.
 
 Gateway records and their OTLP trace context can inherit the caller's incoming `traceparent`, including before authentication succeeds. The caller also decides whether they are correlated at all, because an unsampled `traceparent` suppresses `trace.uid`. Treat gateway trace IDs as correlation hints, not evidence of the caller's identity, and do not treat a missing `trace.uid` as meaningful.
+
+## Policy Generation on Decisions
+
+Allow, audit, and deny decisions record the policy engine generation they were made under in `firewall_rule.version`. The sandbox supervisor keeps this counter and advances it whenever the policy engine replaces its active configuration: when a policy is installed or reloaded, when the supervisor middleware registry or provider credentials are reinstalled, and when fail-closed quarantine starts or ends.
+
+Policy activation events record the generation they activated in `unmapped.active_generation`. Successful policy loads also carry `unmapped.policy_hash`:
+
+```json
+{
+  "class_uid": 5019,
+  "message": "Policy reloaded successfully [policy_hash:0cc0c2b525573c07]",
+  "unmapped": {
+    "policy_hash": "0cc0c2b525573c07",
+    "active_generation": 3
+  }
+}
+```
+
+To find the policy behind a decision, take the events from the same supervisor lifetime and select the most recent event that carries `unmapped.policy_hash` and whose `active_generation` is less than or equal to the decision's `firewall_rule.version`. Some reinstalls advance the generation without changing the policy and without emitting a load event, so an exact match is not always available. Startup does not emit a load event for every policy source. When no such event precedes a decision, the event stream alone does not identify its policy. Do not join on timestamps. Lines from different emitters can be written out of order, and the generation records the policy a decision was actually made under, not the one that was current when the line was written.
+
+Policy validation failures emit a `CONFIG` event with `active_generation` and `candidate_policy_hash`, the hash of the rejected candidate. Its state is `fail_closed` when every request is denied under that generation, or `retained_last_valid` when the previous policy stays active.
+
+The generation starts at zero when the supervisor starts. Use the `LIFECYCLE` start event as the boundary between supervisor lifetimes.
+
+Layer 4 decisions (CONNECT, forward proxy, and transparent TCP) and layer 7 decisions for REST, JSON-RPC, MCP, GraphQL, and inspected WebSocket messages carry the generation. Denials made without matching a rule, such as when the calling process cannot be identified, carry the generation that was active when the denial was made. Events that are not policy decisions, such as MCP protocol version rejections and credential binding failures, leave `firewall_rule.version` unset. Policy DNS refusals also leave it unset. When the workload then connects anyway, the transparent TCP denial that follows carries the generation. Connections closed because the policy changed carry the generation they were authorized under.
 
 ## OCSF Event Classes in JSON
 

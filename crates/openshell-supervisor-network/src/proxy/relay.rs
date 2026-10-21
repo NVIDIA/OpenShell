@@ -152,6 +152,7 @@ pub(super) fn prepare_http_relay<'a>(
         emit_l7_tunnel_close_after_policy_change(
             &decision.intent.destination.host,
             decision.intent.destination.port,
+            decision.policy_generation,
             error,
         );
         return None;
@@ -164,6 +165,7 @@ pub(super) fn prepare_http_relay<'a>(
                 emit_l7_tunnel_close_after_policy_change(
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
+                    decision.policy_generation,
                     error,
                 );
                 return None;
@@ -185,6 +187,7 @@ pub(super) fn prepare_http_relay<'a>(
                 emit_l7_tunnel_close_after_policy_change(
                     &decision.intent.destination.host,
                     decision.intent.destination.port,
+                    decision.policy_generation,
                     error,
                 );
                 return None;
@@ -212,6 +215,7 @@ pub(super) fn prepare_raw_relay(
         emit_l7_tunnel_close_after_policy_change(
             &decision.intent.destination.host,
             decision.intent.destination.port,
+            decision.policy_generation,
             error,
         );
         return None;
@@ -223,6 +227,7 @@ pub(super) fn prepare_raw_relay(
             emit_l7_tunnel_close_after_policy_change(
                 &decision.intent.destination.host,
                 decision.intent.destination.port,
+                decision.policy_generation,
                 error,
             );
             None
@@ -350,6 +355,7 @@ fn emit_stale_relay_close(request: &L7EvalContext, guard: &PolicyGenerationGuard
     emit_l7_tunnel_close_after_policy_change(
         &request.host,
         request.port,
+        guard.captured_generation(),
         miette::miette!(
             "policy generation is stale [captured_generation:{} current_generation:{}]",
             guard.captured_generation(),

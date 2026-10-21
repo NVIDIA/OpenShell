@@ -359,6 +359,7 @@ where
                     "l7-mcp",
                     &reason,
                     summary.as_deref(),
+                    None,
                 ));
                 emit_activity(ctx, true, "l7_parse_rejection");
                 let body = serde_json::json!({
@@ -440,6 +441,7 @@ where
         "l7-mcp",
         &reason,
         summary.as_deref(),
+        None,
     ));
     let deny_group = match error {
         crate::l7::mcp::McpProtocolVersionError::NotAllowed(_) => "l7_policy",
@@ -1392,7 +1394,16 @@ where
         };
         let Some(config) = select_l7_config_for_path(configs, &route_target) else {
             let reason = "no L7 endpoint path matched request";
-            emit_l7_request_log(ctx, &req.action, &route_target, "deny", "l7", reason, None);
+            emit_l7_request_log(
+                ctx,
+                &req.action,
+                &route_target,
+                "deny",
+                "l7",
+                reason,
+                None,
+                engine.captured_generation(),
+            );
             crate::l7::rest::RestProvider::default()
                 .deny_with_redacted_target(
                     &req,
@@ -1595,6 +1606,7 @@ where
             engine_type,
             &reason,
             protocol_summary.as_deref(),
+            engine.captured_generation(),
         );
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
@@ -1844,6 +1856,7 @@ fn select_l7_config_for_path<'a>(
         .max_by_key(|config| config.path_specificity())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_l7_request_log(
     ctx: &L7EvalContext,
     action: &str,
@@ -1852,6 +1865,7 @@ fn emit_l7_request_log(
     engine_type: &str,
     reason: &str,
     protocol_summary: Option<&str>,
+    policy_generation: u64,
 ) {
     let event = build_l7_request_event(
         ctx,
@@ -1861,11 +1875,16 @@ fn emit_l7_request_log(
         engine_type,
         reason,
         protocol_summary,
+        Some(policy_generation),
     );
     egress_emit!(event);
     emit_activity(ctx, decision_str == "deny", "l7_policy");
 }
 
+/// `policy_generation` is the policy engine generation that produced the
+/// decision. Protocol validation rejections that happen before policy
+/// evaluation pass `None`.
+#[allow(clippy::too_many_arguments)]
 fn build_l7_request_event(
     ctx: &L7EvalContext,
     action: &str,
@@ -1874,6 +1893,7 @@ fn build_l7_request_event(
     engine_type: &str,
     reason: &str,
     protocol_summary: Option<&str>,
+    policy_generation: Option<u64>,
 ) -> openshell_ocsf::OcsfEvent {
     let (action_id, disposition_id, severity) = match decision_str {
         "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
@@ -1894,16 +1914,20 @@ fn build_l7_request_event(
         "L7_REQUEST {decision_str} {action} {}:{}{}{protocol_suffix} reason={reason}",
         ctx.host, ctx.port, redacted_target,
     );
-    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+    let builder = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
         .disposition(disposition_id)
         .severity(severity)
         .http_request(HttpRequest::new(action, ctx.ocsf_url(redacted_target)))
-        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-        .firewall_rule(&ctx.policy_name, engine_type)
-        .message(message)
-        .build()
+        .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port));
+    let builder = match policy_generation {
+        Some(generation) => {
+            builder.firewall_rule_at_generation(&ctx.policy_name, engine_type, generation)
+        }
+        None => builder.firewall_rule(&ctx.policy_name, engine_type),
+    };
+    builder.message(message).build()
 }
 
 fn l7_protocol_log_summary(
@@ -2367,7 +2391,7 @@ where
                     ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                .firewall_rule(&ctx.policy_name, "l7")
+                .firewall_rule_at_generation(&ctx.policy_name, "l7", engine.captured_generation())
                 .message(format!(
                     "L7_REQUEST {decision_str} {} {}:{}{} reason={}",
                     request_info.action, ctx.host, ctx.port, redacted_target, reason,
@@ -2611,7 +2635,7 @@ pub(crate) fn emit_policy_reload(
             .severity(SeverityId::Medium)
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(host, port))
-            .firewall_rule(policy_name, "l7")
+            .firewall_rule_at_generation(policy_name, "l7", guard.captured_generation())
             .message(format!(
                 "L7 tunnel closed after policy reload [host:{} port:{} captured_generation:{} current_generation:{}]",
                 host,
@@ -2813,7 +2837,11 @@ where
                     ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                .firewall_rule(&ctx.policy_name, jsonrpc_engine_type(config.protocol))
+                .firewall_rule_at_generation(
+                    &ctx.policy_name,
+                    jsonrpc_engine_type(config.protocol),
+                    policy_version,
+                )
                 .message(jsonrpc_log_message(
                     decision_str,
                     &request_info.action,
@@ -3118,7 +3146,11 @@ where
                     ctx.ocsf_url(&redacted_target),
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                .firewall_rule(&ctx.policy_name, "l7-graphql")
+                .firewall_rule_at_generation(
+                    &ctx.policy_name,
+                    "l7-graphql",
+                    engine.captured_generation(),
+                )
                 .message(format!(
                     "GRAPHQL_L7_REQUEST {decision_str} {} {}:{}{} {gql_summary} reason={}",
                     request_info.action, ctx.host, ctx.port, redacted_target, reason,
@@ -3551,7 +3583,14 @@ fn reevaluate_transformed_body(
 
     if let Some(reason) = l7_request_hard_deny_reason(config.protocol, &transformed_info) {
         let reason = format!("middleware transformation rejected: {reason}");
-        emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
+        emit_transformed_body_decision(
+            ctx,
+            request_info,
+            engine_type,
+            "deny",
+            &reason,
+            engine.captured_generation(),
+        );
         return Ok(Some(reason));
     }
 
@@ -3561,10 +3600,24 @@ fn reevaluate_transformed_body(
     }
     let reason = format!("middleware transformation denied by policy: {reason}");
     if config.enforcement == EnforcementMode::Audit {
-        emit_transformed_body_decision(ctx, request_info, engine_type, "audit", &reason);
+        emit_transformed_body_decision(
+            ctx,
+            request_info,
+            engine_type,
+            "audit",
+            &reason,
+            engine.captured_generation(),
+        );
         return Ok(None);
     }
-    emit_transformed_body_decision(ctx, request_info, engine_type, "deny", &reason);
+    emit_transformed_body_decision(
+        ctx,
+        request_info,
+        engine_type,
+        "deny",
+        &reason,
+        engine.captured_generation(),
+    );
     Ok(Some(reason))
 }
 
@@ -3589,6 +3642,7 @@ fn emit_transformed_body_decision(
     engine_type: &str,
     decision_str: &str,
     reason: &str,
+    policy_generation: u64,
 ) {
     let (action_id, disposition_id, severity) = match decision_str {
         "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
@@ -3608,7 +3662,7 @@ fn emit_transformed_body_decision(
             ctx.ocsf_url(&request_info.target),
         ))
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-        .firewall_rule(&ctx.policy_name, engine_type)
+        .firewall_rule_at_generation(&ctx.policy_name, engine_type, policy_generation)
         .message(format!(
             "L7_REQUEST_TRANSFORMED {decision_str} {} {}:{}{} reason={}",
             request_info.action, ctx.host, ctx.port, request_info.target, reason
@@ -4084,7 +4138,7 @@ mod trace_tests {
                 ..Default::default()
             };
             egress_emit!(build_l7_request_event(
-                &ctx, "GET", "/", "deny", "l7-rest", "denied", None
+                &ctx, "GET", "/", "deny", "l7-rest", "denied", None, None
             ));
         })
         .await;
@@ -10077,14 +10131,133 @@ network_policies:
             "l7",
             "no L7 endpoint path matched request",
             None,
+            Some(6),
         );
 
         assert_eq!(event.class_uid(), 4002);
         assert_eq!(event.base().severity, SeverityId::Medium);
+        // The shorthand projection is unchanged; the generation is carried in
+        // the structured record.
         assert_eq!(
             event.format_shorthand(),
             "HTTP:GET [MED] DENIED GET https://gateway.example.test/other [policy:route_api engine:l7] [reason:L7_REQUEST deny GET gateway.example.test:443/other reason=no L7 endpoint path matched request]"
         );
+        let json = event.to_json().unwrap();
+        assert_eq!(json["firewall_rule"]["name"], "route_api");
+        assert_eq!(json["firewall_rule"]["version"], "6");
+    }
+
+    #[test]
+    fn protocol_rejection_before_policy_evaluation_omits_generation() {
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            ..Default::default()
+        };
+
+        let event = build_l7_request_event(
+            &ctx,
+            "POST",
+            "/mcp",
+            "deny",
+            "l7-mcp",
+            "unsupported MCP protocol version",
+            None,
+            None,
+        );
+
+        let json = event.to_json().unwrap();
+        assert_eq!(json["firewall_rule"]["type"], "l7-mcp");
+        assert!(json["firewall_rule"].get("version").is_none());
+    }
+
+    struct DecisionEventCapture(Arc<std::sync::Mutex<Vec<serde_json::Value>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DecisionEventCapture {
+        fn on_event(&self, _: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(event) = openshell_ocsf::tracing_layers::clone_current_event() {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::to_value(&event).unwrap());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn route_selected_denial_records_the_evaluating_policy_generation() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        const CHILD: &str = "OPENSHELL_TEST_L7_DECISION_GENERATION_CHILD";
+        // Tracing callsite interest is process-wide, so run the capture in an
+        // isolated child process, as the policy DNS event tests do.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "l7::relay::tests::route_selected_denial_records_the_evaluating_policy_generation",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let engine = OpaEngine::from_strings(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY).unwrap();
+        // Advance past the initial generation so the test cannot pass by
+        // accident on a zero default.
+        engine
+            .reload(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY)
+            .unwrap();
+        engine
+            .reload(TEST_POLICY, ENCODED_SLASH_SCOPING_POLICY)
+            .unwrap();
+        let generation = engine.current_generation();
+        assert_eq!(generation, 2);
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let configs = encoded_slash_scoping_configs();
+        let ctx = encoded_slash_scoping_ctx();
+
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscriber = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(DecisionEventCapture(Arc::clone(&events))),
+        );
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, _upstream) = tokio::io::duplex(8192);
+        app.write_all(
+            b"GET /other HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        drop(app);
+        let _ = relay_with_route_selection(
+            &configs,
+            tunnel_engine,
+            &mut relay_client,
+            &mut relay_upstream,
+            &ctx,
+        )
+        .await;
+
+        let events = events.lock().unwrap();
+        let denial = events
+            .iter()
+            .find(|event| {
+                event["class_uid"] == 4002
+                    && event["action"] == "Denied"
+                    && event["firewall_rule"]["name"] == "route_api"
+            })
+            .unwrap_or_else(|| panic!("expected an L7 denial event, got {events:?}"));
+        assert_eq!(denial["firewall_rule"]["version"], generation.to_string());
     }
 
     #[test]
@@ -10103,7 +10276,7 @@ network_policies:
                 ..Default::default()
             };
 
-            let event = build_l7_request_event(&ctx, "GET", "/v1", "allow", "l7", "ok", None);
+            let event = build_l7_request_event(&ctx, "GET", "/v1", "allow", "l7", "ok", None, None);
 
             let json = event.to_json().unwrap();
             assert_eq!(json["http_request"]["url"]["scheme"], scheme);
