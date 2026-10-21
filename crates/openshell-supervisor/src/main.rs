@@ -566,32 +566,50 @@ fn main() -> Result<()> {
                         "isolation-backend role started without validated runtime inputs"
                     ));
                 };
+                let config = openshell_supervisor::SandboxInstanceConfig {
+                    command,
+                    workdir,
+                    timeout_secs: args.timeout,
+                    interactive,
+                    await_main_process_attachment,
+                    sandbox_id: args.sandbox_id,
+                    sandbox: args.sandbox,
+                    container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                    openshell_endpoint: args.openshell_endpoint,
+                    policy_rules: args.policy_rules,
+                    policy_data: args.policy_data,
+                    ssh_socket_path: args.ssh_socket_path,
+                    shared_ssh_socket: openshell_supervisor::shared_ssh_socket_from_env(),
+                    upstream_proxy_args,
+                    additional_ca_bundle: args.additional_ca_bundle,
+                    backend_descriptor,
+                    auth_bundle,
+                    admitted_isolation_backend: Some(admitted_backend),
+                    main_exit_marker: args.main_exit_marker,
+                    trace_context: openshell_supervisor::TraceContext::from_environment(),
+                    provider_workload_api_socket: std::env::var_os(
+                        openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+                    )
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+                    proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+                };
+                // Log push already shares these credentials and the logging
+                // layers these OCSF JSON settings.
+                let bindings = openshell_supervisor::SandboxInstanceBindings::dedicated(
+                    &config,
+                    gateway_credentials,
+                    openshell_ocsf::OcsfJsonSettings {
+                        enabled: ocsf_enabled,
+                        target_version: ocsf_schema_version,
+                    },
+                );
                 let result = Box::pin(openshell_supervisor::run_sandbox_with_backend(
                     backend_setup.as_ref(),
-                    openshell_supervisor::SandboxRunConfig {
-                        command,
-                        workdir,
-                        timeout_secs: args.timeout,
-                        interactive,
-                        await_main_process_attachment,
-                        sandbox_id: args.sandbox_id,
-                        sandbox: args.sandbox,
-                        openshell_endpoint: args.openshell_endpoint,
-                        policy_rules: args.policy_rules,
-                        policy_data: args.policy_data,
-                        ssh_socket_path: args.ssh_socket_path,
-                        health_socket_path: args.health_socket_path,
-                        health_port: args.health_port,
-                        ocsf_enabled,
-                        ocsf_schema_version,
-                        upstream_proxy_args,
-                        additional_ca_bundle: args.additional_ca_bundle,
-                        backend_descriptor,
-                        auth_bundle,
-                        gateway_credentials: Some(gateway_credentials),
-                        admitted_isolation_backend: Some(admitted_backend),
-                        main_exit_marker: args.main_exit_marker,
-                    },
+                    config,
+                    bindings,
+                    args.health_socket_path,
+                    args.health_port,
                 ))
                 .await;
                 supervisor_exit(result)
