@@ -90,8 +90,10 @@ func resolveGatewayDir(name string) (string, ConfigSource, error) {
 	return "", "", fmt.Errorf("%w: %q", ErrGatewayNotFound, name)
 }
 
-// validateGatewayName accepts a single safe path component,
-// matching the Rust CLI's gateway-name rules.
+// validateGatewayName accepts portable, single-component gateway names.
+// Host-derived FQDN and IPv4 names may contain dots. Windows device names,
+// reserved filename characters, and ambiguous dot components are rejected
+// on every platform to keep SDK behavior consistent.
 func validateGatewayName(name string) error {
 	if name == "" {
 		return fmt.Errorf("%w: name must not be empty", ErrInvalidGatewayName)
@@ -104,6 +106,33 @@ func validateGatewayName(name string) error {
 	}
 	if strings.ContainsRune(name, '\x00') {
 		return fmt.Errorf("%w: name must not contain NUL", ErrInvalidGatewayName)
+	}
+	if strings.HasPrefix(name, ".") || strings.HasSuffix(name, ".") || strings.Contains(name, "..") {
+		return fmt.Errorf("%w: invalid dot placement", ErrInvalidGatewayName)
+	}
+
+	// This ASCII-only grammar excludes Windows reserved filename characters
+	// (including colons in raw IPv6 addresses), spaces, and control characters.
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("%w: non-portable character %q", ErrInvalidGatewayName, r)
+	}
+
+	// Windows treats device names as reserved even with an extension:
+	// e.g. CON.txt and COM1.example.com refer to device names.
+	stem, _, _ := strings.Cut(name, ".")
+	stem = strings.ToUpper(stem)
+	switch stem {
+	case "CON", "PRN", "AUX", "NUL":
+		return fmt.Errorf("%w: reserved Windows device name", ErrInvalidGatewayName)
+	}
+	// Reject COM0/LPT0 conservatively too, for Windows portability.
+	if len(stem) == 4 && (strings.HasPrefix(stem, "COM") || strings.HasPrefix(stem, "LPT")) &&
+		stem[3] >= '0' && stem[3] <= '9' {
+		return fmt.Errorf("%w: reserved Windows device name", ErrInvalidGatewayName)
 	}
 	return nil
 }

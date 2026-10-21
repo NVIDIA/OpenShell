@@ -115,10 +115,13 @@ func TestValidateGatewayName_ValidNames(t *testing.T) {
 		"A_B_C",
 		"gw.example.com",
 		"192.0.2.1",
-		"[2001:db8::1]",
-		".hidden",
 		"foo.bar",
 		"config.json",
+		"gw-1.example.com",
+		"COM10",
+		"LPT10",
+		"CONSOLE",
+		"com1x.example.com",
 	}
 
 	for _, name := range validNames {
@@ -223,13 +226,33 @@ func TestValidateGatewayName_SpecialCharacters(t *testing.T) {
 		{"foo#bar", "hash"},
 		{"café", "non-ASCII"},
 		{"日本語", "unicode"},
-		{"foo bar", "tab (space)"},
+		{"foo\tbar", "tab"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.desc, func(t *testing.T) {
 			err := validateGatewayName(tc.name)
-			assert.NoError(t, err)
+			assert.ErrorIs(t, err, ErrInvalidGatewayName)
+		})
+	}
+}
+
+// Windows filename rules apply regardless of the host operating system.
+func TestValidateGatewayName_WindowsFilenameRules(t *testing.T) {
+	invalid := []string{
+		"CON", "con.txt", "CON.example.com",
+		"PRN", "prn.log", "AUX", "aux.json", "NUL", "nul.config",
+		"COM0", "COM1", "com9.txt", "COM1.example.com",
+		"LPT0", "LPT1", "lpt9.log",
+		"gateway.", ".hidden", "foo..bar", "gw.example.com.",
+		"gateway ", "foo bar", "foo:stream", "C:gateway",
+		"foo|bar", "foo?bar", "foo*bar", "foo<bar", "foo>bar", "foo\"bar",
+		"gw\x01bar", "[2001:db8::1]", "2001:db8::1",
+	}
+	for _, name := range invalid {
+		t.Run(name, func(t *testing.T) {
+			err := validateGatewayName(name)
+			assert.ErrorIs(t, err, ErrInvalidGatewayName)
 		})
 	}
 }
