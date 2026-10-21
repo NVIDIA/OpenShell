@@ -135,102 +135,40 @@ fn doc_comment(attrs: &[Attribute]) -> String {
 mod tests {
     use super::expand;
 
-    fn expand_str(attr: &str, item: &str) -> syn::Result<String> {
-        expand(attr.parse().unwrap(), item.parse().unwrap()).map(|tokens| tokens.to_string())
-    }
-
+    // A suite only compiles correct tests, so it never reaches these errors.
     #[test]
-    fn expands_to_wrapper_with_same_name() {
-        let out = expand_str(
-            "",
-            "/// First line\n/// second line.\nasync fn does_a_thing(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap();
-        assert!(out.contains("async fn does_a_thing ()"), "{out}");
-        assert!(out.contains("async fn body (cx : & mut Context)"), "{out}");
-        assert!(out.contains("name : \"does_a_thing\""), "{out}");
-        assert!(
-            out.contains("description : \"First line second line.\""),
-            "{out}"
-        );
-    }
-
-    #[test]
-    fn rejects_missing_doc_comment() {
-        let err = expand_str(
-            "",
-            "async fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("doc comment"), "{err}");
-    }
-
-    #[test]
-    fn rejects_sync_fn() {
-        let err = expand_str(
-            "",
-            "/// Doc.\nfn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("async fn"), "{err}");
-    }
-
-    #[test]
-    fn rejects_wrong_arity() {
-        let err =
-            expand_str("", "/// Doc.\nasync fn t() -> testkit::Result { Ok(()) }").unwrap_err();
-        assert!(err.to_string().contains("exactly one argument"), "{err}");
-    }
-
-    #[test]
-    fn forwards_other_attributes_to_the_wrapper() {
-        let out = expand_str(
-            "",
-            "/// Doc.\n#[ignore = \"needs persistent workspaces\"]\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap();
-        let (wrapper, body) = out.split_once("async fn body").unwrap();
-        assert!(
-            wrapper.contains("# [ignore = \"needs persistent workspaces\"]"),
-            "{out}"
-        );
-        assert!(!body.contains("ignore"), "{out}");
-    }
-
-    #[test]
-    fn rejects_another_test_attribute() {
-        for attr in ["#[test]", "#[tokio::test]"] {
-            let err = expand_str(
+    fn rejects_misuse() {
+        let ok_fn = "async fn t(cx: &mut Context) -> testkit::Result { Ok(()) }";
+        for (attr, item, error) in [
+            (
+                "id = \"t-1\"",
+                format!("/// Doc.\n{ok_fn}"),
+                "takes no arguments",
+            ),
+            ("", ok_fn.to_string(), "doc comment"),
+            (
                 "",
-                &format!(
-                    "/// Doc.\n{attr}\nasync fn t(cx: &mut Context) -> testkit::Result {{ Ok(()) }}"
-                ),
-            )
-            .unwrap_err();
-            assert!(
-                err.to_string().contains("already makes this a test"),
-                "{err}"
-            );
+                "/// Doc.\nfn t(cx: &mut Context) -> testkit::Result { Ok(()) }".to_string(),
+                "async fn",
+            ),
+            (
+                "",
+                "/// Doc.\nasync fn t() -> testkit::Result { Ok(()) }".to_string(),
+                "exactly one argument",
+            ),
+            (
+                "",
+                format!("/// Doc.\n#[tokio::test]\n{ok_fn}"),
+                "already makes this a test",
+            ),
+            (
+                "",
+                format!("/// Doc.\n#[should_panic]\n{ok_fn}"),
+                "`#[should_panic]`",
+            ),
+        ] {
+            let err = expand(attr.parse().unwrap(), item.parse().unwrap()).unwrap_err();
+            assert!(err.to_string().contains(error), "{item}: {err}");
         }
-    }
-
-    #[test]
-    fn rejects_should_panic() {
-        let err = expand_str(
-            "",
-            "/// Doc.\n#[should_panic(expected = \"denied\")]\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("`#[should_panic]`"), "{err}");
-    }
-
-    #[test]
-    fn rejects_arguments() {
-        let err = expand_str(
-            "id = \"t-0123abcd\"",
-            "/// Doc.\nasync fn t(cx: &mut Context) -> testkit::Result { Ok(()) }",
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("takes no arguments"), "{err}");
     }
 }

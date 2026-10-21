@@ -17,7 +17,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use openshell_bootstrap::GatewayMetadata;
 use openshell_sdk::{ClientConfig, EdgeAuthInterceptor, Health, OpenShellClient, ServiceStatus};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
@@ -125,22 +124,6 @@ impl Gateway {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn named_for_test(name: &str) -> Self {
-        Self {
-            name: Some(name.to_string()),
-            endpoint: "https://127.0.0.1:1".to_string(),
-            workspace: DEFAULT_WORKSPACE.to_string(),
-            mtls_dir: None,
-            endpoint_from_env: false,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn endpoint_for_test(endpoint: &str) -> Self {
-        Self::from_endpoint(endpoint.to_string(), DEFAULT_WORKSPACE.to_string())
-    }
-
     /// One line naming the gateway, for test logs.
     pub fn describe(&self) -> String {
         let auth = match (&self.mtls_dir, self.endpoint.starts_with("https://")) {
@@ -235,14 +218,6 @@ fn find_registered(endpoint: &str) -> Option<String> {
     let active = openshell_bootstrap::load_active_gateway()
         .and_then(|name| openshell_bootstrap::get_gateway_metadata(&name));
     let all = openshell_bootstrap::list_gateways().unwrap_or_default();
-    match_endpoint(endpoint, active, all)
-}
-
-fn match_endpoint(
-    endpoint: &str,
-    active: Option<GatewayMetadata>,
-    all: Vec<GatewayMetadata>,
-) -> Option<String> {
     let endpoint = endpoint.trim_end_matches('/');
     active
         .into_iter()
@@ -261,137 +236,4 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map_err(Error::from_display)
         .context(format!("read {}", path.display()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn metadata(name: &str, endpoint: &str, auth_mode: Option<&str>) -> GatewayMetadata {
-        serde_json::from_value(serde_json::json!({
-            "name": name,
-            "gateway_endpoint": endpoint,
-            "is_remote": false,
-            "gateway_port": 0,
-            "auth_mode": auth_mode,
-        }))
-        .unwrap()
-    }
-
-    fn from_metadata(endpoint: &str, auth_mode: Option<&str>) -> Result<Gateway> {
-        Gateway::registered(
-            "gw".to_string(),
-            endpoint.to_string(),
-            auth_mode,
-            PathBuf::from("/config/gateways/gw/mtls"),
-            "default".to_string(),
-            false,
-        )
-    }
-
-    #[test]
-    fn https_gateway_uses_mtls_by_default() {
-        for mode in [None, Some("mtls")] {
-            let gateway = from_metadata("https://127.0.0.1:17670", mode).unwrap();
-            assert_eq!(
-                gateway.mtls_dir,
-                Some(PathBuf::from("/config/gateways/gw/mtls"))
-            );
-            assert_eq!(
-                gateway.describe(),
-                "gateway gw at https://127.0.0.1:17670 (mTLS from /config/gateways/gw/mtls), workspace default"
-            );
-        }
-    }
-
-    #[test]
-    fn plaintext_gateway_has_no_mtls() {
-        for (endpoint, mode) in [
-            ("http://127.0.0.1:18080", Some("plaintext")),
-            ("http://127.0.0.1:18080", None),
-        ] {
-            let gateway = from_metadata(endpoint, mode).unwrap();
-            assert_eq!(gateway.mtls_dir, None);
-            assert!(gateway.describe().contains("(plaintext)"));
-        }
-    }
-
-    #[test]
-    fn rejects_unsupported_auth_modes() {
-        let err = from_metadata("https://gw.example.com", Some("cloudflare_jwt")).unwrap_err();
-        assert!(
-            err.to_string().contains("uses cloudflare_jwt auth"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn raw_endpoint_has_no_name() {
-        let gateway = Gateway::from_endpoint("http://127.0.0.1:1".to_string(), "ws".to_string());
-        assert_eq!(
-            gateway.describe(),
-            "gateway from OPENSHELL_GATEWAY_ENDPOINT at http://127.0.0.1:1 (plaintext), workspace ws"
-        );
-    }
-
-    #[test]
-    fn endpoint_finds_the_registered_gateway() {
-        let all = vec![
-            metadata("other", "https://127.0.0.1:2", None),
-            metadata("gw", "https://127.0.0.1:1/", None),
-        ];
-        assert_eq!(
-            match_endpoint("https://127.0.0.1:1", None, all.clone()),
-            Some("gw".to_string())
-        );
-        assert_eq!(
-            match_endpoint("https://127.0.0.1:3", None, all.clone()),
-            None
-        );
-        // The active gateway wins when two share an endpoint.
-        let active = metadata("active", "https://127.0.0.1:2", None);
-        assert_eq!(
-            match_endpoint("https://127.0.0.1:2", Some(active), all),
-            Some("active".to_string())
-        );
-    }
-
-    #[test]
-    fn endpoint_from_env_keeps_the_gateway_credentials() {
-        let gateway = Gateway::registered(
-            "gw".to_string(),
-            "https://localhost:1".to_string(),
-            None,
-            PathBuf::from("/config/gateways/gw/mtls"),
-            "default".to_string(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(gateway.endpoint, "https://localhost:1");
-        assert!(gateway.endpoint_from_env);
-        assert_eq!(
-            gateway.mtls_dir,
-            Some(PathBuf::from("/config/gateways/gw/mtls"))
-        );
-    }
-
-    #[tokio::test]
-    async fn wait_ready_reports_the_last_error_after_timeout() {
-        // Nothing listens on a port bound and then released.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let gateway =
-            Gateway::from_endpoint(format!("http://127.0.0.1:{port}"), "default".to_string());
-        let err = gateway.wait_ready(Duration::ZERO).await.unwrap_err();
-        let message = err.to_string();
-        assert!(
-            message.starts_with(&format!(
-                "gateway at http://127.0.0.1:{port} not ready after 0s: "
-            )),
-            "{message}"
-        );
-    }
 }

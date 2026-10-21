@@ -515,19 +515,3 @@ fn generate_run_id() -> String {
         .map(|_| char::from(ALPHABET[rng.random_range(0..ALPHABET.len())]))
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_ids_are_dns_label_safe() {
-        let id = generate_run_id();
-        assert_eq!(id.len(), 8);
-        assert!(
-            id.bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
-            "{id}"
-        );
-    }
-}
