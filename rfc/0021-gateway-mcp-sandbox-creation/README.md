@@ -101,11 +101,11 @@ sandbox, for whom, and was it allowed".
   [Asking for more than the parent has](#asking-for-more-than-the-parent-has)).
   A single prompt that shows the child's request and approves it in one step is
   future work.
-- **A results channel.** A parent gets results from `exec` output on tool
-  children, or from files it reads with `get_file` while an agent child runs; a
-  child that has exited leaves only its exit code. A result the gateway keeps
-  for the parent is future work (see
-  [Returning results to the parent](#returning-results-to-the-parent)).
+- **Large or streamed results.** A child returns one final result of at most
+  32 KiB (see [Returning results](#returning-results)). Bigger output stays in
+  files the parent reads with `get_file` while the child runs; progress updates
+  and messages between running agents are future work (see
+  [Agent-to-agent communication through the gateway](#agent-to-agent-communication-through-the-gateway)).
 
 ## Proposal
 
@@ -232,6 +232,9 @@ service SandboxChildren {
   }
   rpc GetSandboxLimits(GetSandboxLimitsRequest) returns (GetSandboxLimitsResponse) {
     option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:read" };
+  }
+  rpc SubmitChildResult(SubmitChildResultRequest) returns (SubmitChildResultResponse) {
+    option (authorization) = { auth_mode: "sandbox" };
   }
 }
 ```
@@ -781,13 +784,14 @@ made.
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
 | `create_sandbox` | users and sandboxes | `name`, `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`; users only: `image`, `grant` | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `PROVER_INCONCLUSIVE`, `PROGRAM_NOT_ALLOWED`, `GLOBAL_POLICY_ACTIVE`, `EXCEEDS_GLOBAL_POLICY`, `IN_PROGRESS`, `STALE_ADMISSION`, `INVALID_ARGUMENT` (request_id reused with different arguments) |
-| `wait` | sandboxes | `handle`, `timeout_s` | `phase`, `exit_code` | `NOT_YOUR_CHILD` |
+| `wait` | sandboxes | `handle`, `timeout_s`, `for_result` | `phase`, `exit_code`, `result` (direct parent only) | `NOT_YOUR_CHILD`, `NOT_DIRECT_CHILD` (`for_result` on a grandchild) |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
 | `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
 | `stop_sandbox` | sandboxes | `handle` | `stopped` | `NOT_YOUR_CHILD` |
 | `get_output` | sandboxes | `handle` | recent log lines of the child; not a durable result, and a child's own standard output is not included | `NOT_YOUR_CHILD` |
 | `list_children` | sandboxes | none | children with kind, lifetime, depth | none |
 | `get_limits` | sandboxes | none | depth, children and total used and allowed; `can_create_children` (agents) and `can_create_tools` | none |
+| `submit_result` | sandboxes | `result` (at most 32 KiB) | `saved`, `repeated` | `NOT_A_CHILD`, `TOO_LARGE`, `ALREADY_SUBMITTED` (different text) |
 | `grant_list` | users | none | grants in the caller's workspace | none |
 | `grant_create` | users | `handle` of a running top-level sandbox, grant fields | the grant | `NOT_ALLOWED`, `ALREADY_EXISTS` |
 | `grant_update` | users | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits, or `revoked` | `NOT_FOUND`, `NOT_ALLOWED` |
@@ -837,8 +841,8 @@ delegated agents usually work for a long time; one-shot children pass
 deleted, crashed or reaped, the gateway stops its children first, deepest first.
 For each child it first bumps the authentication epoch, so the child's next
 call to the gateway fails, then stops it through the compute driver, then
-deletes it. Results the parent has not read are lost; a parent whose work is
-done waits for its children with `wait`. An orphan reaper removes children
+deletes it. A result the parent has not read is deleted with its child; a
+parent whose work is done waits for its children with `wait`. An orphan reaper removes children
 whose parent no longer exists, for example after a gateway crash.
 
 **A parent with running children is never idle.** Otherwise its idle timer
@@ -851,6 +855,37 @@ the proposal fits the child's ceiling and rejects it without asking if it does
 not. Otherwise the user approves as today, with `openshell rule approve`, the
 TUI or auto-approval. Proposals, from a child or from a parent asking for access
 to pass on, are the only point at which the user may be prompted during a run.
+
+### Returning results
+
+**A child hands one final result to its parent, and the parent's `wait`
+returns it.** This is how harnesses already return a sub-agent's answer: the
+spawn call's result. Without it, a parent has to poll a result file with
+`get_file`, and the child has to keep running until the file is read, because
+its files go when it exits.
+
+- **`submit_result { result }`** is called by the child through its own door.
+  The gateway takes the child's identity from the door's token, so a child can
+  submit only its own result. A sandbox with no parent gets `NOT_A_CHILD`.
+- **One result per child.** The same text again is a no-op; different text is
+  refused with `ALREADY_SUBMITTED`.
+- **At most 32 KiB**, so the request stays under the door's 64 KiB body limit
+  after JSON escaping and an oversized result gets the gateway's `TOO_LARGE`.
+  The door answers a body over its own limit with HTTP 413 and the size.
+- **Saved before the child is told "saved"**, as a `sandbox_result` object keyed
+  by the child's id, so the child can exit at once and the result survives a
+  gateway restart.
+- **`wait` with `for_result: true`** keeps waiting past READY until the child
+  submits or exits, and returns `result` with the phase and exit code. A child
+  that exits without submitting returns `result: null` and its exit code. A
+  `wait` that times out leaves the result for the next `wait`.
+- **Only the direct parent gets it.** A grandparent may still `wait` for a
+  grandchild, but `for_result` on it is refused with `NOT_DIRECT_CHILD` and a
+  plain `wait` shows no result. Each level decides what to pass up.
+- **Deleted with the child**, including by cascade stop.
+
+A result is text written by the child, so the parent's harness must treat it as
+data, not instructions (see [Risks](#risks)).
 
 ### Images and resources
 
@@ -1028,8 +1063,9 @@ The work is phased so that each phase is usable and testable on its own:
   `urn:openshell:gateway-mcp` token. Ship host callers first, then in-sandbox
   callers. Carrying gRPC through the door comes in a later phase (see
   [Open questions](#open-questions)).
-- **Phase 3: Tool sandboxes.** `kind: tool`, `exec` with command audit, and the
-  idle timeout.
+- **Phase 3: Tool sandboxes and results.** `kind: tool`, `exec` with command
+  audit, and the idle timeout; `submit_result`, the `sandbox_result` object and
+  `wait`'s `result` and `for_result`.
 - **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
   proof of every grant holder's policy (at create and when a grant is
   attached), child policy and policy write against the global policy in
@@ -1046,12 +1082,18 @@ Validation runs at each phase: unit tests for grant parsing, limits, the program
 check and the ceiling proof; gateway tests for refusals; and an end-to-end
 scenario with the Docker driver that exercises every refusal listed in this RFC.
 
-A proof of concept of phases 1 to 3 exists on the branch `gateway-mcp-poc`
+A proof of concept of phases 1 to 3 exists on the branch
+[`gateway-mcp-poc`](https://github.com/patkraw/OpenShell/tree/gateway-mcp-poc)
 (`crates/openshell-gateway-mcp/`, `crates/openshell-server/src/children.rs`,
 `crates/openshell-supervisor-network/src/gateway_mcp_door.rs`,
-`examples/gateway-mcp-poc/`). Its current end-to-end result, tied to a commit,
-is in `examples/gateway-mcp-poc/README.md` under Results. The proof of concept
-keeps grants and lineage in memory and forwards the supervisor's main session
+`examples/gateway-mcp-poc/`), with
+[tutorials](https://github.com/patkraw/OpenShell/tree/gateway-mcp-poc/examples/gateway-mcp-poc/tutorials)
+that run as written. Returning results is in
+[tutorial 02](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result),
+and `run-pi-result-demo.sh` runs it with a real Pi lead and Pi worker. Its
+current end-to-end result, tied to a commit, is in
+[`examples/gateway-mcp-poc/README.md`](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/README.md#results)
+under Results. The proof of concept keeps grants, lineage and results in memory and forwards the supervisor's main session
 token instead of a dedicated token; it has no durable pending operations,
 startup reconciliation or stopping fence (see [Risks](#risks)), which phases 1
 and 5 add.
@@ -1079,11 +1121,10 @@ and 5 add.
   sandbox can cause; turning the endpoint off in the gateway configuration
   closes the door everywhere after a restart.
 
-- **Results channel.** A child's standard output does not reach the sandbox
-  logs, and `get_file` needs the child to be running. A child that exits before
-  its parent reads its result loses that result. Harnesses must keep agent
-  children running until their result is read; a results channel is future
-  work (see [Returning results to the parent](#returning-results-to-the-parent)).
+- **Results are untrusted input.** A result is text the child wrote, and it
+  reaches the parent's model. A child that was manipulated through a prompt
+  injection can put instructions in it. The gateway checks who submits and how
+  much, not what it says; harnesses must treat a result as data.
 
 - **Spawn storms.** A misbehaving lead can create children up to its grant
   quickly. Atomic counters, `max_total`, operator caps, retry deduplication and
@@ -1102,12 +1143,12 @@ and 5 add.
 
 ## Future work
 
-### Returning results to the parent
+### Larger results and progress
 
-`get_file` lets a parent read a running child's files, but a child's standard
-output does not reach the logs and a child that exits loses its files. A native
-channel would let a child publish a result that the gateway keeps until the
-parent reads it, so `wait` can return the result itself.
+A result is one final message of at most 32 KiB. Larger outputs could be kept
+as artifacts the parent reads by reference after the child exits, and a running
+child could report progress. Both build on the result object and on
+agent-to-agent communication.
 
 ### Agent-to-agent communication through the gateway
 
@@ -1353,15 +1394,14 @@ UpdateSandboxGrant { grant_id, max_breadth: 3, max_total: 4 }
 **8. The lead collects the result and stops the worker.**
 
 `wait` reaching READY means the worker's sandbox is up, not that its agent has
-finished. The worker signals completion explicitly: it writes its result to a
-temporary file and renames it to `/tmp/result.txt` (a rename is atomic), and
-keeps running. The lead polls until the file exists.
+finished. The worker hands its answer back with `submit_result` and exits; the
+lead's `wait` with `for_result` returns as soon as the result is saved.
 
 ```text
-wait { handle: worker } → READY
-get_file { handle: worker, path: /tmp/result.txt } → FILE_ERROR (not written yet)
-… poll …
-get_file { handle: worker, path: /tmp/result.txt } → content
+worker: submit_result { result: "review: LGTM, 2 nits" }
+→ door adds the worker's token → gateway saves sandbox_result for the worker → saved
+lead: wait { handle: worker, for_result: true }
+→ caller is the worker's direct parent → { phase: COMPLETED, exit_code: 0, result: "review: LGTM, 2 nits" }
 stop_sandbox { handle: worker }
 → worker's descendants (none) stopped first, then worker; identity revoked first
 ```
