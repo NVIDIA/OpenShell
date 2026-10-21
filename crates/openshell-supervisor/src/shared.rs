@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Supervisor shared by the sandboxes of one gateway (experimental).
+//! Supervisor host shared by the sandboxes of one gateway.
 
 use miette::Result;
 
