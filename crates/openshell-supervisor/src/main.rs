@@ -17,8 +17,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-mod experimental;
 mod logging;
+mod shared;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
@@ -396,7 +396,7 @@ fn main() -> Result<()> {
             .gateway_endpoint
             .as_deref()
             .ok_or_else(|| miette::miette!("--gateway-endpoint is required for --mode=shared"))?;
-        return experimental::run(address, gateway_endpoint);
+        return shared::run(address, gateway_endpoint);
     }
     if args.gateway_endpoint.is_some() || args.address.is_some() {
         return Err(miette::miette!(
