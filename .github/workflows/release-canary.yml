@@ -239,7 +239,7 @@ jobs:
           docker info
           sudo snap connections openshell | grep -E '^docker +openshell:docker +:docker +'
           openshell --version
-          openshell.prover --version
+          openshell-prover --version
           snap services openshell
           systemctl --user is-enabled --quiet snap.openshell.user-gateway.service
           systemctl --user is-active snap.openshell.user-gateway.service
@@ -283,7 +283,7 @@ jobs:
             read_only:
               - /usr
           EOF
-          result=$(openshell.prover check "$prover_dir/candidate.yaml" \
+          result=$(openshell-prover check "$prover_dir/candidate.yaml" \
             --boundary "$prover_dir/boundary.yaml")
           grep -q '^result: within_boundary$' <<<"$result"
 
