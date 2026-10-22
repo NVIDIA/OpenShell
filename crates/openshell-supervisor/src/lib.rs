@@ -994,7 +994,7 @@ pub async fn run_sandbox_with_backend(
     // supervisor-owned handles shared with the backend.
     let admitted_backend_name = selected_backend.backend_name().to_string();
     let ca_file_paths = Arc::new(std::sync::Mutex::new(None));
-    let (bound, proxy_listener) = selected_backend
+    let attached = selected_backend
         .attach(
             backend_setup::BackendServices {
                 ca_file_paths: ca_file_paths.clone(),
@@ -1011,7 +1011,24 @@ pub async fn run_sandbox_with_backend(
             },
         )
         .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.attach"))
-        .await?;
+        .await;
+    let (bound, proxy_listener) = match attached {
+        Ok(attached) => attached,
+        Err(error) => {
+            if let (Some(sandbox_id), Some(endpoint)) =
+                (sandbox_id.as_deref(), openshell_endpoint.as_deref())
+            {
+                Box::pin(report_attach_refusal(
+                    endpoint,
+                    sandbox_id,
+                    &loaded_policy_origin,
+                    &error,
+                ))
+                .await;
+            }
+            return Err(error);
+        }
+    };
     info!(backend = %admitted_backend_name, "Isolation boundary attached");
     let remote_boundary = (bound, admitted_backend_name, ca_file_paths);
 
@@ -2452,6 +2469,7 @@ async fn load_policy_with_gateway(
             reconciliation_attempts += 1;
             let mut snapshot =
                 grpc_retry("Startup configuration fetch", || gateway.snapshot(sandbox)).await?;
+            let mut written_at_startup = false;
 
             if snapshot.policy.is_none() && !snapshot.configuration_error.is_empty() {
                 reject_startup_configuration(
@@ -2503,7 +2521,10 @@ async fn load_policy_with_gateway(
                 })
                 .await;
                 snapshot = match synced {
-                    Ok(synced) => synced,
+                    Ok(synced) => {
+                        written_at_startup |= synced.version != snapshot.version;
+                        synced
+                    }
                     Err(error) => {
                         // The gateway stored nothing, so report the rejection
                         // against the snapshot this upload was built from and
@@ -2563,7 +2584,10 @@ async fn load_policy_with_gateway(
                 })
                 .await;
                 let canonical = match synced {
-                    Ok(canonical) => canonical,
+                    Ok(canonical) => {
+                        written_at_startup |= canonical.version != snapshot.version;
+                        canonical
+                    }
                     Err(error) => {
                         // The stored policy is unchanged, so report the
                         // rejection against the snapshot it was read from and
@@ -2781,6 +2805,7 @@ async fn load_policy_with_gateway(
                 LoadedPolicyOrigin::Gateway {
                     revision: loaded_policy_revision,
                     has_last_valid_policy,
+                    written_at_startup,
                 },
                 agent_proposals_enabled_from_settings(&snapshot.settings),
                 snapshot.extension_authentication_enabled,
@@ -3205,6 +3230,9 @@ enum LoadedPolicyOrigin {
     Gateway {
         revision: Option<LoadedPolicyRevision>,
         has_last_valid_policy: bool,
+        /// This start wrote `revision` to the gateway, so it is the
+        /// supervisor's own revision to fail if the backend refuses it.
+        written_at_startup: bool,
     },
 }
 
@@ -3697,6 +3725,88 @@ fn enqueue_policy_status(sender: &UnboundedSender<PolicyStatusUpdate>, update: P
             "Policy status reporter unavailable during shutdown"
         );
     }
+}
+
+/// The report that the backend refused, at Attach, the configuration this start
+/// accepted. Only a refusal qualifies: `Unavailable` can succeed on the next start.
+fn attach_refusal_report(
+    sandbox_id: &str,
+    origin: &LoadedPolicyOrigin,
+    error: &miette::Report,
+) -> Option<openshell_core::proto::ReportSandboxConfigurationRequest> {
+    let LoadedPolicyOrigin::Gateway {
+        revision: Some(revision),
+        ..
+    } = origin
+    else {
+        return None;
+    };
+    if error
+        .code()
+        .is_none_or(|code| code.to_string() != backend_setup::ATTACH_REFUSED)
+    {
+        return None;
+    }
+    Some(openshell_core::proto::ReportSandboxConfigurationRequest {
+        sandbox_id: sandbox_id.to_string(),
+        admission: Some(openshell_core::proto::SandboxConfigurationAdmission {
+            instance_id: revision.admission_instance_id.clone()?,
+            state: openshell_core::proto::ConfigurationAdmissionState::Rejected.into(),
+            policy_version: revision.version,
+            policy_hash: revision.policy_hash.clone(),
+            config_revision: revision.config_revision,
+            provider_env_revision: revision.provider_env_revision,
+            error: error.to_string(),
+        }),
+        expected_instance_id: String::new(),
+        refused_before_start: true,
+    })
+}
+
+/// Report an Attach refusal before the supervisor exits. The gateway records
+/// the accepted configuration as refused, and a revision this start wrote ends
+/// Failed with the backend's message. Both reports are best effort, and the
+/// refusal report gets a single bounded attempt so exit is not held up.
+async fn report_attach_refusal(
+    endpoint: &str,
+    sandbox_id: &str,
+    origin: &LoadedPolicyOrigin,
+    error: &miette::Report,
+) {
+    if let Some(request) = attach_refusal_report(sandbox_id, origin, error)
+        && let Err(report_error) = grpc_attempt(
+            "Attach refusal report",
+            openshell_core::grpc_client::report_sandbox_configuration_request(endpoint, request),
+        )
+        .await
+    {
+        warn!(error = %report_error, "Failed to report the isolation backend refusal");
+    }
+    if let Some(revision) = refused_startup_revision(origin, error) {
+        report_initial_policy_failure(endpoint, sandbox_id, Some(revision), error).await;
+    }
+}
+
+/// The revision this start wrote that the backend refused at Attach, if any.
+///
+/// Only a refusal marks it: `Unavailable` can succeed on the next start, and a
+/// revision the user wrote stays as it was.
+fn refused_startup_revision<'a>(
+    origin: &'a LoadedPolicyOrigin,
+    error: &miette::Report,
+) -> Option<&'a LoadedPolicyRevision> {
+    let LoadedPolicyOrigin::Gateway {
+        revision: Some(revision),
+        written_at_startup: true,
+        ..
+    } = origin
+    else {
+        return None;
+    };
+    error
+        .code()
+        .is_some_and(|code| code.to_string() == backend_setup::ATTACH_REFUSED)
+        .then_some(revision)
 }
 
 /// Best-effort `FAILED` acknowledgement when initial policy construction or
@@ -5870,6 +5980,130 @@ network_policies:
     }
 
     #[tokio::test(start_paused = true)]
+    async fn startup_marks_only_the_revision_it_wrote() {
+        use openshell_core::proto::PolicySource;
+
+        for (needs_baseline_paths, written) in [(true, true), (false, false)] {
+            let mut policy = proto_tcp_policy_fixture();
+            if !needs_baseline_paths {
+                assert!(enrich_proto_baseline_paths(&mut policy));
+            }
+            let (calls, _observed) = tokio::sync::mpsc::unbounded_channel();
+            let gateway = WriteRefusingStartupGateway {
+                desired: Arc::new(std::sync::Mutex::new(settings_poll_result(
+                    Some(policy),
+                    1,
+                    PolicySource::Sandbox,
+                ))),
+                refusals: Arc::default(),
+                repair_after_refusal: None,
+                rejection_report_errors: Arc::default(),
+                calls,
+            };
+            let bundle = load_policy_with_gateway(
+                Some("sandbox-id".to_string()),
+                Some("sandbox".to_string()),
+                Some("http://unused.invalid".to_string()),
+                None,
+                None,
+                &openshell_extension_core::ExtensionCredentialStore::new(),
+                LocalPolicyIdentity::Required,
+                None,
+                Some(ImagePolicyDiscovery::Missing),
+                &gateway,
+            )
+            .await
+            .expect("startup must accept the policy");
+            let LoadedPolicyOrigin::Gateway {
+                revision: Some(revision),
+                written_at_startup,
+                ..
+            } = bundle.4
+            else {
+                panic!("startup must bind the policy to its gateway revision");
+            };
+            assert_eq!(written_at_startup, written);
+            assert_eq!(revision.version, if written { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn attach_refusal_reports_the_accepted_generation_as_refused() {
+        use openshell_core::proto::ConfigurationAdmissionState;
+
+        let mut revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
+            Some(proto_policy_fixture()),
+            3,
+            openshell_core::proto::PolicySource::Sandbox,
+        ));
+        revision.admission_instance_id = Some("instance-1".to_string());
+        let origin = |revision: &LoadedPolicyRevision| LoadedPolicyOrigin::Gateway {
+            revision: Some(revision.clone()),
+            has_last_valid_policy: true,
+            written_at_startup: false,
+        };
+        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+
+        let request = attach_refusal_report("sandbox-id", &origin(&revision), &refusal)
+            .expect("a refusal of the accepted generation is reported");
+        assert!(request.refused_before_start);
+        let admission = request.admission.unwrap();
+        assert_eq!(
+            admission.state,
+            i32::from(ConfigurationAdmissionState::Rejected)
+        );
+        assert_eq!(
+            (
+                admission.instance_id.as_str(),
+                admission.policy_version,
+                admission.policy_hash.as_str(),
+                admission.config_revision,
+                admission.provider_env_revision,
+            ),
+            (
+                "instance-1",
+                revision.version,
+                revision.policy_hash.as_str(),
+                revision.config_revision,
+                revision.provider_env_revision,
+            )
+        );
+
+        let transient = miette::miette!("unavailable");
+        assert!(attach_refusal_report("sandbox-id", &origin(&revision), &transient).is_none());
+        assert!(
+            attach_refusal_report("sandbox-id", &LoadedPolicyOrigin::LocalOverride, &refusal)
+                .is_none()
+        );
+        revision.admission_instance_id = None;
+        assert!(attach_refusal_report("sandbox-id", &origin(&revision), &refusal).is_none());
+    }
+
+    #[test]
+    fn attach_refusal_fails_only_the_revision_this_start_wrote() {
+        let revision = LoadedPolicyRevision::from_snapshot(&settings_poll_result(
+            Some(proto_policy_fixture()),
+            3,
+            openshell_core::proto::PolicySource::Sandbox,
+        ));
+        let origin = |written_at_startup| LoadedPolicyOrigin::Gateway {
+            revision: Some(revision.clone()),
+            has_last_valid_policy: true,
+            written_at_startup,
+        };
+        let refusal = miette::miette!(code = backend_setup::ATTACH_REFUSED, "refused");
+        let transient = miette::miette!("unavailable");
+
+        assert_eq!(
+            refused_startup_revision(&origin(true), &refusal).map(|revision| revision.version),
+            Some(3)
+        );
+        assert!(refused_startup_revision(&origin(true), &transient).is_none());
+        assert!(refused_startup_revision(&origin(false), &refusal).is_none());
+        assert!(refused_startup_revision(&LoadedPolicyOrigin::LocalOverride, &refusal).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn startup_policy_write_refusal_permanent_codes_still_exit() {
         use openshell_core::proto::{ConfigurationAdmissionState, PolicySource};
         // No policy or provider change repairs these refusals, so startup
@@ -6677,6 +6911,7 @@ network_policies:
                 &LoadedPolicyOrigin::Gateway {
                     revision: Some(loaded),
                     has_last_valid_policy: true,
+                    written_at_startup: false,
                 },
                 &canonical,
             ),
@@ -6709,6 +6944,7 @@ network_policies:
         let origin = LoadedPolicyOrigin::Gateway {
             revision: None,
             has_last_valid_policy: true,
+            written_at_startup: false,
         };
 
         assert_eq!(
@@ -6814,6 +7050,7 @@ network_policies:
             &LoadedPolicyOrigin::Gateway {
                 revision: None,
                 has_last_valid_policy: true,
+                written_at_startup: false,
             },
             true,
             true

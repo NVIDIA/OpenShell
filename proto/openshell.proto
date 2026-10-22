@@ -3008,6 +3008,12 @@ message ReportSandboxConfigurationRequest {
   SandboxConfigurationAdmission admission = 2;
   // Pending registration replaces only this previously observed instance.
   string expected_instance_id = 3;
+  // With a Rejected admission for the generation this instance already
+  // reported Accepted: the runtime refused it before the workload started, for
+  // example an isolation backend refusing Attach. The gateway then records the
+  // configuration as rejected instead of keeping the accepted state. Omitted or
+  // false keeps the accepted state; set with any other state is INVALID_ARGUMENT.
+  bool refused_before_start = 4;
 }
 
 message ReportSandboxConfigurationResponse {}

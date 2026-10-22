@@ -5009,6 +5009,26 @@ fn configuration_failure_diagnostic(error: &Status) -> &'static str {
     }
 }
 
+/// Both admissions name the same instance and configuration generation.
+fn same_generation(
+    current: &openshell_core::proto::SandboxConfigurationAdmission,
+    reported: &openshell_core::proto::SandboxConfigurationAdmission,
+) -> bool {
+    (
+        &current.instance_id,
+        current.policy_version,
+        &current.policy_hash,
+        current.config_revision,
+        current.provider_env_revision,
+    ) == (
+        &reported.instance_id,
+        reported.policy_version,
+        &reported.policy_hash,
+        reported.config_revision,
+        reported.provider_env_revision,
+    )
+}
+
 fn configuration_generation_matches(
     admission: &openshell_core::proto::SandboxConfigurationAdmission,
     config: &GetSandboxConfigResponse,
@@ -5045,6 +5065,12 @@ pub(super) async fn handle_report_sandbox_configuration(
         .map_err(|_| Status::invalid_argument("invalid admission state"))?;
     if reported == ConfigurationAdmissionState::Unspecified {
         return Err(Status::invalid_argument("admission state is required"));
+    }
+    let refused_before_start = request.get_ref().refused_before_start;
+    if refused_before_start && reported != ConfigurationAdmissionState::Rejected {
+        return Err(Status::invalid_argument(
+            "refused_before_start requires a rejected admission",
+        ));
     }
     let Some(_mutation_guard) = state
         .compute
@@ -5130,10 +5156,16 @@ pub(super) async fn handle_report_sandbox_configuration(
         if let Some(current) = current
             && current.state == i32::from(ConfigurationAdmissionState::Accepted)
         {
-            // A rejected desired update does not invalidate an accepted runtime.
-            let error = admission.error;
-            admission = current.clone();
-            admission.error = error;
+            if refused_before_start && same_generation(current, &admission) {
+                // The runtime refused what it accepted, so the workload never
+                // started on it. Runtime text stays out of public status.
+                admission.error = "The isolation backend refused this configuration before the workload started; create the sandbox again with a policy the backend accepts".to_string();
+            } else {
+                // A rejected desired update does not invalidate an accepted runtime.
+                let error = admission.error;
+                admission = current.clone();
+                admission.error = error;
+            }
         }
     } else {
         admission.error.clear();
@@ -8665,6 +8697,7 @@ mod tests {
                     sandbox_id: sandbox_id.to_string(),
                     admission: Some(admission),
                     expected_instance_id: String::new(),
+                    refused_before_start: false,
                 }),
                 sandbox_id,
             )
@@ -8802,6 +8835,134 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configuration_admission_records_refusal_of_accepted_generation() {
+        use openshell_core::proto::{
+            ConfigurationAdmissionState as Admission, ReportSandboxConfigurationRequest,
+            SandboxConfigurationAdmission,
+        };
+        let state = test_server_state().await;
+        let sandbox_id = "sb-refused";
+        state
+            .store
+            .put_message(&test_sandbox(
+                sandbox_id,
+                "refused",
+                openshell_policy::restrictive_default_policy(),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+        let instance_id = uuid::Uuid::new_v4().to_string();
+        let report = |admission, refused_before_start| {
+            with_sandbox(
+                Request::new(ReportSandboxConfigurationRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    admission: Some(admission),
+                    expected_instance_id: String::new(),
+                    refused_before_start,
+                }),
+                sandbox_id,
+            )
+        };
+        handle_report_sandbox_configuration(
+            &state,
+            report(
+                SandboxConfigurationAdmission {
+                    instance_id: instance_id.clone(),
+                    state: Admission::Pending.into(),
+                    ..Default::default()
+                },
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+        let config = handle_get_sandbox_config(
+            &state,
+            with_sandbox(
+                Request::new(GetSandboxConfigRequest {
+                    name: "refused".to_string(),
+                    workspace_scope: Some(openshell_core::proto::workspace_selector(
+                        "default".to_string(),
+                    )),
+                }),
+                sandbox_id,
+            ),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let accepted = SandboxConfigurationAdmission {
+            instance_id,
+            state: Admission::Accepted.into(),
+            policy_version: config.version,
+            policy_hash: config.policy_hash,
+            config_revision: config.config_revision,
+            provider_env_revision: config.provider_env_revision,
+            error: String::new(),
+        };
+        handle_report_sandbox_configuration(&state, report(accepted.clone(), false))
+            .await
+            .unwrap();
+        let readiness = || async {
+            let persisted = state
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = persisted.status.unwrap();
+            let ready = status
+                .conditions
+                .into_iter()
+                .find(|condition| condition.r#type == "ConfigurationReady")
+                .unwrap();
+            (status.configuration_admission.unwrap().state, ready)
+        };
+
+        // A runtime that fails to apply the generation it runs, such as a
+        // reconcile of unreachable middleware, keeps the accepted state.
+        let mut refused = accepted;
+        refused.state = Admission::Rejected.into();
+        refused.error = "backend text is not shown".to_string();
+        handle_report_sandbox_configuration(&state, report(refused.clone(), false))
+            .await
+            .unwrap();
+        let (admission_state, ready) = readiness().await;
+        assert_eq!(admission_state, i32::from(Admission::Accepted));
+        assert_eq!(ready.status, "True");
+
+        let mut flagged_acceptance = refused.clone();
+        flagged_acceptance.state = Admission::Accepted.into();
+        assert_eq!(
+            handle_report_sandbox_configuration(&state, report(flagged_acceptance, true))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
+        let mut other_generation = refused.clone();
+        other_generation.policy_hash.push('x');
+        assert!(same_generation(&refused, &refused));
+        assert!(!same_generation(&refused, &other_generation));
+
+        handle_report_sandbox_configuration(&state, report(refused, true))
+            .await
+            .unwrap();
+        let (admission_state, ready) = readiness().await;
+        assert_eq!(admission_state, i32::from(Admission::Rejected));
+        assert_eq!(
+            (ready.status.as_str(), ready.reason.as_str()),
+            ("False", "ConfigurationInvalid")
+        );
+        assert!(
+            ready.message.contains("isolation backend refused"),
+            "{ready:?}"
+        );
+        assert!(!ready.message.contains("backend text"), "{ready:?}");
+    }
+
     #[test]
     fn configuration_diagnostic_is_bounded_and_removes_control_characters() {
         let diagnostic = bounded_configuration_diagnostic(&format!("rule\n{}", "é".repeat(1000)));
@@ -8843,6 +9004,7 @@ mod tests {
                         state: Admission::Pending.into(),
                         ..Default::default()
                     }),
+                    refused_before_start: false,
                 }),
                 sandbox_id,
             ),

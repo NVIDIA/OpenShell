@@ -81,6 +81,10 @@ pub trait PreparedBackend: Send + Sync {
     ) -> std::result::Result<BuiltBackend, BackendError>;
 }
 
+/// Diagnostic code of an Attach error that is a backend refusal, as opposed to
+/// a transient failure the next start can retry.
+pub(crate) const ATTACH_REFUSED: &str = "openshell::backend::attach_refused";
+
 /// Created only after name and launch identity checks. Consuming attachment
 /// prevents reusing one prepared startup to build or attach a second client.
 pub struct SelectedBackend {
@@ -196,7 +200,12 @@ impl SelectedBackend {
                 },
             )
             .await
-            .map_err(|error| miette::miette!(error.to_string()))?;
+            .map_err(|error| match error {
+                BackendError::Denied(_) | BackendError::Attach(_) => {
+                    miette::miette!(code = ATTACH_REFUSED, "{error}")
+                }
+                error => miette::miette!("{error}"),
+            })?;
         Ok((bound, built.proxy_listener))
     }
 }

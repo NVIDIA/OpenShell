@@ -13259,6 +13259,12 @@ type ReportSandboxConfigurationRequest struct {
 	Admission *SandboxConfigurationAdmission `protobuf:"bytes,2,opt,name=admission,proto3" json:"admission,omitempty"`
 	// Pending registration replaces only this previously observed instance.
 	ExpectedInstanceId string `protobuf:"bytes,3,opt,name=expected_instance_id,json=expectedInstanceId,proto3" json:"expected_instance_id,omitempty"`
+	// With a Rejected admission for the generation this instance already
+	// reported Accepted: the runtime refused it before the workload started, for
+	// example an isolation backend refusing Attach. The gateway then records the
+	// configuration as rejected instead of keeping the accepted state. Omitted or
+	// false keeps the accepted state; set with any other state is INVALID_ARGUMENT.
+	RefusedBeforeStart bool `protobuf:"varint,4,opt,name=refused_before_start,json=refusedBeforeStart,proto3" json:"refused_before_start,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -13312,6 +13318,13 @@ func (x *ReportSandboxConfigurationRequest) GetExpectedInstanceId() string {
 		return x.ExpectedInstanceId
 	}
 	return ""
+}
+
+func (x *ReportSandboxConfigurationRequest) GetRefusedBeforeStart() bool {
+	if x != nil {
+		return x.RefusedBeforeStart
+	}
+	return false
 }
 
 type ReportSandboxConfigurationResponse struct {
@@ -20390,12 +20403,13 @@ const file_openshell_proto_rawDesc = "" +
 	"policyHash\x12'\n" +
 	"\x0fconfig_revision\x18\x05 \x01(\x04R\x0econfigRevision\x122\n" +
 	"\x15provider_env_revision\x18\x06 \x01(\x04R\x13providerEnvRevision\x12\x14\n" +
-	"\x05error\x18\a \x01(\tR\x05error\"\xbf\x01\n" +
+	"\x05error\x18\a \x01(\tR\x05error\"\xf1\x01\n" +
 	"!ReportSandboxConfigurationRequest\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12I\n" +
 	"\tadmission\x18\x02 \x01(\v2+.openshell.v1.SandboxConfigurationAdmissionR\tadmission\x120\n" +
-	"\x14expected_instance_id\x18\x03 \x01(\tR\x12expectedInstanceId\"$\n" +
+	"\x14expected_instance_id\x18\x03 \x01(\tR\x12expectedInstanceId\x120\n" +
+	"\x14refused_before_start\x18\x04 \x01(\bR\x12refusedBeforeStart\"$\n" +
 	"\"ReportSandboxConfigurationResponse\"\x9b\x04\n" +
 	"\x15SandboxPolicyRevision\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x12\x1f\n" +
