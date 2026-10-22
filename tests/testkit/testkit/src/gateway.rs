@@ -17,8 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use openshell_sdk::{ClientConfig, EdgeAuthInterceptor, Health, OpenShellClient, ServiceStatus};
-use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+use openshell_sdk::{ClientConfig, ClientIdentity, Health, OpenShellClient, ServiceStatus};
 
 use crate::error::{Error, Result, ResultExt};
 
@@ -28,8 +27,6 @@ pub const WORKSPACE_ENV: &str = "OPENSHELL_WORKSPACE";
 const DEFAULT_WORKSPACE: &str = "default";
 
 // Mirrors the SDK's endpoint settings for channels testkit builds itself.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const READY_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
@@ -142,32 +139,22 @@ impl Gateway {
     }
 
     /// Connect to the gateway.
+    ///
+    /// The registered gateway's CA and client certificate are read from its
+    /// CLI config directory and handed to the SDK, which owns the transport
+    /// (TLS, connect timeout, keep-alive).
     pub async fn connect(&self) -> Result<OpenShellClient> {
-        let Some(dir) = &self.mtls_dir else {
-            return OpenShellClient::connect(ClientConfig::new(self.endpoint.clone()))
-                .await
-                .context(format!("connect to {}", self.endpoint));
-        };
-
-        // The SDK does not speak mTLS, so build the channel here and hand it
-        // to the SDK. Every SDK call, including exec, uses this channel.
-        let ca = Certificate::from_pem(read(&dir.join("ca.crt"))?);
-        let identity = Identity::from_pem(read(&dir.join("tls.crt"))?, read(&dir.join("tls.key"))?);
-        let channel = Endpoint::from_shared(self.endpoint.clone())
-            .map_err(|error| Error::from_error(&error))?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .http2_adaptive_window(true)
-            .http2_keep_alive_interval(KEEP_ALIVE_INTERVAL)
-            .keep_alive_while_idle(true)
-            .tls_config(ClientTlsConfig::new().ca_certificate(ca).identity(identity))
-            .map_err(|error| Error::from_error(&error))
-            .context("configure mTLS")?
-            .connect()
+        let mut config = ClientConfig::new(self.endpoint.clone());
+        if let Some(dir) = &self.mtls_dir {
+            config.ca_cert = Some(read(&dir.join("ca.crt"))?);
+            config.client_identity = Some(ClientIdentity::new(
+                read(&dir.join("tls.crt"))?,
+                read(&dir.join("tls.key"))?,
+            ));
+        }
+        OpenShellClient::connect(config)
             .await
-            .map_err(|error| Error::from_error(&error))
-            .context(format!("connect to {} with mTLS", self.endpoint))?;
-        let interceptor = EdgeAuthInterceptor::new(None, None)?;
-        Ok(OpenShellClient::from_parts(channel, interceptor))
+            .context(format!("connect to {}", self.endpoint))
     }
 
     /// Wait until the gateway accepts a connection and reports itself

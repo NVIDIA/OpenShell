@@ -24,4 +24,3 @@ rand = "0.9"
 serde = "1"
 serde_json = "1"
 tokio = { version = "1.43", features = ["macros", "process", "rt", "time"] }
-tonic = { version = "0.14", features = ["tls-native-roots"] }
