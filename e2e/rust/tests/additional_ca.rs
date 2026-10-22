@@ -177,21 +177,27 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
     if destination_mounts.len() != 1 || destination_mounts[0]["RW"] != false {
         return Err(format!("unexpected destination CA mounts: {mounts:#?}"));
     }
-    // Docker bind-mounts the gateway mTLS CA. Podman bind-mounts it only when
-    // user namespaces are not remapping UIDs; otherwise it is delivered as a
-    // container secret (`openshell-tls-ca-*`), which does not appear in
-    // `.Mounts`.
+    // Podman bind-mounts the gateway mTLS CA only when user namespaces are
+    // not remapping UIDs; otherwise it is delivered as a container secret
+    // (`openshell-tls-ca-*`), which does not appear in `.Mounts`. Docker never
+    // bind-mounts it: the gateway CA is staged inside the read-only supervisor
+    // state volume as `tls/ca.pem` and the supervisor is pointed at it through
+    // the `OPENSHELL_TLS_CA` environment variable.
     let gateway_ca_mount = mounts
         .iter()
         .find(|mount| mount["Destination"] == GATEWAY_CA_PATH);
     let gateway_ca_secret = gateway_ca_mount.is_none()
         && driver == "podman"
         && podman_gateway_ca_secret(&container_engine, driver, container_id)?;
-    if gateway_ca_mount.is_none() && !gateway_ca_secret {
+    let gateway_ca_staged = gateway_ca_mount.is_none()
+        && driver == "docker"
+        && docker_gateway_ca_staged(&container_engine, container_id, mounts)?;
+    if gateway_ca_mount.is_none() && !gateway_ca_secret && !gateway_ca_staged {
         return Err("gateway mTLS CA delivery must remain present".to_string());
     }
-    if let Some(gateway_ca_mount) = gateway_ca_mount
-        && destination_mounts[0]["Source"] == gateway_ca_mount["Source"]
+    let gateway_ca_source = gateway_ca_mount.map(|mount| mount["Source"].clone());
+    if let Some(gateway_ca_source) = gateway_ca_source
+        && destination_mounts[0]["Source"] == gateway_ca_source
     {
         return Err("destination and gateway CA mounts must be distinct".to_string());
     }
@@ -204,6 +210,7 @@ fn inspect_local_container(driver: &str, sandbox_name: &str) -> Result<(), Strin
 
 /// Check whether the supervisor received the gateway mTLS CA as a Podman
 /// container secret (the delivery path used when user namespaces remap UIDs).
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
 fn podman_gateway_ca_secret(
     container_engine: &ContainerEngine,
     driver: &str,
@@ -225,6 +232,33 @@ fn podman_gateway_ca_secret(
             .as_str()
             .is_some_and(|name| name.starts_with("openshell-tls-ca-"))
     }))
+}
+
+/// Check whether the Docker supervisor received the gateway mTLS CA through
+/// its staged delivery path: the read-only supervisor state volume plus the
+/// `OPENSHELL_TLS_CA` environment pointer.
+#[cfg(any(feature = "e2e-docker", feature = "e2e-podman"))]
+fn docker_gateway_ca_staged(
+    container_engine: &ContainerEngine,
+    container_id: &str,
+    mounts: &[Value],
+) -> Result<bool, String> {
+    const SUPERVISOR_STATE_MOUNT_PATH: &str = "/.openshell/supervisor";
+    let supervisor_volume = mounts
+        .iter()
+        .find(|mount| mount["Destination"] == SUPERVISOR_STATE_MOUNT_PATH);
+    if supervisor_volume.is_none_or(|mount| mount["RW"] != false) {
+        return Ok(false);
+    }
+    let mut env_command = engine_command(container_engine);
+    env_command.args(["inspect", "--format", "{{json .Config.Env}}", container_id]);
+    let envs = run_json(env_command, "docker environment inspection")?;
+    let envs = envs
+        .as_array()
+        .ok_or("supervisor environment must be an array")?;
+    Ok(envs
+        .iter()
+        .any(|env| env.as_str() == Some("OPENSHELL_TLS_CA=/.openshell/supervisor/tls/ca.pem")))
 }
 
 fn assert_additional_ca_command(command: &[Value]) -> Result<(), String> {
