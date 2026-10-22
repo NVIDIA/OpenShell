@@ -866,6 +866,10 @@ to pass on, are the only point at which the user may be prompted during a run.
 
 ### Returning results
 
+> The proof of concept replaced the design below with `wait` returning the
+> result file (`until_file`, `return_file`), so children never call the
+> gateway. See [Appendix: Delivering a Child's Result](appendices/result-delivery.md).
+
 **A child leaves its result in its own files and says it is done; the parent's
 `wait` returns, and the parent reads the files with `get_file`.** The gateway
 keeps a "done" flag, never the result: it is the control plane, and agent output
