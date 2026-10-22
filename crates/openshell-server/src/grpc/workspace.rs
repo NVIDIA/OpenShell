@@ -469,11 +469,9 @@ pub(super) fn authorize_member_role(
         ));
     }
     if role == WorkspaceRole::Admin && grant != AuthGrant::PlatformAdmin {
-        crate::auth::audit::emit_authorization_denial(
+        return Err(crate::auth::audit::deny(
             principal,
             crate::auth::audit::AuthzDenial::PlatformAdminRequired,
-        );
-        return Err(Status::permission_denied(
             "only platform admins can assign the workspace admin role",
         ));
     }

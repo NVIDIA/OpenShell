@@ -9,13 +9,21 @@
 
 use openshell_ocsf::{
     ActionId, ActivityId, ApiActivityBuilder, AuthProtocolId, AuthenticationBuilder, ConfidenceId,
-    DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo, HttpMethod, HttpRequest,
-    ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
+    DetectionFindingBuilder, DispositionId, Endpoint, EventContext, FindingInfo, HttpMethod,
+    HttpRequest, ResourceDetails, Service, SeverityId, StatusId, Url, User, UserTypeId, ocsf_emit,
 };
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+use tonic::Status;
 
-use super::principal::Principal;
+use super::identity::IdentityProvider;
+use super::principal::{Principal, SandboxIdentitySource};
+
+#[cfg(test)]
+pub mod test_support;
 
 /// Where a gateway connection came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,21 +64,7 @@ impl RequestOrigin {
     }
 }
 
-use super::authenticator::{AuthFailureReason, AuthMechanism};
-
-fn category(reason: AuthFailureReason) -> &'static str {
-    match reason {
-        AuthFailureReason::MissingCredential => "missing_credential",
-        AuthFailureReason::ConflictingCredentials => "conflicting_credentials",
-        AuthFailureReason::MalformedCredential => "malformed_credential",
-        AuthFailureReason::InvalidCredential => "invalid_credential",
-        AuthFailureReason::ExpiredCredential => "expired_credential",
-        AuthFailureReason::AudienceOrIssuerMismatch => "audience_or_issuer_mismatch",
-        AuthFailureReason::UnknownIdentity => "unknown_identity",
-        AuthFailureReason::StaleIdentity => "stale_identity",
-        AuthFailureReason::IdentityProviderUnavailable => "identity_provider_unavailable",
-    }
-}
+use super::authenticator::{AuthFailureReason, AuthMechanism, AuthRejection, bearer_credential};
 
 fn severity(reason: AuthFailureReason) -> SeverityId {
     match reason {
@@ -87,17 +81,37 @@ fn severity(reason: AuthFailureReason) -> SeverityId {
     }
 }
 
-fn with_protocol(
-    builder: AuthenticationBuilder<'_>,
-    mechanism: AuthMechanism,
-) -> AuthenticationBuilder<'_> {
-    match mechanism {
-        AuthMechanism::Oidc => builder.auth_protocol(AuthProtocolId::OpenId),
-        AuthMechanism::Mtls => builder.auth_protocol_other("mtls"),
-        AuthMechanism::SandboxJwt => builder.auth_protocol_other("sandbox_jwt"),
-        AuthMechanism::ComputeDriver => builder.auth_protocol_other("compute_driver"),
-        AuthMechanism::GatewayPeer => builder.auth_protocol_other("k8s_service_account"),
+/// The request to `path` as an OCSF HTTP request; gRPC calls are POSTs.
+fn post(path: &str) -> HttpRequest {
+    HttpRequest {
+        http_method: HttpMethod::Post,
+        url: Some(Url::from_path(path)),
     }
+}
+
+/// An Authentication event for `user`'s request to `path` from `origin`,
+/// naming the protocol of `mechanism` when known.
+fn authentication<'a>(
+    ctx: &'a EventContext,
+    path: &str,
+    origin: &RequestOrigin,
+    user: User,
+    mechanism: Option<AuthMechanism>,
+) -> AuthenticationBuilder<'a> {
+    let mut builder = AuthenticationBuilder::new(ctx, user, Service::new("openshell-gateway"))
+        .http_request(post(path));
+    match mechanism {
+        Some(AuthMechanism::Oidc) => builder = builder.auth_protocol(AuthProtocolId::OpenId),
+        Some(mechanism) => builder = builder.auth_protocol_other(mechanism.as_str()),
+        None => {}
+    }
+    if let Some(source) = origin.source {
+        builder = builder.src_endpoint(source.endpoint());
+    }
+    if let Some(request_id) = &origin.request_id {
+        builder = builder.correlation_uid(request_id);
+    }
+    builder
 }
 
 /// Emit an Authentication failure event for a gRPC request to `path`.
@@ -107,31 +121,243 @@ pub fn emit_authentication_failure(
     mechanism: Option<AuthMechanism>,
     reason: AuthFailureReason,
 ) {
+    authentication_failure(path, origin, User::unidentified(), mechanism, reason);
+}
+
+/// Emit an Authentication failure event for a credential that a handler
+/// verifies itself, returning the status that refuses the current request.
+///
+/// The event names `principal`, the caller the router established from a
+/// separate credential, or leaves the user unidentified when the rejected
+/// credential is the one that named the caller.
+pub fn reject_credential(principal: Option<&Principal>, rejection: AuthRejection) -> Status {
+    let (path, origin) = current_request();
+    authentication_failure(
+        &path,
+        &origin,
+        principal.map_or_else(User::unidentified, principal_user),
+        Some(rejection.mechanism),
+        rejection.reason,
+    );
+    rejection.status
+}
+
+fn authentication_failure(
+    path: &str,
+    origin: &RequestOrigin,
+    user: User,
+    mechanism: Option<AuthMechanism>,
+    reason: AuthFailureReason,
+) {
     let ctx = crate::gateway_ocsf::context("", "");
-    let mut builder = AuthenticationBuilder::new(
-        &ctx,
-        User::unidentified(),
-        Service::new("openshell-gateway"),
-    )
-    .action(ActionId::Denied)
-    .disposition(DispositionId::Blocked)
-    .severity(severity(reason))
-    .status(StatusId::Failure)
-    .status_detail(category(reason))
-    .http_request(HttpRequest {
-        http_method: HttpMethod::Post,
-        url: Some(Url::from_path(path)),
-    })
-    .message(format!("authentication failed: {}", category(reason)));
+    let builder = authentication(&ctx, path, origin, user, mechanism)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(severity(reason))
+        .status(StatusId::Failure)
+        .status_detail(reason.as_str())
+        .message(format!("authentication failed: {}", reason.as_str()));
+    ocsf_emit!(builder.build());
+}
+
+/// How long a credential stays logged on before its next use records a new
+/// logon.
+const LOGON_WINDOW: Duration = Duration::from_hours(1);
+
+/// Credentials tracked at once. When full, the oldest logon is forgotten
+/// early, so a busy gateway records some credentials more than once an hour.
+const MAX_LOGONS: usize = 16_384;
+
+/// Credentials that have recently authenticated, shared by every connection
+/// to this gateway replica.
+///
+/// Every request authenticates, so recording each one would bury user logons
+/// under supervisor polling. A credential instead records one logon when the
+/// replica first accepts it, and again after [`LOGON_WINDOW`] if still in use.
+#[derive(Debug, Clone, Default)]
+pub struct Logons(Arc<Mutex<LogonState>>);
+
+#[derive(Debug, Default)]
+struct LogonState {
+    active: HashSet<[u8; 32]>,
+    by_age: VecDeque<([u8; 32], Instant)>,
+}
+
+impl Logons {
+    /// Record a logon for `credential` at `now`, returning whether it is new.
+    fn log_on(&self, credential: [u8; 32], now: Instant) -> bool {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let LogonState { active, by_age } = &mut *state;
+        while let Some(&(oldest, at)) = by_age.front() {
+            if now.saturating_duration_since(at) < LOGON_WINDOW {
+                break;
+            }
+            by_age.pop_front();
+            active.remove(&oldest);
+        }
+        if active.contains(&credential) {
+            return false;
+        }
+        // Only a new credential makes room, so polling a full record of
+        // credentials that are still logged on records nothing.
+        if by_age.len() >= MAX_LOGONS
+            && let Some((oldest, _)) = by_age.pop_front()
+        {
+            active.remove(&oldest);
+        }
+        active.insert(credential);
+        by_age.push_back((credential, now));
+        true
+    }
+}
+
+/// Whether the gateway verified a credential to establish `principal`.
+fn authenticated(principal: &Principal) -> bool {
+    match principal {
+        Principal::User(user) => user.identity.provider != IdentityProvider::LocalDev,
+        Principal::Anonymous => false,
+        Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => true,
+    }
+}
+
+/// The mechanism that established `principal`, when it has an audit label.
+fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
+    match principal {
+        Principal::Operator(_) => Some(AuthMechanism::Mtls),
+        Principal::User(user) => match user.identity.provider {
+            IdentityProvider::Oidc => Some(AuthMechanism::Oidc),
+            IdentityProvider::Mtls => Some(AuthMechanism::Mtls),
+            IdentityProvider::CloudflareAccess | IdentityProvider::LocalDev => None,
+        },
+        Principal::Sandbox(sandbox) => Some(match sandbox.source {
+            SandboxIdentitySource::BootstrapJwt { .. } => AuthMechanism::SandboxJwt,
+            SandboxIdentitySource::ComputeDriver { .. } => AuthMechanism::ComputeDriver,
+        }),
+        Principal::Peer(_) => Some(AuthMechanism::GatewayPeer),
+        Principal::Anonymous => None,
+    }
+}
+
+/// A digest identifying the credential that established `principal`: the
+/// operator's or mTLS user's certificate, or the bearer token.
+///
+/// Only verified material goes in, so headers the authenticator ignored
+/// cannot make a new logon.
+fn credential_digest(
+    principal: &Principal,
+    headers: &http::HeaderMap,
+    peer_certificate_sha256: Option<&str>,
+) -> Option<[u8; 32]> {
+    let credential = match principal {
+        Principal::Operator(operator) => operator.certificate_sha256.as_str(),
+        Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
+            peer_certificate_sha256.unwrap_or_default()
+        }
+        _ => bearer_credential(headers).unwrap_or_default(),
+    };
+    digest(principal, None, credential)
+}
+
+/// A digest of `principal`, the mechanism when it is not the principal's
+/// own, and the credential, kept apart by separators.
+fn digest(
+    principal: &Principal,
+    mechanism: Option<AuthMechanism>,
+    credential: &str,
+) -> Option<[u8; 32]> {
+    let mut material = principal.audit_actor().into_bytes();
+    material.push(0);
     if let Some(mechanism) = mechanism {
-        builder = with_protocol(builder, mechanism);
+        material.extend_from_slice(mechanism.as_str().as_bytes());
+        material.push(0);
     }
-    if let Some(source) = origin.source {
-        builder = builder.src_endpoint(source.endpoint());
+    material.extend_from_slice(credential.as_bytes());
+    openshell_crypto::sha256(&material).ok()
+}
+
+/// Whether the handler for `path` finishes verifying `principal`'s
+/// credential, and so records its logon itself once it accepts it: the
+/// recorded runtime of a compute-driver credential on `IssueSandboxToken`,
+/// and the lineage of a gateway JWT on `RefreshSandboxToken`. Other
+/// credentials are fully verified by the router.
+fn handler_verifies(path: &str, principal: &Principal) -> bool {
+    let Principal::Sandbox(sandbox) = principal else {
+        return false;
+    };
+    match sandbox.source {
+        SandboxIdentitySource::ComputeDriver { .. } => {
+            path == super::compute_driver::ISSUE_SANDBOX_TOKEN_PATH
+        }
+        SandboxIdentitySource::BootstrapJwt { .. } => {
+            path == super::sandbox_jwt::REFRESH_SANDBOX_TOKEN_PATH
+        }
     }
-    if let Some(request_id) = &origin.request_id {
-        builder = builder.correlation_uid(request_id);
+}
+
+/// Emit an Authentication logon event for a request to `path` that
+/// authenticated as `principal`, unless its credential is already logged on
+/// or the handler finishes verifying it.
+///
+/// `peer_certificate_sha256` fingerprints the connection's verified client
+/// certificate, which identifies an mTLS user's credential.
+pub fn emit_logon(
+    logons: &Logons,
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    headers: &http::HeaderMap,
+    peer_certificate_sha256: Option<&str>,
+) {
+    if authenticated(principal)
+        && !handler_verifies(path, principal)
+        && logs_on(
+            logons,
+            credential_digest(principal, headers, peer_certificate_sha256),
+        )
+    {
+        logon(path, origin, principal, mechanism(principal));
     }
+}
+
+/// Emit an Authentication logon event for the current request once its
+/// handler has finished verifying `principal`'s credential, unless the
+/// credential is already logged on.
+pub fn emit_handler_logon(logons: &Logons, principal: &Principal, headers: &http::HeaderMap) {
+    if logs_on(logons, credential_digest(principal, headers, None)) {
+        let (path, origin) = current_request();
+        logon(&path, &origin, principal, mechanism(principal));
+    }
+}
+
+/// Emit an Authentication logon event for the SSH session `token` that a
+/// handler accepted from `principal`, unless it is already logged on.
+pub fn emit_ssh_session_logon(logons: &Logons, principal: &Principal, token: &str) {
+    let mechanism = AuthMechanism::SshSessionToken;
+    if logs_on(logons, digest(principal, Some(mechanism), token)) {
+        let (path, origin) = current_request();
+        logon(&path, &origin, principal, Some(mechanism));
+    }
+}
+
+/// Whether the credential with `digest` makes a new logon. Without a digest
+/// the credential cannot be deduplicated, so it logs on.
+fn logs_on(logons: &Logons, digest: Option<[u8; 32]>) -> bool {
+    digest.is_none_or(|digest| logons.log_on(digest, Instant::now()))
+}
+
+fn logon(
+    path: &str,
+    origin: &RequestOrigin,
+    principal: &Principal,
+    mechanism: Option<AuthMechanism>,
+) {
+    let ctx = crate::gateway_ocsf::context("", "");
+    let builder = authentication(&ctx, path, origin, principal_user(principal), mechanism)
+        .action(ActionId::Allowed)
+        .disposition(DispositionId::Allowed)
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .message("authentication succeeded");
     ocsf_emit!(builder.build());
 }
 
@@ -156,6 +382,14 @@ pub async fn with_request<F: Future>(path: String, origin: RequestOrigin, handle
     REQUEST
         .scope(RequestContext { path, origin }, handler)
         .await
+}
+
+/// The path and origin of the request a handler is serving, or empty
+/// values outside one.
+fn current_request() -> (String, RequestOrigin) {
+    REQUEST
+        .try_with(|request| (request.path.clone(), request.origin.clone()))
+        .unwrap_or_default()
 }
 
 /// Carry the current request's audit context into `future`, for work a
@@ -195,6 +429,9 @@ pub enum AuthzDenial<'a> {
     PlatformAdminRequired,
     /// The operation requires a verified mTLS operator.
     OperatorRequired,
+    /// A sandbox requested a credential for an extension service its policy
+    /// does not select.
+    ExtensionServiceNotSelected { service: &'a str },
 }
 
 impl AuthzDenial<'_> {
@@ -209,6 +446,7 @@ impl AuthzDenial<'_> {
             Self::InsufficientWorkspaceRole { .. } => "insufficient_workspace_role",
             Self::PlatformAdminRequired => "platform_admin_required",
             Self::OperatorRequired => "operator_required",
+            Self::ExtensionServiceNotSelected { .. } => "extension_service_not_selected",
         }
     }
 
@@ -224,6 +462,10 @@ impl AuthzDenial<'_> {
             | Self::InsufficientWorkspaceRole { workspace } => {
                 Some(ResourceDetails::named("workspace", bounded(workspace)))
             }
+            Self::ExtensionServiceNotSelected { service } => Some(ResourceDetails::named(
+                "extension_service",
+                bounded(service),
+            )),
             _ => None,
         }
     }
@@ -270,11 +512,15 @@ fn principal_user(principal: &Principal) -> User {
 
 /// Emit an authorization denial raised by a handler for the current request.
 pub fn emit_authorization_denial(principal: &Principal, denial: AuthzDenial<'_>) {
-    let request = REQUEST.try_with(Clone::clone).ok();
-    let (path, origin) = request
-        .map(|request| (request.path, request.origin))
-        .unwrap_or_default();
+    let (path, origin) = current_request();
     emit_authorization_denial_for(&path, &origin, principal, denial);
+}
+
+/// Emit an authorization denial raised by a handler for the current request,
+/// returning the status that refuses it with `message`.
+pub fn deny(principal: &Principal, denial: AuthzDenial<'_>, message: impl Into<String>) -> Status {
+    emit_authorization_denial(principal, denial);
+    Status::permission_denied(message)
 }
 
 /// Emit an API Activity denial for a gRPC request to `path`, paired with a
@@ -314,10 +560,7 @@ pub fn emit_authorization_denial_for(
     if !service.is_empty() {
         builder = builder
             .api_service(Service::new(service))
-            .http_request(HttpRequest {
-                http_method: HttpMethod::Post,
-                url: Some(Url::from_path(path)),
-            });
+            .http_request(post(path));
     }
     if let Some(resource) = denial.resource() {
         builder = builder.resource(resource);
@@ -372,5 +615,45 @@ pub fn emit_authorization_denial_for(
             finding = finding.correlation_uid(uid);
         }
         ocsf_emit!(finding.build());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_logs_on_again_after_the_window() {
+        let logons = Logons::default();
+        let start = Instant::now();
+
+        assert!(logons.log_on([1; 32], start));
+        assert!(!logons.log_on([1; 32], start + Duration::from_mins(59)));
+        assert!(logons.log_on([1; 32], start + LOGON_WINDOW));
+    }
+
+    #[test]
+    fn oldest_credential_is_forgotten_when_full() {
+        let logons = Logons::default();
+        let now = Instant::now();
+        let credential = |n: usize| {
+            let mut digest = [0; 32];
+            digest[..8].copy_from_slice(&n.to_le_bytes());
+            digest
+        };
+        for n in 0..MAX_LOGONS {
+            assert!(logons.log_on(credential(n), now));
+        }
+        // Polling every credential in turn while full is not a new logon.
+        for n in 0..MAX_LOGONS {
+            assert!(!logons.log_on(credential(n), now), "credential {n}");
+        }
+
+        assert!(logons.log_on(credential(MAX_LOGONS), now));
+        assert!(logons.log_on(credential(0), now), "oldest was evicted");
+        assert!(
+            !logons.log_on(credential(MAX_LOGONS), now),
+            "newest was kept"
+        );
     }
 }

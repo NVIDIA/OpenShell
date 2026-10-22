@@ -54,8 +54,6 @@ hyper-util = { workspace = true }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "http2", "tls12", "logging"] }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-tokio-rustls = { workspace = true }
-tower = { workspace = true }
 reqwest = { workspace = true }
 
 # Error handling
@@ -70,9 +68,6 @@ tempfile = "3"
 # OIDC/Auth
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }
 base64 = { workspace = true }
-
-# WebSocket (Cloudflare tunnel proxy)
-tokio-tungstenite = { workspace = true }
 
 # Streams
 futures = { workspace = true }

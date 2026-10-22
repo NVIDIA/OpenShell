@@ -12,7 +12,16 @@ rustPlatform.buildRustPackage {
   pname = "tmachine";
   version = "0.1.0";
 
-  src = lib.cleanSource ./.;
+  # Only the crate files, so edits to the Ansible and Nix config beside it
+  # do not rebuild tmachine.
+  src = lib.fileset.toSource {
+    root = ./.;
+    fileset = lib.fileset.unions [
+      ./Cargo.toml
+      ./Cargo.lock
+      ./src
+    ];
+  };
   cargoLock.lockFile = ./Cargo.lock;
 
   env = lib.optionalAttrs stdenv.hostPlatform.isAarch64 {

@@ -3227,6 +3227,15 @@ fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
 }
 
 #[test]
+fn docker_supervisor_healthcheck_probes_fast_only_during_startup() {
+    let health = docker_supervisor_healthcheck();
+
+    assert_eq!(health.start_interval, Some(250_000_000));
+    assert_eq!(health.interval, Some(30_000_000_000));
+    assert_eq!(health.start_period, Some(60_000_000_000));
+}
+
+#[test]
 fn docker_supervisor_defaults_to_the_primary_loopback_endpoint() {
     assert_eq!(
         default_docker_supervisor_grpc_endpoint(17_670, false),

@@ -12,7 +12,7 @@ let
   gnuToolchain = toolchains.${if isAarch64 then "aarch64-gnu" else "x86_64-gnu"};
   muslToolchain = toolchains.${if isAarch64 then "aarch64-musl" else "x86_64-musl"};
   dockerArch = if isAarch64 then "arm64" else "amd64";
-  linuxVmRuntime = pkgs.callPackage ../nix/pkgs/vm-runtime.nix {
+  linuxVmRuntime = pkgs.callPackage ../../nix/pkgs/vm-runtime.nix {
     stdenv = gnuToolchain.stdenv;
   };
   toolchainEnv = pkgs.lib.foldl' (env: toolchain: env // toolchain.env) { } (

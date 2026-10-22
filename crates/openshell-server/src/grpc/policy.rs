@@ -8221,10 +8221,9 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::audit::test_support::assert_boundary_finding;
     use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{
-        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
-    };
+    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::{authed_request, test_server_state};
 
     /// An in-memory store with the example profiles imported at platform scope.
@@ -8453,13 +8452,7 @@ mod tests {
     pub(super) fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
         request
             .extensions_mut()
-            .insert(Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: sandbox_id.to_string(),
-                source: SandboxIdentitySource::BootstrapJwt {
-                    issuer: "openshell-gateway:test".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            }));
+            .insert(crate::auth::principal::test_support::sandbox(sandbox_id));
         request
     }
 
@@ -11697,18 +11690,14 @@ mod tests {
             .await
             .expect_err("missing name must not leak existence to sandbox callers");
         assert_eq!(err.code(), Code::PermissionDenied);
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["status_detail"], "cross_sandbox");
         assert_eq!(
             events[0]["resources"],
             serde_json::json!([{"name": "missing-sandbox", "type": "sandbox"}])
         );
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]
@@ -11810,14 +11799,10 @@ mod tests {
             .expect_err("later frame must not switch sandbox ids");
 
         assert_eq!(err.code(), Code::PermissionDenied);
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 2, "{events:?}");
         assert_eq!(events[0]["status_detail"], "cross_sandbox");
-        assert_eq!(events[1]["class_uid"], 2004);
+        assert_boundary_finding(&events[0], &events[1]);
     }
 
     #[tokio::test]

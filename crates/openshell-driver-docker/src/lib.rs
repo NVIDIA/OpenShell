@@ -94,7 +94,10 @@ const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 // request a bounded opportunity to mark the control exit intentional before
 // publishing a fail-closed runtime error.
 const SUPERVISOR_INTENTIONAL_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
-const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 250_000_000;
+const SUPERVISOR_HEALTH_INTERVAL_NS: i64 = 30_000_000_000;
+// Docker probes at this interval only before the first healthy result and
+// within the start period.
+const SUPERVISOR_HEALTH_START_INTERVAL_NS: i64 = 250_000_000;
 const SUPERVISOR_HEALTH_TIMEOUT_NS: i64 = 2_000_000_000;
 const SUPERVISOR_HEALTH_START_PERIOD_NS: i64 = 60_000_000_000;
 const HOST_GATEWAY_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -5127,6 +5130,23 @@ fn docker_auxiliary_container_labels(
     ])
 }
 
+fn docker_supervisor_healthcheck() -> HealthConfig {
+    HealthConfig {
+        test: Some(vec![
+            "CMD".to_string(),
+            SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string(),
+            "health".to_string(),
+            "--socket".to_string(),
+            SUPERVISOR_HEALTH_SOCKET_PATH.to_string(),
+        ]),
+        interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
+        timeout: Some(SUPERVISOR_HEALTH_TIMEOUT_NS),
+        retries: Some(3),
+        start_period: Some(SUPERVISOR_HEALTH_START_PERIOD_NS),
+        start_interval: Some(SUPERVISOR_HEALTH_START_INTERVAL_NS),
+    }
+}
+
 fn docker_supervisor_host_config(
     mounts: Vec<Mount>,
     grpc_endpoint: &str,
@@ -5375,20 +5395,7 @@ async fn spawn_docker_control_process(
         cmd: Some(command),
         env: Some(environment),
         labels: Some(labels),
-        healthcheck: Some(HealthConfig {
-            test: Some(vec![
-                "CMD".to_string(),
-                SUPERVISOR_IMAGE_CONTROL_BINARY_PATH.to_string(),
-                "health".to_string(),
-                "--socket".to_string(),
-                SUPERVISOR_HEALTH_SOCKET_PATH.to_string(),
-            ]),
-            interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
-            timeout: Some(SUPERVISOR_HEALTH_TIMEOUT_NS),
-            retries: Some(3),
-            start_period: Some(SUPERVISOR_HEALTH_START_PERIOD_NS),
-            start_interval: Some(SUPERVISOR_HEALTH_INTERVAL_NS),
-        }),
+        healthcheck: Some(docker_supervisor_healthcheck()),
         host_config: Some(docker_supervisor_host_config(
             supervisor_mounts,
             &supervisor_endpoint,

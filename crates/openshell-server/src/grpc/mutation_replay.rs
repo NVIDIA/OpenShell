@@ -157,11 +157,9 @@ pub(super) async fn run<M: Mutation>(
     let request_id = validate_request_id(request.get_ref().request_id())?;
     let principal = super::extract_principal(&request)?;
     let Some(identity) = principal.user_identity() else {
-        crate::auth::audit::emit_authorization_denial(
+        return Err(crate::auth::audit::deny(
             &principal,
             crate::auth::audit::AuthzDenial::MethodNotPermitted,
-        );
-        return Err(Status::permission_denied(
             "request admission requires a user principal",
         ));
     };

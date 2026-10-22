@@ -339,9 +339,12 @@ identity belongs in the release manifest. The run ID and attempt distinguish
 reruns without overwriting earlier evidence.
 
 `release-notes.yml` uses Claude Code Action through NVIDIA Inference Hub to
-summarize PRs since the previous stable tag. Stable releases require successful
-generation and publish the notes; prereleases retain a `release-notes` artifact,
-with advisory failures. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
+summarize PRs since the previous stable tag. Prereleases retain a `release-notes`
+artifact, with advisory failures. Stable releases publish the promoted
+prerelease's preview with the prerelease tag replaced by the stable tag. If that
+preview is missing or expired, stable publication generates new notes and
+requires generation to succeed. The promotion summary states whether notes were
+reused or regenerated. Configure the `LLM_INFERENCE_API_KEY` Actions secret and
 the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` Actions variables.
 
 To preview notes without building or publishing:
@@ -633,11 +636,12 @@ These workflows run after merge to publish dev/tagged artifacts and verify them.
 | File | Role |
 |---|---|
 | `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway, sandbox, and supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
-| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. The notes-only mode generates a release notes preview artifact. |
+| `.github/workflows/release.yml` | Manually promote the latest qualified prerelease for a version and branch, create its stable tag, then rebuild and publish. Support releases preserve shared latest channels. Publishes the prerelease's notes preview, retagged, or generates notes when it is unavailable. The notes-only mode generates a release notes preview artifact. |
+| `.github/workflows/release-auto-tag.yml` | Weekdays at 14:00 Europe/Zurich, tags the next `-pre.N` on `main` when commits landed since the latest one, then dispatches Pre-release. It skips when the train has no `-pre.1` or its version is already stable, so push each train's `-pre.1` tag by hand. |
 | `.github/workflows/release-prerelease.yml` | Pre-release orchestrator, triggered by prerelease tag pushes or dispatched by Release Auto-Tag or manually: build, then publish and qualify in parallel. Qualification failure fails the run and sends the failure notification; published artifacts remain available. |
 | `.github/workflows/release-build.yml` | Shared version computation, binary and image builds, and package builds. Validates that the tag matches the caller's release kind. |
 | `.github/workflows/release-publish.yml` | Shared artifact assembly, OCI image tags and Helm chart publication, and package publication. Stable releases also publish to GitHub Releases, snap, npm, PyPI, and Fern. |
-| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by stable publication and notes-only previews. |
+| `.github/workflows/release-notes.yml` | Shared prompt-driven release notes generation through Inference Hub, used by prerelease previews, notes-only previews, and stable publication when no preview is reused. |
 | `.github/workflows/release-qualification.yml` | Reusable qualification suites and result aggregation. Runs security scans, conformance and feature integration, Docker and VM E2E, protobuf compatibility, and advisory compatibility review. |
 | `.github/workflows/snap-package.yml` | Builds snap and component artifacts for Release Dev, Release, and Pre-release without Store credentials or publication. |
 | `.github/workflows/snap-publish.yml` | Uploads existing snap and component artifacts to the Store without rebuilding. Release Dev calls it directly for `latest/edge` after snap builds and requires it to succeed before creating the dev release. Release calls it through `release-publish.yml` for `latest/stable` after qualification and release publication succeed. |

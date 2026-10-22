@@ -3930,7 +3930,8 @@ fn reserve_local_port() -> u16 {
 
 /// Run a CLI forward on a free loopback port, retrying on a new port if another
 /// process takes it first. The CLI checks the port before it binds it, which can
-/// be seconds later for `sandbox create`, so a concurrent test can claim it.
+/// be seconds later for `sandbox create`, so a concurrent test can claim it
+/// either before the check or between the check and the fake `ssh`'s bind.
 async fn with_free_forward_port<F, Fut, T>(mut forward: F) -> (u16, miette::Result<T>)
 where
     F: FnMut(openshell_core::forward::ForwardSpec) -> Fut,
@@ -3939,11 +3940,70 @@ where
     for _ in 0..10 {
         let port = reserve_local_port();
         let result = forward(openshell_core::forward::ForwardSpec::new(port)).await;
-        if !matches!(&result, Err(err) if err.to_string().contains("is already in use")) {
+        if !matches!(&result, Err(err) if lost_forward_port(err)) {
             return (port, result);
         }
     }
     panic!("another process took the forward port on every attempt");
+}
+
+/// Whether a forward failed because another process holds its port: the CLI's
+/// check found it in use, or the fake `ssh` exited 255 when it could not bind.
+fn lost_forward_port(err: &miette::Report) -> bool {
+    err.chain().any(|cause| {
+        let cause = cause.to_string();
+        cause.contains("is already in use")
+            || (cause.starts_with("ssh exited with status") && cause.contains("exit status: 255"))
+    })
+}
+
+#[test]
+fn fake_forward_exits_like_ssh_when_its_port_is_taken() {
+    let dir = helpers::tempdir().unwrap();
+    let fake_forward = install_fake_forward_process_helper(&dir);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+
+    let status = std::process::Command::new(fake_forward)
+        .env("OPENSHELL_FAKE_FORWARD_MODE", "listen")
+        .args(["-N", "-L", &format!("{port}:127.0.0.1:22"), "sandbox"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+
+    assert_eq!(
+        status.code(),
+        Some(255),
+        "ssh -o ExitOnForwardFailure=yes exits 255 when it cannot bind"
+    );
+}
+
+#[tokio::test]
+async fn forward_retries_when_ssh_loses_the_port_after_the_check() {
+    use miette::WrapErr;
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut attempts = 0;
+    let (_, result) = with_free_forward_port(|spec| {
+        attempts += 1;
+        let first = attempts == 1;
+        async move {
+            if first {
+                let status = std::process::ExitStatus::from_raw(255 << 8);
+                return Err(miette::miette!(
+                    "ssh exited with status {status} before local forward listener opened on \
+                     127.0.0.1:{}",
+                    spec.port
+                ))
+                .wrap_err("ssh process started but local forward listener was not reachable");
+            }
+            Ok(())
+        }
+    })
+    .await;
+
+    result.expect("the second port should succeed");
+    assert_eq!(attempts, 2);
 }
 
 fn spawn_service_forward(
