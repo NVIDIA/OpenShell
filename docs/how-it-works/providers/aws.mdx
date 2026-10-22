@@ -166,6 +166,9 @@ endpoints:
 - OpenShell rejects a signed sandbox policy before activation unless the endpoint has a resolvable AWS credential source. An endpoint-bearing profile must declare `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` and cover the signed host, port, and path. An endpointless profile must declare those keys and be selected with `credential_binding.provider` on the signed endpoint.
 - The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
 - The active provider must contain current `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` values. If either becomes unavailable after policy activation, the request fails closed.
+- Signed request fields cannot resolve OpenShell credential placeholders. The proxy strips client-supplied AWS authentication fields and adds trusted SigV4 fields after request rewriting.
+- OpenShell canonicalizes the request path before policy evaluation, then signs and forwards that same canonical request target. S3 signing uses single percent-encoding without additional path normalization so the signature matches the forwarded target.
+- OpenShell relays only final 2xx responses from a signed request. It drops informational responses and replaces redirects, malformed responses, and 4xx or 5xx response details with a generic error. For 4xx and 5xx responses, it preserves the status code. This prevents AWS signature diagnostics from returning signed credentials to the sandbox.
 
 ## Use from a Sandbox
 

@@ -208,7 +208,10 @@ pub fn canonicalize_request_target(
     //     any byte that must be percent-encoded in the pchar set.
     let canonical = build_canonical_path(&resolved, decoded.last().copied() == Some(b'/'), *opts);
 
-    let rewritten = canonical != raw_path;
+    // L7 forwarding always uses origin-form. Converting a validated
+    // absolute-form target keeps policy evaluation and the upstream request
+    // line on the same canonical path.
+    let rewritten = canonical != raw_path || absolute_form_uri.is_some();
     Ok((
         CanonicalPath {
             path: canonical,
@@ -498,6 +501,15 @@ mod tests {
         assert_eq!(canon("http://host/a/../b").unwrap(), "/b");
         assert_eq!(canon("https://host").unwrap(), "/");
         assert_eq!(canon("http://host:443/foo").unwrap(), "/foo");
+
+        let (path, query) = canonicalize_request_target(
+            "https://s3.us-east-1.amazonaws.com/bucket/key?versionId=1",
+            &CanonicalizeOptions::default(),
+        )
+        .expect("absolute-form conversion preserves canonical path bytes");
+        assert_eq!(path.path, "/bucket/key");
+        assert!(path.rewritten, "the outbound request must use origin-form");
+        assert_eq!(query.as_deref(), Some("versionId=1"));
     }
 
     #[test]

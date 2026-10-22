@@ -46,6 +46,12 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
         let meta = event.metadata();
 
+        // aws-sigv4 TRACE events include the canonical request, which can
+        // contain credentials added during signing. Never push them remotely.
+        if meta.target() == "aws_sigv4" || meta.target().starts_with("aws_sigv4::") {
+            return;
+        }
+
         // Filter by configured max level (default: info).
         if *meta.level() > self.max_level {
             return;
@@ -335,13 +341,16 @@ mod tests {
         }
     }
 
-    /// Capture lines emitted by `f` with an `INFO` level filter.
-    fn capture(capacity: usize, f: impl FnOnce()) -> Vec<SandboxLogLine> {
+    fn capture_at(
+        capacity: usize,
+        max_level: tracing::Level,
+        f: impl FnOnce(),
+    ) -> Vec<SandboxLogLine> {
         let (tx, mut rx) = mpsc::channel::<SandboxLogLine>(capacity);
         let layer = LogPushLayer {
             sandbox_id: "sb-test".to_string(),
             tx,
-            max_level: tracing::Level::INFO,
+            max_level,
         };
         let subscriber = tracing_subscriber::registry().with(layer);
         tracing::subscriber::with_default(subscriber, f);
@@ -351,6 +360,11 @@ mod tests {
             out.push(line);
         }
         out
+    }
+
+    /// Capture lines emitted by `f` with an `INFO` level filter.
+    fn capture(capacity: usize, f: impl FnOnce()) -> Vec<SandboxLogLine> {
+        capture_at(capacity, tracing::Level::INFO, f)
     }
 
     #[test]
@@ -421,6 +435,29 @@ mod tests {
 
         let messages: Vec<_> = lines.iter().map(|l| l.message.as_str()).collect();
         assert_eq!(messages, vec!["info line", "warn line"]);
+    }
+
+    #[test]
+    fn aws_sigv4_events_are_never_pushed_at_trace_level() {
+        let sentinel = "SUPER_SECRET_SESSION_TOKEN";
+        let lines = capture_at(16, tracing::Level::TRACE, || {
+            tracing::trace!(
+                target: "aws_sigv4",
+                canonical_request = sentinel,
+                "canonical request"
+            );
+            tracing::trace!(
+                target: "aws_sigv4::http_request",
+                canonical_request = sentinel,
+                "canonical request"
+            );
+            tracing::trace!(target: "unrelated", "safe trace");
+        });
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].target, "unrelated");
+        assert_eq!(lines[0].message, "safe trace");
+        assert!(!format!("{lines:#?}").contains(sentinel));
     }
 
     #[test]

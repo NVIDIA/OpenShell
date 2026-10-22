@@ -26,6 +26,9 @@ pub(super) struct RelayResponseOptions<'a> {
     pub(super) client_requested_upgrade: bool,
     pub(super) websocket: Option<WebSocketResponseValidation>,
     pub(super) observer: Option<&'a EndpointObserver>,
+    /// Hide untrusted upstream non-success details after `OpenShell` signs a
+    /// request with credentials that must never be reflected to the workload.
+    pub(super) suppress_signed_non_success_details: bool,
 }
 
 impl Default for RelayResponseOptions<'_> {
@@ -35,6 +38,7 @@ impl Default for RelayResponseOptions<'_> {
             client_requested_upgrade: true,
             websocket: None,
             observer: None,
+            suppress_signed_non_success_details: false,
         }
     }
 }
@@ -54,8 +58,9 @@ where
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
 
-    // Forward interim responses unchanged, but retain the final response head
-    // until response middleware preflight completes.
+    // Informational responses are not required once the fully buffered request
+    // has been sent. Drop them for signed requests: diagnostic headers can
+    // reflect fields from the canonical request before the final response.
     let mut informational_header_bytes = 0;
     let header_end = loop {
         let header_end = buf
@@ -69,6 +74,9 @@ where
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
             }
+            if options.suppress_signed_non_success_details {
+                return send_suppressed_signed_response(client, request_method, None).await;
+            }
             return Err(miette!("HTTP response headers exceed limit"));
         }
 
@@ -79,11 +87,13 @@ where
                 Some(100 | 102..=199)
             ) {
                 informational_header_bytes += header_end;
-                client
-                    .write_all(&buf[..header_end])
-                    .await
-                    .into_diagnostic()?;
-                client.flush().await.into_diagnostic()?;
+                if !options.suppress_signed_non_success_details {
+                    client
+                        .write_all(&buf[..header_end])
+                        .await
+                        .into_diagnostic()?;
+                    client.flush().await.into_diagnostic()?;
+                }
                 buf.drain(..header_end);
                 continue;
             }
@@ -94,6 +104,9 @@ where
         if n == 0 {
             if let Some(observer) = options.observer.as_ref() {
                 observer.observe(EndpointResult::TransportFailed);
+            }
+            if options.suppress_signed_non_success_details {
+                return send_suppressed_signed_response(client, request_method, None).await;
             }
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
@@ -108,19 +121,42 @@ where
     let observed_status = parse_observed_http_status_code(&header_str);
     if let Some(observer) = options.observer.as_ref() {
         match observed_status {
-            Some(status_code) if status_code < 400 => {
+            Some(status_code)
+                if status_code < 400
+                    && !(options.suppress_signed_non_success_details && status_code >= 300) =>
+            {
                 observer.observe(EndpointResult::HttpResponseReceived);
             }
             Some(_) => observer.observe(EndpointResult::UpstreamRejected),
             None => observer.observe(EndpointResult::TransportFailed),
         }
     }
+    if options.suppress_signed_non_success_details {
+        match observed_status {
+            Some(101) | None => {
+                return send_suppressed_signed_response(client, request_method, None).await;
+            }
+            Some(status_code) if status_code >= 300 => {
+                return send_suppressed_signed_response(client, request_method, Some(status_code))
+                    .await;
+            }
+            Some(_) => {}
+        }
+    }
+
     let status_code = parse_status_code(&header_str).unwrap_or(200);
     let server_wants_close = parse_connection_close(&header_str);
     let http_10_closes_by_default =
         response_is_http_10(&header_str) && !parse_connection_keep_alive(&header_str);
     let event_stream = response_is_event_stream(&header_str);
-    let body_length = parse_body_length(&header_str)?;
+    let body_length = match parse_body_length(&header_str) {
+        Ok(body_length) => body_length,
+        Err(error) if options.suppress_signed_non_success_details => {
+            debug!(%error, "suppressing malformed signed upstream response");
+            return send_suppressed_signed_response(client, request_method, None).await;
+        }
+        Err(error) => return Err(error),
+    };
 
     debug!(
         status_code,
@@ -268,6 +304,28 @@ where
     );
 
     finish_response(client, server_wants_close || http_10_closes_by_default).await
+}
+
+async fn send_suppressed_signed_response<C>(
+    client: &mut C,
+    request_method: &str,
+    upstream_status: Option<u16>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncWrite + Unpin,
+{
+    let status_code = upstream_status.filter(|status| (400..=599).contains(status));
+    let status_code = status_code.unwrap_or(502);
+    let body = br#"{"error":"signed_upstream_rejected"}"#;
+    let head = format!(
+        "HTTP/1.1 {status_code} Upstream Rejected\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    client.write_all(head.as_bytes()).await.into_diagnostic()?;
+    if !request_method.eq_ignore_ascii_case("HEAD") {
+        client.write_all(body).await.into_diagnostic()?;
+    }
+    finish_response(client, true).await
 }
 
 /// Body framing determines when delivery finishes, not whether another
@@ -2082,11 +2140,167 @@ pub(super) fn response_is_event_stream(headers: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ResponseFraming, parse_connection_keep_alive, parse_response_head_for_middleware,
-        response_is_http_10, serialize_response_head,
+        RelayResponseOptions, ResponseFraming, parse_connection_keep_alive,
+        parse_response_head_for_middleware, relay_response, response_is_http_10,
+        serialize_response_head,
     };
-    use crate::l7::provider::BodyLength;
+    use crate::l7::provider::{BodyLength, RelayOutcome};
     use openshell_core::proto::HttpHeader;
+
+    async fn relay_with_signed_error_suppression(
+        request_method: &str,
+        response: &[u8],
+    ) -> (RelayOutcome, Vec<u8>) {
+        let mut upstream = response;
+        let mut delivered = Vec::new();
+        let outcome = relay_response(
+            request_method,
+            &mut upstream,
+            &mut delivered,
+            RelayResponseOptions {
+                suppress_signed_non_success_details: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("relay signed response");
+        (outcome, delivered)
+    }
+
+    #[tokio::test]
+    async fn signed_upstream_errors_are_replaced_for_every_body_framing() {
+        const REFLECTED: &[u8] = b"REFLECTED_SIGNED_CREDENTIAL";
+        let responses = [
+            [
+                b"HTTP/1.1 403 Forbidden\r\nX-Reflected: ".as_slice(),
+                REFLECTED,
+                b"\r\nContent-Length: 27\r\n\r\n".as_slice(),
+                REFLECTED,
+            ]
+            .concat(),
+            [
+                b"HTTP/1.1 403 Forbidden\r\nX-Reflected: ".as_slice(),
+                REFLECTED,
+                b"\r\nTransfer-Encoding: chunked\r\n\r\n1B\r\n".as_slice(),
+                REFLECTED,
+                b"\r\n0\r\n\r\n".as_slice(),
+            ]
+            .concat(),
+            [
+                b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nX-Reflected: ".as_slice(),
+                REFLECTED,
+                b"\r\n\r\n".as_slice(),
+                REFLECTED,
+            ]
+            .concat(),
+        ];
+
+        for response in responses {
+            let (outcome, delivered) = relay_with_signed_error_suppression("GET", &response).await;
+            assert!(matches!(outcome, RelayOutcome::Consumed));
+            assert!(delivered.starts_with(b"HTTP/1.1 403 Upstream Rejected\r\n"));
+            assert!(delivered.ends_with(b"{\"error\":\"signed_upstream_rejected\"}"));
+            assert!(
+                delivered
+                    .windows(REFLECTED.len())
+                    .all(|window| window != REFLECTED)
+            );
+            assert!(
+                !delivered
+                    .windows(b"X-Reflected".len())
+                    .any(|window| window == b"X-Reflected")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_response_suppression_discards_informational_redirect_and_upgrade_bytes() {
+        const REFLECTED: &[u8] = b"REFLECTED_SIGNED_CREDENTIAL";
+        let responses = [
+            [
+                b"HTTP/1.1 103 Early Hints\r\nX-Reflected: ".as_slice(),
+                REFLECTED,
+                b"\r\n\r\nHTTP/1.1 500 Internal Server Error\r\nContent-Length: 27\r\n\r\n"
+                    .as_slice(),
+                REFLECTED,
+            ]
+            .concat(),
+            [
+                b"HTTP/1.1 307 Temporary Redirect\r\nLocation: https://example.test/?token="
+                    .as_slice(),
+                REFLECTED,
+                b"\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            ]
+            .concat(),
+            [
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: reflected\r\nX-Reflected: "
+                    .as_slice(),
+                REFLECTED,
+                b"\r\n\r\n".as_slice(),
+                REFLECTED,
+            ]
+            .concat(),
+        ];
+
+        for (response, expected_status) in responses.into_iter().zip([500, 502, 502]) {
+            let (outcome, delivered) = relay_with_signed_error_suppression("GET", &response).await;
+            assert!(matches!(outcome, RelayOutcome::Consumed));
+            assert!(delivered.starts_with(
+                format!("HTTP/1.1 {expected_status} Upstream Rejected\r\n").as_bytes()
+            ));
+            assert!(
+                delivered
+                    .windows(REFLECTED.len())
+                    .all(|window| window != REFLECTED)
+            );
+            assert!(
+                !delivered
+                    .windows(b"103 Early Hints".len())
+                    .any(|window| window == b"103 Early Hints")
+            );
+            assert!(
+                !delivered
+                    .windows(b"101 Switching Protocols".len())
+                    .any(|window| window == b"101 Switching Protocols")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_error_suppression_replaces_malformed_eof_after_informational_response() {
+        const REFLECTED: &[u8] = b"REFLECTED_SIGNED_CREDENTIAL";
+        let response = [
+            b"HTTP/1.1 103 Early Hints\r\nX-Reflected: ".as_slice(),
+            REFLECTED,
+            b"\r\n\r\nHTTP/1.1 5".as_slice(),
+        ]
+        .concat();
+
+        let (outcome, delivered) = relay_with_signed_error_suppression("GET", &response).await;
+        assert!(matches!(outcome, RelayOutcome::Consumed));
+        assert!(delivered.starts_with(b"HTTP/1.1 502 Upstream Rejected\r\n"));
+        assert!(
+            delivered
+                .windows(REFLECTED.len())
+                .all(|window| window != REFLECTED)
+        );
+        assert!(
+            !delivered
+                .windows(b"103 Early Hints".len())
+                .any(|window| window == b"103 Early Hints")
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_success_response_is_unchanged_but_informational_headers_are_dropped() {
+        let response = b"HTTP/1.1 103 Early Hints\r\nLink: </safe>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Safe: value\r\n\r\nbody";
+        let expected = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Safe: value\r\n\r\nbody";
+
+        let (outcome, delivered) = relay_with_signed_error_suppression("GET", response).await;
+        assert!(matches!(outcome, RelayOutcome::Reusable));
+        assert_eq!(delivered, expected);
+    }
 
     #[test]
     fn http_10_connection_persistence() {

@@ -34,7 +34,9 @@ use openshell_core::net::{
 };
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_core::secrets::{self, SecretResolver, rewrite_header_line_checked};
+use openshell_core::secrets::{
+    self, SecretResolver, UnresolvedPlaceholderReason, rewrite_header_line_checked,
+};
 #[cfg(test)]
 use openshell_isolation_interface::contract::ExecutableIdentity as ContractExecutableIdentity;
 use openshell_isolation_interface::contract::{
@@ -206,6 +208,32 @@ fn emit_credential_endpoint_mismatch(method: &str, host: &str, port: u16, policy
         "Provider credential endpoint binding mismatch; request denied",
     );
     ocsf_emit!(finding);
+}
+
+fn build_signed_request_placeholder_denial_event(
+    method: &str,
+    host: &str,
+    port: u16,
+    policy_name: &str,
+) -> openshell_ocsf::OcsfEvent {
+    HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::for_http_method(method))
+        .http_request(HttpRequest {
+            http_method: method.parse().expect("HTTP method parsing is infallible"),
+            url: None,
+        })
+        .http_response(HttpResponse { code: 403 })
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(host, port))
+        .firewall_rule(policy_name, "credential-signing")
+        .message(format!(
+            "Credential placeholder denied in signed request fields for {host}:{port}"
+        ))
+        .status_detail("credential_placeholder_forbidden_in_signed_request")
+        .build()
 }
 
 /// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
@@ -4909,6 +4937,7 @@ fn endpoint_credentials_for_request(
     }
 }
 
+#[derive(Debug)]
 struct PreparedForwardTarget {
     canonical_path: String,
     raw_query: Option<String>,
@@ -5014,6 +5043,27 @@ fn rewrite_forward_request(
     canonical_authority: &str,
     secret_resolver: Option<&SecretResolver>,
 ) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    rewrite_forward_request_inner(raw, used, path, canonical_authority, secret_resolver, false)
+}
+
+fn rewrite_sigv4_forward_request(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+    secret_resolver: Option<&SecretResolver>,
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
+    rewrite_forward_request_inner(raw, used, path, canonical_authority, secret_resolver, true)
+}
+
+fn rewrite_forward_request_inner(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    canonical_authority: &str,
+    secret_resolver: Option<&SecretResolver>,
+    strip_sigv4_auth_headers: bool,
+) -> Result<Vec<u8>, secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -5086,6 +5136,18 @@ fn rewrite_forward_request(
 
         // Reconstruct hop-by-hop upgrade fields after processing the originals.
         if field_name == "connection" || field_name == "upgrade" {
+            continue;
+        }
+
+        // The trusted signer replaces these client-supplied fields. Drop them
+        // before placeholder resolution, while preserving X-Amz-Content-Sha256
+        // so the relay can still detect the client's payload-signing mode.
+        if strip_sigv4_auth_headers
+            && matches!(
+                field_name.as_str(),
+                "authorization" | "x-amz-date" | "x-amz-security-token"
+            )
+        {
             continue;
         }
 
@@ -6478,13 +6540,39 @@ async fn handle_forward_proxy(
     }
 
     // 9. Rewrite request and forward to upstream
-    let rewritten = match rewrite_forward_request(
-        &forward_request_bytes,
-        forward_request_bytes.len(),
-        &upstream_target,
-        &canonical_authority,
-        secret_resolver.as_deref(),
-    ) {
+    let credential_signing = forward_upgrade_config
+        .as_ref()
+        .map_or(crate::l7::CredentialSigning::None, |config| {
+            config.credential_signing
+        });
+    let sigv4_request_resolver = if credential_signing.is_sigv4() {
+        secret_resolver
+            .as_deref()
+            .map(SecretResolver::without_resolvable_placeholders)
+    } else {
+        None
+    };
+    let request_resolver = sigv4_request_resolver
+        .as_ref()
+        .or(secret_resolver.as_deref());
+    let rewritten_result = if credential_signing.is_sigv4() {
+        rewrite_sigv4_forward_request(
+            &forward_request_bytes,
+            forward_request_bytes.len(),
+            &upstream_target,
+            &canonical_authority,
+            request_resolver,
+        )
+    } else {
+        rewrite_forward_request(
+            &forward_request_bytes,
+            forward_request_bytes.len(),
+            &upstream_target,
+            &canonical_authority,
+            request_resolver,
+        )
+    };
+    let rewritten = match rewritten_result {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
@@ -6498,21 +6586,18 @@ async fn handle_forward_proxy(
                     .end(openshell_core::proto::MiddlewareSessionEndReason::Cancellation)
                     .await;
             }
+            if let Some(observer) = endpoint_observer.as_ref() {
+                observer.observe_credential_resolution_failure(&e);
+            }
             if e.is_endpoint_mismatch() {
-                if let Some(observer) = endpoint_observer.as_ref() {
-                    observer.observe_credential_failure(true);
-                }
                 emit_credential_endpoint_mismatch(method, &host_lc, port, policy_str);
-                respond(
-                    client,
-                    &build_json_error_response(
-                        403,
-                        "Forbidden",
-                        "credential_endpoint_mismatch",
-                        "credential is not authorized for this request endpoint",
-                    ),
-                )
-                .await?;
+            } else if e.is_forbidden_in_signed_request() {
+                ocsf_emit!(build_signed_request_placeholder_denial_event(
+                    method, &host_lc, port, policy_str,
+                ));
+            }
+            respond(client, &build_credential_resolution_error_response(&e)).await?;
+            if e.is_endpoint_mismatch() || e.is_forbidden_in_signed_request() {
                 client.shutdown().await.into_diagnostic()?;
                 let mut discard = [0_u8; 1024];
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -6524,17 +6609,6 @@ async fn handle_forward_proxy(
                     }
                 })
                 .await;
-            } else {
-                respond(
-                    client,
-                    &build_json_error_response(
-                        500,
-                        "Internal Server Error",
-                        "credential_injection_failed",
-                        "unresolved credential placeholder in request",
-                    ),
-                )
-                .await?;
             }
             return Ok(());
         }
@@ -6679,11 +6753,6 @@ async fn handle_forward_proxy(
         return Ok(());
     }
 
-    let credential_signing = forward_upgrade_config
-        .as_ref()
-        .map_or(crate::l7::CredentialSigning::None, |config| {
-            config.credential_signing
-        });
     let signing_service = forward_upgrade_config
         .as_ref()
         .map_or("", |config| config.signing_service.as_str());
@@ -6890,6 +6959,31 @@ async fn respond(client: &mut (impl TokioAsyncWrite + Unpin), bytes: &[u8]) -> R
 /// Returns bytes ready to write to the client socket.  The body is a JSON
 /// object with `error` and `detail` fields, matching the format used by the
 /// L7 deny path in `l7/rest.rs`.
+fn build_credential_resolution_error_response(
+    error: &secrets::UnresolvedPlaceholderError,
+) -> Vec<u8> {
+    match error.reason() {
+        UnresolvedPlaceholderReason::EndpointMismatch => build_json_error_response(
+            403,
+            "Forbidden",
+            "credential_endpoint_mismatch",
+            "credential is not authorized for this request endpoint",
+        ),
+        UnresolvedPlaceholderReason::ForbiddenInSignedRequest => build_json_error_response(
+            403,
+            "Forbidden",
+            "credential_placeholder_forbidden_in_signed_request",
+            "credential placeholders are not allowed in signed request fields",
+        ),
+        UnresolvedPlaceholderReason::Unavailable => build_json_error_response(
+            500,
+            "Internal Server Error",
+            "credential_injection_failed",
+            "unresolved credential placeholder in request",
+        ),
+    }
+}
+
 fn build_json_error_response(status: u16, status_text: &str, error: &str, detail: &str) -> Vec<u8> {
     let body = serde_json::json!({
         "error": error,
@@ -12977,6 +13071,39 @@ network_policies:
     }
 
     #[test]
+    fn signed_request_placeholder_denial_is_not_endpoint_mismatch() {
+        use openshell_ocsf::validation::{load_class_schema, validate_required_fields};
+
+        let (_, resolver) = SecretResolver::from_provider_env(TestHashMap::from([(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "secret".to_string(),
+        )]));
+        let request_resolver = resolver
+            .expect("resolver")
+            .without_resolvable_placeholders();
+        let error = request_resolver
+            .rewrite_header_value("openshell:resolve:env:AWS_SECRET_ACCESS_KEY")
+            .expect_err("signed request fields must reject placeholders");
+
+        let response = String::from_utf8(build_credential_resolution_error_response(&error))
+            .expect("ASCII response");
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("credential_placeholder_forbidden_in_signed_request"));
+        assert!(!response.contains("credential_endpoint_mismatch"));
+
+        let event =
+            build_signed_request_placeholder_denial_event("PUT", "s3.example.com", 443, "s3");
+        assert_eq!(event.base().severity, SeverityId::Medium);
+        let json = event.to_json().unwrap();
+        assert_eq!(
+            json["status_detail"],
+            "credential_placeholder_forbidden_in_signed_request"
+        );
+        assert_eq!(json["http_response"]["code"], 403);
+        validate_required_fields(&json, &load_class_schema("http_activity"));
+    }
+
+    #[test]
     fn forward_credentials_capture_endpoint_resolver_and_revision_together() {
         use openshell_core::proto::{StaticCredentialBinding, StaticCredentialEndpointBinding};
 
@@ -13061,6 +13188,33 @@ network_policies:
                 .rewrite_header_value(placeholder)
                 .expect_err("canonical endpoint must deny traversal");
             assert!(error.is_endpoint_mismatch());
+        }
+    }
+
+    #[test]
+    fn forward_s3_sigv4_target_canonicalizes_before_signing() {
+        for (target, expected) in [
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a//b",
+                "/bucket/a/b",
+            ),
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a/../b",
+                "/bucket/b",
+            ),
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a%3Db",
+                "/bucket/a=b",
+            ),
+            (
+                "http://s3.us-east-1.amazonaws.com/bucket/a+b=c@d%20e",
+                "/bucket/a+b=c@d%20e",
+            ),
+        ] {
+            let prepared =
+                prepare_forward_target(target, crate::l7::path::CanonicalizeOptions::default())
+                    .expect("S3 target must canonicalize");
+            assert_eq!(prepared.upstream_target, expected);
         }
     }
 
@@ -13741,6 +13895,302 @@ network_policies:
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn forward_sigv4_rewrite_rejects_signing_credential_in_request_header() {
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                [
+                    ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+                    (
+                        "AWS_SECRET_ACCESS_KEY".to_string(),
+                        "secret-value".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                TestHashMap::new(),
+                7,
+            );
+        let resolver = SecretResolver::merge(
+            [generation_resolver.as_ref(), current_resolver.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .expect("combined resolver");
+        let request_resolver = resolver.without_resolvable_placeholders();
+        let raw = format!(
+            "GET http://host/p HTTP/1.1\r\n\
+             Host: host\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={}/scope\r\n\
+             x-amz-meta-value: {}\r\n\r\n",
+            child_env["AWS_ACCESS_KEY_ID"], child_env["AWS_SECRET_ACCESS_KEY"]
+        );
+        let error = rewrite_sigv4_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/p",
+            "host",
+            Some(&request_resolver),
+        )
+        .expect_err("signing credential must be rejected before forward relay");
+
+        assert!(error.is_forbidden_in_signed_request());
+        assert!(!error.is_endpoint_mismatch());
+    }
+
+    #[test]
+    fn forward_sigv4_rewrite_preserves_payload_hint_while_replacing_auth_headers() {
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                [
+                    ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+                    ("AWS_SESSION_TOKEN".to_string(), "session-value".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                TestHashMap::new(),
+                7,
+            );
+        let resolver = SecretResolver::merge(
+            [generation_resolver.as_ref(), current_resolver.as_ref()]
+                .into_iter()
+                .flatten(),
+        )
+        .expect("combined resolver");
+        let request_resolver = resolver.without_resolvable_placeholders();
+        let raw = format!(
+            "PUT http://host/bucket/key HTTP/1.1\r\n\
+             Host: host\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={}/scope\r\n\
+             X-Amz-Date: 20261012T000000Z\r\n\
+             X-Amz-Security-Token: {}\r\n\
+             X-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n",
+            child_env["AWS_ACCESS_KEY_ID"], child_env["AWS_SESSION_TOKEN"]
+        );
+
+        let rewritten = rewrite_sigv4_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/bucket/key",
+            "host",
+            Some(&request_resolver),
+        )
+        .expect("old auth headers are replaced by the trusted signer");
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        let rewritten_lower = rewritten.to_ascii_lowercase();
+
+        assert!(!rewritten_lower.contains("authorization:"));
+        assert!(!rewritten_lower.contains("x-amz-date:"));
+        assert!(!rewritten_lower.contains("x-amz-security-token:"));
+        assert!(rewritten.contains("X-Amz-Content-Sha256: UNSIGNED-PAYLOAD"));
+    }
+
+    #[tokio::test]
+    async fn forward_sigv4_rewrite_preserves_streaming_payload_mode_through_relay() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "secret-value".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let request_resolver = resolver.without_resolvable_placeholders();
+        let body = "3\r\nabc\r\n0\r\nx-amz-checksum-crc32: AAAA==\r\n\r\n";
+        let raw = format!(
+            "PUT http://s3.us-east-1.amazonaws.com/bucket/key HTTP/1.1\r\n\
+             Host: s3.us-east-1.amazonaws.com\r\n\
+             Authorization: AWS4-HMAC-SHA256 Credential={}/scope\r\n\
+             X-Amz-Date: 20261012T000000Z\r\n\
+             X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\
+             Content-Encoding: aws-chunked\r\n\
+             Transfer-Encoding: chunked\r\n\
+             X-Amz-Trailer: x-amz-checksum-crc32\r\n\r\n{body}",
+            child_env["AWS_ACCESS_KEY_ID"]
+        );
+        let rewritten = rewrite_sigv4_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/bucket/key",
+            "s3.us-east-1.amazonaws.com",
+            Some(&request_resolver),
+        )
+        .expect("forward rewrite");
+        let guard = forward_test_guard();
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16 * 1024);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(16 * 1024);
+        let body_bytes = body.as_bytes().to_vec();
+        let upstream_task = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let read = upstream_side.read(&mut buf).await.unwrap();
+                assert_ne!(read, 0, "upstream request ended before chunk trailers");
+                forwarded.extend_from_slice(&buf[..read]);
+                if forwarded.ends_with(&body_bytes) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            forwarded
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_rewritten_forward_request(
+                "PUT",
+                "/bucket/key",
+                rewritten,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                ForwardRelayOptions {
+                    generation_guard: &guard,
+                    credential_generation: None,
+                    body_classifier: None,
+                    websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                    secret_resolver: Some(&resolver),
+                    request_body_credential_rewrite: false,
+                    deny_uninspected_credentials: false,
+                    credential_signing: crate::l7::CredentialSigning::SigV4,
+                    signing_service: "s3",
+                    signing_region: "us-east-1",
+                    host: "s3.us-east-1.amazonaws.com",
+                    port: 80,
+                    response_middleware: None,
+                    endpoint_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("relay must not deadlock")
+        .expect("relay should preserve supported streaming mode");
+        drop(proxy_to_upstream);
+        let forwarded = upstream_task.await.expect("upstream task");
+        let forwarded_headers = String::from_utf8_lossy(
+            &forwarded[..forwarded
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("forwarded header terminator")
+                + 4],
+        );
+
+        assert!(
+            forwarded_headers
+                .contains("x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n")
+        );
+        assert!(forwarded_headers.contains("authorization: AWS4-HMAC-SHA256"));
+        assert!(forwarded.ends_with(body.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn forward_sigv4_error_response_cannot_reflect_signed_credentials() {
+        let session_token = "SUPER_SECRET_FORWARD_SESSION_TOKEN";
+        let reflected_hex = hex::encode(session_token);
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                ("AWS_ACCESS_KEY_ID".to_string(), "ASIATESTKEY".to_string()),
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "test-secret-key".to_string(),
+                ),
+                ("AWS_SESSION_TOKEN".to_string(), session_token.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let request_resolver = resolver.without_resolvable_placeholders();
+        let raw = b"GET http://s3.us-east-1.amazonaws.com/bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\n\r\n";
+        let rewritten = rewrite_sigv4_forward_request(
+            raw,
+            raw.len(),
+            "/bucket/key",
+            "s3.us-east-1.amazonaws.com",
+            Some(&request_resolver),
+        )
+        .expect("forward rewrite");
+        let guard = forward_test_guard();
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16 * 1024);
+        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(16 * 1024);
+        let token_for_upstream = session_token.to_string();
+        let hex_for_upstream = reflected_hex.clone();
+        let upstream_task = tokio::spawn(async move {
+            let request = read_http_headers(&mut upstream_side).await;
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains(&format!("x-amz-security-token: {token_for_upstream}\r\n")));
+
+            let body = format!(
+                "<CanonicalRequest>{token_for_upstream}</CanonicalRequest><CanonicalRequestBytes>{hex_for_upstream}</CanonicalRequestBytes>"
+            );
+            let head = format!(
+                "HTTP/1.1 403 Forbidden\r\nX-Reflected: {token_for_upstream}\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let split = head.len() / 2;
+            upstream_side
+                .write_all(&head.as_bytes()[..split])
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            upstream_side
+                .write_all(&head.as_bytes()[split..])
+                .await
+                .unwrap();
+            upstream_side.write_all(body.as_bytes()).await.unwrap();
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            relay_rewritten_forward_request(
+                "GET",
+                "/bucket/key",
+                rewritten,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                ForwardRelayOptions {
+                    generation_guard: &guard,
+                    credential_generation: None,
+                    body_classifier: None,
+                    websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                    secret_resolver: Some(&resolver),
+                    request_body_credential_rewrite: false,
+                    deny_uninspected_credentials: false,
+                    credential_signing: crate::l7::CredentialSigning::SigV4NoBody,
+                    signing_service: "s3",
+                    signing_region: "us-east-1",
+                    host: "s3.us-east-1.amazonaws.com",
+                    port: 80,
+                    response_middleware: None,
+                    endpoint_observer: None,
+                },
+            ),
+        )
+        .await
+        .expect("relay must not deadlock")
+        .expect("signed rejection must be replaced");
+        assert!(matches!(
+            outcome,
+            crate::l7::provider::RelayOutcome::Consumed
+        ));
+        upstream_task.await.expect("upstream task");
+
+        let mut delivered = Vec::new();
+        app_side.read_to_end(&mut delivered).await.unwrap();
+        let delivered = String::from_utf8(delivered).unwrap();
+        assert!(delivered.starts_with("HTTP/1.1 403 Upstream Rejected\r\n"));
+        assert!(delivered.contains("signed_upstream_rejected"));
+        assert!(!delivered.contains(session_token));
+        assert!(!delivered.contains(&reflected_hex));
+        assert!(!delivered.contains("CanonicalRequest"));
     }
 
     #[tokio::test]
@@ -14632,9 +15082,11 @@ network_policies:
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_port = listener.local_addr().unwrap().port();
         let target = target.to_string();
+        let (_, target_host, target_port, _) = parse_proxy_uri(&target).expect("valid test target");
+        let host_header = canonical_forward_authority(&target_host, target_port);
         let client = tokio::spawn(async move {
             let mut socket = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
-            let request = format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+            let request = format!("GET {target} HTTP/1.1\r\nHost: {host_header}\r\n\r\n");
             socket.write_all(request.as_bytes()).await.unwrap();
             let mut response = Vec::new();
             socket.read_to_end(&mut response).await.unwrap();
@@ -14643,6 +15095,16 @@ network_policies:
 
         let (server, _) = listener.accept().await.unwrap();
         let (denial_tx, mut denial_rx) = mpsc::unbounded_channel();
+        let (_, secret_resolver) = SecretResolver::from_provider_env(TestHashMap::from([
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "test-access-key".to_string(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "test-secret-key".to_string(),
+            ),
+        ]));
         Box::pin(handle_tcp_connection(
             server,
             engine,
@@ -14655,7 +15117,7 @@ network_policies:
             Arc::new(None),
             Arc::new(None),
             None,
-            None,
+            secret_resolver.map(Arc::new),
             Some(denial_tx),
             None,
             None,
@@ -14769,6 +15231,104 @@ network_policies:
             "an explicit loopback endpoint must fail declared-endpoint validation; got: {response:?}"
         );
         assert_eq!(denial_stages, ["ssrf"]);
+    }
+
+    #[tokio::test]
+    async fn forward_s3_canonicalizes_routes_and_rejects_query_placeholder_before_upstream() {
+        if !cfg!(target_os = "linux") {
+            eprintln!("skipping: handler identity binding requires /proc (Linux)");
+            return;
+        }
+        let Some(upstream_ip) = non_loopback_test_ipv4() else {
+            eprintln!("skipping: no routable non-loopback IPv4 test address");
+            return;
+        };
+
+        for (raw_path, expected_upstream) in [
+            ("/api//v1", Some(("/api/v1", false))),
+            ("/api/../bucket/key", Some(("/bucket/key", true))),
+            ("/bucket/../api/v1", Some(("/api/v1", false))),
+            (
+                "/api/../bucket/key?leak=openshell%3Aresolve%3Aenv%3AAWS_SECRET_ACCESS_KEY",
+                None,
+            ),
+        ] {
+            let upstream_listener = TcpListener::bind((upstream_ip, 0))
+                .await
+                .expect("bind test upstream");
+            let upstream_port = upstream_listener.local_addr().unwrap().port();
+            let mut upstream_task = tokio::spawn(async move {
+                let (mut socket, _) = upstream_listener.accept().await.unwrap();
+                let request = read_http_headers(&mut socket).await;
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let endpoint_yaml = format!(
+                r#"      - host: "{upstream_ip}"
+        port: {upstream_port}
+        path: "/api/**"
+        protocol: rest
+        access: full
+      - host: "{upstream_ip}"
+        port: {upstream_port}
+        path: "/bucket/**"
+        protocol: rest
+        access: full
+        credential_signing: sigv4:no_body
+        signing_service: s3
+        signing_region: us-east-1
+"#,
+            );
+            let target = format!("http://{upstream_ip}:{upstream_port}{raw_path}");
+            let (response, _) =
+                Box::pin(drive_forward_through_handler(&endpoint_yaml, &target)).await;
+            let response = String::from_utf8(response).unwrap();
+
+            if let Some((expected_upstream_path, expect_sigv4)) = expected_upstream {
+                assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+                let forwarded =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), &mut upstream_task)
+                        .await
+                        .expect("canonical request must reach upstream")
+                        .unwrap();
+                assert!(
+                    forwarded.starts_with(&format!("GET {expected_upstream_path} HTTP/1.1")),
+                    "{forwarded}"
+                );
+                assert!(
+                    !forwarded.contains(raw_path),
+                    "raw non-canonical target reached upstream: {forwarded}"
+                );
+                let forwarded = forwarded.to_ascii_lowercase();
+                if expect_sigv4 {
+                    assert!(forwarded.contains("authorization: aws4-hmac-sha256"));
+                    assert!(forwarded.contains("x-amz-"));
+                } else {
+                    assert!(!forwarded.contains("authorization:"));
+                    assert!(!forwarded.contains("x-amz-"));
+                }
+            } else {
+                assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+                assert!(
+                    response.contains("credential_placeholder_forbidden_in_signed_request"),
+                    "{response}"
+                );
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        &mut upstream_task,
+                    )
+                    .await
+                    .is_err(),
+                    "query placeholder rejection must happen before upstream connect"
+                );
+                upstream_task.abort();
+                let _ = upstream_task.await;
+            }
+        }
     }
 
     /// A real `tls: skip` policy path through the handler is exempt from the

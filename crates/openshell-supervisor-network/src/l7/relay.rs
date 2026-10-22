@@ -23,7 +23,7 @@ use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
-use openshell_core::secrets::{self, SecretResolver};
+use openshell_core::secrets::{self, SecretResolver, UnresolvedPlaceholderReason};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
@@ -536,9 +536,40 @@ fn build_request_authority_mismatch_finding(ctx: &L7EvalContext) -> openshell_oc
 fn build_credential_resolution_event(
     ctx: &L7EvalContext,
     method: &str,
-    endpoint_mismatch: bool,
+    reason: UnresolvedPlaceholderReason,
 ) -> openshell_ocsf::OcsfEvent {
-    let response_code = if endpoint_mismatch { 403 } else { 500 };
+    let (response_code, severity, engine, message, status_detail) = match reason {
+        UnresolvedPlaceholderReason::EndpointMismatch => (
+            403,
+            SeverityId::High,
+            "credential-binding",
+            format!(
+                "Credential use denied: credential is not authorized for {}:{}",
+                ctx.host, ctx.port
+            ),
+            "credential_endpoint_mismatch",
+        ),
+        UnresolvedPlaceholderReason::ForbiddenInSignedRequest => (
+            403,
+            SeverityId::Medium,
+            "credential-signing",
+            format!(
+                "Credential placeholder denied in signed request fields for {}:{}",
+                ctx.host, ctx.port
+            ),
+            "credential_placeholder_forbidden_in_signed_request",
+        ),
+        UnresolvedPlaceholderReason::Unavailable => (
+            500,
+            SeverityId::Medium,
+            "credential-binding",
+            format!(
+                "Credential use denied: credential is unavailable for {}:{}",
+                ctx.host, ctx.port
+            ),
+            "credential_unavailable",
+        ),
+    };
     HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::for_http_method(method))
         .http_request(method_only_request(method))
@@ -547,30 +578,12 @@ fn build_credential_resolution_event(
         })
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
-        .severity(if endpoint_mismatch {
-            SeverityId::High
-        } else {
-            SeverityId::Medium
-        })
+        .severity(severity)
         .status(StatusId::Failure)
         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-        .firewall_rule(&ctx.policy_name, "credential-binding")
-        .message(if endpoint_mismatch {
-            format!(
-                "Credential use denied: credential is not authorized for {}:{}",
-                ctx.host, ctx.port
-            )
-        } else {
-            format!(
-                "Credential use denied: credential is unavailable for {}:{}",
-                ctx.host, ctx.port
-            )
-        })
-        .status_detail(if endpoint_mismatch {
-            "credential_endpoint_mismatch"
-        } else {
-            "credential_unavailable"
-        })
+        .firewall_rule(&ctx.policy_name, engine)
+        .message(message)
+        .status_detail(status_detail)
         .build()
 }
 
@@ -592,16 +605,19 @@ pub(crate) async fn reject_credential_resolution<W>(
 where
     W: AsyncWrite + Unpin,
 {
-    let endpoint_mismatch = error.is_endpoint_mismatch();
-    let status = if endpoint_mismatch {
-        "403 Forbidden"
-    } else {
-        "500 Internal Server Error"
-    };
-    let body = if endpoint_mismatch {
-        r#"{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}"#
-    } else {
-        r#"{"error":"credential_unavailable","message":"Credential placeholder could not be resolved"}"#
+    let (status, body) = match error.reason() {
+        UnresolvedPlaceholderReason::EndpointMismatch => (
+            "403 Forbidden",
+            r#"{"error":"credential_endpoint_mismatch","message":"Credential is not authorized for this request endpoint"}"#,
+        ),
+        UnresolvedPlaceholderReason::ForbiddenInSignedRequest => (
+            "403 Forbidden",
+            r#"{"error":"credential_placeholder_forbidden_in_signed_request","message":"Credential placeholders are not allowed in signed request fields"}"#,
+        ),
+        UnresolvedPlaceholderReason::Unavailable => (
+            "500 Internal Server Error",
+            r#"{"error":"credential_unavailable","message":"Credential placeholder could not be resolved"}"#,
+        ),
     };
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -616,10 +632,10 @@ where
     ocsf_emit!(build_credential_resolution_event(
         ctx,
         method,
-        endpoint_mismatch
+        error.reason()
     ));
 
-    if endpoint_mismatch {
+    if error.is_endpoint_mismatch() {
         ocsf_emit!(build_credential_endpoint_mismatch_finding(ctx));
     }
     Ok(())
@@ -828,7 +844,7 @@ where
             } else if let Some(error) = report.downcast_ref::<secrets::UnresolvedPlaceholderError>()
             {
                 if let Some(observer) = observer {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_resolution_failure(error);
                 }
                 reject_credential_resolution(client, ctx, &request.action, error).await?;
                 Ok(None)
@@ -1347,7 +1363,7 @@ where
             Ok(target) => target,
             Err(error) => {
                 if let Some(observer) = observer.as_ref() {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_resolution_failure(&error);
                 }
                 reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
@@ -2516,7 +2532,7 @@ where
             Ok(target) => target,
             Err(error) => {
                 if let Some(observer) = observer.as_ref() {
-                    observer.observe_credential_failure(error.is_endpoint_mismatch());
+                    observer.observe_credential_resolution_failure(&error);
                 }
                 reject_credential_resolution(client, ctx, &req.action, &error).await?;
                 return Ok(());
@@ -4016,14 +4032,31 @@ mod tests {
                 403,
             ),
             (
-                build_credential_resolution_event(&ctx, "POST", true),
+                build_credential_resolution_event(
+                    &ctx,
+                    "POST",
+                    UnresolvedPlaceholderReason::EndpointMismatch,
+                ),
                 "POST",
                 403,
             ),
             (
-                build_credential_resolution_event(&ctx, "HEAD", false),
+                build_credential_resolution_event(
+                    &ctx,
+                    "HEAD",
+                    UnresolvedPlaceholderReason::Unavailable,
+                ),
                 "HEAD",
                 500,
+            ),
+            (
+                build_credential_resolution_event(
+                    &ctx,
+                    "PUT",
+                    UnresolvedPlaceholderReason::ForbiddenInSignedRequest,
+                ),
+                "PUT",
+                403,
             ),
         ] {
             let json = event.to_json().unwrap();
@@ -4036,6 +4069,48 @@ mod tests {
             validate_required_fields(&json, &schema);
             validate_enum_value(&json, "activity_id", &schema);
         }
+    }
+
+    #[tokio::test]
+    async fn signed_request_placeholder_denial_is_typed_without_endpoint_mismatch_alert() {
+        let (_, resolver) = SecretResolver::from_provider_env(TestHashMap::from([(
+            "AWS_SECRET_ACCESS_KEY".to_string(),
+            "secret".to_string(),
+        )]));
+        let request_resolver = resolver
+            .expect("resolver")
+            .without_resolvable_placeholders();
+        let error = request_resolver
+            .rewrite_header_value("openshell:resolve:env:AWS_SECRET_ACCESS_KEY")
+            .expect_err("signed request fields must reject placeholders");
+        assert!(error.is_forbidden_in_signed_request());
+        assert!(!error.is_endpoint_mismatch());
+
+        let ctx = L7EvalContext {
+            host: "s3.example.test".into(),
+            port: 443,
+            policy_name: "s3".into(),
+            ..Default::default()
+        };
+        let (mut relay, mut caller) = tokio::io::duplex(4096);
+        reject_credential_resolution(&mut relay, &ctx, "PUT", &error)
+            .await
+            .expect("local rejection");
+        drop(relay);
+        let mut response = String::new();
+        caller.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(response.contains("credential_placeholder_forbidden_in_signed_request"));
+        assert!(!response.contains("credential_endpoint_mismatch"));
+
+        let event = build_credential_resolution_event(&ctx, "PUT", error.reason());
+        assert_eq!(event.base().severity, SeverityId::Medium);
+        let json = event.to_json().unwrap();
+        assert_eq!(
+            json["status_detail"],
+            "credential_placeholder_forbidden_in_signed_request"
+        );
+        assert_eq!(json["http_response"]["code"], 403);
     }
 
     #[test]
@@ -4216,9 +4291,13 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(ctx, "GET", true)
-            .to_json()
-            .expect("serialize credential mismatch activity");
+        let activity = build_credential_resolution_event(
+            ctx,
+            "GET",
+            UnresolvedPlaceholderReason::EndpointMismatch,
+        )
+        .to_json()
+        .expect("serialize credential mismatch activity");
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
         assert_eq!(activity["action"], "Denied");
         assert_eq!(activity["disposition"], "Blocked");
@@ -4278,9 +4357,13 @@ mod tests {
             "credential mismatch must not write upstream"
         );
 
-        let activity = build_credential_resolution_event(&ctx, "GET", true)
-            .to_json()
-            .unwrap();
+        let activity = build_credential_resolution_event(
+            &ctx,
+            "GET",
+            UnresolvedPlaceholderReason::EndpointMismatch,
+        )
+        .to_json()
+        .unwrap();
         assert_eq!(activity["status_detail"], "credential_endpoint_mismatch");
         assert_eq!(activity["action"], "Denied");
         assert_eq!(activity["disposition"], "Blocked");
@@ -9058,6 +9141,171 @@ network_policies:
     binaries:
       - { path: /usr/bin/node }
 "#;
+
+    const S3_CANONICALIZATION_POLICY: &str = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: /api/**
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+      - host: gateway.example.test
+        port: 443
+        path: /bucket/**
+        protocol: rest
+        enforcement: enforce
+        credential_signing: sigv4
+        signing_service: s3
+        signing_region: us-east-1
+        rules:
+          - allow:
+              method: GET
+              path: "/bucket/**"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+
+    async fn relay_mixed_s3_target(target: &str) -> (String, String) {
+        let engine = OpaEngine::from_strings(TEST_POLICY, S3_CANONICALIZATION_POLICY).unwrap();
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoints, generation) = engine
+            .query_endpoint_configs_with_generation(&input)
+            .unwrap();
+        let configs: Vec<_> = endpoints
+            .iter()
+            .map(|endpoint| crate::l7::parse_l7_config(endpoint).unwrap())
+            .collect();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let (_, resolver) = SecretResolver::from_provider_env(TestHashMap::from([
+            (
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "test-access-key".to_string(),
+            ),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "test-secret-key".to_string(),
+            ),
+        ]));
+        let ctx = L7EvalContext {
+            secret_resolver: resolver.map(Arc::new),
+            ..encoded_slash_scoping_ctx()
+        };
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+        let server = tokio::spawn(async move {
+            let mut forwarded = Vec::new();
+            let mut chunk = [0u8; 512];
+            while let Ok(Ok(count)) = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                upstream.read(&mut chunk),
+            )
+            .await
+            {
+                if count == 0 {
+                    break;
+                }
+                forwarded.extend_from_slice(&chunk[..count]);
+                if forwarded.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            if !forwarded.is_empty() {
+                upstream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+            String::from_utf8(forwarded).unwrap()
+        });
+
+        app.write_all(
+            format!(
+                "GET {target} HTTP/1.1\r\nHost: gateway.example.test\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_http_headers(&mut app),
+        )
+        .await
+        .expect("route-selected relay must answer");
+        drop(app);
+
+        let forwarded = server.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("route-selected relay must finish")
+            .unwrap()
+            .unwrap();
+        (String::from_utf8(response).unwrap(), forwarded)
+    }
+
+    #[tokio::test]
+    async fn route_selected_s3_canonicalizes_before_signing() {
+        let (response, forwarded) = relay_mixed_s3_target("/api//v1").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(forwarded.starts_with("GET /api/v1 HTTP/1.1"), "{forwarded}");
+        assert!(!forwarded.to_ascii_lowercase().contains("authorization:"));
+
+        let (response, forwarded) = relay_mixed_s3_target("/api/../bucket/key").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            forwarded.starts_with("GET /bucket/key HTTP/1.1"),
+            "{forwarded}"
+        );
+        let signed = forwarded.to_ascii_lowercase();
+        assert!(signed.contains("authorization: aws4-hmac-sha256"));
+        assert!(signed.contains("x-amz-"));
+        assert!(!signed.contains("/api/../bucket/key"));
+
+        let (response, forwarded) = relay_mixed_s3_target("/bucket/../api/v1").await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(forwarded.starts_with("GET /api/v1 HTTP/1.1"), "{forwarded}");
+        let forwarded = forwarded.to_ascii_lowercase();
+        assert!(!forwarded.contains("authorization:"));
+        assert!(!forwarded.contains("x-amz-"));
+    }
+
+    #[tokio::test]
+    async fn route_selected_s3_noncanonical_target_rejects_query_placeholder_before_upstream() {
+        let (response, forwarded) = relay_mixed_s3_target(
+            "/api/../bucket/key?leak=openshell%3Aresolve%3Aenv%3AAWS_SECRET_ACCESS_KEY",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert!(
+            forwarded.is_empty(),
+            "placeholder-bearing signed request reached upstream: {forwarded}"
+        );
+    }
 
     fn encoded_slash_scoping_configs() -> Vec<L7EndpointConfig> {
         let rest = |path: &str, allow_encoded_slash: bool| L7EndpointConfig {

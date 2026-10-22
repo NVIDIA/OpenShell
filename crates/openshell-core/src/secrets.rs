@@ -111,9 +111,13 @@ pub struct UnresolvedPlaceholderError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnresolvedPlaceholderReason {
+pub enum UnresolvedPlaceholderReason {
+    /// No usable credential value exists for the placeholder.
     Unavailable,
+    /// The credential exists but is bound to a different request endpoint.
     EndpointMismatch,
+    /// Workload-controlled fields of a signed request cannot contain placeholders.
+    ForbiddenInSignedRequest,
 }
 
 impl UnresolvedPlaceholderError {
@@ -125,6 +129,16 @@ impl UnresolvedPlaceholderError {
     #[must_use]
     pub fn is_endpoint_mismatch(&self) -> bool {
         self.reason == UnresolvedPlaceholderReason::EndpointMismatch
+    }
+
+    #[must_use]
+    pub fn is_forbidden_in_signed_request(&self) -> bool {
+        self.reason == UnresolvedPlaceholderReason::ForbiddenInSignedRequest
+    }
+
+    #[must_use]
+    pub fn reason(&self) -> UnresolvedPlaceholderReason {
+        self.reason
     }
 }
 
@@ -138,6 +152,8 @@ impl fmt::Display for UnresolvedPlaceholderError {
                     "credential placeholder could not be resolved",
                 UnresolvedPlaceholderReason::EndpointMismatch =>
                     "credential is not authorized for the request endpoint",
+                UnresolvedPlaceholderReason::ForbiddenInSignedRequest =>
+                    "credential placeholders are not allowed in signed request fields",
             },
             self.location,
         )
@@ -184,6 +200,7 @@ pub struct RewriteTargetResult {
 pub struct SecretResolver {
     by_placeholder: HashMap<String, SecretValue>,
     denied_env_keys: HashSet<String>,
+    forbid_placeholders_in_signed_request: bool,
     identity_bound_env_keys: HashSet<String>,
     revision_fallback_allowed_revisions: HashMap<String, Arc<HashSet<u64>>>,
 }
@@ -293,6 +310,7 @@ impl SecretResolver {
             (!by_placeholder.is_empty()).then_some(Self {
                 by_placeholder,
                 denied_env_keys: HashSet::new(),
+                forbid_placeholders_in_signed_request: false,
                 identity_bound_env_keys: HashSet::new(),
                 revision_fallback_allowed_revisions: HashMap::new(),
             })
@@ -348,6 +366,7 @@ impl SecretResolver {
                 Some(Self {
                     by_placeholder,
                     denied_env_keys: HashSet::new(),
+                    forbid_placeholders_in_signed_request: false,
                     identity_bound_env_keys: HashSet::new(),
                     revision_fallback_allowed_revisions: HashMap::new(),
                 }),
@@ -358,21 +377,27 @@ impl SecretResolver {
     pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
         let mut denied_env_keys = HashSet::new();
+        let mut forbid_placeholders_in_signed_request = false;
         let mut identity_bound_env_keys = HashSet::new();
         let mut revision_fallback_allowed_revisions = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
             denied_env_keys.extend(resolver.denied_env_keys.iter().cloned());
+            forbid_placeholders_in_signed_request |= resolver.forbid_placeholders_in_signed_request;
             identity_bound_env_keys.extend(resolver.identity_bound_env_keys.iter().cloned());
             revision_fallback_allowed_revisions
                 .extend(resolver.revision_fallback_allowed_revisions.clone());
         }
-        if by_placeholder.is_empty() {
+        if forbid_placeholders_in_signed_request {
+            by_placeholder.clear();
+        }
+        if by_placeholder.is_empty() && !forbid_placeholders_in_signed_request {
             None
         } else {
             Some(Self {
                 by_placeholder,
                 denied_env_keys,
+                forbid_placeholders_in_signed_request,
                 identity_bound_env_keys,
                 revision_fallback_allowed_revisions,
             })
@@ -406,8 +431,24 @@ impl SecretResolver {
         Self {
             by_placeholder,
             denied_env_keys,
+            forbid_placeholders_in_signed_request: self.forbid_placeholders_in_signed_request,
             identity_bound_env_keys: bound_keys.clone(),
             revision_fallback_allowed_revisions,
+        }
+    }
+
+    /// Return a resolver view that rejects every credential placeholder.
+    ///
+    /// Trusted transforms can keep the original resolver while using this view
+    /// to scan untrusted request content without materializing any secret.
+    #[must_use]
+    pub fn without_resolvable_placeholders(&self) -> Self {
+        Self {
+            by_placeholder: HashMap::new(),
+            denied_env_keys: self.denied_env_keys.clone(),
+            forbid_placeholders_in_signed_request: true,
+            identity_bound_env_keys: self.identity_bound_env_keys.clone(),
+            revision_fallback_allowed_revisions: self.revision_fallback_allowed_revisions.clone(),
         }
     }
 
@@ -416,7 +457,9 @@ impl SecretResolver {
         location: &'static str,
         placeholder: &str,
     ) -> UnresolvedPlaceholderError {
-        let reason = if placeholder_env_key(placeholder)
+        let reason = if self.forbid_placeholders_in_signed_request {
+            UnresolvedPlaceholderReason::ForbiddenInSignedRequest
+        } else if placeholder_env_key(placeholder)
             .is_some_and(|key| self.denied_env_keys.contains(key))
         {
             UnresolvedPlaceholderReason::EndpointMismatch
@@ -481,6 +524,12 @@ impl SecretResolver {
         key: &str,
         location: &'static str,
     ) -> Result<Option<&str>, UnresolvedPlaceholderError> {
+        if self.forbid_placeholders_in_signed_request {
+            return Err(UnresolvedPlaceholderError {
+                location,
+                reason: UnresolvedPlaceholderReason::ForbiddenInSignedRequest,
+            });
+        }
         if self.denied_env_keys.contains(key) {
             return Err(UnresolvedPlaceholderError {
                 location,
@@ -504,11 +553,11 @@ impl SecretResolver {
         value: &str,
         location: &'static str,
     ) -> Result<Option<&str>, UnresolvedPlaceholderError> {
-        if placeholder_env_key(value).is_some_and(|key| self.denied_env_keys.contains(key)) {
-            return Err(UnresolvedPlaceholderError {
-                location,
-                reason: UnresolvedPlaceholderReason::EndpointMismatch,
-            });
+        if (self.forbid_placeholders_in_signed_request
+            && contains_reserved_credential_marker(value))
+            || placeholder_env_key(value).is_some_and(|key| self.denied_env_keys.contains(key))
+        {
+            return Err(self.unresolved_for(location, value));
         }
         Ok(self.resolve_placeholder(value))
     }
@@ -586,7 +635,7 @@ impl SecretResolver {
 
             if text[abs_start..].starts_with(PLACEHOLDER_PREFIX) {
                 let Some((token_end, token)) = self.credential_token_at(text, abs_start) else {
-                    return Err(unresolved(location));
+                    return Err(self.unresolved_for(location, &text[abs_start..]));
                 };
                 let Some(secret) = self.resolve_placeholder(token) else {
                     return Err(self.unresolved_for(location, token));
@@ -607,11 +656,11 @@ impl SecretResolver {
                 continue;
             }
 
-            return Err(unresolved(location));
+            return Err(self.unresolved_for(location, &text[abs_start..]));
         }
 
         if contains_raw_reserved_marker(&rewritten) {
-            return Err(unresolved(location));
+            return Err(self.unresolved_for(location, &rewritten));
         }
 
         *text = rewritten;
@@ -1154,7 +1203,7 @@ fn rewrite_path_segment(
             let Some((token_end, full_placeholder)) = canonical_token_at(segment, abs_start)
                 .or_else(|| alias_token_at(segment, abs_start))
             else {
-                return Err(unresolved("path"));
+                return Err(resolver.unresolved_for("path", &segment[abs_start..]));
             };
             if let Some(secret) = resolver.resolve_placeholder(full_placeholder) {
                 validate_credential_for_path(secret).map_err(|reason| {
@@ -1205,7 +1254,7 @@ fn rewrite_uri_query_params(
                 let replacements =
                     resolver.rewrite_text_placeholders(&mut rewritten, "query_param")?;
                 if replacements == 0 || contains_raw_reserved_marker(&rewritten) {
-                    return Err(unresolved("query_param"));
+                    return Err(resolver.unresolved_for("query_param", &decoded_value));
                 }
                 resolved_params.push(format!("{key}={}", percent_encode_query(&rewritten)));
                 redacted_params.push(format!("{key}=[CREDENTIAL]"));
@@ -1304,7 +1353,7 @@ pub fn rewrite_http_header_block(
     // provider-shaped aliases in both raw and percent-decoded header bytes.
     let output_header = String::from_utf8_lossy(&output[..output.len().min(header_end + 256)]);
     if contains_reserved_credential_marker(&output_header) {
-        return Err(unresolved("header"));
+        return Err(resolver.unresolved_for("header", &output_header));
     }
 
     Ok(RewriteResult {
@@ -1518,6 +1567,130 @@ mod tests {
                     .resolve_placeholder("openshell:resolve:env:ANTHROPIC_API_KEY")),
             Some("sk-test")
         );
+    }
+
+    #[test]
+    fn non_resolving_view_separates_request_content_from_trusted_resolution() {
+        const ENV_KEYS: &[&str] = &[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "API_TOKEN",
+        ];
+        let provider_env: HashMap<String, String> = [
+            ("AWS_ACCESS_KEY_ID".to_string(), "access-value".to_string()),
+            (
+                "AWS_SECRET_ACCESS_KEY".to_string(),
+                "secret-value".to_string(),
+            ),
+            ("AWS_SESSION_TOKEN".to_string(), "session-value".to_string()),
+            ("API_TOKEN".to_string(), "allowed-value".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let stable_handles = ENV_KEYS
+            .iter()
+            .enumerate()
+            .map(|(index, key)| ((*key).to_string(), format!("{:064x}", index + 1)))
+            .collect::<HashMap<_, _>>();
+        let (child_env, generation_resolver, current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision(
+                provider_env.clone(),
+                HashMap::new(),
+                7,
+            );
+        let (stable_child_env, stable_generation_resolver, stable_current_resolver) =
+            SecretResolver::from_provider_env_for_current_revision_with_stable_handles(
+                provider_env,
+                HashMap::new(),
+                7,
+                &stable_handles,
+            );
+        let resolver = SecretResolver::merge(
+            [
+                generation_resolver.as_ref(),
+                current_resolver.as_ref(),
+                stable_generation_resolver.as_ref(),
+                stable_current_resolver.as_ref(),
+            ]
+            .into_iter()
+            .flatten(),
+        )
+        .expect("combined resolver");
+        let request_resolver = resolver.without_resolvable_placeholders();
+
+        for key in ENV_KEYS {
+            assert!(
+                resolver
+                    .resolve_current_env_key_checked(key, "trusted-transform")
+                    .expect("trusted lookup")
+                    .is_some()
+            );
+
+            for placeholder in [
+                placeholder_for_env_key(key),
+                child_env[*key].clone(),
+                stable_child_env[*key].clone(),
+                format!("provider-{PROVIDER_ALIAS_MARKER}{key}"),
+            ] {
+                assert!(
+                    resolver.resolve_placeholder(&placeholder).is_some(),
+                    "test placeholder must resolve before it is denied"
+                );
+
+                let error = request_resolver
+                    .rewrite_header_value(&placeholder)
+                    .expect_err("credential must be unavailable to request content");
+                assert!(error.is_forbidden_in_signed_request());
+                assert!(!error.is_endpoint_mismatch());
+
+                let basic =
+                    base64::engine::general_purpose::STANDARD.encode(format!("user:{placeholder}"));
+                let error = request_resolver
+                    .rewrite_header_value(&format!("Basic {basic}"))
+                    .expect_err("credential must be denied inside Basic authentication");
+                assert!(error.is_forbidden_in_signed_request());
+
+                for target in [format!("/{placeholder}"), format!("/?value={placeholder}")] {
+                    let raw = format!("GET {target} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+                    let error = rewrite_http_header_block(raw.as_bytes(), Some(&request_resolver))
+                        .expect_err("credential must be rejected in request target");
+                    assert!(error.is_forbidden_in_signed_request());
+                }
+            }
+        }
+
+        let error = request_resolver
+            .rewrite_header_value("openshell:resolve:env:UNKNOWN")
+            .expect_err("unknown placeholders are also forbidden in signed request fields");
+        assert_eq!(
+            error.reason(),
+            UnresolvedPlaceholderReason::ForbiddenInSignedRequest
+        );
+        assert_eq!(
+            error.to_string(),
+            "credential placeholders are not allowed in signed request fields in header"
+        );
+
+        let merged = SecretResolver::merge([&resolver, &request_resolver])
+            .expect("a merged non-resolving view remains available for validation");
+        let error = merged
+            .rewrite_header_value(&child_env["AWS_SECRET_ACCESS_KEY"])
+            .expect_err("merging cannot make a signed-request view resolve secrets again");
+        assert!(error.is_forbidden_in_signed_request());
+
+        let bound_keys = ENV_KEYS
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<HashSet<_>>();
+        let scoped_request_resolver =
+            request_resolver.scoped_to_env_keys(&bound_keys, &bound_keys, HashMap::new());
+        let merged = SecretResolver::merge([&resolver, &scoped_request_resolver])
+            .expect("a scoped non-resolving view remains available for validation");
+        let error = merged
+            .rewrite_header_value(&child_env["AWS_SECRET_ACCESS_KEY"])
+            .expect_err("scoping and merging cannot re-enable signed-request placeholders");
+        assert!(error.is_forbidden_in_signed_request());
     }
 
     #[test]
