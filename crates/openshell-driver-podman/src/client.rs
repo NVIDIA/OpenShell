@@ -172,6 +172,12 @@ pub struct ContainerConfig {
     pub labels: HashMap<String, String>,
     #[serde(default)]
     pub user: String,
+    /// The immutable image ID the container was created from. Podman records
+    /// the reference used at creation time here; workloads are always created
+    /// from a resolved image ID, so this pins the image the container runs
+    /// independently of any later tag movement.
+    #[serde(default)]
+    pub image: String,
 }
 
 /// Immutable image metadata needed to bind OCI identity inspection to launch.

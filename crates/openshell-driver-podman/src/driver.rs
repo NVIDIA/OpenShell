@@ -1169,23 +1169,26 @@ impl PodmanComputeDriver {
                     ));
                 }
                 let pull_policy = podman_image_pull_policy(self.config.image_pull_policy);
-                info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
-                self.client
-                    .pull_image(image, pull_policy)
-                    .await
-                    .map_err(ComputeDriverError::from)?;
-                let inspected_image = self
-                    .client
-                    .inspect_image(image)
-                    .await
-                    .map_err(ComputeDriverError::from)?;
-                if inspected_image.id.is_empty() {
-                    return Err(ComputeDriverError::Precondition(format!(
-                        "podman image '{image}' inspection did not return an immutable image ID"
-                    )));
-                }
-                let resolved_image =
-                    container::ResolvedPodmanImage::from_inspect(image, inspected_image)?;
+                let resolved_image = if let Some(existing) = existing_workload_container_id {
+                    self.resolve_retained_workload_image(existing, image).await?
+                } else {
+                    info!(image = %image, policy = %pull_policy, "Ensuring sandbox image");
+                    self.client
+                        .pull_image(image, pull_policy)
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                    let inspected_image = self
+                        .client
+                        .inspect_image(image)
+                        .await
+                        .map_err(ComputeDriverError::from)?;
+                    if inspected_image.id.is_empty() {
+                        return Err(ComputeDriverError::Precondition(format!(
+                            "podman image '{image}' inspection did not return an immutable image ID"
+                        )));
+                    }
+                    container::ResolvedPodmanImage::from_inspect(image, inspected_image)?
+                };
 
                 for mount_image in container::podman_driver_image_mount_sources(
                     sandbox,
@@ -1601,6 +1604,48 @@ impl PodmanComputeDriver {
         );
 
         span_status.finish(Ok(()))
+    }
+
+    /// Resolve the image identity for a supervisor-only refresh of a retained
+    /// workload container.
+    ///
+    /// The retained workload container keeps the image it was created from.
+    /// Re-resolving the request tag could select a different image whose user
+    /// and environment no longer match the retained workload, leaving
+    /// mode-0600 bootstrap files it cannot read. Pin to the immutable image ID
+    /// recorded on the stopped workload and never pull or resolve its tag
+    /// during refresh.
+    async fn resolve_retained_workload_image(
+        &self,
+        existing_workload_container_id: &str,
+        requested_image: &str,
+    ) -> Result<container::ResolvedPodmanImage, ComputeDriverError> {
+        let workload = self
+            .client
+            .inspect_container(existing_workload_container_id)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        let pinned_image = workload.config.image;
+        if pinned_image.is_empty() {
+            return Err(ComputeDriverError::Precondition(
+                "retained Podman workload does not record its pinned image ID".into(),
+            ));
+        }
+        info!(
+            image = %pinned_image,
+            "Reusing retained workload image for supervisor-only refresh"
+        );
+        let inspected_image = self
+            .client
+            .inspect_image(&pinned_image)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        if inspected_image.id.is_empty() {
+            return Err(ComputeDriverError::Precondition(format!(
+                "podman image '{pinned_image}' inspection did not return an immutable image ID"
+            )));
+        }
+        container::ResolvedPodmanImage::from_inspect(requested_image, inspected_image)
     }
 
     /// Resolve image accounts without executing any image-supplied program.
@@ -2668,6 +2713,48 @@ mod tests {
     fn podman_driver_error_from_conflict() {
         let err = ComputeDriverError::from(PodmanApiError::Conflict("exists".into()));
         assert!(matches!(err, ComputeDriverError::AlreadyExists));
+    }
+
+    #[tokio::test]
+    async fn supervisor_refresh_pins_retained_workload_image_without_pulling_tag() {
+        let (socket, requests, handle) = spawn_podman_stub(
+            "refresh-pinned-image",
+            vec![
+                // Inspect of the retained, stopped workload container: it was
+                // created from an immutable image ID.
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"ctr-retained","Name":"workload","State":{"Status":"exited","Running":false},"Config":{"Image":"sha256:pinned-image-id"}}"#,
+                ),
+                // Inspection of the pinned image by ID, not by its tag.
+                StubResponse::new(
+                    StatusCode::OK,
+                    r#"{"Id":"sha256:pinned-image-id","Config":{"User":"1000:1000","Env":["PATH=/usr/bin"],"WorkingDir":"/"}}"#,
+                ),
+            ],
+        );
+        let driver = test_driver(socket);
+        let resolved = driver
+            .resolve_retained_workload_image("ctr-retained", "app:test")
+            .await
+            .expect("pin retained workload image");
+        handle.await.unwrap();
+        assert_eq!(resolved.id, "sha256:pinned-image-id");
+        assert_eq!(resolved.oci_user, "1000:1000");
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "unexpected requests: {requests:?}");
+        assert!(
+            requests[0].contains("/libpod/containers/ctr-retained/json"),
+            "expected retained workload inspection first: {requests:?}"
+        );
+        assert!(
+            requests[1].contains("/libpod/images/sha256%3Apinned-image-id/json"),
+            "expected pinned image inspection: {requests:?}"
+        );
+        assert!(
+            !requests.iter().any(|request| request.contains("/pull")),
+            "supervisor-only refresh must never pull the workload tag: {requests:?}"
+        );
     }
 
     #[test]
