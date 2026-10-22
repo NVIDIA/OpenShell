@@ -257,6 +257,15 @@ fn project_complete(
 }
 
 impl Store {
+    /// Remove private image state when its owning sandbox is reclaimed.
+    pub(crate) async fn delete_sandbox_image_state(
+        &self,
+        sandbox_id: &str,
+    ) -> PersistenceResult<bool> {
+        self.delete(IMAGE_STATE_OBJECT_TYPE, &state_id(sandbox_id))
+            .await
+    }
+
     /// Read gateway-private image state by immutable sandbox identity.
     pub async fn get_sandbox_image_state(
         &self,

@@ -452,6 +452,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_update_state_is_removed_on_sandbox_deletion() {
+        for out_of_band in [false, true] {
+            let (runtime, _, original) = fixture(true).await;
+            let mut unrelated = original.clone();
+            let metadata = unrelated.metadata.as_mut().unwrap();
+            metadata.id = "unrelated-sandbox-id".into();
+            metadata.name = "unrelated-sandbox".into();
+            runtime.store.put_message(&unrelated).await.unwrap();
+            let unrelated = runtime
+                .store
+                .get_message::<Sandbox>(unrelated.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            for sandbox in [&original, &unrelated] {
+                runtime
+                    .update_sandbox_image(
+                        sandbox.object_id(),
+                        "example/workload:new".into(),
+                        sandbox.get_resource_version(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let unrelated_state = runtime
+                .store
+                .get_sandbox_image_state(unrelated.object_id())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                runtime
+                    .store
+                    .get_sandbox_image_state(original.object_id())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+
+            // Exercise explicit deletion and watch-driven removal, including
+            // a delayed or repeated watch deletion event.
+            if out_of_band {
+                runtime.apply_deleted(original.object_id()).await.unwrap();
+            } else {
+                runtime
+                    .delete_sandbox("default", original.object_name())
+                    .await
+                    .unwrap();
+            }
+            runtime.apply_deleted(original.object_id()).await.unwrap();
+            assert!(
+                runtime
+                    .store
+                    .get_message::<Sandbox>(original.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                runtime
+                    .store
+                    .get_sandbox_image_state(original.object_id())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                runtime
+                    .store
+                    .get_sandbox_image_state(unrelated.object_id())
+                    .await
+                    .unwrap(),
+                Some(unrelated_state)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn image_update_rejects_unregistered_updater_without_writes() {
         let (mut runtime, driver, original) = fixture(true).await;
         runtime.image_update_driver = None;

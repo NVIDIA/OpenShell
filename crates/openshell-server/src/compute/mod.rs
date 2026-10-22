@@ -6205,6 +6205,10 @@ impl ComputeRuntime {
     }
 
     async fn cleanup_sandbox_owned_records(&self, sandbox: &Sandbox) -> Result<(), String> {
+        self.store
+            .delete_sandbox_image_state(sandbox.object_id())
+            .await
+            .map_err(|error| format!("delete sandbox image state: {error}"))?;
         self.cleanup_ssh_identity(sandbox)
             .await
             .map_err(|error| error.to_string())?;
