@@ -37,6 +37,7 @@ from pathlib import Path
 # workspace here once its lockfile has been aligned with `--fix`.
 ALIGNED_WORKSPACES = (
     "tests/testkit",
+    "tests/suites/conformance",
 )
 
 
