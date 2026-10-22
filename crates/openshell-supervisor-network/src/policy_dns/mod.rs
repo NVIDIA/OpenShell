@@ -485,6 +485,7 @@ fn dns_query_endpoint(name: &NormalizedName) -> Endpoint {
         ip: None,
         port: None,
         name: None,
+        svc_name: None,
     }
 }
 

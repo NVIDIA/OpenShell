@@ -13,10 +13,18 @@ use std::sync::{LazyLock, OnceLock};
 
 static OCSF_CTX: OnceLock<EventContext> = OnceLock::new();
 
+/// With `test-support`, producer tests get a production-like sandbox identity
+/// so their events carry the same container and device fields production does.
+#[cfg(any(test, feature = "test-support"))]
+const FALLBACK_SANDBOX: (&str, &str, &str) =
+    ("sandbox-test", "test-sandbox", "example/sandbox:test");
+#[cfg(not(any(test, feature = "test-support")))]
+const FALLBACK_SANDBOX: (&str, &str, &str) = ("", "", "");
+
 static OCSF_CTX_FALLBACK: LazyLock<EventContext> = LazyLock::new(|| EventContext {
-    sandbox_id: String::new(),
-    sandbox_name: String::new(),
-    container_image: String::new(),
+    sandbox_id: FALLBACK_SANDBOX.0.to_string(),
+    sandbox_name: FALLBACK_SANDBOX.1.to_string(),
+    container_image: FALLBACK_SANDBOX.2.to_string(),
     hostname: "test".to_string(),
     product_version: env!("CARGO_PKG_VERSION").to_string(),
     proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
