@@ -16,7 +16,7 @@ repository = "https://github.com/NVIDIA/OpenShell"
 # Product backend selection. Consumer crates inherit this choice.
 openshell-crypto = { path = "crates/openshell-crypto", default-features = false, features = ["aws-lc"] }
 # Async runtime
-tokio = { version = "1.43", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 
 # gRPC/Protobuf
 tonic = "0.14"

@@ -14,6 +14,10 @@
 //! [`connect_tcp_nodelay_best_effort`]) help avoid the known latency
 //! imposed by conflict between Nagle's algorithm and delayed ACK behaviors.
 //!
+//! The `AsyncFd` registration helpers ([`register_socket_async_fd`],
+//! [`register_file_async_fd`]) wrap tokio's I/O-safety-`unsafe`
+//! `AsyncFd::register` for owned descriptor types that uphold its contract.
+//!
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -283,6 +287,40 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
         return true;
     }
     false
+}
+
+/// Register an owned [`socket2::Socket`] with the current tokio reactor.
+///
+/// Tokio's `AsyncFd::register` is `unsafe` because a general `AsRawFd`
+/// implementation can expose a descriptor that is closed, reused, or shared
+/// while the `AsyncFd` still holds it. A `socket2::Socket` owns its descriptor
+/// exclusively and keeps it open and referring to the same file description
+/// until dropped, which upholds the contract, so this wrapper is safe.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn register_socket_async_fd(
+    socket: socket2::Socket,
+) -> std::io::Result<tokio::io::unix::AsyncFd<socket2::Socket>> {
+    // SAFETY: `socket` is moved into the returned `AsyncFd`, and a
+    // `socket2::Socket` keeps its descriptor valid, open, and referring to the
+    // same file description for the value's entire lifetime.
+    unsafe { tokio::io::unix::AsyncFd::register(socket) }.map_err(std::io::Error::from)
+}
+
+/// Register an owned [`std::fs::File`] with the current tokio reactor.
+///
+/// Sound for the same reason as [`register_socket_async_fd`]: a `File` owns
+/// its descriptor exclusively and keeps it open and referring to the same
+/// file description until dropped.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn register_file_async_fd(
+    file: std::fs::File,
+) -> std::io::Result<tokio::io::unix::AsyncFd<std::fs::File>> {
+    // SAFETY: `file` is moved into the returned `AsyncFd`, and a `File`
+    // keeps its descriptor valid, open, and referring to the same file
+    // description for the value's entire lifetime.
+    unsafe { tokio::io::unix::AsyncFd::register(file) }.map_err(std::io::Error::from)
 }
 
 /// Enable `TCP_NODELAY` on a stream, logging (not returning) any failure.

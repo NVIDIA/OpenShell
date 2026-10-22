@@ -256,7 +256,7 @@ impl Listener {
         socket.bind(&socket2::SockAddr::vsock(libc::VMADDR_CID_ANY, port))?;
         socket.listen(64)?;
         Ok(Self::Vsock {
-            listener: tokio::io::unix::AsyncFd::new(socket)?,
+            listener: openshell_core::net::register_socket_async_fd(socket)?,
             guest_cid,
         })
     }

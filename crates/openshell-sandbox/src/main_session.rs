@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use rustix::termios::Winsize;
-use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::watch;
@@ -560,7 +559,10 @@ impl MainSession {
     ) {
         match io {
             ProcessIo::Pty(master) => {
-                let master = Arc::new(AsyncFd::new(master).expect("register canonical PTY master"));
+                let master = Arc::new(
+                    openshell_core::net::register_file_async_fd(master)
+                        .expect("register canonical PTY master"),
+                );
                 let reader = Arc::clone(&master);
                 let output = Arc::clone(this);
                 tokio::spawn(async move {

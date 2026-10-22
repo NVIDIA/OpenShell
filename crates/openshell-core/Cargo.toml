@@ -46,6 +46,7 @@ openshell-otel = { path = "../openshell-otel", optional = true }
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 rustix = { workspace = true }
+socket2 = { workspace = true }
 
 [features]
 default = ["telemetry"]

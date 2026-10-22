@@ -9378,7 +9378,14 @@ mod tests {
                 update_sandbox_cas(&state, &sandbox_id, 0, |sandbox| {
                     if first_attempt {
                         first_attempt = false;
-                        barrier.wait();
+                        // Block inside `block_in_place` so the runtime hands
+                        // this worker's core (including any task parked in its
+                        // LIFO slot) to a replacement worker before the
+                        // synchronous barrier wait. Since tokio 1.52.2
+                        // reverted LIFO slot stealing, a plain `barrier.wait()`
+                        // can strand a woken pool waiter in the LIFO slot of
+                        // the blocked worker and deadlock the test.
+                        tokio::task::block_in_place(|| barrier.wait());
                     }
                     let annotations = &mut sandbox.metadata.as_mut().unwrap().annotations;
                     let count = annotations
