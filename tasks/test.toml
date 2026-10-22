@@ -23,7 +23,12 @@ depends = [
   "test:docs-website",
   "test:docs-nav",
   "test:maintainer-approval",
+  "test:cargo-lockfile-alignment",
 ]
+
+["test:cargo-lockfile-alignment"]
+description = "Test the Cargo lockfile alignment check"
+run = "uv run --no-project --with pytest pytest tasks/scripts/check_cargo_lockfile_alignment_test.py"
 
 ["test:docs-website"]
 description = "Test the docs-website sync script"
@@ -120,6 +125,8 @@ run = [
   "cargo test -p openshell-server --features test-support",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml",
   "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/testkit/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/tmachine/Cargo.toml",
+  "cargo nextest run --config-file .config/nextest.toml --manifest-path tests/runner/Cargo.toml",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 test-precommit native"
 hide = true
@@ -159,6 +166,10 @@ run = "OPENSHELL_TEST_CONTAINER_ENGINE=docker e2e/with-docker-gateway.sh cargo t
 ["e2e:oci-image:podman"]
 description = "Run the shared OCI image feature suite against a Podman-backed gateway"
 run = "OPENSHELL_TEST_CONTAINER_ENGINE=podman e2e/with-podman-gateway.sh cargo test --locked --manifest-path tests/suites/features/Cargo.toml -p openshell-test-feature-oci-image -- --test-threads 1 --nocapture"
+
+["e2e:testkit"]
+description = "Run the testkit suites in tests/suites/conformance against a Docker-backed gateway"
+run = "e2e/with-docker-gateway.sh cargo nextest run --locked --manifest-path tests/suites/conformance/Cargo.toml --workspace --exclude openshell-test-conformance-cli --test-threads 1 --no-fail-fast"
 
 ["e2e:rust:push"]
 description = "Run CLI conformance and policy e2e tests against a Docker gateway that pushes configuration"

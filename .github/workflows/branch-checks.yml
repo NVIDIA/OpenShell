@@ -222,6 +222,9 @@ jobs:
           cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all -- --check
           cargo fmt --manifest-path tests/testkit/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/tmachine/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/runner/Cargo.toml --all -- --check
+          cargo fmt --manifest-path tests/suites/conformance/Cargo.toml -p sandbox -- --check
 
   cargo-lockfiles:
     name: Cargo lockfiles
@@ -239,7 +242,9 @@ jobs:
 
       - name: Verify Cargo lockfiles
         shell: nix develop -c bash -euo pipefail {0}
-        run: tasks/scripts/check-cargo-lockfiles.sh
+        run: |
+          tasks/scripts/check-cargo-lockfiles.sh
+          uv run tasks/scripts/check_cargo_lockfile_alignment.py
 
   rust-lint:
     name: Rust lint (${{ matrix.system }})
@@ -279,6 +284,9 @@ jobs:
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path tests/testkit/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/tmachine/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/runner/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path tests/suites/conformance/Cargo.toml -p sandbox --all-targets -- -D warnings
 
   rust-test:
     name: Rust test (${{ matrix.system }})
@@ -328,6 +336,8 @@ jobs:
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/testkit/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/tmachine/Cargo.toml
+          cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path tests/runner/Cargo.toml
 
   rust-postgres-test:
     name: Rust PostgreSQL tests
