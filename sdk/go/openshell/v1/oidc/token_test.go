@@ -14,79 +14,74 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/oauth2"
+
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/oidctoken"
 )
 
-func TestWriteToken_Success(t *testing.T) {
+func loadOIDCTokenFixture(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "conformance", "oidc-token-bundle.json"))
+	require.NoError(t, err)
+	return data
+}
+
+func TestReadToken_ConformanceFixture(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, oidctoken.FileName), loadOIDCTokenFixture(t), 0o600))
+
+	b, err := readToken(dir)
+	require.NoError(t, err)
+	require.NotNil(t, b)
+	assert.Equal(t, "conformance-access-token", b.AccessToken)
+	assert.Equal(t, "conformance-refresh-token", b.RefreshToken)
+	require.NotNil(t, b.ExpiresAt)
+	assert.Equal(t, uint64(4102444800), *b.ExpiresAt)
+	assert.Equal(t, "https://issuer.example.com", b.Issuer)
+	assert.Equal(t, "openshell-cli", b.ClientID)
+}
+
+func TestWriteToken_MatchesConformanceFixture(t *testing.T) {
 	dir := t.TempDir()
 	tok := &oauth2.Token{
-		AccessToken:  "access-123",
-		RefreshToken: "refresh-456",
-		Expiry:       time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC),
+		AccessToken:  "conformance-access-token",
+		RefreshToken: "conformance-refresh-token",
+		Expiry:       time.Unix(4102444800, 0),
 	}
 
-	err := writeToken(dir, tok)
-	require.NoError(t, err)
+	require.NoError(t, writeToken(dir, oidctoken.FromToken(tok, "https://issuer.example.com", "openshell-cli")))
 
-	// Verify the file was written.
-	data, err := os.ReadFile(filepath.Join(dir, "oidc_token.json"))
+	data, err := os.ReadFile(filepath.Join(dir, oidctoken.FileName))
 	require.NoError(t, err)
-	assert.Contains(t, string(data), `"access_token":"access-123"`)
-	assert.Contains(t, string(data), `"refresh_token":"refresh-456"`)
-	assert.Contains(t, string(data), `"expiry":"2026-07-03T12:00:00Z"`)
+	assert.JSONEq(t, string(loadOIDCTokenFixture(t)), string(data))
+}
+
+func TestWriteToken_OmitsEmptyOptionalFields(t *testing.T) {
+	dir := t.TempDir()
+	tok := &oauth2.Token{AccessToken: "access-only"}
+
+	require.NoError(t, writeToken(dir, oidctoken.FromToken(tok, "https://issuer.example.com", "openshell-cli")))
+
+	data, err := os.ReadFile(filepath.Join(dir, oidctoken.FileName))
+	require.NoError(t, err)
+	assert.JSONEq(t,
+		`{"access_token": "access-only", "issuer": "https://issuer.example.com", "client_id": "openshell-cli"}`,
+		string(data))
 }
 
 func TestWriteToken_ReplacesInsecureExistingFileWithOwnerOnlyFile(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, oidcTokenFile)
+	path := filepath.Join(dir, oidctoken.FileName)
 	require.NoError(t, os.WriteFile(path, []byte("old"), 0o644))
 
-	require.NoError(t, writeToken(dir, &oauth2.Token{AccessToken: "secret"}))
+	require.NoError(t, writeToken(dir, oidctoken.Bundle{AccessToken: "secret"}))
 
 	assertOwnerOnlyFilePermissions(t, path)
 }
 
-func TestWriteToken_ExpiresInCalculated(t *testing.T) {
-	dir := t.TempDir()
-	expiry := time.Now().Add(3600 * time.Second)
-	tok := &oauth2.Token{
-		AccessToken: "access-123",
-		Expiry:      expiry,
-	}
-
-	err := writeToken(dir, tok)
-	require.NoError(t, err)
-
-	data, err := os.ReadFile(filepath.Join(dir, "oidc_token.json"))
-	require.NoError(t, err)
-	// expires_in should be roughly 3600 (within a few seconds).
-	assert.Contains(t, string(data), `"expires_in":`)
-}
-
 func TestWriteToken_InvalidDirectory(t *testing.T) {
-	err := writeToken("/nonexistent/path/that/does/not/exist", &oauth2.Token{
-		AccessToken: "test",
-		Expiry:      time.Now().Add(time.Hour),
-	})
+	err := writeToken("/nonexistent/path/that/does/not/exist", oidctoken.Bundle{AccessToken: "test"})
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrTokenPersist))
-}
-
-func TestReadToken_Success(t *testing.T) {
-	dir := t.TempDir()
-	content := `{
-		"access_token": "access-123",
-		"refresh_token": "refresh-456",
-		"expiry": "2099-07-03T12:00:00Z",
-		"expires_in": 3600
-	}`
-	err := os.WriteFile(filepath.Join(dir, "oidc_token.json"), []byte(content), 0o600)
-	require.NoError(t, err)
-
-	tok, err := readToken(dir)
-	require.NoError(t, err)
-	assert.Equal(t, "access-123", tok.AccessToken)
-	assert.Equal(t, "refresh-456", tok.RefreshToken)
-	assert.False(t, tok.Expiry.IsZero())
 }
 
 func TestReadToken_MissingFile(t *testing.T) {
@@ -107,83 +102,10 @@ func TestReadToken_InvalidJSON(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrTokenPersist))
 }
 
-func TestReadToken_ExpiredToken(t *testing.T) {
-	dir := t.TempDir()
-	content := `{
-		"access_token": "expired-access",
-		"expiry": "2020-01-01T00:00:00Z"
-	}`
-	err := os.WriteFile(filepath.Join(dir, "oidc_token.json"), []byte(content), 0o600)
-	require.NoError(t, err)
-
-	tok, err := readToken(dir)
-	assert.Nil(t, tok, "expired token should return nil")
-	assert.NoError(t, err, "expired token is not an error, just nil")
-}
-
-func TestReadToken_ValidWithExpiresInFallback(t *testing.T) {
-	dir := t.TempDir()
-	// No expiry field, only expires_in. Since we wrote it "now",
-	// a large expires_in should make the token valid.
-	content := `{
-		"access_token": "access-via-expires-in",
-		"expires_in": 99999
-	}`
-	err := os.WriteFile(filepath.Join(dir, "oidc_token.json"), []byte(content), 0o600)
-	require.NoError(t, err)
-
-	tok, err := readToken(dir)
-	require.NoError(t, err)
-	// Token with only expires_in cannot reconstruct a valid Expiry
-	// without knowing when the file was written. readToken should
-	// treat it as potentially valid and return it.
-	assert.NotNil(t, tok)
-	assert.Equal(t, "access-via-expires-in", tok.AccessToken)
-}
-
-func TestReadToken_EmptyAccessToken(t *testing.T) {
-	dir := t.TempDir()
-	content := `{
-		"access_token": "",
-		"expiry": "2099-01-01T00:00:00Z"
-	}`
-	err := os.WriteFile(filepath.Join(dir, "oidc_token.json"), []byte(content), 0o600)
-	require.NoError(t, err)
-
-	tok, err := readToken(dir)
-	assert.Nil(t, tok, "empty access token should return nil")
-	assert.NoError(t, err)
-}
-
-func TestWriteAndReadToken_Roundtrip(t *testing.T) {
-	dir := t.TempDir()
-	original := &oauth2.Token{
-		AccessToken:  "roundtrip-access",
-		RefreshToken: "roundtrip-refresh",
-		Expiry:       time.Now().Add(time.Hour).Truncate(time.Second),
-	}
-
-	err := writeToken(dir, original)
-	require.NoError(t, err)
-
-	loaded, err := readToken(dir)
-	require.NoError(t, err)
-	require.NotNil(t, loaded)
-
-	assert.Equal(t, original.AccessToken, loaded.AccessToken)
-	assert.Equal(t, original.RefreshToken, loaded.RefreshToken)
-	// Expiry should be close (within a second due to serialization).
-	assert.WithinDuration(t, original.Expiry, loaded.Expiry, time.Second)
-}
-
 func TestWriteToken_FilePermissions(t *testing.T) {
 	dir := t.TempDir()
-	tok := &oauth2.Token{
-		AccessToken: "perm-check",
-		Expiry:      time.Now().Add(time.Hour),
-	}
 
-	err := writeToken(dir, tok)
+	err := writeToken(dir, oidctoken.Bundle{AccessToken: "perm-check"})
 	require.NoError(t, err)
 
 	assertOwnerOnlyFilePermissions(t, filepath.Join(dir, "oidc_token.json"))

@@ -5,13 +5,16 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/oidctoken"
 	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/types"
 )
 
@@ -87,7 +90,7 @@ func TestNewClient_AuthModeCloudflareJWT(t *testing.T) {
 func TestNewClient_AuthModeOIDC(t *testing.T) {
 	setupGatewayWithTokens(t, "oidc-gw",
 		`{"gateway_endpoint":"localhost:50051","auth_mode":"oidc"}`,
-		map[string]string{oidcTokenFile: `{"access_token":"test-oidc-token"}`},
+		map[string]string{oidctoken.FileName: `{"access_token":"test-oidc-token"}`},
 	)
 
 	// RefreshableToken requires transport security, so use WithAuth
@@ -341,9 +344,9 @@ func TestResolveAuthProvider_CloudflareJWT(t *testing.T) {
 
 func TestResolveAuthProvider_OIDC(t *testing.T) {
 	dir := t.TempDir()
-	writeFile(t, dir, oidcTokenFile, `{"access_token":"oidc-access-token"}`)
+	writeFile(t, dir, oidctoken.FileName, oidcBundleJSON("oidc-access-token", ""))
 
-	cfg := &Config{AuthMode: AuthModeOIDC, Dir: dir}
+	cfg := &Config{AuthMode: AuthModeOIDC, Dir: dir, Name: "prod"}
 	auth, err := resolveAuthProvider(cfg)
 	require.NoError(t, err)
 	require.NotNil(t, auth)
@@ -351,6 +354,25 @@ func TestResolveAuthProvider_OIDC(t *testing.T) {
 	md, err := auth.GetRequestMetadata(context.Background())
 	require.NoError(t, err)
 	assert.Equal(t, "Bearer oidc-access-token", md["authorization"])
+}
+
+func TestResolveAuthProvider_OIDCPicksUpReplacedTokenNearExpiry(t *testing.T) {
+	dir := t.TempDir()
+	// Within the default 10s refresh leeway, so the next call re-reads the file.
+	writeFile(t, dir, oidctoken.FileName, oidcBundleJSON("token-a", fmt.Sprint(time.Now().Add(5*time.Second).Unix())))
+
+	auth, err := resolveAuthProvider(&Config{AuthMode: AuthModeOIDC, Dir: dir, Name: "prod"})
+	require.NoError(t, err)
+
+	md, err := auth.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer token-a", md["authorization"])
+
+	writeFile(t, dir, oidctoken.FileName, oidcBundleJSON("token-b", fmt.Sprint(time.Now().Add(time.Hour).Unix())))
+
+	md, err = auth.GetRequestMetadata(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer token-b", md["authorization"])
 }
 
 func TestResolveAuthProvider_MTLS(t *testing.T) {

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/oauth2"
+
+	"github.com/NVIDIA/OpenShell/sdk/go/openshell/v1/internal/oidctoken"
 )
 
 const (
@@ -23,9 +25,6 @@ const (
 	// cfTokenFile is the legacy Cloudflare token filename, used as
 	// fallback when edge_token does not exist.
 	cfTokenFile = "cf_token"
-
-	// oidcTokenFile is the OIDC token bundle filename.
-	oidcTokenFile = "oidc_token.json"
 )
 
 // edgeTokenLoader provides lazy, thread-safe loading of the edge token
@@ -87,70 +86,55 @@ func readEdgeToken(dir string) (string, error) {
 	return token, nil
 }
 
-// oidcBundle is the on-disk representation of oidc_token.json.
-type oidcBundle struct {
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	Expiry       string `json:"expiry"`
-	ExpiresIn    int64  `json:"expires_in"`
-}
-
 // diskTokenSource implements oauth2.TokenSource by reading oidc_token.json
 // from disk on every Token() call. This allows the source to pick up
 // tokens refreshed by the Rust CLI without process restart.
 type diskTokenSource struct {
-	dir string
+	dir  string
+	name string
 }
 
 // newDiskTokenSource returns an oauth2.TokenSource that reads
-// oidc_token.json from the given gateway directory on each Token() call.
-func newDiskTokenSource(dir string) oauth2.TokenSource {
-	return &diskTokenSource{dir: dir}
+// oidc_token.json from the directory of the named gateway on each
+// Token() call.
+func newDiskTokenSource(dir, name string) oauth2.TokenSource {
+	return &diskTokenSource{dir: dir, name: name}
 }
 
 // Token reads and parses oidc_token.json, returning an oauth2.Token.
 // The file is read on every call to pick up CLI-refreshed tokens.
 func (d *diskTokenSource) Token() (*oauth2.Token, error) {
-	path := filepath.Join(d.dir, oidcTokenFile)
-
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(filepath.Join(d.dir, oidctoken.FileName))
 	if err != nil {
-		return nil, fmt.Errorf("%w: cannot read %s: %v", ErrTokenLoad, oidcTokenFile, err)
+		return nil, d.loadError("cannot read %s: %v", oidctoken.FileName, err)
 	}
 
-	var bundle oidcBundle
+	var bundle oidctoken.Bundle
 	if err := json.Unmarshal(data, &bundle); err != nil {
-		return nil, fmt.Errorf("%w: invalid JSON in %s", ErrTokenLoad, oidcTokenFile)
+		return nil, d.loadError("invalid JSON in %s", oidctoken.FileName)
 	}
 
 	if bundle.AccessToken == "" {
-		return nil, fmt.Errorf("%w: missing access_token in %s", ErrTokenLoad, oidcTokenFile)
+		return nil, d.loadError("missing access_token in %s", oidctoken.FileName)
+	}
+	if bundle.Issuer == "" || bundle.ClientID == "" {
+		return nil, d.loadError("OIDC token for gateway %q is missing issuer or client_id", d.name)
 	}
 
-	tok := &oauth2.Token{
-		AccessToken:  bundle.AccessToken,
-		RefreshToken: bundle.RefreshToken,
-		TokenType:    "Bearer",
-	}
-
-	// Parse expiry from the absolute "expiry" field only. The "expires_in"
-	// field (seconds-until-expiry) cannot be used reliably because there is
-	// no "written_at" timestamp: interpreting it at read time would make
-	// stale tokens appear perpetually valid.
-	if bundle.Expiry != "" {
-		expiry, parseErr := time.Parse(time.RFC3339, bundle.Expiry)
-		if parseErr != nil {
-			return nil, fmt.Errorf("%w: invalid expiry in %s: %v", ErrTokenLoad, oidcTokenFile, parseErr)
-		}
-		tok.Expiry = expiry
-
-		if time.Now().After(expiry) {
-			return nil, fmt.Errorf("%w: token in %s expired at %s; re-authenticate with the CLI",
-				ErrTokenLoad, oidcTokenFile, expiry.Format(time.RFC3339))
-		}
+	tok := bundle.Token()
+	if !tok.Expiry.IsZero() && !time.Now().Before(tok.Expiry) {
+		return nil, d.loadError("OIDC token for gateway %q expired at %s",
+			d.name, tok.Expiry.UTC().Format(time.RFC3339))
 	}
 
 	return tok, nil
+}
+
+// loadError wraps ErrTokenLoad with the CLI login command that repairs
+// the token file.
+func (d *diskTokenSource) loadError(format string, args ...any) error {
+	return fmt.Errorf("%w: %s; run `openshell gateway login %s`",
+		ErrTokenLoad, fmt.Sprintf(format, args...), d.name)
 }
 
 // lazyEdgeAuth implements types.AuthProvider for the cloudflare_jwt auth
