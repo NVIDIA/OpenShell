@@ -39,7 +39,10 @@ PKCE. If the provider does not support PKCE (S256), the flow proceeds
 without it.
 
 Tokens are persisted to the gateway's config directory as
-`oidc_token.json`. Subsequent calls reuse a valid cached token.
+`oidc_token.json`, in the same format as `openshell gateway login`, so CLI
+commands against that gateway can use them. Subsequent calls reuse the stored
+token only when it is valid and was issued for the gateway's issuer and client
+ID; otherwise `Login` runs the flow again and rewrites the file.
 
 For standalone use (no gateway), pass an empty `gatewayName` with
 `WithIssuer` and `WithClientID`. Combine with `WithInMemory` to skip
