@@ -119,8 +119,6 @@ sudo loginctl enable-linger $USER
 
 ## Snap
 
-The snap requires Docker Engine installed from your distribution or Docker's package repository. The Docker snap is not compatible.
-
 The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any existing installation first, then either rerun the `install.sh` script with `OPENSHELL_INSTALL_METHOD=snap OPENSHELL_ACK_BREAKING_UPGRADE=1`, or install the snap directly:
 
 ```shell
@@ -143,12 +141,27 @@ The global command prevents automatic activation for other users but does not st
 systemctl --user disable --now snap.openshell.user-gateway.service
 ```
 
-The snap installs the standalone policy prover as `openshell.prover`. The
-`openshell-prover` alias requires Snap Store approval and may not be available.
-The prover reads local policy files through the `home` interface and does not
-connect to the gateway.
+The snap bundles the VM compute driver and selects it when the gateway user has read/write access to `/dev/kvm`. Without that access, the gateway tries to detect another accessible runtime, such as Docker. If none is available, the gateway fails to start until KVM access is restored or `compute_driver` selects an available runtime. Active desktop sessions commonly receive KVM access through a systemd-logind ACL. On systems where this is not the case, add the gateway user to the `kvm` group and start a new login session:
 
-The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. Its database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
+```shell
+sudo usermod -aG kvm "$USER"
+```
+
+The installer connects the `kvm` interface and warns without blocking installation when the user cannot access `/dev/kvm`.
+
+The snap installs the standalone policy prover as `openshell.prover`. The `openshell-prover` alias requires Snap Store approval and may not be available.  The prover reads local policy files through the `home` interface and does not connect to the gateway.
+
+The gateway runs at `https://127.0.0.1:17670`. It reads `~/snap/openshell/common/.config/openshell/gateway.toml` when that file exists. When neither the service environment nor this file selects a compute driver, the snap selects `vm` if the gateway user can read and write `/dev/kvm`; otherwise the gateway tries to detect another available runtime. To use a different installed driver, set `compute_driver` explicitly; for example:
+
+```toml
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "docker"
+```
+
+Its database defaults to `~/snap/openshell/common/.local/state/openshell/gateway/openshell.db`, and its TLS material lives under `~/snap/openshell/common/.local/state/openshell/tls`. Register it from the same user account:
 
 ```shell
 snap services openshell.user-gateway
@@ -236,18 +249,16 @@ openshell status
 
 Set `old_registration` to the name shown by `openshell gateway list`, and omit the variable assignment and remove command when no registration exists. If a transition is interrupted while both services are disabled, select `gateway-mode=user` or `gateway-mode=system` to resume it. Keep the TLS backup until the selected gateway works and can create a sandbox.
 
-To install a locally built snap, connect its interfaces manually. The user gateway may reach systemd's start limit before Docker is connected, so reset the failed unit and restart it from the affected user session after connecting the interfaces:
+To install a locally built snap, connect its interfaces manually:
 
 ```shell
 sudo snap install ./openshell_*.snap --dangerous
 sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
+sudo snap connect openshell:kvm
 sudo snap connect openshell:docker :docker
-systemctl --user reset-failed snap.openshell.user-gateway.service
 systemctl --user enable --now snap.openshell.user-gateway.service
 ```
-
-For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.
 
 ## Kubernetes
 

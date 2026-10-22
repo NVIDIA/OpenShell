@@ -265,17 +265,15 @@ rm -f "$out" "$err"
 
 assert_snap_install_flow() {
   local name=$1
-  local docker_present=$2
-  local openshell_present=$3
-  local requested_version=$4
-  local expected=$5
+  local openshell_present=$2
+  local requested_version=$3
+  local expected=$4
   local calls
 
   (
     has_cmd() {
       case "$1" in
         snap) return 0 ;;
-        docker) [ "$docker_present" = "1" ] ;;
         *) command -v "$1" >/dev/null 2>&1 ;;
       esac
     }
@@ -297,8 +295,7 @@ assert_snap_install_flow() {
     }
     as_target_user() { printf 'target:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
-    wait_for_docker_daemon() { printf '%s\n' "wait:docker"; }
-    wait_for_user_docker_daemon() { printf '%s\n' "wait:user-docker"; }
+    check_snap_kvm_access() { printf '%s\n' "check:kvm-access"; }
     snap_gateway_mode() {
       if [ "$openshell_present" = 1 ]; then
         printf '%s\n' system
@@ -332,7 +329,7 @@ assert_snap_user_refresh_flow() {
   (
     has_cmd() {
       case "$1" in
-        snap | docker) return 0 ;;
+        snap) return 0 ;;
         *) command -v "$1" >/dev/null 2>&1 ;;
       esac
     }
@@ -354,7 +351,7 @@ assert_snap_user_refresh_flow() {
     }
     as_target_user() { printf 'target:%s\n' "$*"; }
     set_linux_target_runtime_dir() { :; }
-    wait_for_user_docker_daemon() { printf '%s\n' "wait:user-docker"; }
+    check_snap_kvm_access() { printf '%s\n' "check:kvm-access"; }
     snap_gateway_mode() { printf '%s\n' user; }
     wait_for_user_snap_gateway_listener() { printf '%s\n' "wait:user-gateway-listener"; }
     register_user_snap_gateway() { printf '%s\n' "register:user-gateway"; }
@@ -364,8 +361,8 @@ assert_snap_user_refresh_flow() {
     install_linux_snap
   ) >"$out"
   calls="$(cat "$out")"
-  expected="wait:user-docker
-root:snap refresh openshell --channel=latest/stable
+  expected="root:snap refresh openshell --channel=latest/stable
+check:kvm-access
 root:systemctl --global disable snap.openshell.user-gateway.service
 target:systemctl --user daemon-reload
 target:systemctl --user enable --now snap.openshell.user-gateway.service
@@ -381,10 +378,10 @@ wait:gateway-status"
 }
 
 assert_snap_install_flow \
-  "existing Docker is reused" \
-  1 0 "" \
-  "wait:user-docker
-root:snap install openshell --channel=latest/stable
+  "fresh snap defaults to VM without Docker" \
+  0 "" \
+  "root:snap install openshell --channel=latest/stable
+check:kvm-access
 root:systemctl --global disable snap.openshell.user-gateway.service
 target:systemctl --user daemon-reload
 target:systemctl --user enable --now snap.openshell.user-gateway.service
@@ -396,9 +393,8 @@ assert_snap_user_refresh_flow
 
 assert_snap_install_flow \
   "existing OpenShell snap is refreshed" \
-  1 1 "" \
-  "wait:docker
-root:snap refresh openshell --channel=latest/stable
+  1 "" \
+  "root:snap refresh openshell --channel=latest/stable
 root:snap restart openshell.system-gateway
 wait:system-gateway-listener
 register:system-gateway
@@ -445,167 +441,39 @@ if grep -Fq "disabled mode reached" "$err"; then
   exit 1
 fi
 
-assert_snap_install_rejected() {
-  local name=$1
-  local docker_present=$2
-  local docker_snap_present=$3
-  local expected=$4
-
-  if (
-    has_cmd() {
-      case "$1" in
-        snap) return 0 ;;
-        docker) [ "$docker_present" = "1" ] ;;
-        *) command -v "$1" >/dev/null 2>&1 ;;
-      esac
-    }
-    snap() {
-      if [ "${1:-}:${2:-}" = list:docker ]; then
-        [ "$docker_snap_present" = "1" ]
-      else
-        echo "FAIL: ${name}: unexpected snap command: $*" >&2
-        return 99
-      fi
-    }
-    as_root() {
-      echo "FAIL: ${name}: installation reached root command: $*" >&2
-      return 99
-    }
-    set_linux_target_runtime_dir() { :; }
-    install_linux_snap
-  ) >"$out" 2>"$err"; then
-    echo "FAIL: ${name}: snap installation should have been rejected" >&2
-    exit 1
-  fi
-  if ! grep -Fq "$expected" "$err"; then
-    echo "FAIL: ${name}: missing rejection message" >&2
-    cat "$err" >&2 || true
-    exit 1
-  fi
-  if grep -Fq "installation reached root command" "$err"; then
-    cat "$err" >&2 || true
-    exit 1
-  fi
-}
-
-assert_snap_install_rejected \
-  "missing Docker" \
-  0 0 \
-  "Docker is required before installing the OpenShell snap"
-
-assert_snap_install_rejected \
-  "Docker snap" \
-  1 1 \
-  "the Docker snap is not currently compatible with OpenShell"
-
-attempts_file="${tmpdir}/docker-attempts"
-root_probes_file="${tmpdir}/docker-root-probes"
-printf '0\n' >"$attempts_file"
-printf '0\n' >"$root_probes_file"
 if ! (
-  env() {
-    if [ "$*" != "-u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info" ]; then
-      echo "unexpected Docker readiness probe: $*" >&2
-      return 1
-    fi
-    attempts="$(cat "$attempts_file")"
-    attempts=$((attempts + 1))
-    printf '%s\n' "$attempts" >"$attempts_file"
-    [ "$attempts" -ge 3 ]
-  }
-  as_root() {
-    root_probes="$(cat "$root_probes_file")"
-    printf '%s\n' "$((root_probes + 1))" >"$root_probes_file"
-    "$@"
-  }
-  sleep() { :; }
+  as_target_user() { return 0; }
   info() { :; }
-  OPENSHELL_INSTALL_DOCKER_TIMEOUT=3 wait_for_docker_daemon
+  warn() { echo "FAIL: accessible KVM produced warning: $*" >&2; return 1; }
+  TARGET_USER=test-user
+  check_snap_kvm_access
 ) >"$out" 2>"$err"; then
-  echo "FAIL: Docker readiness should succeed after retries" >&2
-  cat "$err" >&2 || true
-  exit 1
-fi
-if [ "$(cat "$attempts_file")" != "3" ]; then
-  echo "FAIL: Docker readiness did not retry three times" >&2
-  exit 1
-fi
-if [ "$(cat "$root_probes_file")" != "3" ]; then
-  echo "FAIL: Docker readiness probes did not run through as_root" >&2
-  exit 1
-fi
-
-if (
-  env() { return 1; }
-  as_root() { "$@"; }
-  snap() { return 1; }
-  sleep() { :; }
-  info() { :; }
-  OPENSHELL_INSTALL_DOCKER_TIMEOUT=2 wait_for_docker_daemon
-) >"$out" 2>"$err"; then
-  echo "FAIL: Docker readiness timeout should fail" >&2
-  exit 1
-fi
-if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable within 2s" "$err"; then
-  echo "FAIL: missing Docker readiness timeout message" >&2
+  echo "FAIL: target-user KVM access should be accepted" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 
-user_attempts_file="${tmpdir}/docker-user-attempts"
-user_probes_file="${tmpdir}/docker-user-probes"
-printf '0\n' >"$user_attempts_file"
-printf '0\n' >"$user_probes_file"
 if ! (
-  env() {
-    if [ "$*" != "-u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info" ]; then
-      echo "unexpected user Docker readiness probe: $*" >&2
-      return 1
-    fi
-    attempts="$(cat "$user_attempts_file")"
-    attempts=$((attempts + 1))
-    printf '%s\n' "$attempts" >"$user_attempts_file"
-    [ "$attempts" -ge 3 ]
-  }
-  as_target_user() {
-    user_probes="$(cat "$user_probes_file")"
-    printf '%s\n' "$((user_probes + 1))" >"$user_probes_file"
-    "$@"
-  }
-  sleep() { :; }
+  as_target_user() { return 1; }
+  getent() { return 0; }
+  snap_kvm_device() { printf '%s\n' "${tmpdir}/test-kvm"; }
   info() { :; }
+  warn() { printf '%s\n' "$*"; }
+  : >"${tmpdir}/test-kvm"
   TARGET_USER=test-user
-  export DOCKER_HOST=tcp://remote.example:2376
-  export DOCKER_CONTEXT=remote
-  OPENSHELL_INSTALL_DOCKER_TIMEOUT=3 wait_for_user_docker_daemon
+  check_snap_kvm_access
 ) >"$out" 2>"$err"; then
-  echo "FAIL: user Docker readiness should succeed after retries" >&2
-  cat "$err" >&2 || true
+  echo "FAIL: missing target-user KVM access must be non-fatal" >&2
   exit 1
 fi
-if [ "$(cat "$user_attempts_file")" != "3" ]; then
-  echo "FAIL: user Docker readiness did not retry three times" >&2
+if ! grep -Fq 'sudo usermod -aG kvm "test-user"' "$out" || \
+  ! grep -Fq 'set compute_driver to another installed driver, such as docker' "$out"; then
+  echo "FAIL: missing KVM access guidance" >&2
+  cat "$out" >&2
   exit 1
 fi
-if [ "$(cat "$user_probes_file")" != "3" ]; then
-  echo "FAIL: user Docker readiness probes did not run through as_target_user" >&2
-  exit 1
-fi
-
-if (
-  env() { return 1; }
-  as_target_user() { "$@"; }
-  sleep() { :; }
-  info() { :; }
-  TARGET_USER=test-user
-  OPENSHELL_INSTALL_DOCKER_TIMEOUT=2 wait_for_user_docker_daemon
-) >"$out" 2>"$err"; then
-  echo "FAIL: user Docker readiness timeout should fail" >&2
-  exit 1
-fi
-if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable as test-user within 2s" "$err"; then
-  echo "FAIL: missing user Docker readiness timeout message" >&2
-  cat "$err" >&2 || true
+if grep -Fq 'usermod ' <(declare -f check_snap_kvm_access | grep -v 'warn '); then
+  echo "FAIL: KVM access check must not modify group membership" >&2
   exit 1
 fi
 
