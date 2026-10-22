@@ -1,57 +1,5 @@
 # Review areas and topics
 
-Draft for community review. All names below are suggestions, not confirmed volunteers. No automatic requests, notifications, or new approval requirements are enabled by this draft.
-
-Related work: [review routing and membership workflow (#4839)](https://github.com/NVIDIA/OpenShell/issues/4839).
-
-## Purpose
-
-Help authors and tools invite the right people to review OpenShell changes. Areas identify components and system boundaries with coordinating ownership. Topics identify expertise that can apply across several areas. An issue or PR can involve several topics.
-
-These definitions follow the group's reviewed areas/topics proposal. This file is the proposed repository registry; the initial roster and format remain open for review.
-
-## Join, change, or leave a roster
-
-Open a PR editing the relevant membership tables below. Include your GitHub handle, role, status, and review scope. Explain the change in the PR description. A reviewed and merged PR is the sign-up mechanism for every role.
-
-For the initial proposal, comment on the forthcoming registry PR to suggest additions, removals, or scope corrections. A proposed person's agreement is needed before their entry becomes confirmed. Contributions linked below are evidence for discussion, not proof of willingness or complete subject-matter coverage.
-
-Subscriber entries require the individual's opt-in. No subscribers have been enrolled in this draft.
-
-## Roles and coverage
-
-| Role | Participation | Repository privilege |
-| --- | --- | --- |
-| maintainer | Available for review and approval in the recorded scope. | Maintain or admin. |
-| reviewer | Available for selected review requests in the recorded scope. | Write. |
-| subscriber | Receives relevant-work notifications and can contribute feedback without a review obligation. | Read, including public access. |
-
-Roles follow repository privileges. Aligning today's privileges and the CNCF organization's permissions is outside this proposal. Suggested maintainer entries are drawn from [MAINTAINERS.md](MAINTAINERS.md); this registry does not grant repository access or change the existing maintainer approval check.
-
-Target at least two confirmed maintainers covering every area and topic. Suggestions do not count as confirmed coverage. Scope limitations matter: two names do not establish two-person coverage of every specialty. All categories currently need confirmation; compliance and MCP also need additional maintainer nominations.
-
-## Proposed routing behavior
-
-Every ready-for-review PR has exactly one primary area for coordination and zero or more relevant topics. There is no hard topic limit; apply topics that merit specialist review. Other materially affected areas still contribute reviewers even when they are not the primary area.
-
-Select a non-author maintainer from the primary area and relevant reviewers for the topics and secondary-area impact. Reuse people who cover several categories, distribute requests among eligible volunteers, and allow human reassignment. Notify opted-in subscribers separately and deduplicate notifications across categories.
-
-Routing must use confirmed membership from the trusted merged registry. A PR changing this file cannot use its proposed membership to authorize its own review. Selection and notifications are follow-up work in #4839; they do not make every roster member a required approver.
-
-## Registry format
-
-Each category has a level-three heading containing its exact label, a scope description, and a membership table with these fixed columns:
-
-| Column | Meaning |
-| --- | --- |
-| GitHub | One GitHub login, written as an @mention. |
-| Role | `maintainer`, `reviewer`, or `subscriber`. |
-| Status | `suggested` or `confirmed`. Only confirmed entries may receive automated requests or notifications. |
-| Scope | The person's review scope or notification interests. |
-| Basis | Optional contribution evidence for a suggestion, or `Self-nominated` for a volunteer. |
-
-Use one row per person in a category. A maintainer or reviewer can cover several categories, but should not also have a subscriber row in the same category. Remove an entry through a reviewed PR to withdraw, or change it to subscriber when the person wants notifications without review requests.
-
 ## Areas
 
 Areas are OpenShell-specific components or system boundaries. They represent the division of labor across the project. Keep the number of areas small enough to support named leads and reporting during community calls.
