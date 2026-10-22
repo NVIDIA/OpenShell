@@ -696,13 +696,13 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
 | supervisor.podDisruptionBudget.enabled | bool | `true` | Render a PodDisruptionBudget with maxUnavailable 1 for the shared supervisor, used only when gatewayConfig selects supervisor_topology = "gateway". Disable it only when maintenance must evict more than one supervisor Pod at a time, or evict a member while another is unavailable. |
 | supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
 | supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
-| supervisor.network.additionalCaConfigMapName | string | `""` | Name of an operator-owned ConfigMap with a `ca.crt` key containing additional destination CA certificates for sandbox supervisors. Empty disables additional destination trust. |
 | supervisor.recoveryTimeoutSeconds | int | `60` | Seconds a sandbox workload stays frozen after losing its pool member's supervision before the sandbox runtime terminates it, rendered as [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an integer from 10 to 300. Null leaves the gateway's pool default of 60 seconds. |
 | supervisor.replicas | int | `1` | Shared supervisor pool members, used only when gatewayConfig selects supervisor_topology = "gateway". The gateway always coordinates the shared supervisor as a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. 1 has no failover; use 2 or more to survive losing a member. Only the supervisor Deployment's replica count depends on this value, so changing it neither restarts the gateway nor replaces running members. Ignored when supervisor.autoscaling.enabled is true. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
