@@ -739,6 +739,55 @@ export XDG_CONFIG_HOME=""
 assert_target_config_dir "empty XDG_CONFIG_HOME falls back per the XDG spec" \
   "${TARGET_HOME}/.config/openshell"
 
+export XDG_CONFIG_HOME="${tmpdir}/xdg config"
+assert_target_config_dir "XDG_CONFIG_HOME with spaces is honored" \
+  "${tmpdir}/xdg config/openshell"
+
+# Registration cleanup must clear the entry the CLI wrote, wherever
+# XDG_CONFIG_HOME puts it, and leave the default location alone.
+seed_gateway_registration() {
+  local config_dir=$1
+  mkdir -p "${config_dir}/gateways/openshell" "${config_dir}/gateways/local"
+  printf '{}\n' >"${config_dir}/gateways/openshell/metadata.json"
+  printf 'openshell\n' >"${config_dir}/active_gateway"
+}
+
+assert_registration_removed() {
+  local name=$1
+  local config_dir=$2
+  if [ -e "${config_dir}/gateways/openshell/metadata.json" ] ||
+    [ -e "${config_dir}/gateways/local" ] ||
+    [ -e "${config_dir}/active_gateway" ]; then
+    echo "FAIL: ${name}: registration left behind in ${config_dir}" >&2
+    exit 1
+  fi
+}
+
+xdg_spaces_config="${tmpdir}/xdg config/openshell"
+default_config="${TARGET_HOME}/.config/openshell"
+
+rm -rf "${tmpdir}/xdg config" "${TARGET_HOME}/.config"
+seed_gateway_registration "$xdg_spaces_config"
+seed_gateway_registration "$default_config"
+remove_local_gateway_registration
+assert_registration_removed "cleanup honors XDG_CONFIG_HOME with spaces" "$xdg_spaces_config"
+if [ ! -e "${default_config}/gateways/openshell/metadata.json" ]; then
+  echo "FAIL: cleanup with XDG_CONFIG_HOME set must not touch ${default_config}" >&2
+  exit 1
+fi
+
+# An empty XDG_CONFIG_HOME must clean up under $HOME/.config, never a
+# directory relative to the working directory.
+export XDG_CONFIG_HOME=""
+cleanup_cwd="${tmpdir}/cleanup-cwd"
+mkdir -p "$cleanup_cwd"
+(cd "$cleanup_cwd" && remove_local_gateway_registration)
+assert_registration_removed "cleanup with empty XDG_CONFIG_HOME uses the target home" "$default_config"
+if [ -e "${cleanup_cwd}/openshell" ]; then
+  echo "FAIL: cleanup with empty XDG_CONFIG_HOME must not create a relative openshell dir" >&2
+  exit 1
+fi
+
 if [ "$saved_xdg_config_home_set" = "set" ]; then
   export XDG_CONFIG_HOME="$saved_xdg_config_home"
 else

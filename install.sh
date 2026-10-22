@@ -616,9 +616,10 @@ user_home() {
 # reset the environment and fall back to the target user's home.
 #
 # An empty XDG_CONFIG_HOME falls back to $HOME/.config, per the XDG base
-# directory spec. The CLI instead joins onto an empty base and yields a relative
-# "openshell", which no installer path can usefully match.
+# directory spec. openshell_core::paths::xdg_config_dir() does the same, so the
+# installer and the CLI agree on every value.
 target_openshell_config_dir() {
+  # shellcheck disable=SC2016
   as_target_user sh -c 'printf "%s\n" "${XDG_CONFIG_HOME:-$HOME/.config}/openshell"'
 }
 
