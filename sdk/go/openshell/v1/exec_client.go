@@ -27,7 +27,8 @@ func (e *execClient) Run(ctx context.Context, workspace, sandboxName string, com
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	if _, err := e.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+	owner, err := sandboxOwner(ctx, e.sandboxes, workspace, sandboxName)
+	if err != nil {
 		return nil, err
 	}
 	var opt *ExecOptions
@@ -37,7 +38,9 @@ func (e *execClient) Run(ctx context.Context, workspace, sandboxName string, com
 	req := converter.ExecRequestToProto(sandboxName, command, opt)
 	req.WorkspaceScope = namedWorkspaceScope(workspace)
 
-	stream, err := e.client.ExecSandbox(ctx, req)
+	stream, err := openRouted(ctx, owner, func(ctx context.Context) (grpc.ServerStreamingClient[pb.ExecSandboxEvent], error) {
+		return e.client.ExecSandbox(ctx, req)
+	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)
 	}
@@ -61,7 +64,8 @@ func (e *execClient) Stream(ctx context.Context, workspace, sandboxName string, 
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	if _, err := e.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+	owner, err := sandboxOwner(ctx, e.sandboxes, workspace, sandboxName)
+	if err != nil {
 		return nil, err
 	}
 	var opt *ExecOptions
@@ -72,7 +76,9 @@ func (e *execClient) Stream(ctx context.Context, workspace, sandboxName string, 
 	req.WorkspaceScope = namedWorkspaceScope(workspace)
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := e.client.ExecSandbox(streamCtx, req)
+	stream, err := openRouted(streamCtx, owner, func(ctx context.Context) (grpc.ServerStreamingClient[pb.ExecSandboxEvent], error) {
+		return e.client.ExecSandbox(ctx, req)
+	})
 	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)
@@ -85,7 +91,8 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 	if sandboxName == "" {
 		return nil, &StatusError{Code: ErrorInvalidArgument, Message: "sandbox name must not be empty"}
 	}
-	if _, err := e.sandboxes.Get(ctx, workspace, sandboxName); err != nil {
+	owner, err := sandboxOwner(ctx, e.sandboxes, workspace, sandboxName)
+	if err != nil {
 		return nil, err
 	}
 	var opt *ExecOptions
@@ -93,20 +100,24 @@ func (e *execClient) Interactive(ctx context.Context, workspace, sandboxName str
 		opt = &opts[0]
 	}
 
+	startReq := converter.ExecInteractiveRequestToProto(sandboxName, command, cols, rows, opt)
+	startReq.WorkspaceScope = namedWorkspaceScope(workspace)
+
 	streamCtx, cancel := context.WithCancel(ctx)
-	stream, err := e.client.ExecSandboxInteractive(streamCtx)
+	stream, err := openRouted(streamCtx, owner, func(ctx context.Context) (grpc.BidiStreamingClient[pb.ExecSandboxInput, pb.ExecSandboxEvent], error) {
+		s, err := e.client.ExecSandboxInteractive(ctx)
+		if err != nil {
+			return nil, err
+		}
+		// io.EOF means the stream already ended; its status comes from Recv.
+		if err := s.Send(&pb.ExecSandboxInput{Payload: &pb.ExecSandboxInput_Start{Start: startReq}}); err != nil && err != io.EOF {
+			return s, err
+		}
+		return s, nil
+	})
 	if err != nil {
 		cancel()
 		return nil, converter.FromGRPCError(err)
-	}
-
-	startReq := converter.ExecInteractiveRequestToProto(sandboxName, command, cols, rows, opt)
-	startReq.WorkspaceScope = namedWorkspaceScope(workspace)
-	if sendErr := stream.Send(&pb.ExecSandboxInput{
-		Payload: &pb.ExecSandboxInput_Start{Start: startReq},
-	}); sendErr != nil {
-		cancel()
-		return nil, converter.FromGRPCError(sendErr)
 	}
 
 	return newInteractiveSession(streamCtx, cancel, stream), nil
