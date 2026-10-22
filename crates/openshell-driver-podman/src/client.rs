@@ -21,7 +21,7 @@ use tracing::debug;
 const API_VERSION: &str = "v5.0.0";
 
 /// Timeout for individual Podman API calls.
-const API_TIMEOUT: Duration = Duration::from_secs(30);
+const API_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Maximum allowed size for the event stream line buffer (1 MB).
 const MAX_EVENT_BUFFER: usize = 1_048_576;
