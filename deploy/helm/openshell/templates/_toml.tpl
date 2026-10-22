@@ -359,7 +359,6 @@ boundary from the gateway listener so its client CA can stay independent. */}}
 {{- $_ := set $config "openshell.gateway.metrics_tls" $metricsTlsConfig -}}
 {{- else -}}
 {{- $_ := unset $config "openshell.gateway.metrics_tls" -}}
->>>>>>> 9c53b03f6 (feat(helm): configure metrics TLS with operator Secrets)
 {{- end -}}
 {{/* A nested YAML map and its dotted top-level table would serialize to
 conflicting TOML definitions. Fail before rendering an invalid ConfigMap. */}}

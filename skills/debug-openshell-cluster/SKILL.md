@@ -961,6 +961,11 @@ contents rather than disabling verification. Configure the scraper with the
 metrics server CA and, for mTLS, its dedicated client certificate and key. Do
 not use `insecureSkipVerify`.
 
+If the Secret is missing or malformed when the pod starts, the gateway remains
+available but keeps the metrics listener disabled rather than falling back to
+plaintext. Correct the Secret and restart the gateway before retrying the
+scrape.
+
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
 mount the `sandbox-jwt` Secret.
