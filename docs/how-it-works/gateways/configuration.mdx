@@ -946,10 +946,20 @@ ssh_socket_path                = "/run/openshell/ssh.sock"
 client_tls_secret_name         = "openshell-client-tls"
 host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
+# Volume backing /sandbox: "persistent_volume_claim" (default) or "empty_dir".
+# An emptyDir needs no StorageClass and is reclaimed with the pod, so it suits
+# clusters without dynamic provisioning; its sizeLimit is workspace_default_storage_size
+# and it does not survive a reschedule, stop, or eviction.
+# workspace_volume             = "empty_dir"
 workspace_default_storage_size = "10Gi"
+# Upper bound for a per-sandbox workspace_storage_size override, bounding both
+# the emptyDir sizeLimit and the PVC request. A request above this is rejected,
+# and startup fails if workspace_default_storage_size exceeds it.
+workspace_max_storage_size     = "10Gi"
 # Kubernetes StorageClass for the workspace PVC. Empty (default) omits the
 # field, using the cluster's default StorageClass. Set this on clusters with no
 # default StorageClass, otherwise the workspace PVC stays Pending.
+# Ignored when workspace_volume = "empty_dir".
 # workspace_storage_class      = "fast-ssd"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.

@@ -198,9 +198,9 @@ errors, avoiding a gateway-side watch restart and its associated watch gap.
 
 ## Workspace Persistence
 
-Sandbox pods use a PVC-backed `/sandbox` workspace. An init container seeds the
-PVC from the image's original `/sandbox` contents on first start and writes a
-sentinel so subsequent starts skip the copy.
+Sandbox pods use a PVC-backed `/sandbox` workspace by default. An init
+container seeds the PVC from the image's original `/sandbox` contents on first
+start and writes a sentinel so subsequent starts skip the copy.
 
 This is a stopgap persistence model. It preserves user files across pod
 rescheduling but duplicates the base workspace and does not automatically apply
@@ -224,6 +224,22 @@ runtime via `OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE` and
 `OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS`. Both apply only to the workspace PVC
 that OpenShell provisions automatically; they have no effect when a `driver_config`
 mount attaches an existing PVC under `/sandbox`, which skips the default PVC.
+
+Set `workspace_volume = "empty_dir"` (standalone driver:
+`OPENSHELL_K8S_WORKSPACE_VOLUME`) to back `/sandbox` with an `emptyDir` capped
+at `workspace_default_storage_size` instead of a PVC, for clusters without
+dynamic provisioning. The Sandbox CR then carries no `volumeClaimTemplates`,
+kubelet reclaims the workspace with the pod, and the init container re-seeds
+`/sandbox` on every start, so stop and start or any other pod replacement
+resets it. `workspace_storage_class` does not apply in this mode.
+
+`workspace_max_storage_size` (default `10Gi`, standalone driver:
+`OPENSHELL_K8S_WORKSPACE_MAX_STORAGE_SIZE`) bounds a per-sandbox workspace size
+so one sandbox cannot claim an unbounded `emptyDir` and starve the node;
+startup validation rejects a default above the maximum. On gateways with
+`allow_driver_config = true`, a sandbox overrides the gateway default through
+`driver_config.kubernetes.workspace_volume` and `workspace_storage_size`; a
+requested size above the maximum is rejected.
 
 ## Credentials, TLS, and Relay
 

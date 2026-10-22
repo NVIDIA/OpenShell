@@ -295,8 +295,10 @@ Only the OpenShell gateway and the Agent Sandbox controller should be able to ma
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Project or stage only `ca.crt` into supervisor Pods to authenticate the gateway. |
 | `sandbox_runtime_image` | `sandboxRuntime.image.*` | Override the sandbox runtime image. |
 | `supervisor_image` | `supervisor.image.*` | Override the supervisor image. |
-| `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace PVC size. |
-| `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. |
+| `workspace_volume` | `gatewayConfig["openshell.drivers.kubernetes"].workspace_volume` | `persistent_volume_claim` (default) or `empty_dir`. `empty_dir` needs no `StorageClass`. |
+| `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Default workspace size: the PVC request, or the `empty_dir` size limit. |
+| `workspace_max_storage_size` | `gatewayConfig["openshell.drivers.kubernetes"].workspace_max_storage_size` | Upper bound (default `10Gi`) for a per-sandbox `workspace_storage_size` override. |
+| `workspace_storage_class` | `server.workspaceStorageClass` | `StorageClass` for workspace PVCs. Set this if the cluster has no default `StorageClass`. Ignored for `empty_dir`. |
 | `allowed_pod_annotations` | `gatewayConfig["openshell.drivers.kubernetes"].allowed_pod_annotations` | Pod annotation keys that sandbox templates may set, as exact keys or `<domain>/*` wildcards. Empty (default) rejects all template annotations. Keys under `openshell.ai` and `agents.x-k8s.io` are reserved and can't be allowlisted. |
 | `allowed_pod_labels` | `gatewayConfig["openshell.drivers.kubernetes"].allowed_pod_labels` | Pod label keys that sandbox templates may set, in the same format as `allowed_pod_annotations`. Empty (default) rejects all template labels. Labels select pods for NetworkPolicy rules and Services, so only allow keys that no other rule in the sandbox namespace selects on. |
 | `sandbox_uid` / `sandbox_gid` | `server.sandboxUid` / `server.sandboxGid` | Sandbox pod UID and GID. Takes priority over OpenShift SCC namespace annotations. `sandbox_gid` defaults to the UID. |
@@ -323,7 +325,7 @@ Workspace storage settings cannot change after a sandbox is created. Delete and 
 
 ### Kubernetes PVC Mounts
 
-Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace PVC for that sandbox.
+Mount existing PersistentVolumeClaims into the agent container through driver config. Any mount under `/sandbox` replaces the default workspace volume for that sandbox.
 
 ```shell
 openshell sandbox create \
@@ -355,6 +357,29 @@ openshell sandbox create \
 | `containers.agent.volume_mounts[].mount_path` | Absolute path in the agent container. |
 | `containers.agent.volume_mounts[].sub_path` | Optional relative path within the PVC. |
 | `containers.agent.volume_mounts[].read_only` | Defaults to `true`. Read-write mounts require a read-write volume. |
+
+### Ephemeral Workspaces
+
+Set `workspace_volume = "empty_dir"` to back `/sandbox` with a size-capped `emptyDir` instead of a per-sandbox PVC. This runs on clusters with no dynamic provisioning or no default `StorageClass`, and kubelet reclaims the workspace with the pod. The init container still seeds `/sandbox` from the image on every pod start, so an `empty_dir` workspace does not survive a reschedule, stop, or eviction, and exceeding its size limit evicts the pod.
+
+On gateways with `allow_driver_config = true`, a sandbox can override the gateway default per creation through `driver_config.kubernetes`:
+
+```shell
+openshell sandbox create \
+  --from registry.example.com/team/claude-code:1.0 \
+  --driver-config-json '{
+    "kubernetes": {
+      "workspace_volume": "empty_dir",
+      "workspace_storage_size": "5Gi"
+    }
+  }' \
+  -- claude
+```
+
+| Field | Description |
+|---|---|
+| `workspace_volume` | `persistent_volume_claim` or `empty_dir`. Overrides the gateway default for this sandbox. |
+| `workspace_storage_size` | Workspace size: the `emptyDir` size limit or the PVC request. Rejected when it exceeds the gateway `workspace_max_storage_size` (default `10Gi`). |
 
 ## Sandbox User Identity
 
