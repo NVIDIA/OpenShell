@@ -22,12 +22,13 @@ use openshell_core::token_grant_failure::{
 };
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
-    StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
+    StatusId, ctx::ctx as ocsf_ctx,
 };
 use tracing::warn;
 
 use crate::l7::provider::L7Request;
 use crate::l7::relay::L7EvalContext;
+use crate::telemetry::ocsf_emit;
 
 /// Borrowed grant configuration for one endpoint-bound provider credential.
 pub struct TokenGrantRequest<'a> {

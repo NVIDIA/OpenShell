@@ -35,10 +35,11 @@ pub(crate) use store::{
 use crate::opa::OpaEngine;
 use crate::proxy::destination::{build_validation_plan, filter_resolved_addresses};
 use crate::proxy::is_host_gateway_alias;
+use crate::telemetry::ocsf_emit;
 use openshell_core::host_pattern::HostSelector;
 use openshell_ocsf::{
     ActionId, ActivityId, ConfigStateChangeBuilder, DispositionId, Endpoint,
-    NetworkActivityBuilder, SeverityId, StateId, StatusId, ocsf_emit,
+    NetworkActivityBuilder, SeverityId, StateId, StatusId,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;

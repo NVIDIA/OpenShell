@@ -11,6 +11,7 @@ use crate::events::{DeviceConfigStateChangeEvent, OcsfEvent};
 /// Builder for Device Config State Change [5019] events.
 pub struct ConfigStateChangeBuilder<'a> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     severity: SeverityId,
     status: Option<StatusId>,
     state_id: Option<StateId>,
@@ -22,10 +23,18 @@ pub struct ConfigStateChangeBuilder<'a> {
 }
 
 impl<'a> ConfigStateChangeBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
+            trace: None,
             severity: SeverityId::Informational,
             status: None,
             state_id: None,
@@ -81,6 +90,10 @@ impl<'a> ConfigStateChangeBuilder<'a> {
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
             base,

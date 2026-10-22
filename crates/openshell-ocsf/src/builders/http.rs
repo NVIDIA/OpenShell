@@ -12,6 +12,7 @@ use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 /// Builder for HTTP Activity [4002] events.
 pub struct HttpActivityBuilder<'a, Context = MissingHttpContext> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -59,6 +60,7 @@ impl<'a> HttpActivityBuilder<'a, MissingHttpContext> {
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
+            trace: None,
             activity: ActivityId::Unknown,
             action: None,
             disposition: None,
@@ -103,9 +105,17 @@ impl HttpActivityBuilder<'_, HasHttpContext> {
 }
 
 impl<'a, Context> HttpActivityBuilder<'a, Context> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     fn with_http_request(self, req: HttpRequest) -> HttpActivityBuilder<'a, HasHttpContext> {
         HttpActivityBuilder {
             ctx: self.ctx,
+            trace: self.trace,
             activity: self.activity,
             action: self.action,
             disposition: self.disposition,
@@ -127,6 +137,7 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
     fn with_http_response(self, resp: HttpResponse) -> HttpActivityBuilder<'a, HasHttpContext> {
         HttpActivityBuilder {
             ctx: self.ctx,
+            trace: self.trace,
             activity: self.activity,
             action: self.action,
             disposition: self.disposition,
@@ -241,6 +252,10 @@ impl HttpActivityBuilder<'_, HasHttpContext> {
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::HttpActivity(HttpActivityEvent {
             base,

@@ -14,7 +14,6 @@ use miette::{IntoDiagnostic, Result};
 use openshell_isolation_interface::contract::BackendDescriptor;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod logging;
@@ -387,6 +386,10 @@ fn main() -> Result<()> {
         return openshell_supervisor::check_control_readiness(&args.socket);
     }
 
+    openshell_ocsf::register_trace_correlation_extractor(
+        openshell_otel::current_ocsf_trace_correlation,
+    );
+
     let args = Args::parse();
     if args.mode == SupervisorMode::Shared {
         let address = args
@@ -654,11 +657,7 @@ fn supervisor_resource_attributes(
 /// A more verbose log level raises `openshell*` spans; dependency spans stay at
 /// INFO so they do not flood the exporter queue.
 fn otlp_span_filter(log_level: &str) -> EnvFilter {
-    let level = log_level
-        .parse::<LevelFilter>()
-        .unwrap_or(LevelFilter::INFO)
-        .max(LevelFilter::INFO);
-    EnvFilter::new(format!("info,openshell={level}"))
+    openshell_otel::supervisor_span_filter(log_level)
 }
 
 /// Choose the supervisor's exit status for a sandbox run.

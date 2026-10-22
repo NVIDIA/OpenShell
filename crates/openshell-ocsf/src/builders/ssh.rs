@@ -12,6 +12,7 @@ use crate::objects::{Actor, Endpoint};
 /// Builder for SSH Activity [4007] events.
 pub struct SshActivityBuilder<'a> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     action: Option<ActionId>,
     disposition: Option<DispositionId>,
@@ -27,10 +28,18 @@ pub struct SshActivityBuilder<'a> {
 }
 
 impl<'a> SshActivityBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
+            trace: None,
             activity: ActivityId::Unknown,
             action: None,
             disposition: None,
@@ -76,6 +85,10 @@ impl<'a> SshActivityBuilder<'a> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::SshActivity(SshActivityEvent {
             base,

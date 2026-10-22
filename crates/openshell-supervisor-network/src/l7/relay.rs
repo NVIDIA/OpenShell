@@ -20,6 +20,7 @@ use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EndpointObserver, EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
+use crate::telemetry::ocsf_emit;
 use miette::{IntoDiagnostic, Result, miette};
 use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::endpoint_status::{EndpointObservationSender, EndpointResult};
@@ -27,7 +28,6 @@ use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
     HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl,
-    ocsf_emit,
 };
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -3753,6 +3753,29 @@ where
         .into_diagnostic()?;
     client.flush().await.into_diagnostic()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::telemetry::tests::{assert_deny_resolves, exported};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_level_l7_relay_deny_uid_resolves_to_one_span_root_trace() {
+        let (events, received) = exported("warn", || {
+            let ctx = L7EvalContext {
+                host: "blocked.example".to_string(),
+                port: 443,
+                policy_name: "rest-policy".to_string(),
+                ..Default::default()
+            };
+            emit_parse_rejection(&ctx, "ambiguous framing", "l7-rest");
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_deny_resolves(&events, &received, true);
+        assert_eq!(received.spans.len(), 1);
+    }
 }
 
 #[cfg(test)]

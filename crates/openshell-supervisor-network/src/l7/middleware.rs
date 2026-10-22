@@ -5,10 +5,11 @@
 
 use crate::l7::relay::L7EvalContext;
 use crate::opa::PolicyGenerationGuard;
+use crate::telemetry::ocsf_emit;
 use miette::{Result, miette};
 use openshell_ocsf::{
     ActionId, ActivityId, DetectionFindingBuilder, DispositionId, Endpoint, FindingInfo,
-    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId, ocsf_emit,
+    HttpActivityBuilder, HttpRequest, NetworkActivityBuilder, SeverityId, StatusId,
 };
 use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -168,7 +169,7 @@ pub fn emit_middleware_uninspectable(ctx: &L7EvalContext, detail: &str, denied: 
             "Uninspectable traffic bypassed middleware (fail_open)"
         })
         .build();
-    ocsf_emit!(event);
+    ocsf_emit!(denied: denied, event);
 }
 
 pub fn emit_websocket_preflight_events(
@@ -178,7 +179,7 @@ pub fn emit_websocket_preflight_events(
     emit_websocket_invocations(ctx, &outcome.invocations);
     emit_websocket_coverage(ctx, &outcome.coverage);
     for event in websocket_preflight_finding_events(outcome) {
-        ocsf_emit!(event);
+        ocsf_emit!(denied: !outcome.allowed, event);
     }
     if outcome.saturated {
         emit_websocket_saturation(ctx);
@@ -263,7 +264,7 @@ pub(super) fn emit_websocket_message_events(
         emit_websocket_saturation(ctx);
     }
     for event in websocket_message_finding_events(outcome) {
-        ocsf_emit!(event);
+        ocsf_emit!(denied: !outcome.allowed, event);
     }
 }
 
@@ -406,7 +407,7 @@ fn emit_websocket_invocations(
                 ])
                 .message("WebSocket middleware stage failed")
                 .build();
-            ocsf_emit!(event);
+            ocsf_emit!(denied: matches!(invocation.outcome, Outcome::Deny | Outcome::FailClosed), event);
         }
         if invocation.stage_disabled {
             let event = DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
@@ -426,7 +427,7 @@ fn emit_websocket_invocations(
                     "WebSocket middleware stage stream became unusable and was disabled for this session",
                 )
                 .build();
-            ocsf_emit!(event);
+            ocsf_emit!(denied: matches!(invocation.outcome, Outcome::Deny | Outcome::FailClosed), event);
         }
     }
 }
@@ -462,7 +463,7 @@ fn emit_middleware_session_capacity_exhausted(ctx: &L7EvalContext) {
         ])
         .message("Persistent middleware session admission was refused at process capacity")
         .build();
-    ocsf_emit!(event);
+    ocsf_emit!(denied: true, event);
 }
 
 fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::OcsfEvent {
@@ -483,7 +484,7 @@ fn middleware_admission_exhausted_event(ctx: &L7EvalContext) -> openshell_ocsf::
 }
 
 fn emit_middleware_admission_exhausted(ctx: &L7EvalContext) {
-    ocsf_emit!(middleware_admission_exhausted_event(ctx));
+    ocsf_emit!(denied: true, middleware_admission_exhausted_event(ctx));
 }
 
 /// Largest body-buffering limit across the entries that actually resolved to a
@@ -811,7 +812,7 @@ fn emit_middleware_body_unavailable(ctx: &L7EvalContext, denied: bool) {
             "Request body exceeded middleware inspection cap; passed through (fail_open)"
         })
         .build();
-    ocsf_emit!(event);
+    ocsf_emit!(denied: denied, event);
 }
 
 /// Parse the raw header block into middleware-visible headers, preserving
@@ -1000,7 +1001,30 @@ fn emit_middleware_events(
     outcome: &openshell_supervisor_middleware::ChainOutcome,
 ) {
     for event in middleware_events(ctx, req, outcome) {
-        ocsf_emit!(event);
+        ocsf_emit!(denied: !outcome.allowed && matches!(event, openshell_ocsf::OcsfEvent::DetectionFinding(_)), event);
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    use crate::telemetry::tests::{assert_deny_resolves, exported};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_level_middleware_deny_finding_is_inside_exported_deny_span() {
+        let (events, received) = exported("warn", || {
+            let ctx = L7EvalContext {
+                host: "blocked.example".to_string(),
+                port: 443,
+                policy_name: "middleware-policy".to_string(),
+                ..Default::default()
+            };
+            emit_middleware_uninspectable(&ctx, "unknown protocol", true);
+        })
+        .await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["class_uid"], 2004);
+        assert_deny_resolves(&events, &received, true);
     }
 }
 

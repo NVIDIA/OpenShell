@@ -12,6 +12,7 @@ use crate::objects::{Actor, Process};
 /// Builder for Process Activity [1007] events.
 pub struct ProcessActivityBuilder<'a> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     severity: SeverityId,
     status: Option<StatusId>,
@@ -25,10 +26,18 @@ pub struct ProcessActivityBuilder<'a> {
 }
 
 impl<'a> ProcessActivityBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
+            trace: None,
             activity: ActivityId::Unknown,
             severity: SeverityId::Informational,
             status: None,
@@ -74,6 +83,10 @@ impl<'a> ProcessActivityBuilder<'a> {
         );
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::ProcessActivity(ProcessActivityEvent {
             base,

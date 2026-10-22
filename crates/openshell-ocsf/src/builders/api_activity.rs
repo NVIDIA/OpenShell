@@ -29,6 +29,7 @@ fn sanitize_model_name(name: &str) -> String {
 /// Builder for API Activity [6003] events.
 pub struct ApiActivityBuilder<'a> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -48,10 +49,18 @@ pub struct ApiActivityBuilder<'a> {
 }
 
 impl<'a> ApiActivityBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: &'a EventContext, operation: impl Into<String>) -> Self {
         Self {
             ctx,
+            trace: None,
             severity: SeverityId::Informational,
             status: None,
             message: None,
@@ -200,6 +209,10 @@ impl<'a> ApiActivityBuilder<'a> {
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::ApiActivity(ApiActivityEvent {
             base,

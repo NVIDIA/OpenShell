@@ -11,6 +11,7 @@ use crate::events::{BaseEvent, OcsfEvent};
 /// Builder for Base Event [0] — events without a specific OCSF class.
 pub struct BaseEventBuilder<'a> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     severity: SeverityId,
     status: Option<StatusId>,
     message: Option<String>,
@@ -19,10 +20,18 @@ pub struct BaseEventBuilder<'a> {
 }
 
 impl<'a> BaseEventBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
+            trace: None,
             severity: SeverityId::Informational,
             status: None,
             message: None,
@@ -62,6 +71,10 @@ impl<'a> BaseEventBuilder<'a> {
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::Base(BaseEvent { base })
     }

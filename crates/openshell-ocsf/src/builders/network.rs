@@ -12,6 +12,7 @@ use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 /// Builder for Network Activity [4001] events.
 pub struct NetworkActivityBuilder<'a, EndpointState = MissingNetworkEndpoint> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     activity: ActivityId,
     activity_name: Option<String>,
     action: Option<ActionId>,
@@ -61,6 +62,7 @@ impl<'a> NetworkActivityBuilder<'a, MissingNetworkEndpoint> {
     pub fn new(ctx: &'a EventContext) -> Self {
         Self {
             ctx,
+            trace: None,
             activity: ActivityId::Unknown,
             activity_name: None,
             action: None,
@@ -114,12 +116,20 @@ impl NetworkActivityBuilder<'_, HasNetworkEndpoint> {
 }
 
 impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     fn with_src_endpoint(
         self,
         endpoint: Endpoint,
     ) -> NetworkActivityBuilder<'a, HasNetworkEndpoint> {
         NetworkActivityBuilder {
             ctx: self.ctx,
+            trace: self.trace,
             activity: self.activity,
             activity_name: self.activity_name,
             action: self.action,
@@ -146,6 +156,7 @@ impl<'a, EndpointState> NetworkActivityBuilder<'a, EndpointState> {
     ) -> NetworkActivityBuilder<'a, HasNetworkEndpoint> {
         NetworkActivityBuilder {
             ctx: self.ctx,
+            trace: self.trace,
             activity: self.activity,
             activity_name: self.activity_name,
             action: self.action,
@@ -283,6 +294,10 @@ impl NetworkActivityBuilder<'_, HasNetworkEndpoint> {
         }
         self.ctx
             .apply_common_fields(&mut base, self.status, self.message);
+
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::NetworkActivity(NetworkActivityEvent {
             base,

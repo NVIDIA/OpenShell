@@ -1184,7 +1184,7 @@ where
                         port = options.port,
                     ))
                     .build();
-                    openshell_ocsf::ocsf_emit!(event);
+                    crate::telemetry::ocsf_emit!(event);
                 }
                 _ => {
                     return Err(miette::Report::new(CredentialUnavailableError::new(
@@ -1534,7 +1534,7 @@ fn emit_uninspected_body_credential_denial(
             req.action, options.host, options.port
         ))
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    crate::telemetry::ocsf_emit!(denied: true, event);
     let finding = openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
         .severity(openshell_ocsf::SeverityId::High)
         .finding_info(openshell_ocsf::FindingInfo::new(
@@ -1548,7 +1548,7 @@ fn emit_uninspected_body_credential_denial(
         ])
         .message("Request body credential placeholder denied")
         .build();
-    openshell_ocsf::ocsf_emit!(finding);
+    crate::telemetry::ocsf_emit!(denied: true, finding);
 }
 
 struct PreparedRequestBody {

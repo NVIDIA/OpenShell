@@ -386,7 +386,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
                     "rejecting endpoint: unrecognized credential_signing value {other:?}"
                 ))
                 .build();
-            openshell_ocsf::ocsf_emit!(event);
+            crate::telemetry::ocsf_emit!(event);
             return None;
         }
         _ => CredentialSigning::None,
@@ -402,7 +402,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             .state(openshell_ocsf::StateId::Disabled, "invalid")
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
             .build();
-        openshell_ocsf::ocsf_emit!(event);
+        crate::telemetry::ocsf_emit!(event);
         return None;
     }
 
@@ -444,7 +444,7 @@ pub(crate) fn emit_uninspected_credential_finding(host: &str, policy_name: &str,
         ])
         .message("Uninspected credential-bearing traffic denied")
         .build();
-    openshell_ocsf::ocsf_emit!(event);
+    crate::telemetry::ocsf_emit!(denied: true, event);
 }
 
 impl L7EndpointConfig {

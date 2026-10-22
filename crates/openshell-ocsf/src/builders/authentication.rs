@@ -12,6 +12,7 @@ use crate::objects::{Endpoint, HttpRequest, Service, User};
 /// Builder for Authentication [3002] Logon events.
 pub struct AuthenticationBuilder<'a> {
     ctx: &'a EventContext,
+    trace: Option<crate::TraceCorrelation>,
     user: User,
     service: Service,
     auth_protocol: Option<AuthProtocolId>,
@@ -28,10 +29,18 @@ pub struct AuthenticationBuilder<'a> {
 }
 
 impl<'a> AuthenticationBuilder<'a> {
+    /// Set trace correlation explicitly instead of using the active span.
+    #[must_use]
+    pub fn trace(mut self, trace: crate::TraceCorrelation) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
     #[must_use]
     pub fn new(ctx: &'a EventContext, user: User, service: Service) -> Self {
         Self {
             ctx,
+            trace: None,
             user,
             service,
             auth_protocol: None,
@@ -116,6 +125,9 @@ impl<'a> AuthenticationBuilder<'a> {
         // Not `apply_common_fields`: the container profile defines `container`
         // on endpoints and processes, never at the event top level.
         base.set_device(self.ctx.device());
+        if let Some(trace) = self.trace {
+            base.set_trace(trace);
+        }
 
         OcsfEvent::Authentication(AuthenticationEvent {
             base,
