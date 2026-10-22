@@ -74,11 +74,52 @@ pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
+/// Which side opens the Sandbox Protocol TCP connection.
+///
+/// Internal state for the current runtime generation. A missing Sandbox
+/// annotation identifies a legacy generation; every new generation uses
+/// `RuntimeInitiated`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KubernetesControlConnection {
+    /// The sandbox runtime dials its supervisor's per-sandbox Service.
+    #[default]
+    RuntimeInitiated,
+    /// The supervisor dials the sandbox runtime's listener (original mode).
+    SupervisorInitiated,
+}
+
+impl KubernetesControlConnection {
+    /// Stable spelling used in configuration and Sandbox annotations.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RuntimeInitiated => "runtime-initiated",
+            Self::SupervisorInitiated => "supervisor-initiated",
+        }
+    }
+}
+
+impl FromStr for KubernetesControlConnection {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "runtime-initiated" => Ok(Self::RuntimeInitiated),
+            "supervisor-initiated" => Ok(Self::SupervisorInitiated),
+            other => Err(format!(
+                "invalid sandbox control connection '{other}'; expected runtime-initiated or supervisor-initiated"
+            )),
+        }
+    }
+}
+
 /// Driver-owned requirements for the Kubernetes sandbox runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesSandboxRuntimeConfig {
-    /// TCP port exposed by the workload boundary to its paired control pod.
+    /// TCP port of the Sandbox Protocol listener: the workload boundary for
+    /// supervisor-initiated sandboxes, the supervisor for runtime-initiated ones.
     pub boundary_port: u16,
 }
 
@@ -153,9 +194,20 @@ where
     Ok(value)
 }
 
+/// Scope of a shared supervisor deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisorTopology {
+    Gateway,
+    Workspace,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
+    /// Deploy an idle shared supervisor through Helm. Does not route sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supervisor_topology: Option<SupervisorTopology>,
     /// Permit caller-supplied driver JSON. Does not waive resource admission.
     pub allow_driver_config: bool,
     /// Operator-owned external attachment approval policy.
@@ -348,6 +400,7 @@ pub const ANNOTATION_SCC_SUPPLEMENTAL_GROUPS: &str = "openshift.io/sa.scc.supple
 impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
+            supervisor_topology: None,
             workspace_mode: WorkspaceMode::default(),
             allow_driver_config: false,
             resource_admission:
@@ -401,6 +454,9 @@ impl Default for KubernetesComputeConfig {
 impl KubernetesComputeConfig {
     /// Validate startup configuration without connecting to Kubernetes.
     pub fn validate_configuration(&self) -> Result<(), String> {
+        if self.supervisor_topology == Some(SupervisorTopology::Workspace) {
+            return Err("supervisor_topology=workspace is not implemented".into());
+        }
         self.validate_workspace_mode()?;
         self.validate_provider_spiffe_workload_api_socket_path()?;
         self.validate_sandbox_identity_config()?;

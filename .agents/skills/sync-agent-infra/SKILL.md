@@ -27,6 +27,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | Inference providers or native model endpoints | `debug-inference`, `openshell-cli` |
 | TUI behavior | `tui-development` |
 | Release artifacts or smoke coverage | `test-release-canary` |
+| Release cadence, tagging, or qualification workflows | `release-captain` |
 | CI diagnostics | `watch-github-actions` |
 | Gator supervision | `launch-openshell-gator` |
 | SBOM workflow | `sbom` |

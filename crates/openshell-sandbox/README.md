@@ -17,3 +17,12 @@ the kernel then tracks the lifetime through workload-owned descriptors. Native
 the last workload reference to a listener removes it without waiting for registry
 collection. Broker source descriptors always use close-on-exec independently of
 the workload's requested descriptor flags.
+
+A boundary configured with `RuntimeInitiatedTlsTcp` binds no listener. It dials
+only the driver-provided supervisor addresses, which must be concrete,
+non-loopback, and share one port, and serves TLS and gRPC over that outbound
+connection. It keeps one spare connection that the supervisor has not yet used
+and dials a replacement when the supervisor starts HTTP/2 on it or the spare
+closes. Live connections keep the same disconnect, freeze, and recovery-deadline
+handling as listener mode, and the workload still cannot connect to the control
+port.

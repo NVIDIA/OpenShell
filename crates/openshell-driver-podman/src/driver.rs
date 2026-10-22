@@ -829,7 +829,9 @@ impl PodmanComputeDriver {
                         return Err(missing());
                     }
                     let workspace_volume = name == container::volume_name(sandbox_id);
-                    if workspace_volume || name == crate::isolation::channel_volume_name(sandbox_id)
+                    if workspace_volume
+                        || name == crate::isolation::channel_volume_name(sandbox_id)
+                        || name == crate::isolation::control_volume_name(sandbox_id)
                     {
                         let owned = volume.labels.as_ref().is_some_and(|labels| {
                             labels.get(LABEL_SANDBOX_ID) == Some(sandbox_id)
@@ -1064,6 +1066,7 @@ impl PodmanComputeDriver {
             .resolve_workload_identity(sandbox, &resolved_image.id, &resolved_image.oci_user)
             .await?;
         let channel_volume = crate::isolation::channel_volume_name(&sandbox.id);
+        let control_volume = crate::isolation::control_volume_name(&sandbox.id);
         let mut runtime_config = self.config.clone();
         runtime_config.sandbox_runtime_image = self
             .client
@@ -1157,6 +1160,7 @@ impl PodmanComputeDriver {
         let cleanup_created = || async {
             if channel_owned.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = self.client.remove_volume(&channel_volume).await;
+                let _ = self.client.remove_volume(&control_volume).await;
             }
             let _ = self.client.remove_volume(&vol_name).await;
             cleanup_sandbox_resolver_secret(&self.client, &resolver_secret_name).await;
@@ -1240,6 +1244,9 @@ impl PodmanComputeDriver {
                         .create_owned_volume(&channel_volume, &sandbox.id, &sandbox.workspace, None)
                         .await?;
                     channel_owned.store(true, std::sync::atomic::Ordering::Relaxed);
+                    self.client
+                        .create_owned_volume(&control_volume, &sandbox.id, &sandbox.workspace, None)
+                        .await?;
                     let workload_id = self.client.create_typed_container(&specs.workload).await?;
                     created_workload = Some(workload_id.clone());
                     self.client.verify_isolation_fence(&workload_id).await?;
@@ -1260,6 +1267,7 @@ impl PodmanComputeDriver {
                     let generation = uuid::Uuid::new_v4().to_string();
                     let archives = crate::isolation::bootstrap_archives(
                         crate::isolation::BootstrapArchivesInput {
+                            runtime_initiated: true,
                             sandbox_id: &sandbox.id,
                             container_id: &workload_id,
                             generation: &generation,
@@ -1280,6 +1288,15 @@ impl PodmanComputeDriver {
                             archives.channel,
                         )
                         .await?;
+                    if let Some(control) = archives.control {
+                        self.client
+                            .copy_to_container(
+                                &workload_id,
+                                crate::isolation::CONTROL_ROOT,
+                                control,
+                            )
+                            .await?;
+                    }
                     if managed_workspace {
                         self.client
                             .copy_to_container(&workload_id, "/sandbox", archives.workspace)
@@ -1611,6 +1628,7 @@ impl PodmanComputeDriver {
             let restart_metadata = crate::isolation::restart_metadata_from_slice(&bundle)?;
             let archives =
                 crate::isolation::bootstrap_archives(crate::isolation::BootstrapArchivesInput {
+                    runtime_initiated: restart_metadata.runtime_initiated,
                     sandbox_id,
                     container_id: &container_id,
                     generation: generation.as_str(),
@@ -1633,6 +1651,11 @@ impl PodmanComputeDriver {
                     archives.channel,
                 )
                 .await?;
+            if let Some(control) = archives.control {
+                self.client
+                    .copy_to_container(&container_id, crate::isolation::CONTROL_ROOT, control)
+                    .await?;
+            }
             self.client
                 .copy_to_container(&supervisor, "/", archives.supervisor)
                 .await?;
@@ -1687,6 +1710,10 @@ impl PodmanComputeDriver {
 
         let Some(container_id) = self.find_container_id(sandbox_id).await? else {
             debug!(sandbox_id = %sandbox_id, "Sandbox container not found (already deleted)");
+            let _ = self
+                .client
+                .remove_volume(&crate::isolation::control_volume_name(sandbox_id))
+                .await;
             let vol = container::volume_name(sandbox_id);
             if let Err(e) = self.client.remove_volume(&vol).await {
                 warn!(sandbox_id = %sandbox_id, volume = %vol, error = %e, "Failed to remove workspace volume");
@@ -1722,6 +1749,14 @@ impl PodmanComputeDriver {
             Err(e) => return Err(ComputeDriverError::from(e)),
         };
 
+        if let Err(error) = self
+            .client
+            .remove_volume(&crate::isolation::control_volume_name(sandbox_id))
+            .await
+            && !matches!(error, PodmanApiError::NotFound(_))
+        {
+            warn!(%sandbox_id, %error, "Failed to remove private control volume");
+        }
         // Remove workspace volume.
         if let Err(error) = self
             .client
@@ -2527,6 +2562,7 @@ mod tests {
             uploads,
             [
                 "/libpod/containers/workload/archive?path=%2F.openshell%2Fchannel",
+                "/libpod/containers/workload/archive?path=%2F.openshell%2Fchannel%2Fcontrol",
                 "/libpod/containers/workload/archive?path=%2Fsandbox",
                 "/libpod/containers/supervisor/archive?path=%2F",
             ]
@@ -3526,6 +3562,7 @@ mod tests {
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
@@ -3545,7 +3582,7 @@ mod tests {
             .clone();
         assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[3],
+            requests[4],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))
@@ -3662,6 +3699,7 @@ mod tests {
         )
         .unwrap();
         let bundle = serde_json::to_vec(&crate::isolation::RestartMetadata {
+            runtime_initiated: false,
             generation: "generation-1".to_string(),
             workload_identity: identity,
             child_env: HashMap::new(),
@@ -3810,6 +3848,13 @@ mod tests {
             sandbox_id,
             None,
         ));
+        responses.push(StubResponse::new(StatusCode::NOT_FOUND, ""));
+        responses.push(StubResponse::new(StatusCode::CREATED, "{}"));
+        responses.push(owned_volume_response(
+            &crate::isolation::control_volume_name(sandbox_id),
+            sandbox_id,
+            None,
+        ));
         responses
     }
 
@@ -3843,6 +3888,7 @@ mod tests {
             created_response("workload"),
             fence_response(),
             StubResponse::new(StatusCode::OK, "").with_archive_members(channel_archive_members()),
+            StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]), // control volume
             StubResponse::new(StatusCode::OK, "").with_archive_members(&["."]),
             created_response("supervisor"),
             StubResponse::new(StatusCode::OK, ""), // supervisor archive
@@ -3905,6 +3951,7 @@ mod tests {
                 .chain([
                     StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "create failed"),
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // control
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // workspace
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // resolver secret
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy secret
@@ -3950,12 +3997,13 @@ mod tests {
             "create-start-fail",
             create_setup_responses(true, sandbox_id)
                 .into_iter()
-                .chain(create_launch_responses().into_iter().take(7))
+                .chain(create_launch_responses().into_iter().take(8))
                 .chain([
                     StubResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "supervisor start failed"),
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // supervisor
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // workload
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
+                    StubResponse::new(StatusCode::NO_CONTENT, ""), // control
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // workspace
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // resolver secret
                     StubResponse::new(StatusCode::NO_CONTENT, ""), // proxy secret
@@ -4001,7 +4049,8 @@ mod tests {
             vec![
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove companion
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove channel if detached
-                StubResponse::new(StatusCode::OK, "[]"),       // list_containers (not found)
+                StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove token secret
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // remove resolver secret
@@ -4055,6 +4104,7 @@ mod tests {
                 StubResponse::new(StatusCode::OK, list_body),
                 // single timed remove_container operation
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
                 // channel volume, now detached
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 // remove_volume
@@ -4085,7 +4135,7 @@ mod tests {
             )
         );
         assert_eq!(
-            requests[5],
+            requests[6],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

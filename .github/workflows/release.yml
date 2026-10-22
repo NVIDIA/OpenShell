@@ -49,6 +49,7 @@ jobs:
       tag: ${{ steps.candidate.outputs.tag }}
       source-sha: ${{ steps.candidate.outputs.source_sha }}
       make-latest: ${{ steps.candidate.outputs.make_latest }}
+      notes-reused: ${{ steps.notes.outputs.reused }}
     steps:
       - name: Require a release branch
         env:
@@ -89,6 +90,32 @@ jobs:
           name: stable-promotion-${{ inputs.tag }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: promotion.json
           retention-days: 90
+          if-no-files-found: error
+
+      # Without a preview (missing or expired), Publish generates the notes instead.
+      - name: Reuse the prerelease notes preview
+        id: notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ steps.candidate.outputs.qualification_run_id }}
+          CANDIDATE_TAG: ${{ steps.candidate.outputs.candidate_tag }}
+          RELEASE_TAG: ${{ steps.candidate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh run download "${RUN_ID}" -R "${GITHUB_REPOSITORY}" -n release-notes -D notes; then
+            sed -i "s/${CANDIDATE_TAG//./\\.}\b/${RELEASE_TAG}/g" notes/release-notes.md
+            echo "reused=true" >> "${GITHUB_OUTPUT}"
+            echo "Release notes are reused from the \`${CANDIDATE_TAG}\` preview." >> "${GITHUB_STEP_SUMMARY}"
+          else
+            echo "Release notes will be regenerated; the \`${CANDIDATE_TAG}\` preview is unavailable." >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload release notes
+        if: ${{ steps.notes.outputs.reused == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-notes
+          path: notes/release-notes.md
           if-no-files-found: error
 
       - name: Create stable tag at the qualified commit
@@ -140,6 +167,7 @@ jobs:
       npm-version: ${{ needs.build.outputs.npm_version }}
       is-prerelease: false
       make-latest: ${{ needs.promote.outputs.make-latest == 'true' }}
+      release-notes-reused: ${{ needs.promote.outputs.notes-reused == 'true' }}
     secrets:
       SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
       FERN_TOKEN: ${{ secrets.FERN_TOKEN }}

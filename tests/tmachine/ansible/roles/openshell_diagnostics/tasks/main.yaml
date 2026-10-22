@@ -46,6 +46,6 @@
     - name: Fetch K3s diagnostics
       ansible.builtin.fetch:
         src: /var/lib/openshell/diagnostics/k3s.txt
-        dest: "{{ role_path }}/../../../../artifacts/tmachine-diagnostics/{{ inventory_hostname }}/k3s.txt"
+        dest: "{{ role_path }}/../../../../../artifacts/tmachine-diagnostics/{{ inventory_hostname }}/k3s.txt"
         flat: true
       failed_when: false

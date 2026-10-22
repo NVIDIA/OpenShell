@@ -69,6 +69,22 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # Pod security context for the shared supervisor Deployment, rendered only
+  # when gatewayConfig selects supervisor_topology = "gateway". On OpenShift,
+  # set the user and group IDs to null so the restricted-v2 SCC can assign the
+  # namespace range; ci/values-openshift-scc.yaml does this.
+  podSecurityContext:
+    # -- Require the shared supervisor to run as a non-root user.
+    runAsNonRoot: true
+    # -- UID assigned to the shared supervisor pod.
+    runAsUser: 65534
+    # -- Primary GID assigned to the shared supervisor pod.
+    runAsGroup: 65534
+    # -- fsGroup assigned to the shared supervisor pod.
+    fsGroup: 65534
+    seccompProfile:
+      # -- Seccomp profile applied to the shared supervisor pod.
+      type: RuntimeDefault
   sandboxRuntime:
     # -- Workload boundary TLS listener port.
     boundaryPort: 5500

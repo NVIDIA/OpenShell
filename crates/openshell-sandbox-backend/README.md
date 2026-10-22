@@ -102,6 +102,29 @@ retain generation, session, resource, identity, and provisioning evidence checks
 
 ## Boundary transport establishment
 
-The client connects to the configured Unix socket, TCP, or vsock endpoint. It
-owns TLS peer verification, session bearer authentication, generation checks,
-and reconnection handling for policy discovery and attachment.
+`SandboxTransport` belongs to this backend's runtime descriptor. Core retains
+only operator-registered endpoints; `DelegatedLaunch` converts those endpoints
+into the backend's transport without changing their serialized representation.
+
+The supervisor chooses one `BoundaryTransport` per runtime descriptor and uses
+clones of it for policy discovery and attachment. It dials the descriptor's
+endpoint, uses a backend-supplied `BoundaryTransportConnector` for raw stream
+establishment, or, for `SandboxTransport::RuntimeInitiatedTcp`, accepts the
+connections the sandbox runtime opens. Every stream from every source completes
+the same pinned TLS client handshake before it carries a request; the shared
+client also keeps session bearer authentication, generation checks, and
+reconnection handling.
+
+For runtime-initiated connections, the supervisor authenticates each accepted
+socket before queueing it. Concurrent unauthenticated handshakes are bounded in
+number and duration, and at most two authenticated spares wait for a client, so
+a new connection cannot displace a live channel. The runtime keeps one spare
+open, so reconnects and credential rotation never wait for a new dial.
+
+The new variants leave existing encodings unchanged. Binaries that predate them
+reject runtime-initiated descriptors instead of falling back to another mode.
+
+Runtime-initiated transport supports TCP, protected Unix sockets, and host
+vsock listeners. These share bounded TLS handshakes, the authenticated spare
+queue, and the same generation-pinned runtime identity check. The legacy
+supervisor-dialed transports remain available for existing descriptors.

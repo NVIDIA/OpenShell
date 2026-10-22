@@ -43,7 +43,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::{
     OpenShellService, ServerState,
-    auth::audit::{self, ConnectionSource, RequestOrigin},
+    auth::audit::{self, AuthzDenial, ConnectionSource, RequestOrigin},
     auth::authenticator::{AuthFailureReason, AuthMechanism, Authentication, AuthenticatorChain},
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
@@ -279,7 +279,7 @@ impl MultiplexService {
                     identity.provider == crate::auth::identity::IdentityProvider::Mtls
                         && identity.roles.iter().any(|role| role == "operator")
                 })
-                .zip(certificate_sha256)
+                .zip(certificate_sha256.clone())
                 .map(|(identity, certificate_sha256)| OperatorPrincipal {
                     identity: identity.clone(),
                     certificate_sha256,
@@ -314,8 +314,10 @@ impl MultiplexService {
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         )
+        .with_peer_certificate(certificate_sha256)
         .with_operator(operator)
-        .with_connection_source(source);
+        .with_connection_source(source)
+        .with_logons(self.state.logons.clone());
         let grpc_service =
             GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
@@ -1040,10 +1042,12 @@ pub struct AuthGrpcRouter<S> {
     authz_policy: Option<AuthzPolicy>,
     /// mTLS peer identity extracted from the TLS handshake.
     peer_identity: Option<Identity>,
+    peer_certificate_sha256: Option<String>,
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
     operator: Option<OperatorPrincipal>,
     connection_source: Option<ConnectionSource>,
+    logons: audit::Logons,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -1069,10 +1073,12 @@ impl<S> AuthGrpcRouter<S> {
             authenticator_chain,
             authz_policy,
             peer_identity,
+            peer_certificate_sha256: None,
             mtls_auth_enabled,
             allow_unauthenticated_users,
             operator: None,
             connection_source: None,
+            logons: audit::Logons::default(),
         }
     }
 
@@ -1083,6 +1089,19 @@ impl<S> AuthGrpcRouter<S> {
 
     fn with_connection_source(mut self, source: ConnectionSource) -> Self {
         self.connection_source = Some(source);
+        self
+    }
+
+    /// The fingerprint of the verified client certificate that
+    /// authenticated `peer_identity`.
+    fn with_peer_certificate(mut self, certificate_sha256: Option<String>) -> Self {
+        self.peer_certificate_sha256 = certificate_sha256;
+        self
+    }
+
+    /// Share logon records with the gateway's other connections.
+    fn with_logons(mut self, logons: audit::Logons) -> Self {
+        self.logons = logons;
         self
     }
 }
@@ -1126,6 +1145,8 @@ where
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
         let operator = self.operator.clone();
         let connection_source = self.connection_source;
+        let logons = self.logons.clone();
+        let peer_certificate_sha256 = self.peer_certificate_sha256.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
@@ -1210,50 +1231,60 @@ where
                 // call extract_principal() always find one.
                 unauthenticated_dev_user_principal()
             };
+            let origin = origin(req.headers());
+            audit::emit_logon(
+                &logons,
+                &path,
+                &origin,
+                &principal,
+                req.headers(),
+                peer_certificate_sha256.as_deref(),
+            );
 
-            match principal {
-                Principal::Operator(_) => {
-                    if !crate::auth::method_authz::is_operator_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "operators may not call supervisor, peer, or unknown methods",
-                        )));
-                    }
+            let method_denied = |message: &str| {
+                let denial = if crate::auth::method_authz::lookup(&path).is_some() {
+                    AuthzDenial::MethodNotPermitted
+                } else {
+                    AuthzDenial::UnknownMethod
+                };
+                Some((denial, tonic::Status::permission_denied(message)))
+            };
+            let denial = match principal {
+                Principal::Operator(_)
+                    if !crate::auth::method_authz::is_operator_callable(&path) =>
+                {
+                    method_denied("operators may not call supervisor, peer, or unknown methods")
                 }
-                Principal::User(ref user) => {
-                    if !crate::auth::method_authz::is_user_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "this method requires a sandbox principal",
-                        )));
-                    }
-                    if let Some(ref policy) = authz_policy
-                        && let Err(status) = policy.check(&user.identity, &path)
-                    {
-                        return Ok(status_response(status));
-                    }
+                Principal::User(_) if !crate::auth::method_authz::is_user_callable(&path) => {
+                    method_denied("this method requires a sandbox principal")
                 }
-                Principal::Sandbox(_) => {
-                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "sandbox principals may not call this method",
-                        )));
-                    }
+                Principal::User(ref user) => authz_policy
+                    .as_ref()
+                    .and_then(|policy| policy.check(&user.identity, &path).err())
+                    .map(|rbac| (rbac.denial, rbac.status)),
+                Principal::Sandbox(_)
+                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) =>
+                {
+                    method_denied("sandbox principals may not call this method")
                 }
-                Principal::Peer(_) => {
-                    if !crate::auth::method_authz::is_peer_callable(&path) {
-                        return Ok(status_response(tonic::Status::permission_denied(
-                            "gateway peer principals may not call this method",
-                        )));
-                    }
+                Principal::Peer(_) if !crate::auth::method_authz::is_peer_callable(&path) => {
+                    method_denied("gateway peer principals may not call this method")
                 }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
+                Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => None,
+            };
+            if let Some((denial, status)) = denial {
+                audit::emit_authorization_denial_for(&path, &origin, &principal, denial);
+                return Ok(status_response(status));
             }
 
             req.extensions_mut().insert(principal);
-            inner.ready().await?.call(req).await
+            let call = inner.ready().await?.call(req);
+            audit::with_request(path, origin, call).await
         })
     }
 }
@@ -3295,11 +3326,7 @@ mod tests {
             .expect("the gateway returns the request ID it generated");
 
         assert_eq!(error.code(), tonic::Code::Unauthenticated);
-        let events: Vec<_> = capture
-            .events()
-            .iter()
-            .map(|event| event.to_json().unwrap())
-            .collect();
+        let events = capture.json_events();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0]["src_endpoint"]["ip"], "127.0.0.1");
         assert!(events[0]["src_endpoint"]["port"].as_u64().is_some());
@@ -3311,18 +3338,20 @@ mod tests {
 
     mod auth_router {
         use super::*;
+        use crate::auth::audit::test_support::{
+            PEER_IP, REQUEST_ID, assert_authentication_failure, assert_boundary_finding,
+            assert_denial, assert_logon, assert_redacted, peer,
+        };
         use crate::auth::authenticator::AuthRejection;
         use crate::auth::authenticator::test_support::MockAuthenticator;
         use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::test_support::{sandbox, user};
         use crate::auth::principal::{
             Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
         };
         use http_body_util::Full;
         use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
         use openshell_ocsf::test_support::OcsfCapture;
-        use openshell_ocsf::validation::schema::{
-            load_class_schema, validate_known_fields, validate_required_fields,
-        };
         use serde::Serialize;
         use std::sync::Arc;
         use std::sync::Mutex;
@@ -3379,18 +3408,6 @@ mod tests {
                 .map(|v| v.to_str().unwrap().to_string())
         }
 
-        fn user_principal(subject: &str) -> Principal {
-            Principal::User(UserPrincipal {
-                identity: Identity {
-                    subject: subject.to_string(),
-                    display_name: None,
-                    roles: vec![],
-                    scopes: vec![],
-                    provider: IdentityProvider::Oidc,
-                },
-            })
-        }
-
         fn provider_writer_principal() -> Principal {
             Principal::User(UserPrincipal {
                 identity: Identity {
@@ -3411,16 +3428,6 @@ mod tests {
                 scopes: vec![],
                 provider: IdentityProvider::Mtls,
             }
-        }
-
-        fn sandbox_principal() -> Principal {
-            Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: "sandbox-a".to_string(),
-                source: SandboxIdentitySource::BootstrapJwt {
-                    issuer: "openshell-gateway:test".to_string(),
-                },
-                trust_domain: Some("openshell".to_string()),
-            })
         }
 
         fn operator_principal() -> OperatorPrincipal {
@@ -3482,7 +3489,7 @@ mod tests {
             user.scopes = vec!["openshell:all".into()];
             for principal in [
                 Principal::User(UserPrincipal { identity: user }),
-                sandbox_principal(),
+                sandbox("sandbox-a"),
                 Principal::Peer(crate::auth::principal::PeerPrincipal {
                     replica_id: "replica".into(),
                     pod_uid: "pod".into(),
@@ -3688,7 +3695,7 @@ mod tests {
         #[tokio::test]
         async fn user_principal_lands_in_request_extensions() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-                user_principal("alice"),
+                user("alice"),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
@@ -3707,7 +3714,7 @@ mod tests {
         #[tokio::test]
         async fn sandbox_principal_lands_in_request_extensions() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-                sandbox_principal(),
+                sandbox("sandbox-a"),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
@@ -3726,7 +3733,7 @@ mod tests {
         #[tokio::test]
         async fn sandbox_principal_can_call_allowlisted_method() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-                sandbox_principal(),
+                sandbox("sandbox-a"),
             ))));
             let chain = AuthenticatorChain::new(vec![mock]);
             let (recorder, seen) = PrincipalRecorder::new();
@@ -3837,7 +3844,7 @@ mod tests {
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Authentication::Accepted(
-                    sandbox_principal(),
+                    sandbox("sandbox-a"),
                 ))));
                 let chain = AuthenticatorChain::new(vec![mock]);
                 let (recorder, seen) = PrincipalRecorder::new();
@@ -3848,6 +3855,226 @@ mod tests {
                 assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
                 assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
             }
+        }
+
+        fn assert_authorization_denial(event: &serde_json::Value, operation: &str, reason: &str) {
+            assert_denial(
+                event,
+                &format!("/openshell.v1.OpenShell/{operation}"),
+                reason,
+            );
+            assert_eq!(event["api"]["operation"], operation);
+            assert_eq!(event["api"]["service"]["name"], "openshell.v1.OpenShell");
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_on_admin_method_emits_denial_and_correlated_finding() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let request = Request::builder()
+                .uri("/openshell.v1.OpenShell/CreateProvider")
+                .header("authorization", "Bearer canary-secret-token-9f2c")
+                .header("x-request-id", REQUEST_ID)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+
+            let res = router.call(request).await.unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_authorization_denial(&events[0], "CreateProvider", "method_not_permitted");
+            assert_eq!(
+                events[0]["actor"],
+                serde_json::json!({"user": {"uid": "sandbox-a", "type_id": 99, "type": "Sandbox"}})
+            );
+            assert_eq!(events[0]["severity_id"], 3);
+
+            let finding = &events[1];
+            assert_boundary_finding(&events[0], finding);
+            for event in &events {
+                assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID);
+                assert_redacted(event, "canary-secret-token");
+            }
+        }
+
+        #[tokio::test]
+        async fn user_missing_rbac_role_emits_denial_without_finding() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: false,
+            };
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy));
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "ListSandboxes", "missing_role");
+            assert_eq!(
+                events[0]["actor"],
+                serde_json::json!({"user": {"uid": "alice", "type_id": 1, "type": "User"}})
+            );
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_on_unknown_method_is_denied_without_a_finding() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/SomeFutureMethod"))
+                .await
+                .unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_authorization_denial(&events[0], "SomeFutureMethod", "unknown_method");
+        }
+
+        #[tokio::test]
+        async fn permitted_sandbox_call_emits_no_authorization_event() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_some());
+            assert!(authorization_events(&capture).is_empty());
+        }
+
+        #[tokio::test]
+        async fn peer_and_operator_denials_name_their_principal_type() {
+            for (principal_type, router) in [
+                (
+                    "Admin",
+                    AuthGrpcRouter::with_peer_identity(
+                        PrincipalRecorder::new().0,
+                        None,
+                        None,
+                        None,
+                        true,
+                        false,
+                    )
+                    .with_operator(Some(operator_principal())),
+                ),
+                (
+                    "Gateway Peer",
+                    AuthGrpcRouter::new(
+                        PrincipalRecorder::new().0,
+                        Some(AuthenticatorChain::new(vec![Arc::new(
+                            MockAuthenticator::returning(Ok(Authentication::Accepted(
+                                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                                    replica_id: "gateway-1".to_string(),
+                                    pod_uid: "pod-1".to_string(),
+                                }),
+                            ))),
+                        )])),
+                        None,
+                    ),
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let mut router = router;
+
+                let res = router
+                    .call(empty_request("/openshell.v1.OpenShell/ConnectSupervisor"))
+                    .await
+                    .unwrap();
+
+                assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{principal_type}");
+                let events = authorization_events(&capture);
+                assert_eq!(events.len(), 1, "{principal_type}: {events:?}");
+                assert_authorization_denial(
+                    &events[0],
+                    "ConnectSupervisor",
+                    "method_not_permitted",
+                );
+                assert_eq!(events[0]["actor"]["user"]["type"], principal_type);
+            }
+        }
+
+        /// Calls the sandbox-scope guard for another sandbox, as a handler
+        /// would for a request body naming it.
+        #[derive(Clone)]
+        struct CrossSandboxHandler;
+
+        impl<B: Send + 'static> Service<Request<B>> for CrossSandboxHandler {
+            type Response = Response<tonic::body::Body>;
+            type Error = Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: Request<B>) -> Self::Future {
+                let principal = req.extensions().get::<Principal>().cloned().unwrap();
+                Box::pin(async move {
+                    let status = crate::auth::guard::ensure_sandbox_scope(&principal, "sandbox-b")
+                        .expect_err("another sandbox must be denied");
+                    Ok(status.into_http())
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn handler_denial_is_recorded_against_the_routed_request() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
+            )))]);
+            let mut router = AuthGrpcRouter::new(CrossSandboxHandler, Some(chain), None)
+                .with_connection_source(ConnectionSource::Peer("10.42.0.7:51234".parse().unwrap()));
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert_eq!(grpc_status(&res).as_deref(), Some("7"));
+            let events = authorization_events(&capture);
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_authorization_denial(&events[0], "GetSandboxConfig", "cross_sandbox");
+            assert_eq!(events[0]["src_endpoint"]["ip"], "10.42.0.7");
+            assert_eq!(
+                events[0]["resources"],
+                serde_json::json!([{"uid": "sandbox-b", "type": "sandbox"}])
+            );
+            assert_boundary_finding(&events[0], &events[1]);
         }
 
         #[tokio::test]
@@ -3931,33 +4158,26 @@ mod tests {
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
         }
 
-        fn captured_json(capture: &OcsfCapture) -> Vec<serde_json::Value> {
+        /// Captured events other than authentication events.
+        fn authorization_events(capture: &OcsfCapture) -> Vec<serde_json::Value> {
             capture
-                .events()
-                .iter()
-                .map(|event| event.to_json().unwrap())
+                .json_events()
+                .into_iter()
+                .filter(|event| event["class_uid"] != 3002)
                 .collect()
         }
 
-        fn assert_authentication_failure(
+        /// Assert that `event` is the router's unidentified Authentication
+        /// failure for `reason`, at `severity_id`.
+        fn assert_router_authentication_failure(
             event: &serde_json::Value,
             path: &str,
             reason: &str,
             severity_id: u8,
         ) {
-            let schema = load_class_schema("authentication");
-            validate_required_fields(event, &schema);
-            validate_known_fields(event, &schema);
-            assert_eq!(event["class_uid"], 3002);
-            assert_eq!(event["activity_id"], 1);
-            assert_eq!(event["status_id"], 2);
-            assert_eq!(event["action_id"], 2);
-            assert_eq!(event["disposition_id"], 2);
+            assert_authentication_failure(event, path, reason);
             assert_eq!(event["severity_id"], severity_id);
-            assert_eq!(event["status_detail"], reason);
             assert_eq!(event["user"]["type_id"], 0);
-            assert_eq!(event["service"]["name"], "openshell-gateway");
-            assert_eq!(event["http_request"]["url"]["path"], path);
             assert_eq!(event["metadata"]["product"]["name"], "OpenShell Gateway");
         }
 
@@ -3975,9 +4195,9 @@ mod tests {
             let res = router.call(empty_request(path)).await.unwrap();
 
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
-            let events = captured_json(&capture);
+            let events = capture.json_events();
             assert_eq!(events.len(), 1, "{events:?}");
-            assert_authentication_failure(&events[0], path, "missing_credential", 2);
+            assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
             assert!(events[0].get("auth_protocol_id").is_none());
         }
 
@@ -3993,9 +4213,9 @@ mod tests {
             let res = router.call(empty_request(path)).await.unwrap();
 
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
-            let events = captured_json(&capture);
+            let events = capture.json_events();
             assert_eq!(events.len(), 1, "{events:?}");
-            assert_authentication_failure(&events[0], path, "missing_credential", 2);
+            assert_router_authentication_failure(&events[0], path, "missing_credential", 2);
             assert_eq!(events[0]["auth_protocol_id"], 99);
             assert_eq!(events[0]["auth_protocol"], "mtls");
         }
@@ -4020,11 +4240,11 @@ mod tests {
 
             assert!(seen.lock().unwrap().is_none());
             assert_eq!(grpc_status(&res).as_deref(), Some("16"));
-            let events = captured_json(&capture);
+            let events = capture.json_events();
             assert_eq!(events.len(), 1, "{events:?}");
-            assert_authentication_failure(&events[0], path, "conflicting_credentials", 3);
+            assert_router_authentication_failure(&events[0], path, "conflicting_credentials", 3);
             assert_eq!(events[0]["auth_protocol"], "mtls");
-            assert!(!events[0].to_string().contains("canary-secret-token"));
+            assert_redacted(&events[0], "canary-secret-token");
         }
 
         async fn call_with_rejection(
@@ -4048,7 +4268,7 @@ mod tests {
 
             assert!(seen.lock().unwrap().is_none());
             let status = tonic::Status::from_header_map(res.headers()).expect("grpc status");
-            (status, captured_json(&capture))
+            (status, capture.json_events())
         }
 
         #[tokio::test]
@@ -4071,13 +4291,11 @@ mod tests {
             let status = tonic::Status::from_header_map(res.headers()).expect("grpc status");
             assert_eq!(status.code(), tonic::Code::Unauthenticated);
             assert_eq!(status.message(), "missing authorization header");
-            let events = captured_json(&capture);
+            let events = capture.json_events();
             assert_eq!(events.len(), 1, "{events:?}");
-            assert_authentication_failure(&events[0], path, "invalid_credential", 3);
+            assert_router_authentication_failure(&events[0], path, "invalid_credential", 3);
             assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
         }
-
-        const REQUEST_ID: &str = "6f1c2d3e-4b5a-4c6d-8e7f-9a0b1c2d3e4f";
 
         async fn missing_credential_event(
             source: ConnectionSource,
@@ -4099,22 +4317,18 @@ mod tests {
 
             router.call(request).await.unwrap();
 
-            let mut events = captured_json(&capture);
+            let mut events = capture.json_events();
             assert_eq!(events.len(), 1, "{events:?}");
             events.remove(0)
         }
 
         #[tokio::test]
         async fn authentication_failure_carries_peer_address_and_request_id() {
-            let event = missing_credential_event(
-                ConnectionSource::Peer("203.0.113.7:51234".parse().unwrap()),
-                REQUEST_ID,
-            )
-            .await;
+            let event = missing_credential_event(peer(), REQUEST_ID).await;
 
             assert_eq!(
                 event["src_endpoint"],
-                serde_json::json!({"ip": "203.0.113.7", "port": 51234})
+                serde_json::json!({"ip": PEER_IP, "port": 51234})
             );
             assert_eq!(event["metadata"]["correlation_uid"], REQUEST_ID);
         }
@@ -4127,7 +4341,7 @@ mod tests {
             )
             .await;
 
-            assert_eq!(event["src_endpoint"]["ip"], "203.0.113.7");
+            assert_eq!(event["src_endpoint"]["ip"], PEER_IP);
         }
 
         #[tokio::test]
@@ -4141,7 +4355,7 @@ mod tests {
                 serde_json::json!({"name": "edge-tunnel"})
             );
             assert!(event["metadata"].get("correlation_uid").is_none());
-            assert!(!event.to_string().contains("attacker"));
+            assert_redacted(&event, "attacker");
         }
 
         #[tokio::test]
@@ -4153,9 +4367,9 @@ mod tests {
                 async { Ok::<_, Infallible>(Response::new(tonic::body::Body::empty())) }
             });
             let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
-                Authentication::Accepted(user_principal("alice")),
+                Authentication::Accepted(user("alice")),
             )))]);
-            let source = ConnectionSource::Peer("203.0.113.7:51234".parse().unwrap());
+            let source = peer();
             let mut router =
                 AuthGrpcRouter::new(inner, Some(chain), None).with_connection_source(source);
 
@@ -4183,11 +4397,11 @@ mod tests {
             assert_eq!(status.code(), tonic::Code::Unauthenticated);
             assert_eq!(status.message(), "invalid token: ExpiredSignature");
             assert_eq!(events.len(), 1, "{events:?}");
-            assert_authentication_failure(&events[0], path, "expired_credential", 2);
+            assert_router_authentication_failure(&events[0], path, "expired_credential", 2);
             assert_eq!(events[0]["auth_protocol_id"], 4);
             assert_eq!(events[0]["auth_protocol"], "OpenID");
-            assert!(!events[0].to_string().contains("canary-secret-token"));
-            assert!(!events[0].to_string().contains("ExpiredSignature"));
+            assert_redacted(&events[0], "canary-secret-token");
+            assert_redacted(&events[0], "ExpiredSignature");
         }
 
         #[tokio::test]
@@ -4207,30 +4421,355 @@ mod tests {
 
             assert_eq!(status.code(), tonic::Code::Unauthenticated);
             assert_eq!(events.len(), 1, "{events:?}");
-            assert_authentication_failure(&events[0], path, "stale_identity", 3);
+            assert_router_authentication_failure(&events[0], path, "stale_identity", 3);
             assert_eq!(events[0]["auth_protocol_id"], 99);
             assert_eq!(events[0]["auth_protocol"], "sandbox_jwt");
         }
 
+        fn bearer_request(path: &str, token: &str, request_id: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .uri(path)
+                .header("authorization", format!("Bearer {token}"))
+                .header("x-request-id", request_id)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        }
+
         #[tokio::test]
-        async fn authenticated_and_exempt_requests_emit_no_authentication_event() {
+        async fn credential_logs_on_once_and_exempt_requests_emit_nothing() {
             let capture = OcsfCapture::default();
             let _guard = capture.install();
             let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
-                Authentication::Accepted(user_principal("alice")),
+                Authentication::Accepted(user("alice")),
+            )))]);
+            let (recorder, _) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::new(recorder, Some(chain), None).with_connection_source(peer());
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            for request in [
+                bearer_request(path, "canary-secret-token-9f2c", REQUEST_ID),
+                bearer_request(
+                    path,
+                    "canary-secret-token-9f2c",
+                    "0d9a4c1e-5b6f-4a7d-9e8c-1f2a3b4c5d6e",
+                ),
+                bearer_request(
+                    "/openshell.v1.OpenShell/Health",
+                    "canary-secret-token-9f2c",
+                    REQUEST_ID,
+                ),
+            ] {
+                let res = router.call(request).await.unwrap();
+                assert!(grpc_status(&res).is_none());
+            }
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_logon(&events[0], path);
+            assert_eq!(
+                events[0]["user"],
+                serde_json::json!({"uid": "alice", "type_id": 1, "type": "User"})
+            );
+            assert_eq!(events[0]["auth_protocol_id"], 4);
+            assert_eq!(
+                events[0]["src_endpoint"],
+                serde_json::json!({"ip": PEER_IP, "port": 51234})
+            );
+            assert_eq!(events[0]["metadata"]["correlation_uid"], REQUEST_ID);
+            assert_redacted(&events[0], "canary-secret-token");
+        }
+
+        #[tokio::test]
+        async fn each_new_credential_logs_on() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(sandbox("sandbox-a")),
             )))]);
             let (recorder, _) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/GetSandboxConfig";
 
-            for path in [
-                "/openshell.v1.OpenShell/ListSandboxes",
-                "/openshell.v1.OpenShell/Health",
-            ] {
-                let res = router.call(empty_request(path)).await.unwrap();
-                assert!(grpc_status(&res).is_none(), "{path}");
+            for token in ["first-token", "refreshed-token", "first-token"] {
+                router
+                    .call(bearer_request(path, token, REQUEST_ID))
+                    .await
+                    .unwrap();
             }
 
-            let events = captured_json(&capture);
+            let events = capture.json_events();
+            assert_eq!(events.len(), 2, "{events:?}");
+            for event in &events {
+                assert_logon(event, path);
+                assert_eq!(
+                    event["user"],
+                    serde_json::json!({"uid": "sandbox-a", "type_id": 99, "type": "Sandbox"})
+                );
+                assert_eq!(event["auth_protocol"], "sandbox_jwt");
+            }
+        }
+
+        #[tokio::test]
+        async fn unverified_header_bytes_do_not_make_a_new_logon() {
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+            for (case, router, headers) in [
+                (
+                    "mTLS user with ignored authorization headers",
+                    AuthGrpcRouter::with_peer_identity(
+                        PrincipalRecorder::new().0,
+                        None,
+                        None,
+                        Some(mtls_identity("alice")),
+                        true,
+                        false,
+                    ),
+                    ["Basic first-nonce", "Basic second-nonce"],
+                ),
+                (
+                    "bearer scheme spelled differently",
+                    AuthGrpcRouter::new(
+                        PrincipalRecorder::new().0,
+                        Some(AuthenticatorChain::new(vec![Arc::new(
+                            MockAuthenticator::returning(Ok(Authentication::Accepted(user(
+                                "alice",
+                            )))),
+                        )])),
+                        None,
+                    ),
+                    ["Bearer alice-token", "bEARER alice-token"],
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let mut router = router;
+
+                for authorization in headers {
+                    let request = Request::builder()
+                        .uri(path)
+                        .header("authorization", authorization)
+                        .body(Full::new(Bytes::new()))
+                        .unwrap();
+                    router.call(request).await.unwrap();
+                }
+
+                let events = capture.json_events();
+                assert_eq!(events.len(), 1, "{case}: {events:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn logon_names_the_protocol_that_established_the_principal() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(Ok(
+                Authentication::Accepted(Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "gateway-1".to_string(),
+                    pod_uid: "pod-1".to_string(),
+                })),
+            )))]);
+            let mut router = AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None);
+            let path = "/openshell.v1.OpenShell/PeerRelay";
+
+            router
+                .call(bearer_request(path, "peer-token", REQUEST_ID))
+                .await
+                .unwrap();
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_logon(&events[0], path);
+            assert_eq!(events[0]["user"]["type"], "Gateway Peer");
+            assert_eq!(events[0]["auth_protocol"], "k8s_service_account");
+        }
+
+        #[tokio::test]
+        async fn verified_credentials_log_on_before_a_sandbox_token_method_denies_them() {
+            for path in [
+                "/openshell.v1.OpenShell/IssueSandboxToken",
+                "/openshell.v1.OpenShell/RefreshSandboxToken",
+            ] {
+                for (principal, principal_type) in [
+                    (user("alice"), "User"),
+                    (Principal::Operator(operator_principal()), "Admin"),
+                    (
+                        Principal::Peer(crate::auth::principal::PeerPrincipal {
+                            replica_id: "gateway-1".to_string(),
+                            pod_uid: "pod-1".to_string(),
+                        }),
+                        "Gateway Peer",
+                    ),
+                ] {
+                    let capture = OcsfCapture::default();
+                    let _guard = capture.install();
+                    let chain = AuthenticatorChain::new(vec![Arc::new(
+                        MockAuthenticator::returning(Ok(Authentication::Accepted(principal))),
+                    )]);
+                    let (recorder, seen) = PrincipalRecorder::new();
+                    let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                    let res = router
+                        .call(bearer_request(path, "verified-token", REQUEST_ID))
+                        .await
+                        .unwrap();
+
+                    assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+                    assert!(seen.lock().unwrap().is_none(), "{path}");
+                    let events = capture.json_events();
+                    assert_eq!(events.len(), 2, "{principal_type} {path}: {events:?}");
+                    assert_logon(&events[0], path);
+                    assert_eq!(events[0]["user"]["type"], principal_type);
+                    assert_eq!(events[1]["class_uid"], 6003);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn handlers_that_finish_verification_record_their_own_logon() {
+            for (principal, path) in [
+                (
+                    Principal::Sandbox(SandboxPrincipal {
+                        sandbox_id: "sandbox-a".to_string(),
+                        source: SandboxIdentitySource::ComputeDriver {
+                            driver_name: "kubernetes".to_string(),
+                            runtime_identity: "pod-uid".to_string(),
+                        },
+                        trust_domain: None,
+                    }),
+                    "/openshell.v1.OpenShell/IssueSandboxToken",
+                ),
+                (
+                    Principal::Sandbox(SandboxPrincipal {
+                        sandbox_id: "sandbox-a".to_string(),
+                        source: SandboxIdentitySource::BootstrapJwt {
+                            issuer: "openshell-gateway:test".to_string(),
+                        },
+                        trust_domain: None,
+                    }),
+                    "/openshell.v1.OpenShell/RefreshSandboxToken",
+                ),
+            ] {
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(principal)),
+                ))]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                router
+                    .call(bearer_request(path, "sandbox-token", REQUEST_ID))
+                    .await
+                    .unwrap();
+
+                assert!(seen.lock().unwrap().is_some(), "{path} reached the handler");
+                let events = capture.json_events();
+                assert!(events.is_empty(), "{path}: {events:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn connections_share_logons() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let logons = audit::Logons::default();
+            let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+            for _ in 0..2 {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(user("alice"))),
+                ))]);
+                let mut connection =
+                    AuthGrpcRouter::new(PrincipalRecorder::new().0, Some(chain), None)
+                        .with_logons(logons.clone());
+                connection
+                    .call(bearer_request(path, "alice-token", REQUEST_ID))
+                    .await
+                    .unwrap();
+            }
+
+            let events = capture.json_events();
+            assert_eq!(events.len(), 1, "{events:?}");
+        }
+
+        #[tokio::test]
+        async fn each_certificate_logs_on_once() {
+            // A connection authenticated by the certificate with `fingerprint`,
+            // whose subject is always "alice".
+            let user = |fingerprint: &str, logons: &audit::Logons| {
+                AuthGrpcRouter::with_peer_identity(
+                    PrincipalRecorder::new().0,
+                    None,
+                    None,
+                    Some(mtls_identity("alice")),
+                    true,
+                    false,
+                )
+                .with_peer_certificate(Some(fingerprint.to_string()))
+                .with_logons(logons.clone())
+            };
+            let admin = |fingerprint: &str, logons: &audit::Logons| {
+                AuthGrpcRouter::with_peer_identity(
+                    PrincipalRecorder::new().0,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .with_operator(Some(OperatorPrincipal {
+                    certificate_sha256: fingerprint.to_string(),
+                    ..operator_principal()
+                }))
+                .with_logons(logons.clone())
+            };
+            for principal_type in ["User", "Admin"] {
+                let router = |fingerprint: &str, logons: &audit::Logons| {
+                    if principal_type == "User" {
+                        user(fingerprint, logons)
+                    } else {
+                        admin(fingerprint, logons)
+                    }
+                };
+                let capture = OcsfCapture::default();
+                let _guard = capture.install();
+                let logons = audit::Logons::default();
+                let path = "/openshell.v1.OpenShell/ListSandboxes";
+
+                // Two connections with one certificate, then a renewed
+                // certificate for the same subject.
+                for fingerprint in ["sha256-original", "sha256-original", "sha256-renewed"] {
+                    let mut router = router(fingerprint, &logons);
+                    for _ in 0..2 {
+                        router.call(empty_request(path)).await.unwrap();
+                    }
+                }
+
+                let events = capture.json_events();
+                assert_eq!(events.len(), 2, "{principal_type}: {events:?}");
+                for event in &events {
+                    assert_logon(event, path);
+                    assert_eq!(event["user"]["type"], principal_type);
+                    assert_eq!(event["auth_protocol"], "mtls");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn unauthenticated_dev_user_does_not_log_on() {
+            let capture = OcsfCapture::default();
+            let _guard = capture.install();
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, true);
+
+            router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_some());
+            let events = capture.json_events();
             assert!(events.is_empty(), "{events:?}");
         }
 

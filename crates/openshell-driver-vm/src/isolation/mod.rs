@@ -100,9 +100,23 @@ impl VmBoundarySpec {
                 auth_epoch: self.auth_epoch,
                 gateway_id: self.gateway_id,
                 verification_keys: self.verification_keys,
-                listener: BoundaryListener::Vsock {
-                    control_port: self.control_port,
-                    tls: self.sandbox_tls,
+                listener: match &self.transport {
+                    SandboxTransport::RuntimeInitiatedVsock { port, .. } => {
+                        BoundaryListener::RuntimeInitiatedVsock {
+                            host_port: *port,
+                            tls: self.sandbox_tls,
+                        }
+                    }
+                    SandboxTransport::RuntimeInitiatedUnix { .. } => {
+                        BoundaryListener::RuntimeInitiatedVsock {
+                            host_port: self.control_port,
+                            tls: self.sandbox_tls,
+                        }
+                    }
+                    _ => BoundaryListener::Vsock {
+                        control_port: self.control_port,
+                        tls: self.sandbox_tls,
+                    },
                 },
                 resource_claims: resource_claims.clone(),
                 resource_claim_files: BTreeMap::new(),

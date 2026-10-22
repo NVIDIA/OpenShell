@@ -1636,14 +1636,20 @@ impl VmDriver {
             trust_anchor_pem: channel_tls.trust_anchor_pem.clone(),
         };
         let transport = if plan.backend == VmBackend::Qemu {
-            SandboxTransport::Vsock {
-                guest_cid: plan.vsock_cid.ok_or_else(|| {
-                    Status::internal("QEMU launch plan is missing a guest vsock CID")
-                })?,
-                port: VM_CONTROL_PORT,
+            let guest_cid = plan
+                .vsock_cid
+                .ok_or_else(|| Status::internal("QEMU launch plan is missing a guest vsock CID"))?;
+            SandboxTransport::RuntimeInitiatedVsock {
+                guest_cid,
+                // Each QEMU guest connects to a distinct host port. The CID
+                // allocator already guarantees uniqueness among live guests.
+                port: VM_CONTROL_PORT
+                    .checked_add(guest_cid)
+                    .filter(|port| *port != u32::MAX)
+                    .ok_or_else(|| Status::resource_exhausted("VM control port space exhausted"))?,
             }
         } else {
-            SandboxTransport::Unix {
+            SandboxTransport::RuntimeInitiatedUnix {
                 socket_path: control_socket.clone(),
             }
         };
@@ -1733,6 +1739,7 @@ impl VmDriver {
         } else {
             let _ = tokio::fs::remove_file(&control_socket).await;
             command
+                .arg("--vm-vsock-runtime-initiated")
                 .arg("--vm-vsock-control-port")
                 .arg(VM_CONTROL_PORT.to_string())
                 .arg("--vm-vsock-control-socket")
@@ -7118,7 +7125,10 @@ fn inject_guest_boundary_bundle(
     let tls = match &config.listener {
         BoundaryListener::Unix { tls, .. }
         | BoundaryListener::TlsTcp { tls, .. }
-        | BoundaryListener::Vsock { tls, .. } => tls.clone(),
+        | BoundaryListener::Vsock { tls, .. }
+        | BoundaryListener::RuntimeInitiatedTlsTcp { tls, .. }
+        | BoundaryListener::RuntimeInitiatedUnix { tls, .. }
+        | BoundaryListener::RuntimeInitiatedVsock { tls, .. } => tls.clone(),
     };
     let encoded_config = config
         .encode()

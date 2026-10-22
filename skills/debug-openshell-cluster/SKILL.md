@@ -339,6 +339,13 @@ Common findings:
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
 - A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: inspect supervisor and backend logs for policy rejection, network-mediation initialization, protected-channel setup, or listener failures. A backend that cannot enforce the admitted policy must reject it before starting workload code.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
+- New Docker and Podman sandboxes dial the supervisor over a separate private
+  Unix socket volume; the workload keeps `network=none`. Check both containers'
+  mounts and socket-directory ownership if attachment times out. Existing
+  containers retain their saved legacy transport through restart. New VM
+  generations dial host CID 2 over vsock; libkrun forwards to a protected host
+  Unix socket, while QEMU uses a per-guest host port. Keep supervisor and runtime
+  binaries compatible when creating new generations.
 - Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
@@ -1014,10 +1021,50 @@ per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
 Pod before releasing either Pod. The supervisor Pod runs
 `/openshell-supervisor`. Both Pods use the
 same resolved non-root identity, request no capabilities, drop `ALL`, disable
-privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
-the sandbox over per-sandbox TLS with server-certificate verification plus
-bootstrap-token client authentication, and owns gateway policy, provider
-credentials, DNS, and mediated upstream connections.
+privilege escalation, and use `RuntimeDefault` seccomp. The supervisor and
+sandbox talk over per-sandbox TLS with server-certificate verification plus
+bootstrap-token client authentication; the supervisor owns gateway policy,
+provider credentials, DNS, and mediated upstream connections.
+
+Each sandbox records which side opens that connection in the Sandbox annotation
+`openshell.ai/sandbox-runtime-control-connection`, bound to
+`openshell.ai/sandbox-runtime-control-generation`. A missing marker or a
+different current runtime generation means
+`supervisor-initiated`: the `os-boundary-<id>` Service selects the workload Pod
+and the supervisor dials it. With `runtime-initiated` (used for new
+generations), a separate `os-supervisor-<id>` Service selects the supervisor Pod, the sandbox runtime dials
+it, and a per-sandbox NetworkPolicy `os-control-<id>` admits only that
+connection at both the workload (egress) and the supervisor (ingress). The
+Service publishes the supervisor before it is Ready, because readiness follows
+the runtime's attach. If the runtime logs `cannot reach the supervisor`, check
+that the CNI applied both directions of `os-control-<id>`.
+Stop/start upgrades legacy sandboxes to runtime-initiated control, as does
+gateway recovery that recreates both Pods. Existing running generations keep
+their current connection until replaced. Check the mode first when a sandbox
+never becomes ready, especially after changing images:
+
+```bash
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> \
+  -o jsonpath='{.metadata.annotations.openshell\.ai/sandbox-runtime-control-connection}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-boundary-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-supervisor-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get networkpolicy os-control-<sandbox-id> -o yaml
+```
+
+A `runtime-initiated` sandbox needs a gateway, supervisor image, and sandbox
+runtime image that all support the mode. An older supervisor or runtime fails
+to decode its launch descriptor, so the sandbox cannot start or restart.
+Old gateways can restart sandboxes by creating their own compatible pair;
+`os-boundary-<id>` always keeps its workload selector. New gateways also create
+it for new sandboxes, alongside the supervisor Service. Upgrade the images
+together within each generation. There is no legacy rollout flag.
+Adding the supervisor endpoint on restart requires `create` and `get` on
+Services in the sandbox namespace. For a `Forbidden` restart error, check the
+gateway ServiceAccount with `kubectl auth can-i create services --namespace
+<sandbox-namespace> --as system:serviceaccount:<gateway-namespace>:<gateway-service-account>`.
+Do not edit the annotation, Service selector, or `os-control-<id>` policy:
+reconciliation suspends a sandbox whose Service or control policy no longer
+matches its recorded mode.
 
 The supervisor loads its startup configuration through the polling RPCs and
 opens `ConnectSupervisor` once the workload runs. When the gateway runs with
@@ -1232,7 +1279,8 @@ credential failures.
 | One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
 | Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
-| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
+| OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |

@@ -153,11 +153,7 @@ async fn emits_one_disclosure_event_per_attempt_without_values() {
     .await
     .unwrap_err();
 
-    let events: Vec<_> = capture
-        .events()
-        .iter()
-        .map(|event| event.to_json().unwrap())
-        .collect();
+    let events = crate::auth::audit::test_support::disclosure_events(&capture);
     assert_eq!(events.len(), 3, "{events:?}");
     let outcomes: Vec<_> = events
         .iter()

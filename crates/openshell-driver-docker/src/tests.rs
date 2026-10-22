@@ -2056,7 +2056,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
         .mounts
         .expect("driver config mounts should be set");
 
-    assert_eq!(mounts.len(), 3);
+    assert_eq!(mounts.len(), 4);
     assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
     assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
@@ -3224,6 +3224,15 @@ fn docker_supervisor_leaves_named_gateway_hosts_to_dns() {
         docker_supervisor_host_address("https://gateway.example.com:17670"),
         None
     );
+}
+
+#[test]
+fn docker_supervisor_healthcheck_probes_fast_only_during_startup() {
+    let health = docker_supervisor_healthcheck();
+
+    assert_eq!(health.start_interval, Some(250_000_000));
+    assert_eq!(health.interval, Some(30_000_000_000));
+    assert_eq!(health.start_period, Some(60_000_000_000));
 }
 
 #[test]

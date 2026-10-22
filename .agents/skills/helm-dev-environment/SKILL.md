@@ -57,6 +57,27 @@ Override with env vars before running `helm:k3s:create`:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
 
+### Shared supervisor plumbing
+
+Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`
+using a values file (the table key is literally `openshell.drivers.kubernetes`):
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+```
+
+The gateway chart creates a separate, single-replica shared-host placeholder Deployment
+in the release namespace, regardless of shared/managed/operator workspace mode.
+Use a supervisor image built from this branch: `--mode=shared` is new.
+The chart sets `--gateway-endpoint` from the gateway's gRPC endpoint and
+`--address` to `0.0.0.0:5501`. Check its rollout and TCP health probes on this
+listener (container port `supervisor`, 5501). The outbound gateway connection and
+session RPCs are not implemented yet; sandboxes
+still use dedicated supervisors. `workspace` is reserved and rejected. Omit the
+field to disable it.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):
@@ -81,7 +102,16 @@ The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
 and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
-workload Pod. The
+workload Pod. New sandbox generations use `runtime-initiated` control: the sandbox
+runtime dials its supervisor through `os-supervisor-<id>`. The legacy
+`os-boundary-<id>` Service keeps selecting the workload for old gateways during
+rolling upgrades. New gateways create both Services and bind the control-mode
+annotation to its runtime generation. The driver adds a per-sandbox
+`os-control-<id>` NetworkPolicy for that path only. Existing running generations
+keep their connection until replaced; stop/start and gateway recovery that
+recreates both Pods upgrade legacy generations automatically. Use compatible
+gateway, supervisor, and sandbox runtime images together; there is no legacy
+rollout flag. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
 generates gateway and CLI TLS secrets on first install. Supervisor Pods project
 only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User

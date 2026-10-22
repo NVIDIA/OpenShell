@@ -124,6 +124,37 @@ impl Principal {
     }
 }
 
+/// Principals for tests.
+#[cfg(test)]
+pub mod test_support {
+    use super::{Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use crate::auth::identity::{Identity, IdentityProvider};
+
+    /// An OIDC user with no roles or scopes.
+    pub fn user(subject: &str) -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    /// A sandbox holding a gateway JWT.
+    pub fn sandbox(sandbox_id: &str) -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

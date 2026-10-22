@@ -18,10 +18,20 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer as _, layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
 mod logging;
+mod shared;
 
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 const HEALTH_SUBCOMMAND: &str = "health";
 const SERVICE_NAME: &str = "openshell-supervisor";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum SupervisorMode {
+    /// Supervise a single sandbox generation.
+    #[default]
+    Dedicated,
+    /// Host sandbox supervision sessions in a shared process.
+    Shared,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 enum SupervisorRole {
@@ -46,6 +56,18 @@ struct HealthArgs {
 #[command(about = "OpenShell policy and workload supervisor")]
 #[allow(clippy::struct_excessive_bools)]
 struct Args {
+    /// Supervisor deployment mode.
+    #[arg(long, value_enum, default_value_t)]
+    mode: SupervisorMode,
+
+    /// Gateway endpoint for the shared supervisor's outbound connection.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    gateway_endpoint: Option<String>,
+
+    /// Shared supervisor listen address, also used for TCP health probes.
+    #[arg(long, required_if_eq("mode", "shared"))]
+    address: Option<std::net::SocketAddr>,
+
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
     role: SupervisorRole,
@@ -366,6 +388,21 @@ fn main() -> Result<()> {
     }
 
     let args = Args::parse();
+    if args.mode == SupervisorMode::Shared {
+        let address = args
+            .address
+            .ok_or_else(|| miette::miette!("--address is required for --mode=shared"))?;
+        let gateway_endpoint = args
+            .gateway_endpoint
+            .as_deref()
+            .ok_or_else(|| miette::miette!("--gateway-endpoint is required for --mode=shared"))?;
+        return shared::run(address, gateway_endpoint);
+    }
+    if args.gateway_endpoint.is_some() || args.address.is_some() {
+        return Err(miette::miette!(
+            "--gateway-endpoint and --address require --mode=shared"
+        ));
+    }
     validate_role_arguments(&args)?;
     arm_parent_liveness(args.parent_liveness_stdin)?;
     validate_main_exit_marker(args.main_exit_marker.as_deref())?;
