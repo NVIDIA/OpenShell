@@ -838,6 +838,11 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
+With `gatewayConfig.openshell.gateway.spiffe_delegation`, the gateway brokers
+provider tokens for shared-supervisor sandboxes using the SPIRE admin socket.
+Check that config table and the gateway's `spire-agent-admin` mount; the shared
+supervisor receives final access tokens and does not mount the SPIRE socket.
+
 If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
 is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
 mount the `sandbox-jwt` Secret.

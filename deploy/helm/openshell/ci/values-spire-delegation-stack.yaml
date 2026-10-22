@@ -18,7 +18,7 @@ spire-server:
 spire-agent:
   # The agent keeps root for workload attestation but creates its admin
   # socket (mode 0770) with this group, which only the gateway
-  # joins (experimental_spiffe_delegation.admin_socket_group).
+  # joins (spiffe_delegation.admin_socket_group).
   podSecurityContext:
     runAsUser: 0
     runAsGroup: 10035

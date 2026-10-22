@@ -649,12 +649,9 @@ fn prepare_server_config_with_drivers(
     // the generated TLS bundle so upgrades pick up sandbox auth without a
     // user-authored config file.
     config.gateway_jwt = gateway_jwt;
-    config.experimental_spiffe_delegation = file.as_ref().and_then(|file| {
-        file.openshell
-            .gateway
-            .experimental_spiffe_delegation
-            .clone()
-    });
+    config.spiffe_delegation = file
+        .as_ref()
+        .and_then(|file| file.openshell.gateway.spiffe_delegation.clone());
 
     // Reject invalid delegation before startup; gateway state parses it later.
     crate::spiffe_delegation::SpiffeDelegation::validate_config(&config)

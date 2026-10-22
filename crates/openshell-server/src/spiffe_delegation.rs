@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! SPIRE delegated issuance owned by the gateway, never by a supervisor or sandbox.
-use openshell_core::config::{Config, ExperimentalSpiffeDelegationConfig};
+use openshell_core::config::{Config, SpiffeDelegationConfig};
 use openshell_core::spiffe::SandboxSpiffeIdPrefix;
 use openshell_core::token_grant_failure::{
     TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
@@ -31,7 +31,7 @@ impl SpiffeDelegation {
     /// # Errors
     ///
     /// Rejects delegation without gateway session JWTs and a positive session
-    /// TTL, and settings [`ExperimentalSpiffeDelegationConfig::validate`]
+    /// TTL, and settings [`SpiffeDelegationConfig::validate`]
     /// rejects.
     pub fn validate_config(config: &Config) -> Result<(), String> {
         enabled(config).map(drop)
@@ -49,11 +49,11 @@ impl SpiffeDelegation {
     }
 
     /// Parse `config`, already validated for the gateway `gateway_id`.
-    fn new(config: &ExperimentalSpiffeDelegationConfig, gateway_id: &str) -> Result<Self, String> {
+    fn new(config: &SpiffeDelegationConfig, gateway_id: &str) -> Result<Self, String> {
         let prefix = SandboxSpiffeIdPrefix::parse(&config.spiffe_id_prefix)?;
         let trust_domain = openshell_core::spiffe::trust_domain(prefix.as_str())
             .and_then(|name| spiffe::TrustDomain::new(name).ok())
-            .ok_or("experimental_spiffe_delegation prefix has no valid trust domain")?;
+            .ok_or("spiffe_delegation prefix has no valid trust domain")?;
         Ok(Self {
             admin_socket: PathBuf::from(&config.admin_socket_path),
             prefix,
@@ -113,19 +113,17 @@ impl SpiffeDelegation {
 }
 
 /// Validated delegation settings and gateway ID, when delegation is enabled.
-fn enabled(config: &Config) -> Result<Option<(&ExperimentalSpiffeDelegationConfig, &str)>, String> {
-    let Some(delegation) = &config.experimental_spiffe_delegation else {
+fn enabled(config: &Config) -> Result<Option<(&SpiffeDelegationConfig, &str)>, String> {
+    let Some(delegation) = &config.spiffe_delegation else {
         return Ok(None);
     };
     let jwt = config
         .gateway_jwt
         .as_ref()
-        .ok_or("experimental_spiffe_delegation requires gateway session JWTs")?;
+        .ok_or("spiffe_delegation requires gateway session JWTs")?;
     delegation.validate(&jwt.gateway_id)?;
     if jwt.ttl_secs.is_none() {
-        return Err(
-            "experimental_spiffe_delegation requires a positive gateway_jwt.ttl_secs".into(),
-        );
+        return Err("spiffe_delegation requires a positive gateway_jwt.ttl_secs".into());
     }
     Ok(Some((delegation, &jwt.gateway_id)))
 }
@@ -342,7 +340,7 @@ mod tests {
     #[ignore = "requires the real SPIRE fixture; run mise run test:spire-delegation"]
     async fn gateway_obtains_only_the_expected_sandbox_identity() {
         let env = |key| std::env::var(key).expect("SPIRE fixture variable");
-        let config = ExperimentalSpiffeDelegationConfig {
+        let config = SpiffeDelegationConfig {
             admin_socket_path: env("OPENSHELL_TEST_SPIRE_ADMIN_SOCKET"),
             spiffe_id_prefix: env("OPENSHELL_TEST_SPIRE_ID_PREFIX"),
             admin_socket_group: None,

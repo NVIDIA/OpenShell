@@ -129,7 +129,7 @@ tests:
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
-        openshell.gateway.experimental_spiffe_delegation:
+        openshell.gateway.spiffe_delegation:
           admin_socket_path: /run/spire/admin/admin.sock
           spiffe_id_prefix: spiffe://example.org/openshell
           admin_socket_group: 10035
