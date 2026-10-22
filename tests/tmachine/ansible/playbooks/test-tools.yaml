@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+---
+# Tools the testkit suites run on the machine itself, next to cargo-nextest.
+# The file-transfer suite builds a Git repository there to check that upload
+# honors .gitignore.
+- name: Install test tools
+  hosts: all
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Wait for SSH
+      ansible.builtin.wait_for_connection:
+
+    - name: Install Git
+      ansible.builtin.package:
+        name: git
+        state: present
