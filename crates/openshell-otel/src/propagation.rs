@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use http::HeaderMap;
+use opentelemetry::Context;
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -112,18 +113,18 @@ pub fn current_trace_context_environment() -> Vec<(&'static str, String)> {
 
 /// Parent `span` under the trace context in `TRACEPARENT` and `TRACESTATE`.
 ///
+/// Reads the environment the same way [`EnvTraceContextInterceptor`] does:
+/// both spellings are accepted, whitespace is trimmed, and blank values are
+/// treated as unset.
+///
 /// Leaves `span` unchanged when the environment carries no valid context.
 pub fn set_parent_from_environment(span: &tracing::Span) {
     let carrier = [
-        ("traceparent", TRACEPARENT_ENV),
-        ("tracestate", TRACESTATE_ENV),
+        ("traceparent", read_env(TRACEPARENT_ENV)),
+        ("tracestate", read_env(TRACESTATE_ENV)),
     ]
     .into_iter()
-    .filter_map(|(field, name)| {
-        std::env::var(name)
-            .ok()
-            .map(|value| (field.to_string(), value))
-    })
+    .filter_map(|(field, value)| value.map(|value| (field.to_string(), value)))
     .collect::<BTreeMap<_, _>>();
     set_parent_from_carrier(span, &carrier);
 }
@@ -167,9 +168,124 @@ impl tonic::service::Interceptor for TraceContextInterceptor {
     }
 }
 
+/// Reads W3C trace-context propagation fields from process environment
+/// variables (`TRACEPARENT` and `TRACESTATE`).
+///
+/// CI systems (GitHub Actions, GitLab CI, Jenkins OpenTelemetry plugins)
+/// export these variables to propagate the pipeline trace to child processes.
+/// Both upper-case and lower-case spellings are accepted; blank values are
+/// treated as unset.
+#[derive(Debug, Clone, Default)]
+struct EnvTraceContext {
+    traceparent: Option<String>,
+    tracestate: Option<String>,
+}
+
+impl EnvTraceContext {
+    fn from_env() -> Self {
+        Self {
+            traceparent: read_env(TRACEPARENT_ENV),
+            tracestate: read_env(TRACESTATE_ENV),
+        }
+    }
+}
+
+/// Read one environment variable, trimming whitespace and discarding blanks.
+fn read_one(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Read an environment variable by its upper-case name, falling back to the
+/// lower-case spelling, trimming whitespace and discarding blank values.
+///
+/// Each spelling is normalized before the fallback, so a blank upper-case
+/// value never shadows a valid lower-case one.
+fn read_env(upper: &str) -> Option<String> {
+    read_one(upper).or_else(|| read_one(&upper.to_ascii_lowercase()))
+}
+
+impl Extractor for EnvTraceContext {
+    fn get(&self, key: &str) -> Option<&str> {
+        match key {
+            "traceparent" => self.traceparent.as_deref(),
+            "tracestate" => self.tracestate.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        let mut keys = Vec::new();
+        if self.traceparent.is_some() {
+            keys.push("traceparent");
+        }
+        if self.tracestate.is_some() {
+            keys.push("tracestate");
+        }
+        keys
+    }
+}
+
+/// Passively forwards a W3C trace context captured from the process
+/// environment onto outbound tonic requests.
+///
+/// Unlike [`TraceContextInterceptor`], this does not require an active
+/// OpenTelemetry span or an `SdkTracerProvider`; it reads `TRACEPARENT`
+/// (and optionally `TRACESTATE`) once at construction and injects them as
+/// gRPC metadata. This lets short-lived clients (e.g. the CLI on a CI runner)
+/// extend a pipeline trace to the gateway without any collector configuration.
+///
+/// When `TRACEPARENT` is unset or invalid the captured context carries no
+/// valid span, so injection is a no-op.
+#[derive(Debug, Clone)]
+pub struct EnvTraceContextInterceptor {
+    context: Context,
+}
+
+impl EnvTraceContextInterceptor {
+    /// Capture the W3C trace context from the process environment.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let env = EnvTraceContext::from_env();
+        let context = context_from(&env);
+        if env.traceparent.is_some() && !span_context_is_valid(&context) {
+            tracing::debug!("TRACEPARENT is set but invalid; not forwarding trace context");
+        }
+        Self { context }
+    }
+}
+
+/// Extract a [`Context`] from an [`Extractor`] using a fresh base context, so
+/// the result depends only on the extractor and not on any ambient context.
+fn context_from(extractor: &impl Extractor) -> Context {
+    TraceContextPropagator::new().extract_with_context(&Context::new(), extractor)
+}
+
+fn span_context_is_valid(context: &Context) -> bool {
+    use opentelemetry::trace::TraceContextExt as _;
+
+    context.span().span_context().is_valid()
+}
+
+impl tonic::service::Interceptor for EnvTraceContextInterceptor {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        TraceContextPropagator::new().inject_context(
+            &self.context,
+            &mut MetadataMapInjector::new(request.metadata_mut()),
+        );
+        Ok(request)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tonic::service::Interceptor as _;
 
     fn env_test_exporter() -> (
         opentelemetry_sdk::trace::SdkTracerProvider,
@@ -319,5 +435,125 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("value")
         );
+    }
+
+    fn interceptor_with(extractor: EnvTraceContext) -> EnvTraceContextInterceptor {
+        EnvTraceContextInterceptor {
+            context: context_from(&extractor),
+        }
+    }
+
+    fn snapshot_env(names: &[&'static str]) -> Vec<(&'static str, Option<String>)> {
+        names
+            .iter()
+            .map(|name| (*name, std::env::var(name).ok()))
+            .collect()
+    }
+
+    #[allow(unsafe_code)]
+    fn restore_env(saved: &[(&'static str, Option<String>)]) {
+        for (name, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn env_trace_context_from_env_reads_both_spellings_and_skips_blanks() {
+        let _tracing_lock = crate::test_lock();
+        let saved = snapshot_env(&[TRACEPARENT_ENV, "traceparent", TRACESTATE_ENV, "tracestate"]);
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+        // Upper-case spelling with surrounding whitespace.
+        unsafe {
+            std::env::set_var(TRACEPARENT_ENV, format!("  {traceparent}  "));
+            std::env::set_var(TRACESTATE_ENV, " vendor=value ");
+        }
+        let padded = EnvTraceContext::from_env();
+        assert_eq!(padded.traceparent.as_deref(), Some(traceparent));
+        assert_eq!(padded.tracestate.as_deref(), Some("vendor=value"));
+
+        // Lower-case-only spelling.
+        unsafe {
+            std::env::remove_var(TRACEPARENT_ENV);
+            std::env::remove_var(TRACESTATE_ENV);
+            std::env::set_var("traceparent", traceparent);
+            std::env::set_var("tracestate", "vendor=value");
+        }
+        let lower = EnvTraceContext::from_env();
+        assert_eq!(lower.traceparent.as_deref(), Some(traceparent));
+        assert_eq!(lower.tracestate.as_deref(), Some("vendor=value"));
+
+        // A blank upper-case value must not shadow a valid lower-case one.
+        unsafe {
+            std::env::set_var(TRACEPARENT_ENV, "   ");
+            std::env::remove_var("tracestate");
+        }
+        let shadowed = EnvTraceContext::from_env();
+        assert_eq!(shadowed.traceparent.as_deref(), Some(traceparent));
+        assert_eq!(shadowed.tracestate, None);
+
+        // Blank values in both spellings are treated as unset.
+        unsafe {
+            std::env::set_var("traceparent", "");
+        }
+        let blank = EnvTraceContext::from_env();
+        assert_eq!(blank.traceparent, None);
+
+        restore_env(&saved);
+    }
+
+    #[test]
+    fn env_interceptor_forwards_valid_traceparent() {
+        let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let mut interceptor = interceptor_with(EnvTraceContext {
+            traceparent: Some(traceparent.to_string()),
+            tracestate: Some("vendor=value".to_string()),
+        });
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+        assert_eq!(
+            request
+                .metadata()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok()),
+            Some(traceparent)
+        );
+        assert_eq!(
+            request
+                .metadata()
+                .get("tracestate")
+                .and_then(|value| value.to_str().ok()),
+            Some("vendor=value")
+        );
+    }
+
+    #[test]
+    fn env_interceptor_is_noop_without_traceparent() {
+        let mut interceptor = interceptor_with(EnvTraceContext::default());
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+        assert!(request.metadata().get("traceparent").is_none());
+        assert!(request.metadata().get("tracestate").is_none());
+    }
+
+    #[test]
+    fn env_interceptor_is_noop_for_invalid_traceparent() {
+        let mut interceptor = interceptor_with(EnvTraceContext {
+            traceparent: Some("not-a-valid-traceparent".to_string()),
+            tracestate: Some("vendor=value".to_string()),
+        });
+
+        let request = interceptor.call(tonic::Request::new(())).unwrap();
+
+        assert!(request.metadata().get("traceparent").is_none());
+        assert!(request.metadata().get("tracestate").is_none());
     }
 }
