@@ -12,11 +12,12 @@
 The registry parser is importable by other tools. Repository roles and review
 engagement are inputs to routing, rather than fields in REVIEWERS.md.
 
-Preview with --repo OWNER/REPO --pr NUMBER --state-file STATE.json. Add --apply
-to synchronize requests. Persist the state file across runs, isolated per PR,
-and serialize updates for that PR. It records only requests this tool created;
-without prior state, existing requests are treated as manual. Both ready-for-
-review and label-change callers use the same current-state reconciliation.
+Preview with --repo OWNER/REPO --pr NUMBER. Add --apply to synchronize requests.
+Each run reads the PR's current requests, request/removal timeline, comments,
+and reviews. Human choices and engaged reviewers are preserved; other requests
+follow the current area/topic labels. Requests with unknown provenance are
+preserved too. No state is stored between runs. Serialize updates for each PR.
+Both ready-for-review and label-change callers use the same reconciliation.
 
 Read this helper and REVIEWERS.md from a trusted merged ref. The CLI uses gh
 authentication, checks current write access, and paginates all engagement feeds.
@@ -73,7 +74,7 @@ class ReviewPlan:
     remove: tuple[str, ...] = ()
     keep: tuple[str, ...] = ()
     engaged: tuple[str, ...] = ()
-    managed_reviewers: tuple[str, ...] = ()
+    manual: tuple[str, ...] = ()
     ineligible: tuple[str, ...] = ()
 
 
@@ -270,6 +271,42 @@ def engaged_reviewers(*feeds: list[dict]) -> set[str]:
     }
 
 
+def manual_reviewers(events: list[dict], requested: set[str]) -> set[str]:
+    """Reconstruct human choices from a complete review-request timeline.
+
+    Bot actors identify automated changes. A human request stays protected
+    through repeated requests until it is removed. Human removals also stay
+    protected, so a later label change does not immediately re-request them.
+    Unknown actors and current requests with missing history are preserved.
+    Team events do not affect individual requests.
+    """
+    active, manual = set(), set()
+    changes = [
+        event
+        for event in events
+        if event.get("event") in {"review_requested", "review_request_removed"}
+    ]
+    for event in sorted(changes, key=lambda entry: entry["id"]):
+        login = (event.get("requested_reviewer") or {}).get("login")
+        if not login:
+            continue
+        login = login.lower()
+        automated = (event.get("actor") or {}).get("type") == "Bot"
+        if event["event"] == "review_requested":
+            if login not in active:
+                manual.discard(login)
+            active.add(login)
+            if not automated:
+                manual.add(login)
+        else:
+            active.discard(login)
+            if automated:
+                manual.discard(login)
+            else:
+                manual.add(login)
+    return manual | ({login.lower() for login in requested} - active)
+
+
 def plan_review_requests(
     categories: tuple[Category, ...],
     *,
@@ -277,17 +314,17 @@ def plan_review_requests(
     requested: set[str],
     engaged: set[str],
     eligible: set[str],
-    managed: set[str],
+    manual: set[str],
 ) -> ReviewPlan:
     """Compute requests without IO; callers supply complete, current snapshots.
 
     Select all eligible matching members except the author. Never re-request
-    participants or remove an engaged reviewer. Only obsolete requests present
-    in `managed` may be removed; all other requests remain human-owned.
+    participants or change a manually managed or engaged reviewer's state.
+    Other pending requests follow the current label selection.
     """
     requested = {login.lower() for login in requested}
     engaged = {login.lower() for login in engaged}
-    managed = {login.lower() for login in managed}
+    manual = {login.lower() for login in manual}
     if pull_request.get("state") != "open" or pull_request.get("draft", False):
         return ReviewPlan(False, "PR is closed or draft", keep=tuple(sorted(requested)))
     author = pull_request["user"]["login"].lower()
@@ -303,10 +340,9 @@ def plan_review_requests(
     }
     if not selected & area_members:
         raise ReadinessError("primary area has no eligible non-author reviewer")
-    add = selected - requested - engaged
-    remove = (requested & managed) - selected - engaged
+    add = selected - requested - engaged - manual
+    remove = requested - selected - engaged - manual
     keep = requested - remove
-    owners = ((managed & keep) | add) - {author}
     return ReviewPlan(
         True,
         "PR is ready for review routing",
@@ -315,7 +351,7 @@ def plan_review_requests(
         tuple(sorted(remove)),
         tuple(sorted(keep)),
         tuple(sorted(engaged)),
-        tuple(sorted(owners)),
+        tuple(sorted(manual)),
         tuple(sorted(matched - selected)),
     )
 
@@ -358,10 +394,13 @@ def _load_context(repository: str, number: int) -> dict:
     reviews = _api(f"{pull}/reviews?per_page=100", pages=True)
     comments = _api(f"{root}/issues/{number}/comments?per_page=100", pages=True)
     inline = _api(f"{pull}/comments?per_page=100", pages=True)
+    timeline = _api(f"{root}/issues/{number}/timeline?per_page=100", pages=True)
+    requested = {user["login"].lower() for user in request_pages}
     return {
         "pull_request": pr,
-        "requested": {user["login"].lower() for user in request_pages},
+        "requested": requested,
         "engaged": engaged_reviewers(reviews, comments, inline),
+        "manual": manual_reviewers(timeline, requested),
     }
 
 
@@ -372,37 +411,6 @@ def _eligible_reviewers(repository: str, logins: set[str]) -> set[str]:
         if value.get("permission") in {"write", "maintain", "admin"}:
             eligible.add(login)
     return eligible
-
-
-def _read_managed(path: Path | None, repository: str, number: int) -> set[str]:
-    if path is None or not path.exists():
-        return set()
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if (
-        not isinstance(value, dict)
-        or value.get("schema_version") != 1
-        or value.get("repository") != repository
-        or value.get("pull_number") != number
-        or not isinstance(value.get("managed_reviewers"), list)
-        or not all(
-            isinstance(login, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", login)
-            for login in value["managed_reviewers"]
-        )
-    ):
-        raise ReadinessError("managed-request state does not match this repository/PR")
-    return {login.lower() for login in value["managed_reviewers"]}
-
-
-def _write_managed(path: Path, repository: str, number: int, logins: set[str]):
-    value = {
-        "schema_version": 1,
-        "repository": repository,
-        "pull_number": number,
-        "managed_reviewers": sorted(logins),
-    }
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
 
 
 def _routing_identity(context: dict):
@@ -420,44 +428,32 @@ def _apply_plan(
     *,
     repository: str,
     number: int,
-    state: Path,
     context: dict,
-    managed: set[str],
     categories: tuple[Category, ...],
     eligible: set[str],
 ) -> ReviewPlan:
-    """Refresh before writes and persist successful additions before removals."""
+    """Refresh metadata before changes, including human choices before removals."""
     fresh = _load_context(repository, number)
     if _routing_identity(fresh) != _routing_identity(context):
-        raise ReadinessError(
-            "PR changed while planning; rerun before updating requests"
-        )
-    plan = plan_review_requests(categories, **fresh, eligible=eligible, managed=managed)
+        raise ReadinessError("PR changed while planning; rerun before updating requests")
+    plan = plan_review_requests(categories, **fresh, eligible=eligible)
     if not plan.ready:
         return plan
     endpoint = f"repos/{repository}/pulls/{number}/requested_reviewers"
-    owners = (managed & fresh["requested"]) | set(plan.add)
     if plan.add:
         _api(endpoint, method="POST", data={"reviewers": list(plan.add)})
-    # A later read/DELETE failure must not lose ownership of successful adds.
-    _write_managed(state, repository, number, owners)
     latest = _load_context(repository, number)
     if _routing_identity(latest) != _routing_identity(context):
-        raise ReadinessError(
-            "PR changed after additions; saved ownership, rerun reconciliation"
-        )
-    remove = (set(plan.remove) & latest["requested"]) - latest["engaged"]
+        raise ReadinessError("PR changed after additions; rerun reconciliation")
+    latest_plan = plan_review_requests(categories, **latest, eligible=eligible)
+    remove = set(latest_plan.remove)
     if remove:
         _api(endpoint, method="DELETE", data={"reviewers": sorted(remove)})
     remaining = latest["requested"] - remove
-    owners &= remaining
-    _write_managed(state, repository, number, owners)
     return replace(
-        plan,
-        remove=tuple(sorted(remove)),
+        latest_plan,
+        add=plan.add,
         keep=tuple(sorted(remaining)),
-        engaged=tuple(sorted(latest["engaged"])),
-        managed_reviewers=tuple(sorted(owners)),
     )
 
 
@@ -467,19 +463,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo", required=True, help="target OWNER/REPO")
     parser.add_argument("--pr", required=True, type=int, help="pull request number")
     parser.add_argument(
-        "--state-file", type=Path, help="persisted per-PR managed requests"
-    )
-    parser.add_argument(
         "--apply", action="store_true", help="apply requests; otherwise preview JSON"
     )
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.pr <= 0:
         parser.error("--repo must be OWNER/REPO and --pr must be positive")
-    if args.apply and args.state_file is None:
-        parser.error("--apply requires --state-file to track tool-owned requests")
     try:
         categories = parse_reviewers(args.reviewers.read_text(encoding="utf-8"))
-        managed = _read_managed(args.state_file, args.repo, args.pr)
         context = _load_context(args.repo, args.pr)
         pr = context["pull_request"]
         selected = (
@@ -489,16 +479,12 @@ def main(argv: list[str] | None = None) -> int:
             else set()
         )
         eligible = _eligible_reviewers(args.repo, selected)
-        plan = plan_review_requests(
-            categories, **context, eligible=eligible, managed=managed
-        )
+        plan = plan_review_requests(categories, **context, eligible=eligible)
         if args.apply and plan.ready:
             plan = _apply_plan(
                 repository=args.repo,
                 number=args.pr,
-                state=args.state_file,
                 context=context,
-                managed=managed,
                 categories=categories,
                 eligible=eligible,
             )

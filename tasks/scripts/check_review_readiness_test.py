@@ -174,7 +174,13 @@ CATEGORIES = (
 
 
 def context(
-    *labels, requested=(), engaged=(), author="author", draft=False, state="open"
+    *labels,
+    requested=(),
+    engaged=(),
+    manual=(),
+    author="author",
+    draft=False,
+    state="open",
 ):
     return {
         "pull_request": {
@@ -186,13 +192,14 @@ def context(
         },
         "requested": set(requested),
         "engaged": set(engaged),
+        "manual": set(manual),
     }
 
 
 class RoutingTests(unittest.TestCase):
-    def plan(self, snapshot, *, managed=(), eligible=("alice", "bob", "carol", "dave")):
+    def plan(self, snapshot, *, eligible=("alice", "bob", "carol", "dave")):
         return registry.plan_review_requests(
-            CATEGORIES, **snapshot, eligible=set(eligible), managed=set(managed)
+            CATEGORIES, **snapshot, eligible=set(eligible)
         )
 
     def test_initial_requests_all_matching_members_deduplicated(self):
@@ -207,24 +214,32 @@ class RoutingTests(unittest.TestCase):
         )
         self.assertEqual(plan.add, ("carol",))
 
-    def test_label_change_removes_only_obsolete_owned_unengaged_requests(self):
+    def test_label_change_preserves_manual_and_engaged_requests(self):
         plan = self.plan(
             context(
-                "area:build", requested=("alice", "bob", "manual"), engaged=("BOB",)
+                "area:build",
+                requested=("alice", "bob", "manual"),
+                engaged=("BOB",),
+                manual=("MANUAL",),
             ),
-            managed=("alice", "bob"),
         )
         self.assertEqual(plan.add, ("dave",))
         self.assertEqual(plan.remove, ("alice",))
         self.assertEqual(plan.keep, ("bob", "manual"))
-        self.assertEqual(plan.managed_reviewers, ("bob", "dave"))
+        self.assertEqual(plan.manual, ("manual",))
 
-    def test_repeated_run_preserves_manual_ownership_and_is_idempotent(self):
-        snapshot = context("area:runtime", requested=("alice", "bob", "manual"))
-        plan = self.plan(snapshot, managed=("bob",))
+    def test_repeated_run_preserves_manual_requests_and_is_idempotent(self):
+        snapshot = context(
+            "area:runtime", requested=("alice", "bob", "manual"), manual=("manual",)
+        )
+        plan = self.plan(snapshot)
         self.assertEqual(plan.add, ())
         self.assertEqual(plan.remove, ())
-        self.assertEqual(plan.managed_reviewers, ("bob",))
+        self.assertEqual(plan.manual, ("manual",))
+
+    def test_matching_reviewer_manually_removed_is_not_requested_again(self):
+        plan = self.plan(context("area:runtime", manual=("alice",)))
+        self.assertEqual(plan.add, ("bob",))
 
     def test_missing_multiple_and_unknown_routing_labels_fail(self):
         cases = [
@@ -245,7 +260,7 @@ class RoutingTests(unittest.TestCase):
         for overrides in ({"draft": True}, {"state": "closed"}):
             with self.subTest(overrides=overrides):
                 plan = self.plan(
-                    context(requested=("alice",), **overrides), managed=("alice",)
+                    context(requested=("alice",), **overrides)
                 )
                 self.assertFalse(plan.ready)
                 self.assertEqual(
@@ -279,6 +294,72 @@ class RoutingTests(unittest.TestCase):
         )
 
 
+def request_event(number, login, *, manual=False, removed=False):
+    return {
+        "id": number,
+        "event": "review_request_removed" if removed else "review_requested",
+        "actor": {
+            "login": "maintainer" if manual else "workflow[bot]",
+            "type": "User" if manual else "Bot",
+        },
+        "requested_reviewer": {"login": login},
+    }
+
+
+class TimelineTests(unittest.TestCase):
+    def test_separates_human_and_bot_requests(self):
+        events = [request_event(1, "Alice", manual=True), request_event(2, "Bob")]
+        self.assertEqual(
+            registry.manual_reviewers(events, {"alice", "bob"}), {"alice"}
+        )
+
+    def test_unknown_actor_and_missing_history_preserve_requests(self):
+        event = request_event(1, "alice")
+        event["actor"] = None
+        self.assertEqual(
+            registry.manual_reviewers([event], {"alice", "bob"}), {"alice", "bob"}
+        )
+
+    def test_human_replaces_automatic_request(self):
+        events = [
+            request_event(1, "alice"),
+            request_event(2, "alice", manual=True, removed=True),
+            request_event(3, "alice", manual=True),
+        ]
+        self.assertEqual(registry.manual_reviewers(events, {"alice"}), {"alice"})
+
+    def test_bot_re_request_does_not_erase_existing_human_request(self):
+        events = [request_event(1, "alice", manual=True), request_event(2, "alice")]
+        self.assertEqual(registry.manual_reviewers(events, {"alice"}), {"alice"})
+
+    def test_manual_removal_is_preserved_and_automatic_removal_is_not(self):
+        events = [
+            request_event(1, "alice"),
+            request_event(2, "bob"),
+            request_event(3, "alice", manual=True, removed=True),
+            request_event(4, "bob", removed=True),
+        ]
+        self.assertEqual(registry.manual_reviewers(events, set()), {"alice"})
+
+    def test_completed_request_cycle_does_not_protect_later_automatic_request(self):
+        events = [
+            request_event(1, "alice", manual=True),
+            request_event(2, "alice", removed=True),
+            request_event(3, "alice"),
+        ]
+        self.assertEqual(registry.manual_reviewers(events, {"alice"}), set())
+
+    def test_orders_changes_by_event_id_and_ignores_team_and_unrelated_events(self):
+        events = [
+            request_event(3, "alice", manual=True),
+            {"event": "review_requested", "id": 4, "requested_team": {"slug": "team"}},
+            request_event(2, "alice", removed=True),
+            {"event": "commented", "id": 9},
+            request_event(1, "alice"),
+        ]
+        self.assertEqual(registry.manual_reviewers(events, {"alice"}), {"alice"})
+
+
 class GitHubTests(unittest.TestCase):
     def test_api_paginates_array_and_object_feeds(self):
         feeds = (
@@ -306,12 +387,15 @@ class GitHubTests(unittest.TestCase):
             [{"user": {"login": "Reviewer"}}],
             [{"user": {"login": "Commenter"}}],
             [{"user": {"login": "Inline"}}],
+            [request_event(1, "Manual", manual=True)],
         ]
         with mock.patch.object(registry, "_api", side_effect=responses) as api:
             snapshot = registry._load_context("owner/repo", 42)
         self.assertEqual(snapshot["requested"], {"manual"})
         self.assertEqual(snapshot["engaged"], {"reviewer", "commenter", "inline"})
+        self.assertEqual(snapshot["manual"], {"manual"})
         self.assertTrue(all(call.kwargs["pages"] for call in api.call_args_list[1:]))
+        self.assertIn("/timeline?per_page=100", api.call_args.args[0])
 
     def test_only_current_write_maintain_admin_permissions_are_eligible(self):
         responses = [
@@ -326,37 +410,32 @@ class GitHubTests(unittest.TestCase):
 
 
 class ReconciliationTests(unittest.TestCase):
-    def apply(self, path, snapshot, *, managed, snapshots):
+    def apply(self, snapshot, *, snapshots, responses=None):
         with (
             mock.patch.object(registry, "_load_context", side_effect=snapshots),
-            mock.patch.object(registry, "_api") as api,
+            mock.patch.object(registry, "_api", side_effect=responses) as api,
         ):
             plan = registry._apply_plan(
                 repository="owner/repo",
                 number=42,
-                state=path,
                 context=snapshot,
-                managed=set(managed),
                 categories=CATEGORIES,
                 eligible={"alice", "bob", "carol", "dave"},
             )
         return plan, api
 
-    def test_engagement_between_plan_and_delete_protects_reviewer(self):
-        snapshot = context("area:build", requested=("alice", "bob", "manual"))
+    def test_engagement_and_manual_request_between_plan_and_delete_protect_reviewers(self):
+        snapshot = context("area:build", requested=("alice", "bob", "carol"))
         latest = context(
-            "area:build", requested=("alice", "bob", "manual", "dave"), engaged=("bob",)
+            "area:build",
+            requested=("alice", "bob", "carol", "dave"),
+            engaged=("bob",),
+            manual=("carol",),
         )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            plan, api = self.apply(
-                path, snapshot, managed=("alice", "bob"), snapshots=[snapshot, latest]
-            )
-            self.assertEqual(plan.remove, ("alice",))
-            self.assertEqual(plan.keep, ("bob", "dave", "manual"))
-            self.assertEqual(
-                registry._read_managed(path, "owner/repo", 42), {"bob", "dave"}
-            )
+        plan, api = self.apply(snapshot, snapshots=[snapshot, latest])
+        self.assertEqual(plan.remove, ("alice",))
+        self.assertEqual(plan.keep, ("bob", "carol", "dave"))
+        self.assertEqual(plan.manual, ("carol",))
         endpoint = "repos/owner/repo/pulls/42/requested_reviewers"
         self.assertEqual(
             api.call_args_list,
@@ -370,75 +449,58 @@ class ReconciliationTests(unittest.TestCase):
         before = context("area:runtime")
         changed = context("area:build")
         with (
-            tempfile.TemporaryDirectory() as directory,
             mock.patch.object(registry, "_load_context", return_value=changed),
             mock.patch.object(registry, "_api") as api,
         ):
-            path = Path(directory) / "state.json"
             with self.assertRaisesRegex(registry.ReadinessError, "PR changed"):
                 registry._apply_plan(
-                    repository="owner/repo", number=42, state=path, context=before,
-                    managed=set(), categories=CATEGORIES, eligible={"alice", "bob"},
+                    repository="owner/repo",
+                    number=42,
+                    context=before,
+                    categories=CATEGORIES,
+                    eligible={"alice", "bob"},
                 )
             api.assert_not_called()
-            self.assertFalse(path.exists())
 
-    def test_review_completed_after_addition_does_not_leave_stale_owned_request(self):
+    def test_human_removal_before_first_write_is_preserved(self):
+        snapshot = context("area:build")
+        latest = context("area:build", manual=("dave",))
+        plan, api = self.apply(snapshot, snapshots=[latest, latest])
+        self.assertEqual(plan.add, ())
+        api.assert_not_called()
+
+    def test_review_completed_after_addition_is_not_requested_again(self):
         snapshot = context("area:build")
         latest = context("area:build", engaged=("dave",))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            plan, _ = self.apply(
-                path, snapshot, managed=(), snapshots=[snapshot, latest]
-            )
-            self.assertEqual(plan.managed_reviewers, ())
-            self.assertEqual(registry._read_managed(path, "owner/repo", 42), set())
+        plan, api = self.apply(snapshot, snapshots=[snapshot, latest])
+        self.assertEqual(plan.keep, ())
+        self.assertEqual(plan.engaged, ("dave",))
+        self.assertEqual(api.call_count, 1)
 
-    def test_successful_additions_remain_owned_if_removal_fails(self):
+    def test_partial_failure_is_reconciled_from_github_on_next_run(self):
         snapshot = context("area:build", requested=("alice",))
         latest = context("area:build", requested=("alice", "dave"))
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            with (
-                mock.patch.object(
-                    registry, "_load_context", side_effect=[snapshot, latest]
-                ),
-                mock.patch.object(
-                    registry, "_api",
-                    side_effect=[None, subprocess.CalledProcessError(1, "gh")],
-                ),
-            ):
-                with self.assertRaises(subprocess.CalledProcessError):
-                    registry._apply_plan(
-                        repository="owner/repo", number=42, state=path,
-                        context=snapshot, managed={"alice"}, categories=CATEGORIES,
-                        eligible={"dave"},
-                    )
-            self.assertEqual(
-                registry._read_managed(path, "owner/repo", 42), {"alice", "dave"}
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.apply(
+                snapshot,
+                snapshots=[snapshot, latest],
+                responses=[None, subprocess.CalledProcessError(1, "gh")],
             )
-
-    def test_state_cannot_be_reused_for_another_pr_or_repository(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "state.json"
-            registry._write_managed(path, "owner/repo", 42, {"alice"})
-            for repository, number in (("owner/other", 42), ("owner/repo", 43)):
-                with (
-                    self.subTest(repository=repository, number=number),
-                    self.assertRaises(registry.ReadinessError),
-                ):
-                    registry._read_managed(path, repository, number)
-            path.write_text("[]", encoding="utf-8")
-            with self.assertRaises(registry.ReadinessError):
-                registry._read_managed(path, "owner/repo", 42)
+        plan, api = self.apply(latest, snapshots=[latest, latest])
+        self.assertEqual(plan.add, ())
+        self.assertEqual(plan.remove, ("alice",))
+        api.assert_called_once_with(
+            "repos/owner/repo/pulls/42/requested_reviewers",
+            method="DELETE",
+            data={"reviewers": ["alice"]},
+        )
 
 
 class CliTests(unittest.TestCase):
-    def test_default_mode_previews_without_writes_or_state_changes(self):
+    def test_default_mode_previews_without_writes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "REVIEWERS.md"
             path.write_text(DOCUMENT, encoding="utf-8")
-            state = Path(directory) / "state.json"
             output = io.StringIO()
             with (
                 mock.patch.object(
@@ -451,17 +513,40 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(
                     registry.main([
                         "--reviewers", str(path), "--repo", "owner/repo", "--pr", "42",
-                        "--state-file", str(state),
                     ]),
                     0,
                 )
             self.assertEqual(json.loads(output.getvalue())["add"], ["alice"])
-            self.assertFalse(state.exists())
             api.assert_not_called()
 
-    def test_apply_requires_persisted_ownership_state(self):
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            registry.main(["--repo", "owner/repo", "--pr", "42", "--apply"])
+    def test_apply_uses_github_metadata_without_a_state_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "REVIEWERS.md"
+            path.write_text(DOCUMENT, encoding="utf-8")
+            before = context("area:runtime")
+            after = context("area:runtime", requested=("alice",))
+            output = io.StringIO()
+            with (
+                mock.patch.object(
+                    registry, "_load_context", side_effect=[before, before, after]
+                ),
+                mock.patch.object(registry, "_eligible_reviewers", return_value={"alice"}),
+                mock.patch.object(registry, "_api") as api,
+                contextlib.redirect_stdout(output),
+            ):
+                self.assertEqual(
+                    registry.main([
+                        "--reviewers", str(path), "--repo", "owner/repo", "--pr", "42",
+                        "--apply",
+                    ]),
+                    0,
+                )
+            api.assert_called_once_with(
+                "repos/owner/repo/pulls/42/requested_reviewers",
+                method="POST",
+                data={"reviewers": ["alice"]},
+            )
+            self.assertEqual(list(Path(directory).iterdir()), [path])
 
     def test_invalid_registry_fails_before_contacting_github_without_partial_json(self):
         with tempfile.TemporaryDirectory() as directory:
