@@ -84,7 +84,6 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
-        {{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
         - name: certgen
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
@@ -120,7 +119,6 @@ spec:
             {{- if and .Values.grpcRoute.backendTLSPolicy.enabled (not .Values.certManager.enabled) }}
             - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
             {{- end }}
-        {{- end }}
 {{- if and .Values.certManager.enabled .Values.grpcRoute.backendTLSPolicy.enabled }}
 ---
 # Post-install Job that polls for the cert-manager-issued server Secret and
