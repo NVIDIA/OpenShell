@@ -71,6 +71,7 @@ use openshell_core::{Config, Error, ObjectLabels, Result};
 use openshell_extension_core::{
     BearerTokenSlot, ExtensionAudience, ExtensionCallerKind, ExtensionKind, MAX_EXTENSION_TOKEN_TTL,
 };
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
@@ -80,9 +81,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::{
     Arc, Mutex, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
@@ -433,13 +434,116 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
-fn log_metrics_tls_handshake_rejection(error: &std::io::Error, client: SocketAddr) {
-    warn!(
+const METRICS_TLS_HANDSHAKE_WARNING_INTERVAL: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct MetricsTlsHandshakeLogState {
+    last_warning: Option<Instant>,
+    suppressed: u64,
+}
+
+struct MetricsTlsHandshakeLogLimiter {
+    interval: Duration,
+    state: Mutex<MetricsTlsHandshakeLogState>,
+    rejected: AtomicU64,
+}
+
+impl MetricsTlsHandshakeLogLimiter {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            state: Mutex::new(MetricsTlsHandshakeLogState::default()),
+            rejected: AtomicU64::new(0),
+        }
+    }
+
+    fn record(&self, now: Instant) -> Option<u64> {
+        self.rejected.fetch_add(1, Ordering::Relaxed);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .last_warning
+            .is_none_or(|last_warning| now.duration_since(last_warning) >= self.interval)
+        {
+            state.last_warning = Some(now);
+            return Some(std::mem::take(&mut state.suppressed));
+        }
+        state.suppressed += 1;
+        None
+    }
+}
+
+fn log_metrics_tls_handshake_rejection(
+    limiter: &MetricsTlsHandshakeLogLimiter,
+    error: &std::io::Error,
+    client: SocketAddr,
+) {
+    debug!(
         event = "metrics_tls_handshake_rejected",
         error = %error,
         client = %client,
-        "Rejected metrics TLS handshake; verify that the client uses HTTPS and, when client authentication is enabled, a certificate trusted by the metrics client CA"
+        "Rejected metrics TLS handshake"
     );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_rejected",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Rejected metrics TLS handshakes; verify that clients use HTTPS and, when client authentication is enabled, certificates trusted by the metrics client CA"
+        );
+    }
+}
+
+fn log_metrics_tls_handshake_timeout(limiter: &MetricsTlsHandshakeLogLimiter, client: SocketAddr) {
+    debug!(
+        event = "metrics_tls_handshake_timed_out",
+        client = %client,
+        "Metrics TLS handshake timed out"
+    );
+    if let Some(suppressed) = limiter.record(Instant::now()) {
+        warn!(
+            event = "metrics_tls_handshake_timed_out",
+            suppressed,
+            total = limiter.rejected.load(Ordering::Relaxed),
+            "Metrics TLS handshakes timed out"
+        );
+    }
+}
+
+fn metrics_tls_acceptor_or_disable(
+    metrics_tls: &openshell_core::MetricsTlsConfig,
+) -> Option<TlsAcceptor> {
+    match TlsAcceptor::from_files(
+        &metrics_tls.cert_path,
+        &metrics_tls.key_path,
+        metrics_tls.client_ca_path.as_deref(),
+        metrics_tls.require_client_auth,
+        None,
+        None,
+        Vec::new(),
+    ) {
+        Ok(acceptor) => Some(acceptor),
+        Err(error) => {
+            error!(
+                event = "metrics_tls_listener_disabled",
+                listener = "metrics",
+                error = %error,
+                "Metrics TLS listener disabled because its certificate material could not be loaded"
+            );
+            let event = ConfigStateChangeBuilder::new(&gateway_ocsf::context("", ""))
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .state(StateId::Disabled, "initialization_failed")
+                .message(format!(
+                    "metrics TLS listener disabled because certificate material could not be loaded: {error}"
+                ))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
+            None
+        }
+    }
 }
 
 fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
@@ -1005,31 +1109,36 @@ pub(crate) async fn run_server(
 
     // Bind the Prometheus metrics endpoint on a dedicated port when configured.
     if let Some((metrics_bind_address, prometheus_handle)) = metrics_endpoint {
-        let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
-            Error::transport(format!(
-                "failed to bind metrics port {metrics_bind_address}: {e}",
-            ))
-        })?;
         if let Some(metrics_tls) = &config.metrics_tls {
-            let metrics_tls_acceptor = TlsAcceptor::from_files(
-                &metrics_tls.cert_path,
-                &metrics_tls.key_path,
-                metrics_tls.client_ca_path.as_deref(),
-                metrics_tls.require_client_auth,
-                None,
-                None,
-                Vec::new(),
-            )?;
-            metrics_tls_acceptor.spawn_reload_worker_for_listener(shutdown_rx.clone(), "metrics");
+            if let Some(metrics_tls_acceptor) = metrics_tls_acceptor_or_disable(metrics_tls) {
+                let metrics_listener =
+                    TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                        Error::transport(format!(
+                            "failed to bind metrics port {metrics_bind_address}: {e}",
+                        ))
+                    })?;
+                metrics_tls_acceptor
+                    .spawn_reload_worker_for_listener(shutdown_rx.clone(), "metrics");
 
-            info!(address = %metrics_bind_address, "Metrics TLS server listening");
-            tokio::spawn(serve_tls_metrics_listener(
-                metrics_listener,
-                metrics_router(prometheus_handle),
-                metrics_tls_acceptor,
-                shutdown_rx.clone(),
-            ));
+                info!(address = %metrics_bind_address, "Metrics TLS server listening");
+                tokio::spawn(serve_tls_metrics_listener(
+                    metrics_listener,
+                    metrics_router(prometheus_handle),
+                    metrics_tls_acceptor,
+                    shutdown_rx.clone(),
+                ));
+            } else {
+                warn!(
+                    listener = "metrics",
+                    "Metrics listener remains unavailable until valid TLS certificate material is provided"
+                );
+            }
         } else {
+            let metrics_listener = TcpListener::bind(metrics_bind_address).await.map_err(|e| {
+                Error::transport(format!(
+                    "failed to bind metrics port {metrics_bind_address}: {e}",
+                ))
+            })?;
             info!(address = %metrics_bind_address, "Metrics server listening");
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(
@@ -1180,6 +1289,9 @@ async fn serve_tls_metrics_listener(
     tls_acceptor: TlsAcceptor,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let handshake_log_limiter = Arc::new(MetricsTlsHandshakeLogLimiter::new(
+        METRICS_TLS_HANDSHAKE_WARNING_INTERVAL,
+    ));
     loop {
         let accepted = tokio::select! {
             changed = shutdown.changed() => {
@@ -1202,6 +1314,7 @@ async fn serve_tls_metrics_listener(
 
         let acceptor = tls_acceptor.clone();
         let service = TowerToHyperService::new(router.clone());
+        let handshake_log_limiter = handshake_log_limiter.clone();
         tokio::spawn(async move {
             match tokio::time::timeout(Duration::from_secs(10), acceptor.acceptor().accept(stream))
                 .await
@@ -1222,10 +1335,10 @@ async fn serve_tls_metrics_listener(
                     debug!(error = %error, client = %addr, "Metrics TLS handshake closed early");
                 }
                 Ok(Err(error)) => {
-                    log_metrics_tls_handshake_rejection(&error, addr);
+                    log_metrics_tls_handshake_rejection(&handshake_log_limiter, &error, addr);
                 }
                 Err(_) => {
-                    warn!(client = %addr, "Metrics TLS handshake timed out");
+                    log_metrics_tls_handshake_timeout(&handshake_log_limiter, addr);
                 }
             }
         });
@@ -2173,18 +2286,19 @@ pub(crate) async fn ensure_default_workspace(store: &Store) -> Result<()> {
 mod tests {
     use super::{
         BoundGatewayListener, ConfiguredComputeDriver, ConnectionProtocol, ExtensionKind,
-        MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
-        bind_gateway_listener, classify_initial_bytes, configured_compute_driver,
-        extension_token_ttl, is_benign_tls_handshake_failure, log_metrics_tls_handshake_rejection,
+        MetricsTlsHandshakeLogLimiter, MultiplexService, ServerState, TlsAcceptor,
+        allow_plaintext_service_http, bind_gateway_listener, classify_initial_bytes,
+        configured_compute_driver, extension_token_ttl, is_benign_tls_handshake_failure,
+        log_metrics_tls_handshake_rejection, metrics_tls_acceptor_or_disable,
         mint_gateway_extension_credential, serve_gateway_listener, serve_tls_metrics_listener,
         validate_peer_endpoint_scheme,
     };
     use axum::{Router, routing::get};
     use openshell_core::{
-        Config,
+        Config, MetricsTlsConfig,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
-    use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
+    use rcgen::{CertificateParams, KeyUsagePurpose};
     use std::fs::{self, File};
     use std::io::{BufReader, Error, ErrorKind};
     use std::net::SocketAddr;
@@ -2193,7 +2307,7 @@ mod tests {
         Arc, LazyLock, Mutex,
         atomic::{AtomicBool, Ordering},
     };
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tempfile::{TempDir, tempdir};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
@@ -2256,10 +2370,11 @@ mod tests {
     fn write_test_client_certificate(
         directory: &Path,
         name: &str,
-        ca_cert: &rcgen::Certificate,
-        ca_key: &KeyPair,
+        ca_cert: &openshell_crypto::pki::Certificate,
+        ca_key: &openshell_crypto::pki::KeyPair,
     ) -> (PathBuf, PathBuf) {
-        let client_key = KeyPair::generate().expect("failed to generate test client key");
+        let client_key =
+            openshell_crypto::pki::generate_keypair().expect("failed to generate test client key");
         let mut client_params =
             CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
         client_params
@@ -2269,14 +2384,20 @@ mod tests {
             KeyUsagePurpose::DigitalSignature,
             KeyUsagePurpose::KeyEncipherment,
         ];
-        let client_cert = client_params
-            .signed_by(&client_key, ca_cert, ca_key)
-            .expect("failed to sign test client certificate");
+        let client_cert =
+            openshell_crypto::pki::signed_by(client_params, &client_key, ca_cert, ca_key)
+                .expect("failed to sign test client certificate");
 
         let cert_path = directory.join(format!("{name}-cert.pem"));
         let key_path = directory.join(format!("{name}-key.pem"));
         fs::write(&cert_path, client_cert.pem()).expect("failed to write test client certificate");
-        fs::write(&key_path, client_key.serialize_pem()).expect("failed to write test client key");
+        fs::write(
+            &key_path,
+            client_key
+                .serialize_pem()
+                .expect("failed to encode test client key"),
+        )
+        .expect("failed to write test client key");
         (cert_path, key_path)
     }
 
@@ -2728,18 +2849,21 @@ mod tests {
 
     #[test]
     fn metrics_tls_handshake_rejection_logs_actionable_context() {
-        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt as _};
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let writer = TraceBuffer(buffer.clone());
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
                 .with_writer(move || writer.clone())
-                .with_ansi(false),
+                .with_ansi(false)
+                .with_filter(tracing_subscriber::filter::LevelFilter::DEBUG),
         );
         let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_secs(60));
 
         log_metrics_tls_handshake_rejection(
+            &limiter,
             &Error::new(ErrorKind::InvalidData, "untrusted client certificate"),
             "192.0.2.10:443".parse().expect("valid test client address"),
         );
@@ -2758,6 +2882,57 @@ mod tests {
         assert!(output.contains("192.0.2.10:443"), "log output: {output}");
         assert!(
             output.contains("Rejected metrics TLS handshake"),
+            "log output: {output}"
+        );
+    }
+
+    #[test]
+    fn metrics_tls_handshake_warnings_are_rate_limited() {
+        let limiter = MetricsTlsHandshakeLogLimiter::new(Duration::from_secs(60));
+        let start = Instant::now();
+
+        assert_eq!(limiter.record(start), Some(0));
+        assert_eq!(limiter.record(start + Duration::from_secs(1)), None);
+        assert_eq!(limiter.record(start + Duration::from_secs(2)), None);
+        assert_eq!(
+            limiter.record(start + Duration::from_secs(60)),
+            Some(2),
+            "the next warning reports the rejected handshakes suppressed during the interval"
+        );
+    }
+
+    #[test]
+    fn invalid_metrics_tls_material_disables_only_the_metrics_listener() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TraceBuffer(buffer.clone());
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || writer.clone())
+                .with_ansi(false),
+        );
+        let _traced = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+        let tls = MetricsTlsConfig {
+            cert_path: PathBuf::from("/tmp/openshell-missing-metrics-cert.pem"),
+            key_path: PathBuf::from("/tmp/openshell-missing-metrics-key.pem"),
+            client_ca_path: None,
+            require_client_auth: false,
+        };
+
+        assert!(
+            metrics_tls_acceptor_or_disable(&tls).is_none(),
+            "invalid metrics TLS files must not produce a plaintext listener or abort startup"
+        );
+
+        let output = String::from_utf8(buffer.lock().expect("trace buffer lock").clone())
+            .expect("tracing output is UTF-8");
+        assert!(
+            output.contains("metrics_tls_listener_disabled"),
+            "log output: {output}"
+        );
+        assert!(
+            output.contains("listener=\"metrics\""),
             "log output: {output}"
         );
     }

@@ -367,6 +367,11 @@ existing Prometheus deployments. Enable `metrics.tls.enabled` to serve it over
 HTTPS. The initial implementation uses operator-provided Kubernetes Secrets;
 it does not generate metrics PKI or create a `ServiceMonitor`.
 
+If the configured metrics TLS Secret is missing or malformed when the gateway
+starts, OpenShell leaves the metrics listener disabled and continues serving
+the gateway. It never falls back to plaintext; correct the Secret and restart
+the gateway to restore scraping.
+
 ```yaml
 metrics:
   tls:

@@ -46,7 +46,7 @@ tests:
     asserts:
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.gateway\.metrics_tls\].*?cert_path\s*=\s*"/etc/openshell-metrics/server/tls\.crt".*?key_path\s*=\s*"/etc/openshell-metrics/server/tls\.key".*?client_ca_path\s*=\s*"/etc/openshell-metrics/client-ca/ca\.crt".*?require_client_auth\s*=\s*true'
+          pattern: '(?ms)\[openshell\.gateway\.metrics_tls\].*?cert_path\s*=\s*"/etc/openshell-metrics/server/tls\.crt".*?client_ca_path\s*=\s*"/etc/openshell-metrics/client-ca/ca\.crt".*?key_path\s*=\s*"/etc/openshell-metrics/server/tls\.key".*?require_client_auth\s*=\s*true'
 
   - it: mounts operator-provided metrics mTLS Secrets read-only
     template: templates/statefulset.yaml

@@ -2809,100 +2809,101 @@ mod tests {
 
     #[test]
     fn metrics_tls_file_values_merge_into_runtime_configuration() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _cert = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_CERT");
-        let _key = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_KEY");
-        let _ca = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_CLIENT_CA");
-        let _require = EnvVarGuard::remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH");
-        let (mut args, matches) = parse_with_args(&[
-            "openshell-gateway",
-            "--db-url",
-            "sqlite::memory:",
-            "--metrics-port",
-            "9090",
-        ]);
-        let file = config_file_from_toml(
-            r#"
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-port",
+                    "9090",
+                ]);
+                let file = config_file_from_toml(
+                    r#"
 [openshell.gateway.metrics_tls]
 cert_path = "/metrics/tls.crt"
 key_path = "/metrics/tls.key"
 client_ca_path = "/metrics/ca.crt"
 require_client_auth = true
 "#,
-        );
+                );
 
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-        let tls = resolve_metrics_tls(&args)
-            .expect("valid metrics TLS configuration")
-            .expect("metrics TLS is configured");
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                let tls = resolve_metrics_tls(&args)
+                    .expect("valid metrics TLS configuration")
+                    .expect("metrics TLS is configured");
 
-        assert_eq!(tls.cert_path, PathBuf::from("/metrics/tls.crt"));
-        assert_eq!(tls.key_path, PathBuf::from("/metrics/tls.key"));
-        assert_eq!(tls.client_ca_path, Some(PathBuf::from("/metrics/ca.crt")));
-        assert!(tls.require_client_auth);
+                assert_eq!(tls.cert_path, PathBuf::from("/metrics/tls.crt"));
+                assert_eq!(tls.key_path, PathBuf::from("/metrics/tls.key"));
+                assert_eq!(tls.client_ca_path, Some(PathBuf::from("/metrics/ca.crt")));
+                assert!(tls.require_client_auth);
+            });
     }
 
     #[test]
     fn explicit_metrics_client_auth_value_overrides_file_value() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _cert = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_CERT");
-        let _key = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_KEY");
-        let _ca = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_CLIENT_CA");
-        let _require = EnvVarGuard::remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH");
-        let (mut args, matches) = parse_with_args(&[
-            "openshell-gateway",
-            "--db-url",
-            "sqlite::memory:",
-            "--metrics-port",
-            "9090",
-            "--metrics-require-client-auth=false",
-        ]);
-        let file = config_file_from_toml(
-            r#"
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (mut args, matches) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    "--metrics-port",
+                    "9090",
+                    "--metrics-require-client-auth=false",
+                ]);
+                let file = config_file_from_toml(
+                    r#"
 [openshell.gateway.metrics_tls]
 cert_path = "/metrics/tls.crt"
 key_path = "/metrics/tls.key"
 client_ca_path = "/metrics/ca.crt"
 require_client_auth = true
 "#,
-        );
+                );
 
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
-        let tls = resolve_metrics_tls(&args)
-            .expect("valid metrics TLS configuration")
-            .expect("metrics TLS is configured");
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                let tls = resolve_metrics_tls(&args)
+                    .expect("valid metrics TLS configuration")
+                    .expect("metrics TLS is configured");
 
-        assert!(!tls.require_client_auth);
+                assert!(!tls.require_client_auth);
+            });
     }
 
     #[test]
     fn metrics_client_auth_requires_a_metrics_client_ca() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _cert = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_CERT");
-        let _key = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_KEY");
-        let _ca = EnvVarGuard::remove("OPENSHELL_METRICS_TLS_CLIENT_CA");
-        let _require = EnvVarGuard::remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH");
-        let (args, _) = parse_with_args(&[
-            "openshell-gateway",
-            "--metrics-tls-cert",
-            "/metrics/tls.crt",
-            "--metrics-tls-key",
-            "/metrics/tls.key",
-            "--metrics-require-client-auth",
-        ]);
+        Environment::new()
+            .remove("OPENSHELL_METRICS_TLS_CERT")
+            .remove("OPENSHELL_METRICS_TLS_KEY")
+            .remove("OPENSHELL_METRICS_TLS_CLIENT_CA")
+            .remove("OPENSHELL_METRICS_REQUIRE_CLIENT_AUTH")
+            .run(|| {
+                let (args, _) = parse_with_args(&[
+                    "openshell-gateway",
+                    "--metrics-tls-cert",
+                    "/metrics/tls.crt",
+                    "--metrics-tls-key",
+                    "/metrics/tls.key",
+                    "--metrics-require-client-auth",
+                ]);
 
-        let error = resolve_metrics_tls(&args).expect_err("client auth without a CA must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("--metrics-require-client-auth requires --metrics-tls-client-ca")
-        );
+                let error =
+                    resolve_metrics_tls(&args).expect_err("client auth without a CA must fail");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("--metrics-require-client-auth requires --metrics-tls-client-ca")
+                );
+            });
     }
 
     #[test]

@@ -378,6 +378,11 @@ valid change is applied without restarting the gateway; an invalid replacement
 keeps the last known-good configuration active. Reload logs and OCSF events
 include `listener=metrics` to distinguish this boundary from gateway TLS.
 
+If the metrics certificate, key, or client CA cannot be loaded at startup, the
+gateway continues serving its control-plane and health listeners but disables
+the metrics listener. It does not fall back to plaintext. Correct the mounted
+Secret and restart the gateway to restore metrics scraping.
+
 For a Helm installation, set `metrics.tls.enabled=true` and provide the
 operator-managed Secret names through `metrics.tls.certSecretName` and, for
 mTLS, `metrics.tls.clientCaSecretName`. The chart does not create
