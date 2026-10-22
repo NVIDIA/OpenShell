@@ -258,7 +258,7 @@ mod tests {
             binary_path,
             sandbox_id: Some("sandbox-123".to_string()),
             sandbox_name: Some("agent-box".to_string()),
-            openshell_endpoint: None,
+            gateway: None,
             provider_credentials: None,
             agent_proposals: AgentProposals::new(true),
             denial_tx: None,
