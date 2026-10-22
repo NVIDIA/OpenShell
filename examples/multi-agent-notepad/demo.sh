@@ -166,6 +166,9 @@ run_sandbox() {
         --provider "$DEMO_GITHUB_PROVIDER_NAME" \
         --policy "$POLICY_FILE" \
         --upload "${PAYLOAD_DIR}:/sandbox" \
+        --detach \
+        --no-tty
+    "$OPENSHELL_BIN" sandbox exec "$name" \
         --no-tty \
         -- bash /sandbox/payload/demo-runner.sh "$@"
 }

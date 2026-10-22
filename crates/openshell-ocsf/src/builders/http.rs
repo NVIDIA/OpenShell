@@ -183,7 +183,7 @@ impl<'a, Context> HttpActivityBuilder<'a, Context> {
 
     #[must_use]
     pub fn actor_process(mut self, process: crate::objects::Process) -> Self {
-        self.actor = Some(Actor { process });
+        self.actor = Some(Actor::process(process));
         self
     }
 

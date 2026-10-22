@@ -1,0 +1,627 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! Bounded registry for socket-time seccomp virtualization.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::net::SocketAddr;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+
+use rustix::fs::fstat;
+
+use crate::linux::proc_fd;
+
+/// Stable identity for one mediated socket within a listener generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SocketIdentity {
+    /// Generation of the seccomp listener that created the socket.
+    pub listener_generation: u64,
+    /// Socket inode observed from the source descriptor.
+    pub inode: u64,
+    /// Kernel `SO_COOKIE` value.
+    pub cookie: u64,
+}
+
+/// Supported INET address family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InetFamily {
+    /// `AF_INET`.
+    V4,
+    /// `AF_INET6`.
+    V6,
+}
+
+/// Supported INET socket kind and protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InetKind {
+    /// TCP stream socket.
+    Tcp,
+    /// UDP datagram socket restricted to the DNS relay.
+    DnsUdp,
+}
+
+/// Immutable socket metadata captured before ADDFD-SEND.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketMetadata {
+    /// Address family.
+    pub family: InetFamily,
+    /// Socket kind/protocol.
+    pub kind: InetKind,
+    /// Whether the injected descriptor must be close-on-exec.
+    pub close_on_exec: bool,
+    /// Whether the socket's open-file description is nonblocking.
+    pub nonblocking: bool,
+    /// Task generation that created the socket.
+    pub creator_generation: u64,
+}
+
+/// Stable state of one socket open-file description.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SocketState {
+    /// Created but not bound or connected.
+    Created,
+    /// Explicitly bound by the workload.
+    Bound { local: SocketAddr },
+    /// Connected through an external supervisor relay.
+    Connected { original_peer: SocketAddr },
+    /// Connected directly to an allowed workload loopback endpoint.
+    Local { peer: SocketAddr },
+    /// UDP socket pinned to the exact local DNS relay.
+    DnsUdp { relay: SocketAddr },
+    /// TCP socket pinned to the exact local DNS relay.
+    DnsTcp { relay: SocketAddr },
+    /// Workload-owned listening socket.
+    Listening { local: SocketAddr },
+    /// A committed relay failed after connection.
+    Failed { errno: i32 },
+}
+
+/// One committed registry entry.
+#[derive(Debug)]
+pub struct SocketEntry {
+    identity: SocketIdentity,
+    metadata: SocketMetadata,
+    state: SocketState,
+    retained_preconnect: Option<OwnedFd>,
+}
+
+impl SocketEntry {
+    /// Stable socket identity.
+    #[must_use]
+    pub fn identity(&self) -> SocketIdentity {
+        self.identity
+    }
+
+    /// Immutable creation metadata.
+    #[must_use]
+    pub fn metadata(&self) -> SocketMetadata {
+        self.metadata
+    }
+
+    /// Current stable state.
+    #[must_use]
+    pub fn state(&self) -> &SocketState {
+        &self.state
+    }
+
+    /// Retained source descriptor used to perform pre-connect operations on
+    /// the exact injected open-file description.
+    pub fn retained_preconnect(&self) -> io::Result<&OwnedFd> {
+        self.retained_preconnect.as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "socket no longer has a retained pre-connect descriptor",
+            )
+        })
+    }
+
+    /// Replace the stable state. Callers perform policy and notification
+    /// revalidation before invoking this commit primitive.
+    pub fn set_state(&mut self, state: SocketState) {
+        if matches!(state, SocketState::Listening { .. }) {
+            // Native accept needs no broker reference. Only workload aliases
+            // should keep a listener alive after this transition.
+            self.release_preconnect();
+        }
+        self.state = state;
+    }
+
+    /// Close the temporary source descriptor after a connection or listen commits.
+    pub fn release_preconnect(&mut self) {
+        self.retained_preconnect = None;
+    }
+
+    /// Verify that the retained source still has the registered cookie and
+    /// inode.
+    pub fn validate_retained_identity(&self) -> io::Result<()> {
+        let retained = self.retained_preconnect()?;
+        let identity = socket_identity(retained.as_fd(), self.identity.listener_generation)?;
+        if identity == self.identity {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "retained socket identity changed",
+            ))
+        }
+    }
+}
+
+/// Tentative socket metadata that is invisible until ADDFD-SEND succeeds.
+#[derive(Debug)]
+pub struct TentativeSocket {
+    identity: SocketIdentity,
+    metadata: SocketMetadata,
+    source: OwnedFd,
+}
+
+impl TentativeSocket {
+    /// Stable identity used to correlate the ADDFD transaction.
+    #[must_use]
+    pub fn identity(&self) -> SocketIdentity {
+        self.identity
+    }
+
+    /// Source descriptor passed to ADDFD-SEND.
+    #[must_use]
+    pub fn source_fd(&self) -> RawFd {
+        self.source.as_raw_fd()
+    }
+}
+
+/// Bounded committed socket registry.
+pub struct SocketRegistry {
+    listener_generation: u64,
+    capacity: usize,
+    entries: BTreeMap<u64, SocketEntry>,
+}
+
+impl SocketRegistry {
+    /// Create an empty registry for one nonzero listener generation.
+    pub fn new(listener_generation: u64, capacity: usize) -> io::Result<Self> {
+        if listener_generation == 0 || capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listener generation and registry capacity must be nonzero",
+            ));
+        }
+        Ok(Self {
+            listener_generation,
+            capacity,
+            entries: BTreeMap::new(),
+        })
+    }
+
+    /// Number of committed entries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no sockets are committed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of entries that still retain a broker-owned descriptor.
+    #[must_use]
+    pub fn retained_preconnect_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.retained_preconnect.is_some())
+            .count()
+    }
+
+    /// Whether another socket would exceed the configured bound.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.capacity
+    }
+
+    /// Retain only sockets that remain installed in a workload descriptor
+    /// table. The trusted broker's temporary source descriptors are excluded
+    /// from `installed` by the caller.
+    pub fn retain_installed(&mut self, installed: &std::collections::BTreeSet<u64>) {
+        self.entries
+            .retain(|inode, _entry| installed.contains(inode));
+    }
+
+    /// Stage a newly created source descriptor without publishing it.
+    pub fn stage(&self, source: OwnedFd, metadata: SocketMetadata) -> io::Result<TentativeSocket> {
+        if self.entries.len() >= self.capacity {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        let identity = socket_identity(source.as_fd(), self.listener_generation)?;
+        if self.entries.contains_key(&identity.inode) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "socket inode is already registered",
+            ));
+        }
+        Ok(TentativeSocket {
+            identity,
+            metadata,
+            source,
+        })
+    }
+
+    /// Publish a tentative socket only after ADDFD-SEND has succeeded.
+    pub fn commit(&mut self, tentative: TentativeSocket) -> io::Result<SocketIdentity> {
+        self.commit_with_state(tentative, SocketState::Created)
+    }
+
+    /// Publish a tentative socket in a caller-proven initial state.
+    ///
+    /// Used when the trusted broker has already established the socket's
+    /// state before publication, so the entry never appears unconnected.
+    pub fn commit_with_state(
+        &mut self,
+        tentative: TentativeSocket,
+        state: SocketState,
+    ) -> io::Result<SocketIdentity> {
+        if self.entries.len() >= self.capacity {
+            return Err(io::Error::from_raw_os_error(libc::EMFILE));
+        }
+        if tentative.identity.listener_generation != self.listener_generation
+            || self.entries.contains_key(&tentative.identity.inode)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "socket identity cannot be committed to this registry",
+            ));
+        }
+        let identity = tentative.identity;
+        let retain_source = matches!(state, SocketState::Created | SocketState::Bound { .. });
+        self.entries.insert(
+            identity.inode,
+            SocketEntry {
+                identity,
+                metadata: tentative.metadata,
+                state,
+                retained_preconnect: retain_source.then_some(tentative.source),
+            },
+        );
+        Ok(identity)
+    }
+
+    /// Resolve a notifying task's installed descriptor to a committed entry.
+    pub fn resolve(&self, tid: u32, fd: RawFd) -> io::Result<&SocketEntry> {
+        let inode = proc_fd::socket_inode(tid, fd)?;
+        let entry = self.entries.get(&inode).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "socket inode is not registered for this sandbox",
+            )
+        })?;
+        if entry.retained_preconnect.is_some() {
+            entry.validate_retained_identity()?;
+        }
+        Ok(entry)
+    }
+
+    /// Return `None` only when procfs positively identifies an unregistered
+    /// descriptor. Inspection and retained-identity failures stay errors.
+    pub fn resolve_for_native_fallback(
+        &self,
+        tid: u32,
+        fd: RawFd,
+    ) -> io::Result<Option<&SocketEntry>> {
+        let Some(inode) = proc_fd::socket_inode_if_socket(tid, fd)? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries.get(&inode) else {
+            return Ok(None);
+        };
+        if entry.retained_preconnect.is_some() {
+            entry.validate_retained_identity()?;
+        }
+        Ok(Some(entry))
+    }
+
+    /// Mutable form of [`Self::resolve`].
+    pub fn resolve_mut(&mut self, tid: u32, fd: RawFd) -> io::Result<&mut SocketEntry> {
+        let inode = proc_fd::socket_inode(tid, fd)?;
+        let entry = self.entries.get_mut(&inode).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "socket inode is not registered for this sandbox",
+            )
+        })?;
+        if entry.retained_preconnect.is_some() {
+            entry.validate_retained_identity()?;
+        }
+        Ok(entry)
+    }
+
+    /// Mutable form of [`Self::resolve_for_native_fallback`].
+    pub fn resolve_mut_for_native_fallback(
+        &mut self,
+        tid: u32,
+        fd: RawFd,
+    ) -> io::Result<Option<&mut SocketEntry>> {
+        let Some(inode) = proc_fd::socket_inode_if_socket(tid, fd)? else {
+            return Ok(None);
+        };
+        let Some(entry) = self.entries.get_mut(&inode) else {
+            return Ok(None);
+        };
+        if entry.retained_preconnect.is_some() {
+            entry.validate_retained_identity()?;
+        }
+        Ok(Some(entry))
+    }
+
+    /// Remove metadata after descendant-FD collection proves no installed
+    /// alias remains.
+    pub fn remove_inode(&mut self, inode: u64) -> bool {
+        self.entries.remove(&inode).is_some()
+    }
+}
+
+fn socket_identity(fd: BorrowedFd<'_>, listener_generation: u64) -> io::Result<SocketIdentity> {
+    let stat = fstat(fd)?;
+    if stat.st_mode & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "registry source descriptor is not a socket",
+        ));
+    }
+    let cookie = rustix::net::sockopt::socket_cookie(fd)?;
+    if cookie == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "kernel returned an invalid SO_COOKIE",
+        ));
+    }
+    Ok(SocketIdentity {
+        listener_generation,
+        inode: stat.st_ino,
+        cookie,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::process::{Command, Stdio};
+
+    use rustix::net::{AddressFamily, SocketFlags, SocketType, ipproto};
+
+    use super::*;
+
+    fn tcp_socket() -> OwnedFd {
+        rustix::net::socket_with(
+            AddressFamily::INET,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            Some(ipproto::TCP),
+        )
+        .expect("socket")
+    }
+
+    fn metadata() -> SocketMetadata {
+        SocketMetadata {
+            family: InetFamily::V4,
+            kind: InetKind::Tcp,
+            close_on_exec: true,
+            nonblocking: false,
+            creator_generation: 11,
+        }
+    }
+
+    #[test]
+    fn listening_commit_does_not_retain_source() {
+        let mut registry = SocketRegistry::new(7, 1).unwrap();
+        let source = tcp_socket();
+        let installed = rustix::io::fcntl_dupfd_cloexec(&source, 3).unwrap();
+        let tentative = registry.stage(source, metadata()).unwrap();
+        let local = "127.0.0.1:12345".parse().unwrap();
+        registry
+            .commit_with_state(tentative, SocketState::Listening { local })
+            .unwrap();
+        let entry = registry
+            .resolve(std::process::id(), installed.as_raw_fd())
+            .unwrap();
+        assert_eq!(entry.state(), &SocketState::Listening { local });
+        assert!(entry.retained_preconnect().is_err());
+        assert_eq!(registry.retained_preconnect_count(), 0);
+    }
+
+    #[test]
+    fn tentative_entry_is_invisible_until_commit() {
+        let mut registry = SocketRegistry::new(7, 1).unwrap();
+        let socket = tcp_socket();
+        let fd = socket.as_raw_fd();
+        let tentative = registry.stage(socket, metadata()).unwrap();
+        assert!(registry.is_empty());
+        assert_eq!(
+            registry
+                .resolve(std::process::id(), fd)
+                .expect_err("tentative socket must be invisible")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let identity = registry.commit(tentative).unwrap();
+        let entry = registry.resolve(std::process::id(), fd).unwrap();
+        assert_eq!(entry.identity(), identity);
+        assert_eq!(entry.metadata(), metadata());
+        assert_eq!(entry.state(), &SocketState::Created);
+        assert_eq!(registry.len(), 1);
+
+        assert_eq!(
+            registry
+                .stage(tcp_socket(), metadata())
+                .expect_err("quota must fail before injection")
+                .raw_os_error(),
+            Some(libc::EMFILE)
+        );
+    }
+
+    #[test]
+    fn native_fallback_requires_a_verified_descriptor() {
+        let mut registry = SocketRegistry::new(7, 1).unwrap();
+        let source = tcp_socket();
+        let installed = rustix::io::fcntl_dupfd_cloexec(&source, 3).unwrap();
+        let tentative = registry.stage(source, metadata()).unwrap();
+        registry.commit(tentative).unwrap();
+        assert!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), installed.as_raw_fd())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            registry
+                .resolve_mut_for_native_fallback(std::process::id(), installed.as_raw_fd())
+                .unwrap()
+                .is_some()
+        );
+
+        let unregistered = tcp_socket();
+        assert!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), unregistered.as_raw_fd())
+                .unwrap()
+                .is_none()
+        );
+        let regular = std::fs::File::open("/dev/null").unwrap();
+        assert!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), regular.as_raw_fd())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry
+                .resolve_for_native_fallback(std::process::id(), i32::MAX)
+                .expect_err("vanished descriptor must fail closed")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(
+            registry
+                .resolve_mut_for_native_fallback(std::process::id(), i32::MAX)
+                .expect_err("vanished descriptor must fail closed")
+                .raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn native_fallback_rejects_unreadable_task_descriptors() {
+        const CHILD: &str = "OPENSHELL_UNREADABLE_DESCRIPTOR_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let socket = tcp_socket();
+            // SAFETY: the disposable child changes only its own dumpability.
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) }, 0);
+            println!("{}", socket.as_raw_fd());
+            io::stdout().flush().unwrap();
+            let mut release = [0_u8];
+            io::stdin().read_exact(&mut release).unwrap();
+            return;
+        }
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+
+        let executable = std::env::current_exe().unwrap();
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg("linux::socket_registry::tests::native_fallback_rejects_unreadable_task_descriptors")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited early"
+            );
+            if let Ok(fd) = line.trim().parse::<RawFd>() {
+                let registry = SocketRegistry::new(7, 1).unwrap();
+                assert_eq!(
+                    registry
+                        .resolve_for_native_fallback(child.id(), fd)
+                        .expect_err("unreadable descriptor must fail closed")
+                        .kind(),
+                    io::ErrorKind::PermissionDenied
+                );
+                child.stdin.take().unwrap().write_all(&[1]).unwrap();
+                break;
+            }
+        }
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn dup_alias_resolves_to_same_open_file_description() {
+        let mut registry = SocketRegistry::new(9, 4).unwrap();
+        let socket = tcp_socket();
+        let alias = rustix::io::dup(&socket).expect("dup");
+
+        let tentative = registry.stage(socket, metadata()).unwrap();
+        let identity = registry.commit(tentative).unwrap();
+        assert_eq!(
+            registry
+                .resolve(std::process::id(), alias.as_raw_fd())
+                .unwrap()
+                .identity(),
+            identity
+        );
+    }
+
+    #[test]
+    fn collection_reclaims_only_uninstalled_socket_metadata() {
+        let mut registry = SocketRegistry::new(12, 2).unwrap();
+        let first = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+        let second = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+        assert!(registry.is_full());
+
+        registry.retain_installed(&std::collections::BTreeSet::from([first.inode]));
+
+        assert_eq!(registry.len(), 1);
+        assert!(registry.remove_inode(first.inode));
+        assert!(!registry.remove_inode(second.inode));
+    }
+
+    #[test]
+    fn retained_count_excludes_connected_metadata() {
+        let mut registry = SocketRegistry::new(13, 2).unwrap();
+        let retained = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+        let connected = registry
+            .commit(registry.stage(tcp_socket(), metadata()).unwrap())
+            .unwrap();
+
+        assert_eq!(registry.retained_preconnect_count(), 2);
+
+        let entry = registry.entries.get_mut(&connected.inode).unwrap();
+        entry.set_state(SocketState::Connected {
+            original_peer: "127.0.0.1:443".parse().unwrap(),
+        });
+        entry.release_preconnect();
+
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.retained_preconnect_count(), 1);
+        assert!(
+            registry.entries[&retained.inode]
+                .retained_preconnect
+                .is_some()
+        );
+    }
+}

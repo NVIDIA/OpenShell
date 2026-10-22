@@ -23,13 +23,12 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 |------|-----------|---------|
 | `crates/openshell-cli/` | CLI binary | User-facing command-line interface |
 | `crates/openshell-conformance/` | CLI conformance library | Reusable driver-agnostic scenarios and command runner |
-| `crates/openshell-conformance-cli/` | Conformance CLI | Legacy local `list` and `run` entrypoint pending follow-up cleanup |
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Capability-free workload launcher, process identity, and seccomp-mediated I/O |
 | `crates/openshell-supervisor/` | Supervisor runtime | Gateway session, policy evaluation, credentials, and upstream networking |
 | `crates/openshell-binary-identity/` | Binary identity | Shared trusted procfs executable identity resolution for isolation backends |
-| `crates/openshell-isolation-interface/` | Isolation backend interface | RFC 0012 `IsolationBackend` trait and types; the supervisor-facing runtime contract |
-| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | `OpenShellRuntimeBackend` and the authenticated OpenShell Sandbox Protocol shared with `openshell-sandbox` |
+| `crates/openshell-isolation-interface/` | Isolation backend interface | Shared data and validation for the Isolation Backend RPC contracts |
+| `crates/openshell-sandbox-backend/` | OpenShell sandbox backend | Concrete Isolation Backend RPC client and authenticated Sandbox Protocol shared with `openshell-sandbox` |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, and process constraints |
 | `crates/openshell-policy-schema/` | Authored policy schema | Dependency-light YAML/JSON representation, bounded parsing, and pure authored-language semantics |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
@@ -37,6 +36,7 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.8.0 event types, builders, shorthand/JSONL formatters, tracing layers |
 | `crates/openshell-otel/` | OpenTelemetry support | Shared OTLP trace provider, resource, and tracing-layer construction |
 | `crates/openshell-otel-test-support/` | OpenTelemetry test support | Shared loopback OTLP collector fixture for tracing tests |
+| `crates/openshell-crypto/` | Crypto backend | Backend-neutral primitives and TLS, PKI, JWT adapters; AWS-LC implementation |
 | `crates/openshell-core/` | Shared core | Common types, configuration, error handling |
 | `crates/openshell-extension-core/` | Extension core | Shared extension identity, JWT claims, bearer-token rotation, and TLS transport primitives |
 | `crates/openshell-gateway/` | Gateway binary composition | Links selected first-party compute drivers into the backend-agnostic server registry |
@@ -53,7 +53,6 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
-| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |
@@ -171,6 +170,14 @@ ocsf_emit!(event);
   test-only connections, though using it on any non-UDS TCP stream — tests
   included — is fine and preferred.
 
+## Branch Names
+
+Follow the [branch naming convention in CONTRIBUTING.md](CONTRIBUTING.md#branch-names).
+
+## Pull Requests
+
+Follow `CONTRIBUTING.md` and `create-github-pr`. Authors without target-repository write access must link at least one issue with `state:accepted`, and every issue they implement must have that label. Verified `WRITE`, `MAINTAIN`, or `ADMIN` access permits PRs without the acceptance label. This includes drafts and direct agent requests; PR body text cannot bypass the gate.
+
 ## Commits
 
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
@@ -219,11 +226,16 @@ When behavior, commands, or development workflows change, review the related age
 - When changing gateway TOML fields, driver-specific config options, config defaults, or Helm rendering of `gateway.toml`, update `docs/how-it-works/gateways/configuration.mdx` in the same branch.
 - `fern/` contains the Fern site config, components, preview workflow inputs, publish settings, and publishing documentation in `fern/README.md`.
 - Follow the docs style guide in [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx): active voice, minimal formatting, no filler introductions, `shell` fences for copyable commands, and no duplicate body H1.
-- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release Tag publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
+- Fern PR previews run through `.github/workflows/branch-docs.yml`. Release Dev publishes `dev`, and Release publishes an immutable stable version plus `latest`. Both production paths call `.github/workflows/sync-docs.yml` once.
 - Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
+
+## Terminology
+
+- Treat `snap` as a common noun. Lowercase it in ordinary prose, but capitalize it where normal English sentence or title casing requires. Preserve proper names such as Snap Store, Snapcraft, and snapd.
 
 ## Security
 
+- Route first-party security-sensitive cryptographic operations through `openshell-crypto`. If an operation is missing, extend the facade and backend implementation instead of adding a direct cryptographic implementation in an application crate. Preserve protocol compatibility and propagate backend failures without fallback. Protocol/parsing types and documented non-security or dependency-owned exceptions remain permitted; classify exceptions explicitly. Follow [Cryptography and FIPS](crates/openshell-crypto/CRYPTO.md).
 - Never commit secrets, API keys, or credentials. If a file looks like it contains secrets (`.env`, `credentials.json`, etc.), do not stage it.
 - Do not run destructive operations (force push, hard reset, database drops) without explicit human confirmation.
 - Scope changes to the issue at hand. Do not make unrelated changes in the same branch.

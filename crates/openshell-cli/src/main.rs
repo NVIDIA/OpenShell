@@ -3,12 +3,13 @@
 
 //! `OpenShell` CLI - command-line interface for `OpenShell`.
 
+#![forbid(unsafe_code)]
+
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
 use openshell_cli::color::{self, ColorChoice, Colorize};
-use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -858,6 +859,10 @@ enum ProviderCommands {
         #[arg(long = "type")]
         provider_type: String,
 
+        /// Labels to attach to the provider (KEY=VALUE, repeatable).
+        #[arg(long = "label", value_name = "KEY=VALUE")]
+        labels: Vec<String>,
+
         /// Load provider credentials/config from existing local state.
         #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials", "from_oidc_token"])]
         from_existing: bool,
@@ -916,6 +921,10 @@ enum ProviderCommands {
         /// Opaque continuation token from a previous page.
         #[arg(long, default_value = "")]
         page_token: String,
+
+        /// Filter providers by labels (e.g. env=dev,team=ml).
+        #[arg(long)]
+        label_selector: Option<String>,
 
         /// Print only provider names, one per line.
         #[arg(long, conflicts_with = "output")]
@@ -1442,7 +1451,7 @@ enum SandboxCommands {
         name: Option<String>,
 
         /// Create the sandbox from a named sandbox template.
-        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs"])]
+        #[arg(long, conflicts_with_all = ["from", "gpu", "cpu", "memory", "driver_config_json", "envs", "env_from"])]
         template: Option<String>,
 
         /// Sandbox source: a rootfs tar archive (`.tar`, `.tar.gz`, or `.tgz`)
@@ -1459,8 +1468,14 @@ enum SandboxCommands {
         /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
         /// When `SANDBOX_PATH` is omitted, files are uploaded to the container's
         /// working directory.
-        /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
-        /// upload everything.
+        /// Inside a Git work tree, `.gitignore` rules are applied by default.
+        /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+        /// Filtering errors or empty selections stop the upload; use
+        /// `--no-git-ignore` to intentionally upload everything.
+        ///
+        /// Cannot be combined with a trailing command, because uploads finish
+        /// after the main process starts. Create the sandbox without a command,
+        /// then run the workload with `sandbox exec`.
         #[arg(
             long,
             value_hint = ValueHint::AnyPath,
@@ -1578,11 +1593,24 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Attach non-secret annotations to the sandbox (key=value format,
+        /// repeatable). Values may contain `/`, spaces, and `=`.
+        #[arg(long = "annotation", value_name = "KEY=VALUE")]
+        annotations: Vec<String>,
+
         /// Set a non-secret environment variable in the sandbox.
         /// Do not use this option for API keys, tokens, or other secrets; create
         /// a provider and attach it with `--provider` instead. Repeatable.
+        /// Each value is limited to 8 KiB and cannot contain a newline.
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
+
+        /// Set a sandbox environment variable from the CLI process environment.
+        ///
+        /// Format: `KEY[=ENVVAR]`. When `ENVVAR` is omitted, `KEY` is used.
+        /// The value does not appear in the CLI process arguments. Repeatable.
+        #[arg(long = "env-from", value_name = "KEY[=ENVVAR]")]
+        env_from: Vec<String>,
 
         /// Suppress warnings when --env values look like credentials.
         #[arg(long = "no-credential-warnings")]
@@ -1605,6 +1633,7 @@ enum SandboxCommands {
         output: OutputFormat,
 
         /// Command to run after "--" (defaults to an interactive shell).
+        /// Each argument is limited to 32 KiB.
         #[arg(last = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -1764,6 +1793,11 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    ///
+    /// Inside a Git work tree, `.gitignore` rules are applied by default.
+    /// Outside a Git work tree, uploads proceed unfiltered with a warning.
+    /// Filtering errors or empty selections stop the upload; use
+    /// `--no-git-ignore` to intentionally upload everything.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.
@@ -1774,7 +1808,11 @@ enum SandboxCommands {
         #[arg(value_hint = ValueHint::AnyPath)]
         local_path: String,
 
-        /// Destination path in the sandbox (defaults to the container's working directory).
+        /// Destination path in the sandbox (defaults to its working directory).
+        ///
+        /// For an unfiltered single-file upload, an existing directory or a
+        /// trailing slash places the file inside that directory. A missing
+        /// nested path without a trailing slash renames the file.
         dest: Option<String>,
 
         /// Disable `.gitignore` filtering (uploads everything).
@@ -2606,22 +2644,12 @@ async fn run_async() -> Result<()> {
         )
         .init();
 
-    // Propagate verbosity to the OpenSSH LogLevel used by SSH subprocesses.
-    // Only set the env var when it hasn't been explicitly overridden by the
-    // user, so `OPENSHELL_SSH_LOG_LEVEL=DEBUG openshell ...` still wins.
-    if std::env::var("OPENSHELL_SSH_LOG_LEVEL").is_err() {
-        let ssh_log_level = match cli.verbose {
-            0 => "ERROR",
-            1 => "INFO",
-            _ => "DEBUG",
-        };
-        // SAFETY: Called early in main() before spawning async tasks that
-        // read the environment, so no concurrent readers exist.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("OPENSHELL_SSH_LOG_LEVEL", ssh_log_level);
-        }
-    }
+    // SSH commands read an explicit environment override themselves.
+    openshell_cli::ssh::set_default_ssh_log_level(match cli.verbose {
+        0 => "ERROR",
+        1 => "INFO",
+        _ => "DEBUG",
+    });
 
     match cli.command {
         // -----------------------------------------------------------
@@ -3358,7 +3386,9 @@ async fn run_async() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    annotations,
                     envs,
+                    env_from,
                     no_credential_warnings,
                     approval_mode,
                     output,
@@ -3382,21 +3412,17 @@ async fn run_async() -> Result<()> {
                         None // prompt or auto-detect
                     };
 
-                    // Parse --label flags into a HashMap<String, String>.
-                    let mut labels_map = HashMap::new();
-                    for label_str in &labels {
-                        let parts: Vec<&str> = label_str.splitn(2, '=').collect();
-                        if parts.len() != 2 {
-                            return Err(miette::miette!(
-                                "invalid label format '{}', expected key=value",
-                                label_str
-                            ));
-                        }
-                        labels_map.insert(parts[0].to_string(), parts[1].to_string());
-                    }
+                    // Parse --label and --annotation flags into maps.
+                    let labels_map = run::parse_key_value_pairs(&labels, "--label")?;
+                    let annotations_map = run::parse_key_value_pairs(&annotations, "--annotation")?;
 
                     // Parse --env flags into a HashMap<String, String>.
-                    let env_map = run::parse_env_pairs(&envs)?;
+                    let mut env_map = run::parse_env_pairs(&envs)?;
+                    for (key, value) in run::parse_env_from_pairs(&env_from)? {
+                        if env_map.insert(key.clone(), value).is_some() {
+                            return Err(miette::miette!("duplicate environment key '{key}'"));
+                        }
+                    }
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -3406,14 +3432,6 @@ async fn run_async() -> Result<()> {
                             (local, remote, !no_git_ignore)
                         })
                         .collect();
-
-                    // Validate all local paths before creating the sandbox so failures are
-                    // fast and have no side effects.
-                    for (local, _, _) in &upload_specs {
-                        if std::fs::symlink_metadata(local).is_err() {
-                            return Err(miette::miette!("local path does not exist: {}", local));
-                        }
-                    }
 
                     let editor = editor.map(Into::into);
                     let forward = forward
@@ -3453,6 +3471,7 @@ async fn run_async() -> Result<()> {
                             tty_override,
                             auto_providers_override,
                             labels: labels_map,
+                            annotations: annotations_map,
                             environment: env_map,
                             approval_mode: &approval_mode,
                             output: output.as_str(),
@@ -3881,6 +3900,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::Create {
                     name,
                     provider_type,
+                    labels,
                     from_existing,
                     credentials,
                     from_gcloud_adc,
@@ -3905,6 +3925,7 @@ async fn run_async() -> Result<()> {
                         server: endpoint,
                         name: &name,
                         provider_type: provider_type.as_str(),
+                        labels: &labels,
                         credentials: &credentials,
                         credential_source,
                         config: &config,
@@ -4000,6 +4021,7 @@ async fn run_async() -> Result<()> {
                 ProviderCommands::List {
                     page_size,
                     page_token,
+                    label_selector,
                     names,
                     output,
                     all_workspaces,
@@ -4008,6 +4030,7 @@ async fn run_async() -> Result<()> {
                         endpoint,
                         page_size,
                         &page_token,
+                        label_selector.as_deref().unwrap_or_default(),
                         names,
                         output.as_str(),
                         &cli.workspace,
@@ -4332,29 +4355,10 @@ mod tests {
         ));
     }
 
-    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
-    // A static mutex serialises them so concurrent threads don't clobber
-    // each other's environment.
-    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
-    /// then restore the original value.
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = XDG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+    fn with_tmp_xdg(tmp: &std::path::Path, f: impl FnOnce()) {
+        test_environment::Environment::new()
+            .set("XDG_CONFIG_HOME", tmp)
+            .run(f);
     }
 
     fn edge_metadata(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -4876,6 +4880,35 @@ mod tests {
             "sandbox create with no --upload should succeed, got: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn sandbox_create_upload_conflicts_with_command_and_help_says_so() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            ".",
+            "--",
+            "true",
+        ])
+        .expect_err("--upload with a trailing command should be rejected");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let cmd = Cli::command();
+        let create = cmd
+            .find_subcommand("sandbox")
+            .and_then(|c| c.find_subcommand("create"))
+            .expect("missing sandbox create subcommand");
+        let help = create
+            .get_arguments()
+            .find(|a| a.get_id() == "upload")
+            .and_then(|a| a.get_long_help())
+            .expect("--upload has long help")
+            .to_string();
+        assert!(help.contains("Cannot be combined with a trailing command"));
+        assert!(help.contains("sandbox exec"));
     }
 
     #[test]
@@ -5678,6 +5711,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_create_accepts_labels_with_each_credential_source() {
+        for source in [
+            vec![],
+            vec!["--from-existing"],
+            vec!["--credential", "GITHUB_TOKEN=token"],
+            vec!["--from-gcloud-adc"],
+            vec!["--from-oidc-token"],
+            vec!["--runtime-credentials"],
+        ] {
+            let mut args = vec![
+                "openshell",
+                "provider",
+                "create",
+                "--name",
+                "labeled",
+                "--type",
+                "github",
+                "--label",
+                "env=dev",
+                "--label",
+                "team=ml",
+            ];
+            args.extend(source);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Commands::Provider {
+                    command: Some(ProviderCommands::Create { labels, .. }),
+                }) => assert_eq!(labels, ["env=dev", "team=ml"]),
+                other => panic!("expected provider create, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn provider_list_accepts_label_selector_in_all_output_modes() {
+        for output in [
+            vec![],
+            vec!["--names"],
+            vec!["-o", "json"],
+            vec!["-o", "yaml"],
+        ] {
+            let mut args = vec![
+                "openshell",
+                "provider",
+                "list",
+                "--all-workspaces",
+                "--label-selector",
+                "env=dev,team=ml",
+            ];
+            args.extend(output);
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.command {
+                Some(Commands::Provider {
+                    command:
+                        Some(ProviderCommands::List {
+                            label_selector,
+                            all_workspaces,
+                            ..
+                        }),
+                }) => {
+                    assert_eq!(label_selector.as_deref(), Some("env=dev,team=ml"));
+                    assert!(all_workspaces);
+                }
+                other => panic!("expected provider list, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn provider_create_accepts_no_credential_source() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -6133,6 +6235,33 @@ mod tests {
             } else {
                 panic!("expected SandboxCommands::Create");
             }
+        }
+    }
+
+    #[test]
+    fn sandbox_create_annotation_is_repeatable() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--annotation",
+            "policy-source-file=/home/you/my policy.yaml",
+            "--annotation",
+            "owner=platform",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { annotations, .. }),
+                ..
+            }) => assert_eq!(
+                annotations,
+                vec![
+                    "policy-source-file=/home/you/my policy.yaml".to_string(),
+                    "owner=platform".to_string(),
+                ]
+            ),
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
     }
 
@@ -7050,3 +7179,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

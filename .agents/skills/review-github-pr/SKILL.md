@@ -39,10 +39,27 @@ gh pr list --head "<branch>" --state open
 Retrieve the PR metadata:
 
 ```bash
-gh pr view <number> --json title,body,state,headRefName,baseRefName,labels,author
+gh pr view <number> --json title,body,state,headRefName,baseRefName,labels,author,closingIssuesReferences
 ```
 
 Record the **title**, **body**, **headRefName**, and **baseRefName** for use in later steps.
+
+### Check Issue Acceptance
+
+Inspect every closing issue reference (paginate as needed) and fetch its current
+repository and labels. Verify the PR author's permission in the target repository:
+
+```bash
+gh api repos/OWNER/REPO/collaborators/AUTHOR/permission --jq .permission
+```
+
+Call out each linked issue missing `state:accepted`, with an issue link. Verified
+`write`, `maintain`, or `admin` access permits the exception; report it as context,
+not a blocking concern. Other authors need at least one target-repository issue,
+and every linked issue must be accepted; report violations under **Potential
+Concerns**. PR body text such as `No issue required` does not bypass this gate.
+Report failed lookups as unverified and continue the code review. For a branch
+without a PR, note that issue acceptance was not verified.
 
 ## Step 3: Generate the Diff
 
@@ -136,6 +153,7 @@ Read through the full diff (and the PR description if available). Produce a summ
     suggested change.
   - Do not fabricate concerns or claim a behavioral regression without evidence
     for both the prior and proposed behavior.
+- **Cryptographic boundaries**: For changed first-party security-sensitive crypto, verify use of `openshell-crypto`, backend dispatch, failure propagation without fallback, and protocol/storage compatibility. Missing operations belong in the facade/backend contracts. Check dependency-owned and non-security exceptions against the repository's [crypto architecture](../../../crates/openshell-crypto/CRYPTO.md); protocol/parsing types alone are not bypasses. Report undocumented bypasses or scope expansion under **Potential Concerns**.
 - **Agent infrastructure**: When the PR changes behavior, commands, or development workflows, use the `sync-agent-infra` maintenance map to check that related skills were updated. When it adds, removes, or renames skills or crates; changes workflow relationships or skill coverage; modifies issue or PR templates; or changes agent cross-references, apply the full consistency checklist. Report missing companion updates or drift under **Potential Concerns**.
 
 ## Step 5: Output
@@ -173,9 +191,9 @@ User says: "Review PR #456"
 
 ### Review by branch name
 
-User says: "Review branch `feature/add-pagination`"
+User says: "Review branch `feat/1234-add-pagination/octocat`"
 
-1. Look up PR with `gh pr list --head "feature/add-pagination"`
+1. Look up PR with `gh pr list --head "feat/1234-add-pagination/octocat"`
 2. If found, fetch PR metadata and diff
 3. If not found, diff against main locally
 4. Produce summary

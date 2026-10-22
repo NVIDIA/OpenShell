@@ -45,6 +45,18 @@ struct Args {
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that supervisors downgrade exported events to.
+    #[arg(
+        long,
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        requires = "otlp_ocsf_endpoint"
+    )]
+    otlp_ocsf_schema_version: Option<String>,
+
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
 
@@ -87,6 +99,16 @@ struct Args {
     )]
     sandbox_image_pull_secrets: Vec<String>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_ALLOWED_POD_ANNOTATIONS",
+        value_delimiter = ','
+    )]
+    allowed_pod_annotations: Vec<String>,
+
+    #[arg(long, env = "OPENSHELL_K8S_ALLOWED_POD_LABELS", value_delimiter = ',')]
+    allowed_pod_labels: Vec<String>,
+
     #[arg(long, env = "OPENSHELL_MANAGED_SSH_INGRESS_ENABLED")]
     managed_ssh_ingress_enabled: bool,
 
@@ -116,13 +138,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
-    #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE")]
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
     sandbox_runtime_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_RUNTIME_IMAGE_PULL_POLICY")]
     sandbox_runtime_image_pull_policy: Option<KubernetesImagePullPolicy>,
 
-    #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
     supervisor_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
@@ -238,6 +260,7 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let driver = KubernetesComputeDriver::new(
         KubernetesComputeConfig {
+            supervisor_topology: None,
             allow_driver_config: args.admission_config_json.allow_driver_config,
             resource_admission: args.admission_config_json.resource_admission.clone(),
             workspace_mode: args.workspace_mode,
@@ -273,6 +296,14 @@ async fn main() -> Result<()> {
             proxy_connect_by_hostname: args.proxy_connect_by_hostname.then_some(true),
             proxy_ca_bundle: args.proxy_ca_bundle,
             grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
+            supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+            supervisor_gateway_name: args.gateway_name.clone(),
+            supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
+                openshell_core::sandbox_env::OcsfOtlpExport {
+                    endpoint,
+                    schema_version: args.otlp_ocsf_schema_version.clone(),
+                }
+            }),
             ssh_socket_path: args.sandbox_ssh_socket_path,
             client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
             host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
@@ -287,6 +318,8 @@ async fn main() -> Result<()> {
                 .unwrap_or_default(),
             default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
                 .unwrap_or_default(),
+            allowed_pod_annotations: args.allowed_pod_annotations,
+            allowed_pod_labels: args.allowed_pod_labels,
             sa_token_ttl_secs: args.sa_token_ttl_secs,
             provider_spiffe_workload_api_socket_path: args
                 .provider_spiffe_workload_api_socket_path

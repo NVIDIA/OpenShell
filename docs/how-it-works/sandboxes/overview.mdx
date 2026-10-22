@@ -33,6 +33,9 @@ attaching:
 openshell sandbox create --name worker --detach -- ./worker
 ```
 
+Drivers that do not support foreground attachment reject the request before
+provisioning. Use `--detach` with those drivers.
+
 Use `--restart-policy on-failure` to replace the runtime after a nonzero main
 process exit, or `--restart-policy always` to replace it after every exit:
 
@@ -75,6 +78,10 @@ sandbox after that process exits.
 finish after the canonical process starts. Create a scratch sandbox, upload the
 files, then launch the workload with `sandbox exec`, or build the files into the
 sandbox image.
+
+The trailing command takes at most 256 arguments. Each argument is limited to
+32 KiB and all arguments together to 256 KiB. Send a larger input, such as a
+long system prompt, with `sandbox upload` and read it inside the sandbox.
 
 For automation, use `--output json` or `--output yaml` to get machine-readable sandbox metadata after creation:
 
@@ -157,7 +164,9 @@ device.
 Exact GPU device selection is driver-specific and still requires `--gpu`. For
 Docker or Podman, pass CDI IDs through `cdi_devices`. The top-level key must
 match the active driver; replace `docker` with `podman` when using Podman. CDI
-IDs are treated as opaque strings. The list must not contain duplicate IDs, and
+IDs must be valid CDI qualified names (`<vendor>/<class>=<name>`); host-device
+paths are rejected. Explicit selectors are not restricted to NVIDIA names.
+The list must not contain duplicate IDs, and
 its length must match the effective GPU count:
 
 ```shell
@@ -334,12 +343,16 @@ as it arrives. The CLI closes remote stdin when the pipe reaches EOF and
 continues reading command output until the command finishes. Redirect stdin
 from `/dev/null` when a command needs no input.
 
+If streamed stdin exceeds the 4 MiB limit, the CLI reports an error and warns that the command may already have processed partial input. Cancellation does not undo that work.
+
 The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
 Large stdout and stderr streams are delivered before a successful exit. A slow
 reader backpressures the command. If output delivery fails, `exec` returns a
 failure instead of reporting success with incomplete output.
 If a background process keeps stdout or stderr open for more than 30 seconds
 after the command exits, `exec` reports an output delivery failure.
+
+A failed final gRPC status also makes the CLI report failure, even if the remote command reported exit code zero. The CLI does not automatically retry the execution.
 
 Run an interactive shell with a TTY:
 
@@ -383,6 +396,16 @@ openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
 
 Variables set with `--env` are available to all processes in the sandbox, including the initial command, interactive shells, and exec commands.
 
+Use `--env-from KEY[=ENVVAR]` when the value should come from the CLI process environment instead of appearing in the CLI process arguments. If `ENVVAR` is omitted, OpenShell reads `KEY`:
+
+```shell
+export SESSION_TOKEN="..."
+openshell sandbox create --env-from SESSION_TOKEN -- my-agent
+openshell sandbox create --env-from AGENT_TOKEN=SESSION_TOKEN -- my-agent
+```
+
+`--env-from` changes only how the CLI receives the value. The resulting variable is still available to processes in the sandbox, just like `--env`.
+
 When an `--env` key looks like a credential — a known provider variable, or a name whose underscore-separated segments include a credential word such as `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `API_KEY`, `ACCESS_KEY`, or `SECRET_KEY` (for example `DB_TOKEN` or `MY_ACCESS_KEY`) — `sandbox create` prints a non-blocking warning. Matching is on whole segments, so unrelated names like `TOKENIZERS_PARALLELISM` or `PASSWORDLESS_LOGIN` do not warn. The agent inside the sandbox can read plain environment values directly, so to hide a secret from the agent, attach it through a [profile-backed provider](/how-it-works/providers/profiles) with `--provider` instead. Suppress the warning with `--no-credential-warnings`. Detection uses the key name only; values are never inspected or printed.
 
 You can also set per-command environment variables with `sandbox exec`:
@@ -394,6 +417,10 @@ openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
 Per-command variables override the sandbox-level environment for that command only.
 
 Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
+
+`sandbox create` accepts at most 128 variables. Each value is limited to 8 KiB
+and cannot contain a newline, and all names and values together are limited to
+256 KiB. Send larger or multi-line values with `sandbox upload`.
 
 ## Label a Sandbox
 
@@ -408,6 +435,12 @@ List only the sandboxes that match a label selector:
 ```shell
 openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
+```
+
+Use `--annotation KEY=VALUE` for non-secret metadata that does not fit label limits, such as a file path. Annotation values can contain `/`, spaces, and `=`, and appear in the `annotations` field of `sandbox get -o json` and `sandbox list -o json`.
+
+```shell
+openshell sandbox create --annotation "policy-source-file=/home/you/policies/research policy.yaml" -- claude
 ```
 
 The Python SDK accepts the same gateway labels and selectors. Labels passed to
@@ -512,13 +545,11 @@ console.log(sandbox.serviceUrls[''])
 
 ```go
 sandbox, err := client.Sandboxes().Create(
-    ctx, "default", "app-server", spec, nil,
-    v1.CreateOptions{ServiceExposures: []v1.ServiceExposure{
-        {
-            TargetPort: 4500,
-            AuthorizationMode: v1.ServiceAuthorizationModeBearerPassthrough,
-        },
-    }},
+    ctx, "default", "app-server", spec,
+    v1.WithServiceExposures(v1.ServiceExposure{
+        TargetPort:        4500,
+        AuthorizationMode: v1.ServiceAuthorizationModeBearerPassthrough,
+    }),
 )
 fmt.Println(sandbox.ServiceURLs[""])
 ```
@@ -699,9 +730,9 @@ openshell sandbox get my-sandbox --policy-only
 
 ### Diagnose Failed Calls to Tool Servers
 
-A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This information is available for configured endpoints that use MCP over HTTP. It helps you find where the call failed without changing sandbox readiness.
+A sandbox can be `Ready` while an agent's call to an external tool server fails with `fetch failed`. Run `openshell sandbox get my-sandbox` and look under `Tool server connections` for the server's address, `Last result`, and `Reported at`. This is available for configured MCP-over-HTTP endpoints and does not change sandbox readiness.
 
-JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the corresponding timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`; SDKs render it using their native or curated time representation. Select the endpoint by its address to read the result directly. Treat `endpoint_id` as opaque.
+JSON and YAML output include an `endpoint_statuses` list with `last_reported_at`. The protobuf API exposes the same timestamp as `Sandbox.status.endpoint_statuses[].last_reported_time`, which SDKs render in their own time type. Select an endpoint by its address; `endpoint_id` is opaque.
 
 For example, use `jq` to select the tool server at `tools.example.com`, path `/mcp`, and port `443`:
 
@@ -715,22 +746,45 @@ openshell sandbox get my-sandbox --output json | jq -e \
 
 Read `last_result` to choose the next check:
 
-- `NoObservedExchange`: no result has been reported for the current configuration and supervisor session. Try the operation and inspect its logs if no result appears.
-- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Informational responses alone do not establish success. Check the client's response for protocol or tool errors; an HTTP 200 response can still contain an error.
+- `NoObservedExchange`: nothing has been reported for the current configuration and supervisor session. Try the operation, then check the logs if no result appears.
+- `HttpResponseReceived`: the server returned a final HTTP status below 400, including a protocol upgrade. Check the client's response for protocol or tool errors, because an HTTP 200 can still carry one.
 - `PolicyDenied`: OpenShell denied the request, including MCP protocol-version, request-header, request-body, and HTTP-method checks. Check the sandbox policy and denial logs.
-- `CredentialUnavailable`: required credentials were unavailable. Check the endpoint's attached provider.
+- `CredentialUnavailable`: a required credential was unavailable. Check the attached provider and [diagnose the token grant failure](#read-token-grant-failures).
 - `TlsFailed`: TLS setup or the handshake failed. Check certificates and TLS configuration.
 - `TransportFailed`: the network exchange failed. Check name resolution, connectivity, and the server process.
-- `UpstreamRejected`: the server returned an HTTP status of 400 or higher. Check the server's response and logs.
-- `Unspecified`: the result is unrecognized or absent. Do not infer success from it.
+- `UpstreamRejected`: the server returned HTTP 400 or higher. Check the server's response and logs.
+- `Unspecified`: the result is unrecognized or absent. Do not infer success.
 
-For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After the server recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
+For example, a stopped server can produce `TransportFailed` while the sandbox stays `Ready`. After it recovers, an HTTP response below 400 updates the result to `HttpResponseReceived`.
 
-Results come from actual traffic and do not expire. A result can remain unchanged after the server stops until another observed exchange or configuration/session reset. Reports combine recent observations and can drop them when full, so this list is not a request history. The address remains available when a result resets to `NoObservedExchange`. To verify current tool availability, run the actual operation.
+Results come from actual traffic and do not expire, so one can outlast the server until another exchange is observed or the configuration or session resets. Reports can drop observations when full, so this is not a request history. The address remains after a reset to `NoObservedExchange`. To verify current availability, run the operation.
 
-`last_reported_at` is the RFC 3339 rendering of the protobuf `last_reported_time` when the gateway accepted the result. It is empty until a result is reported. New accepted observations advance it, including repeated results; identical report retries do not. If a configuration reset supersedes a report whose acknowledgement was lost, the gateway can accept still-valid pending evidence again and advance this timestamp without another exchange.
+`last_reported_at` is the RFC 3339 form of `last_reported_time`, the time the gateway accepted the result. It is empty until a result is reported. Each newly accepted observation advances it, including a repeated result; a retry of an identical report does not.
 
-Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record that combines observations from all callers and ports; it does not establish that every caller or port works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one distinct endpoint. If several configured paths share that host and port, inspect the logs for the failure.
+Addresses use lowercase hosts, canonical paths, and sorted distinct effective ports. Equivalent addresses share one record across all callers and ports, so it does not show that every one works. A failure before the HTTP path is known, such as a TLS failure during CONNECT, updates status only when the host and port identify one endpoint. Otherwise, check the logs.
+
+### Read Token Grant Failures
+
+When OpenShell cannot obtain a required token, the workload receives HTTP 502 with an `x-openshell-request-id` header. The response hides the cause. If you can read the sandbox, inspect its latest failure:
+
+```shell
+openshell sandbox get my-sandbox --output json | jq '.last_token_grant_failure'
+```
+
+Match `failure.request_id` to the response header; a newer failure may have replaced the record. It identifies the destination host and port, failure code, stage, and recovery action. Provider and credential names appear when known; credential values never appear.
+
+| Recovery action | Next step |
+|---|---|
+| `reauthorize` | Authorize the provider again. |
+| `fix_configuration` | Repair the provider, grant, or workload identity configuration. |
+| `retry` | Retry later. |
+| `investigate` | Check supervisor and gateway logs using the request ID. |
+
+For MCP-over-HTTP endpoints, `Tool server connections` also shows the cause as `last_failure` under `CredentialUnavailable`. A credential failure does not establish that the remote server is unhealthy.
+
+The sandbox retains one latest failure, not a request history. A successful grant for the same destination, provider, and credential clears it; failures before credential selection clear on the next successful grant to that destination. Policy, provider, and supervisor-session resets also clear it. JSON/YAML shows `null` when no failure remains.
+
+See [Token Grant Failures](/how-it-works/providers/profiles#token-grant-failures) for failure-code definitions and token-service behavior.
 
 ### Inspect Logs and Activity
 
@@ -759,6 +813,8 @@ The dashboard has three panels stacked vertically: Gateways, Providers (or Globa
 
 The sandbox table’s NOTES column shows `Invalid config` when policy or provider configuration blocks provisioning. Open the sandbox detail view for the full rejection reason, or run `openshell sandbox get <name> -o json`. The note clears after the configuration is repaired; active port forwards remain listed.
 
+Press `c` in the Sandboxes panel to create a sandbox. In the optional Command field, use quotes or backslashes to group arguments containing spaces. For example, `/bin/sh -c "echo GOOD; read x"` prints `GOOD` and waits for Enter. Invalid quoting keeps the form open without creating a sandbox. The field does not expand variables or evaluate shell operators; invoke a shell explicitly with `sh -c` when you need that behavior.
+
 ## Port Forwarding
 
 Forward a local port to a running sandbox to access services inside it, such as a web server or database:
@@ -769,6 +825,14 @@ openshell forward start 8000 my-sandbox -d    # run in background
 ```
 
 OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
+
+To bind the local side to an IPv6 loopback address, pass it positionally as `[bind_address:]port`. IPv6 addresses are bracketed in both the SSH forward argument and the printed access URL:
+
+```shell
+openshell forward start ::1:8000 my-sandbox
+# Local URL: http://[::1]:8000/
+```
+
 CLI forwards run independently of SSH multiplexing settings in your SSH config.
 Foreground forwards end when the command exits; only background forwards appear in `forward list`.
 
@@ -805,6 +869,29 @@ openshell sandbox create --from registry.example.com/your-org/claude-agent:lates
 
 ## SSH Config
 
+Each sandbox has its own SSH host key. The key stays the same when the
+supervisor or container restarts, a pod is rescheduled, or the sandbox is
+stopped and started. Deleting the sandbox removes its key. Creating another
+sandbox with the same name creates a different key.
+
+The gateway returns the public fingerprint in `Sandbox.host_key_fingerprint`
+from sandbox creation, lookup, and listing, and in
+`CreateSshSessionResponse.host_key_fingerprint`. The value uses OpenSSH's
+`SHA256:<base64>` format. Read it over an authenticated gateway connection,
+pin it to the sandbox ID, and reject SSH connections that present a different
+fingerprint. This also applies to clients that connect directly to the
+supervisor's SSH socket.
+
+The gateway keeps the private key in its credential store and delivers it
+only to the supervisor. The sandbox workload cannot read the key. Drivers,
+gateway, and supervisor must use the matching OpenShell release. Older
+runtimes can return an empty fingerprint; an empty value cannot verify an
+SSH server's identity.
+
+The CLI and TUI continue to use their existing SSH connection settings.
+Exposing the fingerprint does not enable automatic host-key verification in
+those clients.
+
 Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
 
 ```shell
@@ -821,6 +908,16 @@ Upload files from your host into the sandbox:
 openshell sandbox upload my-sandbox ./src
 ```
 
+Uploads stream with bounded buffering and wait for the sandbox to consume
+data, so the 4 MiB process-input budget does not limit the total upload size.
+Upgrade both the CLI and the supervisor runtime used by your sandboxes to use
+this behavior. The CLI reports an unsupported upload protocol before sending
+file data to an older supervisor.
+
+Uploads extract directly into the destination. If you cancel an upload or it
+fails, files already extracted remain and may be incomplete. Retry against the
+existing sandbox after checking the destination, or remove the partial files.
+
 When you omit the destination, OpenShell discovers the sandbox's working
 directory and uploads there. For a named local directory, OpenShell preserves
 the basename, matching `scp -r` and `cp -r`. If that directory already exists,
@@ -828,6 +925,8 @@ the upload merges into it and overwrites matching entries without deleting
 unrelated entries.
 
 OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
+
+For a single file uploaded without Git filtering, an existing destination directory receives `<directory>/<source-basename>`, with or without a trailing `/`. A symlink to a destination directory is preserved, and the file is written inside its target. A missing nested destination without `/` at the end instead names the uploaded file. For example, `openshell sandbox upload my-sandbox ./config.json /sandbox/settings.json --no-git-ignore` writes `settings.json`; uploading to an existing `/sandbox/settings` directory writes `settings/config.json`. Successful unfiltered uploads print the resulting path. Git-filtered uploads still treat the destination as a directory.
 
 Download files from the sandbox to your host:
 
@@ -847,20 +946,36 @@ directory are also accepted.
 <Note>
 You can also upload files at creation time with the `--upload` flag on
 `openshell sandbox create`. Pass `--upload` multiple times to upload
-several paths in a single command:
+several paths in a single command. You cannot add a trailing command, so run
+the workload from the shell that opens or with `sandbox exec`:
 
 ```shell
-openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
+openshell sandbox create --from registry.example.com/your-org/claude-agent:latest --upload ./src:/workspace/src --upload ./config:/workspace/config
 ```
 
 </Note>
 
 By default, uploads inside a Git repository respect `.gitignore` rules so that
 build artifacts, dependency caches, and other ignored files are not transferred.
-If `.gitignore` filtering excludes every file in the upload path, the CLI falls
-back to an unfiltered upload and prints a warning. Pass `--no-git-ignore` to
-opt into unfiltered uploads explicitly, upload a path outside the Git work
-tree, or force-add the intended files if they should remain Git-aware.
+The CLI stops the affected upload if Git filtering fails or selects no files.
+When the CLI confirms that the source is outside a Git work tree, it uploads
+without filtering and warns that `.gitignore` rules are not applied. Git must
+be installed to determine whether filtering applies. A broken or inaccessible
+repository stops the upload. Pass `--no-git-ignore` to intentionally upload
+without filtering. These rules apply to both `sandbox upload` and
+`sandbox create --upload`.
+
+`sandbox create --upload` checks every upload locally before it provisions the
+sandbox. If any upload is rejected, including a missing path or a Git filtering
+failure, the command exits with an error and creates no sandbox. If a transfer
+fails after provisioning, the sandbox remains running and earlier uploads may
+have completed. Use `openshell sandbox upload` to retry against the existing
+sandbox, or `openshell sandbox delete` to remove it. Add `--no-git-ignore` to the
+retry only if you intend to upload without filtering.
+
+Uploads preserve symlinks, including dangling links, instead of dereferencing
+their targets. A symlink source bypasses Git filtering so the link itself is
+archived.
 
 ## Stop and Start Sandboxes
 
@@ -884,6 +999,10 @@ Stop and start are idempotent. You can also start a retained `Completed` or
 command. Starting a fresh instance invalidates SSH sessions issued for the
 previous runtime generation. Delete an inactive sandbox normally when you no
 longer need its retained state.
+
+If an infrastructure failure leaves a sandbox in `Error`, fix the reported cause, then run `sandbox stop` followed by `sandbox start`. Wait for stop to succeed before starting. This retains the sandbox and its persistent workspace on backends that support restarting stopped sandboxes; it cannot recover deleted resources or storage.
+
+For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
 ## Delete Sandboxes
 
@@ -921,30 +1040,24 @@ Management operations remain available while startup is blocked. After repair,
 the supervisor completes startup without recreating the sandbox. Starting a
 stopped sandbox repeats configuration admission before launching its workload.
 
-The gateway enforces a 300-second provisioning repair window, independently of
-the CLI wait timeout. An effective policy, settings, provider, profile, or
-attachment change resets the window from its stored change time. The first
-failed configuration load for that change grants another full window. Repeated
-failures and reconnects do not extend it; reaching `Ready` clears it.
+Image preparation and initial supervisor startup have an absolute deadline of 1800 seconds by default, independently of the CLI wait timeout. Operators can set `image_preparation_timeout_seconds` in `[openshell.gateway]` to any value from 1 through 86400. Each new create or explicit start stores its deadline. Progress events, configuration edits, and gateway or driver restarts cannot extend it. Changing the gateway setting affects new attempts only.
 
-When the window expires, the sandbox enters `Error` with reason
-`ProvisioningTimedOut`. The gateway stops its workload and supervisor compute,
-retaining the sandbox record, diagnostic, and restartable storage. Cleanup can
-remain pending if the backend is unavailable; the gateway retries it. Inspect
-`provisioning` in JSON output for the deadline, timeout, and cleanup timestamps.
-TUI NOTES distinguishes pending cleanup from reclaimed compute.
+The first authenticated configuration report from the current supervisor ends preparation and starts a separate 300-second admission repair window. A slow image download therefore does not consume time reserved for fixing policy. During admission, an effective policy, settings, provider, profile, or attachment change resets the window from its stored change time. The first failed configuration load for that change grants another full window. Repeated failures, duplicate reports, and reconnects do not extend it; reaching `Ready` clears it.
 
-Repair the configuration, wait for cleanup to complete, then explicitly restart:
+Preparation expiry sets the sandbox to `Error` with reason `ImagePreparationTimedOut`; admission repair expiry uses `ProvisioningTimedOut`. The gateway stops its workload and supervisor compute, retaining the sandbox record, diagnostic, and restartable storage. Cleanup can remain pending if the backend is unavailable; the gateway retries it. Inspect `provisioning` in JSON output for the active `phase`, `deadline`, original `preparation_deadline`, `admission_start_time`, and cleanup timestamps. TUI NOTES identifies preparation timeout and distinguishes pending cleanup from reclaimed compute.
+
+The gateway keeps each submitted create or start operation running after its caller disconnects, its deadline expires, or monitoring fails. This includes recovery and the stop/start sequence for automatic restart. While `driver_operation_pending` is true, explicit start, stop, and deletion are blocked; automatic restart keeps its schedule and waits. Timeout cleanup can try to stop partial compute, but it cannot declare completion until the original driver call returns and a subsequent stop succeeds. This prevents a stop that observed missing compute from allowing a retry just before the original create finishes. Uploaded rootfs archives remain available to the owned operation.
+
+An actual driver response clears the pending flag, including ordinary rejection errors. The gateway retains `driver_operation_id` so a delayed response handler cannot change newer recovery work on the same provisioning attempt. Both fields appear in the `provisioning` JSON object. Backend behavior after a transport error still follows the driver's existing contract. If the owning gateway crashes before recording the response, the flag and any protected upload can remain indefinitely; restart and age alone cannot establish that the operation finished. There is currently no API to resolve that lost ownership, so automatic cleanup completion, retry, and deletion remain blocked for that record.
+
+For `ImagePreparationTimedOut`, inspect image preparation and supervisor startup diagnostics and check whether the configured preparation budget is sufficient. For `ProvisioningTimedOut`, repair the rejected configuration. In either case, wait for cleanup to complete, then explicitly restart:
 
 ```shell
 openshell sandbox get my-sandbox --output json
 openshell sandbox start my-sandbox
 ```
 
-Editing configuration after expiry does not restart compute. A retry gets a new
-300-second window, while static-policy restrictions from any previous activation
-remain in force. Timed-out records are retained even for ephemeral creates; use
-`sandbox delete` when you no longer need the diagnostic or stored state.
+Editing configuration after expiry does not restart compute. An explicit retry gets a new preparation deadline and a separate admission repair window, while static-policy restrictions from any previous activation remain in force. Attempts already active when the gateway is upgraded retain their stored deadline. Timed-out records are retained even for ephemeral creates; use `sandbox delete` when you no longer need the diagnostic or stored state.
 
 | Phase        | Description                                                                                                                                                    |
 | ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |

@@ -28,6 +28,7 @@ owo-colors = { workspace = true }
 serde = { workspace = true }
 url = { workspace = true }
 indexmap = { workspace = true }
+shell-words = { workspace = true }
 
 [lints]
 workspace = true

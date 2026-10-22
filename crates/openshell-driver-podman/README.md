@@ -7,6 +7,13 @@ REST API over a Unix socket. Each sandbox has two independent containers:
 - `openshell-supervisor` evaluates policy, holds gateway credentials, and
   proxies approved egress in a separate companion container.
 
+New containers dial the supervisor over a separate private Unix socket volume
+at `/.openshell/channel/control/control.sock`; workload networking remains
+`none`. The supervisor's bootstrap-key mount stays read-only. Restart metadata
+records the direction, with missing metadata retaining the legacy runtime
+listener. Deploy matching supervisor and sandbox runtime binaries for new
+containers.
+
 The driver provisions placement, identity, credentials, transport, and lifecycle.
 The shared isolation interface supplies exec, attach, signal, terminate, binary
 identity, DNS, TCP, and loopback-forwarding semantics.
@@ -43,7 +50,9 @@ stopped Podman container does not populate nested named volumes. Restart restore
 only the channel bootstrap into the existing channel volume, preserving the
 workspace. The workload starts before the supervisor so its user namespace exists
 when the supervisor joins it; a stopped supervisor resolves that namespace again
-on its next start.
+on its next start. The driver creates the managed workspace volume owned by
+the workload's final UID and GID, so the workload never starts as root. Custom
+image workspaces have no workspace volume or upload.
 
 The runtime must pass the sandbox's unprivileged enforcement probe, including
 nested seccomp notification and Landlock. Unsupported runtime defaults fail
@@ -90,6 +99,24 @@ workload; user-namespace modes that cannot use image volumes retain the trusted
 binary extraction path. `supervisor_image` supplies the dynamically linked
 glibc `/openshell-supervisor` binary outside the workload. Image and request
 environment belong to agent children, never the supervisor process.
+
+## OCI working directory
+
+OpenShell reads `WORKDIR` from the workload image. If it is unset, `/`, or
+`/sandbox`, OpenShell uses its managed `/sandbox` workspace volume. A custom
+path must be absolute and normalized, and cannot overlap `/proc`, `/sys`,
+`/dev`, OpenShell-reserved paths, or the workload's private control and CA
+mounts. Image volumes and driver mounts cannot cover it; mounts nested below it
+remain valid.
+
+A custom path stays in the image's container filesystem with its ownership and
+permissions. The workload starts as the final non-root user, which must be able
+to reach and write the directory. Agent commands use the path as their working
+directory.
+
+Custom workspace contents survive stop/start of the same workload container,
+but are removed with that container. They do not live in a managed named volume
+and are not copied to a replacement container.
 
 ## Lifecycle and readiness
 

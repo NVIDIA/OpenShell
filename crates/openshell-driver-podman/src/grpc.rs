@@ -683,6 +683,7 @@ mod tests {
                 StubResponse::new(StatusCode::NO_CONTENT, ""), // channel
                 // list_containers returns empty (container already gone)
                 StubResponse::new(StatusCode::OK, "[]"),
+                StubResponse::new(StatusCode::NO_CONTENT, ""), // control volume
                 // remove_volume
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
@@ -711,7 +712,7 @@ mod tests {
             .clone();
         assert!(requests[2].contains("/libpod/containers/json"));
         assert_eq!(
-            requests[3],
+            requests[4],
             format!(
                 "DELETE {}",
                 api_path(&format!("/libpod/volumes/{volume_name}"))

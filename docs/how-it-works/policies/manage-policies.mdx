@@ -368,14 +368,11 @@ openshell sandbox get my-sandbox --output json
 
 The same repair window applies when the gateway refuses an image-policy upload or a policy update that adds baseline filesystem paths with `FAILED_PRECONDITION` or `INVALID_ARGUMENT`. After the gateway acknowledges the rejection report, startup waits two seconds, reads a fresh configuration, and retries. If your repair reaches the gateway before that report, startup immediately reads the repaired configuration. The sandbox log records the gateway's reason; repeated refusals of the same write, status code, and configuration are logged once. Authentication and authorization failures still stop startup.
 
-You have 300 seconds to fix the configuration. Replace the policy with
-`openshell policy set`, or fix the provider configuration. Until the workload
-first starts, you can also change filesystem, Landlock, and process settings.
-Each change to the policy, providers, or settings restarts the 300 seconds.
+You have 300 seconds to fix the configuration after the supervisor starts admission. Image preparation has its own deadline and does not consume that repair time. Replace the policy with `openshell policy set`, or fix the provider configuration. Until the workload first starts, you can also change filesystem, Landlock, and process settings. Each effective change to the policy, providers, or settings restarts the 300 seconds; writing an unchanged value does not.
 
 If the time runs out, the sandbox moves to `Error` with the reason
 `ProvisioningTimedOut`. Fixing the configuration does not restart it. After you
-fix it, start the sandbox again, which begins a new 300-second window:
+fix it, start the sandbox again. Admission gets a new 300-second window after preparation:
 
 ```shell
 openshell sandbox start my-sandbox

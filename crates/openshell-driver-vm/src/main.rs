@@ -9,7 +9,7 @@ use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServ
 #[cfg(target_os = "macos")]
 use openshell_driver_vm::{VM_RUNTIME_DIR_ENV, configured_runtime_dir};
 use openshell_driver_vm::{
-    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VsockPortMap, procguard, run_vm,
+    VmBackend, VmDriver, VmDriverConfig, VmLaunchConfig, VmMount, VsockPortMap, procguard, run_vm,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -34,6 +34,9 @@ struct Args {
     admission_config_json: openshell_core::resource_admission::DriverAdmissionConfig,
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
+
+    #[arg(long, hide = true)]
+    internal_prepare_image: Option<PathBuf>,
 
     #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
     vm_root_disk: Option<PathBuf>,
@@ -96,6 +99,18 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
+
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that supervisors downgrade exported events to.
+    #[arg(
+        long,
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        requires = "otlp_ocsf_endpoint"
+    )]
+    otlp_ocsf_schema_version: Option<String>,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -224,6 +239,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_PROXY_CA_BUNDLE")]
     proxy_ca_bundle: Option<String>,
 
+    #[arg(long, env = "OPENSHELL_VM_ENABLE_BIND_MOUNTS", default_value_t = false)]
+    enable_bind_mounts: bool,
+
     #[arg(long, env = "OPENSHELL_VM_ROOTFS_TAR_STAGING_DIR")]
     rootfs_tar_staging_dir: Option<PathBuf>,
 
@@ -244,11 +262,23 @@ struct Args {
 
     #[arg(long, hide = true)]
     vm_vsock_control_socket: Option<PathBuf>,
+
+    #[arg(long, hide = true)]
+    vm_vsock_runtime_initiated: bool,
+
+    #[arg(long, hide = true)]
+    vm_mount: Vec<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(request) = args.internal_prepare_image {
+        openshell_driver_vm::driver::run_image_preparation_worker(&request)
+            .await
+            .map_err(|error| miette::miette!("{error}"))?;
+        return Ok(());
+    }
     if args.internal_run_vm {
         // The VM launcher arms procguard after resolving its runtime so its
         // libkrun worker cannot outlive the launcher.
@@ -288,6 +318,14 @@ async fn main() -> Result<()> {
         grpc_endpoint: args
             .grpc_endpoint
             .ok_or_else(|| miette::miette!("OPENSHELL_GRPC_ENDPOINT is required"))?,
+        supervisor_otlp_endpoint: args.otlp_endpoint.clone(),
+        supervisor_gateway_name: args.gateway_name.clone(),
+        supervisor_ocsf_export: args.otlp_ocsf_endpoint.clone().map(|endpoint| {
+            openshell_core::sandbox_env::OcsfOtlpExport {
+                endpoint,
+                schema_version: args.otlp_ocsf_schema_version.clone(),
+            }
+        }),
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
@@ -319,6 +357,7 @@ async fn main() -> Result<()> {
         sandbox_gid: args.sandbox_gid,
         rootfs_tar_staging_dir: args.rootfs_tar_staging_dir.clone(),
         rootfs_tar_max_bytes: args.rootfs_tar_max_bytes,
+        enable_bind_mounts: args.enable_bind_mounts,
     })
     .await
     .map_err(|err| miette::miette!("{err}"))?;
@@ -608,6 +647,12 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         Some(other) => return Err(format!("unknown VM backend: {other}")),
     };
 
+    let mounts = args
+        .vm_mount
+        .iter()
+        .map(|m| parse_vm_mount_arg(m))
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(VmLaunchConfig {
         root_disk,
         overlay_disk,
@@ -631,7 +676,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
             (Some(guest_port), Some(host_socket)) => Some(VsockPortMap {
                 guest_port,
                 host_socket,
-                host_initiated: true,
+                host_initiated: !args.vm_vsock_runtime_initiated,
             }),
             (None, None) => None,
             _ => {
@@ -641,6 +686,36 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
                 );
             }
         },
+        mounts,
+    })
+}
+
+fn parse_vm_mount_arg(arg: &str) -> std::result::Result<VmMount, String> {
+    // Split from the right: the driver generates the tag and mode, so a tab
+    // in the source can never shift them.
+    let mut parts = arg.rsplitn(3, '\t');
+    let mode = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format: {arg}"))?;
+    let tag = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing tag): {arg}"))?;
+    let source = parts
+        .next()
+        .ok_or_else(|| format!("invalid --vm-mount format (missing source): {arg}"))?;
+    let read_only = match mode {
+        "ro" => true,
+        "rw" => false,
+        _ => {
+            return Err(format!(
+                "invalid --vm-mount mode '{mode}': expected 'ro' or 'rw'"
+            ));
+        }
+    };
+    Ok(VmMount {
+        host_path: PathBuf::from(source),
+        tag: tag.to_string(),
+        read_only,
     })
 }
 
@@ -700,7 +775,7 @@ fn maybe_reexec_internal_vm_with_runtime_env() -> Result<()> {
 mod tests {
     use super::{
         Args, ComputeDriverListenMode, PeerCredentials, authorize_peer_credentials,
-        compute_driver_listen_mode,
+        compute_driver_listen_mode, parse_vm_mount_arg,
     };
     use clap::Parser;
     use std::path::PathBuf;
@@ -939,5 +1014,39 @@ mod tests {
                 expected_peer_pid: None,
             }
         );
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readonly() {
+        let m = parse_vm_mount_arg("/host/src\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src"));
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_parses_readwrite() {
+        let m = parse_vm_mount_arg("/host/src\tosfs1\trw").unwrap();
+        assert!(!m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_keeps_tag_and_mode_when_source_has_tab() {
+        let m = parse_vm_mount_arg("/host/src\tvfs9\trw\tosfs0\tro").unwrap();
+        assert_eq!(m.host_path, PathBuf::from("/host/src\tvfs9\trw"));
+        assert_eq!(m.tag, "osfs0");
+        assert!(m.read_only);
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_unknown_mode() {
+        let err = parse_vm_mount_arg("/host/src\tosfs0\treadonly").unwrap_err();
+        assert!(err.contains("expected 'ro' or 'rw'"));
+    }
+
+    #[test]
+    fn parse_vm_mount_arg_rejects_missing_fields() {
+        assert!(parse_vm_mount_arg("/host/src\tosfs0").is_err());
+        assert!(parse_vm_mount_arg("/host/src").is_err());
     }
 }

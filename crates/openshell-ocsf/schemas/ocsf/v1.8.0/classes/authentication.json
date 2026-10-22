@@ -1,0 +1,1271 @@
+{
+    "attributes": {
+        "class_name": {
+            "type": "string_t",
+            "description": "The event class name, as defined by class_uid value: <code>Authentication</code>.",
+            "group": "classification",
+            "requirement": "optional",
+            "caption": "Class",
+            "type_name": "String"
+        },
+        "raw_data": {
+            "type": "string_t",
+            "description": "The raw event/finding data as received from the source.",
+            "group": "context",
+            "requirement": "optional",
+            "caption": "Raw Data",
+            "type_name": "String"
+        },
+        "status_code": {
+            "type": "string_t",
+            "description": "The event status code, as reported by the event source.<br /><br />For example, in a Windows Failed Authentication event, this would be the value of 'Failure Code', e.g. 0x18.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Status Code",
+            "type_name": "String"
+        },
+        "is_cleartext": {
+            "type": "boolean_t",
+            "description": "Indicates whether the credentials were passed in clear text.<p><b>Note:</b> True if the credentials were passed in a clear text protocol such as FTP or TELNET, or if Windows detected that a user's logon password was passed to the authentication package in clear text.</p>",
+            "group": "context",
+            "requirement": "optional",
+            "caption": "Cleartext Credentials",
+            "type_name": "Boolean"
+        },
+        "risk_score": {
+            "type": "integer_t",
+            "description": "The risk score as reported by the event source.",
+            "group": "context",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Risk Score",
+            "type_name": "Integer"
+        },
+        "is_remote": {
+            "type": "boolean_t",
+            "description": "The attempted authentication is over a remote connection.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Remote",
+            "type_name": "Boolean"
+        },
+        "time": {
+            "type": "timestamp_t",
+            "description": "The normalized event occurrence time or the finding creation time.",
+            "group": "occurrence",
+            "requirement": "required",
+            "caption": "Event Time",
+            "type_name": "Timestamp"
+        },
+        "severity_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "description": "Action is required but the situation is not serious at this time.",
+                    "caption": "Medium"
+                },
+                "6": {
+                    "description": "An error occurred but it is too late to take remedial action.",
+                    "caption": "Fatal"
+                },
+                "0": {
+                    "description": "The event/finding severity is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "description": "Informational message. No action required.",
+                    "caption": "Informational"
+                },
+                "2": {
+                    "description": "The user decides if action is needed.",
+                    "caption": "Low"
+                },
+                "99": {
+                    "description": "The event/finding severity is not mapped. See the <code>severity</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "description": "Action is required immediately.",
+                    "caption": "High"
+                },
+                "5": {
+                    "description": "Action is required immediately and the scope is broad.",
+                    "caption": "Critical"
+                }
+            },
+            "description": "<p>The normalized identifier of the event/finding severity.</p>The normalized severity is a measurement the effort and expense required to manage and resolve an event or incident. Smaller numerical values represent lower impact events, and larger numerical values represent higher impact events.",
+            "group": "classification",
+            "requirement": "required",
+            "sibling": "severity",
+            "caption": "Severity ID",
+            "type_name": "Integer"
+        },
+        "observables": {
+            "type": "object_t",
+            "description": "The observables associated with the event or a finding.",
+            "group": "primary",
+            "is_array": true,
+            "references": [
+                {
+                    "description": "OCSF Observables FAQ",
+                    "url": "https://github.com/ocsf/ocsf-docs/blob/main/articles/defining-and-using-observables.md"
+                }
+            ],
+            "requirement": "recommended",
+            "object_type": "observable",
+            "object_name": "Observable",
+            "caption": "Observables"
+        },
+        "http_response": {
+            "type": "object_t",
+            "description": "Details about the underlying HTTP response.",
+            "group": "context",
+            "requirement": "optional",
+            "object_type": "http_response",
+            "object_name": "HTTP Response",
+            "caption": "HTTP Response"
+        },
+        "user": {
+            "type": "object_t",
+            "description": "The subject (user/role or account) to authenticate.",
+            "group": "primary",
+            "requirement": "required",
+            "object_type": "user",
+            "object_name": "User",
+            "caption": "User"
+        },
+        "enrichments": {
+            "type": "object_t",
+            "description": "The additional information from an external data source, which is associated with the event or a finding. For example add location information for the IP address in the DNS answers:</p><code>[{\"name\": \"answers.ip\", \"value\": \"92.24.47.250\", \"type\": \"location\", \"data\": {\"city\": \"Socotra\", \"continent\": \"Asia\", \"coordinates\": [-25.4153, 17.0743], \"country\": \"YE\", \"desc\": \"Yemen\"}}]</code>",
+            "group": "context",
+            "is_array": true,
+            "requirement": "optional",
+            "object_type": "enrichment",
+            "object_name": "Enrichment",
+            "caption": "Enrichments"
+        },
+        "severity": {
+            "type": "string_t",
+            "description": "The event/finding severity, normalized to the caption of the <code>severity_id</code> value. In the case of 'Other', it is defined by the source.",
+            "group": "classification",
+            "requirement": "optional",
+            "caption": "Severity",
+            "type_name": "String"
+        },
+        "category_name": {
+            "type": "string_t",
+            "description": "The event category name, as defined by category_uid value: <code>Identity & Access Management</code>.",
+            "group": "classification",
+            "requirement": "optional",
+            "caption": "Category",
+            "type_name": "String"
+        },
+        "authorizations": {
+            "type": "object_t",
+            "description": "Provides details about an authorization, such as authorization outcome, and any associated policies related to the activity/event.",
+            "group": "primary",
+            "is_array": true,
+            "requirement": "optional",
+            "object_type": "authorization",
+            "object_name": "Authorization Result",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Authorization Information"
+        },
+        "attacks": {
+            "type": "object_t",
+            "description": "An array of MITRE ATT&CK\u00ae objects describing identified tactics, techniques & sub-techniques. The objects are compatible with MITRE ATLAS\u2122 tactics, techniques & sub-techniques.",
+            "group": "primary",
+            "is_array": true,
+            "references": [
+                {
+                    "description": "MITRE ATT&CK\u00ae",
+                    "url": "https://attack.mitre.org"
+                },
+                {
+                    "description": "MITRE ATLAS",
+                    "url": "https://atlas.mitre.org/matrices/ATLAS"
+                }
+            ],
+            "requirement": "optional",
+            "object_type": "attack",
+            "object_name": "MITRE ATT&CK\u00ae & ATLAS\u2122",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "MITRE ATT&CK\u00ae and ATLAS\u2122 Details"
+        },
+        "confidence": {
+            "type": "string_t",
+            "description": "The confidence, normalized to the caption of the confidence_id value. In the case of 'Other', it is defined by the event source.",
+            "group": "context",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Confidence",
+            "type_name": "String"
+        },
+        "account_switch_type_id": {
+            "type": "integer_t",
+            "enum": {
+                "0": {
+                    "description": "The account switch type is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "description": "A utility like <code>sudo</code>, <code>su</code>, or equivalent was used to perform actions in the context of another user.",
+                    "references": [
+                        {
+                            "description": "sudo documentation",
+                            "url": "https://www.sudo.ws/"
+                        },
+                        {
+                            "description": "su Linux manual page",
+                            "url": "https://man7.org/linux/man-pages/man1/su.1.html"
+                        },
+                        {
+                            "description": "su macOS manual page",
+                            "url": "https://www.unix.com/man_page/osx/1/su/"
+                        }
+                    ],
+                    "caption": "Substitute User"
+                },
+                "2": {
+                    "description": "An API like <code>ImpersonateLoggedOnUser()</code> or equivalent was used to perform actions in the context of another user.",
+                    "references": [
+                        {
+                            "description": "Microsoft ImpersonateLoggedOnUser() documentation",
+                            "url": "https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-impersonateloggedonuser"
+                        }
+                    ],
+                    "caption": "Impersonate"
+                },
+                "99": {
+                    "description": "The account switch type is not mapped. See the <code>account_switch_type</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                }
+            },
+            "description": "The normalized identifier of the account switch method.",
+            "group": "primary",
+            "requirement": "recommended",
+            "sibling": "account_switch_type",
+            "caption": "Account Switch Type ID",
+            "type_name": "Integer"
+        },
+        "certificate": {
+            "type": "object_t",
+            "description": "The certificate associated with the authentication or pre-authentication (Kerberos).",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "certificate",
+            "object_name": "Digital Certificate",
+            "caption": "Certificate"
+        },
+        "osint": {
+            "type": "object_t",
+            "description": "The OSINT (Open Source Intelligence) object contains details related to an indicator such as the indicator itself, related indicators, geolocation, registrar information, subdomains, analyst commentary, and other contextual information. This information can be used to further enrich a detection or finding by providing decisioning support to other analysts and engineers.",
+            "group": "primary",
+            "is_array": true,
+            "requirement": "required",
+            "object_type": "osint",
+            "object_name": "OSINT",
+            "profiles": [
+                "osint"
+            ],
+            "caption": "OSINT"
+        },
+        "firewall_rule": {
+            "type": "object_t",
+            "description": "The firewall rule that pertains to the control that triggered the event, if applicable.",
+            "group": "primary",
+            "requirement": "optional",
+            "object_type": "firewall_rule",
+            "object_name": "Firewall Rule",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Firewall Rule"
+        },
+        "malware_scan_info": {
+            "type": "object_t",
+            "description": "Describes details about the scan job that identified malware on the target system.",
+            "group": "primary",
+            "requirement": "optional",
+            "object_type": "malware_scan_info",
+            "object_name": "Malware Scan Info",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Malware Scan Info"
+        },
+        "unmapped": {
+            "type": "object_t",
+            "description": "The attributes that are not mapped to the event schema. The names and values of those attributes are specific to the event source.",
+            "group": "context",
+            "requirement": "optional",
+            "object_type": "object",
+            "object_name": "Object",
+            "caption": "Unmapped Data"
+        },
+        "activity_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "description": "A Kerberos authentication ticket (TGT) was requested.",
+                    "caption": "Authentication Ticket"
+                },
+                "6": {
+                    "description": "A preauthentication stage was engaged.",
+                    "caption": "Preauth"
+                },
+                "0": {
+                    "description": "The event activity is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "description": "A new logon session was requested.",
+                    "caption": "Logon"
+                },
+                "2": {
+                    "description": "A logon session was terminated and no longer exists.",
+                    "caption": "Logoff"
+                },
+                "99": {
+                    "description": "The event activity is not mapped. See the <code>activity_name</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "description": "A Kerberos service ticket was requested.",
+                    "caption": "Service Ticket Request"
+                },
+                "5": {
+                    "description": "A Kerberos service ticket was renewed.",
+                    "caption": "Service Ticket Renew"
+                },
+                "7": {
+                    "description": "A utility or service switched the user account. See the <code>account_switch_type_id</code> attribute for more details.",
+                    "caption": "Account Switch"
+                }
+            },
+            "description": "The normalized identifier of the activity that triggered the event.",
+            "group": "classification",
+            "requirement": "required",
+            "sibling": "activity_name",
+            "caption": "Activity ID",
+            "type_name": "Integer",
+            "suppress_checks": [
+                "sibling_convention"
+            ]
+        },
+        "type_name": {
+            "type": "string_t",
+            "description": "The event/finding type name, as defined by the type_uid.",
+            "group": "classification",
+            "requirement": "optional",
+            "caption": "Type Name",
+            "type_name": "String"
+        },
+        "time_dt": {
+            "type": "datetime_t",
+            "description": "The normalized event occurrence time or the finding creation time.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "profiles": [
+                "datetime"
+            ],
+            "caption": "Event Time",
+            "type_name": "Datetime"
+        },
+        "auth_protocol": {
+            "type": "string_t",
+            "description": "The authentication protocol as defined by the caption of <code>auth_protocol_id</code>. In the case of <code>Other</code>, it is defined by the event source.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Auth Protocol",
+            "type_name": "String"
+        },
+        "metadata": {
+            "type": "object_t",
+            "description": "The metadata associated with the event or a finding.",
+            "group": "context",
+            "requirement": "required",
+            "object_type": "metadata",
+            "object_name": "Metadata",
+            "caption": "Metadata"
+        },
+        "raw_data_hash": {
+            "type": "object_t",
+            "description": "The hash, which describes the content of the raw_data field.",
+            "group": "context",
+            "requirement": "optional",
+            "object_type": "fingerprint",
+            "object_name": "Fingerprint",
+            "caption": "Raw Data Hash"
+        },
+        "start_time": {
+            "type": "timestamp_t",
+            "description": "The start time of a time period, or the time of the least recent event included in the aggregate event.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "caption": "Start Time",
+            "type_name": "Timestamp"
+        },
+        "end_time": {
+            "type": "timestamp_t",
+            "description": "The end time of a time period, or the time of the most recent event included in the aggregate event.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "caption": "End Time",
+            "type_name": "Timestamp"
+        },
+        "service": {
+            "type": "object_t",
+            "description": "The service or gateway to which the user or process is being authenticated",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "service",
+            "object_name": "Service",
+            "caption": "Service"
+        },
+        "is_mfa": {
+            "type": "boolean_t",
+            "description": "Indicates whether Multi Factor Authentication was used during authentication.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Multi Factor Authentication",
+            "type_name": "Boolean"
+        },
+        "device": {
+            "type": "object_t",
+            "description": "An addressable device, computer system or host.",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "device",
+            "object_name": "Device",
+            "profiles": [
+                "host"
+            ],
+            "caption": "Device"
+        },
+        "confidence_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "caption": "High"
+                },
+                "0": {
+                    "description": "The normalized confidence is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "caption": "Low"
+                },
+                "2": {
+                    "caption": "Medium"
+                },
+                "99": {
+                    "description": "The confidence is not mapped to the defined enum values. See the <code>confidence</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                }
+            },
+            "description": "The normalized confidence refers to the accuracy of the rule that created the finding. A rule with a low confidence means that the finding scope is wide and may create finding reports that may not be malicious in nature.",
+            "group": "context",
+            "requirement": "recommended",
+            "profiles": [
+                "security_control"
+            ],
+            "sibling": "confidence",
+            "caption": "Confidence ID",
+            "type_name": "Integer"
+        },
+        "confidence_score": {
+            "type": "integer_t",
+            "description": "The confidence score as reported by the event source.",
+            "group": "context",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Confidence Score",
+            "type_name": "Integer"
+        },
+        "logon_type_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "description": "A user or device logged onto this device from the network.",
+                    "caption": "Network"
+                },
+                "0": {
+                    "description": "The logon type is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "description": "Used only by the System account, for example at system startup.",
+                    "caption": "System"
+                },
+                "2": {
+                    "description": "A local logon to device console.",
+                    "caption": "Interactive"
+                },
+                "99": {
+                    "description": "The logon type is not mapped. See the <code>logon_type</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "description": "A batch server logon, where processes may be executing on behalf of a user without their direct intervention.",
+                    "caption": "Batch"
+                },
+                "5": {
+                    "description": "A logon by a service or daemon that was started by the OS.",
+                    "caption": "OS Service"
+                },
+                "7": {
+                    "description": "A user unlocked the device.",
+                    "caption": "Unlock"
+                },
+                "8": {
+                    "description": "A user logged on to this device from the network. The user's password in the authentication package was not hashed.",
+                    "caption": "Network Cleartext"
+                },
+                "9": {
+                    "description": "A caller cloned its current token and specified new credentials for outbound connections. The new logon session has the same local identity, but uses different credentials for other network connections.",
+                    "caption": "New Credentials"
+                },
+                "10": {
+                    "description": "A remote logon using Terminal Services or remote desktop application.",
+                    "caption": "Remote Interactive"
+                },
+                "11": {
+                    "description": "A user logged on to this device with network credentials that were stored locally on the device and the domain controller was not contacted to verify the credentials.",
+                    "caption": "Cached Interactive"
+                },
+                "12": {
+                    "description": "Same as Remote Interactive. This is used for internal auditing.",
+                    "caption": "Cached Remote Interactive"
+                },
+                "13": {
+                    "description": "Workstation logon.",
+                    "caption": "Cached Unlock"
+                }
+            },
+            "description": "The normalized logon type identifier.",
+            "group": "primary",
+            "requirement": "recommended",
+            "sibling": "logon_type",
+            "caption": "Logon Type ID",
+            "type_name": "Integer"
+        },
+        "cloud": {
+            "type": "object_t",
+            "description": "Describes details about the Cloud environment where the event or finding was created.",
+            "group": "primary",
+            "requirement": "required",
+            "object_type": "cloud",
+            "object_name": "Cloud",
+            "profiles": [
+                "cloud"
+            ],
+            "caption": "Cloud"
+        },
+        "duration": {
+            "type": "long_t",
+            "description": "The event duration or aggregate time, the amount of time the event covers from <code>start_time</code> to <code>end_time</code> in milliseconds.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "caption": "Duration Milliseconds",
+            "type_name": "Long"
+        },
+        "auth_protocol_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "caption": "Digest"
+                },
+                "6": {
+                    "caption": "OAUTH 2.0"
+                },
+                "0": {
+                    "description": "The authentication protocol is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "caption": "NTLM"
+                },
+                "2": {
+                    "caption": "Kerberos"
+                },
+                "99": {
+                    "description": "The authentication protocol is not mapped. See the <code>auth_protocol</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "caption": "OpenID"
+                },
+                "5": {
+                    "caption": "SAML"
+                },
+                "7": {
+                    "caption": "PAP"
+                },
+                "8": {
+                    "caption": "CHAP"
+                },
+                "9": {
+                    "caption": "EAP"
+                },
+                "10": {
+                    "caption": "RADIUS"
+                },
+                "11": {
+                    "caption": "Basic Authentication"
+                },
+                "12": {
+                    "caption": "LDAP"
+                }
+            },
+            "description": "The normalized identifier of the authentication protocol used to create the user session.",
+            "group": "primary",
+            "requirement": "recommended",
+            "sibling": "auth_protocol",
+            "caption": "Auth Protocol ID",
+            "type_name": "Integer"
+        },
+        "status_detail": {
+            "type": "string_t",
+            "description": "The details about the authentication request. For example, possible details for Windows logon or logoff events are:<ul><li>Success</li><ul><li>LOGOFF_USER_INITIATED</li><li>LOGOFF_OTHER</li></ul><li>Failure</li><ul><li>USER_DOES_NOT_EXIST</li><li>INVALID_CREDENTIALS</li><li>ACCOUNT_DISABLED</li><li>ACCOUNT_LOCKED_OUT</li><li>PASSWORD_EXPIRED</li></ul></ul>",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Status Detail",
+            "type_name": "String"
+        },
+        "category_uid": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "description": "Identity & Access Management (IAM) events relate to the supervision of the system's authentication and access control model. Examples of such events are the success or failure of authentication, granting of authority, password change, entity change, privileged use etc.",
+                    "uid": 3,
+                    "caption": "Identity & Access Management"
+                }
+            },
+            "description": "The category unique identifier of the event.",
+            "group": "classification",
+            "requirement": "required",
+            "sibling": "category_name",
+            "caption": "Category ID",
+            "type_name": "Integer"
+        },
+        "type_uid": {
+            "type": "long_t",
+            "enum": {
+                "300200": {
+                    "caption": "Authentication: Unknown"
+                },
+                "300299": {
+                    "caption": "Authentication: Other"
+                },
+                "300201": {
+                    "description": "A new logon session was requested.",
+                    "caption": "Authentication: Logon"
+                },
+                "300202": {
+                    "description": "A logon session was terminated and no longer exists.",
+                    "caption": "Authentication: Logoff"
+                },
+                "300203": {
+                    "description": "A Kerberos authentication ticket (TGT) was requested.",
+                    "caption": "Authentication: Authentication Ticket"
+                },
+                "300204": {
+                    "description": "A Kerberos service ticket was requested.",
+                    "caption": "Authentication: Service Ticket Request"
+                },
+                "300205": {
+                    "description": "A Kerberos service ticket was renewed.",
+                    "caption": "Authentication: Service Ticket Renew"
+                },
+                "300206": {
+                    "description": "A preauthentication stage was engaged.",
+                    "caption": "Authentication: Preauth"
+                },
+                "300207": {
+                    "description": "A utility or service switched the user account. See the <code>account_switch_type_id</code> attribute for more details.",
+                    "caption": "Authentication: Account Switch"
+                }
+            },
+            "description": "The event/finding type ID. It identifies the event's semantics and structure. The value is calculated by the logging system as: <code>class_uid * 100 + activity_id</code>.",
+            "group": "classification",
+            "requirement": "required",
+            "sibling": "type_name",
+            "caption": "Type ID",
+            "type_name": "Long"
+        },
+        "action": {
+            "type": "string_t",
+            "description": "The normalized caption of <code>action_id</code>.",
+            "group": "primary",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Action",
+            "type_name": "String"
+        },
+        "is_new_logon": {
+            "type": "boolean_t",
+            "description": "Indicates logon is from a device not seen before or a first time account logon.",
+            "group": "context",
+            "requirement": "optional",
+            "caption": "New Logon",
+            "type_name": "Boolean"
+        },
+        "message": {
+            "type": "string_t",
+            "description": "The description of the event/finding, as defined by the source.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Message",
+            "type_name": "String"
+        },
+        "raw_data_size": {
+            "type": "long_t",
+            "description": "The size of the raw data which was transformed into an OCSF event, in bytes.",
+            "group": "context",
+            "requirement": "optional",
+            "caption": "Raw Data Size",
+            "type_name": "Long"
+        },
+        "api": {
+            "type": "object_t",
+            "description": "Describes details about a typical API (Application Programming Interface) call.",
+            "group": "context",
+            "requirement": "optional",
+            "object_type": "api",
+            "object_name": "API",
+            "profiles": [
+                "cloud"
+            ],
+            "caption": "API Details"
+        },
+        "status_id": {
+            "type": "integer_t",
+            "enum": {
+                "0": {
+                    "description": "The status is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "caption": "Success"
+                },
+                "2": {
+                    "caption": "Failure"
+                },
+                "99": {
+                    "description": "The status is not mapped. See the <code>status</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                }
+            },
+            "description": "The normalized identifier of the event status.",
+            "group": "primary",
+            "requirement": "recommended",
+            "sibling": "status",
+            "caption": "Status ID",
+            "type_name": "Integer"
+        },
+        "authentication_token": {
+            "type": "object_t",
+            "description": "The authentication token, ticket, or assertion, e.g. <code>Kerberos</code>, <code>OIDC</code>, <code>SAML</code>.",
+            "group": "context",
+            "references": [
+                {
+                    "description": "RFC 4120: The Kerberos Network Authentication Service (V5)",
+                    "url": "https://www.rfc-editor.org/rfc/rfc4120"
+                },
+                {
+                    "description": "OpenID Connect Core 1.0",
+                    "url": "https://openid.net/specs/openid-connect-core-1_0.html"
+                },
+                {
+                    "description": "The OASIS Security Assertion Markup Language (SAML) V2.0",
+                    "url": "https://docs.oasis-open.org/security/saml/v2.0/saml-core-2.0-os.pdf"
+                }
+            ],
+            "requirement": "optional",
+            "object_type": "authentication_token",
+            "object_name": "Authentication Token",
+            "caption": "Authentication Token"
+        },
+        "http_request": {
+            "type": "object_t",
+            "description": "Details about the underlying HTTP request.",
+            "group": "context",
+            "requirement": "optional",
+            "object_type": "http_request",
+            "object_name": "HTTP Request",
+            "caption": "HTTP Request"
+        },
+        "activity_name": {
+            "type": "string_t",
+            "description": "The event activity name, as defined by the activity_id.",
+            "group": "classification",
+            "requirement": "optional",
+            "caption": "Activity",
+            "type_name": "String"
+        },
+        "count": {
+            "type": "integer_t",
+            "description": "The number of times that events in the same logical group occurred during the event <strong>Start Time</strong> to <strong>End Time</strong> period.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "caption": "Count",
+            "type_name": "Integer"
+        },
+        "action_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "description": "The activity was observed, but neither explicitly allowed nor denied. This is common with IDS and EDR controls that report additional information on observed behavior such as TTPs. The <code>disposition_id</code> attribute should be set to a value that conforms to this action, for example 'Logged', 'Alert', 'Detected', 'Count', etc.",
+                    "caption": "Observed"
+                },
+                "0": {
+                    "description": "The action was unknown. The <code>disposition_id</code> attribute may still be set to a non-unknown value, for example 'Custom Action', 'Challenge'.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "description": "The activity was allowed. The <code>disposition_id</code> attribute should be set to a value that conforms to this action, for example 'Allowed', 'Approved', 'Delayed', 'No Action', 'Count' etc.",
+                    "caption": "Allowed"
+                },
+                "2": {
+                    "description": "The attempted activity was denied. The <code>disposition_id</code> attribute should be set to a value that conforms to this action, for example 'Blocked', 'Rejected', 'Quarantined', 'Isolated', 'Dropped', 'Access Revoked, etc.",
+                    "caption": "Denied"
+                },
+                "99": {
+                    "description": "The action is not mapped. See the <code>action</code> attribute which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "description": "The activity was modified, adjusted, or corrected. The <code>disposition_id</code> attribute should be set appropriately, for example 'Restored', 'Corrected', 'Delayed', 'Captcha', 'Tagged'.",
+                    "caption": "Modified"
+                }
+            },
+            "description": "The action taken by a control or other policy-based system leading to an outcome or disposition. An unknown action may still correspond to a known disposition. Refer to <code>disposition_id</code> for the outcome of the action.",
+            "group": "primary",
+            "requirement": "recommended",
+            "profiles": [
+                "security_control"
+            ],
+            "sibling": "action",
+            "caption": "Action ID",
+            "type_name": "Integer"
+        },
+        "end_time_dt": {
+            "type": "datetime_t",
+            "description": "The end time of a time period, or the time of the most recent event included in the aggregate event.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "profiles": [
+                "datetime"
+            ],
+            "caption": "End Time",
+            "type_name": "Datetime"
+        },
+        "start_time_dt": {
+            "type": "datetime_t",
+            "description": "The start time of a time period, or the time of the least recent event included in the aggregate event.",
+            "group": "occurrence",
+            "requirement": "optional",
+            "profiles": [
+                "datetime"
+            ],
+            "caption": "Start Time",
+            "type_name": "Datetime"
+        },
+        "risk_level_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "caption": "High"
+                },
+                "0": {
+                    "caption": "Info"
+                },
+                "1": {
+                    "caption": "Low"
+                },
+                "2": {
+                    "caption": "Medium"
+                },
+                "99": {
+                    "description": "The risk level is not mapped. See the <code>risk_level</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "caption": "Critical"
+                }
+            },
+            "description": "The normalized risk level id.",
+            "group": "context",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "sibling": "risk_level",
+            "caption": "Risk Level ID",
+            "type_name": "Integer",
+            "suppress_checks": [
+                "enum_convention"
+            ]
+        },
+        "dst_endpoint": {
+            "type": "object_t",
+            "description": "The endpoint to which the authentication was targeted.",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "network_endpoint",
+            "object_name": "Network Endpoint",
+            "caption": "Destination Endpoint"
+        },
+        "is_alert": {
+            "type": "boolean_t",
+            "description": "Indicates that the event is considered to be an alertable signal. Should be set to <code>true</code> if <code>disposition_id = Alert</code> among other dispositions, and/or <code>risk_level_id</code> or <code>severity_id</code> of the event is elevated. Not all control events will be alertable, for example if <code>disposition_id = Exonerated</code> or <code>disposition_id = Allowed</code>.",
+            "group": "primary",
+            "requirement": "recommended",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Alert",
+            "type_name": "Boolean"
+        },
+        "timezone_offset": {
+            "type": "integer_t",
+            "description": "The number of minutes that the reported event <code>time</code> is ahead or behind UTC, in the range -1,080 to +1,080.",
+            "group": "occurrence",
+            "requirement": "recommended",
+            "caption": "Timezone Offset",
+            "type_name": "Integer"
+        },
+        "policy": {
+            "type": "object_t",
+            "description": "The policy that pertains to the control that triggered the event, if applicable. For example the name of an anti-malware policy or an access control policy.",
+            "group": "primary",
+            "requirement": "optional",
+            "object_type": "policy",
+            "object_name": "Policy",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Policy"
+        },
+        "auth_factors": {
+            "type": "object_t",
+            "description": "Describes a category of methods used for identity verification in an authentication attempt.",
+            "group": "context",
+            "is_array": true,
+            "requirement": "optional",
+            "object_type": "auth_factor",
+            "object_name": "Authentication Factor",
+            "caption": "Authentication Factors"
+        },
+        "risk_details": {
+            "type": "string_t",
+            "description": "Describes the risk associated with the finding.",
+            "group": "context",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Risk Details",
+            "type_name": "String"
+        },
+        "account_switch_type": {
+            "type": "string_t",
+            "description": "The account switch method, normalized to the caption of the account_switch_type_id value. In the case of 'Other', it is defined by the event source.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Account Switch Type",
+            "type_name": "String"
+        },
+        "src_endpoint": {
+            "type": "object_t",
+            "description": "Details about the source of the IAM activity.",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "network_endpoint",
+            "object_name": "Network Endpoint",
+            "caption": "Source Endpoint"
+        },
+        "malware": {
+            "type": "object_t",
+            "description": "A list of Malware objects, describing details about the identified malware.",
+            "group": "primary",
+            "is_array": true,
+            "requirement": "optional",
+            "object_type": "malware",
+            "object_name": "Malware",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Malware"
+        },
+        "actor": {
+            "type": "object_t",
+            "description": "The actor object describes details about the user/role/process that was the source of the activity. Note that this is not the threat actor of a campaign but may be part of a campaign.",
+            "group": "context",
+            "requirement": "recommended",
+            "object_type": "actor",
+            "object_name": "Actor",
+            "profiles": null,
+            "caption": "Actor"
+        },
+        "session": {
+            "type": "object_t",
+            "description": "The authenticated user or service session.",
+            "group": "primary",
+            "requirement": "recommended",
+            "object_type": "session",
+            "object_name": "Session",
+            "caption": "Session"
+        },
+        "risk_level": {
+            "type": "string_t",
+            "description": "The risk level, normalized to the caption of the risk_level_id value.",
+            "group": "context",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Risk Level",
+            "type_name": "String"
+        },
+        "status": {
+            "type": "string_t",
+            "description": "The event status, normalized to the caption of the status_id value. In the case of 'Other', it is defined by the event source.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Status",
+            "type_name": "String"
+        },
+        "class_uid": {
+            "type": "integer_t",
+            "enum": {
+                "3002": {
+                    "description": "Authentication events report authentication session activities, including user attempts to log on or log off, regardless of success, as well as other key stages within the authentication process. These events are typically generated by authentication services, such as Kerberos, OIDC, or SAML, and may include information about the user, the authentication method used, and the status of the authentication attempt.",
+                    "caption": "Authentication"
+                }
+            },
+            "description": "The unique identifier of a class. A class describes the attributes available in an event.",
+            "group": "classification",
+            "requirement": "required",
+            "sibling": "class_name",
+            "caption": "Class ID",
+            "type_name": "Integer"
+        },
+        "logon_type": {
+            "type": "string_t",
+            "description": "The logon type, normalized to the caption of the logon_type_id value. In the case of 'Other', it is defined by the event source.",
+            "group": "primary",
+            "requirement": "recommended",
+            "caption": "Logon Type",
+            "type_name": "String"
+        },
+        "disposition": {
+            "type": "string_t",
+            "description": "The disposition name, normalized to the caption of the disposition_id value. In the case of 'Other', it is defined by the event source.",
+            "group": "primary",
+            "requirement": "optional",
+            "profiles": [
+                "security_control"
+            ],
+            "caption": "Disposition",
+            "type_name": "String"
+        },
+        "disposition_id": {
+            "type": "integer_t",
+            "enum": {
+                "3": {
+                    "description": "A suspicious file or other content was moved to a benign location.",
+                    "caption": "Quarantined"
+                },
+                "6": {
+                    "description": "The request was detected as a threat and resulted in the connection being dropped.",
+                    "caption": "Dropped"
+                },
+                "0": {
+                    "description": "The disposition is unknown.",
+                    "caption": "Unknown"
+                },
+                "1": {
+                    "description": "Granted access or allowed the action to the protected resource.",
+                    "caption": "Allowed"
+                },
+                "2": {
+                    "description": "Denied access or blocked the action to the protected resource.",
+                    "caption": "Blocked"
+                },
+                "99": {
+                    "description": "The disposition is not mapped. See the <code>disposition</code> attribute, which contains a data source specific value.",
+                    "caption": "Other"
+                },
+                "4": {
+                    "description": "A session was isolated on the network or within a browser.",
+                    "caption": "Isolated"
+                },
+                "5": {
+                    "description": "A file or other content was deleted.",
+                    "caption": "Deleted"
+                },
+                "7": {
+                    "description": "A custom action was executed such as running of a command script. Use the <code>message</code> attribute of the base class for details.",
+                    "caption": "Custom Action"
+                },
+                "8": {
+                    "description": "A request or submission was approved. For example, when a form was properly filled out and submitted. This is distinct from <code>1</code> 'Allowed'.",
+                    "caption": "Approved"
+                },
+                "9": {
+                    "description": "A quarantined file or other content was restored to its original location.",
+                    "caption": "Restored"
+                },
+                "10": {
+                    "description": "A suspicious or risky entity was deemed to no longer be suspicious (re-scored).",
+                    "caption": "Exonerated"
+                },
+                "11": {
+                    "description": "A corrupt file or configuration was corrected.",
+                    "caption": "Corrected"
+                },
+                "12": {
+                    "description": "A corrupt file or configuration was partially corrected.",
+                    "caption": "Partially Corrected"
+                },
+                "14": {
+                    "description": "An operation was delayed, for example if a restart was required to finish the operation.",
+                    "caption": "Delayed"
+                },
+                "15": {
+                    "description": "Suspicious activity or a policy violation was detected without further action.",
+                    "caption": "Detected"
+                },
+                "16": {
+                    "description": "The outcome of an operation had no action taken.",
+                    "caption": "No Action"
+                },
+                "17": {
+                    "description": "The operation or action was logged without further action.",
+                    "caption": "Logged"
+                },
+                "18": {
+                    "description": "A file or other entity was marked with extended attributes.",
+                    "caption": "Tagged"
+                },
+                "20": {
+                    "description": "Counted the request or activity but did not determine whether to allow it or block it.",
+                    "caption": "Count"
+                },
+                "21": {
+                    "description": "The request was detected as a threat and resulted in the connection being reset.",
+                    "caption": "Reset"
+                },
+                "22": {
+                    "description": "Required the end user to solve a CAPTCHA puzzle to prove that a human being is sending the request.",
+                    "caption": "Captcha"
+                },
+                "23": {
+                    "description": "Ran a silent challenge that required the client session to verify that it's a browser, and not a bot.",
+                    "caption": "Challenge"
+                },
+                "24": {
+                    "description": "The requestor's access has been revoked due to security policy enforcements. Note: use the <code>Host</code> profile if the <code>User</code> or <code>Actor</code> requestor is not present in the event class.",
+                    "caption": "Access Revoked"
+                },
+                "25": {
+                    "description": "A request or submission was rejected.  For example, when a form was improperly filled out and submitted. This is distinct from <code>2</code> 'Blocked'.",
+                    "caption": "Rejected"
+                },
+                "26": {
+                    "description": "An attempt to access a resource was denied due to an authorization check that failed. This is a more specific disposition than <code>2</code> 'Blocked' and can be complemented with the <code>authorizations</code> attribute for more detail.",
+                    "caption": "Unauthorized"
+                },
+                "27": {
+                    "description": "An error occurred during the processing of the activity or request. Use the <code>message</code> attribute of the base class for details.",
+                    "caption": "Error"
+                },
+                "13": {
+                    "description": "A corrupt file or configuration was not corrected.",
+                    "caption": "Uncorrected"
+                },
+                "19": {
+                    "description": "The request or activity was detected as a threat and resulted in a notification but request was not blocked.",
+                    "caption": "Alert"
+                }
+            },
+            "description": "Describes the outcome or action taken by a security control, such as access control checks, malware detections or various types of policy violations.",
+            "group": "primary",
+            "requirement": "recommended",
+            "profiles": [
+                "security_control"
+            ],
+            "sibling": "disposition",
+            "caption": "Disposition ID",
+            "type_name": "Integer"
+        },
+        "logon_process": {
+            "type": "object_t",
+            "description": "The trusted process that validated the authentication credentials.",
+            "group": "context",
+            "requirement": "optional",
+            "object_type": "process",
+            "object_name": "Process",
+            "caption": "Logon Process"
+        }
+    },
+    "name": "authentication",
+    "description": "Authentication events report authentication session activities, including user attempts to log on or log off, regardless of success, as well as other key stages within the authentication process. These events are typically generated by authentication services, such as Kerberos, OIDC, or SAML, and may include information about the user, the authentication method used, and the status of the authentication attempt.",
+    "uid": 3002,
+    "extends": "iam",
+    "category": "iam",
+    "constraints": {
+        "at_least_one": [
+            "service",
+            "dst_endpoint"
+        ]
+    },
+    "references": [
+        {
+            "description": "D3FEND\u2122 Ontology d3f:AuthenticationEvent",
+            "url": "https://d3fend.mitre.org/event/d3f:AuthenticationEvent"
+        }
+    ],
+    "profiles": [
+        "cloud",
+        "container",
+        "data_classification",
+        "datetime",
+        "host",
+        "linux/linux_users",
+        "macos/macos_users",
+        "osint",
+        "security_control"
+    ],
+    "caption": "Authentication",
+    "associations": {
+        "user": [
+            "dst_endpoint"
+        ],
+        "dst_endpoint": [
+            "user"
+        ],
+        "src_endpoint": [
+            "actor.user"
+        ],
+        "actor.user": [
+            "src_endpoint"
+        ]
+    },
+    "category_name": "Identity & Access Management",
+    "category_uid": 3
+}

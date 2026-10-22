@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectListQuery, ObjectType, PersistenceError, Store, generate_name, test_store};
+use super::{
+    ObjectListQuery, ObjectType, PersistenceError, PolicyRecord, Store, generate_name, test_store,
+};
 use crate::policy_store::{AtomicPolicyRevisionWrite, PolicyStoreExt};
 use openshell_core::proto::datamodel::v1::ObjectMeta as ProtoObjectMeta;
 use openshell_core::proto::{ObjectForTest, Sandbox, SandboxPolicy, SandboxSpec};
@@ -35,7 +37,6 @@ async fn failed_store_calls_are_marked_on_the_span() {
 /// the span must stay clean — otherwise every lease a replica does not win, and
 /// every gateway restart, exports as a failure.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn expected_conflicts_leave_the_span_unmarked() {
     use crate::otel_tracing::test_exporter;
 
@@ -66,6 +67,7 @@ async fn expected_conflicts_leave_the_span_unmarked() {
         .await
         .expect_err("the name is already taken");
 
+    traced.wait_for_span("store.put_if").await;
     let span = traced.span_with("store.put_if", "object.id", "expected-conflict-second");
 
     assert_eq!(
@@ -79,7 +81,6 @@ async fn expected_conflicts_leave_the_span_unmarked() {
 /// Span names stay low-cardinality so they group across object types; what
 /// each call touched is carried as attributes.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_spans_record_what_they_touched_as_attributes() {
     use crate::otel_tracing::test_exporter;
 
@@ -97,6 +98,13 @@ async fn store_spans_record_what_they_touched_as_attributes() {
         .unwrap();
     store.list("sandbox", "default", 10, 0).await.unwrap();
 
+    traced
+        .wait_for_spans(|spans| {
+            ["store.get", "store.get_by_name", "store.list"]
+                .iter()
+                .all(|name| spans.iter().any(|span| &span.name == name))
+        })
+        .await;
     let by_name = traced.span_with("store.get_by_name", "object.name", "my-sandbox");
     assert_eq!(
         test_exporter::attribute(&by_name, "object_type").as_deref(),
@@ -227,7 +235,7 @@ fn embedded_migrators_include_pagination_indexes() {
 #[tokio::test]
 async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
     for url in ["sqlite::memory:", "sqlite://?mode=memory"] {
-        let store = super::sqlite::SqliteStore::connect(url)
+        let store = super::sqlite::SqliteStore::connect(url, None)
             .await
             .expect("connect to in-memory SQLite");
         store.migrate().await.expect("migrate in-memory SQLite");
@@ -273,6 +281,76 @@ async fn sqlite_in_memory_store_survives_pool_connection_replacement() {
                 .is_some(),
             "database URL: {url}"
         );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_pool_ceiling_defaults_and_honours_an_override() {
+    use super::sqlite::{DEFAULT_MAX_CONNECTIONS, SqliteStore};
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let unset = SqliteStore::connect(&url, None)
+        .await
+        .expect("connect to sqlite");
+    assert_eq!(unset.max_connections(), DEFAULT_MAX_CONNECTIONS);
+
+    let raised = SqliteStore::connect(&url, Some(32))
+        .await
+        .expect("connect to sqlite");
+    assert_eq!(raised.max_connections(), 32);
+}
+
+/// An in-memory database lives inside its single connection: a second one
+/// would open a different, empty database, so the ceiling cannot be raised.
+#[tokio::test]
+async fn in_memory_sqlite_pins_the_pool_to_one_connection() {
+    use super::sqlite::SqliteStore;
+
+    let store = SqliteStore::connect("sqlite::memory:", Some(32))
+        .await
+        .expect("connect to in-memory sqlite");
+    assert_eq!(store.max_connections(), 1);
+}
+
+/// The SSH identity lock keeps one data connection while it queries the
+/// pool, so a single-connection `PostgreSQL` pool is refused at startup. The
+/// check runs before any connection opens, so nothing listens on the URL.
+#[tokio::test]
+async fn postgres_rejects_a_single_connection_data_pool_before_connecting() {
+    for url in [
+        "postgres://openshell@127.0.0.1:1/openshell",
+        "postgresql://openshell@127.0.0.1:1/openshell",
+    ] {
+        let error = Store::connect_with_pool_sizes(url, Some(1), None)
+            .await
+            .expect_err("a PostgreSQL data pool of one must be rejected");
+        match error {
+            openshell_core::Error::Config { message } => assert!(
+                message.contains("database_max_connections") && message.contains("at least 2"),
+                "the error names the setting and its minimum, got {message:?}"
+            ),
+            other => panic!("expected a configuration error, got {other:?}"),
+        }
+    }
+}
+
+/// `SQLite` takes the SSH identity lock without a pool connection, so one
+/// connection is enough there, on disk and in memory.
+#[tokio::test]
+async fn sqlite_accepts_a_single_connection_data_pool() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let on_disk = format!(
+        "sqlite:{}?mode=rwc",
+        tmp.path().join("openshell.db").display()
+    );
+    for url in [on_disk.as_str(), "sqlite::memory:"] {
+        let store = Store::connect_with_pool_sizes(url, Some(1), None)
+            .await
+            .expect("a single-connection SQLite pool connects and migrates");
+        store.ping().await.expect("the store answers");
     }
 }
 
@@ -1343,6 +1421,85 @@ fn policy_test_sandbox(id: &str, name: &str) -> Sandbox {
 }
 
 #[tokio::test]
+async fn initial_policy_history_is_insert_only() {
+    assert_initial_policy_history_is_insert_only(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires OPENSHELL_TEST_POSTGRES_URL pointing to a test database"]
+async fn postgres_initial_policy_history_is_insert_only() {
+    let url = std::env::var("OPENSHELL_TEST_POSTGRES_URL").expect("test database URL");
+    let store = Store::connect(&url).await.unwrap();
+    assert_initial_policy_history_is_insert_only(&store).await;
+}
+
+async fn assert_initial_policy_history_is_insert_only(store: &Store) {
+    let id = uuid::Uuid::new_v4().to_string();
+    let sandbox = policy_test_sandbox(&id, &id);
+    let record = PolicyRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        sandbox_id: id.clone(),
+        version: 1,
+        policy_payload: SandboxPolicy::default().encode_to_vec(),
+        policy_hash: "initial-hash".into(),
+        status: "loaded".into(),
+        load_error: None,
+        created_at_ms: 1,
+        loaded_at_ms: None,
+        provenance: StdHashMap::new(),
+    };
+
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    assert!(store.get_latest_policy(&id).await.unwrap().is_none());
+
+    store.put_message(&sandbox).await.unwrap();
+    let (first, second) = tokio::join!(
+        store.put_initial_policy_revision(&record, "default"),
+        store.put_initial_policy_revision(&record, "default"),
+    );
+    first.unwrap();
+    second.unwrap();
+    let initial = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(initial.status, "loaded");
+    assert_eq!(initial.policy_hash, record.policy_hash);
+    assert_eq!(store.list_policies(&id, 10, 0).await.unwrap().len(), 1);
+
+    store
+        .update_policy_status(&id, 1, "failed", Some("apply failed"), None)
+        .await
+        .unwrap();
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    let failed = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.load_error.as_deref(), Some("apply failed"));
+
+    store
+        .put_policy_revision(
+            &uuid::Uuid::new_v4().to_string(),
+            &id,
+            "default",
+            2,
+            &record.policy_payload,
+            "new-hash",
+        )
+        .await
+        .unwrap();
+    store
+        .put_initial_policy_revision(&record, "default")
+        .await
+        .unwrap();
+    let latest = store.get_latest_policy(&id).await.unwrap().unwrap();
+    assert_eq!(latest.version, 2);
+    assert_eq!(store.list_policies(&id, 10, 0).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn policy_atomic_write_commits_revision_provenance_and_sandbox_projection() {
     let store = test_store().await;
     store
@@ -2194,6 +2351,83 @@ async fn cas_concurrent_updates_one_succeeds() {
     assert_eq!(record.resource_version, 2);
 }
 
+/// Write `payload` to the shared `sandbox-1` row under `condition`.
+async fn put_sandbox_1(
+    store: &Store,
+    payload: &str,
+    condition: super::WriteCondition,
+) -> Result<super::WriteResult, PersistenceError> {
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            "default",
+            payload.as_bytes(),
+            None,
+            condition,
+        )
+        .await
+}
+
+/// Each write must report the version it produced, even while other writers
+/// race on the same row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sqlite_concurrent_writes_return_their_own_resource_version() {
+    use super::WriteCondition;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    const WRITERS: u64 = 8;
+    const WRITES: u64 = 25;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let url = on_disk_store_url(&tmp.path().join("openshell.db"));
+    let store = Arc::new(Store::connect(&url).await.expect("connect to sqlite"));
+    put_sandbox_1(&store, "initial", WriteCondition::MustCreate)
+        .await
+        .unwrap();
+
+    let writers = (0..WRITERS).map(|writer| {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move {
+            let mut versions = Vec::new();
+            for write in 0..WRITES {
+                let payload = format!("{writer}-{write}");
+                let unconditional = put_sandbox_1(&store, &payload, WriteCondition::Unconditional)
+                    .await
+                    .unwrap();
+                versions.push(unconditional.resource_version);
+
+                // Retry the version-checked update until it wins a race.
+                loop {
+                    let current = store.get("sandbox", "id-1").await.unwrap().unwrap();
+                    let condition = WriteCondition::MatchResourceVersion(current.resource_version);
+                    match put_sandbox_1(&store, &payload, condition).await {
+                        Ok(result) => {
+                            versions.push(result.resource_version);
+                            break;
+                        }
+                        Err(PersistenceError::Conflict { .. }) => {}
+                        Err(err) => panic!("unexpected error: {err}"),
+                    }
+                }
+            }
+            versions
+        })
+    });
+
+    let mut seen = BTreeSet::new();
+    for handle in futures::future::join_all(writers).await {
+        for version in handle.unwrap() {
+            assert!(seen.insert(version), "version {version} returned twice");
+        }
+    }
+
+    let total = WRITERS * WRITES * 2;
+    assert_eq!(seen, (2..=total + 1).collect::<BTreeSet<_>>());
+}
+
 #[tokio::test]
 async fn cas_update_message_cas_succeeds() {
     use openshell_core::proto::Sandbox;
@@ -2807,7 +3041,6 @@ async fn membership_selector_escapes_adversarial_label_key() {
 /// so a trace decomposes an RPC into the storage work it did rather than
 /// bottoming out at the request boundary.
 #[tokio::test]
-#[ignore = "flaky under concurrent test execution"]
 async fn store_operations_export_spans_with_parents() {
     use tracing::Instrument as _;
 
@@ -2827,7 +3060,7 @@ async fn store_operations_export_spans_with_parents() {
     .await;
     drop(request_span);
 
-    let root = traced.span_named("request");
+    let root = traced.wait_for_span("request").await;
     let spans = traced.finished_spans();
     let child = spans
         .iter()

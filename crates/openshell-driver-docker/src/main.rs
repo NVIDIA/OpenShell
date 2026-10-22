@@ -25,6 +25,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_DRIVER_CONFIG")]
     config: PathBuf,
 
+    /// OCI image containing the `openshell-sandbox` runtime binary.
+    #[arg(long, env = openshell_core::config::SANDBOX_RUNTIME_IMAGE_ENV)]
+    sandbox_runtime_image: Option<String>,
+
+    /// OCI image containing the `openshell-supervisor` control binary.
+    #[arg(long, env = openshell_core::config::SUPERVISOR_IMAGE_ENV)]
+    supervisor_image: Option<String>,
+
     /// Gateway listener address used to derive the supervisor endpoint.
     #[arg(
         long,
@@ -38,6 +46,18 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
+
+    /// OTLP/gRPC collector endpoint for supervisor OCSF event export.
+    #[arg(long, env = "OPENSHELL_OTLP_OCSF_ENDPOINT")]
+    otlp_ocsf_endpoint: Option<String>,
+
+    /// OCSF schema version that supervisors downgrade exported events to.
+    #[arg(
+        long,
+        env = "OPENSHELL_OTLP_OCSF_SCHEMA_VERSION",
+        requires = "otlp_ocsf_endpoint"
+    )]
+    otlp_ocsf_schema_version: Option<String>,
 
     #[arg(long, env = "OPENSHELL_GATEWAY_NAME")]
     gateway_name: Option<String>,
@@ -63,6 +83,20 @@ async fn main() -> Result<()> {
         docker_config.allow_driver_config = policy.allow_driver_config;
         docker_config.resource_admission = policy.resource_admission;
     }
+    if let Some(image) = args.sandbox_runtime_image {
+        docker_config.sandbox_runtime_image = Some(image);
+    }
+    if let Some(image) = args.supervisor_image {
+        docker_config.supervisor_image = Some(image);
+    }
+    docker_config.supervisor_otlp_endpoint = args.otlp_endpoint.clone();
+    docker_config.supervisor_gateway_name = args.gateway_name.clone();
+    docker_config.supervisor_ocsf_export = args.otlp_ocsf_endpoint.clone().map(|endpoint| {
+        openshell_core::sandbox_env::OcsfOtlpExport {
+            endpoint,
+            schema_version: args.otlp_ocsf_schema_version.clone(),
+        }
+    });
     let driver = DockerComputeDriver::new(args.gateway_bind, &args.log_level, &docker_config)
         .await
         .into_diagnostic()?;

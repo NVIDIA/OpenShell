@@ -384,6 +384,8 @@ pub struct SandboxRef {
     pub labels: HashMap<String, String>,
     pub resource_version: u64,
     pub exit_code: Option<i32>,
+    /// Public OpenSSH SHA256 host identity; absent on older gateways.
+    pub host_key_fingerprint: Option<String>,
     pub created_from_workload_template: Option<SandboxWorkloadTemplateProvenance>,
     /// Service URLs returned by sandbox creation, keyed by service name. The
     /// empty key identifies the unnamed service. Non-create reads leave this empty.
@@ -437,6 +439,8 @@ impl SandboxRef {
             labels: meta.labels,
             resource_version: meta.resource_version,
             exit_code,
+            host_key_fingerprint: (!sandbox.host_key_fingerprint.is_empty())
+                .then_some(sandbox.host_key_fingerprint),
             created_from_workload_template,
             service_urls: HashMap::new(),
             restart_count,

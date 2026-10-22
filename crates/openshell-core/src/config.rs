@@ -46,6 +46,33 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 /// Default domain used for browser-facing sandbox service URLs.
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
+/// Gateway delivery path for supervisor configuration.
+///
+/// `Push` sends configuration over the supervisor session to supervisors that
+/// apply streamed configuration, which then stop polling. Other supervisors
+/// keep polling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigDeliveryMode {
+    #[default]
+    Poll,
+    Push,
+}
+
+impl FromStr for ConfigDeliveryMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "poll" => Ok(Self::Poll),
+            "push" => Ok(Self::Push),
+            _ => Err(format!(
+                "invalid config delivery mode '{value}'; expected poll or push"
+            )),
+        }
+    }
+}
+
 /// Gateway posture when a sandbox rejects a candidate policy generation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -89,21 +116,45 @@ pub const DEFAULT_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/superv
 /// Default OCI repository for the sandbox runtime image (no tag).
 pub const DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/sandbox";
 
-/// Return the default sandbox runtime image reference with a version-pinned tag.
-#[must_use]
-pub fn default_sandbox_runtime_image() -> String {
+/// Process-level default for the trusted sandbox runtime image.
+pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
+
+/// Process-level default for the trusted supervisor image.
+pub const SUPERVISOR_IMAGE_ENV: &str = "OPENSHELL_SUPERVISOR_IMAGE";
+
+fn compiled_sandbox_runtime_image() -> String {
     format!(
         "{DEFAULT_SANDBOX_RUNTIME_IMAGE_REPO}:{}",
         default_supervisor_image_tag()
     )
 }
 
-/// Return the default supervisor image reference with a version-pinned tag.
-#[must_use]
-pub fn default_supervisor_image() -> String {
+fn compiled_supervisor_image() -> String {
     format!(
         "{DEFAULT_SUPERVISOR_IMAGE_REPO}:{}",
         default_supervisor_image_tag()
+    )
+}
+
+fn runtime_image_default(environment_value: Option<String>, compiled_default: String) -> String {
+    environment_value.unwrap_or(compiled_default)
+}
+
+/// Return the process-configured sandbox runtime image, or the compiled default.
+#[must_use]
+pub fn default_sandbox_runtime_image() -> String {
+    runtime_image_default(
+        std::env::var(SANDBOX_RUNTIME_IMAGE_ENV).ok(),
+        compiled_sandbox_runtime_image(),
+    )
+}
+
+/// Return the process-configured supervisor image, or the compiled default.
+#[must_use]
+pub fn default_supervisor_image() -> String {
+    runtime_image_default(
+        std::env::var(SUPERVISOR_IMAGE_ENV).ok(),
+        compiled_supervisor_image(),
     )
 }
 
@@ -185,6 +236,9 @@ pub struct Config {
     /// Security posture for rejected sandbox policy generations.
     pub policy_validation_failure_mode: PolicyValidationFailureMode,
 
+    /// Whether supervisors poll for configuration or receive it over their session.
+    pub config_delivery_mode: ConfigDeliveryMode,
+
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
@@ -219,6 +273,24 @@ pub struct Config {
     /// Database URL for persistence.
     pub database_url: String,
 
+    /// Connection ceiling for the persistence pool.
+    ///
+    /// `None` leaves the backend's built-in default in place. The right
+    /// ceiling depends on the deployment — how many gateway replicas share
+    /// the database, and what `max_connections` a Postgres server itself
+    /// allows — so it cannot be one number baked into the binary. An
+    /// in-memory `SQLite` database ignores it: the database lives in its single
+    /// connection.
+    pub database_max_connections: Option<u32>,
+
+    /// Connection ceiling for the `PostgreSQL` mutation lock pool.
+    ///
+    /// `None` keeps the built-in default of 4. Each mutation guard holds one
+    /// lock connection, so this bounds how many guarded mutations a replica
+    /// runs or waits on in `PostgreSQL` at once. `SQLite` has no lock pool and
+    /// ignores it.
+    pub database_lock_max_connections: Option<u32>,
+
     /// Explicit compute driver configured for the gateway.
     /// `None` enables runtime auto-detection.
     pub compute_driver: Option<String>,
@@ -239,6 +311,10 @@ pub struct Config {
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
+
+    /// Absolute image preparation and initial supervisor startup budget for new
+    /// sandbox attempts, in seconds. Must be between 1 and 86400, inclusive.
+    pub image_preparation_timeout_seconds: u32,
 
     /// Maximum gRPC requests allowed per rate-limit window.
     ///
@@ -382,6 +458,10 @@ pub struct OidcConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
+    /// Enable gateway-wide operators authenticated by verified certificates with OU=operator.
+    /// Independent of ordinary mTLS user authentication; defaults off.
+    #[serde(default)]
+    pub operator_enabled: bool,
     /// When true, the gateway maps a verified TLS client certificate into a
     /// user principal. Sandbox and supervisor clients use bearer identity, so
     /// this setting is independent of the selected compute driver.
@@ -851,6 +931,7 @@ impl Config {
             metrics_bind_address: None,
             log_level: default_log_level(),
             policy_validation_failure_mode: PolicyValidationFailureMode::default(),
+            config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
             oidc: None,
             auth: GatewayAuthConfig::default(),
@@ -860,11 +941,14 @@ impl Config {
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
+            database_max_connections: None,
+            database_lock_max_connections: None,
             compute_driver: None,
             compute_driver_endpoints: BTreeMap::new(),
             credential_drivers: Vec::new(),
             default_credential_driver: None,
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            image_preparation_timeout_seconds: 1800,
             grpc_rate_limit_requests: None,
             grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
@@ -908,6 +992,27 @@ impl Config {
     #[must_use]
     pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
         self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with a database pool connection ceiling.
+    ///
+    /// `None` keeps the persistence backend's default.
+    #[must_use]
+    pub const fn with_database_max_connections(mut self, max_connections: Option<u32>) -> Self {
+        self.database_max_connections = max_connections;
+        self
+    }
+
+    /// Create a new configuration with a mutation lock pool connection ceiling.
+    ///
+    /// `None` keeps the built-in default.
+    #[must_use]
+    pub const fn with_database_lock_max_connections(
+        mut self,
+        max_connections: Option<u32>,
+    ) -> Self {
+        self.database_lock_max_connections = max_connections;
         self
     }
 
@@ -1116,10 +1221,11 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppArmorProfile, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, ImagePullPolicy, PolicyValidationFailureMode,
-        UpstreamProxyConfig, default_sandbox_pids_limit, normalize_compute_driver_name,
+        AppArmorProfile, Config, ConfigDeliveryMode, DEFAULT_SERVICE_ROUTING_DOMAIN,
+        GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
+        GatewayJwtConfig, GatewayProviderProfileSourceConfig, ImagePullPolicy,
+        PolicyValidationFailureMode, UpstreamProxyConfig, default_sandbox_pids_limit,
+        normalize_compute_driver_name,
     };
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -1137,6 +1243,19 @@ mod tests {
             PolicyValidationFailureMode::RetainLastValid
         );
         assert!("keep_old".parse::<PolicyValidationFailureMode>().is_err());
+    }
+
+    #[test]
+    fn config_delivery_defaults_to_poll_and_rejects_unknown_modes() {
+        assert_eq!(
+            Config::new(None).config_delivery_mode,
+            ConfigDeliveryMode::Poll
+        );
+        assert_eq!(
+            "push".parse::<ConfigDeliveryMode>().unwrap(),
+            ConfigDeliveryMode::Push
+        );
+        assert!("enabled".parse::<ConfigDeliveryMode>().is_err());
     }
 
     #[test]
@@ -1639,15 +1758,30 @@ mod tests {
 
     #[test]
     fn default_supervisor_image_is_version_pinned() {
-        use super::{default_sandbox_runtime_image, default_supervisor_image};
-        let image = default_supervisor_image();
+        use super::{compiled_sandbox_runtime_image, compiled_supervisor_image};
+        let image = compiled_supervisor_image();
         assert!(image.starts_with("ghcr.io/nvidia/openshell/supervisor:"));
         let tag = image.rsplit_once(':').unwrap().1;
         assert!(!tag.is_empty());
 
-        let sandbox_image = default_sandbox_runtime_image();
+        let sandbox_image = compiled_sandbox_runtime_image();
         assert!(sandbox_image.starts_with("ghcr.io/nvidia/openshell/sandbox:"));
         let sandbox_tag = sandbox_image.rsplit_once(':').unwrap().1;
         assert!(!sandbox_tag.is_empty());
+    }
+
+    #[test]
+    fn runtime_image_environment_value_replaces_compiled_default() {
+        use super::runtime_image_default;
+
+        let digest = format!("registry.example.com/sandbox@sha256:{}", "a".repeat(64));
+        assert_eq!(
+            runtime_image_default(Some(digest.clone()), "compiled:default".to_string()),
+            digest
+        );
+        assert_eq!(
+            runtime_image_default(None, "compiled:default".to_string()),
+            "compiled:default"
+        );
     }
 }

@@ -122,6 +122,10 @@ pub struct VmComputeConfig {
     pub provider_spiffe_workload_api_tcp_endpoint: Option<String>,
     #[serde(default)]
     pub provider_spiffe_allow_guest_tcp: bool,
+
+    /// Allow bind-mounting host directories into VM sandboxes.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl VmComputeConfig {
@@ -254,6 +258,7 @@ impl Default for VmComputeConfig {
             proxy_ca_bundle: None,
             provider_spiffe_workload_api_tcp_endpoint: None,
             provider_spiffe_allow_guest_tcp: false,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -575,6 +580,9 @@ pub async fn spawn(
         command.arg("--guest-tls-ca").arg(tls.ca);
     }
     append_vm_proxy_and_spiffe_args(&mut command, vm_config);
+    if vm_config.enable_bind_mounts {
+        command.arg("--enable-bind-mounts");
+    }
 
     let mut child = command.spawn().map_err(|e| {
         Error::execution(format!(
@@ -660,8 +668,22 @@ fn append_vm_proxy_and_spiffe_args(command: &mut Command, config: &VmComputeConf
 }
 
 fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>, gateway_name: &str) {
-    if let Some(config) = otlp_config {
-        command.arg("--otlp-endpoint").arg(&config.endpoint);
+    let traces_endpoint = otlp_config.and_then(OtlpConfig::traces_endpoint);
+    let ocsf = otlp_config.and_then(|config| config.ocsf.as_ref());
+    if let Some(endpoint) = traces_endpoint {
+        command.arg("--otlp-endpoint").arg(endpoint);
+    }
+    if let Some(ocsf) = ocsf {
+        command.arg("--otlp-ocsf-endpoint").arg(&ocsf.endpoint);
+        if let Some(version) = ocsf.schema_version {
+            command
+                .arg("--otlp-ocsf-schema-version")
+                .arg(version.as_str());
+        }
+    }
+    // The driver names its own spans with the gateway name, and supervisors
+    // name their spans and OCSF records with it.
+    if traces_endpoint.is_some() || ocsf.is_some() {
         command.arg("--gateway-name").arg(gateway_name);
     }
 }
@@ -760,7 +782,9 @@ mod tests {
         validate_vm_sandbox_identity,
     };
     use openshell_core::UpstreamProxyConfig;
-    use openshell_server::config_file::OtlpConfig;
+    use openshell_server::config_file::{
+        OcsfOtlpConfig, OcsfSchemaVersion, OtlpConfig, OtlpTracesConfig,
+    };
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -808,8 +832,11 @@ mod tests {
         append_otlp_args(
             &mut command,
             Some(&OtlpConfig {
-                endpoint: "http://collector.internal:4317".to_string(),
                 service_name: Some("custom-gateway".to_string()),
+                traces: Some(OtlpTracesConfig {
+                    endpoint: "http://collector.internal:4317".to_string(),
+                }),
+                ocsf: None,
             }),
             "production-us-west",
         );
@@ -824,6 +851,40 @@ mod tests {
             [
                 "--otlp-endpoint",
                 "http://collector.internal:4317",
+                "--gateway-name",
+                "production-us-west"
+            ]
+        );
+    }
+
+    #[test]
+    fn vm_driver_command_includes_gateway_ocsf_export() {
+        let mut command = tokio::process::Command::new("openshell-driver-vm");
+        append_otlp_args(
+            &mut command,
+            Some(&OtlpConfig {
+                service_name: None,
+                traces: None,
+                ocsf: Some(OcsfOtlpConfig {
+                    endpoint: "http://siem.internal:4317".to_string(),
+                    schema_version: Some(OcsfSchemaVersion::V1_3),
+                }),
+            }),
+            "production-us-west",
+        );
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--otlp-ocsf-endpoint",
+                "http://siem.internal:4317",
+                "--otlp-ocsf-schema-version",
+                "1.3",
                 "--gateway-name",
                 "production-us-west"
             ]

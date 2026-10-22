@@ -10,6 +10,11 @@ attachments. Managed mode stages an immutable copy for each sandbox runtime
 generation.
 See [resource admission configuration](../../docs/how-it-works/gateways/configuration.mdx#external-resource-admission).
 
+Caller PVC mounts cannot overlap the driver-managed `/.openshell` control tree
+or `/run`, including nested `subPath` mounts. Resource approval labels do not
+permit mounting over these paths. Use data paths such as `/data` or a directory
+below `/sandbox`.
+
 The driver uses the Kubernetes API to create, delete, fetch, and watch sandbox
 custom resources. It runs in-process with the gateway server and supports three
 workspace namespace modes via `workspace_mode`:
@@ -17,13 +22,20 @@ workspace namespace modes via `workspace_mode`:
 - **Shared** (default): All sandboxes render into a single static namespace.
   Resource names use `{workspace}--{name}` for collision avoidance.
 - **Managed**: The driver auto-creates/deletes a K8s namespace per workspace
-  (`openshell-{gateway_id}-{workspace_name}`), creates a ServiceAccount in each,
-  and copies OpenShift SCC annotations from the gateway namespace when present.
+  (`openshell-{gateway_id}-{workspace_name}`) and creates a ServiceAccount in
+  each. On OpenShift, it leaves SCC annotations to the namespace allocator and
+  waits for the namespace's own MCS, UID-range, and supplemental-group
+  annotations before provisioning sandbox resources. An existing namespace with
+  a UID range but no MCS must be recreated so OpenShift can allocate a complete
+  set of SCC annotations.
 - **Operator**: Workspace names map 1:1 to pre-provisioned namespaces discovered
   through exactly one source: either a label selector
   (`operator_namespace_label`) or a drop-in allowlist file
   (`operator_namespace_file`). Sandbox creation fails closed if the workspace
-  namespace is not in the current allowlist. Workspace deletion only removes
+  namespace is not in the current allowlist. With a label selector, workspace
+  checks that run before the watcher's first namespace listing wait up to 10
+  seconds for it and then return `Unavailable`, so a gateway restart does not
+  reject labeled workspaces as unknown. Workspace deletion only removes
   gateway state; it never deletes or otherwise accesses the operator-managed
   Kubernetes namespace.
 
@@ -75,6 +87,12 @@ The supervisor Pod has a direct, non-controller owner reference to the Sandbox
 resource. This links its garbage-collection lifecycle to the sandbox without
 competing with the Agent Sandbox controller for workload-Pod ownership.
 
+When the gateway exports OTLP traces, the driver sets
+`OPENSHELL_OTLP_ENDPOINT` on the supervisor Pod to the gateway's endpoint and
+`TRACEPARENT` to the trace context of the operation that created the Pod. The
+supervisor exports its spans there and parents its startup span on that
+context. The endpoint is not configurable in driver TOML.
+
 The driver creates one namespace-wide `NetworkPolicy` before it releases any
 workload Pod. It selects every OpenShell workload, denies all workload egress,
 and permits OpenShell supervisor Pods to reach the sandbox TLS port. The
@@ -85,6 +103,61 @@ them. The cluster CNI must enforce ingress and egress `NetworkPolicy` for every
 sandbox namespace. Kubernetes accepts policy objects without confirming
 enforcement, so operators must verify CNI support before running sandboxes.
 
+### Control connection direction
+
+Every new runtime generation uses `runtime-initiated` control. The Sandbox
+annotation `openshell.ai/sandbox-runtime-control-connection` records the mode,
+bound to `openshell.ai/sandbox-runtime-control-generation`. A missing marker or
+a different current runtime generation identifies a legacy,
+`supervisor-initiated` generation, which keeps working until replaced. Stop/start
+upgrades it automatically: with both old Pods removed, the driver adds the
+supervisor Service and records the new mode and generation
+before releasing the replacement workload. Gateway recovery that recreates both
+Pods also upgrades the generation. Reconciliation never migrates a running
+generation. An unknown annotation value fails closed; there is no rollout flag.
+
+Only the dial direction differs. In both modes the sandbox runtime presents the
+generation-pinned TLS server identity and serves gRPC, and the supervisor
+verifies that identity, acts as the gRPC client, and sends the Sandbox Protocol
+JWT. The per-sandbox Service `os-boundary-<id>` always selects the paired
+workload Pod. A separate `os-supervisor-<id>` Service always selects the paired
+supervisor Pod. New gateways create both Services, retaining the legacy
+Service's UID, ClusterIP, and selector across restarts so an older gateway can
+still replace the generation during a rolling upgrade.
+
+For `runtime-initiated`:
+
+- The bootstrap Secret gives the runtime the Service ClusterIP and port. The
+  runtime retries with capped backoff until the supervisor listens, so neither
+  Pod waits on the other during bootstrap. The Service sets
+  `publishNotReadyAddresses` because the supervisor becomes Ready only after
+  the runtime attaches through it. The workload still cannot reach the control
+  port.
+- A per-sandbox `NetworkPolicy` `os-control-<id>` selects only this sandbox's
+  two Pods and admits one flow, from its workload Pod to its supervisor Pod on
+  `boundary_port` over TCP, as workload egress and supervisor ingress.
+  Supervisors may already be ingress-isolated by the managed SSH ingress policy;
+  when that policy is disabled, this one isolates them. Exec, file sync, and
+  logs need no other supervisor ingress because the supervisor opens those
+  connections. The CNI must still allow kubelet readiness probes. The
+  namespace-wide policies are unchanged.
+- The policy's UID and resourceVersion are bound into the boundary resource
+  claims and outer-fence evidence. Reconciliation suspends the workload if the
+  policy disappears, diverges, or changes generation, or if the active control
+  Service no longer selects the role the recorded mode requires.
+- Both Services and the control policy are owned by the Sandbox resource and are
+  deleted only with that sandbox.
+
+Deploy a gateway, supervisor image, and sandbox runtime image that all support
+`runtime-initiated` before using it. Older binaries reject the new descriptor
+shapes and fail closed.
+
+During a mixed-version rollout, an old gateway can restart a sandbox by
+creating its own compatible supervisor/runtime pair through the legacy
+Service. It preserves unknown annotations, so the mode marker is accepted only
+for its recorded generation. Do not replace an individual generation's
+supervisor or runtime binary with one that cannot read its descriptor.
+
 Each sandbox generation uses two immutable bootstrap Secrets. A trusted init
 container stages the sandbox bootstrap into memory, and the sandbox removes it
 before starting untrusted code. The other Secret is mounted only by the
@@ -92,10 +165,13 @@ supervisor; when `proxy_ca_bundle` is configured it also carries the operator's
 corporate proxy CA bundle, which the gateway reads from its own filesystem so
 the anchor stays in the gateway's trust domain rather than the sandbox
 namespace. The TLS channel binds the namespace, Sandbox CR, workload Pod,
-supervisor Pod, and shared network-policy identities. Stop deletes the workload
+supervisor Pod, and shared network-policy identities, plus the per-sandbox
+control policy for `runtime-initiated` sandboxes. Stop deletes the workload
 and supervisor Pods. Start rotates both Secrets and creates a new supervisor
-Pod before releasing a new workload Pod. The shared network fence remains for
-the lifetime of the namespace.
+Pod before releasing a new workload Pod. It also renders the trusted init
+container again from gateway config, so a sandbox created by an older gateway
+starts with the current sandbox runtime image. The shared network fence
+remains for the lifetime of the namespace.
 
 Kubernetes policies are additive, and the API does not attest that the CNI
 enforces them. Keep sandbox namespaces administrative: untrusted principals
@@ -114,7 +190,9 @@ state and platform events into the shared compute-driver protobuf surface used
 by the gateway.
 
 Kubernetes API calls use explicit timeouts so gRPC handlers do not block
-indefinitely when the API server is slow or unavailable. Resource and Event
+indefinitely when the API server is slow or unavailable. The request client's
+timeout starts when each request is sent, so time a pooled connection spends
+idle does not shorten it. Resource and Event
 watches recover in place with API-friendly backoff after transient watcher
 errors, avoiding a gateway-side watch restart and its associated watch gap.
 
@@ -181,6 +259,13 @@ credentials after launch and must inspect its same-identity descendants.
 The workload Pod does not share host network, PID, IPC, or process namespaces.
 The driver uses a scheduling gate to inspect the admitted Pod and bind its UID
 into the bootstrap claims before kubelet starts it.
+
+Lifecycle RPCs and runtime reconciliation share a per-sandbox mutation gate
+across clones of the driver. Reconciliation skips busy sandboxes and refreshes
+the Sandbox CR under that gate before cleanup, so a stopped or stopping LIST
+snapshot cannot delete a supervisor created by a concurrent restart in the same
+driver instance. The gate preserves concurrency across sandboxes; it does not
+provide distributed exclusion between separate gateway or driver processes.
 
 ## GPU Support
 

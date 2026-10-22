@@ -58,10 +58,21 @@ pub const CONDITION_WORKSPACE_VALIDATION_FAILED: &str = "WorkspaceValidationFail
 
 /// Supervisor exit status reserved for OCI workspace validation failures.
 ///
-/// Local container drivers translate this status into
+/// Local container drivers translate a supervisor exit with this status into
 /// [`CONDITION_WORKSPACE_VALIDATION_FAILED`] so users receive the specific
 /// provisioning failure rather than a generic container exit.
 pub const SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED: i32 = 78;
+
+/// Error context for a rejected image-provided OCI working directory.
+///
+/// The supervisor recognizes it in a failed agent start and exits with
+/// [`SUPERVISOR_EXIT_WORKSPACE_VALIDATION_FAILED`].
+pub const WORKSPACE_VALIDATION_ERROR_CONTEXT: &str = "image workspace validation failed";
+
+/// Driver condition message for [`CONDITION_WORKSPACE_VALIDATION_FAILED`].
+/// Fixed text, because supervisor output may contain secrets.
+pub const WORKSPACE_VALIDATION_FAILED_MESSAGE: &str =
+    "OCI WorkingDir is not usable by the sandbox identity";
 
 /// Ready-condition reason when a container was terminated by an external signal.
 ///
@@ -133,6 +144,18 @@ pub const UPSTREAM_PROXY_AUTH_MOUNT_PATH: &str = "/etc/openshell/auth/upstream-p
 /// credential, a CA certificate is not secret, so a plain read-only bind
 /// mount is used rather than a driver secret.
 pub const PROXY_CA_MOUNT_PATH: &str = "/etc/openshell/tls/proxy/ca-bundle.pem";
+
+/// Container-side mount path for an operator-supplied additional destination
+/// CA bundle.
+///
+/// Drivers with an `additional_ca_bundle` operator setting bind-mount the
+/// host PEM file here (read-only) and pass the path on the supervisor's argv
+/// via `--additional-ca-bundle`. The supervisor folds it into its upstream
+/// TLS trust store alongside the system CA bundle, for direct (non-proxied)
+/// inspected HTTPS egress to destinations signed by a private CA — unlike
+/// [`PROXY_CA_MOUNT_PATH`], this applies regardless of whether a corporate
+/// forward proxy is configured.
+pub const ADDITIONAL_CA_MOUNT_PATH: &str = "/etc/openshell/tls/additional/ca-bundle.pem";
 
 /// A validated corporate upstream-proxy address.
 ///
@@ -1228,8 +1251,10 @@ mod tests {
     fn ca_bundle_file_accepts_a_real_certificate() {
         // The positive case that pins host acceptance to guest acceptance:
         // what the driver stages is exactly what rustls will trust.
-        let cert = rcgen::generate_simple_self_signed(vec!["proxy.corp.example".to_string()])
-            .expect("test CA");
+        let cert = openshell_crypto::pki::generate_simple_self_signed(vec![
+            "proxy.corp.example".to_string(),
+        ])
+        .expect("test CA");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proxy-ca.pem");
         std::fs::write(&path, cert.cert.pem()).unwrap();

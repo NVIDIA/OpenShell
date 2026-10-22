@@ -3,15 +3,19 @@
 
 //! Real SSH sessions with controlled boundary I/O, including stalled stdin.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use super::input::MAX_PENDING_INPUT;
 use super::tests::test_client;
 use openshell_isolation_interface::contract::{
-    BackendError, BoundaryExec, BoundaryExitStatus, BoundaryProcess, BoundarySignal, ExecSession,
-    ExecSpec,
+    BackendError, BoundaryExitStatus, BoundarySignal, ExecSpec,
 };
+use rpc_test::ExecSession;
 use russh::ChannelMsg;
 use std::collections::VecDeque;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -58,7 +62,7 @@ struct TestProcess {
 }
 
 #[async_trait::async_trait]
-impl BoundaryProcess for TestProcess {
+impl rpc_test::BoundaryProcess for TestProcess {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         let mut status = self.status.subscribe();
         Ok(*status
@@ -85,13 +89,35 @@ impl BoundaryProcess for TestProcess {
 struct TestExec(Mutex<VecDeque<ExecSession>>);
 
 #[async_trait::async_trait]
-impl BoundaryExec for TestExec {
+impl rpc_test::BoundaryExec for TestExec {
     async fn exec(&self, _spec: ExecSpec) -> Result<ExecSession, BackendError> {
         Ok(self
             .0
             .lock()
             .unwrap()
             .pop_front()
+            .expect("test exec session"))
+    }
+}
+
+struct FailThenExec {
+    failed: AtomicBool,
+    session: Mutex<Option<ExecSession>>,
+}
+
+#[async_trait::async_trait]
+impl rpc_test::BoundaryExec for FailThenExec {
+    async fn exec(&self, _spec: ExecSpec) -> Result<ExecSession, BackendError> {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            return Err(BackendError::Unavailable(
+                "test boundary admission failure".to_string(),
+            ));
+        }
+        Ok(self
+            .session
+            .lock()
+            .unwrap()
+            .take()
             .expect("test exec session"))
     }
 }
@@ -156,12 +182,49 @@ async fn start_exec(
 }
 
 #[tokio::test]
+async fn exec_start_failure_keeps_ssh_session_usable() {
+    tokio::time::timeout(DEADLINE, async {
+        let (session, mut control) = exec_session();
+        let client = test_client(
+            None,
+            rpc_test::exec(Arc::new(FailThenExec {
+                failed: AtomicBool::new(false),
+                session: Mutex::new(Some(session)),
+            })),
+            russh::client::Config::default(),
+        )
+        .await;
+
+        let mut rejected = client.channel_open_session().await.unwrap();
+        rejected.exec(true, "first").await.unwrap();
+        assert!(matches!(rejected.wait().await, Some(ChannelMsg::Failure)));
+
+        let mut channel = start_exec(&client).await;
+        control.stdout.shutdown().await.unwrap();
+        control.stderr.shutdown().await.unwrap();
+        control
+            .process
+            .status
+            .send_replace(Some(BoundaryExitStatus::Exited(0)));
+        loop {
+            match channel.wait().await {
+                Some(ChannelMsg::ExitStatus { exit_status: 0 }) => break,
+                Some(_) => {}
+                None => panic!("successful exec closed without an exit status"),
+            }
+        }
+    })
+    .await
+    .expect("a rejected exec closed the SSH session");
+}
+
+#[tokio::test]
 async fn full_input_allows_output_signals_and_channel_close() {
     tokio::time::timeout(DEADLINE, async {
         let (session, mut control) = exec_session();
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([session].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session].into())))),
             russh::client::Config::default(),
         )
         .await;
@@ -216,12 +279,12 @@ async fn full_input_allows_output_signals_and_channel_close() {
 }
 
 #[tokio::test]
-async fn disconnect_cancels_stalled_input_without_main_session() {
+async fn disconnect_does_not_block_remote_process_exit() {
     tokio::time::timeout(DEADLINE, async {
         let (session, mut control) = exec_session();
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([session].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session].into())))),
             russh::client::Config::default(),
         )
         .await;
@@ -236,13 +299,19 @@ async fn disconnect_cancels_stalled_input_without_main_session() {
             .disconnect(russh::Disconnect::ByApplication, "test disconnect", "")
             .await
             .unwrap();
+        // The backend retains process ownership after an attachment disconnects.
+        // Its independent exit must still release the blocked input writer.
+        control
+            .process
+            .status
+            .send_replace(Some(BoundaryExitStatus::Exited(0)));
         control
             .dropped
             .await
             .expect("disconnect releases blocked stdin");
     })
     .await
-    .expect("disconnect retained a blocked stdin writer");
+    .expect("disconnect blocked remote process completion");
 }
 
 #[tokio::test]
@@ -251,7 +320,7 @@ async fn process_exit_cancels_stalled_input() {
         let (session, mut control) = exec_session();
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([session].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session].into())))),
             russh::client::Config::default(),
         )
         .await;
@@ -287,23 +356,20 @@ async fn process_exit_cancels_stalled_input() {
 #[tokio::test]
 async fn overflow_reports_failure_and_preserves_sibling_channel() {
     tokio::time::timeout(DEADLINE, async {
-        let (first, mut a) = exec_session();
+        let (first, a) = exec_session();
         let (second, mut b) = exec_session();
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([first, second].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([first, second].into())))),
             russh::client::Config::default(),
         )
         .await;
         let mut channel = start_exec(&client).await;
         let sibling = start_exec(&client).await;
-        channel
-            .data(vec![7; MAX_PENDING_INPUT].as_slice())
-            .await
-            .unwrap();
-        channel.signal(russh::Sig::INT).await.unwrap();
-        a.signals.recv().await.unwrap();
-        channel.data(&b"overflow"[..]).await.unwrap();
+        // Fill the SSH queue beyond the bounded RPC transport capacity.
+        let _ = channel
+            .data(vec![7; 2 * MAX_PENDING_INPUT].as_slice())
+            .await;
         a.dropped.await.expect("overflow releases blocked stdin");
         a.process
             .terminated
@@ -344,7 +410,7 @@ async fn eof_drains_accepted_input_and_allows_larger_total_transfers() {
         let (session, mut control) = exec_session_with_capacity(64 * 1024);
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([session].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session].into())))),
             russh::client::Config::default(),
         )
         .await;
@@ -404,7 +470,7 @@ async fn eof_preserves_queued_input_until_the_child_reads() {
         let (session, mut control) = exec_session();
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([session].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session].into())))),
             russh::client::Config::default(),
         )
         .await;
@@ -427,11 +493,11 @@ async fn eof_preserves_queued_input_until_the_child_reads() {
 #[tokio::test]
 async fn overflow_reports_failure_without_output_window_credit() {
     tokio::time::timeout(DEADLINE, async {
-        let (session, mut control) = exec_session();
+        let (session, control) = exec_session();
         let (second, sibling_control) = exec_session();
         let client = test_client(
             None,
-            Arc::new(TestExec(Mutex::new([session, second].into()))),
+            rpc_test::exec(Arc::new(TestExec(Mutex::new([session, second].into())))),
             russh::client::Config {
                 window_size: 0,
                 ..Default::default()
@@ -440,15 +506,10 @@ async fn overflow_reports_failure_without_output_window_credit() {
         .await;
         let mut channel = start_exec(&client).await;
         let mut sibling = start_exec(&client).await;
-        channel
-            .data(vec![7; MAX_PENDING_INPUT].as_slice())
-            .await
-            .unwrap();
-        channel.signal(russh::Sig::INT).await.unwrap();
-        control.signals.recv().await.unwrap();
-        // Overflow must not queue a diagnostic behind the zero output window.
-        // That would block Handle messages, including the sibling's status.
-        channel.data(&b"overflow"[..]).await.unwrap();
+        // Fill the SSH queue beyond the bounded RPC transport capacity.
+        let _ = channel
+            .data(vec![7; 2 * MAX_PENDING_INPUT].as_slice())
+            .await;
         control.dropped.await.unwrap();
         loop {
             match channel.wait().await {

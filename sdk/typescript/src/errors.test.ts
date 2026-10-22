@@ -50,6 +50,7 @@ describe('fromConnect', () => {
     [Code.InvalidArgument, 'invalid_config'],
     [Code.Unauthenticated, 'auth'],
     [Code.PermissionDenied, 'auth'],
+    [Code.OutOfRange, 'rpc'],
     [Code.Internal, 'rpc'],
   ];
 

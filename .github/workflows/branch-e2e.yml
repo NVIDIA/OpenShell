@@ -1,8 +1,6 @@
 name: Branch E2E Checks
 
 on:
-  merge_group:
-    types: [checks_requested]
   push:
     branches:
       - "pull-request/[0-9]+"
@@ -50,15 +48,6 @@ jobs:
               run_kubernetes_ha_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               run_kubernetes_credential_drivers_e2e="$(jq -r 'index("test:e2e-kubernetes") != null' <<< "$LABELS_JSON")"
               ;;
-            merge_group)
-              # Merge groups have no PR labels. When GPU E2E is required as documented
-              # in CI.md, skipping it leaves the gate pending until the queue times out
-              # and ejects the PR. HA stays off until stable.
-              run_core_e2e=true
-              run_gpu_e2e=true
-              run_kubernetes_ha_e2e=false
-              run_kubernetes_credential_drivers_e2e=false
-              ;;
             *)
               run_core_e2e=true
               run_gpu_e2e=true
@@ -82,7 +71,7 @@ jobs:
 
   version:
     needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_any_e2e == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -144,6 +133,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
@@ -184,6 +174,7 @@ jobs:
           ref: ${{ github.sha }}
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - uses: ./.github/actions/build-rust-binary
         with:
@@ -226,7 +217,7 @@ jobs:
   build-rpm:
     name: Build RPM packages
     needs: [pr_metadata, version, build-binaries]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+    if: needs.pr_metadata.outputs.run_integration == 'true'
     permissions:
       actions: read
       contents: read
@@ -265,6 +256,7 @@ jobs:
         [
           {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
           {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
           {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
         ]
@@ -284,7 +276,10 @@ jobs:
       test-matrix: >-
         [
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
         ]
 
   # Run driver-specific integration tests:
@@ -319,7 +314,6 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
 
   podman-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -331,7 +325,6 @@ jobs:
     uses: ./.github/workflows/e2e-podman-test.yml
     with:
       image-tag: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
       suite-matrix: >-
         [{"suite":"ci","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:ci"}]
 
@@ -343,8 +336,6 @@ jobs:
       contents: read
       packages: read
     uses: ./.github/workflows/e2e-vm-test.yml
-    with:
-      conformance-artifact-prefix: openshell-conformance
 
   docker-external-driver-e2e:
     needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
@@ -359,7 +350,6 @@ jobs:
       runner: linux-arm64-cpu8
       gateway-artifact: openshell-gateway-plain-aarch64-unknown-linux-gnu
       external-driver-binary: openshell-driver-docker
-      conformance-artifact-prefix: openshell-conformance
       suite-matrix: >-
         [{"suite":"external-driver","cmd":"mise run --no-deps --skip-deps e2e:docker:external-driver","apt_packages":"openssh-client","python_proto":false,"mcp":false}]
 
@@ -375,7 +365,6 @@ jobs:
       image-tag: ${{ github.sha }}
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       external-driver-binary: openshell-driver-podman
-      conformance-artifact-prefix: openshell-conformance
       suite-matrix: >-
         [{"suite":"external-driver","runner":"ubuntu-26.04","podman_major":"5","podman_package_version":"5.7.0+ds2-3build1","conmon_package_version":"2.1.13+ds1-2","cmd":"mise run --no-deps --skip-deps e2e:podman:external-driver"}]
 
@@ -391,7 +380,6 @@ jobs:
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       suite-name: external-driver
       e2e-task: e2e:vm:external-driver
-      conformance-artifact-prefix: openshell-conformance
 
   gpu-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -403,7 +391,6 @@ jobs:
     uses: ./.github/workflows/e2e-gpu-test.yaml
     with:
       image-tag: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
 
   kubernetes-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -425,7 +412,6 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (Rust smoke, Agent Sandbox ${{ matrix.agent_sandbox_api }})
       agent-sandbox-version: ${{ matrix.agent_sandbox_version }}
-      conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-managed-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -439,7 +425,6 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace managed mode)
       e2e-task: e2e:kubernetes:workspace-managed
-      conformance-artifact-prefix: openshell-conformance
 
   kubernetes-external-driver-e2e:
     needs: [pr_metadata, build-binaries, build-gateway-plain, build-external-drivers, build-images]
@@ -456,7 +441,6 @@ jobs:
       gateway-artifact: openshell-gateway-plain-x86_64-unknown-linux-gnu
       external-driver-binary: openshell-driver-kubernetes
       cluster-images: sandbox supervisor
-      conformance-artifact-prefix: openshell-conformance
 
   kubernetes-workspace-operator-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -470,7 +454,6 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes E2E (workspace operator mode)
       e2e-task: e2e:kubernetes:workspace-operator
-      conformance-artifact-prefix: openshell-conformance
 
   kubernetes-ha-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -488,7 +471,6 @@ jobs:
       test-name: kubernetes_ha_rebalancing
       kubernetes-features: e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-ha
       use-envoy-gateway: true
-      conformance-artifact-prefix: openshell-conformance
 
   kubernetes-credential-drivers-e2e:
     needs: [pr_metadata, build-binaries, build-images]
@@ -502,7 +484,6 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes Credential Drivers E2E
       e2e-task: e2e:kubernetes:credential-drivers
-      conformance-artifact-prefix: openshell-conformance
 
   core-e2e-result:
     name: Core E2E result

@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::User;
+
 /// OCSF Process object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Process {
@@ -74,10 +76,38 @@ impl Process {
 }
 
 /// OCSF Actor object — the entity that initiated the event.
+///
+/// The schema requires at least one attribute; the constructors set exactly
+/// one of `process` or `user`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     /// The process that performed the action.
-    pub process: Process,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<Process>,
+
+    /// The principal that performed the action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<User>,
+}
+
+impl Actor {
+    /// An actor identified by the process that performed the action.
+    #[must_use]
+    pub fn process(process: Process) -> Self {
+        Self {
+            process: Some(process),
+            user: None,
+        }
+    }
+
+    /// An actor identified by an authenticated principal.
+    #[must_use]
+    pub fn user(user: User) -> Self {
+        Self {
+            process: None,
+            user: Some(user),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,10 +161,17 @@ mod tests {
 
     #[test]
     fn test_actor_serialization() {
-        let actor = Actor {
-            process: Process::new("python3", 42),
-        };
+        let actor = Actor::process(Process::new("python3", 42));
         let json = serde_json::to_value(&actor).unwrap();
         assert_eq!(json["process"]["name"], "python3");
+        assert!(json.get("user").is_none());
+    }
+
+    #[test]
+    fn test_user_actor_serialization() {
+        let actor = Actor::user(User::new("alice", crate::enums::UserTypeId::User));
+        let json = serde_json::to_value(&actor).unwrap();
+        assert_eq!(json["user"]["uid"], "alice");
+        assert!(json.get("process").is_none());
     }
 }

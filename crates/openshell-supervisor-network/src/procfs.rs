@@ -569,13 +569,13 @@ fn collect_descendant_pids_with_depth(root_pid: u32) -> Vec<DescendantPid> {
 /// result. Subsequent requests from the same binary path must produce the
 /// same hash, or the request is denied.
 pub fn file_sha256(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
+    use miette::IntoDiagnostic as _;
     use std::io::Read;
 
     let start = std::time::Instant::now();
     let mut file = std::fs::File::open(path)
         .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = openshell_crypto::sha256_digest().into_diagnostic()?;
     let mut buf = vec![0u8; 65536].into_boxed_slice();
     let mut total_read = 0u64;
     loop {
@@ -586,10 +586,10 @@ pub fn file_sha256(path: &Path) -> Result<String> {
             break;
         }
         total_read += n as u64;
-        hasher.update(&buf[..n]);
+        hasher.update(&buf[..n]).into_diagnostic()?;
     }
 
-    let hash = hasher.finalize();
+    let hash = hasher.finish().into_diagnostic()?;
     debug!(
         "        file_sha256: {}ms size={} path={}",
         start.elapsed().as_millis(),
@@ -900,20 +900,9 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn resolve_tcp_peer_socket_owners_returns_all_forked_socket_holders() {
+    fn resolve_tcp_peer_socket_owners_returns_all_descendant_socket_holders() {
         use std::net::{TcpListener, TcpStream};
         use std::time::{Duration, Instant};
-
-        struct ChildGuard(libc::pid_t);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                #[allow(unsafe_code)]
-                unsafe {
-                    libc::kill(self.0, libc::SIGKILL);
-                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
-                }
-            }
-        }
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let proxy_addr = listener.local_addr().unwrap();
@@ -922,21 +911,9 @@ mod tests {
         let connection = WorkloadProxyTcpConnection::new(workload_addr, proxy_addr);
         let (_accepted, _) = listener.accept().expect("accept");
 
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        let child_pid = unsafe { libc::fork() };
-        assert!(child_pid >= 0, "fork failed");
-        if child_pid == 0 {
-            // libc/syscall FFI requires unsafe
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::sleep(30);
-                libc::_exit(0);
-            }
-        }
-
-        let _guard = ChildGuard(child_pid);
-        let child_pid_u32 = child_pid.cast_unsigned();
+        let guard = crate::test_support::spawn_socket_holder(&stream, false);
+        let child_pid = guard.0.id();
+        let child_pid_u32 = child_pid;
         let entrypoint_pid = std::process::id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let owners = loop {
@@ -952,7 +929,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for forked child to appear as a socket owner; got {owner_pids:?}"
+                "timed out waiting for descendant child to appear as a socket owner; got {owner_pids:?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         };

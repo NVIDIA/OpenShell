@@ -2,10 +2,13 @@
 <!-- 1-3 sentences: what this PR does and why -->
 
 ## Related Issue
-<!-- Every PR must close an existing issue covering its scope. Use Closes #NNN. -->
+<!-- Every PR must close an existing issue covering its scope, except automated dependency updates. Use Closes #NNN; see CONTRIBUTING.md for the exception. Authors without repository write access must link at least one issue with state:accepted. PR body text cannot bypass this acceptance check. -->
 
 ## Changes
 <!-- Bullet list of key changes -->
+
+## Release Notes
+<!-- Optional: describe the user-facing change in a few short, easy-to-read sentences. Keep this section concise. Leave it empty when the summary is enough. -->
 
 ## Testing
 <!-- Report current verification performed for this implementation. Do not copy diagnostics from the original issue. -->

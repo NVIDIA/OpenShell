@@ -190,6 +190,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
+- [`ci/values-autoscaling.yaml`](ci/values-autoscaling.yaml) - CI overlay for rendering the optional gateway HorizontalPodAutoscaler
 - [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
 - [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
@@ -202,6 +203,36 @@ database is backed by a per-pod PVC:
 server:
   dbUrl: "sqlite:/var/openshell/openshell.db"
 ```
+
+#### Data PVC storage
+
+Size the gateway data claim, `openshell-data`, and select its StorageClass with
+`server.dataStorageSize` and `server.dataStorageClass`. Omitting both
+requests `1Gi` from the cluster's default StorageClass. Set
+`server.dataStorageClass` on clusters with no default StorageClass,
+otherwise the gateway PVC stays Pending. Both values are ignored under
+`workload.kind=deployment`, which mounts no PVC.
+
+```yaml
+server:
+  dataStorageSize: 20Gi
+  dataStorageClass: fast-ssd
+```
+
+`volumeClaimTemplates` is immutable, so set both at install time. To grow an
+existing claim, expand it in place when its StorageClass allows expansion, then
+recreate the StatefulSet so its template matches:
+
+```shell
+kubectl -n openshell patch pvc openshell-data-openshell-0 \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl -n openshell delete statefulset openshell --cascade=orphan
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <installed-version> \
+  --reuse-values -n openshell --set server.dataStorageSize=20Gi
+```
+
+A recreated StatefulSet re-adopts existing claims unchanged, so changing
+StorageClass means copying the data to a new claim.
 
 #### External PostgreSQL
 
@@ -240,9 +271,37 @@ database. The chart creates a retained Kubernetes Secret with the shared
 key-encryption key and injects that key into every gateway pod, so the same
 default works for single-replica and external database-backed HA deployments.
 
-Use `kubernetes-secrets` or `vault` instead when credentials should live in a
-cluster or external secret backend. Enabling one external credential driver
-disables the default credential-storage key-encryption key Secret and env injection.
+Use `gatewayConfig` to select `kubernetes-secrets` or `vault` when credentials
+should live in a cluster or external secret backend. Selecting an external
+credential driver disables the default credential-storage key-encryption-key
+Secret and environment injection. The map is rendered directly as gateway TOML,
+so it uses the gateway's snake_case field names:
+
+```yaml
+gatewayConfig:
+  openshell.gateway:
+    credential_drivers:
+      - vault
+  openshell.credential_drivers.vault:
+    address: https://vault.vault.svc.cluster.local:8200
+    mount: secret
+    kv_version: "2"
+    auth_method: kubernetes
+    role: openshell-gateway
+```
+
+> `gatewayConfig` must contain only non-secret values. Helm serializes unknown
+> fields generically and cannot determine whether an arbitrary string, such as
+> `api_token`, is confidential. Do not put passwords, tokens, private keys,
+> database URLs, or other secret material in this map. Use Secret-backed
+> environment variables, files, volumes, or gateway credential drivers instead.
+> The chart rejects known unsafe forms such as `database_url`, inline URL
+> credentials, and PEM private keys; it is not a general secret scanner.
+
+For the Kubernetes Secret driver, use
+`openshell.credential_drivers.kubernetes-secrets.namespace` in the same map.
+The chart derives any required RBAC from the selected driver; use a dedicated
+namespace to limit access to OpenShell-managed Secrets.
 
 #### OpenShift
 
@@ -276,6 +335,32 @@ DNS name while connecting directly to the owning pod. Custom TLS Secrets must
 include that Service DNS name in the server certificate and provide the CA and
 client credentials configured by `server.tls`.
 
+Set `autoscaling.enabled=true` to render an `autoscaling/v2`
+HorizontalPodAutoscaler for the gateway workload. The Deployment or
+StatefulSet then omits `spec.replicas`, and the chart applies its
+multi-replica checks to `autoscaling.maxReplicas`. CPU and memory targets
+need a matching `resources.requests` entry, or a `resources.limits` entry,
+which Kubernetes copies into the request. Add custom metrics from a metrics
+adapter with `autoscaling.metrics`. See the
+[High Availability guide](https://docs.nvidia.com/openshell/latest/kubernetes/high-availability)
+for the metrics to scale and alert on.
+
+Enabling autoscaling on an existing release removes `spec.replicas` from the
+workload in that upgrade. Kubernetes can reset the workload to one replica
+until the HPA scales it back to at least `autoscaling.minReplicas`, which
+disconnects supervisor sessions from the other gateway pods; they reconnect to the remaining replica. Enable autoscaling
+when you install the chart, or during a maintenance window. On an existing
+release, upgrade with `--reset-then-reuse-values`, which needs Helm 3.14 or
+later. With an older Helm, save the values with
+`helm get values <release> -o yaml > values.yaml` and upgrade with
+`--reset-values -f values.yaml`. `--reuse-values` keeps the
+previous chart version's defaults, which lack the autoscaling values,
+including the scale-down `behavior`, when that release predates them. For background, refer to
+[Migrating Deployments and StatefulSets to horizontal autoscaling](https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#migrating-deployments-and-statefulsets-to-horizontal-autoscaling).
+Disabling autoscaling renders `spec.replicas` from `replicaCount` again,
+which defaults to 1, so set `replicaCount` to the replica count you want in
+that upgrade.
+
 ## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
@@ -292,12 +377,16 @@ JWT signing Secret.
 
 ## SPIFFE/SPIRE provider token grants
 
-Set `server.providerTokenGrants.spiffe.enabled=true` to let the gateway and
-sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token grants. The
-chart keeps supervisor-to-gateway authentication on gateway-minted sandbox JWTs,
-mounts the SPIFFE CSI socket into the gateway pod, exports
-`OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`, and passes the socket path to
-the Kubernetes driver so sandbox pods can mount the same socket.
+Set `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+to let sandbox supervisors use SPIFFE JWT-SVIDs for dynamic provider token
+grants. The chart keeps supervisor-to-gateway authentication on gateway-minted
+sandbox JWTs and passes the configured socket path to the Kubernetes driver.
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+```
 
 For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
 add `ci/values-spire.yaml` to the OpenShell release values files.

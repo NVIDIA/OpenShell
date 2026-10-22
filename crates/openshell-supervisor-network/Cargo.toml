@@ -11,7 +11,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+sha2 = { workspace = true }
 openshell-binary-identity = { path = "../openshell-binary-identity" }
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", features = ["oauth"] }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-ocsf = { path = "../openshell-ocsf" }
@@ -46,12 +49,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
 sha1 = "0.10"
-sha2 = { workspace = true }
 spiffe = { workspace = true }
 tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tonic = { workspace = true }
 tower-mcp-types = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
@@ -62,9 +65,13 @@ default = ["bundled-ca-roots"]
 bundled-ca-roots = ["dep:webpki-roots"]
 
 [dev-dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
+
+openshell-driver-vm = { path = "../openshell-driver-vm", default-features = false, features = ["allocation-tracking"] }
 openshell-ocsf = { path = "../openshell-ocsf", features = ["test-support"] }
+openshell-otel = { path = "../openshell-otel" }
 openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-middleware-builtins" }
-tonic = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = "0.3"
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
@@ -74,7 +81,11 @@ tokio-stream = { workspace = true, features = ["net"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["socket", "net"] }
+
 [target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true }
 
 [lints]
 workspace = true

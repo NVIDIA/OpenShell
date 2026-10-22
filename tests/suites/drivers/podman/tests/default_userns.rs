@@ -16,19 +16,33 @@ const SANDBOX_TIMEOUT: Duration = Duration::from_secs(300);
 const PODMAN_TEST_INPUT_DIR_ENV: &str = "OPENSHELL_TEST_INPUT_DIR";
 const PODMAN_TEST_IMAGE_ENV: &str = "OPENSHELL_PODMAN_TEST_IMAGE";
 
+const WORKSPACE_AND_UID_MAP_PROBE: &str = r#"set -eu
+workload_owner="$(id -u):$(id -g)"
+workspace_owner="$(stat -c '%u:%g' /sandbox)"
+printf 'workload-owner=%s\nworkspace-owner=%s\n' "$workload_owner" "$workspace_owner"
+test "$(id -u)" -ne 0
+test "$workspace_owner" = "$workload_owner"
+probe=$(mktemp /sandbox/userns-probe.XXXXXX)
+printf 'workspace probe\n' > "$probe"
+rm "$probe"
+echo podman-userns-workspace-ok
+cat /proc/self/uid_map
+"#;
+
 /// Verify that the gateway's user-namespace configuration matches Podman's
-/// direct behavior for the same profile.
+/// direct behavior for the same profile and preserves workspace access.
 ///
 /// The test runs a short-lived sandbox command and compares its user-namespace
 /// mapping with the direct-Podman reference stored at
 /// `OPENSHELL_TEST_INPUT_DIR/reference-uid-map`. The tmachine pre-test
 /// playbook creates that reference in the same gateway-user context. This deliberately
 /// avoids baking a particular Podman mapping into OpenShell's test contract.
-///
+/// The workload also verifies that the managed workspace is owned by its
+/// non-root UID/GID and that it can create, write, and remove a file there.
 #[tokio::test]
 async fn configured_userns_matches_podman_reference() {
-    let mut runner = OpenShellRunner::from_env("podman-userns")
-        .expect("candidate openshell CLI is available");
+    let mut runner =
+        OpenShellRunner::from_env("podman-userns").expect("candidate openshell CLI is available");
     let result = async {
         runner.check_gateway_status().await?;
         assert_podman_gateway(&runner).await?;
@@ -59,15 +73,18 @@ async fn configured_userns_matches_podman_reference() {
         if let Some(image) = workload_image.as_deref() {
             create_args.extend(["--from", image]);
         }
-        create_args.extend(["--no-tty", "--", "cat", "/proc/self/uid_map"]);
+        create_args.extend(["--no-tty", "--", "sh", "-c", WORKSPACE_AND_UID_MAP_PROBE]);
         let run = runner
-            .step("userns/uid-map")
-            .description("sandbox exposes its UID map")
+            .step("userns/workspace-and-uid-map")
+            .description("sandbox can write to its owned workspace and exposes its UID map")
             .with_timeout(SANDBOX_TIMEOUT)
             .run(&create_args)
             .await
             .map_err(|error| error.to_string())?;
         run.require_success()?;
+        if !run.stdout().contains("podman-userns-workspace-ok") {
+            return Err(run.failure_diagnostic("non-root workload owns and can write to /sandbox"));
+        }
         let sandbox_uid_map = normalize_uid_map(run.stdout()).ok_or_else(|| {
             run.failure_diagnostic("sandbox returns a non-empty UID map")
         })?;

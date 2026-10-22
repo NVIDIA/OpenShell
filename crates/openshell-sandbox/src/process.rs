@@ -20,8 +20,8 @@ use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::debug;
 
@@ -104,6 +104,9 @@ pub(crate) fn ca_runtime_read_only_paths(ca_paths: Option<&(PathBuf, PathBuf)>) 
     paths.push(bundle.clone());
     paths
 }
+
+/// Prefix of environment variable names reserved for `OpenShell`.
+pub(crate) const RESERVED_ENV_PREFIX: &str = "OPENSHELL_";
 
 const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
     openshell_core::sandbox_env::OCI_IMAGE_USER,
@@ -205,6 +208,21 @@ fn apply_canonical_process_environment(
     interactive: bool,
     user_environment: &HashMap<String, String>,
 ) {
+    // The canonical process inherits the sandbox's environment so the image's
+    // own ENV (PATH, LANG, JAVA_HOME, ...) reaches the workload. Remove the
+    // reserved OPENSHELL_ namespace inherited from the sandbox itself, which
+    // carries its own control state (for example the serialized user
+    // environment and log level), then restore the one marker the workload is
+    // meant to see. The gateway rejects declared variables in this namespace.
+    for (key, _) in std::env::vars_os() {
+        if key
+            .to_str()
+            .is_some_and(|key| key.starts_with(RESERVED_ENV_PREFIX))
+        {
+            cmd.env_remove(key);
+        }
+    }
+    cmd.env(openshell_core::sandbox_env::SANDBOX, "1");
     cmd.envs(user_environment);
     let (session_user, session_home) = session_user_and_home(policy, workspace.home());
     // Resolve a shell present in the workload image. This code runs inside the
@@ -230,7 +248,21 @@ fn apply_canonical_process_environment(
     }
 }
 
-fn configured_user_environment() -> HashMap<String, String> {
+static BOUNDARY_USER_ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub(crate) fn install_boundary_user_environment(
+    environment: HashMap<String, String>,
+) -> Result<(), String> {
+    BOUNDARY_USER_ENVIRONMENT
+        .set(environment)
+        .map_err(|_| "boundary workload environment already installed".to_string())
+}
+
+pub(crate) fn configured_user_environment() -> HashMap<String, String> {
+    if let Some(environment) = BOUNDARY_USER_ENVIRONMENT.get() {
+        return environment.clone();
+    }
     std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
@@ -340,7 +372,7 @@ fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
 
 #[cfg(target_os = "linux")]
 pub fn spawn_command_with_workload_launcher(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: Command,
 ) -> std::io::Result<Child> {
     let runtime = tokio::runtime::Handle::current();
@@ -352,7 +384,7 @@ pub fn spawn_command_with_workload_launcher(
 
 #[cfg(target_os = "linux")]
 pub fn spawn_std_command_with_workload_launcher(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     mut cmd: std::process::Command,
 ) -> std::io::Result<std::process::Child> {
     launcher.execute(move || cmd.spawn())?
@@ -389,7 +421,7 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
-        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
@@ -440,7 +472,7 @@ impl ProcessHandle {
     #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
-        launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        launcher: &crate::linux::workload_launcher::WorkloadLauncher,
         program: &str,
         args: &[String],
         workspace: &ResolvedWorkspace,
@@ -450,9 +482,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -518,11 +548,8 @@ impl ProcessHandle {
         let prepared_sandbox = prepare_child_sandbox(policy, workspace.root(), &runtime_read_only)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
         #[cfg(target_os = "linux")]
-        let mut child_hardening =
-            openshell_isolation_interface::linux::child_seccomp::prepare(std::process::id())
-                .map_err(|error| {
-                    miette::miette!("prepare child self-protection filter: {error}")
-                })?;
+        let mut child_hardening = crate::linux::child_seccomp::prepare(std::process::id())
+            .map_err(|error| miette::miette!("prepare child self-protection filter: {error}"))?;
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -615,9 +642,7 @@ impl ProcessHandle {
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .kill_on_drop(true)
-            .env(openshell_core::sandbox_env::SANDBOX, "1");
+        cmd.args(args).kill_on_drop(true);
 
         let mut pty_master = None;
         let mut terminal_slave_fd = None;
@@ -1123,6 +1148,73 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn canonical_process_drops_inherited_reserved_environment() {
+        // The sandbox's own control variables live in the reserved
+        // OPENSHELL_ namespace and must not reach the workload, while the
+        // image's ordinary ENV must. Run in a fresh copy of the test binary
+        // so the test harness environment is untouched.
+        const CHILD_MARKER: &str = "OPENSHELL_TEST_RESERVED_ENV_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::canonical_process_drops_inherited_reserved_environment",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .env(openshell_core::sandbox_env::LOG_LEVEL, "debug")
+                .env(openshell_core::sandbox_env::USER_ENVIRONMENT, "{}")
+                .env("IMAGE_LANG", "keep")
+                .status()
+                .expect("run isolated environment test");
+            assert!(status.success(), "isolated environment test failed");
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: None,
+        });
+        // Mirror production: inherit the sandbox environment, no env_clear.
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdout(StdStdio::piped());
+        apply_canonical_process_environment(
+            &mut cmd,
+            &policy,
+            &ResolvedWorkspace::default(),
+            false,
+            &HashMap::from([("DECLARED".into(), "yes".into())]),
+        );
+        let output = runtime
+            .block_on(async { cmd.output().await })
+            .expect("run environment probe");
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        let variables: HashMap<_, _> = environment
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect();
+        assert!(
+            !variables
+                .keys()
+                .any(|key| key.starts_with(RESERVED_ENV_PREFIX)
+                    && *key != openshell_core::sandbox_env::SANDBOX),
+            "reserved variables reached the workload: {variables:?}"
+        );
+        assert_eq!(
+            variables.get(openshell_core::sandbox_env::SANDBOX),
+            Some(&"1")
+        );
+        assert_eq!(variables.get("IMAGE_LANG"), Some(&"keep"));
+        assert_eq!(variables.get("DECLARED"), Some(&"yes"));
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn canonical_process_receives_declared_environment_and_home() {
         let current_user = User::from_uid(nix::unistd::geteuid()).unwrap().unwrap();
@@ -1179,38 +1271,33 @@ mod tests {
     fn probe_hardened_child(probe: unsafe fn() -> i64) -> i64 {
         const HARDEN_FAILED: i64 = -2;
 
-        let mut fds = [0; 2];
-        let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        assert_eq!(
-            pipe_rc,
-            0,
-            "pipe failed: {}",
-            std::io::Error::last_os_error()
-        );
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create probe pipe");
 
         match unsafe { fork() }.expect("fork should succeed") {
             ForkResult::Child => {
-                unsafe { libc::close(fds[0]) };
+                drop(read_fd);
                 let value = match harden_child_process() {
                     Ok(()) => unsafe { probe() },
                     Err(_) => HARDEN_FAILED,
                 };
                 let bytes = value.to_ne_bytes();
-                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                let written = rustix::io::write(&write_fd, &bytes);
+                drop(write_fd);
+                // SAFETY: terminate the fork child without running inherited
+                // parent destructors; the write wrapper performs one syscall.
                 unsafe {
-                    libc::close(fds[1]);
-                    libc::_exit(i32::from(written != bytes.len().cast_signed()));
+                    libc::_exit(i32::from(written != Ok(bytes.len())));
                 }
             }
             ForkResult::Parent { child } => {
-                unsafe { libc::close(fds[1]) };
+                drop(write_fd);
                 let mut bytes = [0u8; size_of::<i64>()];
-                let read = unsafe { libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) };
-                unsafe { libc::close(fds[0]) };
+                let read = rustix::io::read(&read_fd, &mut bytes[..]);
+                drop(read_fd);
                 assert_eq!(
-                    read.cast_unsigned(),
-                    bytes.len(),
-                    "expected {} probe bytes, got {}",
+                    read,
+                    Ok(bytes.len()),
+                    "expected {} probe bytes, got {:?}",
                     bytes.len(),
                     read
                 );
@@ -1226,15 +1313,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[allow(unsafe_code)]
-    unsafe fn core_dump_limit_is_zero_probe() -> i64 {
-        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-        let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, limit.as_mut_ptr()) };
-        if rc != 0 {
-            return -1;
+    fn core_dump_limit_is_zero_probe() -> i64 {
+        match nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE) {
+            Ok((current, maximum)) => i64::from(current == 0 && maximum == 0),
+            Err(_) => -1,
         }
-        let limit = unsafe { limit.assume_init() };
-        i64::from(limit.rlim_cur == 0 && limit.rlim_max == 0)
     }
 
     #[test]

@@ -3,6 +3,13 @@
 Shared types, constants, configuration, and helpers used across OpenShell
 crates.
 
+## Isolation registrations
+
+`isolation_registration` owns the operator registry's backend names, byte-stream
+endpoints, and shared validation. Its fallible conversions carry registrations
+through the compute-driver protobuf and back into the supervisor's JSON launch
+file. These routes contain no credentials or driver-owned launch coordinates.
+
 ## Object Metadata
 
 Top-level user-facing objects use a Kubernetes-style metadata convention. The

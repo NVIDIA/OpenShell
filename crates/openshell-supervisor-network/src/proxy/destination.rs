@@ -362,20 +362,16 @@ pub(crate) async fn validate_destination(
                     DestinationDenial::from_check(error, DestinationDenialKind::AllowedIps)
                 })?
         }
-        AddressAuthorization::ExactDeclaredHost => {
-            resolve_and_check_declared_endpoint(host, port, sandbox_entrypoint_pid)
-                .await
-                .map_err(|error| {
-                    DestinationDenial::from_check(error, DestinationDenialKind::DeclaredEndpoint)
-                })?
-        }
-        AddressAuthorization::DefaultPublicOnly => {
-            resolve_and_reject_internal(host, port, sandbox_entrypoint_pid)
-                .await
-                .map_err(|error| {
-                    DestinationDenial::from_check(error, DestinationDenialKind::InternalAddress)
-                })?
-        }
+        AddressAuthorization::ExactDeclaredHost => resolve_and_check_declared_endpoint(host, port)
+            .await
+            .map_err(|error| {
+                DestinationDenial::from_check(error, DestinationDenialKind::DeclaredEndpoint)
+            })?,
+        AddressAuthorization::DefaultPublicOnly => resolve_and_reject_internal(host, port)
+            .await
+            .map_err(|error| {
+                DestinationDenial::from_check(error, DestinationDenialKind::InternalAddress)
+            })?,
         AddressAuthorization::PinnedResolved(addresses) => addresses
             .iter()
             .copied()

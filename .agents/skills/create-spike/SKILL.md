@@ -22,6 +22,6 @@ Ask the human operator to attest that they personally use OpenShell and directly
 
 ## Record the result
 
-Create an issue with User Story, Problem Statement, Impact / Why This Matters, Proposed Design when relevant, Acceptance Criteria, Alternatives Considered, and concise Agent Investigation. Include OpenShell-only reproduction and environment details for bugs. Inspect current GitHub `state:*` labels and descriptions before applying the one that matches the evidence; do not hard-code label names. Do not apply an acceptance state or add the issue to the roadmap.
+Create an issue with User Story, Problem Statement, Impact / Why This Matters, Proposed Design when relevant, Acceptance Criteria, Alternatives Considered, and concise Agent Investigation. Include OpenShell-only reproduction and environment details for bugs. Follow Label Discovery in `CONTRIBUTING.md` before applying the assessment state that matches the evidence; retrieve every page and resolve unclear meanings rather than hard-coding label names. Do not apply an acceptance state or add the issue to the roadmap.
 
-Report the issue URL, technical findings, uncertainties, and the human disposition needed. For subsequent authorized implementation, use `build-from-issue`. Every eventual PR must close an issue covering its own scope; split multi-PR efforts into separate closable issues and use a high-level issue only for tracking.
+Report the issue URL, technical findings, uncertainties, and the human disposition needed. For subsequent authorized implementation, use `build-from-issue`. Every eventual PR from this issue-backed workflow must close an issue covering its own scope; split multi-PR efforts into separate closable issues and use a high-level issue only for tracking.

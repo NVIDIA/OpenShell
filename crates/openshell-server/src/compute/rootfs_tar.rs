@@ -18,7 +18,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use openshell_core::time::now_ms;
-use rand::RngCore;
 use tonic::Status;
 use tracing::{info, warn};
 
@@ -32,6 +31,9 @@ const MAX_SLOTS_PER_CALLER: usize = 4;
 /// let one caller starve everyone else.
 const MAX_TOTAL_SLOTS: usize = 64;
 const STAGING_DIR_PREFIX: &str = "req-";
+// A driver request can outlive its gateway. Age alone never proves that such
+// a request stopped reading its input.
+const PENDING_DRIVER_MARKER: &str = ".driver-request-pending";
 const MAX_STAGED_FILE_NAME_LEN: usize = 128;
 
 /// `driver_config.<driver>` key the CLI sets to redeem a staging slot.
@@ -85,6 +87,35 @@ impl StagedRootfsTar {
     /// Hand the directory to the driver, which removes it after staging.
     pub fn disarm(&mut self) {
         self.dir = None;
+    }
+
+    /// Protect this input from the orphan sweep before dispatch. The armed
+    /// guard still removes it if dispatch is rejected before the driver runs.
+    pub async fn prepare_dispatch(&self) -> Result<(), Status> {
+        let directory = self
+            .dir
+            .as_ref()
+            .ok_or_else(|| Status::internal("rootfs upload ownership was already transferred"))?;
+        tokio::fs::write(directory.join(PENDING_DRIVER_MARKER), b"pending\n")
+            .await
+            .map_err(|error| Status::internal(format!("protect rootfs upload: {error}")))
+    }
+
+    /// Restore ordinary error cleanup after the owned driver future returns.
+    /// Successful responses leave cleanup with the driver; an interrupted
+    /// owner leaves the marker and archive for explicit reconciliation.
+    pub async fn finish_driver_operation(&mut self, accepted: bool) {
+        let Some(directory) = self.path.parent() else {
+            return;
+        };
+        if let Err(error) = tokio::fs::remove_file(directory.join(PENDING_DRIVER_MARKER)).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(%error, "Rootfs upload remains protected after driver response");
+        }
+        if !accepted {
+            self.dir = Some(directory.to_path_buf());
+        }
     }
 }
 
@@ -188,6 +219,7 @@ impl RootfsTarStagingRegistry {
 
         // The directory name uses independent randomness so the token never
         // appears in a filesystem path, a directory listing, or a log field.
+        let token = new_staging_token()?;
         let dir = staging_root.join(format!("{STAGING_DIR_PREFIX}{}", uuid::Uuid::new_v4()));
         create_private_dir(&dir).map_err(|err| {
             Status::internal(format!(
@@ -196,7 +228,6 @@ impl RootfsTarStagingRegistry {
         })?;
 
         let file = dir.join(&file_name);
-        let token = new_staging_token();
         let expires_at = Instant::now() + self.ttl;
         let expires_at_ms = now_ms() + i64::try_from(self.ttl.as_millis()).unwrap_or(i64::MAX);
 
@@ -303,6 +334,12 @@ impl RootfsTarStagingRegistry {
             if !name.starts_with(STAGING_DIR_PREFIX) {
                 continue;
             }
+            // Preserve uncertain ownership across gateway restarts. A missing
+            // response or old mtime is not permission to remove a live input.
+            match std::fs::symlink_metadata(entry.path().join(PENDING_DRIVER_MARKER)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) | Err(_) => continue,
+            }
             let stale = entry
                 .metadata()
                 .and_then(|meta| meta.modified())
@@ -323,10 +360,10 @@ impl RootfsTarStagingRegistry {
     }
 }
 
-fn new_staging_token() -> String {
-    let mut raw = [0u8; 32];
-    rand::rng().fill_bytes(&mut raw);
-    hex::encode(raw)
+fn new_staging_token() -> Result<String, Status> {
+    let raw = openshell_crypto::random_bytes::<32>()
+        .map_err(|error| Status::internal(error.to_string()))?;
+    Ok(hex::encode(raw))
 }
 
 /// Reject anything that would let `dir.join(file_name)` escape the request
@@ -689,5 +726,32 @@ mod tests {
         assert!(!stale.exists());
         assert!(!fresh.exists());
         assert!(unrelated.exists(), "unrelated entries must be left alone");
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_preserves_dispatched_upload_after_owner_loss() {
+        let root = temp_root();
+        let registry = RootfsTarStagingRegistry::new(Some(root.path().to_path_buf()), 1024);
+        let slot = registry.begin("default", "test", "rootfs.tar", 7).unwrap();
+        std::fs::write(&slot.upload_path, b"archive").unwrap();
+        let mut staged = registry.consume(&slot.token).unwrap();
+        staged.prepare_dispatch().await.unwrap();
+        staged.disarm();
+        let restarted = RootfsTarStagingRegistry::with_ttl(
+            Some(root.path().to_path_buf()),
+            1024,
+            Duration::ZERO,
+        );
+        restarted.sweep_orphans();
+        assert!(
+            slot.upload_path.exists(),
+            "age cannot settle an owned driver request"
+        );
+        staged.finish_driver_operation(true).await;
+        restarted.sweep_orphans();
+        assert!(
+            !slot.upload_path.exists(),
+            "settled uploads follow normal sweep rules"
+        );
     }
 }

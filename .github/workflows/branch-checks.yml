@@ -31,11 +31,87 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
       base_sha: ${{ steps.gate.outputs.base_sha }}
+      pr_number: ${{ steps.pr-number.outputs.number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
         uses: ./.github/actions/pr-gate
+
+      - id: pr-number
+        shell: bash
+        env:
+          PR_REF: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = push ] && [[ "$PR_REF" =~ ^pull-request/([0-9]+)$ ]]; then
+            echo "number=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=0" >> "$GITHUB_OUTPUT"
+          fi
+
+  compatibility-review:
+    name: Compatibility Review (advisory)
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: ./.github/workflows/codex-compatibility.yml
+    with:
+      candidate_ref: ${{ github.sha }}
+      source_sha: ${{ github.sha }}
+      base_ref: >-
+        ${{ github.event.merge_group.base_sha
+            || needs.pr_metadata.outputs.base_sha
+            || format('refs/remotes/origin/{0}', github.event.repository.default_branch) }}
+      pr_number: ${{ fromJSON(needs.pr_metadata.outputs.pr_number) }}
+    secrets:
+      CODEX_SECURITY_API_KEY: ${{ secrets.CODEX_SECURITY_API_KEY }}
+
+  compatibility-comment:
+    name: Comment on detected breaking changes
+    needs: [pr_metadata, compatibility-review]
+    if: >-
+      ${{ !cancelled() && needs.pr_metadata.outputs.pr_number != '0'
+          && needs.compatibility-review.outputs.has_findings == 'true'
+          && needs.compatibility-review.outputs.report_artifact != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download compatibility report
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.compatibility-review.outputs.report_artifact }}
+          path: compatibility-report
+
+      - name: Post new or materially updated findings
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          PR_NUMBER: ${{ needs.pr_metadata.outputs.pr_number }}
+          SOURCE_SHA: ${{ github.sha }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const report = JSON.parse(fs.readFileSync('compatibility-report/report.json', 'utf8'));
+            if (!report.review?.findings?.some(finding => !finding.previous_report_url)) return;
+            const number = Number(process.env.PR_NUMBER);
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: number });
+            if (pr.state !== 'open' || pr.head.sha !== process.env.SOURCE_SHA) {
+              core.notice('Skipping a comment for a closed PR or an outdated head.');
+              return;
+            }
+            const markdown = fs.readFileSync('compatibility-report/comment.md', 'utf8');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}/attempts/${process.env.GITHUB_RUN_ATTEMPT}`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: number,
+              body: `${markdown}\n[Branch check run](${runUrl})`,
+            });
 
   protobuf-compatibility:
     name: Protobuf Compatibility
@@ -64,7 +140,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -89,7 +165,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -114,14 +190,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: ./.github/actions/setup-nix
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          prepare-shell: "true"
+          shell-installable: .#devShells.x86_64-linux.default
 
       - name: Check dependencies
         run: cargo deny check licenses bans sources
@@ -137,6 +210,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Format
@@ -146,6 +220,7 @@ jobs:
           cargo fmt --manifest-path e2e/rust/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check
           cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check
+          cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all -- --check
 
   cargo-lockfiles:
     name: Cargo lockfiles
@@ -158,6 +233,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - name: Verify Cargo lockfiles
@@ -185,6 +261,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -199,6 +276,7 @@ jobs:
           cargo clippy --locked --manifest-path e2e/rust/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings
           cargo clippy --locked --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings
 
   rust-test:
     name: Rust test (${{ matrix.system }})
@@ -221,12 +299,24 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
         with:
           cache-key: rust-checks-v2
           save-cache: "true"
+
+      - name: Verify crypto backend independence
+        shell: nix develop -c bash -euo pipefail {0}
+        run: |
+          cargo tree --locked -p openshell-crypto --no-default-features --edges normal,build,dev --prefix none > /tmp/openshell-crypto-dependencies.txt
+          if grep -Eq '^(ring|aws-lc-rs|aws-lc-sys|aws-lc-fips-sys) v' /tmp/openshell-crypto-dependencies.txt; then
+            echo "ERROR: backend-free crypto build includes Ring or AWS-LC" >&2
+            cat /tmp/openshell-crypto-dependencies.txt >&2
+            exit 1
+          fi
+          cargo test --locked -p openshell-crypto --no-default-features --test independent_backend
 
       - name: Test
         shell: nix develop -c bash -euo pipefail {0}
@@ -235,6 +325,36 @@ jobs:
         run: |
           cargo nextest run --locked --profile ci --workspace --features openshell-server/test-support
           cargo nextest run --locked --config-file .config/nextest.toml --profile ci --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml
+
+  rust-postgres-test:
+    name: Rust PostgreSQL tests
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    # Bare runner: the test script starts a disposable PostgreSQL container
+    # with the host's Docker.
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-nix
+        with:
+          prepare-shell: "true"
+          cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache-key: rust-checks-v2
+          save-cache: "false"
+
+      - name: Test
+        shell: nix develop -c bash -euo pipefail {0}
+        env:
+          CONTAINER_ENGINE: docker
+          OPENSHELL_TELEMETRY_ENABLED: "false"
+        run: tasks/scripts/run-postgres-tests.sh --locked --profile ci
 
   rust-build-modes:
     name: Rust build modes (${{ matrix.system }})
@@ -257,6 +377,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -306,6 +427,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -330,6 +452,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -356,6 +479,7 @@ jobs:
 
       - uses: ./.github/actions/setup-nix
         with:
+          prepare-shell: "true"
           cachix-auth-token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
       - uses: ./.github/actions/setup-rust
@@ -381,7 +505,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -410,6 +534,9 @@ jobs:
         run: |
           bash tasks/scripts/test-gateway-pull-policy.sh
           bash tasks/scripts/test-gateway-config.sh
+
+      - name: Test release qualification summary
+        run: mise run test:qualification-summary
   go:
     name: Go SDK
     needs: pr_metadata
@@ -417,7 +544,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -437,7 +564,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -457,7 +584,7 @@ jobs:
     runs-on: linux-amd64-cpu8
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/openshell/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:9cb72baa2e61a1b5f12407e6e82da7fdba0aa722@sha256:67a9a0c32cb99825e6d3e9d9eec45d67149ea1ff7c11a1b1e1b3480d2d3df684
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

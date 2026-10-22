@@ -19,4 +19,7 @@ runs:
       env:
         CHECK_REF: ${{ inputs.ref }}
       run: |
+        # Retry dependency preparation, then run the compatibility check once.
+        nix build --no-link --no-write-lock-file .#check-protobuf-compatibility ||
+          nix build --no-link --no-write-lock-file .#check-protobuf-compatibility
         nix run .#check-protobuf-compatibility --no-write-lock-file -- "$CHECK_REF"

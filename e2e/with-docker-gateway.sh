@@ -526,6 +526,7 @@ if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
 fi
 
 SUPERVISOR_IMAGE="$(resolve_docker_supervisor_image)"
+export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
 build_local_docker_supervisor_image_if_required "${SUPERVISOR_IMAGE}"
 ensure_docker_supervisor_image "${SUPERVISOR_IMAGE}"
 echo "Using Docker supervisor image: ${SUPERVISOR_IMAGE}"
@@ -618,7 +619,10 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   else
     printf 'allow_driver_config = true\n'
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+    # Container jobs need their bridge address; host runs exercise discovery.
+    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+      printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
+    fi
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'enable_bind_mounts = true\n'
@@ -632,7 +636,9 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 if [ "${OPENSHELL_E2E_EXTERNAL_COMPUTE_DRIVER:-0}" = "1" ]; then
   {
     printf 'sandbox_label = %s\n'        "$(toml_string "${E2E_NAMESPACE}")"
-    printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+    if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+      printf 'grpc_endpoint = %s\n' "$(toml_string "${GATEWAY_ENDPOINT}")"
+    fi
     printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
     printf 'image_pull_policy = %s\n'    "$(toml_string "${SANDBOX_IMAGE_PULL_POLICY}")"
     printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
