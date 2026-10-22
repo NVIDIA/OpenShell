@@ -66,9 +66,10 @@ tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
+h2 = "0.4"
+rcgen = { workspace = true }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
-rcgen = { workspace = true }
 tokio-rustls = { workspace = true }
 
 [lints]

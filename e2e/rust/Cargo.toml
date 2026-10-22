@@ -26,6 +26,7 @@ e2e = []
 # when it has resolved an IP.
 e2e-host-gateway = ["e2e"]
 e2e-local-container-driver = ["e2e"]
+e2e-additional-ca = ["e2e", "e2e-host-gateway"]
 e2e-docker = ["e2e", "e2e-host-gateway", "e2e-local-container-driver"]
 # Selects tests that need a Docker gateway with config_delivery_mode = "push".
 e2e-config-push = ["e2e-docker"]
@@ -92,6 +93,11 @@ required-features = ["e2e-docker"]
 name = "docker_corporate_proxy"
 path = "tests/docker_corporate_proxy.rs"
 required-features = ["e2e-docker"]
+
+[[test]]
+name = "additional_ca"
+path = "tests/additional_ca.rs"
+required-features = ["e2e-additional-ca"]
 
 [[test]]
 name = "driver_config_volume"

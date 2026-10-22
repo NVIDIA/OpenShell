@@ -329,6 +329,7 @@ async fn main() -> Result<()> {
             sandbox_gid: args.sandbox_gid,
         },
         shutdown_rx,
+        None,
     )
     .await
     .into_diagnostic()?;
