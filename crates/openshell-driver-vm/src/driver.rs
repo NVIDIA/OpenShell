@@ -3311,6 +3311,43 @@ impl VmDriver {
         )
     }
 
+    fn publish_pulling_event(&self, sandbox_id: &str, image_ref: &str) {
+        self.publish_platform_event(
+            sandbox_id.to_string(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Pulling",
+                format!("Pulling image \"{image_ref}\""),
+            ),
+        );
+    }
+
+    /// A registry-sourced root disk found in the cache: `Pulling`, the
+    /// `CacheHit` progress and `Pulled`, so the image step still advances.
+    async fn publish_registry_cache_hit(
+        &self,
+        sandbox_id: &str,
+        image_ref: &str,
+        image_identity: &str,
+        image_path: &Path,
+    ) {
+        self.publish_pulling_event(sandbox_id, image_ref);
+        self.publish_vm_progress(
+            sandbox_id,
+            "CacheHit",
+            format!("Using cached VM root disk for image \"{image_ref}\""),
+            HashMap::from([
+                ("image_ref".to_string(), image_ref.to_string()),
+                ("image_source".to_string(), "registry".to_string()),
+                ("cache_hit".to_string(), "true".to_string()),
+                ("image_identity".to_string(), image_identity.to_string()),
+            ]),
+        );
+        self.publish_pulled_event(sandbox_id, image_ref, image_path)
+            .await;
+    }
+
     async fn ensure_cached_registry_rootfs_image(
         &self,
         sandbox_id: &str,
@@ -3321,6 +3358,31 @@ impl VmDriver {
         let span_status = openshell_otel::ErrorStatusGuard::current();
         info!(image_ref = %image_ref, "vm driver: ensuring cached root disk image (registry)");
         let reference = parse_registry_reference(image_ref)?;
+        // A digest pin already names the image's content, and a cached root
+        // disk is only published after its manifest was verified against
+        // that digest. On a hit the registry cannot add anything, so neither
+        // authenticate nor resolve: the sandbox boots from the cache without a
+        // network round trip, and keeps booting while the registry is down.
+        // Tags still resolve through the registry below.
+        if let Some(digest) = reference.digest() {
+            let image_identity = bootstrap_image_cache_identity(digest);
+            let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
+            if tokio::fs::metadata(&image_path).await.is_ok() {
+                info!(
+                    image_identity = %image_identity,
+                    image_path = %image_path.display(),
+                    "vm driver: root disk image cache hit (digest-pinned, no registry call)"
+                );
+                self.publish_registry_cache_hit(
+                    sandbox_id,
+                    image_ref,
+                    &image_identity,
+                    &image_path,
+                )
+                .await;
+                return span_status.finish(Ok(image_identity));
+            }
+        }
         info!(image_ref = %image_ref, "vm driver: authenticating with registry");
         self.publish_vm_progress(
             sandbox_id,
@@ -3365,39 +3427,19 @@ impl VmDriver {
         let image_identity = bootstrap_image_cache_identity(&source_image_identity);
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
 
-        // Emit a driver progress hint for cache hits too and immediately
-        // follow with `Pulled` so the image step still advances cleanly.
-        self.publish_platform_event(
-            sandbox_id.to_string(),
-            platform_event(
-                "vm",
-                "Normal",
-                "Pulling",
-                format!("Pulling image \"{image_ref}\""),
-            ),
-        );
-
         if tokio::fs::metadata(&image_path).await.is_ok() {
             info!(
                 image_identity = %image_identity,
                 image_path = %image_path.display(),
                 "vm driver: root disk image cache hit (no build needed)"
             );
-            self.publish_vm_progress(
-                sandbox_id,
-                "CacheHit",
-                format!("Using cached VM root disk for image \"{image_ref}\""),
-                HashMap::from([
-                    ("image_ref".to_string(), image_ref.to_string()),
-                    ("image_source".to_string(), "registry".to_string()),
-                    ("cache_hit".to_string(), "true".to_string()),
-                    ("image_identity".to_string(), image_identity.clone()),
-                ]),
-            );
-            self.publish_pulled_event(sandbox_id, image_ref, &image_path)
+            self.publish_registry_cache_hit(sandbox_id, image_ref, &image_identity, &image_path)
                 .await;
             return span_status.finish(Ok(image_identity));
         }
+
+        // A driver progress hint before the build, so the image step advances.
+        self.publish_pulling_event(sandbox_id, image_ref);
 
         info!(
             image_identity = %image_identity,

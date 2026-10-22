@@ -33,6 +33,7 @@ run = [
   "cargo clippy --manifest-path examples/governance-interceptor/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all-targets -- -D warnings",
   "cargo clippy --manifest-path examples/isolation-backend-v8/Cargo.toml --all-targets -- -D warnings",
+  "cargo clippy --manifest-path tests/testkit/Cargo.toml --all-targets -- -D warnings",
 ]
 run_windows = "powershell -NoProfile -ExecutionPolicy Bypass -File tasks/scripts/windows-msvc.ps1 lint native"
 hide = true
@@ -45,6 +46,7 @@ run = [
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all",
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all",
   "cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all",
+  "cargo fmt --manifest-path tests/testkit/Cargo.toml --all",
 ]
 hide = true
 
@@ -56,6 +58,7 @@ run = [
   "cargo fmt --manifest-path examples/governance-interceptor/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/supervisor-middleware-content-guard/Cargo.toml --all -- --check",
   "cargo fmt --manifest-path examples/isolation-backend-v8/Cargo.toml --all -- --check",
+  "cargo fmt --manifest-path tests/testkit/Cargo.toml --all -- --check",
 ]
 hide = true
 

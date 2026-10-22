@@ -119,7 +119,6 @@ CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
 CORPORATE_PROXY_CA_FIXTURE_DEPLOYED=0
 OPENSHIFT_DETECTED=0
-OPENSHIFT_SANDBOX_SCC_GRANTED=0
 OPENSHIFT_POSTGRES_SCC_GRANTED=0
 OPENSHIFT_ROUTE_HOST=""
 # Temp dir holding the client mTLS material extracted from openshell-client-tls
@@ -587,14 +586,6 @@ cleanup() {
   if [ "${CORPORATE_PROXY_CA_FIXTURE_DEPLOYED}" = "1" ]; then
     kctl -n "${NAMESPACE}" delete configmap "${CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP}" \
       --ignore-not-found >/dev/null 2>&1 || true
-  fi
-
-  if [ "${OPENSHIFT_SANDBOX_SCC_GRANTED}" = "1" ]; then
-    oc adm policy remove-scc-from-user privileged \
-      --context "${KUBE_CONTEXT}" \
-      -z openshell-sandbox -n "${NAMESPACE}" \
-      2>/dev/null || true
-    OPENSHIFT_SANDBOX_SCC_GRANTED=0
   fi
 
   # Remove the extracted client mTLS material (also covered by the WORKDIR sweep
@@ -1258,12 +1249,6 @@ if [ "${OPENSHIFT_DETECTED}" = "1" ]; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-openshift-scc.yaml")
 
   kctl create namespace "${NAMESPACE}" --dry-run=client -o yaml | kctl apply -f -
-
-  echo "Granting privileged SCC to openshell-sandbox in namespace ${NAMESPACE}..."
-  oc adm policy add-scc-to-user privileged \
-    --context "${KUBE_CONTEXT}" \
-    -z openshell-sandbox -n "${NAMESPACE}"
-  OPENSHIFT_SANDBOX_SCC_GRANTED=1
 
   # Drive the gateway through a passthrough Route with mTLS instead of
   # port-forward. The Route host is deterministic: OpenShift serves any name

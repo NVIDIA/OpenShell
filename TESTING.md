@@ -16,6 +16,7 @@ crates/*/tests/        # Rust integration tests
 python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
+tests/testkit/         # Support library for SDK-driven E2E suites
 ```
 
 ## Rust Tests
@@ -128,6 +129,16 @@ requires mTLS.
 `mise run test:gateway-config` validates generated gateway TOML without a live
 runtime. It covers the current schema and the Podman in-tree versus external
 driver configuration boundary.
+
+### testkit (`tests/testkit/`)
+
+`testkit` is the support library for SDK-driven end-to-end suites. Tests are
+`#[testkit::test]` functions with a required doc comment. They find the
+gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
+`OPENSHELL_GATEWAY`, or the active gateway, and `cx.cli` runs the CLI named
+by `OPENSHELL_BIN`. See
+[tests/testkit/README.md](tests/testkit/README.md) for how to write and run
+tests.
 
 ### Python E2E (`e2e/python/`)
 
@@ -447,14 +458,19 @@ OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
 ```
 
 **OpenShift**: when the target cluster exposes the `route.openshift.io` API
-group, the harness automatically applies SCC-compatible Helm overrides, grants
-the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
-PostgreSQL fixture for DB scenarios), and drives the gateway through a
-passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
-needed, but `oc` must be installed and authenticated against the target cluster
-with permission to modify SCC bindings (`oc adm policy add-scc-to-user`) — the
-harness exits early if `oc` is missing. The SCC grants and extracted client
-mTLS material are removed during cleanup, including on failure or interrupt.
+group, the harness automatically applies SCC-compatible Helm overrides and
+drives the gateway through a passthrough Route with mandatory mTLS instead of
+port-forward. No extra flags are needed, but `oc` must be installed and
+authenticated against the target cluster; the harness exits early if `oc` is
+missing. DB scenarios grant `anyuid` to the PostgreSQL fixture and require
+permission to modify SCC bindings (`oc adm policy add-scc-to-user`). That grant
+and extracted client mTLS material are removed during cleanup, including on
+failure or interrupt.
+
+Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
+without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
+that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
