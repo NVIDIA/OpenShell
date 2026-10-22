@@ -6,6 +6,10 @@
 //! Desired-state cursors never establish success. Credentials, policy, and
 //! the authenticated workload boundary must acknowledge the same authority.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
+use openshell_sandbox_backend::BoundaryExec;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +18,7 @@ use openshell_core::proto::{
     ReportProviderReadinessResponse,
 };
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BoundaryExec, ProviderEnvironmentInstallation};
+use openshell_isolation_interface::contract::ProviderEnvironmentInstallation;
 use openshell_supervisor_network::opa::PolicyGenerationGuard;
 use tokio::sync::watch;
 
@@ -283,7 +287,7 @@ impl Tracker {
         sandbox_id: String,
         credentials: ProviderCredentialState,
         sessions: watch::Receiver<Option<String>>,
-        boundary: Arc<dyn BoundaryExec>,
+        boundary: Arc<BoundaryExec>,
     ) -> Reporter {
         let tracker = self.clone();
         Reporter(tokio::spawn(async move {
@@ -305,7 +309,7 @@ impl Tracker {
         &self,
         credentials: ProviderCredentialState,
         mut sessions: watch::Receiver<Option<String>>,
-        boundary: Arc<dyn BoundaryExec>,
+        boundary: Arc<BoundaryExec>,
         client: C,
     ) {
         let tracker = self;
@@ -387,12 +391,11 @@ fn report_acknowledged(response: &ReportProviderReadinessResponse, sequence: u64
             .is_some_and(|ttl| !ttl.is_zero())
 }
 
-#[tonic::async_trait]
 trait ReportClient: Send + Sync {
-    async fn report(
+    fn report(
         &self,
         observation: ProviderReadinessObservation,
-    ) -> miette::Result<ReportProviderReadinessResponse>;
+    ) -> impl Future<Output = miette::Result<ReportProviderReadinessResponse>> + Send;
 }
 
 struct GatewayReporter {
@@ -400,7 +403,6 @@ struct GatewayReporter {
     sandbox_id: String,
 }
 
-#[tonic::async_trait]
 impl ReportClient for GatewayReporter {
     async fn report(
         &self,
@@ -462,7 +464,6 @@ mod tests {
 
     struct CapturingReporter(tokio::sync::mpsc::UnboundedSender<ProviderReadinessObservation>);
 
-    #[tonic::async_trait]
     impl ReportClient for CapturingReporter {
         async fn report(
             &self,
@@ -489,7 +490,6 @@ mod tests {
         )>,
     );
 
-    #[tonic::async_trait]
     impl ReportClient for DelayedReporter {
         async fn report(
             &self,
@@ -510,14 +510,12 @@ mod tests {
     );
 
     #[tonic::async_trait]
-    impl BoundaryExec for DelayedBoundary {
+    impl rpc_test::BoundaryExec for DelayedBoundary {
         async fn exec(
             &self,
             _spec: openshell_isolation_interface::contract::ExecSpec,
-        ) -> Result<
-            openshell_isolation_interface::contract::ExecSession,
-            openshell_isolation_interface::contract::BackendError,
-        > {
+        ) -> Result<rpc_test::ExecSession, openshell_isolation_interface::contract::BackendError>
+        {
             unreachable!("reporting must never launch a workload process")
         }
 
@@ -581,9 +579,12 @@ mod tests {
         let task = tokio::spawn(async move {
             reporting_tracker
                 .run_reporter(
-                    reporting_credentials,
+                    reporting_credentials.clone(),
                     receiver,
-                    Arc::new(DelayedBoundary(boundary_tx)),
+                    rpc_test::exec_with_credentials(
+                        Arc::new(DelayedBoundary(boundary_tx)),
+                        reporting_credentials,
+                    ),
                     DelayedReporter(report_tx),
                 )
                 .await;
@@ -698,9 +699,12 @@ mod tests {
         let task = tokio::spawn(async move {
             tracker
                 .run_reporter(
-                    credentials,
+                    credentials.clone(),
                     receiver,
-                    Arc::new(DelayedBoundary(boundary_tx)),
+                    rpc_test::exec_with_credentials(
+                        Arc::new(DelayedBoundary(boundary_tx)),
+                        credentials,
+                    ),
                     CapturingReporter(report_tx),
                 )
                 .await;
@@ -714,9 +718,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // A cancelled RPC may still finish remotely. Its late acknowledgment
+        // must not publish readiness for the replacement gateway session.
+        let _ = old_ack.send(installed.clone());
         assert!(
-            old_ack.send(installed.clone()).is_err(),
-            "replaced session must cancel its pending installation"
+            tokio::time::timeout(Duration::from_millis(30), report_rx.recv())
+                .await
+                .is_err()
         );
         current_ack.send(installed.clone()).unwrap();
         let report = tokio::time::timeout(Duration::from_secs(1), report_rx.recv())

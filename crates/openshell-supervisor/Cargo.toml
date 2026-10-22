@@ -15,6 +15,7 @@ name = "openshell-supervisor"
 path = "src/main.rs"
 
 [dependencies]
+openshell-crypto = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false, features = ["jwt", "trace-context"] }
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
@@ -39,6 +40,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 socket2 = { workspace = true }
 tempfile = "3"
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
@@ -54,6 +56,8 @@ telemetry = ["openshell-core/telemetry"]
 bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
+openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
+tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 futures = { workspace = true }
 temp-env = "0.3"

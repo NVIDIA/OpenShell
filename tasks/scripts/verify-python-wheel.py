@@ -13,7 +13,14 @@ from email.parser import Parser
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
 
-PROTO_STEMS = ("datamodel", "openshell", "options", "sandbox")
+PROTO_STEMS = (
+    "credential_driver",
+    "datamodel",
+    "extension",
+    "openshell",
+    "options",
+    "sandbox",
+)
 BYTECODE_SUFFIXES = (".pyc", ".pyo")
 NATIVE_SUFFIXES = (".dll", ".dylib", ".exe", ".pyd", ".so")
 

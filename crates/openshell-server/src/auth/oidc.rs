@@ -10,12 +10,14 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
-use super::authenticator::{Authenticator, bearer_credential};
+use super::authenticator::{AuthFailureReason, AuthMechanism};
+use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::identity::{Identity, IdentityProvider};
 use super::principal::{Principal, UserPrincipal};
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 use openshell_core::OidcConfig;
+use openshell_crypto::jwt::decode;
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -32,7 +34,8 @@ use tracing::{debug, error, info, warn};
 /// These are structural bypasses for gRPC infrastructure that doesn't map to a
 /// single RPC method. Per-method bypasses (e.g. `Health`) are declared at the
 /// handler with `auth_mode: "unauthenticated"` in the proto annotation.
-const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
+const UNAUTHENTICATED_PREFIXES: &[&str] =
+    &[crate::multiplex::REFLECTION_PATH_PREFIX, "/grpc.health."];
 
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
@@ -575,7 +578,7 @@ impl JwksCache {
     /// Create a new JWKS cache, discovering the JWKS URI and fetching the
     /// initial key set.
     pub async fn new(config: &OidcConfig) -> Result<Self, String> {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        openshell_crypto::tls::ensure_default_provider();
         let http = Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -791,23 +794,32 @@ impl JwksCache {
     ///
     /// This is the authentication step — it verifies the caller's identity
     /// but does not check authorization (that's `authz::AuthzPolicy::check`).
-    pub async fn validate_token(&self, token: &str) -> Result<Identity, Status> {
+    pub async fn validate_token(&self, token: &str) -> Result<Identity, AuthRejection> {
         crate::install_jsonwebtoken_crypto_provider();
 
         self.refresh_if_stale().await.map_err(|e| {
             warn!(error = %e, "JWKS refresh failed");
-            Status::internal("OIDC key refresh failed")
+            reject(
+                AuthFailureReason::IdentityProviderUnavailable,
+                Status::internal("OIDC key refresh failed"),
+            )
         })?;
 
         // Decode the header to find the key ID.
         let header = decode_header(token).map_err(|e| {
             debug!(error = %e, "Failed to decode JWT header");
-            Status::unauthenticated("invalid token")
+            reject(
+                AuthFailureReason::MalformedCredential,
+                Status::unauthenticated("invalid token"),
+            )
         })?;
 
         let kid = header.kid.ok_or_else(|| {
             debug!("JWT has no kid in header");
-            Status::unauthenticated("invalid token: missing kid")
+            reject(
+                AuthFailureReason::MalformedCredential,
+                Status::unauthenticated("invalid token: missing kid"),
+            )
         })?;
 
         // Refresh once on kid miss.
@@ -816,7 +828,10 @@ impl JwksCache {
             drop(keys_guard);
             self.refresh_keys_coalesced().await.map_err(|e| {
                 warn!(error = %e, "JWKS refresh on kid miss failed");
-                Status::internal("OIDC key refresh failed")
+                reject(
+                    AuthFailureReason::IdentityProviderUnavailable,
+                    Status::internal("OIDC key refresh failed"),
+                )
             })?;
             keys_guard = self.keys.read().await;
         }
@@ -826,7 +841,10 @@ impl JwksCache {
             .map(|(dk, alg)| (dk.clone(), *alg))
             .ok_or_else(|| {
                 debug!(kid = %kid, "JWT kid not found in JWKS");
-                Status::unauthenticated("invalid token: unknown signing key")
+                reject(
+                    AuthFailureReason::InvalidCredential,
+                    Status::unauthenticated("invalid token: unknown signing key"),
+                )
             })?;
         drop(keys_guard);
 
@@ -836,7 +854,10 @@ impl JwksCache {
                 expected = ?cached_algorithm,
                 "JWT algorithm mismatch for cached signing key"
             );
-            return Err(Status::unauthenticated("invalid token"));
+            return Err(reject(
+                AuthFailureReason::InvalidCredential,
+                Status::unauthenticated("invalid token"),
+            ));
         }
 
         let mut validation = Validation::new(cached_algorithm);
@@ -846,7 +867,10 @@ impl JwksCache {
 
         let token_data = decode::<OidcClaims>(token, &decoding_key, &validation).map_err(|e| {
             debug!(error = %e, "JWT validation failed");
-            Status::unauthenticated(format!("invalid token: {e}"))
+            reject(
+                decode_failure_reason(e.kind()),
+                Status::unauthenticated(format!("invalid token: {e}")),
+            )
         })?;
 
         let mut claims = token_data.claims;
@@ -868,10 +892,31 @@ impl JwksCache {
     }
 }
 
+fn reject(reason: AuthFailureReason, status: Status) -> AuthRejection {
+    AuthRejection::new(AuthMechanism::Oidc, reason, status)
+}
+
+fn decode_failure_reason(kind: &jsonwebtoken::errors::ErrorKind) -> AuthFailureReason {
+    use jsonwebtoken::errors::ErrorKind;
+    match kind {
+        ErrorKind::ExpiredSignature => AuthFailureReason::ExpiredCredential,
+        ErrorKind::InvalidIssuer | ErrorKind::InvalidAudience => {
+            AuthFailureReason::AudienceOrIssuerMismatch
+        }
+        ErrorKind::InvalidToken
+        | ErrorKind::MissingRequiredClaim(_)
+        | ErrorKind::InvalidClaimFormat(_)
+        | ErrorKind::Base64(_)
+        | ErrorKind::Json(_)
+        | ErrorKind::Utf8(_) => AuthFailureReason::MalformedCredential,
+        _ => AuthFailureReason::InvalidCredential,
+    }
+}
+
 /// Authenticator that validates `Authorization: Bearer <jwt>` headers against
 /// the configured OIDC issuer.
 ///
-/// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
+/// Returns `NotApplicable` when no Bearer header is present, so the chain can fall
 /// through to other authenticators (e.g. the gateway-minted sandbox JWT
 /// authenticator).
 pub struct OidcAuthenticator {
@@ -890,13 +935,15 @@ impl Authenticator for OidcAuthenticator {
         &self,
         headers: &http::HeaderMap,
         _path: &str,
-    ) -> Result<Option<Principal>, Status> {
+    ) -> Result<Authentication, AuthRejection> {
         let Some(token) = bearer_credential(headers) else {
-            return Ok(None);
+            return Ok(Authentication::NotApplicable);
         };
 
         let identity = self.cache.validate_token(token).await?;
-        Ok(Some(Principal::User(UserPrincipal { identity })))
+        Ok(Authentication::Accepted(Principal::User(UserPrincipal {
+            identity,
+        })))
     }
 }
 
@@ -998,30 +1045,30 @@ mod tests {
 
     #[tokio::test]
     async fn oidc_loads_discovery_and_jwks_from_tls_idp_with_rotated_local_ca() {
-        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rcgen::{BasicConstraints, CertificateParams, IsCa};
         use rustls::pki_types::PrivateKeyDer;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let mut old_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         old_ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let old_ca_key = KeyPair::generate().unwrap();
-        let old_ca_cert = old_ca_params.self_signed(&old_ca_key).unwrap();
+        let old_ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let old_ca_cert = openshell_crypto::pki::self_signed(old_ca_params, &old_ca_key).unwrap();
 
         let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca_cert = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
 
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server_key = KeyPair::generate().unwrap();
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .unwrap();
-        let server_config = rustls::ServerConfig::builder()
+        let server_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let server_cert =
+            openshell_crypto::pki::signed_by(server_params, &server_key, &ca_cert, &ca_key)
+                .unwrap();
+        let server_config = openshell_crypto::tls::server_builder()
             .with_no_client_auth()
             .with_single_cert(
                 vec![server_cert.der().clone()],
-                PrivateKeyDer::Pkcs8(server_key.serialize_der().into()),
+                PrivateKeyDer::Pkcs8(server_key.serialize_der().unwrap().into()),
             )
             .unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
@@ -1205,10 +1252,13 @@ mod tests {
     #[test]
     fn reflection_is_unauthenticated() {
         assert!(is_unauthenticated_method(
+            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        ));
+        assert!(!is_unauthenticated_method(
             "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
         ));
-        assert!(is_unauthenticated_method(
-            "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
+        assert!(!is_unauthenticated_method(
+            "/grpc.reflection.v2.ServerReflection/ServerReflectionInfo"
         ));
     }
 
@@ -1375,7 +1425,7 @@ mod tests {
         header.kid = Some(kid.to_owned());
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_KEY.private_pem.as_bytes())
             .expect("load RSA signing key");
-        jsonwebtoken::encode(&header, claims, &key).expect("sign RS256 token")
+        openshell_crypto::jwt::encode(&header, claims, &key).expect("sign RS256 token")
     }
 
     fn claims_for(issuer: &str, audience: &str, exp: i64) -> serde_json::Value {
@@ -1475,10 +1525,12 @@ mod tests {
         };
         let forged = format!("{}.{forged_payload}.{}", segments[0], segments[2]);
 
-        cache
+        let rejection = cache
             .validate_token(&forged)
             .await
             .expect_err("a swapped payload must fail the signature check");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
     }
 
     #[tokio::test]
@@ -1490,7 +1542,7 @@ mod tests {
         crate::install_jsonwebtoken_crypto_provider();
         let mut header = jsonwebtoken::Header::new(Algorithm::RS256);
         header.kid = Some(TEST_KID.to_owned());
-        let token = jsonwebtoken::encode(
+        let token = openshell_crypto::jwt::encode(
             &header,
             &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
             &jsonwebtoken::EncodingKey::from_rsa_pem(other.private_pem.as_bytes())
@@ -1498,10 +1550,12 @@ mod tests {
         )
         .expect("sign with unrelated key");
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token signed by a key outside the JWKS must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
     }
 
     #[tokio::test]
@@ -1515,10 +1569,12 @@ mod tests {
             TEST_KID,
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("an expired token must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::ExpiredCredential);
     }
 
     #[tokio::test]
@@ -1531,10 +1587,15 @@ mod tests {
             TEST_KID,
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token from another issuer must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(
+            rejection.reason,
+            AuthFailureReason::AudienceOrIssuerMismatch
+        );
     }
 
     #[tokio::test]
@@ -1547,10 +1608,15 @@ mod tests {
             TEST_KID,
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token minted for another audience must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(
+            rejection.reason,
+            AuthFailureReason::AudienceOrIssuerMismatch
+        );
     }
 
     #[tokio::test]
@@ -1563,19 +1629,64 @@ mod tests {
             "rotated-away-key",
         );
 
-        cache
+        let rejection = cache
             .validate_token(&token)
             .await
             .expect_err("a token naming a kid absent from the JWKS must be rejected");
+        assert_eq!(rejection.mechanism, AuthMechanism::Oidc);
+        assert_eq!(rejection.reason, AuthFailureReason::InvalidCredential);
+    }
+
+    #[tokio::test]
+    async fn unparseable_token_is_rejected_as_malformed() {
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+
+        let rejection = cache
+            .validate_token("not-a-jwt")
+            .await
+            .expect_err("an unparseable token must be rejected");
+        assert_eq!(rejection.reason, AuthFailureReason::MalformedCredential);
+        assert_eq!(rejection.status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[tokio::test]
+    async fn jwks_outage_is_rejected_as_identity_provider_unavailable() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let server = wiremock::MockServer::start().await;
+        let cache = cache_with_mock_issuer(&server).await;
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let token = mint_rs256(
+            &claims_for(&server.uri(), TEST_AUDIENCE, now_secs() + 3600),
+            "rotated-in-key",
+        );
+        let rejection = cache
+            .validate_token(&token)
+            .await
+            .expect_err("a token cannot be verified while the JWKS is unreachable");
+        assert_eq!(
+            rejection.reason,
+            AuthFailureReason::IdentityProviderUnavailable
+        );
+        assert_eq!(rejection.status.code(), tonic::Code::Internal);
     }
 
     mod jwks_validation {
         use super::*;
         use base64::Engine;
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use jsonwebtoken::{EncodingKey, Header, encode};
+        use jsonwebtoken::{EncodingKey, Header};
         use openshell_core::OidcConfig;
-        use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
+        use openshell_crypto::jwt::encode;
+        use rcgen::{PKCS_ECDSA_P256_SHA256, PKCS_ECDSA_P384_SHA384, PKCS_ED25519};
         use rsa::traits::PublicKeyParts;
         use std::time::{SystemTime, UNIX_EPOCH};
         use wiremock::matchers::{method, path};
@@ -1680,19 +1791,19 @@ mod tests {
         fn ec_test_key(kid: &str, curve: &str) -> TestSigningKey {
             let (key_pair, algorithm, coord_len) = match curve {
                 "P-256" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P256_SHA256).unwrap(),
                     Algorithm::ES256,
                     32,
                 ),
                 "P-384" => (
-                    KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
+                    openshell_crypto::pki::generate_keypair_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
                     Algorithm::ES384,
                     48,
                 ),
                 other => panic!("unsupported curve {other}"),
             };
             let encoding_key =
-                EncodingKey::from_ec_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ec_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let (x, y) = ec_coords_from_spki(&key_pair.public_key_der(), coord_len);
             let jwk = serde_json::json!({
                 "kty": "EC",
@@ -1711,9 +1822,9 @@ mod tests {
         }
 
         fn ed25519_test_key(kid: &str) -> TestSigningKey {
-            let key_pair = KeyPair::generate_for(&PKCS_ED25519).unwrap();
+            let key_pair = openshell_crypto::pki::generate_keypair_for(&PKCS_ED25519).unwrap();
             let encoding_key =
-                EncodingKey::from_ed_pem(key_pair.serialize_pem().as_bytes()).unwrap();
+                EncodingKey::from_ed_pem(key_pair.serialize_pem().unwrap().as_bytes()).unwrap();
             let spki = key_pair.public_key_der();
             let x = URL_SAFE_NO_PAD.encode(&spki[spki.len() - 32..]);
             let jwk = serde_json::json!({
@@ -1932,7 +2043,7 @@ mod tests {
             });
             let unknown_kid_token = encode(&header, &claims, &good.encoding_key).unwrap();
             let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
 
             assert!(cache.validate_token(&token).await.is_ok());
         }
@@ -2017,7 +2128,7 @@ mod tests {
                 .checked_sub(grace + Duration::from_secs(1))
                 .unwrap();
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2079,7 +2190,7 @@ mod tests {
 
             let previous_refresh = *cache.last_kid_miss_refresh.read().await;
             let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
             assert!(*cache.last_kid_miss_refresh.read().await > previous_refresh);
 
             // Keep the remaining lookups deterministically inside the same
@@ -2089,7 +2200,7 @@ mod tests {
                 Instant::now().checked_add(Duration::from_mins(1)).unwrap();
             for _ in 0..4 {
                 let err = cache.validate_token(&unknown_kid_token).await.unwrap_err();
-                assert_eq!(err.code(), tonic::Code::Unauthenticated);
+                assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
             }
 
             let requests = server.received_requests().await.unwrap();
@@ -2110,7 +2221,7 @@ mod tests {
             let token = sign_token(&ec, &issuer, &config.audience, "user-1");
             let forged = token_with_header_alg(&token, Algorithm::HS256);
             let err = cache.validate_token(&forged).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2127,7 +2238,8 @@ mod tests {
             });
             let token = encode(&header, &claims, &key.encoding_key).unwrap();
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.reason, AuthFailureReason::MalformedCredential);
         }
 
         #[tokio::test]
@@ -2139,7 +2251,7 @@ mod tests {
             let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&signing, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2167,7 +2279,7 @@ mod tests {
             rs256_variant.algorithm = Algorithm::RS256;
             let mismatched = sign_token(&rs256_variant, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&mismatched).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2200,7 +2312,7 @@ mod tests {
 
             let sign_token_str = sign_token(&sign_key, &issuer, &config.audience, "sign-user");
             let err = cache.validate_token(&sign_token_str).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2214,7 +2326,7 @@ mod tests {
             let (cache, issuer, config, _server) = cache_from_jwks(jwks).await;
             let token = sign_token(&key, &issuer, &config.audience, "user-1");
             let err = cache.validate_token(&token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2263,7 +2375,7 @@ mod tests {
             });
             let second_token = encode(&header, &claims, &second.encoding_key).unwrap();
             let err = cache.validate_token(&second_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
 
         #[tokio::test]
@@ -2275,11 +2387,11 @@ mod tests {
 
             let rsa_token = sign_token(&rsa, &issuer, &config.audience, "rsa-user");
             let err = cache.validate_token(&rsa_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
 
             let eddsa_token = sign_token(&eddsa, &issuer, &config.audience, "eddsa-user");
             let err = cache.validate_token(&eddsa_token).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+            assert_eq!(err.status.code(), tonic::Code::Unauthenticated);
         }
     }
 }

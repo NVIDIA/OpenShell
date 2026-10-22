@@ -130,10 +130,36 @@ if (deletion.outcome === 'accepted') {
 }
 ```
 
+Sandbox refs returned by `create`, `get`, and `list` include `createdAtMs`, the
+creation time in epoch milliseconds. It is absent when the gateway omits it.
+
 `client.sandbox` also supports streaming and interactive exec, TCP forwarding,
 SSH sessions, sandbox provider attachment, configuration, and policy. Close
 operation-scoped streams and forwarding handles when finished. The root client
 does not retain a dedicated session and has no `close()` method.
+
+## Watch Logs and Events
+
+`watchLogs` streams a sandbox's log lines and platform events with automatic
+reconnect and loss-aware resume. Pass a previous item's `cursor` back in as
+`resumeAfterCursor` to continue after a restart without gaps or duplicates:
+
+```ts
+for await (const item of client.sandbox.watchLogs(sandbox.name, { followLogs: true })) {
+  if (item.kind === 'log') {
+    console.log(`${item.line.level} ${item.line.message}`)
+  } else if (item.kind === 'warning') {
+    console.warn(`gap: ${item.message}`)
+  }
+}
+```
+
+When a resume cursor has expired, `watchLogs` stops with an `SdkError` whose
+`code` is `rpc` and whose `connectCode` is `Code.OutOfRange`. To accept the missing
+events, start a new watch with an empty `resumeAfterCursor`.
+
+See [Accessing Logs](/observability/accessing-logs) for the cursor and resume
+contract this method implements.
 
 ## Use the Raw Client
 

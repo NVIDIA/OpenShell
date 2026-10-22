@@ -48,6 +48,28 @@ mise run test:rust     # cargo test --workspace
 
 Rust validation checks tracked Cargo lockfiles; run `mise run rust:lockfiles:check` to check them directly. If one is stale, refresh it with Cargo using its adjacent manifest, review the diff, and commit the update.
 
+### PostgreSQL-backed tests
+
+Tests that need a real PostgreSQL server, such as advisory-lock concurrency
+across two stores, are `#[ignore]`d and named `postgres_*`. Run them with:
+
+```shell
+mise run test:rust:postgres
+```
+
+The task starts a disposable PostgreSQL container with Docker or Podman
+(set `CONTAINER_ENGINE` to choose), runs the tests one at a time, and removes
+the container. Each test works in its own temporary schema, except the replay
+and provider refresh lock tests, which use the default schema. To use your own
+disposable database, set `OPENSHELL_TEST_POSTGRES_URL`. The task overrides
+`OPENSHELL_REPLAY_TEST_DATABASE_URL` so legacy tests use that same database.
+Never point it at a database that a running gateway uses: the tests take
+fleet-wide advisory locks.
+Branch Checks runs them on x86_64 Linux.
+Load-sensitive capacity checks are named `bench_postgres_*` instead, so that
+task skips them. Run them on an idle machine with
+`mise run test:rust:postgres:bench`.
+
 ### Native Windows validation
 
 Use `mise run --skip-tools pre-commit` with the existing Rust/MSVC toolchain.
@@ -213,18 +235,32 @@ HTTP `Host`, TLS SNI, and mTLS handling.
 Suites:
 
 - Common suite (`--features e2e`) - driver-neutral CLI behavior, sandbox lifecycle, sync, port forwarding, policy, and provider tests.
-- CLI conformance (`openshell-conformance`) - named scenarios for lifecycle,
-  mechanistic drafts, and the sandbox-local API, including agent-authored
-  permission requests. Driver E2E wrappers run every scenario. The
-  installed-artifact conformance suite runs all scenarios and offers a focused
-  `policy-advisor` testsuite for manual integration runs.
+- CLI conformance (`tests/suites/conformance`) - portable Cargo tests for
+  lifecycle, mechanistic drafts, file transfer, and the sandbox-local API,
+  including agent-authored permission requests. Driver E2E runs the complete
+  Cargo test package. The installed-artifact conformance suite runs the same
+  tests from a nextest archive and offers a focused `policy-advisor` testsuite
+  for manual integration runs.
 - Driver suites (`--features e2e-docker`, `e2e-podman`, `e2e-kubernetes`, or
   `e2e-vm`) - CLI conformance plus the common and driver-specific coverage for
   the selected deployment.
 - Docker suite (`--features e2e-docker`) - includes Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway start.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
+- Configuration push suite (`--features e2e-config-push`) - CLI conformance and the policy tests against a Docker gateway with `config_delivery_mode = "push"`. Run it with `mise run e2e:rust:push`.
 - VM suite (`--features e2e-vm`) - runs e2e tests on a VM.
 - Kubernetes credential-driver suite (`--features e2e-kubernetes-credential-drivers`) - targeted Kubernetes Secrets and Vault provider credential storage coverage.
+
+The Docker, Podman, Kubernetes, and VM runners execute CLI
+conformance before their Rust tests. Set the driver's feature variable
+(`OPENSHELL_E2E_DOCKER_FEATURES`, `OPENSHELL_E2E_PODMAN_FEATURES`,
+`OPENSHELL_E2E_KUBERNETES_FEATURES`, or `OPENSHELL_E2E_VM_FEATURES`) to
+`e2e-conformance-only` to skip the Rust tests; the runner logs a notice when
+it skips them. Unset or empty values select the driver's default Rust
+features. The selector is handled by the runner; it is not a Cargo feature.
+
+```shell
+OPENSHELL_E2E_KUBERNETES_FEATURES=e2e-conformance-only mise run e2e:kubernetes
+```
 
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
@@ -242,17 +278,25 @@ Run the Docker-backed Rust CLI e2e suite:
 mise run e2e:docker
 ```
 
-Run the minimal portable CLI conformance profile against the gateway selected
-in your OpenShell CLI configuration:
+Run the portable CLI conformance suite against the gateway selected in your
+OpenShell CLI configuration:
 
 ```shell
-mise run e2e:cli-conformance
+cargo build --package openshell-cli
+OPENSHELL_BIN="$PWD/target/debug/openshell" \
+  cargo test \
+    --locked \
+    --manifest-path tests/suites/conformance/Cargo.toml \
+    --package openshell-test-conformance-cli \
+    --no-fail-fast \
+    -- \
+    --test-threads=1 \
+    --nocapture
 ```
 
-The gateway must already be installed, reachable, and selected before the task
-starts. The task does not provision a gateway or select a compute driver. Set
-`OPENSHELL_BIN` to test a prebuilt CLI; otherwise, the task builds the CLI from
-the current checkout.
+The gateway must already be installed, reachable, and selected before the tests
+start. The test suite does not provision a gateway or select a compute driver.
+Set `OPENSHELL_BIN` to another executable to test a different prebuilt CLI.
 
 The phase-1 scenario verifies the complete CLI-to-gateway-to-driver path without
 depending on how the gateway was installed or which driver is configured. It
@@ -278,12 +322,32 @@ openshell sandbox list --output json
 openshell sandbox delete <sandbox-name>
 ```
 
-Gateway-backed Rust E2E tasks build the standalone conformance CLI, run its
-registered scenarios against the configured gateway, then run any lane-specific
-Rust tests that still apply. Run the Podman-backed Rust CLI e2e suite:
+Gateway-backed Rust E2E tasks run the CLI conformance Cargo tests against the
+configured gateway, then run any lane-specific Rust tests that still apply.
+Run the Podman-backed Rust CLI e2e suite:
 
 ```shell
 mise run e2e:podman
+```
+
+`nix run .#build-artifacts` also builds
+`artifacts/packages/openshell.deb` for tmachine's `deb` installer, targeting the
+host's Linux architecture (`arm64` or `amd64`). Set `OPENSHELL_DEB_VERSION` to
+override the default package version, `0.0.0-local`.
+
+It also builds `artifacts/packages/rpm/openshell.rpm` and
+`artifacts/packages/rpm/openshell-gateway.rpm` for tmachine's `rpm` installer.
+The RPM step runs `packit build locally` with `openshell.spec` in the Fedora
+container that CI uses, so it needs a Docker daemon that runs Linux containers
+for the host's architecture (`aarch64` or `x86_64`), such as Docker Desktop on
+macOS. The package version defaults to the development version that branch CI
+computes; set `OPENSHELL_RPM_VERSION` and `OPENSHELL_RPM_RELEASE` to override
+it. After `nix run .#build-artifacts-binaries`, `nix run .#build-artifacts-rpm`
+rebuilds only the RPMs. Run conformance against the installed RPMs:
+
+```shell
+nix run .#build-artifacts
+nix run .#tmachine -- test fedora-podman-rootful rpm conformance
 ```
 
 Run the portable subset in a disposable rootless Podman guest:
@@ -305,11 +369,37 @@ Rust feature and preloads its Python workload image into the rootless Podman
 store. The separate `driver-podman` testsuite compares OpenShell and direct
 Podman user-namespace mappings for the default, `auto`, `keep-id`, and private
 profiles. The E2E archive excludes binaries that still depend on wrapper-owned
-gateway controls, host fixtures, missing guest tools, or nondeterministic relay
-setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
-binary. `tests/artifacts.nix` keeps the follow-up exclusions explicit and uses
+gateway controls, SPIFFE fixtures, the caller driver-config setting, or other
+guest setup. The `driver-podman` suite replaces the removed `podman_userns` E2E
+binary. `tests/tmachine/artifacts.nix` keeps the follow-up exclusions explicit and uses
 the same filter for the generated inventory, so excluded binaries cannot appear
 as false passes or silently re-enter the archive.
+
+The `oci-image` feature testsuite (`tests/suites/features/oci-image`) checks
+OCI image identity and working-directory behavior shared by the Docker and
+Podman drivers against installed deb packages on Ubuntu and rpm packages on
+Fedora. CI runs it on Docker rootful, Podman rootful, and Podman rootless guests:
+
+```shell
+nix run .#tmachine -- test ubuntu-docker-rootful deb oci-image
+```
+
+The shared suite also runs in the existing ARM64 Docker E2E workflow for
+branch checks and both release workflows. That interim lane compiles the same
+test crate natively and uses the architecture-matched prebuilt candidate CLI
+and gateway plus the candidate multi-architecture sandbox and supervisor
+images through `e2e/with-docker-gateway.sh`. The tmachine lanes still use
+x86_64 artifacts; they do not replace ARM64 image coverage.
+
+Run it against a local Docker or Podman gateway:
+
+```shell
+mise run e2e:oci-image
+mise run e2e:oci-image:podman
+```
+
+Both tasks set `OPENSHELL_TEST_CONTAINER_ENGINE`, the command that builds test
+images into the gateway's image store.
 
 Run the VM-backed Rust CLI e2e suite:
 
@@ -326,6 +416,12 @@ mise run e2e:kubernetes:credential-drivers
 ```
 
 ### Kubernetes E2E (`e2e/rust/e2e-kubernetes.sh`)
+
+The `e2e-kubernetes` nextest profile temporarily excludes only
+`canonical_main_connect_recovers_its_ssh_transport` while
+[#4445](https://github.com/NVIDIA/OpenShell/issues/4445) investigates delayed SSH
+input-owner release through port-forwarding. The test remains available to other
+driver profiles; the remaining Kubernetes tests stay enabled.
 
 Kubernetes e2e tests deploy an OpenShell gateway into a real Kubernetes cluster
 via Helm and run the Rust e2e suite against it. On vanilla Kubernetes the harness
@@ -351,14 +447,19 @@ OPENSHELL_E2E_KUBE_TEST=smoke mise run e2e:kubernetes
 ```
 
 **OpenShift**: when the target cluster exposes the `route.openshift.io` API
-group, the harness automatically applies SCC-compatible Helm overrides, grants
-the required SCCs (`privileged` to `openshell-sandbox`, and `anyuid` to the
-PostgreSQL fixture for DB scenarios), and drives the gateway through a
-passthrough Route with mandatory mTLS instead of port-forward. No extra flags are
-needed, but `oc` must be installed and authenticated against the target cluster
-with permission to modify SCC bindings (`oc adm policy add-scc-to-user`) — the
-harness exits early if `oc` is missing. The SCC grants and extracted client
-mTLS material are removed during cleanup, including on failure or interrupt.
+group, the harness automatically applies SCC-compatible Helm overrides and
+drives the gateway through a passthrough Route with mandatory mTLS instead of
+port-forward. No extra flags are needed, but `oc` must be installed and
+authenticated against the target cluster; the harness exits early if `oc` is
+missing. DB scenarios grant `anyuid` to the PostgreSQL fixture and require
+permission to modify SCC bindings (`oc adm policy add-scc-to-user`). That grant
+and extracted client mTLS material are removed during cleanup, including on
+failure or interrupt.
+
+Sandbox pods use the namespace-assigned UID/GID and run under `restricted-v2`
+without a privileged SCC grant to `openshell-sandbox`. Earlier versions required
+that grant for in-container isolation setup. [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation)
+explains the isolation backend separation behind the capability-free runtime.
 
 On a **remote** cluster, drop the `e2e-host-gateway` feature. Those tests rely
 on the sandbox-side `host.openshell.internal` alias reaching the machine running
@@ -490,7 +591,7 @@ cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
 Run a single Docker-only test directly with cargo:
 
 ```shell
-cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test custom_image
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test docker_preflight
 ```
 
 The harness (`e2e/rust/src/harness/`) provides:

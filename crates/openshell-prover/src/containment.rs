@@ -2249,6 +2249,16 @@ mod tests {
         parse_policy_str(value).expect("valid policy")
     }
 
+    #[test]
+    fn unknown_policy_controls_are_not_silently_omitted_from_containment_checks() {
+        for control in ["ui", "unsupported_control"] {
+            let source = format!("version: 1\n{control}: {{}}\n");
+            let error =
+                parse_policy_str(&source).expect_err("unknown policy authority must fail closed");
+            assert!(error.to_string().contains(control));
+        }
+    }
+
     fn options() -> CheckOptions {
         CheckOptions::new(Duration::from_secs(10))
     }

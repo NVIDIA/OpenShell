@@ -6,10 +6,16 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use opentelemetry_proto::tonic::collector::logs::v1::{
+    ExportLogsServiceRequest, ExportLogsServiceResponse,
+    logs_service_server::{LogsService, LogsServiceServer},
+};
 use opentelemetry_proto::tonic::collector::trace::v1::{
     ExportTraceServiceRequest, ExportTraceServiceResponse,
     trace_service_server::{TraceService, TraceServiceServer},
 };
+use opentelemetry_proto::tonic::common::v1::any_value::Value;
+use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::Span;
 
 /// Serialize tracing tests and keep their callsites enabled process-wide.
@@ -68,9 +74,34 @@ pub async fn assert_compute_driver_tracing(
 #[derive(Clone, Debug, Default)]
 pub struct ReceivedTraces {
     pub spans: Vec<Span>,
+    /// String bodies of exported log records.
+    pub log_bodies: Vec<String>,
+    /// `authorization` metadata of each log export request.
+    pub log_authorizations: Vec<String>,
     pub service_names: Vec<String>,
     pub gateway_names: Vec<String>,
     pub compute_drivers: Vec<String>,
+    pub encodings: Vec<String>,
+}
+
+impl ReceivedTraces {
+    fn record_resource(&mut self, resource: Option<Resource>) {
+        for attribute in resource
+            .into_iter()
+            .flat_map(|resource| resource.attributes)
+        {
+            let Some(Value::StringValue(value)) = attribute.value.and_then(|value| value.value)
+            else {
+                continue;
+            };
+            match attribute.key.as_str() {
+                "service.name" => self.service_names.push(value),
+                "openshell.gateway.name" => self.gateway_names.push(value),
+                "openshell.gateway.compute_driver" => self.compute_drivers.push(value),
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -90,28 +121,15 @@ impl TraceService for Collector {
                 .received
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(encoding) = request
+                .metadata()
+                .get("grpc-encoding")
+                .and_then(|value| value.to_str().ok())
+            {
+                received.encodings.push(encoding.to_string());
+            }
             for resource_span in request.into_inner().resource_spans {
-                if let Some(resource) = resource_span.resource {
-                    for attribute in resource.attributes {
-                        let Some(value) = attribute.value.and_then(|value| value.value) else {
-                            continue;
-                        };
-                        let opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
-                            value,
-                        ) = value
-                        else {
-                            continue;
-                        };
-                        match attribute.key.as_str() {
-                            "service.name" => received.service_names.push(value),
-                            "openshell.gateway.name" => received.gateway_names.push(value),
-                            "openshell.gateway.compute_driver" => {
-                                received.compute_drivers.push(value);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                received.record_resource(resource_span.resource);
                 for scope_span in resource_span.scope_spans {
                     received.spans.extend(scope_span.spans);
                 }
@@ -122,7 +140,43 @@ impl TraceService for Collector {
     }
 }
 
-/// Loopback OTLP/gRPC server that captures exported spans and resources.
+#[tonic::async_trait]
+impl LogsService for Collector {
+    async fn export(
+        &self,
+        request: tonic::Request<ExportLogsServiceRequest>,
+    ) -> Result<tonic::Response<ExportLogsServiceResponse>, tonic::Status> {
+        {
+            let mut received = self
+                .received
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(authorization) = request
+                .metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+            {
+                received.log_authorizations.push(authorization.to_string());
+            }
+            for resource_logs in request.into_inner().resource_logs {
+                received.record_resource(resource_logs.resource);
+                for scope_logs in resource_logs.scope_logs {
+                    for record in scope_logs.log_records {
+                        if let Some(Value::StringValue(body)) =
+                            record.body.and_then(|body| body.value)
+                        {
+                            received.log_bodies.push(body);
+                        }
+                    }
+                }
+            }
+        }
+        self.exported.notify_one();
+        Ok(tonic::Response::new(ExportLogsServiceResponse::default()))
+    }
+}
+
+/// Loopback OTLP/gRPC server that captures exported spans, logs, and resources.
 pub struct OtlpTestServer {
     endpoint: String,
     received: Arc<Mutex<ReceivedTraces>>,
@@ -133,20 +187,45 @@ pub struct OtlpTestServer {
 
 impl OtlpTestServer {
     pub async fn start() -> Self {
+        Self::start_with(None).await
+    }
+
+    /// Serve over TLS at `https://localhost:<port>` using `identity`.
+    pub async fn start_tls(identity: tonic::transport::Identity) -> Self {
+        Self::start_with(Some(identity)).await
+    }
+
+    async fn start_with(identity: Option<tonic::transport::Identity>) -> Self {
         let received = Arc::new(Mutex::new(ReceivedTraces::default()));
         let exported = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("OTLP test collector should bind a loopback listener");
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = if identity.is_some() {
+            format!("https://localhost:{port}")
+        } else {
+            format!("http://127.0.0.1:{port}")
+        };
         let collector = Collector {
             received: Arc::clone(&received),
             exported: Arc::clone(&exported),
         };
+        let mut server = tonic::transport::Server::builder();
+        if let Some(identity) = identity {
+            server = server
+                .tls_config(tonic::transport::ServerTlsConfig::new().identity(identity))
+                .expect("OTLP test collector should accept its TLS identity");
+        }
+        let trace_service = TraceServiceServer::new(collector.clone())
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
+        let logs_service = LogsServiceServer::new(collector)
+            .accept_compressed(tonic::codec::CompressionEncoding::Gzip);
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(TraceServiceServer::new(collector))
+            server
+                .add_service(trace_service)
+                .add_service(logs_service)
                 .serve_with_incoming_shutdown(
                     tokio_stream::wrappers::TcpListenerStream::new(listener),
                     async {

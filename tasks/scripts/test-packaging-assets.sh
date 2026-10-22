@@ -40,10 +40,10 @@ assert_file_exists() {
 service="${ROOT}/deploy/deb/openshell-gateway.service"
 control="${ROOT}/deploy/deb/control.in"
 spec="${ROOT}/openshell.spec"
-package_qualification="${ROOT}/tests/ansible/roles/openshell_packaged_gateway/tasks/main.yaml"
-tmachine_gateway_service="${ROOT}/tests/ansible/roles/openshell_gateway/templates/gateway.service.j2"
-tmachine_docker_config="${ROOT}/tests/ansible/roles/openshell_gateway/templates/gateway-docker.toml.j2"
-tmachine_podman_config="${ROOT}/tests/ansible/roles/openshell_gateway/templates/gateway-podman.toml.j2"
+package_qualification="${ROOT}/tests/tmachine/ansible/roles/openshell_packaged_gateway/tasks/main.yaml"
+tmachine_gateway_service="${ROOT}/tests/tmachine/ansible/roles/openshell_gateway/templates/gateway.service.j2"
+tmachine_docker_config="${ROOT}/tests/tmachine/ansible/roles/openshell_gateway/templates/gateway-docker.toml.j2"
+tmachine_podman_config="${ROOT}/tests/tmachine/ansible/roles/openshell_gateway/templates/gateway-podman.toml.j2"
 development_gateway="${ROOT}/nix/test-guest/provisioners/roles/gateway-podman/tasks/development-gateway.yml"
 
 assert_file_exists "$service"
@@ -157,23 +157,34 @@ for snap_file in \
   assert_not_contains "$snap_file" "default-provider: docker"
 done
 if [[ -e "${ROOT}/snap/hooks/connect-plug-docker" ]]; then
-  echo "FAIL: obsolete Snap Docker connection hook must not exist" >&2
+  echo "FAIL: obsolete snap Docker connection hook must not exist" >&2
   exit 1
 fi
 if [[ ! -x "$snap_install_hook" ]]; then
-  echo "FAIL: Snap install hook must be executable" >&2
+  echo "FAIL: snap install hook must be executable" >&2
   exit 1
 fi
 if [[ ! -x "$snap_configure_hook" ]]; then
-  echo "FAIL: Snap configure hook must be executable" >&2
+  echo "FAIL: snap configure hook must be executable" >&2
   exit 1
 fi
 assert_contains "$snapcraft" 'daemon-scope: system'
 assert_contains "$snapcraft" 'daemon-scope: user'
 assert_contains "$snapcraft" 'install-mode: disable'
 assert_not_contains "$snapcraft" 'install-mode: enable'
+for app in system-gateway user-gateway; do
+  if ! awk -v app="$app" '
+    $0 == "  " app ":" { found = 1; in_app = 1; next }
+    in_app && /^  [[:alnum:]_-]+:$/ { exit !disabled }
+    in_app && /install-mode: disable/ { disabled = 1 }
+    END { exit !(found && disabled) }
+  ' "$snapcraft"; then
+    echo "FAIL: snap ${app} must use install-mode: disable" >&2
+    exit 1
+  fi
+done
 if grep -Eq '^  gateway:$' "$snapcraft"; then
-  echo "FAIL: removed Snap gateway app must not remain declared" >&2
+  echo "FAIL: removed snap gateway app must not remain declared" >&2
   exit 1
 fi
 assert_contains "$snapcraft" '  system-gateway:'
@@ -187,7 +198,7 @@ assert_not_contains "$snapcraft" 'OPENSHELL_DB_URL: "sqlite:$SNAP_USER_COMMON'
 assert_not_contains "$snapcraft" 'OPENSHELL_LOCAL_TLS_DIR: "$SNAP_USER_COMMON'
 assert_contains "$snapcraft" 'refresh-mode: endure'
 if [[ ! -x "$snap_post_refresh_hook" ]]; then
-  echo "FAIL: Snap post-refresh hook must be executable" >&2
+  echo "FAIL: snap post-refresh hook must be executable" >&2
   exit 1
 fi
 assert_not_contains "$ROOT/tasks/scripts/snap-gateway-wrapper.sh" 'OPENSHELL_DISABLE_TLS'
@@ -211,7 +222,7 @@ if ! awk '
   }
   END { exit !(in_prover && finished && command && alias && home && plug_count == 1) }
 ' "$snapcraft"; then
-  echo "FAIL: Snap prover app must expose the openshell-prover alias with only home access" >&2
+  echo "FAIL: snap prover app must expose the openshell-prover alias with only home access" >&2
   exit 1
 fi
 assert_not_contains "$snap_install_docs" "snap connect openshell:home"
@@ -219,8 +230,19 @@ assert_not_contains "$snap_install_docs" "snap connect openshell:network"
 assert_not_contains "$snap_install_docs" "snap connect openshell:network-bind"
 assert_contains "$snap_install_docs" "snap connect openshell:docker :docker"
 assert_contains "$snap_install_docs" "systemctl --user reset-failed snap.openshell.user-gateway.service"
-assert_contains "$snap_install_docs" "snap start --user openshell.user-gateway"
-assert_contains "$snapcraft" "snap start --user openshell.user-gateway"
+assert_contains "$snap_install_docs" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$ROOT/install.sh" "systemctl --user enable --now snap.openshell.user-gateway.service"
+assert_contains "$ROOT/install.sh" "systemctl --global disable snap.openshell.user-gateway.service"
+assert_contains "$snap_install_docs" 'every user gateway binds to `127.0.0.1:17670`'
+assert_contains "$snap_install_docs" "systemctl --user disable --now snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "Every user gateway binds to 127.0.0.1:17670"
+assert_contains "$snap_install_docs" "sudo systemctl disable --global snap.openshell.user-gateway.service"
+assert_contains "$snapcraft" "sudo systemctl disable --global snap.openshell.user-gateway.service"
+for snap_file in "$ROOT/install.sh" "$snapcraft" "$snap_install_docs"; do
+  assert_not_contains "$snap_file" "snap start --user openshell.user-gateway"
+  assert_not_contains "$snap_file" "snap restart openshell.user-gateway"
+done
 assert_contains "$snap_install_docs" "openshell.user-gateway"
 assert_contains "$snap_install_docs" "openshell.system-gateway"
 assert_contains "$snap_install_docs" "Existing HTTPS registrations continue to work"

@@ -20,6 +20,7 @@ pub mod dynamic_credential_key;
 pub mod dynamic_string_allowlist;
 #[cfg(unix)]
 pub mod e2fsprogs;
+pub mod endpoint_failure;
 pub mod endpoint_path;
 pub mod endpoint_status;
 pub mod error;
@@ -32,6 +33,7 @@ pub mod gpu;
 pub mod grpc_client;
 pub mod host_pattern;
 pub mod image;
+pub mod isolation_registration;
 pub mod jwt;
 pub mod local_api_socket;
 pub mod mcp;
@@ -61,7 +63,9 @@ pub mod shell;
 pub mod spiffe;
 pub mod telemetry;
 pub mod time;
+pub mod token_grant_failure;
 pub mod transport_errors;
+pub mod upload;
 
 pub use config::{
     AppArmorProfile, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
@@ -96,5 +100,9 @@ mod build_version;
 ///
 /// Emitted by `build.rs` via `tonic_build::configure().file_descriptor_set_path(...)`.
 /// Used by tests in `openshell-server` to enumerate every RPC and verify that
-/// each one has an `#[rpc_auth(...)]` declaration on its handler.
+/// each one declares the `openshell.options.v1.authorization` proto option.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));
+
+#[cfg(test)]
+#[path = "../../../tests/support/environment.rs"]
+mod test_environment;

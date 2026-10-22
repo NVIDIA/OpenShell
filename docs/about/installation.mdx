@@ -38,7 +38,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
   OPENSHELL_VERSION=pre sh
 ```
 
-The installer checks prerelease tags from newest to oldest, selects an unexpired artifact from a successful release run for the current platform, and downloads only that artifact. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, prereleases and explicit release tags use Debian or RPM packages.
+The installer checks prerelease tags from newest to oldest, selects an unexpired published package for the current platform, and downloads only that artifact. The selected candidate may still be qualifying or may have failed qualification. Installed packages keep the candidate's exact version, such as `0.1.0-pre.3`. Prerelease tags do not create entries on the GitHub Releases page. On Linux, prereleases and explicit release tags use Debian or RPM packages.
 
 The rolling [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) does not require GitHub authentication:
 
@@ -86,7 +86,7 @@ The gateway reads `~/.config/openshell/gateway.toml` if it exists, otherwise the
 
 ## Linux
 
-The script installs a Debian package on Debian and Ubuntu or an RPM package on Fedora and RHEL. Set `OPENSHELL_INSTALL_METHOD=snap` to install the [Snap](#snap) package instead; hosts that already have the OpenShell snap keep refreshing it. Linux packages require glibc 2.28 or newer.
+The script installs a Debian package on Debian and Ubuntu or an RPM package on Fedora and RHEL. Set `OPENSHELL_INSTALL_METHOD=snap` to install the [snap](#snap) package instead; hosts that already have the OpenShell snap keep refreshing it. Linux packages require glibc 2.28 or newer.
 
 The gateway runs as a systemd user service at `https://127.0.0.1:17670` and reads `~/.config/openshell/gateway.toml`.
 
@@ -125,6 +125,22 @@ The snap does not migrate existing Debian, RPM, or Homebrew installs. Remove any
 
 ```shell
 sudo snap install openshell
+systemctl --user enable --now snap.openshell.user-gateway.service
+```
+
+The user gateway is disabled globally by default. The install script enables it only for the user who ran the script. After a direct snap installation, choose one user account to run the gateway and enable it with the command above. Do not enable the gateway for multiple users who may be logged in at the same time: every user gateway binds to `127.0.0.1:17670`, so only one can run on the system at a time.
+
+Older OpenShell snap revisions could enable the user gateway globally, causing it to start for every user. Remove that global enablement once, then enable the gateway from the account that will run it:
+
+```shell
+sudo systemctl disable --global snap.openshell.user-gateway.service
+systemctl --user enable --now snap.openshell.user-gateway.service
+```
+
+The global command prevents automatic activation for other users but does not stop gateways already running in their user sessions. Run the following command from each other affected user's session:
+
+```shell
+systemctl --user disable --now snap.openshell.user-gateway.service
 ```
 
 The snap installs the standalone policy prover as `openshell.prover`. The
@@ -142,7 +158,7 @@ openshell status
 
 Existing installations upgraded from the former `openshell.gateway` service retain their state under `/var/snap/openshell/common` through `openshell.system-gateway`. Existing HTTPS registrations continue to work because the endpoint and TLS identity do not change.
 
-If this user still has an old HTTP registration, or has not previously been enrolled, wait for the system gateway to be active, copy its client credentials into the user's Snap state, and register its HTTPS endpoint:
+If this user still has an old HTTP registration, or has not previously been enrolled, wait for the system gateway to be active, copy its client credentials into the user's snap state, and register its HTTPS endpoint:
 
 ```shell
 snap services openshell.system-gateway
@@ -161,9 +177,9 @@ openshell gateway add https://127.0.0.1:17670 --local --name openshell
 openshell status
 ```
 
-Set `old_registration` to the name shown by `openshell gateway list`, and omit the variable assignment and `openshell gateway remove` when no registration exists. Older direct Snap instructions may have used `openshell-gateway`, while the install script uses `openshell`.
+Set `old_registration` to the name shown by `openshell gateway list`, and omit the variable assignment and `openshell gateway remove` when no registration exists. Older direct snap instructions may have used `openshell-gateway`, while the install script uses `openshell`.
 
-### Change the Snap gateway mode
+### Change the snap gateway mode
 
 The user and system gateways have separate configuration, databases, and cryptographic identities. Changing modes does not migrate gateway or sandbox state and interrupts active sandbox sessions. Back up any state you need and delete active sandboxes before changing modes.
 
@@ -187,6 +203,7 @@ To use the user gateway, start it and replace the previous CLI registration afte
 
 ```shell
 sudo snap set openshell gateway-mode=user
+systemctl --user enable --now snap.openshell.user-gateway.service
 systemctl --user is-active snap.openshell.user-gateway.service
 openshell gateway list
 old_registration="NAME_FROM_GATEWAY_LIST"
@@ -194,6 +211,8 @@ openshell gateway remove "$old_registration"
 openshell gateway add https://127.0.0.1:17670 --local --name openshell
 openshell status
 ```
+
+Setting `gateway-mode=user` disables the system gateway but does not enable or disable any user's gateway service. Enable the service for only one selected user. To hand the gateway to another user, first run `systemctl --user disable --now snap.openshell.user-gateway.service` from the current gateway user's session, then run the enable command from the new user's session. Otherwise, the two services will compete for `127.0.0.1:17670`.
 
 To use the system gateway, start it, wait for it to generate its root-owned credentials, then copy its client bundle and replace the previous CLI registration:
 
@@ -225,7 +244,7 @@ sudo snap connect openshell:log-observe
 sudo snap connect openshell:system-observe
 sudo snap connect openshell:docker :docker
 systemctl --user reset-failed snap.openshell.user-gateway.service
-snap start --user openshell.user-gateway
+systemctl --user enable --now snap.openshell.user-gateway.service
 ```
 
 For an installation upgraded from a legacy system gateway, use `sudo systemctl reset-failed snap.openshell.system-gateway.service` and `sudo snap restart openshell.system-gateway` instead.
@@ -254,6 +273,13 @@ brew uninstall nvidia/openshell/openshell
 rm -rf "$(brew --prefix)/var/openshell"
 ```
 
+Snap:
+
+```shell
+systemctl --user disable --now snap.openshell.user-gateway.service
+sudo snap remove --purge openshell
+```
+
 Debian and Ubuntu:
 
 ```shell
@@ -268,12 +294,6 @@ Fedora and RHEL:
 systemctl --user disable --now openshell-gateway
 sudo dnf remove openshell-gateway openshell-prover openshell
 rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/openshell"
-```
-
-Snap:
-
-```shell
-sudo snap remove --purge openshell
 ```
 
 Remove any custom config or database set through `OPENSHELL_GATEWAY_CONFIG` or `OPENSHELL_DB_URL` separately.

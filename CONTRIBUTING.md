@@ -27,9 +27,9 @@ We use a vouch system. This exists because AI makes it trivial to generate plaus
 3. Write in your own words. AI-generated vouch requests will be denied.
 4. A maintainer will comment `/vouch` if approved, and the request discussion
    will close automatically.
-5. Once vouched, you can submit pull requests.
+5. **Get vouched before opening a PR.** Once vouched, you can submit pull requests.
 
-**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with push access bypass this check.
+**If you are not vouched, any pull request you open will be automatically closed.** The PR and its discussion are preserved. Once vouched, open a new PR (preferred) or reopen the closed one. It cannot be held open or converted to a draft to bypass the check. Org members and collaborators with push access bypass this check.
 
 ### Finding Work
 
@@ -108,12 +108,16 @@ Contributor and maintainer skills live in `.agents/skills/`. They are marked int
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
 | Reviewing       | `launch-openshell-gator`  | Launch and supervise OpenShell gator agents for issue and PR monitoring                             |
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
+| Maintenance     | `release-openshell`       | Pick the latest qualified prerelease and tag its commit as stable                                   |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Triage          | `review-triage-queue`     | Create a local, read-only queue report from GitHub intake                                           |
+| Triage          | `apply-triage-action`     | Apply, reject, or defer one explicitly selected triage recommendation                               |
 | Platform        | `helm-dev-environment`    | Start and manage the local Kubernetes development environment                                       |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Platform        | `build-openshell-mxc-windows` | Maintain and validate the build-only x64 and ARM64 Windows MSVC lane                             |
 | Documentation   | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes                                  |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
+| Maintenance     | `release-captain`         | Run the weekly Monday pre-flight and Tuesday stable release checklist                               |
 | Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
 ### Issue Workflow
@@ -379,11 +383,15 @@ mise run docs
 
 PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
 
-Release Dev publishes the `dev` docs version from `main`. Release Tag publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
+Release Dev publishes the `dev` docs version from `main`. Release publishes an immutable stable version and updates `latest`. See [fern/README.md](fern/README.md) for the source layout, version model, and publishing workflows.
 
 `docs/` is the source-of-truth docs tree. `fern/` contains the site configuration, components, theme assets, and its README.
 
 See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
+
+## Stale Issues and Pull Requests
+
+Issues and pull requests receive `state:stale` after 14 days without activity. Only `lifecycle:frozen` or `state:frozen` exempts an issue from stale handling. Both labels are supported while the naming convention is being decided. Issues close after another 14 days without activity; pull requests are not automatically closed. Comment on an item to reset the inactivity timer and remove its stale label.
 
 ## Pull Requests
 
@@ -392,9 +400,15 @@ See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authorin
 3. Run the checks appropriate to the affected code and behavior, as described below.
 4. Open a PR using the `create-github-pr` skill or manually following the [PR template](.github/PULL_REQUEST_TEMPLATE.md).
 
+For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
+
 Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
-Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not change applicable verification, review, or private vulnerability disclosure requirements.
+Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
+
+The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acceptance` job result for the triggering PR when it is opened, edited, reopened, or updated with new commits. It does not publish a shared commit status; lookup and execution errors fail the job. Link accepted issues in this repository using `Fixes #NNN` or `Closes #NNN`; GitHub recognizes closing references when a PR targets the default branch. Rerun the workflow after issue labels change. Making the job required for merging and configuring any required Actions event policy are separate repository settings; merge-queue support is not included.
+
+Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
 ### Branch Names
 
@@ -490,10 +504,17 @@ By making a contribution to this project, I certify that:
 ```
 
 ```bash
-git commit -s -m "feat(sandbox): add new capability"
+git commit --signoff --message "feat(sandbox): add new capability"
 ```
 
-DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+DCO sign-off is separate from cryptographic commit signing, and the two have different requirements:
+
+- **DCO sign-off** (`--signoff`) adds the `Signed-off-by` trailer to each commit. It applies to every contributor. The DCO Assistant bot also asks you to sign the DCO once, by commenting on your PR.
+- **Cryptographic commit signing** applies to org members and collaborators only. CI requires it so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+### PR testing checklist
+
+Only mark a checklist item as complete after you have run and verified it, not as a plan for what you intend to test. Unchecked boxes at submission are fine; they show what still needs verification before merge.
 
 ## CI
 

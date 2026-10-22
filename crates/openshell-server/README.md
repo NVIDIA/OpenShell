@@ -9,6 +9,15 @@ The server owns control-plane RPCs, authentication, provider credential delivery
 and sandbox lifecycle orchestration. The `openshell-gateway` crate composes the
 server with selected compute drivers.
 
+## Sandbox launch identity
+
+A new start, including an automatic restart, commits a fresh runtime generation
+and an incremented authorization epoch before invoking the compute driver.
+The launch session ID is derived from the durable sandbox ID and generation.
+Retries reuse that generation and session, including after gateway restart.
+Credential renewal retains both; credentials for an older launch cannot
+authorize the new one.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment
@@ -70,7 +79,8 @@ cargo test -p openshell-server --features test-support,prebuilt-z3
 cargo clippy -p openshell-server --all-targets --features test-support,prebuilt-z3 -- -D warnings
 ```
 
-The ignored `refresh_locks_coordinate_independent_replica_sessions` test requires
+The ignored `postgres_refresh_locks_coordinate_independent_replica_sessions` test
+runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.

@@ -72,7 +72,7 @@ NOTES:
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
     x86_64/aarch64, depending on the host package manager. Set
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
-    that already have the OpenShell snap keep refreshing it. Snap installs use
+    that already have the OpenShell snap keep refreshing it. snap installs use
     latest/stable by default and latest/edge for dev, and do not support
     explicit release tags or prereleases. The OpenShell snap requires a running
     Docker Engine installed from a system package or Docker's package
@@ -455,12 +455,15 @@ resolve_latest_prerelease_tag() {
     }
 
     for _run_id in $_run_ids; do
-      _successful="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
-        .status == "completed" and .conclusion == "success" and
-        (.path | startswith(".github/workflows/release-tag.yml"))')" || {
+      # Packages are published before qualification; a failed or running
+      # qualification must not hide an already-published candidate.
+      _release_workflow="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
+        (.path | split("@")[0]) |
+        . == ".github/workflows/release-prerelease.yml" or
+        . == ".github/workflows/release-tag.yml"')" || {
         error "failed to check prerelease workflow run ${_run_id}"
       }
-      if [ "$_successful" = "true" ]; then
+      if [ "$_release_workflow" = "true" ]; then
         printf '%s\n' "$_tag"
         return 0
       fi
@@ -1255,7 +1258,7 @@ openshell_snap_channel() {
   case "${OPENSHELL_VERSION:-}" in
     dev) printf '%s\n' "latest/edge" ;;
     '') printf '%s\n' "latest/stable" ;;
-    *) error "Snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
+    *) error "snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
   esac
 }
 
@@ -1327,7 +1330,7 @@ copy_snap_client_bundle() {
   done
 }
 
-# Snap revisions that require mTLS ship the post-refresh hook that migrates
+# snap revisions that require mTLS ship the post-refresh hook that migrates
 # older plaintext configs.
 snap_gateway_uses_mtls() {
   [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]
@@ -1493,12 +1496,16 @@ Install Docker Engine from a system package or Docker's package repository, then
   if [ "$_gateway_mode" = system ]; then
     warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
     as_root snap restart openshell.system-gateway
-  elif [ "$_existing_snap" = true ]; then
-    warn "restarting the OpenShell user gateway to use the refreshed snap; active sandbox sessions will be interrupted"
-    # as root, snap restart automatically restarts the given user services for
-    # all active users (there should just be one), and is forwards-compatible
-    # with planned changes to the snap user daemon commands.
-    as_root snap restart openshell.user-gateway
+  else
+    # In case refreshing from an old snap which had a globally-enabled user
+    # gateway service, globally disable it, then just enable for the target user
+    as_root systemctl --global disable snap.openshell.user-gateway.service
+    as_target_user systemctl --user daemon-reload
+    as_target_user systemctl --user enable --now snap.openshell.user-gateway.service
+    if [ "$_existing_snap" = true ]; then
+      warn "restarting the OpenShell user gateway to use the refreshed snap; active sandbox sessions will be interrupted"
+      as_target_user systemctl --user restart snap.openshell.user-gateway.service
+    fi
   fi
 
   info "registering local gateway as ${TARGET_USER}..."

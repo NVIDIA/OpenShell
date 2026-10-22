@@ -17,6 +17,26 @@ Create pull requests on GitHub using the `gh` CLI.
 
 ## Before Creating a PR
 
+### Verify Contributor Access and Issue Acceptance
+
+Before pushing or creating a PR (including a draft), verify the author's access
+to the target repository, not their fork. For the authenticated `gh` user:
+
+```bash
+gh repo view OWNER/REPO --json nameWithOwner,viewerPermission
+gh issue view ISSUE_NUMBER --repo OWNER/REPO --json number,url,labels
+```
+
+Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may proceed without
+`state:accepted`; keep the issue link and note the missing label. Everyone else
+must link at least one target-repository issue and have `state:accepted` on each.
+Otherwise, preserve local work and report which issue needs acceptance. A direct
+request, roadmap placement, other labels, or vouch status does not bypass this gate.
+
+When acting for another author, verify their permissions. Resolve failed lookups
+before proceeding; retry sandbox network failures outside the sandbox before
+reporting an authentication problem. Vouch requirements still apply separately.
+
 ### Check Config Documentation
 
 If the branch changes gateway TOML parsing, `[openshell.gateway]` fields,
@@ -156,6 +176,9 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ## Changes
 <!-- Bullet list of key changes -->
 
+## Release Notes
+<!-- Optional: a few short, easy-to-read sentences about the user-facing change -->
+
 ## Testing
 <!-- What testing was done? -->
 - [ ] Checks appropriate to the affected code and behavior pass
@@ -168,6 +191,8 @@ PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEM
 ```
 
 Populate the testing checklist based on what was actually run. Check boxes for steps that were completed.
+Keep the Release Notes section concise, with only a few easy-to-read sentences.
+Leave it empty when the summary already captures the user-facing change.
 
 ## Example PR (Complete)
 
@@ -188,6 +213,10 @@ Closes #456
 - Added `page_size` and `page_token` fields to the sandbox list API call
 - Default page size is 100, max is 1,000
 - Structured responses include `next_page_token`
+
+## Release Notes
+
+Sandbox list results can now be paged through with `--page-size` and `--page-token`.
 
 ## Testing
 
@@ -219,6 +248,9 @@ EOF
 ## After Creating
 
 The command outputs the PR URL and number.
+
+Rerun `PR Issue Acceptance` after linked issue labels change; it does not refresh
+automatically on issue-label events.
 
 **Display the URL using markdown link syntax** so it's easily clickable:
 

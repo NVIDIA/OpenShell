@@ -240,6 +240,35 @@ openshell provider update my-graph \
 
 Use `0` as the timestamp to clear expiry for a credential key.
 
+## Label a Provider
+
+Attach labels when you create a provider to track environment or team ownership.
+Repeat `--label` for each key-value pair. This example uses the imported `pypi`
+profile, which requires no static credentials.
+
+```shell
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+```
+
+List providers that match every key-value pair in a comma-separated selector.
+Filtering applies before pagination and only returns providers in the selected
+workspace. Platform Admins can filter across workspaces with `--all-workspaces`.
+
+```shell
+openshell provider list --label-selector env=dev,team=ml
+openshell provider list --all-workspaces --label-selector team=ml --output json
+openshell provider get public-pypi
+```
+
+`get` displays attached labels. JSON and YAML list output also include labels.
+When continuing a paginated list with `--page-token`, keep the selector and
+workspace scope unchanged.
+
+API clients set `CreateProviderRequest.provider.metadata.labels` and filter with
+`ListProvidersRequest.label_selector`. The gateway returns labels in
+`provider.metadata.labels`. Provider updates preserve existing labels and do
+not change them, so set labels during creation.
+
 ## Credential Refresh
 
 Provider refresh stores non-injectable refresh material separately from the
@@ -446,6 +475,24 @@ The proxy resolves credential placeholders in the following parts of an HTTP req
 
 The proxy does not rewrite cookies, response content, unsupported request
 bodies, or WebSocket binary frames.
+
+### Clients that parse JWT claims
+
+A trusted launcher can wrap an issued placeholder in a JWT-shaped alias when a
+client needs local account metadata. Keep the original placeholder suffix in
+the signature segment:
+
+```text
+base64url(header).base64url(claims).OPENSHELL-RESOLVE-ENV-<issued-placeholder-suffix>
+```
+
+For example, a placeholder beginning `openshell:resolve:env:s` becomes a JWT
+whose signature begins `OPENSHELL-RESOLVE-ENV-s`, retaining the entire handle and
+environment key. Use the placeholder supplied to the running workload; do not
+substitute a bare environment key or manufacture a handle. OpenShell replaces
+the entire alias with the resolved credential and preserves its endpoint,
+authorization-epoch, and expiry checks. The claims supply local metadata only;
+the alias is not a signed identity token or an upstream credential.
 
 ### Fail-closed behavior
 

@@ -43,7 +43,7 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 /// In VM mode, the overlayfs snapshotter re-extracts image layers from the
 /// content store on every boot, so 600s accommodates cold image preparation,
 /// workspace initialization, and sandbox startup.
-const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
+const SANDBOX_READY_TIMEOUT: Duration = Duration::from_mins(10);
 
 static NEXT_SANDBOX_NAME: AtomicU64 = AtomicU64::new(1);
 
@@ -488,39 +488,6 @@ impl SandboxGuard {
             .arg(&self.name)
             .arg(local_path)
             .arg(dest)
-            .arg("--no-git-ignore");
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{stdout}{stderr}");
-
-        if !output.status.success() {
-            return Err(format!(
-                "sandbox upload failed (exit {:?}):\n{combined}",
-                output.status.code()
-            ));
-        }
-
-        Ok(combined)
-    }
-
-    /// Upload local files to the sandbox's discovered working directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the upload command fails.
-    pub async fn upload_to_workdir(&self, local_path: &str) -> Result<String, String> {
-        let mut cmd = openshell_cmd();
-        cmd.arg("sandbox")
-            .arg("upload")
-            .arg(&self.name)
-            .arg(local_path)
             .arg("--no-git-ignore");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

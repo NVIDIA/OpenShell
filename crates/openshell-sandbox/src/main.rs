@@ -24,7 +24,7 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 const BOOTSTRAP_SUBCOMMAND: &str = "bootstrap";
 const SEED_WORKSPACE_SUBCOMMAND: &str = "seed-workspace";
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 const KUBERNETES_BOOTSTRAP_SECRET_FILES: [&str; 3] = ["boundary.json", "tls.crt", "tls.key"];
 #[cfg(target_os = "linux")]
 const BOOTSTRAP_INPUT_ROOT: &str = "/.openshell/bootstrap-input";
@@ -146,7 +146,7 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
             std::io::Error::last_os_error()
         ));
     }
-    openshell_isolation_interface::linux::task_memory::probe_child_access()
+    openshell_sandbox::linux::task_memory::probe_child_access()
         .into_diagnostic()
         .wrap_err("same-UID task-memory probe")?;
     // The successful production-shaped parent-to-child round trip above is
@@ -154,24 +154,19 @@ fn qualify_runtime() -> Result<(openshell_sandbox::RuntimeQualification, Qualifi
     // broker is intentionally nondumpable, so that fallback is inaccessible
     // even though /proc/<dumpable-child>/mem remains available to mediation.
     let task_memory_copy = true;
+    // Check the ABI first: on an older kernel the allow/deny probe would fail
+    // with an opaque ruleset error instead of naming the ABI it needs.
+    let landlock_abi =
+        openshell_sandbox::sandbox::linux::require_landlock_abi().wrap_err("Landlock ABI probe")?;
     probe_landlock_allow_deny().wrap_err("Landlock allow/deny probe")?;
-    let notification =
-        openshell_isolation_interface::linux::seccomp_notify::probe_notification_api()
-            .into_diagnostic()
-            .wrap_err("seccomp notification probe")?;
+    let notification = openshell_sandbox::linux::seccomp_notify::probe_notification_api()
+        .into_diagnostic()
+        .wrap_err("seccomp notification probe")?;
     probe_socket_virtualization().wrap_err("socket virtualization probe")?;
-    openshell_isolation_interface::linux::socket_confinement::probe_loopback_confinement()
+    openshell_sandbox::linux::socket_confinement::probe_loopback_confinement()
         .into_diagnostic()
         .wrap_err("socket loopback confinement probe")?;
     probe_dns_relay_bind().wrap_err("DNS relay bind probe")?;
-    let landlock_abi = openshell_isolation_interface::linux::landlock::abi_version()
-        .into_diagnostic()
-        .wrap_err("Landlock ABI probe")?;
-    if landlock_abi < 3 {
-        return Err(miette::miette!(
-            "sandbox self-protection requires Landlock ABI v3 or newer (including truncation), found v{landlock_abi}"
-        ));
-    }
 
     let groups = nix::unistd::getgroups()
         .into_diagnostic()?
@@ -358,8 +353,8 @@ fn probe_socket_virtualization() -> Result<()> {
     use std::sync::mpsc;
 
     use miette::Context as _;
-    use openshell_isolation_interface::linux::seccomp_notify::NotificationListener;
-    use openshell_isolation_interface::linux::socket_registry::{
+    use openshell_sandbox::linux::seccomp_notify::NotificationListener;
+    use openshell_sandbox::linux::socket_registry::{
         InetFamily, InetKind, SocketMetadata, SocketRegistry, SocketState,
     };
 
@@ -434,10 +429,9 @@ fn probe_socket_virtualization() -> Result<()> {
         .into_diagnostic()
         .wrap_err("resolve socket probe executable")?;
     let sandbox_tgid = std::process::id();
-    let mut child_hardening =
-        openshell_isolation_interface::linux::child_seccomp::prepare(sandbox_tgid)
-            .into_diagnostic()
-            .wrap_err("prepare socket probe child hardening")?;
+    let mut child_hardening = openshell_sandbox::linux::child_seccomp::prepare(sandbox_tgid)
+        .into_diagnostic()
+        .wrap_err("prepare socket probe child hardening")?;
     let (listener_tx, listener_rx) = mpsc::sync_channel::<std::io::Result<NotificationListener>>(1);
     let (child_tx, child_rx) = mpsc::sync_channel::<std::io::Result<std::process::Child>>(1);
     let launcher = std::thread::Builder::new()
@@ -447,12 +441,11 @@ fn probe_socket_virtualization() -> Result<()> {
                 let _ = listener_tx.send(Err(error));
                 return;
             }
-            let listener =
-                openshell_isolation_interface::linux::seccomp_notify::install_listener(&[
-                    libc::SYS_socket,
-                    libc::SYS_connect,
-                    libc::SYS_sendto,
-                ]);
+            let listener = openshell_sandbox::linux::seccomp_notify::install_listener(&[
+                libc::SYS_socket,
+                libc::SYS_connect,
+                libc::SYS_sendto,
+            ]);
             let Ok(listener) = listener else {
                 let _ = listener_tx.send(listener);
                 return;
@@ -660,7 +653,7 @@ fn probe_socket_virtualization() -> Result<()> {
                     return Err(miette::miette!("unexpected DNS probe destination"));
                 }
                 let mut payload = vec![0_u8; length];
-                openshell_isolation_interface::linux::task_memory::read_exact(
+                openshell_sandbox::linux::task_memory::read_exact(
                     notification.tid,
                     notification.args[1],
                     &mut payload,
@@ -795,19 +788,9 @@ fn block_launcher_signals() -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-unsafe fn set_child_core_limit() -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `limit` is a live fixed-size rlimit and this child-only update
-    // permanently disables core dumps before any untrusted instruction.
-    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) } < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+fn set_child_core_limit() -> std::io::Result<()> {
+    nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(target_os = "linux")]
@@ -868,7 +851,7 @@ fn read_probe_sockaddr(tid: u32, address: u64, length: u64) -> Result<std::net::
         return Err(miette::miette!("socket probe requires an IPv4 sockaddr"));
     }
     let mut bytes = vec![0_u8; length];
-    openshell_isolation_interface::linux::task_memory::read_exact(tid, address, &mut bytes)
+    openshell_sandbox::linux::task_memory::read_exact(tid, address, &mut bytes)
         .into_diagnostic()?;
     decode_probe_sockaddr(&bytes)
 }
@@ -1197,15 +1180,11 @@ fn probe_child_self_protection(sandbox_tgid: libc::pid_t, socket: libc::c_int) -
     if unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 1 {
         return Err(miette::miette!("workload child is not dumpable after exec"));
     }
-    let mut core_limit = libc::rlimit {
-        rlim_cur: libc::rlim_t::MAX,
-        rlim_max: libc::rlim_t::MAX,
-    };
-    // SAFETY: `core_limit` is writable storage for the current limit.
-    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &raw mut core_limit) } < 0 {
-        return Err(std::io::Error::last_os_error()).into_diagnostic();
-    }
-    if core_limit.rlim_cur != 0 || core_limit.rlim_max != 0 {
+    let (current, maximum) =
+        nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+            .map_err(std::io::Error::from)
+            .into_diagnostic()?;
+    if current != 0 || maximum != 0 {
         return Err(miette::miette!("workload child core limit is not zero"));
     }
     let mut local = 0_u8;
@@ -1556,7 +1535,7 @@ fn run_kubernetes_bootstrap() -> Result<()> {
     ))
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::os::unix::fs::PermissionsExt as _;
@@ -1613,7 +1592,7 @@ fn stage_kubernetes_bootstrap_at(source: &Path, runtime: &Path, state: &Path) ->
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn copy_projected_secret_file(
     source_root: &Path,
     name: &str,
@@ -1631,7 +1610,7 @@ fn copy_projected_secret_file(
     copy_regular_file(&canonical_source, destination, mode)
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
@@ -1668,10 +1647,12 @@ fn copy_regular_file(source: &Path, destination: &Path, mode: u32) -> Result<()>
 
 /// Seed the persistent workspace from the agent image as the final workload
 /// identity. This replaces the former root shell/tar init container.
+#[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace() -> Result<()> {
     seed_kubernetes_workspace_at(Path::new("/sandbox"), Path::new("/mnt/openshell-workspace"))
 }
 
+#[cfg(target_os = "linux")]
 fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::{Read as _, Write as _};
@@ -1724,6 +1705,7 @@ fn copy_workspace_tree(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()> {
     use std::fs::{self, OpenOptions};
     use std::io::Write as _;
@@ -1766,6 +1748,13 @@ fn seed_kubernetes_workspace_at(source: &Path, destination: &Path) -> Result<()>
         .sync_all()
         .into_diagnostic()?;
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn seed_kubernetes_workspace() -> Result<()> {
+    Err(miette::miette!(
+        "Kubernetes workspace seeding is supported only on Linux"
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -1834,7 +1823,7 @@ fn main() -> Result<()> {
     run_boundary(&args.bootstrap, &args.log_level)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

@@ -3,21 +3,26 @@
 
 //! SSH connection and proxy utilities.
 
+mod upload;
+
 use crate::color::Colorize;
 use crate::tls::{
     GrpcClient, TlsOptions, grpc_client, owner_replica, retry_unrouted, routed_to, with_owner_hint,
 };
 use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+use nix::sys::signal::Signal;
 use openshell_core::driver_mounts;
 use openshell_core::forward::{
-    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
-    validate_ssh_session_response, write_forward_pid,
+    ForwardSpec, build_proxy_command, format_gateway_url, resolve_ssh_gateway, sandbox_ssh_args,
+    shell_escape, validate_ssh_session_response, write_forward_pid,
 };
 use openshell_core::proto::{
     CreateSshSessionRequest, GetSandboxRequest, SandboxPhase, SshRelayTarget, TcpForwardFrame,
     TcpForwardInit, tcp_forward_init,
+};
+use openshell_core::upload::{
+    DestinationKind as UploadDestinationKind, ExpectedDestination, UploadPlan,
 };
 use std::fs;
 use std::future::Future;
@@ -26,6 +31,7 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -63,7 +69,14 @@ const CONNECT_CHILD_TERMINATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SSH_TRANSPORT_FAILURE_EXIT_CODE: i32 = 255;
 const SYNC_RETRY_ATTEMPTS: usize = 4;
 const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
-const UPLOAD_DESTINATION_CHANGED_EXIT_CODE: i32 = 73;
+static DEFAULT_SSH_LOG_LEVEL: OnceLock<&'static str> = OnceLock::new();
+
+/// Set the SSH log level derived from CLI verbosity before starting commands.
+pub fn set_default_ssh_log_level(level: &'static str) {
+    DEFAULT_SSH_LOG_LEVEL
+        .set(level)
+        .expect("SSH log level is configured only once");
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -169,9 +182,13 @@ async fn ssh_session_config(
         // to 127.0.0.1 but the cluster is actually running on a remote host.
         #[allow(clippy::cast_possible_truncation)]
         let gateway_port_u16 = session.gateway_port as u16;
-        let (gateway_host, gateway_port) =
-            resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-        format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port)
+        let (gateway_scheme, gateway_host, gateway_port) = resolve_ssh_gateway(
+            &session.gateway_scheme,
+            &session.gateway_host,
+            gateway_port_u16,
+            server,
+        );
+        format_gateway_url(&gateway_scheme, &gateway_host, gateway_port)
     };
     let gateway_name = tls
         .gateway_name()
@@ -197,23 +214,20 @@ async fn ssh_session_config(
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
-    // SSH log level follows the program's verbosity.  main() maps the `-v`
-    // count to OPENSHELL_SSH_LOG_LEVEL; an explicit env-var override wins.
-    let ssh_log_level =
-        std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| "ERROR".to_string());
+    // An explicit environment override wins over the CLI verbosity default.
+    let ssh_log_level = std::env::var("OPENSHELL_SSH_LOG_LEVEL").unwrap_or_else(|_| {
+        DEFAULT_SSH_LOG_LEVEL
+            .get()
+            .copied()
+            .unwrap_or("ERROR")
+            .to_string()
+    });
 
     let mut command = Command::new("ssh");
+    // Nested ProxyCommand processes inherit the effective verbosity too.
+    command.env("OPENSHELL_SSH_LOG_LEVEL", &ssh_log_level);
     command
-        .arg("-o")
-        .arg(format!("ProxyCommand={proxy_command}"))
-        .arg("-o")
-        .arg("StrictHostKeyChecking=no")
-        .arg("-o")
-        .arg("UserKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null")
-        .arg("-o")
-        .arg(format!("LogLevel={ssh_log_level}"))
+        .args(sandbox_ssh_args(proxy_command, &ssh_log_level))
         // Detect a dead relay within ~45s. The relay rides on a TCP connection
         // that the client has no way to observe silently dropping (gateway
         // restart, supervisor restart, cluster failover), so fall back to
@@ -225,82 +239,39 @@ fn ssh_base_command(proxy_command: &str) -> Command {
     command
 }
 
-#[cfg(unix)]
-const TRANSIENT_TTY_SIGNALS: &[Signal] = &[Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM];
-
-#[cfg(unix)]
-struct ParentSignalGuard {
-    previous: Vec<(Signal, SigAction)>,
-}
-
-#[cfg(unix)]
-impl ParentSignalGuard {
-    #[allow(unsafe_code)]
-    fn ignore_transient_tty_signals() -> Result<Self> {
-        let mut previous = Vec::with_capacity(TRANSIENT_TTY_SIGNALS.len());
-        for &signal in TRANSIENT_TTY_SIGNALS {
-            let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
-            // SAFETY: `sigaction` is the POSIX API for updating process signal
-            // dispositions. We install `SIG_IGN` for a small fixed set of
-            // terminal signals and store the previous handlers for restoration.
-            let old = unsafe { sigaction(signal, &action) }.into_diagnostic()?;
-            previous.push((signal, old));
-        }
-        Ok(Self { previous })
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ParentSignalGuard {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        for &(signal, previous) in self.previous.iter().rev() {
-            // SAFETY: these `SigAction` values were returned by `sigaction`
-            // above for this process, so restoring them here returns the parent
-            // signal handlers to their original state.
-            let _ = unsafe { sigaction(signal, &previous) };
-        }
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn reset_transient_tty_signals(command: &mut Command) {
-    // SAFETY: `pre_exec` runs in the forked child immediately before `exec`.
-    // We only reset a small fixed set of signal handlers to `SIG_DFL`, which is
-    // required so SSH receives terminal signals normally even though the parent
-    // process temporarily ignores them to preserve cleanup.
-    unsafe {
-        command.pre_exec(|| {
-            for &signal in TRANSIENT_TTY_SIGNALS {
-                let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
-                sigaction(signal, &action).map_err(|err| std::io::Error::other(err.to_string()))?;
-            }
-            Ok(())
-        });
-    }
-}
-
-fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<i32> {
+async fn exec_or_wait(command: Command, replace_process: bool) -> Result<i32> {
     if replace_process && std::io::stdin().is_terminal() {
         #[cfg(unix)]
         {
+            let mut command = command;
             let err = command.exec();
             return Err(miette::miette!("failed to exec ssh: {err}"));
         }
     }
 
+    // Catch terminal signals in the parent while SSH receives the same signals
+    // from the foreground process group. Unlike SIG_IGN, caught dispositions
+    // reset to their defaults when the child execs, so SSH stays interruptible.
     #[cfg(unix)]
-    let _signal_guard = if !replace_process && std::io::stdin().is_terminal() {
-        reset_transient_tty_signals(&mut command);
-        Some(ParentSignalGuard::ignore_transient_tty_signals()?)
+    let mut signals = if !replace_process && std::io::stdin().is_terminal() {
+        Some(TerminationSignals::new()?)
     } else {
         None
     };
-
-    let status = command.status().into_diagnostic()?;
-
-    Ok(status.code().unwrap_or(1))
+    let mut child = TokioCommand::from(command)
+        .kill_on_drop(true)
+        .spawn()
+        .into_diagnostic()?;
+    #[cfg(unix)]
+    if let Some(signals) = signals.as_mut() {
+        loop {
+            tokio::select! {
+                status = child.wait() => return Ok(process_exit_code(status.into_diagnostic()?)),
+                _ = signals.recv() => {}
+            }
+        }
+    }
+    Ok(process_exit_code(child.wait().await.into_diagnostic()?))
 }
 
 fn main_attach_command(session: &SshSessionConfig) -> Command {
@@ -324,9 +295,7 @@ fn main_attach_command(session: &SshSessionConfig) -> Command {
 
 async fn run_main_attach(session: &SshSessionConfig, replace_process: bool) -> Result<i32> {
     let command = main_attach_command(session);
-    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
-        .await
-        .into_diagnostic()?
+    exec_or_wait(command, replace_process).await
 }
 
 fn process_exit_code(status: ExitStatus) -> i32 {
@@ -367,6 +336,8 @@ struct ConnectCancellation {
 }
 
 impl ConnectCancellation {
+    // Unix signal registration is fallible; retain the shared API on Windows.
+    #[cfg_attr(not(unix), allow(clippy::unnecessary_wraps))]
     fn new() -> Result<Self> {
         Ok(Self {
             #[cfg(unix)]
@@ -374,6 +345,8 @@ impl ConnectCancellation {
         })
     }
 
+    // Waiting consumes mutable signal state only on Unix.
+    #[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
     async fn wait<F, T>(&mut self, future: F) -> std::result::Result<T, i32>
     where
         F: Future<Output = T>,
@@ -419,6 +392,8 @@ async fn terminate_and_reap_child(child: &mut Child, signal: Signal) -> Result<i
     Ok(128 + signal as i32)
 }
 
+// The shared cancellation state is mutated by the Unix signal receiver.
+#[cfg_attr(not(unix), allow(clippy::needless_pass_by_ref_mut))]
 async fn run_main_attach_supervised(
     session: &SshSessionConfig,
     cancellation: &mut ConnectCancellation,
@@ -843,16 +818,10 @@ pub async fn sandbox_forward(
 }
 
 /// A forward must stay owned by the process we spawn so it can be reaped or
-/// tracked by PID. User SSH config may otherwise move it into a persistent mux.
+/// tracked by PID. User SSH config may otherwise fork it into the background.
 fn ssh_forward_command(proxy_command: &str, sandbox_id: &str, spec: &ForwardSpec) -> Command {
     let mut command = ssh_base_command(proxy_command);
     command
-        .arg("-o")
-        .arg("ControlMaster=no")
-        .arg("-o")
-        .arg("ControlPath=none")
-        .arg("-o")
-        .arg("ControlPersist=no")
         .arg("-o")
         .arg("ForkAfterAuthentication=no")
         .arg("-N")
@@ -1048,9 +1017,7 @@ async fn sandbox_exec_with_mode(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    tokio::task::spawn_blocking(move || exec_or_wait(ssh, tty && replace_process))
-        .await
-        .into_diagnostic()??;
+    exec_or_wait(ssh, tty && replace_process).await?;
 
     Ok(())
 }
@@ -1223,74 +1190,13 @@ fn local_upload_path_is_file_like(path: &Path) -> bool {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UploadDestinationKind {
-    Directory,
-    File,
-    Missing,
-}
-
-impl UploadDestinationKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Directory => "directory",
-            Self::File => "file",
-            Self::Missing => "missing",
-        }
-    }
-}
-
-// Check every existing parent before interpreting a failed existence test as
-// absence. An inaccessible directory, a file used as a parent, or a dangling
-// parent symlink must fail inspection instead of selecting filename semantics.
-// Only fixed tokens go to stdout; diagnostics remain on stderr.
-const UPLOAD_DESTINATION_KIND_SH: &str = r#"upload_destination_kind() {
-    upload_path=$1
-    upload_parent=$2
-    while :; do
-        if [ -d "$upload_parent" ]; then
-            if [ ! -x "$upload_parent" ]; then
-                printf 'cannot inspect upload destination parent: %s\n' "$upload_parent" >&2
-                return 1
-            fi
-        elif [ -e "$upload_parent" ] || [ -L "$upload_parent" ]; then
-            printf 'upload destination parent is not a directory: %s\n' "$upload_parent" >&2
-            return 1
-        fi
-        case "$upload_parent" in
-            /|.) break ;;
-            */*) upload_parent=${upload_parent%/*}; [ -n "$upload_parent" ] || upload_parent=/ ;;
-            *) upload_parent=. ;;
-        esac
-    done
-    if [ -d "$upload_path" ]; then
-        printf directory
-    elif [ -e "$upload_path" ] || [ -L "$upload_path" ]; then
-        printf file
-    else
-        printf missing
-    fi
-}"#;
-
-fn upload_destination_kind_invocation(path: &str) -> String {
-    let (parent, _) = split_sandbox_path(path);
-    format!(
-        "upload_destination_kind {} {}",
-        shell_escape(path),
-        shell_escape(parent),
-    )
-}
-
 fn file_upload_destination_needs_probe(path: &str) -> bool {
     // Keep the existing /name heuristic: a top-level path means a directory.
     !path.ends_with('/') && split_sandbox_path(path).0 != "/"
 }
 
 fn build_upload_destination_probe_cmd(path: &str) -> String {
-    format!(
-        "{UPLOAD_DESTINATION_KIND_SH}\n{}",
-        upload_destination_kind_invocation(path),
-    )
+    openshell_core::upload::build_destination_probe(path)
 }
 
 fn parse_upload_destination_kind(output: &str) -> Result<UploadDestinationKind> {
@@ -1319,32 +1225,19 @@ fn resolve_file_upload_destination<'a>(
     }
 }
 
+#[cfg(test)]
 fn build_upload_extract_cmd(
     dest_dir: &str,
     expected_destination: Option<(&str, UploadDestinationKind)>,
 ) -> String {
-    let escaped_dest = shell_escape(dest_dir);
-    let extract = format!("mkdir -p -- {escaped_dest} && cat | tar xf - -C {escaped_dest}");
-    let Some((path, kind)) = expected_destination else {
-        return extract;
-    };
-
-    // Recheck before mkdir or tar can replace a path whose type changed after
-    // planning. This detects changes, but is not atomic with extraction and
-    // does not pin a symlink's target against concurrent replacement.
-    format!(
-        "{UPLOAD_DESTINATION_KIND_SH}\n\
-         upload_kind=$({probe}) || exit 1\n\
-         if [ \"$upload_kind\" != {expected} ]; then\n\
-             printf 'upload destination changed type before extraction: %s\\n' {path} >&2\n\
-             exit {changed_status}\n\
-         fi\n\
-         {extract}",
-        probe = upload_destination_kind_invocation(path),
-        expected = kind.as_str(),
-        path = shell_escape(path),
-        changed_status = UPLOAD_DESTINATION_CHANGED_EXIT_CODE,
-    )
+    openshell_core::upload::build_extract_command(&UploadPlan {
+        destination_directory: dest_dir.to_string(),
+        expected_destination: expected_destination.map(|(path, kind)| ExpectedDestination {
+            path: path.to_string(),
+            kind,
+        }),
+    })
+    .expect("test upload destination is valid")
 }
 
 /// Stream an archive into the sandbox and return its final destination.
@@ -1372,8 +1265,16 @@ async fn ssh_tar_upload(
     {
         let output = ssh_run_capture_stdout(&session, &build_upload_destination_probe_cmd(path))
             .await
+            .map_err(|error| {
+                if sync_error_is_retryable(&error) {
+                    error
+                } else {
+                    Report::new(upload::UploadError::Remote(error.to_string()))
+                }
+            })
             .wrap_err_with(|| format!("failed to inspect upload destination '{path}'"))?;
-        let kind = parse_upload_destination_kind(&output)?;
+        let kind = parse_upload_destination_kind(&output)
+            .map_err(|error| Report::new(upload::UploadError::Protocol(error.to_string())))?;
         let (directory, basename) = resolve_file_upload_destination(path, tar_name, kind);
         dest_dir = directory;
         *tar_name = basename;
@@ -1392,46 +1293,38 @@ async fn ssh_tar_upload(
         UploadSource::FileList { .. } => dest_dir.to_string(),
     };
 
-    let mut ssh = ssh_base_command(&session.proxy_command);
-    ssh.arg("-T")
-        .arg("-o")
-        .arg("RequestTTY=no")
-        .arg("sandbox")
-        .arg(build_upload_extract_cmd(dest_dir, expected_destination))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-
-    let mut child = ssh.spawn().into_diagnostic()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
-
-    // Wait even when the writer gets a broken pipe. A failed remote guard can
-    // close stdin early; its status must not become a retryable write error.
-    let archive_result =
-        tokio::task::spawn_blocking(move || -> Result<()> { write_upload_archive(stdin, source) })
-            .await
-            .into_diagnostic()?;
-    let status = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .into_diagnostic()?
-        .into_diagnostic()?;
-
-    if status.code() == Some(UPLOAD_DESTINATION_CHANGED_EXIT_CODE) {
-        return Err(miette::miette!(
-            "upload destination changed type before extraction; retry the upload"
-        ));
-    }
-    if !status.success() {
-        return Err(miette::miette!(
-            "ssh tar extract exited with status {status}"
-        ));
-    }
-    archive_result?;
+    let ssh = ssh_upload_command(&session.proxy_command);
+    let plan = UploadPlan {
+        destination_directory: dest_dir.to_string(),
+        expected_destination: expected_destination.map(|(path, kind)| ExpectedDestination {
+            path: path.to_string(),
+            kind,
+        }),
+    };
+    upload::run(ssh, plan, move |writer| {
+        write_upload_archive(writer, source)
+    })
+    .await
+    .map_err(Report::new)?;
 
     Ok(final_path)
+}
+
+/// Upload EOF marks a complete archive and the SSH exit status reports
+/// extraction, so the session must stay in the process we spawn. User SSH
+/// config may otherwise fork it into the background.
+fn ssh_upload_command(proxy_command: &str) -> Command {
+    let mut command = ssh_base_command(proxy_command);
+    command
+        .arg("-o")
+        .arg("ForkAfterAuthentication=no")
+        .arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("-s")
+        .arg("sandbox")
+        .arg(openshell_core::upload::SUBSYSTEM);
+    command
 }
 
 /// Split a sandbox path into (`parent_directory`, basename).
@@ -1606,7 +1499,7 @@ pub async fn sandbox_sync_up_files(
         files: files.to_vec(),
         archive_prefix: file_list_archive_prefix(local_path),
     };
-    retry_sandbox_sync("upload", || {
+    retry_sandbox_upload(|| {
         let source = source.clone();
         async move { ssh_tar_upload(server, name, dest, source, tls, workspace).await }
     })
@@ -1646,7 +1539,7 @@ pub async fn sandbox_sync_up(
         local_path: local_path.to_path_buf(),
         tar_name,
     };
-    retry_sandbox_sync("upload", || {
+    retry_sandbox_upload(|| {
         let source = source.clone();
         async move { ssh_tar_upload(server, name, sandbox_path, source, tls, workspace).await }
     })
@@ -1693,9 +1586,10 @@ async fn ssh_run_capture_stdout(session: &SshSessionConfig, command: &str) -> Re
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
-    let output = tokio::task::spawn_blocking(move || ssh.output())
+    let output = TokioCommand::from(ssh)
+        .kill_on_drop(true)
+        .output()
         .await
-        .into_diagnostic()?
         .into_diagnostic()?;
     if !output.status.success() {
         return Err(miette::miette!(
@@ -1815,6 +1709,25 @@ async fn sandbox_sync_down_once(
     }
 }
 
+async fn retry_sandbox_upload<F, Fut, T>(run: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    #[cfg(unix)]
+    {
+        // Tokio retains handlers after listeners drop; cover setup and retry delays too.
+        let mut signals = TerminationSignals::new()?;
+        tokio::select! {
+            biased;
+            _ = signals.recv() => Err(Report::new(upload::UploadError::Cancelled)),
+            result = retry_sandbox_sync("upload", run) => result,
+        }
+    }
+    #[cfg(not(unix))]
+    retry_sandbox_sync("upload", run).await
+}
+
 async fn retry_sandbox_sync<F, Fut, T>(operation: &str, mut run: F) -> Result<T>
 where
     F: FnMut() -> Fut,
@@ -1841,6 +1754,9 @@ where
 }
 
 fn sync_error_is_retryable(error: &Report) -> bool {
+    if let Some(error) = error.downcast_ref::<upload::UploadError>() {
+        return error.is_retryable();
+    }
     let message = format!("{error:?}").to_ascii_lowercase();
     [
         "broken pipe",
@@ -2413,8 +2329,132 @@ pub fn print_ssh_config(gateway: &str, name: &str, workspace: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn ssh_verbosity_reaches_nested_proxy_commands_and_respects_override() {
+        for override_level in [None, Some("INFO")] {
+            let environment = override_level.map_or_else(
+                || Environment::new().remove("OPENSHELL_SSH_LOG_LEVEL"),
+                |level| Environment::new().set("OPENSHELL_SSH_LOG_LEVEL", level),
+            );
+            environment.run(|| {
+                set_default_ssh_log_level("DEBUG");
+                let expected = override_level.unwrap_or("DEBUG");
+                let command = ssh_base_command("openshell ssh-tunnel");
+                assert!(
+                    command
+                        .get_args()
+                        .any(|arg| arg == std::ffi::OsStr::new(&format!("LogLevel={expected}")))
+                );
+                assert!(command.get_envs().any(|(key, value)| {
+                    key == "OPENSHELL_SSH_LOG_LEVEL"
+                        && value == Some(std::ffi::OsStr::new(expected))
+                }));
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_signal_workload_child() {
+        let Some(marker) = std::env::var_os("OPENSHELL_SIGNAL_WAIT_MARKER") else {
+            return;
+        };
+        // Only publish readiness after exec has reset the parent's caught
+        // signal dispositions. No external utility filename is assumed.
+        fs::write(marker, std::process::id().to_string()).unwrap();
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_signal_wait_child() {
+        let Some(marker) = std::env::var_os("OPENSHELL_SIGNAL_WAIT_MARKER") else {
+            return;
+        };
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "ulimit -c 0; exec \"$@\"", "signal-probe"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "ssh::tests::interactive_signal_workload_child",
+                "--nocapture",
+            ])
+            .env("OPENSHELL_SIGNAL_WAIT_MARKER", marker)
+            .stdin(Stdio::inherit());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(runtime.block_on(exec_or_wait(command, false)).unwrap(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_wait_survives_terminal_signals_and_reaps_child() {
+        use nix::sys::signal::killpg;
+        use nix::unistd::Pid;
+
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                if self.0.try_wait().ok().flatten().is_none() {
+                    let _ = killpg(Pid::from_raw(self.0.id().cast_signed()), Signal::SIGKILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+        for signal in [Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("ready");
+            let terminal = nix::pty::openpty(None, None).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "ssh::tests::interactive_signal_wait_child",
+                    "--nocapture",
+                ])
+                .env("OPENSHELL_SIGNAL_WAIT_MARKER", &marker)
+                .process_group(0)
+                .stdin(Stdio::from(terminal.slave))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut probe = Probe(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Ok(pid) = fs::read_to_string(&marker)
+                    && pid.parse::<u32>().is_ok()
+                {
+                    break;
+                }
+                assert!(
+                    probe.0.try_wait().unwrap().is_none(),
+                    "probe exited before ready"
+                );
+                assert!(Instant::now() < deadline, "probe did not become ready");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            killpg(Pid::from_raw(probe.0.id().cast_signed()), signal).unwrap();
+            loop {
+                if let Some(status) = probe.0.try_wait().unwrap() {
+                    assert!(status.success(), "parent failed under {signal}: {status}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "parent did not reap SSH after {signal}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            drop(terminal.master);
+        }
+    }
+
     use super::*;
     use crate::TEST_ENV_LOCK;
+    use crate::test_utils::Environment;
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
@@ -2457,6 +2497,167 @@ mod tests {
     fn sync_error_retry_filter_rejects_validation_failures() {
         let error = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
         assert!(!sync_error_is_retryable(&error));
+    }
+
+    #[test]
+    fn upload_errors_retry_only_explicit_transport_failures() {
+        for error in [
+            upload::UploadError::Unsupported,
+            upload::UploadError::Protocol("connection reset in invalid acknowledgment".into()),
+            upload::UploadError::Remote("destination /connection/unavailable".into()),
+            upload::UploadError::Archive("broken pipe while reading source".into()),
+            upload::UploadError::Cancelled,
+        ] {
+            assert!(!sync_error_is_retryable(&Report::new(error)));
+        }
+        assert!(sync_error_is_retryable(&Report::new(
+            upload::UploadError::Transport("SSH relay disconnected".into())
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_cancellation_covers_retry_delay_and_setup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const PHASE_ENV: &str = "OPENSHELL_UPLOAD_CANCEL_PHASE";
+        const MARKER_ENV: &str = "OPENSHELL_UPLOAD_CANCEL_MARKER";
+        const PID_ENV: &str = "OPENSHELL_UPLOAD_CANCEL_PROBE_PID";
+        struct Probe(std::process::Child);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        if let Some(phase) = std::env::var_os(PHASE_ENV) {
+            let marker = PathBuf::from(std::env::var_os(MARKER_ENV).unwrap());
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let mut attempts = 0;
+                let error = retry_sandbox_upload(|| {
+                    attempts += 1;
+                    assert_eq!(attempts, 1, "cancelled upload started another attempt");
+                    let marker = marker.clone();
+                    let setup = phase == "setup";
+                    async move {
+                        if setup {
+                            let session = SshSessionConfig {
+                                proxy_command: String::new(),
+                                sandbox_id: String::new(),
+                                sandbox_name: String::new(),
+                                gateway_url: String::new(),
+                                token: String::new(),
+                                main_terminal: false,
+                                replica: None,
+                            };
+                            return ssh_run_capture_stdout(&session, "unused").await.map(|_| ());
+                        }
+                        let mut command = Command::new("sh");
+                        command.args(["-c", "exit 255"]);
+                        let error = upload::run(
+                            command,
+                            UploadPlan {
+                                destination_directory: "/tmp/upload".into(),
+                                expected_destination: None,
+                            },
+                            |_| Ok(()),
+                        )
+                        .await
+                        .unwrap_err();
+                        assert!(matches!(error, upload::UploadError::Transport(_)));
+                        // A spawned task runs only after the current-thread
+                        // runtime reaches the retry wait.
+                        tokio::spawn(async move {
+                            fs::write(marker, "retry delay").unwrap();
+                        });
+                        Err(Report::new(error))
+                    }
+                })
+                .await
+                .unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<upload::UploadError>(),
+                    Some(upload::UploadError::Cancelled)
+                ));
+                assert_eq!(attempts, 1);
+                if phase == "setup" {
+                    let pid = fs::read_to_string(std::env::var_os(PID_ENV).unwrap())
+                        .unwrap()
+                        .parse::<i32>()
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_millis(750), async {
+                        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+                        {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    })
+                    .await
+                    .expect("cancelled probe must be terminated and reaped");
+                }
+            });
+            return;
+        }
+
+        for phase in ["retry delay", "setup"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let marker = temporary.path().join("ready");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "ssh::tests::upload_cancellation_covers_retry_delay_and_setup",
+                    "--nocapture",
+                ])
+                .env(PHASE_ENV, phase)
+                .env(MARKER_ENV, &marker)
+                .env(PID_ENV, temporary.path().join("probe-pid"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null());
+            if phase == "setup" {
+                let ssh = temporary.path().join("ssh");
+                fs::write(
+                    &ssh,
+                    "#!/bin/sh\n\
+                     printf '%s' \"$$\" > \"$OPENSHELL_UPLOAD_CANCEL_PROBE_PID\"\n\
+                     printf setup > \"$OPENSHELL_UPLOAD_CANCEL_MARKER\"\n\
+                     exec sleep 60\n",
+                )
+                .unwrap();
+                fs::set_permissions(ssh, fs::Permissions::from_mode(0o755)).unwrap();
+                let mut path = temporary.path().as_os_str().to_os_string();
+                path.push(":");
+                path.push(std::env::var_os("PATH").unwrap_or_default());
+                command.env("PATH", path);
+            }
+            let mut probe = Probe(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !fs::read_to_string(&marker).is_ok_and(|ready| ready == phase) {
+                assert!(probe.0.try_wait().unwrap().is_none(), "probe exited early");
+                assert!(Instant::now() < deadline, "probe did not reach {phase}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(probe.0.id().cast_signed()),
+                Signal::SIGINT,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                if let Some(status) = probe.0.try_wait().unwrap() {
+                    assert!(status.success(), "upload cancellation failed: {status}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "cancellation waited through {phase}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     #[test]
@@ -2545,55 +2746,41 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
         let xdg = tempfile::tempdir().unwrap();
-        let old_home = std::env::var("HOME").ok();
-        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", xdg.path());
-        }
 
-        let ssh_dir = home.path().join(".ssh");
-        fs::create_dir_all(&ssh_dir).unwrap();
-        let user_config = ssh_dir.join("config");
-        fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
+        Environment::new()
+            .set("HOME", home.path())
+            .set("XDG_CONFIG_HOME", xdg.path())
+            .run(|| {
+                let home = PathBuf::from(std::env::var_os("HOME").unwrap());
 
-        let managed_path = install_ssh_config("openshell", "demo", "default").unwrap();
-        install_ssh_config("openshell", "demo", "default").unwrap();
+                let ssh_dir = home.join(".ssh");
+                fs::create_dir_all(&ssh_dir).unwrap();
+                let user_config = ssh_dir.join("config");
+                fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
 
-        let main_contents = fs::read_to_string(&user_config).unwrap();
-        assert!(main_contents.contains("Host personal"));
-        assert_eq!(main_contents.matches("Include ").count(), 1);
-        assert!(main_contents.contains(&render_include_line(&managed_path)));
-        let include_idx = main_contents.find("Include ").unwrap();
-        let host_idx = main_contents.find("Host personal").unwrap();
-        assert!(include_idx < host_idx);
+                let managed_path = install_ssh_config("openshell", "demo", "default").unwrap();
+                install_ssh_config("openshell", "demo", "default").unwrap();
 
-        let managed_contents = fs::read_to_string(&managed_path).unwrap();
-        assert_eq!(
-            managed_contents
-                .matches("Host openshell-demo.default")
-                .count(),
-            1
-        );
-        assert!(managed_contents.contains("ProxyCommand"));
+                let main_contents = fs::read_to_string(&user_config).unwrap();
+                assert!(main_contents.contains("Host personal"));
+                assert_eq!(main_contents.matches("Include ").count(), 1);
+                assert!(main_contents.contains(&render_include_line(&managed_path)));
+                let include_idx = main_contents.find("Include ").unwrap();
+                let host_idx = main_contents.find("Host personal").unwrap();
+                assert!(include_idx < host_idx);
 
-        unsafe {
-            match old_home {
-                Some(val) => std::env::set_var("HOME", val),
-                None => std::env::remove_var("HOME"),
-            }
-            match old_xdg {
-                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
+                let managed_contents = fs::read_to_string(&managed_path).unwrap();
+                assert_eq!(
+                    managed_contents
+                        .matches("Host openshell-demo.default")
+                        .count(),
+                    1
+                );
+                assert!(managed_contents.contains("ProxyCommand"));
+            });
     }
 
     #[test]
@@ -2660,9 +2847,11 @@ mod tests {
         assert_eq!(forward_probe_host(&loopback), "127.0.0.1");
     }
 
+    /// Resolve `ssh -G` for `command`'s arguments against a user config that
+    /// enables connection sharing and forking for the host `sandbox`. `extra_args`
+    /// supplies the host and, for the forking option, `-N`, when `command` lacks them.
     #[cfg(unix)]
-    #[test]
-    fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
+    fn effective_ssh_config(command: &Command, extra_args: &[&str]) -> String {
         let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2677,16 +2866,12 @@ mod tests {
         )
         .unwrap();
 
-        let forward = ssh_forward_command(
-            "openshell ssh-proxy --sandbox demo",
-            "sandbox-id",
-            &ForwardSpec::new(18080),
-        );
         let output = Command::new("ssh")
             .arg("-F")
             .arg(&config)
             .arg("-G")
-            .args(forward.get_args())
+            .args(command.get_args())
+            .args(extra_args)
             .output()
             .unwrap();
         assert!(
@@ -2694,19 +2879,58 @@ mod tests {
             "ssh -G failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let effective = String::from_utf8(output.stdout).unwrap();
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    #[cfg(unix)]
+    fn assert_connection_sharing_disabled(effective: &str) {
         assert!(effective.lines().any(|line| line == "controlmaster false"));
         assert!(effective.lines().any(|line| line == "controlpersist no"));
-        assert!(
-            effective
-                .lines()
-                .any(|line| line == "forkafterauthentication no")
-        );
         assert!(
             !effective
                 .lines()
                 .any(|line| { line.starts_with("controlpath ") && line != "controlpath none" })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_base_command_overrides_user_connection_sharing() {
+        let effective =
+            effective_ssh_config(&ssh_base_command("openshell ssh-proxy"), &["-N", "sandbox"]);
+        assert_connection_sharing_disabled(&effective);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forward_ssh_command_overrides_user_multiplexing_and_forking() {
+        let forward = ssh_forward_command(
+            "openshell ssh-proxy --sandbox demo",
+            "sandbox-id",
+            &ForwardSpec::new(18080),
+        );
+        let effective = effective_ssh_config(&forward, &[]);
+        assert_connection_sharing_disabled(&effective);
+        assert!(
+            effective
+                .lines()
+                .any(|line| line == "forkafterauthentication no")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upload_ssh_command_overrides_user_multiplexing_and_forking() {
+        let upload = ssh_upload_command("openshell ssh-proxy --sandbox demo");
+        let effective = effective_ssh_config(&upload, &[]);
+        assert_connection_sharing_disabled(&effective);
+        for expected in [
+            "forkafterauthentication no",
+            "requesttty false",
+            "sessiontype subsystem",
+        ] {
+            assert!(effective.lines().any(|line| line == expected), "{expected}");
+        }
     }
 
     #[tokio::test]
@@ -2741,97 +2965,76 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn track_background_forward_or_cleanup_runs_cleanup_when_pidfile_write_fails() {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         // Make forward PID-file writes fail with ENOTDIR after listener readiness.
         let blocking_file = tmp.path().join("not-a-dir");
         fs::write(&blocking_file, b"x").unwrap();
-        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", &blocking_file);
-        }
 
-        let mut cleaned_up = false;
-        let result = track_background_forward_or_cleanup(
-            "default",
-            "demo",
-            8080,
-            4242,
-            "sbx-1",
-            "127.0.0.1",
-            || {
-                cleaned_up = true;
-            },
-        );
+        Environment::new()
+            .set("XDG_CONFIG_HOME", &blocking_file)
+            .run(|| {
+                let mut cleaned_up = false;
+                let result = track_background_forward_or_cleanup(
+                    "default",
+                    "demo",
+                    8080,
+                    4242,
+                    "sbx-1",
+                    "127.0.0.1",
+                    || {
+                        cleaned_up = true;
+                    },
+                );
 
-        unsafe {
-            match old_xdg {
-                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        assert!(
-            result.is_err(),
-            "PID-file write failure must surface as an error"
-        );
-        assert!(
-            cleaned_up,
-            "the owned SSH child must be cleaned up when tracking fails so no \
+                assert!(
+                    result.is_err(),
+                    "PID-file write failure must surface as an error"
+                );
+                assert!(
+                    cleaned_up,
+                    "the owned SSH child must be cleaned up when tracking fails so no \
              reachable-but-untracked forward is left running"
-        );
+                );
+            });
     }
 
     #[test]
-    #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn track_background_forward_or_cleanup_tracks_pid_without_cleanup_on_success() {
-        let _guard = TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
-        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
-        }
 
-        let mut cleaned_up = false;
-        let result = track_background_forward_or_cleanup(
-            "default",
-            "demo",
-            8080,
-            4242,
-            "sbx-1",
-            "127.0.0.1",
-            || {
-                cleaned_up = true;
-            },
-        );
-        let pid_file_exists = openshell_core::forward::forward_pid_path("default", "demo", 8080)
-            .is_ok_and(|path| path.exists());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", tmp.path())
+            .run(|| {
+                let mut cleaned_up = false;
+                let result = track_background_forward_or_cleanup(
+                    "default",
+                    "demo",
+                    8080,
+                    4242,
+                    "sbx-1",
+                    "127.0.0.1",
+                    || {
+                        cleaned_up = true;
+                    },
+                );
+                let pid_file_exists =
+                    openshell_core::forward::forward_pid_path("default", "demo", 8080)
+                        .is_ok_and(|path| path.exists());
 
-        unsafe {
-            match old_xdg {
-                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-
-        assert!(
-            result.is_ok(),
-            "a writable PID directory must track successfully"
-        );
-        assert!(
-            pid_file_exists,
-            "successful tracking must persist a PID file"
-        );
-        assert!(
-            !cleaned_up,
-            "successful tracking must not terminate the forward process"
-        );
+                assert!(
+                    result.is_ok(),
+                    "a writable PID directory must track successfully"
+                );
+                assert!(
+                    pid_file_exists,
+                    "successful tracking must persist a PID file"
+                );
+                assert!(
+                    !cleaned_up,
+                    "successful tracking must not terminate the forward process"
+                );
+            });
     }
 
     #[test]
@@ -3382,7 +3585,7 @@ mod tests {
             let output = run_upload_shell(&command, tmp.path(), Some(&archive));
             assert_eq!(
                 output.status.code(),
-                Some(UPLOAD_DESTINATION_CHANGED_EXIT_CODE)
+                Some(openshell_core::upload::DESTINATION_CHANGED_EXIT_CODE)
             );
             assert!(String::from_utf8_lossy(&output.stderr).contains("changed type"));
             if initial_kind == UploadDestinationKind::Directory {

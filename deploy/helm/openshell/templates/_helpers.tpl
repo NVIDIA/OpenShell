@@ -568,6 +568,20 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
+{{- $kubernetes := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- if hasKey $kubernetes "supervisor_topology" -}}
+{{- $topology := get $kubernetes "supervisor_topology" -}}
+{{- if not (has $topology (list "gateway" "workspace")) -}}
+{{- fail "supervisor_topology must be gateway or workspace; omit it to disable the shared supervisor" -}}
+{{- end -}}
+{{- if eq $topology "workspace" -}}
+{{- fail "supervisor_topology=workspace is not implemented" -}}
+{{- end -}}
+{{- $gateway := get (.Values.gatewayConfig | default dict) "openshell.gateway" | default dict -}}
+{{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
+{{- fail "supervisor_topology requires the kubernetes compute driver" -}}
+{{- end -}}
+{{- end -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $maxReplicas := int (include "openshell.maxReplicas" .) -}}
@@ -623,5 +637,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if kindIs "invalid" .Values.server.tls.clientCaSecretName -}}
 {{- fail "server.tls.clientCaSecretName cannot be null; omit the key to use the chart default (openshell-server-client-ca), or set to \"\" to disable client certificate verification for HTTPS-only mode" -}}
+{{- end -}}
+{{- $dataStorageSize := .Values.server.dataStorageSize -}}
+{{- if and (eq $workloadKind "statefulset") $dataStorageSize (not (regexMatch "^[0-9]+(\\.[0-9]+)?([KMGTPE]i|[kMGTPE])$" (toString $dataStorageSize))) -}}
+{{- fail "server.dataStorageSize must be a Kubernetes quantity with a unit, such as 20Gi" -}}
 {{- end -}}
 {{- end }}

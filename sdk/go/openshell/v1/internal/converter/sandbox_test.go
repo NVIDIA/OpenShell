@@ -256,6 +256,61 @@ func TestSandboxFromProto_EndpointStatuses(t *testing.T) {
 	assert.Equal(t, uint32(443), input.Status.EndpointStatuses[1].Ports[0])
 }
 
+func TestSandboxFromProto_TokenGrantFailures(t *testing.T) {
+	upstreamStatus := uint32(409)
+	failure := &pb.EndpointFailure{
+		Domain:             pb.EndpointFailureDomain_ENDPOINT_FAILURE_DOMAIN_TOKEN_GRANT,
+		Code:               "provider_authorization_required",
+		RecoveryAction:     pb.ProviderCredentialRefreshRecoveryAction_PROVIDER_CREDENTIAL_REFRESH_RECOVERY_ACTION_REAUTHORIZE,
+		Provider:           "github",
+		CredentialKey:      "token",
+		Stage:              "token_endpoint",
+		UpstreamHttpStatus: &upstreamStatus,
+		RequestId:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+	}
+	input := &pb.Sandbox{Status: &pb.SandboxStatus{
+		EndpointStatuses: []*pb.EndpointStatus{{EndpointId: "with-failure", LastFailure: failure}, {EndpointId: "without-failure"}},
+		LastTokenGrantFailure: &pb.TokenGrantFailureObservation{
+			DestinationHost: "api.example.test",
+			DestinationPort: 8443,
+			Failure:         failure,
+		},
+	}}
+
+	status := SandboxFromProto(input).Status
+	wantStatus := uint32(409)
+	want := &v1.EndpointFailure{
+		Domain:             v1.EndpointFailureDomainTokenGrant,
+		Code:               "provider_authorization_required",
+		RecoveryAction:     v1.RefreshRecoveryActionReauthorize,
+		Provider:           "github",
+		CredentialKey:      "token",
+		Stage:              "token_endpoint",
+		UpstreamHTTPStatus: &wantStatus,
+		RequestID:          "0b6f1f6e-7c55-4f1c-9a43-2d8f5b1f0e11",
+	}
+	assert.Equal(t, want, status.EndpointStatuses[0].LastFailure)
+	assert.Nil(t, status.EndpointStatuses[1].LastFailure)
+	assert.Equal(t, &v1.TokenGrantFailureObservation{
+		DestinationHost: "api.example.test",
+		DestinationPort: 8443,
+		Failure:         want,
+	}, status.LastTokenGrantFailure)
+
+	// The SDK values must not share the wire message's optional status.
+	upstreamStatus = 500
+	assert.Equal(t, uint32(409), *status.LastTokenGrantFailure.Failure.UpstreamHTTPStatus)
+
+	// Unknown wire domains must not select a closed code set.
+	failure.Domain = pb.EndpointFailureDomain(99)
+	input.Status.LastTokenGrantFailure.Failure = nil
+	status = SandboxFromProto(input).Status
+	assert.Equal(t, v1.EndpointFailureDomainUnspecified, status.EndpointStatuses[0].LastFailure.Domain)
+	assert.Nil(t, status.LastTokenGrantFailure.Failure)
+	input.Status.LastTokenGrantFailure = nil
+	assert.Nil(t, SandboxFromProto(input).Status.LastTokenGrantFailure)
+}
+
 func TestEndpointResultFromProto(t *testing.T) {
 	for _, tc := range []struct {
 		input pb.EndpointResult

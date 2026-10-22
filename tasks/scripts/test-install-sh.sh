@@ -162,7 +162,7 @@ if ! (
   find_existing_native_openshell_bin() { return 1; }
   guard_native_to_snap_transition
 ) >"$out" 2>"$err"; then
-  echo "FAIL: Snap install without an existing native installation should continue" >&2
+  echo "FAIL: snap install without an existing native installation should continue" >&2
   cat "$err" >&2 || true
   exit 1
 fi
@@ -177,7 +177,7 @@ assert_native_to_snap_blocked() {
     UPGRADE_NOTICE_ACK=""
     guard_native_to_snap_transition
   ) >"$out" 2>"$err"; then
-    echo "FAIL: ${name}: expected native-to-Snap transition to be blocked" >&2
+    echo "FAIL: ${name}: expected native-to-snap transition to be blocked" >&2
     exit 1
   fi
   if ! grep -Fq "detected existing non-snap OpenShell ${version} at /usr/bin/openshell" "$err"; then
@@ -186,7 +186,7 @@ assert_native_to_snap_blocked() {
     exit 1
   fi
   if ! grep -Fq "does not import state from a non-snap installation" "$err"; then
-    echo "FAIL: ${name}: missing isolated Snap state explanation" >&2
+    echo "FAIL: ${name}: missing isolated snap state explanation" >&2
     cat "$err" >&2 || true
     exit 1
   fi
@@ -201,12 +201,12 @@ if ! (
   UPGRADE_NOTICE_ACK=1
   guard_native_to_snap_transition
 ) >"$out" 2>"$err"; then
-  echo "FAIL: acknowledged native-to-Snap transition should continue" >&2
+  echo "FAIL: acknowledged native-to-snap transition should continue" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if ! grep -Fq "continuing because OPENSHELL_ACK_BREAKING_UPGRADE=1 is set" "$err"; then
-  echo "FAIL: acknowledged native-to-Snap transition was not reported" >&2
+  echo "FAIL: acknowledged native-to-snap transition was not reported" >&2
   cat "$err" >&2 || true
   exit 1
 fi
@@ -215,7 +215,7 @@ if (
   RELEASE_TAG=""
   target_uses_breaking_gateway_model
 ); then
-  echo "FAIL: Snap targets must not use the version-boundary upgrade guard" >&2
+  echo "FAIL: snap targets must not use the version-boundary upgrade guard" >&2
   exit 1
 fi
 
@@ -223,12 +223,12 @@ out="$(mktemp)"
 err="$(mktemp)"
 
 if ! OPENSHELL_VERSION=dev openshell_snap_channel >"$out" 2>"$err"; then
-  echo "FAIL: dev must select the latest/edge Snap channel" >&2
+  echo "FAIL: dev must select the latest/edge snap channel" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if [ "$(cat "$out")" != "latest/edge" ]; then
-  echo "FAIL: dev must select the latest/edge Snap channel" >&2
+  echo "FAIL: dev must select the latest/edge snap channel" >&2
   exit 1
 fi
 if [ -s "$err" ]; then
@@ -238,12 +238,12 @@ if [ -s "$err" ]; then
 fi
 
 if ! OPENSHELL_VERSION="" openshell_snap_channel >"$out" 2>"$err"; then
-  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable Snap channel" >&2
+  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable snap channel" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if [ "$(cat "$out")" != "latest/stable" ]; then
-  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable Snap channel" >&2
+  echo "FAIL: unset OPENSHELL_VERSION must select the latest/stable snap channel" >&2
   exit 1
 fi
 if [ -s "$err" ]; then
@@ -253,11 +253,11 @@ if [ -s "$err" ]; then
 fi
 
 if (OPENSHELL_VERSION=v1.2.3 openshell_snap_channel) >"$out" 2>"$err"; then
-  echo "FAIL: pinned release must not select a Snap channel" >&2
+  echo "FAIL: pinned release must not select a snap channel" >&2
   exit 1
 fi
-if ! grep -Fq "Snap installs do not support OPENSHELL_VERSION=v1.2.3" "$err"; then
-  echo "FAIL: pinned release Snap rejection was not explained" >&2
+if ! grep -Fq "snap installs do not support OPENSHELL_VERSION=v1.2.3" "$err"; then
+  echo "FAIL: pinned release snap rejection was not explained" >&2
   cat "$err" >&2
   exit 1
 fi
@@ -366,12 +366,15 @@ assert_snap_user_refresh_flow() {
   calls="$(cat "$out")"
   expected="wait:user-docker
 root:snap refresh openshell --channel=latest/stable
-root:snap restart openshell.user-gateway
+root:systemctl --global disable snap.openshell.user-gateway.service
+target:systemctl --user daemon-reload
+target:systemctl --user enable --now snap.openshell.user-gateway.service
+target:systemctl --user restart snap.openshell.user-gateway.service
 wait:user-gateway-listener
 register:user-gateway
 wait:gateway-status"
   if [ "$calls" != "$expected" ]; then
-    echo "FAIL: existing user-mode Snap refresh used the wrong service" >&2
+    echo "FAIL: existing user-mode snap refresh used the wrong service" >&2
     printf 'Expected:\n%s\nActual:\n%s\n' "$expected" "$calls" >&2
     exit 1
   fi
@@ -382,6 +385,9 @@ assert_snap_install_flow \
   1 0 "" \
   "wait:user-docker
 root:snap install openshell --channel=latest/stable
+root:systemctl --global disable snap.openshell.user-gateway.service
+target:systemctl --user daemon-reload
+target:systemctl --user enable --now snap.openshell.user-gateway.service
 wait:user-gateway-listener
 register:user-gateway
 wait:gateway-status"
@@ -426,11 +432,11 @@ if (
   set_linux_target_runtime_dir() { :; }
   install_linux_snap
 ) >"$out" 2>"$err"; then
-  echo "FAIL: disabled Snap gateway mode should block installation" >&2
+  echo "FAIL: disabled snap gateway mode should block installation" >&2
   exit 1
 fi
 if ! grep -Fq "OpenShell snap gateway mode is disabled" "$err"; then
-  echo "FAIL: disabled Snap gateway mode missing recovery guidance" >&2
+  echo "FAIL: disabled snap gateway mode missing recovery guidance" >&2
   cat "$err" >&2 || true
   exit 1
 fi
@@ -468,7 +474,7 @@ assert_snap_install_rejected() {
     set_linux_target_runtime_dir() { :; }
     install_linux_snap
   ) >"$out" 2>"$err"; then
-    echo "FAIL: ${name}: Snap installation should have been rejected" >&2
+    echo "FAIL: ${name}: snap installation should have been rejected" >&2
     exit 1
   fi
   if ! grep -Fq "$expected" "$err"; then
@@ -604,7 +610,7 @@ if ! grep -Fq "Docker daemon at /var/run/docker.sock did not become reachable as
 fi
 
 if ! grep -Fq '/snap/bin/openshell' "${ROOT}/install.sh"; then
-  echo "FAIL: Snap installs must use the Snap CLI explicitly" >&2
+  echo "FAIL: snap installs must use the snap CLI explicitly" >&2
   exit 1
 fi
 
@@ -619,14 +625,14 @@ if ! (
   snap_gateway_uses_mtls() { return 0; }
   register_system_snap_gateway
 ) >"$out" 2>"$err"; then
-  echo "FAIL: Snap gateway registration should succeed" >&2
+  echo "FAIL: snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
 if [ "$registration_calls" != "copy:client-bundle
 target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]; then
-  echo "FAIL: mTLS Snap gateway registration must copy the client bundle and use HTTPS" >&2
+  echo "FAIL: mTLS snap gateway registration must copy the client bundle and use HTTPS" >&2
   printf '%s\n' "$registration_calls" >&2
   exit 1
 fi
@@ -639,18 +645,18 @@ if ! (
   snap_gateway_uses_mtls() { return 1; }
   register_system_snap_gateway
 ) >"$out" 2>"$err"; then
-  echo "FAIL: legacy plaintext Snap gateway registration should succeed" >&2
+  echo "FAIL: legacy plaintext snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 registration_calls="$(cat "$registration_calls_file")"
 if [ "$registration_calls" != "target:/snap/bin/openshell gateway add http://127.0.0.1:17670 --local --name openshell" ]; then
-  echo "FAIL: legacy Snap gateway registration must use HTTP without copying certificates" >&2
+  echo "FAIL: legacy snap gateway registration must use HTTP without copying certificates" >&2
   printf '%s\n' "$registration_calls" >&2
   exit 1
 fi
 if ! grep -Fq "without client authentication" "$err"; then
-  echo "FAIL: legacy Snap gateway registration must warn about unauthenticated access" >&2
+  echo "FAIL: legacy snap gateway registration must warn about unauthenticated access" >&2
   exit 1
 fi
 
@@ -698,16 +704,16 @@ chmod 644 "${snap_user_home}/snap/openshell/common/.local/state/openshell/tls/cl
 snap_user_tls="${snap_user_home}/snap/openshell/common/.local/state/openshell/tls"
 for file in ca.crt client/tls.crt client/tls.key; do
   if ! cmp -s "${snap_tls_src}/${file}" "${snap_user_tls}/${file}"; then
-    echo "FAIL: Snap client bundle copy missing ${file}" >&2
+    echo "FAIL: snap client bundle copy missing ${file}" >&2
     exit 1
   fi
   if [[ -z $(find "${snap_user_tls}/${file}" -perm 600) ]]; then
-    echo "FAIL: Snap client bundle ${file} must be mode 0600" >&2
+    echo "FAIL: snap client bundle ${file} must be mode 0600" >&2
     exit 1
   fi
 done
 if [[ -z $(find "$snap_user_tls" -maxdepth 0 -perm 700) ]]; then
-  echo "FAIL: Snap client bundle directory must be mode 0700" >&2
+  echo "FAIL: snap client bundle directory must be mode 0700" >&2
   exit 1
 fi
 
@@ -808,12 +814,12 @@ if ! (
   print_gateway_add_output() { :; }
   register_user_snap_gateway
 ) >"$out" 2>"$err"; then
-  echo "FAIL: user Snap gateway registration should succeed" >&2
+  echo "FAIL: user snap gateway registration should succeed" >&2
   cat "$err" >&2 || true
   exit 1
 fi
 if [[ $(cat "$registration_calls_file") != "target:/snap/bin/openshell gateway add https://127.0.0.1:17670 --local --name openshell" ]]; then
-  echo "FAIL: user Snap gateway registration must use its own local TLS bundle" >&2
+  echo "FAIL: user snap gateway registration must use its own local TLS bundle" >&2
   cat "$registration_calls_file" >&2
   exit 1
 fi
@@ -870,8 +876,15 @@ gh() {
         *"?name=openshell-v0.1.0-pre.9-linux-amd64-deb"*)
           [ "${MOCK_NO_PRERELEASE:-0}" = "1" ] || printf '123456\n'
           ;;
-        *"actions/runs/999"*) printf 'false\n' ;;
-        *"actions/runs/101"*) printf 'true\n' ;;
+        *"actions/runs/999"*)
+          printf '%s\n' '{"path":".github/workflows/branch.yml","status":"completed","conclusion":"success"}' | jq -r "$4"
+          ;;
+        *"actions/runs/101"*)
+          jq -n --arg path "${MOCK_PRERELEASE_WORKFLOW:-.github/workflows/release-prerelease.yml}" \
+            --arg status "${MOCK_PRERELEASE_STATUS:-completed}" \
+            --arg conclusion "${MOCK_PRERELEASE_CONCLUSION:-failure}" \
+            '{path: $path, status: $status, conclusion: $conclusion}' | jq -r "$4"
+          ;;
         *)
           ;;
       esac
@@ -909,13 +922,23 @@ if ! grep -Fq 'actions/artifacts?name=openshell-v1.0.0-pre.2-linux-amd64-deb' "$
 fi
 if ! grep -Fq 'actions/runs/999' "$mock_gh_log" ||
   ! grep -Fq 'actions/runs/101' "$mock_gh_log"; then
-  echo "FAIL: pre alias did not skip an unsuccessful run" >&2
+  echo "FAIL: pre alias did not skip an unrelated workflow" >&2
   cat "$mock_gh_log" >&2
   exit 1
 fi
-if ! grep -Fq '.conclusion == "success"' "$mock_gh_log"; then
-  echo "FAIL: pre alias did not require a successful workflow run" >&2
-  cat "$mock_gh_log" >&2
+for workflow_state in completed:failure in_progress:null completed:success; do
+  resolved_prerelease="$(MOCK_PRERELEASE_STATUS="${workflow_state%:*}" \
+    MOCK_PRERELEASE_CONCLUSION="${workflow_state#*:}" OPENSHELL_VERSION=pre resolve_release_tag)"
+  if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
+    echo "FAIL: published prerelease was hidden by qualification state ${workflow_state}" >&2
+    exit 1
+  fi
+done
+
+resolved_prerelease="$(MOCK_PRERELEASE_WORKFLOW=.github/workflows/release-tag.yml \
+  MOCK_PRERELEASE_CONCLUSION=success OPENSHELL_VERSION=pre resolve_release_tag)"
+if [ "$resolved_prerelease" != "v1.0.0-pre.2" ]; then
+  echo "FAIL: pre alias did not accept packages published by the legacy release workflow" >&2
   exit 1
 fi
 if grep -Fq -- '--paginate' "$mock_gh_log"; then

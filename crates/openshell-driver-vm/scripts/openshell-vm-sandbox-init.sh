@@ -203,34 +203,13 @@ prepare_guest_image_rootfs() {
 
 exec_supervisor_in_newroot() {
     local chroot_bin
-    local bootstrap="/.openshell-bootstrap"
-    local supervisor="${bootstrap}/opt/openshell/bin/openshell-sandbox"
-    local loader
-    local lib_path
+    local supervisor="/.openshell-bootstrap/opt/openshell/bin/openshell-sandbox"
 
     for chroot_bin in /usr/sbin/chroot /usr/bin/chroot /sbin/chroot /bin/chroot; do
         [ -x "$chroot_bin" ] || continue
 
         if [ -x "/newroot${supervisor}" ]; then
-            for loader in \
-                "${bootstrap}/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-                "${bootstrap}/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib64/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib/ld-linux-x86-64.so.2" \
-                "${bootstrap}/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-                "${bootstrap}/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
-                "${bootstrap}/lib/ld-linux-aarch64.so.1" \
-                "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
-                if [ -x "/newroot${loader}" ]; then
-                    lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
-                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" "$@"
-                fi
-            done
             exec "$chroot_bin" /newroot "$supervisor" "$@"
-        fi
-
-        if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
-            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox "$@"
         fi
     done
 
@@ -470,6 +449,40 @@ configure_hostname() {
     ts "hostname=${sandbox_hostname}"
 }
 
+# OCI images commonly ship an empty /etc/hosts and rely on the container
+# runtime to bind-mount a generated one. No runtime does that here, and /etc is
+# read-only once the supervisor applies policy, so init supplies the loopback
+# names when the file is missing or empty. A non-empty file is the image
+# author's and is kept as is. Without these entries `localhost` fails to
+# resolve: the guest resolver is the loopback relay, which has no record for it.
+configure_hosts() {
+    local hosts_file
+    hosts_file="$(root_path /etc/hosts)"
+
+    # An absolute symlink target resolves against init's own root, not the
+    # workload root, so following one could write outside the workload. Leave
+    # an image-authored link alone.
+    if [ -L "$hosts_file" ]; then
+        ts "WARN: ${hosts_file} is a symlink; leaving it unchanged"
+        return 0
+    fi
+    if [ -s "$hosts_file" ]; then
+        return 0
+    fi
+
+    # Missing loopback names degrade the workload but do not make the sandbox
+    # unsafe, so a write failure is reported and boot continues. The shell's
+    # own error stays visible on the console to explain the failure.
+    if ! printf '%s\n' \
+        '127.0.0.1 localhost' \
+        '::1 localhost ip6-localhost ip6-loopback' \
+        >"$hosts_file"; then
+        ts "WARN: could not write ${hosts_file}; localhost will not resolve"
+        return 0
+    fi
+    ts "populated empty /etc/hosts with loopback names"
+}
+
 run_openshell_init_dropins() {
     # Run executable drop-ins from /opt/openshell/init.d in deterministic
     # ASCII-sorted order. Drop-ins are *executed* in a child shell rather
@@ -544,6 +557,74 @@ run_openshell_init_dropins() {
     done < <(LC_ALL=C sort -u "$manifest")
 }
 
+# Create a virtiofs mount point under ROOT_PREFIX without following symlinks,
+# so an image cannot redirect a validated target onto another guest path.
+# Directories created under /sandbox are handed to the sandbox user.
+prepare_virtiofs_target() {
+    local target="$1" owner="$2"
+    local path="${ROOT_PREFIX:-}" component
+    local -a components
+    IFS=/ read -r -a components <<<"${target#/}"
+    for component in "${components[@]}"; do
+        [ -n "$component" ] || continue
+        path="${path}/${component}"
+        if [ -L "$path" ]; then
+            ts >&2 "FATAL: virtiofs mount target ${target} traverses symlink ${path#"${ROOT_PREFIX:-}"}"
+            exit 1
+        fi
+        if [ ! -e "$path" ]; then
+            if ! mkdir "$path"; then
+                ts >&2 "FATAL: failed to create virtiofs mount point ${target}"
+                exit 1
+            fi
+            case "${path#"${ROOT_PREFIX:-}"}" in
+                /sandbox/*)
+                    if ! chown "$owner" "$path"; then
+                        ts >&2 "FATAL: failed to hand virtiofs mount point parent ${path#"${ROOT_PREFIX:-}"} to ${owner}"
+                        exit 1
+                    fi
+                    ;;
+            esac
+        elif [ ! -d "$path" ]; then
+            ts >&2 "FATAL: virtiofs mount target ${target} is not a directory"
+            exit 1
+        fi
+    done
+    printf '%s\n' "$path"
+}
+
+# Runs after every /sandbox ownership fixup and the root-run init drop-ins so
+# nothing in init walks into host-backed shares.
+mount_virtiofs_shares() {
+    local manifest
+    manifest="$(root_path /.openshell/mounts.manifest)"
+    # The driver always writes the manifest; it is empty without mounts.
+    [ -s "$manifest" ] || return 0
+
+    ts "mounting virtiofs shares"
+    local tag target mode mount_opts guest_target owner
+    owner="$(sandbox_owner)"
+    while IFS=$'\t' read -r tag target mode; do
+        [ -n "$tag" ] || continue
+        case "$mode" in
+            ro)  mount_opts="-o ro" ;;
+            rw)  mount_opts="" ;;
+            *)
+                ts "FATAL: unknown virtiofs mount mode '${mode}' for tag ${tag}"
+                exit 1
+                ;;
+        esac
+        guest_target="$(prepare_virtiofs_target "$target" "$owner")" || exit 1
+        # shellcheck disable=SC2086
+        if mount -t virtiofs $mount_opts "$tag" "$guest_target"; then
+            ts "  mounted virtiofs ${tag} -> ${target} (${mode})"
+        else
+            ts "FATAL: failed to mount virtiofs ${tag} at ${target}"
+            exit 1
+        fi
+    done < "$manifest"
+}
+
 run_post_overlay_setup() {
     # Source QEMU-injected environment variables if present. The file lives in
     # the overlay upperdir so the cached bootstrap rootfs remains immutable.
@@ -573,6 +654,7 @@ run_post_overlay_setup() {
     setup_sandbox_workdir
 
     configure_hostname
+    configure_hosts
     if ! /opt/openshell/bin/openshell-vm-init prepare-network; then
         ts "FATAL: failed to bring up the loopback interface"
         exit 1
@@ -616,6 +698,8 @@ if [ -d /sandbox ]; then
 fi
 
 run_openshell_init_dropins
+
+mount_virtiofs_shares
 
 if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
     ts "OPENSHELL_SANDBOX_ID=${OPENSHELL_SANDBOX_ID}"

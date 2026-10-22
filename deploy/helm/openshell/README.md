@@ -203,6 +203,36 @@ server:
   dbUrl: "sqlite:/var/openshell/openshell.db"
 ```
 
+#### Data PVC storage
+
+Size the gateway data claim, `openshell-data`, and select its StorageClass with
+`server.dataStorageSize` and `server.dataStorageClass`. Omitting both
+requests `1Gi` from the cluster's default StorageClass. Set
+`server.dataStorageClass` on clusters with no default StorageClass,
+otherwise the gateway PVC stays Pending. Both values are ignored under
+`workload.kind=deployment`, which mounts no PVC.
+
+```yaml
+server:
+  dataStorageSize: 20Gi
+  dataStorageClass: fast-ssd
+```
+
+`volumeClaimTemplates` is immutable, so set both at install time. To grow an
+existing claim, expand it in place when its StorageClass allows expansion, then
+recreate the StatefulSet so its template matches:
+
+```shell
+kubectl -n openshell patch pvc openshell-data-openshell-0 \
+  -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+kubectl -n openshell delete statefulset openshell --cascade=orphan
+helm upgrade openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <installed-version> \
+  --reuse-values -n openshell --set server.dataStorageSize=20Gi
+```
+
+A recreated StatefulSet re-adopts existing claims unchanged, so changing
+StorageClass means copying the data to a new claim.
+
 #### External PostgreSQL
 
 Use external PostgreSQL when the gateway should connect to a database managed
@@ -372,7 +402,7 @@ discovery endpoint or its TLS CA.
 | agentSandbox.preflight.enabled | bool | `true` | Check the live cluster for a supported Agent Sandbox API before rendering gateway resources. Disable only for offline rendering and linting. |
 | autoscaling.behavior | object | `{"scaleDown":{"policies":[{"periodSeconds":120,"type":"Pods","value":1}],"stabilizationWindowSeconds":300}}` | HPA scaling behavior. Scale-down hands the removed pod's supervisor sessions to the remaining replicas, so the default removes at most one replica every two minutes after a five-minute stabilization window. Helm merges maps: set autoscaling.behavior.scaleDown to null to drop the default. |
 | autoscaling.enabled | bool | `false` | Render a HorizontalPodAutoscaler and stop rendering spec.replicas. |
-| autoscaling.maxReplicas | int | `4` | Maximum gateway replicas. Each replica opens its own PostgreSQL connection pool; size the database for rollouts at this count, as the High Availability guide describes. |
+| autoscaling.maxReplicas | int | `4` | Maximum gateway replicas. Each replica opens up to database_max_connections + database_lock_max_connections PostgreSQL connections (14 with the defaults; set them under gatewayConfig.openshell.gateway); size the database for rollouts at this count, as the High Availability guide describes. With a Deployment and the default pool sizes, the default of 4 needs `max_connections` of at least 126, more than the PostgreSQL default of 100. |
 | autoscaling.metrics | list | `[]` | Additional autoscaling/v2 MetricSpec entries appended verbatim, such as Pods metrics served by prometheus-adapter. |
 | autoscaling.minReplicas | int | `2` | Minimum gateway replicas. Use 2 or more to survive a pod failure. |
 | autoscaling.targetCPUUtilizationPercentage | int | `80` | Target average CPU utilization, as a percentage of resources.requests.cpu. Set to null to disable. Requires resources.requests.cpu, or resources.limits.cpu, which Kubernetes copies into the request. |
@@ -420,6 +450,10 @@ discovery endpoint or its TLS CA.
 | openshiftRoute.host | string | `""` | Hostname for the Route. Must match a SAN on the gateway's server cert. |
 | pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.failOnTimeout | bool | `true` | Fail the helm install/upgrade if cert-manager does not issue the certificate within the polling timeout. When true (default), the install fails immediately if the timeout is reached, providing clear feedback that BackendTLSPolicy is non-functional. When false, the hook succeeds with a warning and you can run `helm upgrade` after cert-manager issues the certificate to create the backend CA ConfigMap. If you set this to false and see "TLS error: Secret is not supplied by SDS" when connecting to the gateway, check if the TLS secret exists and run `helm upgrade` to create the ConfigMap. |
+| pkiInitJob.securityContext.allowPrivilegeEscalation | bool | `false` | Whether the certgen hook container can gain additional privileges. |
+| pkiInitJob.securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the certgen hook container. |
+| pkiInitJob.securityContext.runAsNonRoot | bool | `true` | Require the certgen hook container to run as a non-root user. |
+| pkiInitJob.securityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the certgen hook container. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
 | pkiInitJob.timeoutSeconds | int | `120` | Maximum time in seconds for the certgen hook to poll for cert-manager certificates. When using cert-manager with BackendTLSPolicy, the hook polls for this many seconds waiting for the certificate to be issued, then creates the backend CA ConfigMap. The Job deadline is set to (timeoutSeconds + 30) to allow time for ConfigMap creation and cleanup. Increase this if cert-manager takes longer than 120 seconds to issue certificates. |
@@ -460,6 +494,7 @@ discovery endpoint or its TLS CA.
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
+| securityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
 | server.credentialDrivers.kubernetesSecrets.createNamespace | bool | `false` | Create the credential namespace. Requires a namespace other than the release namespace. The Namespace is retained on uninstall so stored credentials survive; an existing Namespace not owned by this release is left untouched. |
 | server.credentialDrivers.kubernetesSecrets.enabled | bool | `false` | Enable the in-tree Kubernetes Secret credential driver. WARNING: The RBAC Role grants read/write access to ALL Secrets in the configured namespace. Use a dedicated namespace to limit blast radius. |
@@ -477,6 +512,8 @@ discovery endpoint or its TLS CA.
 | server.credentialDrivers.vault.timeoutSecs | string | `""` | HTTP request timeout in seconds. Empty = driver default. |
 | server.credentialDrivers.vault.tokenPath | string | `""` | Mounted token file path when authMethod is token_file. |
 | server.credentialStorage.existingSecret | string | `""` | Name of a pre-existing Secret containing the key-encryption key. When set, the chart does NOT generate a new Secret; it references this one instead. The Secret must contain a key named "key-encryption-key" with a base64-encoded 32-byte value. Required for GitOps workflows that render manifests with `helm template` (where `lookup` is unavailable). |
+| server.dataStorageClass | string | `""` | Kubernetes StorageClass for the gateway data PVC (StatefulSet workload only). Empty (default) = omit storageClassName, using the cluster's default StorageClass. Set this on clusters with no default StorageClass, otherwise the gateway PVC stays Pending. Use a block-backed class, not NFS or other network filesystems. Immutable after install. |
+| server.dataStorageSize | string | `""` | Storage request for the gateway data PVC, `openshell-data` (StatefulSet workload only). Uses Kubernetes quantity syntax and requires an explicit unit ("20Gi", not "20"). Empty = built-in default (1Gi). Growing an existing release's claim is PVC expansion, not a values change. |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). SQLite runs in WAL mode and needs a local block-backed volume, not NFS or other network filesystems. |
 | server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
@@ -548,6 +585,11 @@ discovery endpoint or its TLS CA.
 | supervisor.image.registry | string | `""` | Supervisor image registry. Empty uses global.image.registry. |
 | supervisor.image.repository | string | `"openshell/supervisor"` | Supervisor image repository. |
 | supervisor.image.tag | string | `""` | Supervisor image tag. Defaults to the chart appVersion when empty. |
+| supervisor.podSecurityContext.fsGroup | int | `65534` | fsGroup assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.runAsGroup | int | `65534` | Primary GID assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
+| supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
+| supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

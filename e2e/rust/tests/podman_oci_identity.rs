@@ -3,20 +3,19 @@
 
 #![cfg(feature = "e2e-podman")]
 
-//! Podman-specific E2E coverage for OCI identity inspection and immutable-image
-//! launch.
+//! Podman-specific E2E coverage for the supervisor companion container.
 //!
-//! The test builds an image through the selected Podman engine, creates a
-//! sandbox from its mutable tag, and verifies both the child identity and the
-//! image ID recorded on the real sandbox container. This exercises the Podman
-//! API inspect → protected metadata → create path rather than only its unit
-//! serialization boundaries. Workspace behavior shared with Docker is covered
-//! by the `oci-image` feature suite in `tests/suites/features`.
+//! Podman runs the supervisor as the resolved OCI workload identity with no
+//! effective capabilities; Docker runs it as a fixed unprivileged user. The
+//! test builds an image through the selected Podman engine, creates a sandbox
+//! from it, and inspects the real supervisor container. The workload's image
+//! ID, identity, network, and mounts, and what the main process and
+//! `sandbox exec` see, are shared with Docker and covered by the `oci-image`
+//! feature suite in `tests/suites/features`.
 
 use std::process::Stdio;
 
 use openshell_e2e::harness::container::{ContainerEngine, is_e2e_driver};
-use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
 const BASE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
@@ -38,7 +37,6 @@ network_policies: {}
 struct ImageGuard {
     engine: ContainerEngine,
     tag: String,
-    id: String,
 }
 
 impl ImageGuard {
@@ -89,7 +87,6 @@ USER {OCI_UID}:{OCI_GID}
                     .ok_or_else(|| "build context path is not UTF-8".to_string())?,
             ],
         )?;
-        let id = run_engine(&engine, &["image", "inspect", "--format", "{{.Id}}", &tag])?;
         let user = run_engine(
             &engine,
             &["image", "inspect", "--format", "{{.Config.User}}", &tag],
@@ -100,7 +97,7 @@ USER {OCI_UID}:{OCI_GID}
             ));
         }
 
-        Ok(Self { engine, tag, id })
+        Ok(Self { engine, tag })
     }
 }
 
@@ -135,10 +132,6 @@ fn run_engine(engine: &ContainerEngine, args: &[&str]) -> Result<String, String>
         ));
     }
     Ok(stdout.trim().to_string())
-}
-
-fn sandbox_container_id(engine: &ContainerEngine, sandbox_name: &str) -> Result<String, String> {
-    container_id_for_role(engine, sandbox_name, "sandbox")
 }
 
 fn container_id_for_role(
@@ -177,15 +170,8 @@ fn container_id_for_role(
     }
 }
 
-fn normalized_image_id(image_id: &str) -> &str {
-    image_id
-        .trim()
-        .strip_prefix("sha256:")
-        .unwrap_or(image_id.trim())
-}
-
 #[tokio::test]
-async fn podman_uses_oci_identity_and_inspected_image_id() {
+async fn podman_supervisor_runs_as_oci_identity_without_capabilities() {
     if !is_e2e_driver("podman") {
         eprintln!("Skipping Podman OCI identity test: e2e driver is not podman");
         return;
@@ -199,96 +185,15 @@ async fn podman_uses_oci_identity_and_inspected_image_id() {
     std::fs::write(policy.path(), OCI_FALLBACK_POLICY).expect("write OCI fallback policy");
     let policy_path = policy.path().to_str().expect("policy path is UTF-8");
     let mut sandbox = SandboxGuard::create_keep_with_args(
-        &[
-            "--from",
-            &image.tag,
-            "--policy",
-            policy_path,
-            "--no-tty",
-        ],
-        &[
-            "sh",
-            "-c",
-            "set -eu; printf 'direct-identity=%s:%s\n' \"$(id -u)\" \"$(id -g)\"; echo podman-oci-identity-ready; sleep infinity",
-        ],
+        &["--from", &image.tag, "--policy", policy_path, "--no-tty"],
+        &["sh", "-c", "echo podman-oci-identity-ready; sleep infinity"],
         READY_MARKER,
     )
     .await
     .expect("create sandbox from Podman-built OCI identity image");
 
-    let direct_output = strip_ansi(&sandbox.create_output);
-    assert!(
-        direct_output.contains("direct-identity=2345:2346"),
-        "expected direct child identity {OCI_UID}:{OCI_GID}:\n{direct_output}"
-    );
-
-    let ssh_output = sandbox
-        .exec(&[
-            "sh",
-            "-c",
-            "test \"$(id -u):$(id -g)\" = 2345:2346; echo podman-ssh-identity-ok",
-        ])
-        .await
-        .expect("SSH child should use Podman OCI identity");
-    assert!(
-        ssh_output.contains("podman-ssh-identity-ok"),
-        "expected SSH identity marker:\n{ssh_output}"
-    );
-
-    let container_id =
-        sandbox_container_id(&image.engine, &sandbox.name).expect("find Podman sandbox container");
-    let launched_image_id = run_engine(
-        &image.engine,
-        &[
-            "container",
-            "inspect",
-            "--format",
-            "{{.Image}}",
-            &container_id,
-        ],
-    )
-    .expect("inspect Podman sandbox container image");
-    assert_eq!(
-        normalized_image_id(&launched_image_id),
-        normalized_image_id(&image.id),
-        "Podman sandbox must launch the immutable image ID inspected before creation"
-    );
-
-    let workspace_output = sandbox
-        .exec(&[
-            "sh",
-            "-c",
-            "set -eu; test \"$(pwd -P)\" = /home/app/project; test ! -e /sandbox; stat -c 'workspace-owner=%u:%g' .; touch probe; rm probe; echo podman-workspace-write-ok",
-        ])
-        .await
-        .expect("OCI workload should be able to write to its image workspace");
-    assert!(
-        workspace_output.contains(&format!("workspace-owner={OCI_UID}:{OCI_GID}")),
-        "expected workspace owner {OCI_UID}:{OCI_GID}:\n{workspace_output}"
-    );
-    assert!(
-        workspace_output.contains("podman-workspace-write-ok"),
-        "expected workspace write marker:\n{workspace_output}"
-    );
-
-    assert_isolated_pair(&image, &sandbox, &container_id).await;
-    sandbox.cleanup().await;
-}
-
-async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, container_id: &str) {
     let supervisor_id = container_id_for_role(&image.engine, &sandbox.name, "supervisor")
         .expect("find separate supervisor companion");
-    assert_ne!(supervisor_id, container_id);
-    let workload_user = run_engine(
-        &image.engine,
-        &["inspect", "--format", "{{.Config.User}}", container_id],
-    )
-    .unwrap();
-    assert_eq!(
-        workload_user,
-        format!("{OCI_UID}:{OCI_GID}"),
-        "a custom OCI workspace must start directly as the final identity"
-    );
     let supervisor_user = run_engine(
         &image.engine,
         &["inspect", "--format", "{{.Config.User}}", &supervisor_id],
@@ -304,31 +209,5 @@ async fn assert_isolated_pair(image: &ImageGuard, sandbox: &SandboxGuard, contai
         supervisor_caps, "[]",
         "the supervisor companion may not have effective capabilities"
     );
-    let network = run_engine(
-        &image.engine,
-        &[
-            "inspect",
-            "--format",
-            "{{.HostConfig.NetworkMode}}",
-            container_id,
-        ],
-    )
-    .unwrap();
-    assert_eq!(network, "none");
-    let mounts = run_engine(
-        &image.engine,
-        &[
-            "inspect",
-            "--format",
-            "{{range .Mounts}}{{println .Destination}}{{end}}",
-            container_id,
-        ],
-    )
-    .unwrap();
-    assert!(!mounts.contains("/etc/openshell/tls"));
-    assert!(!mounts.contains("/.openshell/supervisor"));
-    assert!(!mounts.lines().any(|path| path == "/home/app/project"));
-    assert!(!mounts.lines().any(|path| path == "/sandbox"));
-    let posture = sandbox.exec(&["sh", "-c", "set -eu; awk '/^CapEff:|^CapBnd:|^NoNewPrivs:/ {print}' /proc/self/status; test ! -r /.openshell/channel/sandbox/server.key; test ! -r /.openshell/supervisor/runtime-descriptor.json"]).await.expect("workload cannot read either control credential set");
-    assert!(posture.contains("0000000000000000"));
+    sandbox.cleanup().await;
 }

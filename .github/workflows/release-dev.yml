@@ -127,6 +127,7 @@ jobs:
         [
           {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"conformance"},
           {"environment":"ubuntu-k3s","installer":"k3s","testsuite":"conformance"},
+          {"environment":"ubuntu-k3s","installer":"k3s-ha","testsuite":"conformance"},
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"conformance"},
           {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"conformance"}
         ]
@@ -145,7 +146,10 @@ jobs:
       test-matrix: >-
         [
           {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"provider-refresh"},
-          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"}
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"provider-refresh"},
+          {"environment":"ubuntu-docker-rootful","installer":"deb","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootful","installer":"rpm","testsuite":"oci-image"},
+          {"environment":"fedora-podman-rootless","installer":"rpm","testsuite":"oci-image"}
         ]
 
   docker-e2e:
@@ -159,7 +163,6 @@ jobs:
       image-tag: ${{ github.sha }}
       checkout-ref: ${{ github.sha }}
       runner: linux-arm64-cpu8
-      conformance-artifact-prefix: openshell-conformance
 
   vm-e2e:
     needs: [build-binaries, build-vm-driver]
@@ -170,7 +173,6 @@ jobs:
     uses: ./.github/workflows/e2e-vm-test.yml
     with:
       checkout-ref: ${{ github.sha }}
-      conformance-artifact-prefix: openshell-conformance
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
@@ -244,7 +246,7 @@ jobs:
       checkout-ref: ${{ github.sha }}
 
   build-snap:
-    name: Build Snap
+    name: Build snap
     needs: [compute-versions, build-binaries]
     uses: ./.github/workflows/snap-package.yml
     with:
@@ -261,7 +263,7 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   publish-snap:
-    name: Publish Snap
+    name: Publish snap
     needs: build-snap
     uses: ./.github/workflows/snap-publish.yml
     with:
@@ -450,7 +452,7 @@ jobs:
           cat release/openshell.rb
 
       - name: Attest VM driver artifacts
-        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: |
             release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz

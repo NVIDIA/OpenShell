@@ -17,7 +17,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 
 | Change | Skills to inspect |
 |---|---|
-| Issues, triage, labels, or feature proposals | `create-github-issue`, `triage-issue`, `create-spike`, `build-from-issue` |
+| Issues, triage, labels, or feature proposals | `create-github-issue`, `triage-issue`, `review-triage-queue`, `apply-triage-action`, `create-spike`, `build-from-issue` |
 | PR template, vouch behavior, or review conventions | `create-github-pr`, `review-github-pr`, `build-from-issue` |
 | Security assessment or remediation | `review-security-issue`, `fix-security-issue` |
 | Published docs workflow | `update-docs-from-commits` |
@@ -27,6 +27,7 @@ Run after adding, removing, or renaming a skill or crate; changing issue or PR c
 | Inference providers or native model endpoints | `debug-inference`, `openshell-cli` |
 | TUI behavior | `tui-development` |
 | Release artifacts or smoke coverage | `test-release-canary` |
+| Release cadence, tagging, or qualification workflows | `release-captain` |
 | CI diagnostics | `watch-github-actions` |
 | Gator supervision | `launch-openshell-gator` |
 | SBOM workflow | `sbom` |

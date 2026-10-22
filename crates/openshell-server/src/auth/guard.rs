@@ -8,10 +8,10 @@
 //! `sandbox_id`. User principals retain the broad scope the RBAC layer
 //! already evaluated.
 
+use super::audit::{AuthzDenial, deny};
 use super::principal::Principal;
 use super::principal::SandboxPrincipal;
 use tonic::Status;
-use tracing::info;
 
 /// Reject a sandbox-class request whose body references a sandbox other
 /// than the one the calling principal was authenticated against.
@@ -30,19 +30,20 @@ use tracing::info;
 pub fn ensure_sandbox_scope(principal: &Principal, claimed_sandbox_id: &str) -> Result<(), Status> {
     match principal {
         Principal::User(_) | Principal::Operator(_) => Ok(()),
-        Principal::Peer(_) => Err(Status::permission_denied(
+        Principal::Peer(_) => Err(deny(
+            principal,
+            AuthzDenial::MethodNotPermitted,
             "gateway peer principals may not call sandbox-scoped methods",
         )),
         Principal::Sandbox(p) => {
             if p.sandbox_id == claimed_sandbox_id {
                 Ok(())
             } else {
-                info!(
-                    principal_sandbox_id = %p.sandbox_id,
-                    requested_sandbox_id = %claimed_sandbox_id,
-                    "cross-sandbox access denied"
-                );
-                Err(Status::permission_denied(
+                Err(deny(
+                    principal,
+                    AuthzDenial::CrossSandbox {
+                        sandbox_id: claimed_sandbox_id,
+                    },
                     "cross-sandbox access denied: principal does not own this sandbox",
                 ))
             }
@@ -87,9 +88,11 @@ pub fn ensure_sandbox_principal_scope(
             ensure_sandbox_scope(principal, claimed_sandbox_id)?;
             Ok(p.clone())
         }
-        Principal::User(_) | Principal::Operator(_) | Principal::Peer(_) => Err(
-            Status::permission_denied("supervisor RPCs require a sandbox principal"),
-        ),
+        Principal::User(_) | Principal::Operator(_) | Principal::Peer(_) => Err(deny(
+            principal,
+            AuthzDenial::MethodNotPermitted,
+            "supervisor RPCs require a sandbox principal",
+        )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "supervisor RPCs require an authenticated sandbox principal",
         )),
@@ -116,37 +119,19 @@ pub fn require_operator<T>(
         None | Some(Principal::Anonymous) => {
             Err(Status::unauthenticated("operator authentication required"))
         }
-        _ => Err(Status::permission_denied("verified mTLS operator required")),
+        Some(principal) => Err(deny(
+            principal,
+            AuthzDenial::OperatorRequired,
+            "verified mTLS operator required",
+        )),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
 
-    fn user(subject: &str) -> Principal {
-        Principal::User(UserPrincipal {
-            identity: Identity {
-                subject: subject.to_string(),
-                display_name: None,
-                roles: vec![],
-                scopes: vec![],
-                provider: IdentityProvider::Oidc,
-            },
-        })
-    }
-
-    fn sandbox(id: &str) -> Principal {
-        Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: id.to_string(),
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: "openshell-gateway:test".to_string(),
-            },
-            trust_domain: Some("openshell".to_string()),
-        })
-    }
+    use crate::auth::principal::test_support::{sandbox, user};
 
     #[test]
     fn user_principal_bypasses_equality_check() {

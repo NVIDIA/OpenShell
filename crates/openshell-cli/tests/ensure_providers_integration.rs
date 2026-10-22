@@ -7,7 +7,8 @@
 
 mod helpers;
 
-use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
+use helpers::TempDir;
+use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
@@ -30,7 +31,6 @@ use openshell_core::proto::{
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
@@ -42,6 +42,7 @@ use tonic::{Response, Status};
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
+    list_requests: Arc<Mutex<Vec<ListProvidersRequest>>>,
 }
 
 #[derive(Clone, Default)]
@@ -79,6 +80,13 @@ impl TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
@@ -364,8 +372,13 @@ impl OpenShell for TestOpenShell {
 
     async fn list_providers(
         &self,
-        _request: tonic::Request<ListProvidersRequest>,
+        request: tonic::Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
+        self.state
+            .list_requests
+            .lock()
+            .await
+            .push(request.into_inner());
         let providers = self
             .state
             .providers
@@ -846,7 +859,7 @@ async fn run_server() -> TestServer {
             .unwrap();
     });
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = helpers::tempdir().unwrap();
     let ca_path = dir.path().join("ca.crt");
     let cert_path = dir.path().join("tls.crt");
     let key_path = dir.path().join("tls.key");
@@ -866,6 +879,108 @@ async fn run_server() -> TestServer {
 }
 
 // ── tests ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn provider_create_forwards_labels_for_explicit_and_discovered_credentials() {
+    let ts = run_server().await;
+    Environment::from_pairs(&[("NVIDIA_API_KEY", "nvapi-test-key")])
+        .run_async(async {
+            let labels = vec!["env=dev".to_string(), "team=ml".to_string()];
+            let credentials = vec!["NVIDIA_API_KEY=test-explicit".to_string()];
+            for (name, source, credentials) in [
+                (
+                    "explicit",
+                    run::ProviderCreateCredentialSource::ExplicitCredentials,
+                    credentials.as_slice(),
+                ),
+                (
+                    "discovered",
+                    run::ProviderCreateCredentialSource::Existing,
+                    &[],
+                ),
+            ] {
+                run::provider_create_with_options(run::ProviderCreateOptions {
+                    server: &ts.endpoint,
+                    name,
+                    provider_type: "nvidia",
+                    labels: &labels,
+                    credentials,
+                    credential_source: source,
+                    config: &[],
+                    workspace: "default",
+                    profile_workspace: "",
+                    tls: &ts.tls,
+                })
+                .await
+                .unwrap();
+                let providers = ts.openshell.state.providers.lock().await;
+                let provider = &providers[name];
+                assert_eq!(
+                    provider.metadata.as_ref().unwrap().labels,
+                    HashMap::from([("env".into(), "dev".into()), ("team".into(), "ml".into())])
+                );
+                assert!(provider.credentials.contains_key("NVIDIA_API_KEY"));
+            }
+
+            for label in ["no-equals-sign", "=no-key"] {
+                let err = run::provider_create_with_options(run::ProviderCreateOptions {
+                    server: &ts.endpoint,
+                    name: "invalid",
+                    provider_type: "nvidia",
+                    labels: &[label.into()],
+                    credentials: &credentials,
+                    credential_source: run::ProviderCreateCredentialSource::ExplicitCredentials,
+                    config: &[],
+                    workspace: "default",
+                    profile_workspace: "",
+                    tls: &ts.tls,
+                })
+                .await
+                .unwrap_err();
+                assert!(err.to_string().contains("--label"));
+            }
+            assert!(
+                !ts.openshell
+                    .state
+                    .providers
+                    .lock()
+                    .await
+                    .contains_key("invalid")
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn provider_list_forwards_selector_pagination_and_workspace_scope() {
+    let ts = run_server().await;
+    for all_workspaces in [false, true] {
+        run::provider_list(
+            &ts.endpoint,
+            3,
+            "cursor",
+            "env=dev,team=ml",
+            false,
+            "json",
+            "team-ml",
+            all_workspaces,
+            &ts.tls,
+        )
+        .await
+        .unwrap();
+        let requests = ts.openshell.state.list_requests.lock().await;
+        let request = requests.last().unwrap();
+        assert_eq!(request.page_size, 3);
+        assert_eq!(request.page_token, "cursor");
+        assert_eq!(request.label_selector, "env=dev,team=ml");
+        let expected = if all_workspaces {
+            openshell_core::proto::all_workspaces_selector()
+        } else {
+            openshell_core::proto::workspace_selector("team-ml")
+        };
+        assert_eq!(request.workspace_scope.as_ref(), Some(&expected));
+    }
+}
 
 /// When `--provider nvidia` is passed and a provider named "nvidia" already
 /// exists, `ensure_required_providers` should return it directly without
@@ -901,33 +1016,36 @@ async fn explicit_provider_name_passes_through_when_it_exists() {
 #[tokio::test]
 async fn explicit_provider_name_auto_creates_when_valid_type() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-test-key")]);
 
-    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
-        .await
-        .expect("grpc client");
+    Environment::from_pairs(&[("NVIDIA_API_KEY", "nvapi-test-key")])
+        .run_async(async {
+            let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+                .await
+                .expect("grpc client");
 
-    let result = run::ensure_required_providers(
-        &mut client,
-        &["nvidia".to_string()],
-        Some(true), // --auto-providers to skip interactive prompt
-        "default",
-    )
-    .await
-    .expect("should auto-create the provider");
+            let result = run::ensure_required_providers(
+                &mut client,
+                &["nvidia".to_string()],
+                Some(true), // --auto-providers to skip interactive prompt
+                "default",
+            )
+            .await
+            .expect("should auto-create the provider");
 
-    assert_eq!(result, vec!["nvidia".to_string()]);
+            assert_eq!(result, vec!["nvidia".to_string()]);
 
-    // Verify the provider was created on the server with the right type.
-    let providers = ts.openshell.state.providers.lock().await;
-    let provider = providers
-        .get("nvidia")
-        .expect("nvidia provider should exist");
-    assert_eq!(provider.r#type, "nvidia");
-    assert_eq!(
-        provider.credentials.get("NVIDIA_API_KEY"),
-        Some(&"nvapi-test-key".to_string()),
-    );
+            // Verify the provider was created on the server with the right type.
+            let providers = ts.openshell.state.providers.lock().await;
+            let provider = providers
+                .get("nvidia")
+                .expect("nvidia provider should exist");
+            assert_eq!(provider.r#type, "nvidia");
+            assert_eq!(
+                provider.credentials.get("NVIDIA_API_KEY"),
+                Some(&"nvapi-test-key".to_string()),
+            );
+        })
+        .await;
 }
 
 /// When `--provider my-custom-thing` is passed and "my-custom-thing" is not a
@@ -965,94 +1083,103 @@ async fn explicit_provider_name_errors_for_unrecognised_name() {
 #[tokio::test]
 async fn no_auto_providers_skips_missing_explicit_provider() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-skip-test")]);
 
-    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
-        .await
-        .expect("grpc client");
+    Environment::from_pairs(&[("NVIDIA_API_KEY", "nvapi-skip-test")])
+        .run_async(async {
+            let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+                .await
+                .expect("grpc client");
 
-    let result = run::ensure_required_providers(
-        &mut client,
-        &["nvidia".to_string()],
-        Some(false), // --no-auto-providers
-        "default",
-    )
-    .await
-    .expect("should succeed with empty list");
+            let result = run::ensure_required_providers(
+                &mut client,
+                &["nvidia".to_string()],
+                Some(false), // --no-auto-providers
+                "default",
+            )
+            .await
+            .expect("should succeed with empty list");
 
-    assert!(
-        result.is_empty(),
-        "skipped providers should not appear in the result"
-    );
+            assert!(
+                result.is_empty(),
+                "skipped providers should not appear in the result"
+            );
 
-    let providers = ts.openshell.state.providers.lock().await;
-    assert!(
-        providers.is_empty(),
-        "no providers should be created when --no-auto-providers is set"
-    );
+            let providers = ts.openshell.state.providers.lock().await;
+            assert!(
+                providers.is_empty(),
+                "no providers should be created when --no-auto-providers is set"
+            );
+        })
+        .await;
 }
 
 /// Several explicit providers are all resolved and created.
 #[tokio::test]
 async fn multiple_explicit_providers_combined() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[
+
+    Environment::from_pairs(&[
         ("NVIDIA_API_KEY", "nvapi-combo"),
         ("ANTHROPIC_API_KEY", "sk-ant-combo"),
-    ]);
+    ])
+    .run_async(async {
+        let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+            .await
+            .expect("grpc client");
 
-    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        let result = run::ensure_required_providers(
+            &mut client,
+            &["nvidia".to_string(), "claude-code".to_string()],
+            Some(true),
+            "default",
+        )
         .await
-        .expect("grpc client");
+        .expect("should create both providers");
 
-    let result = run::ensure_required_providers(
-        &mut client,
-        &["nvidia".to_string(), "claude-code".to_string()],
-        Some(true),
-        "default",
-    )
-    .await
-    .expect("should create both providers");
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"nvidia".to_string()));
+        assert!(result.contains(&"claude-code".to_string()));
 
-    assert_eq!(result.len(), 2);
-    assert!(result.contains(&"nvidia".to_string()));
-    assert!(result.contains(&"claude-code".to_string()));
-
-    let providers = ts.openshell.state.providers.lock().await;
-    assert_eq!(providers.len(), 2);
-    assert!(providers.contains_key("nvidia"));
-    assert!(providers.contains_key("claude-code"));
+        let providers = ts.openshell.state.providers.lock().await;
+        assert_eq!(providers.len(), 2);
+        assert!(providers.contains_key("nvidia"));
+        assert!(providers.contains_key("claude-code"));
+    })
+    .await;
 }
 
 /// A provider named twice appears only once in the result.
 #[tokio::test]
 async fn repeated_explicit_provider_deduplicates() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-dedup")]);
 
-    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
-        .await
-        .expect("grpc client");
+    Environment::from_pairs(&[("NVIDIA_API_KEY", "nvapi-dedup")])
+        .run_async(async {
+            let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+                .await
+                .expect("grpc client");
 
-    let result = run::ensure_required_providers(
-        &mut client,
-        &["nvidia".to_string(), "nvidia".to_string()],
-        Some(true),
-        "default",
-    )
-    .await
-    .expect("should succeed");
+            let result = run::ensure_required_providers(
+                &mut client,
+                &["nvidia".to_string(), "nvidia".to_string()],
+                Some(true),
+                "default",
+            )
+            .await
+            .expect("should succeed");
 
-    assert_eq!(
-        result,
-        vec!["nvidia".to_string()],
-        "nvidia should appear exactly once"
-    );
+            assert_eq!(
+                result,
+                vec!["nvidia".to_string()],
+                "nvidia should appear exactly once"
+            );
 
-    let providers = ts.openshell.state.providers.lock().await;
-    assert_eq!(
-        providers.len(),
-        1,
-        "only one provider should be created on the server"
-    );
+            let providers = ts.openshell.state.providers.lock().await;
+            assert_eq!(
+                providers.len(),
+                1,
+                "only one provider should be created on the server"
+            );
+        })
+        .await;
 }

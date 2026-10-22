@@ -78,7 +78,7 @@ The root [`flake.nix`](../../flake.nix) exposes this directory as the `test-gues
 | Fedora 44 | No | Yes | Yes | Yes | `.rpm` |
 | Rocky Linux 9 | Yes | Yes | No | Yes | `.rpm` |
 
-The `snapd` configuration is available for Ubuntu and prepares snapd for Snap
+The `snapd` configuration is available for Ubuntu and prepares snapd for snap
 Store installation experiments. Combine it with `docker` to reproduce the
 system-Docker canary, or use it alone to verify that `install.sh` fails safely
 when Docker is absent.
@@ -175,19 +175,18 @@ prepared guest image to a particular build or driver configuration.
 Compose it with `gateway-podman` after either Podman configuration. The role
 uses the recorded mode to select the corresponding service account. It
 generates configuration only for development artifacts; RPM installations
-retain their packaged service and first-start configuration. For example, run
-conformance after the rootless provisioners complete:
+retain their packaged service and first-start configuration. For example,
+check the development gateway after the rootless provisioners complete:
 
 ```shell
 nix run .#test-guest -- \
   --distro fedora --with podman-rootless --with selinux \
   --copy ./openshell:/usr/local/bin/openshell \
-  --copy ./openshell-conformance:/usr/local/bin/openshell-conformance \
   --copy ./openshell-gateway:/usr/local/bin/openshell-gateway \
   --copy ./openshell-sandbox.tar:/usr/local/lib/openshell-sandbox.tar \
   --provision openshell-development \
   --provision gateway-podman \
-  -- /usr/local/bin/openshell-conformance run smoke
+  -- /usr/local/bin/openshell status
 ```
 
 `openshell-rpm` expects OpenShell to have been installed with `--install`. It
