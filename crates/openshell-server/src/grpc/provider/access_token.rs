@@ -27,11 +27,17 @@ pub(in crate::grpc) async fn handle(
     request: Request<GetSandboxProviderAccessTokenRequest>,
 ) -> Result<Response<GetSandboxProviderAccessTokenResponse>, Status> {
     let request_id = canonical_request_id(request.metadata());
+    // Failures go to the authenticated sandbox's log stream; other callers
+    // are logged on the gateway only.
+    let log_sandbox_id = match request.extensions().get::<Principal>() {
+        Some(Principal::Sandbox(principal)) => Some(principal.sandbox_id.clone()),
+        _ => None,
+    };
     let result = obtain(state, request, request_id.as_deref()).await;
     result.map_err(|status| {
         let status = sanitize_token_grant_status(status);
         log_token_grant_failure(
-            None,
+            log_sandbox_id.as_deref(),
             request_id.as_deref(),
             TokenGrantFailure::from_status(&status),
         );

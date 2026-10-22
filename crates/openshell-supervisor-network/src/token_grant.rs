@@ -47,7 +47,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use openshell_core::grpc_client::GatewayEndpoint;
+use openshell_core::grpc_client::{GatewayEndpoint, SandboxProviderTokenClient};
 use openshell_core::oauth::{
     self, ACCESS_TOKEN_TYPE, OAuthTokenResponse, TokenExchangeParams, TokenGrantClient,
     TokenGrantParams, effective_client_assertion_type, effective_token_type, token_cache_ttl,
@@ -290,17 +290,19 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
 /// supervisor holds no workload identity of its own.
 ///
 /// It forwards only the credential key and request ID over the instance's
-/// authenticated gateway connection and validates the returned token. The
-/// gateway authorizes, acquires, exchanges, and caches; this resolver holds
-/// no cache, SVID, intermediate token, or HTTP client.
+/// reused authenticated gateway connection and validates the returned token.
+/// The gateway authorizes, acquires, exchanges, and caches on every request;
+/// this resolver holds no cache, SVID, intermediate token, or HTTP client.
 pub struct GatewayTokenGrantResolver {
-    gateway: GatewayEndpoint,
+    gateway: SandboxProviderTokenClient,
 }
 
 impl GatewayTokenGrantResolver {
     #[must_use]
     pub fn new(gateway: GatewayEndpoint) -> Self {
-        Self { gateway }
+        Self {
+            gateway: SandboxProviderTokenClient::new(gateway),
+        }
     }
 }
 
@@ -310,12 +312,10 @@ impl TokenGrantResolver for GatewayTokenGrantResolver {
         request: TokenGrantRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
         Box::pin(async move {
-            let token = openshell_core::grpc_client::get_sandbox_provider_access_token(
-                &self.gateway,
-                request.provider_key,
-                Some(request.request_id),
-            )
-            .await?;
+            let token = self
+                .gateway
+                .get_access_token(request.provider_key, Some(request.request_id))
+                .await?;
             validate_access_token(&token.access_token)?;
             Ok(token.access_token)
         })

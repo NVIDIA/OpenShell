@@ -1578,44 +1578,75 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
-/// Obtain only the final access token; the gateway selects and verifies the
-/// sandbox identity and resolves all grant parameters from its configuration.
-#[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
-pub async fn get_sandbox_provider_access_token(
-    gateway: &GatewayEndpoint,
-    credential_key: &str,
-    request_id: Option<&str>,
-) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
-    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
-    let mut client = connect(&gateway.with_url(endpoint.as_str()))
+/// Final provider access tokens for one sandbox instance over one reused
+/// gateway channel.
+///
+/// The channel connects on the first request; a failed connection is retried
+/// by the next one. Concurrent requests share the channel without holding a
+/// lock across the call, and tonic reconnects it after transport loss. Each
+/// request reads the instance's current bearer, so renewal and revocation
+/// apply without reconnecting, and the gateway authorizes every request.
+pub struct SandboxProviderTokenClient {
+    gateway: GatewayEndpoint,
+    client: tokio::sync::OnceCell<OpenShellClient<AuthedChannel>>,
+}
+
+impl SandboxProviderTokenClient {
+    #[must_use]
+    pub fn new(gateway: GatewayEndpoint) -> Self {
+        Self {
+            gateway,
+            client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Obtain only the final access token; the gateway selects and verifies
+    /// the sandbox identity and resolves all grant parameters from its
+    /// configuration.
+    #[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
+    pub async fn get_access_token(
+        &self,
+        credential_key: &str,
+        request_id: Option<&str>,
+    ) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+        let endpoint = token_grant_gateway_endpoint(self.gateway.url())?;
+        // Like connect(), refuse locally revoked sandbox instance credentials
+        // before the call; the response boundary rejects them again.
+        let unavailable = || gateway_grant_failure(TokenGrantFailureKind::Unavailable);
+        if self.gateway.credentials().is_revoked() {
+            return Err(unavailable());
+        }
+        let mut client = self
+            .client
+            .get_or_try_init(|| async { connect(&self.gateway.with_url(endpoint.as_str())).await })
+            .await
+            .map_err(|_| unavailable())?
+            .clone();
+        let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
+            credential_key: credential_key.to_string(),
+        });
+        if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
+            request.metadata_mut().insert("x-request-id", value);
+        }
+        let response = tokio::time::timeout(
+            Duration::from_mins(1),
+            client.get_sandbox_provider_access_token(request),
+        )
         .await
-        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
-    let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
-        credential_key: credential_key.to_string(),
-    });
-    if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
-        request.metadata_mut().insert("x-request-id", value);
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
+        .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
+        .into_inner();
+        if self.gateway.credentials().is_revoked() {
+            return Err(gateway_grant_failure(
+                TokenGrantFailureKind::WorkloadIdentityRejected,
+            ));
+        }
+        provider_subject_token_exchange_result(crate::proto::ExchangeProviderSubjectTokenResponse {
+            access_token: response.access_token,
+            expires_after: response.expires_after,
+            token_type: response.token_type,
+        })
     }
-    let response = tokio::time::timeout(
-        Duration::from_mins(1),
-        client.get_sandbox_provider_access_token(request),
-    )
-    .await
-    .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
-    .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
-    .into_inner();
-    // connect() and the response boundary both reject locally revoked sandbox
-    // instance credentials.
-    if gateway.credentials().is_revoked() {
-        return Err(gateway_grant_failure(
-            TokenGrantFailureKind::WorkloadIdentityRejected,
-        ));
-    }
-    provider_subject_token_exchange_result(crate::proto::ExchangeProviderSubjectTokenResponse {
-        access_token: response.access_token,
-        expires_after: response.expires_after,
-        token_type: response.token_type,
-    })
 }
 
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
