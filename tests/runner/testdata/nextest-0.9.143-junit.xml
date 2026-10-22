@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" skipped="0" failures="1" errors="0" uuid="e0d0eb2a-e54e-4eb7-a734-3aef01ec64ce" timestamp="2026-10-22T20:54:54.893-07:00" time="0.028">
+    <testsuite name="sandbox::smoke" tests="2" skipped="0" errors="0" failures="1">
+        <testcase name="create_exec_delete" classname="sandbox::smoke" timestamp="2026-10-22T20:54:54.894-07:00" time="0.026"/>
+        <testcase name="fails" classname="sandbox::smoke" timestamp="2026-10-22T20:54:54.894-07:00" time="0.026">
+            <failure message="thread &apos;fails&apos; (63231268) panicked at sandbox/tests/smoke.rs:7:5" type="test failure with exit code 101">thread &apos;fails&apos; (63231268) panicked at sandbox/tests/smoke.rs:7:5:
+assertion `left == right` failed: sandbox phase
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+some stdout
+test fails ... FAILED
+
+failures:
+
+failures:
+    fails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;fails&apos; (63231268) panicked at sandbox/tests/smoke.rs:7:5:
+assertion `left == right` failed: sandbox phase
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>
