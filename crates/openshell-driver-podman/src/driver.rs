@@ -171,6 +171,11 @@ pub struct PodmanComputeDriver {
     /// gateway; standalone drivers self-source one from the
     /// `--sandbox-additional-ca-bundle` operator path.
     network_trust: Option<NetworkSupervisorTrustBundle>,
+    /// Keeps the driver-owned staging directory for an operator-supplied
+    /// additional CA bundle alive for the driver process lifetime. The
+    /// artifact inside it is bind-mounted into supervisors and re-verified
+    /// on every create/start.
+    network_trust_staging: Option<Arc<tempfile::TempDir>>,
 }
 
 impl std::fmt::Debug for PodmanComputeDriver {
@@ -180,6 +185,10 @@ impl std::fmt::Debug for PodmanComputeDriver {
             .field("default_image", &self.config.default_image)
             .field("network_name", &self.config.network_name)
             .field("gpu_inventory", &self.gpu_selector.device_ids())
+            .field(
+                "network_trust_staged",
+                &self.network_trust_staging.is_some(),
+            )
             .finish()
     }
 }
@@ -476,8 +485,13 @@ fn resolve_socket_path(
 /// directly. The file is read with the same bounded, no-symlink validation
 /// the gateway applies to its own configured bundle, and a SHA-256 digest of
 /// the material becomes the trust generation so stop/start reconciliation
-/// behaves identically to gateway-managed deployments.
-fn operator_network_trust(path: &str) -> Result<NetworkSupervisorTrustBundle, PodmanApiError> {
+/// behaves identically to gateway-managed deployments. The operator-owned
+/// source keeps its own permissions; the normalized material is staged into
+/// a driver-owned `0444` artifact so the immutable-artifact verification
+/// every later create/start performs accepts it.
+fn operator_network_trust(
+    path: &str,
+) -> Result<(NetworkSupervisorTrustBundle, tempfile::TempDir), PodmanApiError> {
     let pem = openshell_core::driver_utils::read_upstream_proxy_ca_bundle_file(
         path,
         "additional_ca_bundle",
@@ -485,12 +499,67 @@ fn operator_network_trust(path: &str) -> Result<NetworkSupervisorTrustBundle, Po
     .map_err(PodmanApiError::InvalidInput)?;
     let certificate_count = pem.matches("-----BEGIN CERTIFICATE-----").count();
     let digest = format!("sha256:{:x}", sha2::Sha256::digest(pem.as_bytes()));
-    Ok(NetworkSupervisorTrustBundle::new(
-        pem.into_bytes(),
-        certificate_count,
-        digest,
-        PathBuf::from(path),
+
+    let staging = tempfile::tempdir().map_err(|error| {
+        PodmanApiError::InvalidInput(format!("create additional CA staging directory: {error}"))
+    })?;
+    let artifact_path = staging.path().join("additional-ca.crt");
+    stage_operator_network_trust_artifact(&artifact_path, pem.as_bytes())?;
+    Ok((
+        NetworkSupervisorTrustBundle::new(
+            pem.into_bytes(),
+            certificate_count,
+            digest,
+            artifact_path,
+        ),
+        staging,
     ))
+}
+
+/// Write the normalized operator material as a read-only, regular artifact.
+///
+/// The file is created writable-private and only then made immutable so no
+/// observer ever sees a world-writable artifact; the staging directory itself
+/// is process-private (`0700`).
+fn stage_operator_network_trust_artifact(
+    artifact_path: &Path,
+    normalized: &[u8],
+) -> Result<(), PodmanApiError> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(artifact_path).map_err(|error| {
+        PodmanApiError::InvalidInput(format!(
+            "create additional CA artifact '{}': {error}",
+            artifact_path.display()
+        ))
+    })?;
+    file.write_all(normalized)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            PodmanApiError::InvalidInput(format!(
+                "write additional CA artifact '{}': {error}",
+                artifact_path.display()
+            ))
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(artifact_path, std::fs::Permissions::from_mode(0o444)).map_err(
+            |error| {
+                PodmanApiError::InvalidInput(format!(
+                    "restrict additional CA artifact '{}': {error}",
+                    artifact_path.display()
+                ))
+            },
+        )?;
+    }
+    Ok(())
 }
 
 impl PodmanComputeDriver {
@@ -505,17 +574,21 @@ impl PodmanComputeDriver {
         let socket_path = resolve_socket_path(config.socket_path.clone(), detect_socket)?;
         config.socket_path = Some(socket_path.clone());
 
-        let network_trust = match (network_trust, config.additional_ca_bundle.as_deref()) {
-            (Some(_), Some(path)) => {
-                return Err(PodmanApiError::InvalidInput(format!(
-                    "destination CA trust was supplied both by the gateway and through \
-                     --sandbox-additional-ca-bundle ('{path}'); configure exactly one source"
-                )));
-            }
-            (Some(bundle), None) => Some(bundle),
-            (None, Some(path)) => Some(operator_network_trust(path)?),
-            (None, None) => None,
-        };
+        let (network_trust, network_trust_staging) =
+            match (network_trust, config.additional_ca_bundle.as_deref()) {
+                (Some(_), Some(path)) => {
+                    return Err(PodmanApiError::InvalidInput(format!(
+                        "destination CA trust was supplied both by the gateway and through \
+                         --sandbox-additional-ca-bundle ('{path}'); configure exactly one source"
+                    )));
+                }
+                (Some(bundle), None) => (Some(bundle), None),
+                (None, Some(path)) => {
+                    let (bundle, staging) = operator_network_trust(path)?;
+                    (Some(bundle), Some(Arc::new(staging)))
+                }
+                (None, None) => (None, None),
+            };
 
         if !socket_path.exists() {
             if cfg!(target_os = "macos") {
@@ -638,6 +711,7 @@ impl PodmanComputeDriver {
             gpu_inventory_refresh: Arc::new(local_podman_gpu_selector_state),
             lifecycle_event_fences: LifecycleEventFences::default(),
             network_trust,
+            network_trust_staging,
         };
         let reconciler = driver.clone();
         tokio::spawn(async move {
@@ -2268,6 +2342,7 @@ impl PodmanComputeDriver {
             }),
             lifecycle_event_fences: LifecycleEventFences::default(),
             network_trust: None,
+            network_trust_staging: None,
         }
     }
 }
@@ -4531,5 +4606,46 @@ mod tests {
         let gpu = resources.gpu.unwrap();
         assert!(gpu.default_selection_supported);
         assert!(gpu.count_selection_supported);
+    }
+
+    #[test]
+    fn operator_network_trust_stages_immutable_artifact_from_readable_source() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let ca = openshell_crypto::pki::self_signed(ca_params, &ca_key).unwrap();
+        let source = std::env::temp_dir().join(format!(
+            "openshell-operator-ca-{}-{}.crt",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::write(&source, ca.pem()).unwrap();
+        // The operator-owned source is deliberately writable `0644`, which
+        // the immutable-artifact verification must never see.
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (bundle, staging) =
+            operator_network_trust(source.to_str().unwrap()).expect("stage operator trust");
+        let artifact = bundle.artifact_path();
+        assert_ne!(
+            artifact, source,
+            "staged artifact must not be the source path"
+        );
+        assert!(artifact.starts_with(staging.path()));
+        // The verification every create/start performs must accept the staged
+        // artifact without touching the operator's source permissions.
+        bundle
+            .verify_artifact()
+            .expect("staged operator artifact must satisfy immutable verification");
+        let source_mode = fs::metadata(&source).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            source_mode, 0o644,
+            "operator source permissions must be preserved"
+        );
+        let artifact_mode = fs::metadata(artifact).unwrap().permissions().mode() & 0o777;
+        assert_eq!(artifact_mode, 0o444, "staged artifact must be read-only");
+        let _ = fs::remove_file(&source);
     }
 }
