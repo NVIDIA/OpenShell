@@ -70,15 +70,20 @@ gatewayConfig:
 
 The gateway chart creates a single-replica shared supervisor Deployment,
 Service, and NetworkPolicy in the release namespace, regardless of
-shared/managed/operator workspace mode, and the certgen hook issues its
-session-control Secrets. New sandbox generations run as sandbox instances in
-that process. Its process-health `tcpSocket` probes connect to the mTLS
-session-control port (5501); there is no separate health port. The chart starts
-`--mode=shared`, sets `--gateway-endpoint` to the gateway gRPC URL, and binds
-`--address` to this control/probe listener. Build the
-gateway, supervisor, and sandbox images from the same branch:
-all three must support the routed runtime connection. `workspace` is reserved
-and rejected. Omit the field to disable it. `mise run
+shared/managed/operator workspace mode, and the certgen hook issues the
+`<release>-supervisor-host` Secret: a private CA and the client certificate
+the supervisor presents to the gateway. The gateway mounts only that Secret's
+`ca.crt` and accepts the certificate solely for the private
+`openshell.supervisor.host.v1` assignment stream; the topology therefore
+requires gateway TLS (`server.disableTls` is rejected). New sandbox generations
+run as sandbox instances in that process. The chart starts `--mode=shared`,
+sets `--gateway-endpoint` to the gateway gRPC URL, mounts the host certificate
+at `--host-tls-dir`, and binds `--address` (5501) to a plain TCP health
+listener for the `tcpSocket` probes; nothing dials the supervisor but sandbox
+runtimes (5500) and the kubelet. Build the gateway, supervisor, and sandbox
+images from the same branch: all three must support the routed runtime
+connection and the assignment stream. `workspace` is reserved and rejected.
+Omit the field to disable it. `mise run
 e2e:kubernetes:shared-supervisor` runs the focused e2e
 (`ci/values-supervisor.yaml`). The task prepends that overlay to any
 colon-separated `OPENSHELL_E2E_KUBE_EXTRA_VALUES` list, so layer a

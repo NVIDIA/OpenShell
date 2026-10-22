@@ -118,6 +118,8 @@ pub enum AuthMechanism {
     GatewayPeer,
     /// The `CreateSshSession` token an SSH relay presents.
     SshSessionToken,
+    /// The shared supervisor host's gateway-scoped client certificate.
+    SupervisorHost,
 }
 
 impl AuthMechanism {
@@ -131,6 +133,7 @@ impl AuthMechanism {
             Self::ComputeDriver => "compute_driver",
             Self::GatewayPeer => "k8s_service_account",
             Self::SshSessionToken => "ssh_session_token",
+            Self::SupervisorHost => "supervisor_host_mtls",
         }
     }
 }

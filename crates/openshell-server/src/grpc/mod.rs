@@ -10,6 +10,7 @@ pub mod provider;
 mod provider_credentials;
 pub mod provider_readiness;
 mod sandbox;
+pub mod supervisor_host;
 pub use sandbox::mint_persisted_authentication;
 mod service;
 mod validation;

@@ -10,7 +10,7 @@ release:
   name: openshell
   namespace: gateway
 tests:
-  - it: issues the session-control PKI with the hook
+  - it: issues the supervisor host identity with the hook
     template: templates/certgen.yaml
     set:
       gatewayConfig:
@@ -21,12 +21,10 @@ tests:
           path: spec.template.spec.containers[1].args
           value:
             - generate-certs
-            - --tls-only
-            - --server-secret-name=openshell-supervisor-control
-            - --client-secret-name=openshell-supervisor-control-client
-            - --server-san=openshell-supervisor.gateway.svc
+            - --client-only
+            - --client-secret-name=openshell-supervisor-host
         documentIndex: 3
-  - it: issues only the session-control PKI when the gateway PKI is external
+  - it: issues only the supervisor host identity when the gateway PKI is external
     template: templates/certgen.yaml
     set:
       pkiInitJob:
@@ -62,7 +60,7 @@ tests:
             verbs:
               - get
         documentIndex: 0
-  - it: mounts the session-control client credential only on the gateway
+  - it: projects only the supervisor host CA onto the gateway
     template: templates/statefulset.yaml
     set:
       gatewayConfig:
@@ -72,12 +70,15 @@ tests:
       - contains:
           path: spec.template.spec.volumes
           content:
-            name: supervisor-control
+            name: supervisor-host-ca
             secret:
-              secretName: openshell-supervisor-control-client
+              secretName: openshell-supervisor-host
+              items:
+                - key: ca.crt
+                  path: ca.crt
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
-            name: supervisor-control
-            mountPath: /etc/openshell-tls/supervisor-control
+            name: supervisor-host-ca
+            mountPath: /etc/openshell-tls/supervisor-host
             readOnly: true

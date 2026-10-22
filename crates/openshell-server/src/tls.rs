@@ -13,10 +13,12 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use notify::event::EventKind;
 use notify::{Event, RecursiveMode, Watcher};
+use openshell_core::supervisor_host::HostIdentity;
 use openshell_core::{Error, Result};
 use openshell_ocsf::{ConfigStateChangeBuilder, EventContext, SeverityId, StateId, StatusId};
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use tokio::sync::{mpsc, watch};
@@ -31,7 +33,7 @@ use tracing::{debug, info, warn};
 /// re-read from the same files without the caller tracking them separately.
 #[derive(Clone)]
 pub struct TlsAcceptor {
-    config: Arc<ArcSwap<ServerConfig>>,
+    state: Arc<ArcSwap<AcceptorState>>,
     cert_path: PathBuf,
     key_path: PathBuf,
     client_ca_path: Option<PathBuf>,
@@ -39,7 +41,101 @@ pub struct TlsAcceptor {
     external_cert_path: Option<PathBuf>,
     external_key_path: Option<PathBuf>,
     external_server_names: Vec<String>,
+    /// CA that issues the shared supervisor host's client certificate. Its
+    /// certificates are accepted by the handshake and classified into the
+    /// supervisor host realm; they never become user identities.
+    supervisor_host_ca_path: Option<PathBuf>,
     reload_spawned: Arc<AtomicBool>,
+}
+
+/// One generation of TLS configuration: the handshake config and the
+/// per-realm verifiers built from the same CA files, swapped together so a
+/// handshake is always classified against the roots that accepted it.
+struct AcceptorState {
+    config: Arc<ServerConfig>,
+    /// Verifies chains against the ordinary client CA alone.
+    client_verifier: Option<Arc<dyn ClientCertVerifier>>,
+    /// Verifies chains against the supervisor host CA alone.
+    supervisor_host_verifier: Option<Arc<dyn ClientCertVerifier>>,
+}
+
+/// Who a finished handshake proves the peer to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRealm {
+    /// No client certificate was presented.
+    Anonymous,
+    /// The chain verifies against the ordinary client CA.
+    Client,
+    /// The chain verifies against the supervisor host CA.
+    SupervisorHost(HostIdentity),
+}
+
+/// A snapshot of the acceptor for one connection: the handshake and the
+/// classification of its result use the same configuration generation.
+#[derive(Clone)]
+pub struct TlsHandshake {
+    state: Arc<AcceptorState>,
+}
+
+impl TlsHandshake {
+    /// Complete the server side of a TLS handshake.
+    pub async fn accept<S>(&self, stream: S) -> std::io::Result<tokio_rustls::server::TlsStream<S>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        tokio_rustls::TlsAcceptor::from(self.state.config.clone())
+            .accept(stream)
+            .await
+    }
+
+    /// Classify a finished handshake. Fails closed: a presented chain that
+    /// verifies against neither configured CA, or against both, is refused
+    /// rather than treated as an ordinary client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the chain cannot be attributed to exactly one
+    /// realm or the host identity cannot be derived from it.
+    pub fn classify<S>(&self, stream: &tokio_rustls::server::TlsStream<S>) -> Result<PeerRealm> {
+        let (_, connection) = stream.get_ref();
+        let Some((end_entity, intermediates)) = connection
+            .peer_certificates()
+            .and_then(|certificates| certificates.split_first())
+        else {
+            return Ok(PeerRealm::Anonymous);
+        };
+        let now = UnixTime::now();
+        let verifies = |verifier: &Option<Arc<dyn ClientCertVerifier>>| {
+            verifier.as_ref().is_some_and(|verifier| {
+                verifier
+                    .verify_client_cert(end_entity, intermediates, now)
+                    .is_ok()
+            })
+        };
+        match (
+            verifies(&self.state.supervisor_host_verifier),
+            verifies(&self.state.client_verifier),
+        ) {
+            (true, true) => Err(Error::tls(
+                "client certificate verifies against both the client CA and the supervisor host CA; refusing the ambiguous identity",
+            )),
+            (true, false) => {
+                let subject = certificate_common_name(end_entity).ok_or_else(|| {
+                    Error::tls("supervisor host certificate has no subject common name")
+                })?;
+                let digest = openshell_crypto::sha256(end_entity.as_ref())
+                    .map_err(|e| Error::tls(format!("fingerprint host certificate: {e}")))?;
+                Ok(PeerRealm::SupervisorHost(HostIdentity {
+                    subject,
+                    certificate_sha256: hex::encode(digest),
+                }))
+            }
+            (false, true) => Ok(PeerRealm::Client),
+            (false, false) => Err(Error::tls(
+                "client certificate was accepted by the handshake but verifies against no configured client CA",
+            )),
+        }
+    }
 }
 
 impl TlsAcceptor {
@@ -69,7 +165,7 @@ impl TlsAcceptor {
         external_key_path: Option<&Path>,
         external_server_names: Vec<String>,
     ) -> Result<Self> {
-        let config = build_server_config(
+        let state = build_acceptor_state(
             cert_path,
             key_path,
             client_ca_path,
@@ -77,9 +173,10 @@ impl TlsAcceptor {
             external_cert_path,
             external_key_path,
             &external_server_names,
+            None,
         )?;
         Ok(Self {
-            config: Arc::new(ArcSwap::from(config)),
+            state: Arc::new(ArcSwap::from_pointee(state)),
             cert_path: cert_path.to_path_buf(),
             key_path: key_path.to_path_buf(),
             client_ca_path: client_ca_path.map(Path::to_path_buf),
@@ -87,8 +184,22 @@ impl TlsAcceptor {
             external_cert_path: external_cert_path.map(Path::to_path_buf),
             external_key_path: external_key_path.map(Path::to_path_buf),
             external_server_names,
+            supervisor_host_ca_path: None,
             reload_spawned: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Also accept client certificates issued by the supervisor host CA at
+    /// `ca_path`; [`TlsHandshake::classify`] places them in
+    /// [`PeerRealm::SupervisorHost`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CA file cannot be read or parsed.
+    pub fn with_supervisor_host_ca(mut self, ca_path: &Path) -> Result<Self> {
+        self.supervisor_host_ca_path = Some(ca_path.to_path_buf());
+        self.reload()?;
+        Ok(self)
     }
 
     /// Re-read certificates from the same paths used at construction and
@@ -97,7 +208,7 @@ impl TlsAcceptor {
     /// Returns `Ok(())` when the new config was built and swapped successfully.
     /// Returns `Err(...)` if cert/key loading fails — the old config is preserved.
     pub fn reload(&self) -> Result<()> {
-        let new_config = build_server_config(
+        let state = build_acceptor_state(
             &self.cert_path,
             &self.key_path,
             self.client_ca_path.as_deref(),
@@ -105,8 +216,9 @@ impl TlsAcceptor {
             self.external_cert_path.as_deref(),
             self.external_key_path.as_deref(),
             &self.external_server_names,
+            self.supervisor_host_ca_path.as_deref(),
         )?;
-        self.config.store(new_config);
+        self.state.store(Arc::new(state));
 
         let event = ConfigStateChangeBuilder::new(&tls_ocsf_ctx())
             .severity(SeverityId::Informational)
@@ -124,7 +236,16 @@ impl TlsAcceptor {
     /// alive for the duration of the TLS handshake.
     #[must_use]
     pub fn acceptor(&self) -> tokio_rustls::TlsAcceptor {
-        tokio_rustls::TlsAcceptor::from(self.config.load_full())
+        tokio_rustls::TlsAcceptor::from(self.state.load().config.clone())
+    }
+
+    /// Snapshot the current configuration for one connection, so its
+    /// handshake and the classification of its peer agree.
+    #[must_use]
+    pub fn handshake(&self) -> TlsHandshake {
+        TlsHandshake {
+            state: self.state.load_full(),
+        }
     }
 
     /// Spawn a background worker that watches the parent directories of the
@@ -172,6 +293,12 @@ impl TlsAcceptor {
             let ext_dir = ext_key.parent().unwrap_or_else(|| Path::new("."));
             if !dirs.contains(&ext_dir.to_path_buf()) {
                 dirs.push(ext_dir.to_path_buf());
+            }
+        }
+        if let Some(ref host_ca) = self.supervisor_host_ca_path {
+            let host_dir = host_ca.parent().unwrap_or_else(|| Path::new("."));
+            if !dirs.contains(&host_dir.to_path_buf()) {
+                dirs.push(host_dir.to_path_buf());
             }
         }
 
@@ -361,7 +488,80 @@ fn build_cert_resolver(
     })))
 }
 
+fn root_store(roots: &[CertificateDer<'static>]) -> Result<rustls::RootCertStore> {
+    let mut store = rustls::RootCertStore::empty();
+    for cert in roots {
+        store
+            .add(cert.clone())
+            .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
+    }
+    Ok(store)
+}
+
+/// Strict verifier for one realm: chains must be issued by one of `roots`.
+fn build_realm_verifier(roots: &[CertificateDer<'static>]) -> Result<Arc<dyn ClientCertVerifier>> {
+    WebPkiClientVerifier::builder_with_provider(
+        Arc::new(root_store(roots)?),
+        openshell_crypto::tls::configuration_provider(),
+    )
+    .build()
+    .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))
+}
+
+/// Build the handshake config and the per-realm verifiers from one read of
+/// each CA file, so the handshake and the classification agree on the roots.
+#[allow(clippy::too_many_arguments)]
+fn build_acceptor_state(
+    cert_path: &Path,
+    key_path: &Path,
+    client_ca_path: Option<&Path>,
+    require_client_auth: bool,
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
+    supervisor_host_ca_path: Option<&Path>,
+) -> Result<AcceptorState> {
+    let client_roots = client_ca_path.map(load_certs).transpose()?;
+    let host_roots = supervisor_host_ca_path.map(load_certs).transpose()?;
+    let config = build_server_config_with_roots(
+        cert_path,
+        key_path,
+        client_roots.as_deref(),
+        require_client_auth,
+        external_cert_path,
+        external_key_path,
+        external_server_names,
+        host_roots.as_deref(),
+    )?;
+    Ok(AcceptorState {
+        config,
+        client_verifier: client_roots
+            .as_deref()
+            .map(build_realm_verifier)
+            .transpose()?,
+        supervisor_host_verifier: host_roots
+            .as_deref()
+            .map(build_realm_verifier)
+            .transpose()?,
+    })
+}
+
+/// Subject common name of a DER certificate.
+fn certificate_common_name(certificate: &CertificateDer<'_>) -> Option<String> {
+    use x509_parser::prelude::*;
+
+    let (_, parsed) = X509Certificate::from_der(certificate.as_ref()).ok()?;
+    parsed
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|attribute| attribute.as_str().ok())
+        .map(str::to_string)
+}
+
 /// Build a `ServerConfig` from certificate, key, and optional client CA files.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
 fn build_server_config(
     cert_path: &Path,
     key_path: &Path,
@@ -370,6 +570,35 @@ fn build_server_config(
     external_cert_path: Option<&Path>,
     external_key_path: Option<&Path>,
     external_server_names: &[String],
+    supervisor_host_ca_path: Option<&Path>,
+) -> Result<Arc<ServerConfig>> {
+    build_server_config_with_roots(
+        cert_path,
+        key_path,
+        client_ca_path.map(load_certs).transpose()?.as_deref(),
+        require_client_auth,
+        external_cert_path,
+        external_key_path,
+        external_server_names,
+        supervisor_host_ca_path
+            .map(load_certs)
+            .transpose()?
+            .as_deref(),
+    )
+}
+
+/// Build a `ServerConfig` from certificate and key files and already loaded
+/// client roots: the ordinary client CA and the supervisor host CA.
+#[allow(clippy::too_many_arguments)]
+fn build_server_config_with_roots(
+    cert_path: &Path,
+    key_path: &Path,
+    client_roots: Option<&[CertificateDer<'static>]>,
+    require_client_auth: bool,
+    external_cert_path: Option<&Path>,
+    external_key_path: Option<&Path>,
+    external_server_names: &[String],
+    supervisor_host_roots: Option<&[CertificateDer<'static>]>,
 ) -> Result<Arc<ServerConfig>> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
@@ -387,17 +616,24 @@ fn build_server_config(
         external_server_names,
     )?;
 
-    let mut config = if let Some(ca_path) = client_ca_path {
-        let ca_certs = load_certs(ca_path)?;
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
+    let client_roots = client_roots
+        .into_iter()
+        .chain(supervisor_host_roots)
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut config = if client_roots.is_empty() {
+        let builder = openshell_crypto::tls::server_builder().with_no_client_auth();
+        if let Some(resolver) = resolver {
+            builder.with_cert_resolver(resolver)
+        } else {
+            builder
+                .with_single_cert(certs, key)
+                .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         }
-
+    } else {
         let verifier_builder = WebPkiClientVerifier::builder_with_provider(
-            Arc::new(root_store),
+            Arc::new(root_store(&client_roots)?),
             openshell_crypto::tls::configuration_provider(),
         );
         let verifier = if require_client_auth {
@@ -409,15 +645,6 @@ fn build_server_config(
         .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
 
         let builder = openshell_crypto::tls::server_builder().with_client_cert_verifier(verifier);
-        if let Some(resolver) = resolver {
-            builder.with_cert_resolver(resolver)
-        } else {
-            builder
-                .with_single_cert(certs, key)
-                .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
-        }
-    } else {
-        let builder = openshell_crypto::tls::server_builder().with_no_client_auth();
         if let Some(resolver) = resolver {
             builder.with_cert_resolver(resolver)
         } else {
@@ -543,6 +770,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
         )
         .expect("failed to build server config");
 
@@ -887,6 +1115,179 @@ mod tests {
         // Clean shutdown
         let _ = shutdown_tx.send(true);
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    /// Issue a leaf certificate for `common_name` from `ca`.
+    fn issue_leaf(
+        common_name: &str,
+        ca: &openshell_crypto::pki::Certificate,
+        ca_key: &KeyPair,
+    ) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("leaf params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, common_name);
+        let key = openshell_crypto::pki::generate_keypair().expect("leaf key");
+        let cert = openshell_crypto::pki::signed_by(params, &key, ca, ca_key).expect("sign leaf");
+        let chain = rustls_pemfile::certs(&mut cert.pem().as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("leaf chain");
+        let key = rustls_pemfile::private_key(&mut key.serialize_pem().unwrap().as_bytes())
+            .expect("leaf key pem")
+            .expect("leaf key present");
+        (chain, key)
+    }
+
+    /// Handshake with `acceptor`, presenting `client` when given, and
+    /// classify the server side of the connection.
+    async fn classify_with(
+        acceptor: &TlsAcceptor,
+        server_ca: &Path,
+        client: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    ) -> Result<PeerRealm> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let handshake = acceptor.handshake();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let tls = handshake.accept(stream).await?;
+            Ok::<_, std::io::Error>(handshake.classify(&tls))
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certs(server_ca).expect("server CA") {
+            roots.add(cert).expect("root");
+        }
+        let builder = openshell_crypto::tls::client_builder().with_root_certificates(roots);
+        let config = match client {
+            Some((chain, key)) => builder
+                .with_client_auth_cert(chain, key)
+                .expect("client identity"),
+            None => builder.with_no_client_auth(),
+        };
+        let tcp = TcpStream::connect(address).await.expect("connect");
+        let tls = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await
+            .expect("client handshake");
+        drop(tls);
+        server
+            .await
+            .expect("server task")
+            .expect("server handshake")
+    }
+
+    /// The supervisor host CA and the ordinary client CA are separate realms:
+    /// a host certificate never becomes a client identity, a client
+    /// certificate never becomes a host, and overlapping roots are refused.
+    #[tokio::test]
+    async fn handshake_keeps_supervisor_host_and_client_realms_apart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (client_ca, client_ca_key) = generate_test_certs_with_ca(dir.path());
+        let mut host_ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        host_ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        host_ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        host_ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "supervisor-host-ca");
+        let host_ca_key = openshell_crypto::pki::generate_keypair().unwrap();
+        let host_ca = openshell_crypto::pki::self_signed(host_ca_params, &host_ca_key).unwrap();
+        write_test_file(dir.path(), "host-ca.pem", host_ca.pem().as_bytes());
+        let server_ca = dir.path().join("ca.pem");
+        let acceptor = || {
+            TlsAcceptor::from_files(
+                &dir.path().join("server-cert.pem"),
+                &dir.path().join("server-key.pem"),
+                Some(&server_ca),
+                false,
+                None,
+                None,
+                Vec::new(),
+            )
+            .expect("acceptor")
+        };
+        let two_realms = acceptor()
+            .with_supervisor_host_ca(&dir.path().join("host-ca.pem"))
+            .expect("host CA");
+
+        assert_eq!(
+            classify_with(&two_realms, &server_ca, None).await.unwrap(),
+            PeerRealm::Anonymous
+        );
+        assert_eq!(
+            classify_with(
+                &two_realms,
+                &server_ca,
+                Some(issue_leaf("openshell-client", &client_ca, &client_ca_key)),
+            )
+            .await
+            .unwrap(),
+            PeerRealm::Client
+        );
+        match classify_with(
+            &two_realms,
+            &server_ca,
+            Some(issue_leaf(
+                "openshell-supervisor-host",
+                &host_ca,
+                &host_ca_key,
+            )),
+        )
+        .await
+        .unwrap()
+        {
+            PeerRealm::SupervisorHost(identity) => {
+                assert_eq!(identity.subject, "openshell-supervisor-host");
+                assert_eq!(identity.certificate_sha256.len(), 64);
+            }
+            other => panic!("host certificate classified as {other:?}"),
+        }
+
+        // Without a host CA, a host certificate is simply an unknown client.
+        let client_only = acceptor();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handshake = client_only.handshake();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handshake.accept(stream).await.map(|_| ())
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_certs(&server_ca).unwrap() {
+            roots.add(cert).unwrap();
+        }
+        let (chain, key) = issue_leaf("openshell-supervisor-host", &host_ca, &host_ca_key);
+        let config = openshell_crypto::tls::client_builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(chain, key)
+            .unwrap();
+        let tcp = TcpStream::connect(address).await.unwrap();
+        let client = tokio_rustls::TlsConnector::from(Arc::new(config))
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tcp,
+            )
+            .await;
+        assert!(
+            client.is_err() || server.await.unwrap().is_err(),
+            "a host certificate must not pass a handshake that trusts only the client CA"
+        );
+
+        // The same CA for both realms makes every certificate ambiguous.
+        let ambiguous = acceptor()
+            .with_supervisor_host_ca(&server_ca)
+            .expect("overlapping CA");
+        assert!(
+            classify_with(
+                &ambiguous,
+                &server_ca,
+                Some(issue_leaf("openshell-client", &client_ca, &client_ca_key)),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]

@@ -28,13 +28,8 @@ openshell-supervisor-middleware-builtins = { path = "../openshell-supervisor-mid
 openshell-supervisor-network = { path = "../openshell-supervisor-network", default-features = false }
 openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
-bytes = { workspace = true }
 clap = { workspace = true }
 futures = { workspace = true }
-http = { workspace = true }
-http-body-util = { workspace = true }
-hyper = { workspace = true }
-hyper-util = { workspace = true }
 miette = { workspace = true }
 nix = { workspace = true }
 opentelemetry = { workspace = true }
@@ -49,6 +44,7 @@ tempfile = "3"
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
+tokio-stream = { workspace = true }
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
@@ -64,6 +60,11 @@ bundled-ca-roots = ["openshell-supervisor-network/bundled-ca-roots"]
 
 [dev-dependencies]
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend", features = ["test-support"] }
+bytes = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
 tonic-prost = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = "0.3"

@@ -123,38 +123,53 @@ backend or enable a Windows workload runtime.
 
 ## Shared supervisor host
 
-`openshell-supervisor --mode=shared --gateway-endpoint <gateway-url> --address <ip:port>` hosts the sandbox instances of many sandboxes in
-one process for the Kubernetes gateway supervisor topology. It is Unix-only.
+`openshell-supervisor --mode=shared --gateway-endpoint <gateway-url> --host-tls-dir <dir> --address <ip:port>`
+hosts the sandbox instances of many sandboxes in one process for the
+Kubernetes gateway supervisor topology. It is Unix-only. The host opens no
+control listener: it dials the gateway and receives its assignments from it.
 
-`--gateway-endpoint` selects the gateway each sandbox instance dials. The current
-admission RPCs still arrive from the gateway at `--address`; moving admission
-onto a supervisor-initiated stream is a separate implementation step.
-
-- **Admission.** A mutually authenticated TLS 1.3 listener
-  (`--address`, credentials in `--session-control-tls-dir`)
-  serves `PUT`, `GET`, and `DELETE /v1/sessions/{route}` and `GET /v1/sessions`
-  as JSON; these established session-control paths and fields address sandbox
-  instances. Only a client holding the admission certificate, which Helm gives
-  only the gateway, can register instances. A registration carries one
-  generation's runtime descriptor and gateway-issued credentials; the host
-  never acts with any other identity and has no Kubernetes identity. An
-  identical registration is accepted again; a different one for a registered
-  route returns `409`.
-- **Sandbox instances.** `shared_host::SharedHost` validates each
-  registration and admits it into the `SandboxInstanceHost` registry, keyed by
-  route with the registration digest as its fingerprint. Its private files
-  live under `--session-root` (proxy CA, trust directory, SSH socket). The
-  registry owns removal, so it completes when the caller disconnects, and the
-  route stays reserved until the instance has ended and its files are
-  deleted.
+- **Gateway attachment.** The host dials `--gateway-endpoint` (which must be
+  `https`) with the client certificate in `--host-tls-dir` (`tls.crt`,
+  `tls.key`), verifying the gateway with `OPENSHELL_TLS_CA` and
+  `OPENSHELL_GATEWAY_TLS_SERVER_NAME` like every sandbox instance does, and
+  opens the private `openshell.supervisor.host.v1/SupervisorHost.Attach`
+  stream (`proto/supervisor_host.proto`). The certificate comes from a CA the
+  gateway trusts only for this stream; the host identity authorizes nothing
+  else, and the host never acts with any other identity and has no Kubernetes
+  identity. The stream starts with a hello carrying a per-process instance id
+  and a connection epoch; the gateway supersedes an older stream of the same
+  process and refuses a delayed older connection.
+- **Assignments.** The gateway owns the desired set and sends it as complete
+  `AssignmentSnapshot`s with session-scoped revisions. `shared_host::SharedHost::reconcile`
+  validates the snapshot as a whole (at most 256 instances, no route twice),
+  decodes each assignment's launch material (the JSON
+  `SandboxInstanceRegistration` of `openshell-sandbox-backend`), admits it into
+  the `SandboxInstanceHost` registry keyed by route with the registration
+  digest as its fingerprint, and removes every hosted route the snapshot
+  omits. An identical assignment is a no-op; one that cannot be admitted
+  (invalid material, or a different fingerprint for a live route) is reported
+  as a failed instance and never touches the running one. Snapshots are
+  reconciled one at a time on a separate task, so heartbeats and status keep
+  flowing while instances stop; only the newest unapplied snapshot is kept,
+  and a connection finishes the reconciliation it started before the next
+  connection begins. Private files live under `--session-root` (proxy CA,
+  trust directory, SSH socket); the registry owns removal and keeps the route
+  reserved until the instance has ended and its files are deleted.
+- **Status.** After each reconciliation and whenever an instance is admitted,
+  changes phase or readiness, or is removed, the host sends a complete
+  `HostStatus` naming the revision it has reconciled to; readiness is set only
+  once the gateway has accepted the instance's own supervisor session.
+- **Disconnects.** Losing the gateway stream never stops an instance. The
+  host reconnects with backoff, reports what it runs, and applies the first
+  snapshot of the new session; only a snapshot that omits an instance, or
+  process shutdown, stops it.
 - **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
   instance's runtime-initiated Sandbox Protocol connections; see
   `openshell-sandbox-backend` for the routing preface.
-- **Health.** The chart's kubelet `tcpSocket` probes connect to the
-  session-control port (5501) and close without completing TLS, so they report
-  only that the process is listening; every request still requires mTLS.
-  Instance readiness is reported per instance over session control. SIGTERM
-  and SIGINT stop every instance, which ends their workloads' supervision.
+- **Health.** `--address` is a plain TCP listener that accepts and closes
+  kubelet `tcpSocket` probe connections; it carries no control traffic and
+  reports only that the process runs. SIGTERM and SIGINT stop every instance,
+  which ends their workloads' supervision.
 
 Sandbox instances get no upstream proxy, extra CA bundle, or provider workload identity:
 the Kubernetes driver refuses the topology when an upstream proxy or provider

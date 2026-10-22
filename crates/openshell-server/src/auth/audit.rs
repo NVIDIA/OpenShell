@@ -216,7 +216,10 @@ fn authenticated(principal: &Principal) -> bool {
     match principal {
         Principal::User(user) => user.identity.provider != IdentityProvider::LocalDev,
         Principal::Anonymous => false,
-        Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => true,
+        Principal::Operator(_)
+        | Principal::Sandbox(_)
+        | Principal::Peer(_)
+        | Principal::SupervisorHost(_) => true,
     }
 }
 
@@ -234,6 +237,7 @@ fn mechanism(principal: &Principal) -> Option<AuthMechanism> {
             SandboxIdentitySource::ComputeDriver { .. } => AuthMechanism::ComputeDriver,
         }),
         Principal::Peer(_) => Some(AuthMechanism::GatewayPeer),
+        Principal::SupervisorHost(_) => Some(AuthMechanism::SupervisorHost),
         Principal::Anonymous => None,
     }
 }
@@ -250,6 +254,7 @@ fn credential_digest(
 ) -> Option<[u8; 32]> {
     let credential = match principal {
         Principal::Operator(operator) => operator.certificate_sha256.as_str(),
+        Principal::SupervisorHost(host) => host.identity.certificate_sha256.as_str(),
         Principal::User(user) if user.identity.provider == IdentityProvider::Mtls => {
             peer_certificate_sha256.unwrap_or_default()
         }
@@ -506,6 +511,7 @@ fn principal_user(principal: &Principal) -> User {
         Principal::Operator(operator) => User::new(&operator.identity.subject, UserTypeId::Admin),
         Principal::Sandbox(sandbox) => User::other(&sandbox.sandbox_id, "Sandbox"),
         Principal::Peer(peer) => User::other(&peer.replica_id, "Gateway Peer"),
+        Principal::SupervisorHost(host) => User::other(&host.identity.subject, "Supervisor Host"),
         Principal::Anonymous => User::unidentified(),
     }
 }

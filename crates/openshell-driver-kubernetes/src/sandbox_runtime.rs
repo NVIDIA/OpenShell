@@ -43,6 +43,8 @@ pub const PROXY_CA_PRIVATE_KEY: &str = "proxy-ca.key";
 /// bundle (`proxy_ca_bundle`). Distinct from [`PROXY_CA_CERTIFICATE_KEY`],
 /// which is the sandbox's own generated TLS-interception CA.
 pub const UPSTREAM_PROXY_CA_BUNDLE_KEY: &str = "upstream-proxy-ca.pem";
+/// JSON sandbox instance registration of a generation on the shared supervisor.
+pub const SHARED_INSTANCE_KEY: &str = "instance.json";
 pub const CLIENT_TLS_CA_KEY: &str = "client-ca.crt";
 pub const SANDBOX_BOOTSTRAP_INPUT_PATH: &str = "/.openshell/bootstrap-input";
 pub const BOUNDARY_CONFIG_PATH: &str = "/.openshell/state/bootstrap/boundary.json";
@@ -682,6 +684,35 @@ pub fn supervisor_bootstrap_secret(
             ..Default::default()
         },
         data: Some(data),
+        immutable: Some(true),
+        type_: Some("Opaque".to_string()),
+        ..Default::default()
+    }
+}
+
+/// Durable launch material of one shared-supervisor sandbox instance, under
+/// the generation's supervisor Secret name so the existing generation cleanup
+/// deletes it. The gateway reads it back to rebuild the host's assignments.
+#[must_use]
+pub fn shared_instance_secret(
+    namespace: &str,
+    names: &SandboxRuntimeNames,
+    sandbox_id: &str,
+    registration: Vec<u8>,
+    owner: OwnerReference,
+) -> Secret {
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(names.supervisor_secret.clone()),
+            namespace: Some(namespace.to_string()),
+            owner_references: Some(vec![owner]),
+            labels: Some(common_labels(sandbox_id, SUPERVISOR_SECRET_COMPONENT)),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([(
+            SHARED_INSTANCE_KEY.to_string(),
+            ByteString(registration),
+        )])),
         immutable: Some(true),
         type_: Some("Opaque".to_string()),
         ..Default::default()

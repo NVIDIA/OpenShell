@@ -26,6 +26,9 @@ pub enum AuthMode {
     Peer,
     /// Only a verified mTLS operator may call this method.
     Operator,
+    /// Only the gateway's shared supervisor host, authenticated by its
+    /// gateway-scoped host certificate, may call this method.
+    SupervisorHost,
 }
 
 /// Coarse role mapping. Maps to the configured `admin_role` /
@@ -91,7 +94,11 @@ pub fn is_sandbox_callable(method: &str) -> bool {
 pub fn is_user_callable(method: &str) -> bool {
     match lookup(method).map(|m| m.auth_mode) {
         Some(
-            AuthMode::Sandbox | AuthMode::Unauthenticated | AuthMode::Peer | AuthMode::Operator,
+            AuthMode::Sandbox
+            | AuthMode::Unauthenticated
+            | AuthMode::Peer
+            | AuthMode::Operator
+            | AuthMode::SupervisorHost,
         ) => false,
         Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
     }
@@ -110,6 +117,16 @@ pub fn is_operator_callable(method: &str) -> bool {
 #[must_use]
 pub fn is_peer_callable(method: &str) -> bool {
     matches!(lookup(method).map(|m| m.auth_mode), Some(AuthMode::Peer))
+}
+
+/// `true` if the method is callable by the shared supervisor host, and by
+/// nothing else.
+#[must_use]
+pub fn is_supervisor_host_callable(method: &str) -> bool {
+    matches!(
+        lookup(method).map(|m| m.auth_mode),
+        Some(AuthMode::SupervisorHost)
+    )
 }
 
 #[cfg(test)]
@@ -173,6 +190,16 @@ mod tests {
             assert!(!is_user_callable(path));
             assert!(is_peer_callable(path));
         }
+        // The supervisor host stream is reachable only with a host identity.
+        let host_attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
+        assert!(is_supervisor_host_callable(host_attach));
+        assert!(!is_user_callable(host_attach));
+        assert!(!is_operator_callable(host_attach));
+        assert!(!is_sandbox_callable(host_attach));
+        assert!(!is_peer_callable(host_attach));
+        assert!(!is_supervisor_host_callable(
+            "/openshell.v1.OpenShell/ConnectSupervisor"
+        ));
         // Unauthenticated methods are not "user callable" — they're
         // intercepted before principal evaluation.
         assert!(!is_user_callable("/openshell.v1.OpenShell/Health"));

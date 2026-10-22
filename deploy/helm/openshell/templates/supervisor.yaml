@@ -12,11 +12,11 @@
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
-# One supervisor process hosting a session per sandbox generation. Sessions
-# are registered only by the gateway, over a mutually authenticated API whose
-# client credential only the gateway mounts. The Pod holds no Kubernetes or
-# gateway identity of its own: each session acts only with the credentials
-# the gateway issued for its generation.
+# One supervisor process hosting a sandbox instance per sandbox generation.
+# The process dials the gateway with its host certificate and receives its
+# assignments from it; nothing but sandbox runtimes and kubelet probes connect
+# to it. The Pod holds no Kubernetes identity of its own: each instance acts
+# only with the credentials the gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -26,7 +26,7 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
-  # Sessions live in this process; a second replica could not serve them.
+  # Instances live in this process; a second replica could not serve them.
   replicas: 1
   strategy:
     type: Recreate
@@ -60,9 +60,9 @@ spec:
             - --gateway-endpoint
             - {{ $endpoint | quote }}
             - --address
-            - 0.0.0.0:{{ get $shared "control_port" }}
-            - --session-control-tls-dir
-            - /etc/openshell/session-control
+            - 0.0.0.0:5501
+            - --host-tls-dir
+            - /etc/openshell/supervisor-host
             - --runtime-listen
             - 0.0.0.0:{{ get $shared "runtime_port" }}
             - --session-root
@@ -84,8 +84,8 @@ spec:
             - name: runtime
               containerPort: {{ get $shared "runtime_port" }}
               protocol: TCP
-            - name: session-control
-              containerPort: {{ get $shared "control_port" }}
+            - name: health
+              containerPort: 5501
               protocol: TCP
           securityContext:
             allowPrivilegeEscalation: false
@@ -98,22 +98,22 @@ spec:
               memory: 64Mi
             limits:
               memory: 1Gi
-          # Process health only: the probes open and close a TCP connection
-          # to the mTLS session-control listener. Each session reports its own
-          # readiness to the gateway through the session-control API.
+          # Process health only: the health listener accepts and closes probe
+          # connections. Each instance's readiness is reported to the gateway
+          # over the supervisor's own connection to it.
           readinessProbe:
             tcpSocket:
-              port: session-control
+              port: health
           livenessProbe:
             tcpSocket:
-              port: session-control
+              port: health
           volumeMounts:
             - name: run
               mountPath: /run/openshell
             - name: logs
               mountPath: /var/log
-            - name: session-control
-              mountPath: /etc/openshell/session-control
+            - name: supervisor-host
+              mountPath: /etc/openshell/supervisor-host
               readOnly: true
             {{- if $gatewayTls }}
             - name: gateway-ca
@@ -125,9 +125,9 @@ spec:
           emptyDir: {}
         - name: logs
           emptyDir: {}
-        - name: session-control
+        - name: supervisor-host
           secret:
-            secretName: {{ $name }}-control
+            secretName: {{ $name }}-host
         {{- if $gatewayTls }}
         - name: gateway-ca
           secret:
@@ -153,17 +153,13 @@ spec:
       port: {{ get $shared "runtime_port" }}
       targetPort: runtime
       protocol: TCP
-    - name: session-control
-      port: {{ get $shared "control_port" }}
-      targetPort: session-control
-      protocol: TCP
 {{- if .Values.networkPolicy.enabled }}
 ---
-# Only the gateway reaches session control, and only sandbox workloads in this
-# gateway's sandbox namespaces reach the routed runtime listener. Each
-# sandbox's own egress allowance limits its workload to that port, and the
-# routing preface plus the generation's pinned TLS identity decide which
-# session it reaches.
+# Only sandbox workloads in this gateway's sandbox namespaces reach the routed
+# runtime listener. Each sandbox's own egress allowance limits its workload to
+# that port, and the routing preface plus the generation's pinned TLS identity
+# decide which instance it reaches. The supervisor dials the gateway itself,
+# so no ingress from the gateway is needed.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -181,13 +177,6 @@ spec:
     - Egress
   ingress:
     - from:
-        - podSelector:
-            matchLabels:
-              {{- include "openshell.selectorLabels" . | nindent 14 }}
-      ports:
-        - protocol: TCP
-          port: {{ get $shared "control_port" }}
-    - from:
         - namespaceSelector:
             {{- include "openshell.supervisorSandboxNamespaces" (dict "kubernetes" $kubernetes) | nindent 12 }}
           podSelector:
@@ -196,7 +185,8 @@ spec:
       ports:
         - protocol: TCP
           port: {{ get $shared "runtime_port" }}
-  # Sessions carry policy-approved sandbox egress, as dedicated supervisors do.
+  # Instances carry policy-approved sandbox egress, as dedicated supervisors
+  # do, and the host reaches the gateway.
   egress:
     - {}
 {{- end }}

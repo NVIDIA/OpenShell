@@ -124,8 +124,9 @@ spec:
         {{- end }}
         {{- if $supervisor }}
         {{- $supervisorName := include "openshell.supervisorName" . }}
-        # Private PKI for the shared supervisor's session-control API. Only
-        # the gateway receives its client credential.
+        # Private PKI for the shared supervisor's host identity: the supervisor
+        # presents the client certificate to the gateway, which trusts only
+        # the CA.
         - name: supervisor-certgen
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
@@ -139,10 +140,8 @@ spec:
           command: ["/usr/local/bin/openshell-gateway"]
           args:
             - generate-certs
-            - --tls-only
-            - --server-secret-name={{ $supervisorName }}-control
-            - --client-secret-name={{ $supervisorName }}-control-client
-            - --server-san={{ $supervisorName }}.{{ $ns }}.svc
+            - --client-only
+            - --client-secret-name={{ $supervisorName }}-host
         {{- end }}
 {{- if and .Values.certManager.enabled .Values.grpcRoute.backendTLSPolicy.enabled }}
 ---

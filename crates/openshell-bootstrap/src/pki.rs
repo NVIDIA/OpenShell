@@ -44,6 +44,10 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
     "::1",
 ];
 
+/// Subject of the shared supervisor host's client certificate. The gateway
+/// binds host identity to the issuing CA, not to this name.
+pub const SUPERVISOR_HOST_CLIENT_NAME: &str = "openshell-supervisor-host";
+
 /// Generate a complete PKI bundle: CA, server cert, and client cert.
 ///
 /// `extra_sans` are additional Subject Alternative Names to add to the server
@@ -53,6 +57,25 @@ pub const DEFAULT_SERVER_SANS: &[&str] = &[
 /// never expire. This is appropriate for an internal dev-cluster PKI where certs
 /// are ephemeral to the cluster's lifetime.
 pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
+    generate_pki_with_client(extra_sans, "openshell-client", "openshell-user")
+}
+
+/// Generate the private PKI of a gateway's shared supervisor host: a CA and
+/// one client certificate the host presents to the gateway. The server
+/// certificate is unused and never written.
+pub fn generate_supervisor_host_pki() -> Result<PkiBundle> {
+    generate_pki_with_client(
+        &[],
+        SUPERVISOR_HOST_CLIENT_NAME,
+        SUPERVISOR_HOST_CLIENT_NAME,
+    )
+}
+
+fn generate_pki_with_client(
+    extra_sans: &[String],
+    client_common_name: &str,
+    client_organizational_unit: &str,
+) -> Result<PkiBundle> {
     // --- CA ---
     let ca_key = openshell_crypto::pki::generate_keypair()
         .into_diagnostic()
@@ -102,10 +125,10 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     client_params.use_authority_key_identifier_extension = true;
     client_params
         .distinguished_name
-        .push(DnType::CommonName, "openshell-client");
+        .push(DnType::CommonName, client_common_name);
     client_params
         .distinguished_name
-        .push(DnType::OrganizationalUnitName, "openshell-user");
+        .push(DnType::OrganizationalUnitName, client_organizational_unit);
 
     let client_cert =
         openshell_crypto::pki::signed_by(client_params, &client_key, &ca_cert, &ca_key)

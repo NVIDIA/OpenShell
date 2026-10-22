@@ -363,7 +363,7 @@ raw gateway configuration so openshell.effectiveKubernetesConfig can use it.
 {{- end }}
 
 {{/*
-Name of the shared supervisor Deployment, Service, and session-control Secrets:
+Name of the shared supervisor Deployment, Service, and host identity Secret:
 the fullname with a fixed suffix, within the 63-character Service name limit.
 A fullname without room for the suffix keeps a prefix and a hash of the whole
 fullname, so the name never collapses into another release resource's name.
@@ -617,9 +617,9 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 {{- if not (hasKey $kubernetes "supervisor_image") -}}{{- $_ := set $kubernetes "supervisor_image" (include "openshell.supervisorImage" .) -}}{{- end -}}
 {{- if not (hasKey $runtimeConfig "boundary_port") -}}{{- $_ := set $runtimeConfig "boundary_port" 5500 -}}{{- end -}}
 {{- $_ := set $kubernetes "sandbox_runtime" $runtimeConfig -}}
-{{/* The chart owns the shared supervisor and its session-control credential. */}}
+{{/* The chart owns the shared supervisor and the CA of its host identity. */}}
 {{- if include "openshell.supervisorEnabled" . -}}
-{{- $_ := set $kubernetes "shared_supervisor" (dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "control_port" 5501 "control_tls_dir" "/etc/openshell-tls/supervisor-control") -}}
+{{- $_ := set $kubernetes "shared_supervisor" (dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "host_ca_file" "/etc/openshell-tls/supervisor-host/ca.crt") -}}
 {{- end -}}
 {{- toYaml $kubernetes -}}
 {{- end }}
@@ -643,6 +643,9 @@ Validate chart values that Helm would otherwise accept silently.
 {{- end -}}
 {{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
 {{- fail "supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
+{{- end -}}
+{{- if .Values.server.disableTls -}}
+{{- fail "supervisor_topology=gateway requires gateway TLS; the shared supervisor authenticates with a client certificate" -}}
 {{- end -}}
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
 {{- fail "supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}

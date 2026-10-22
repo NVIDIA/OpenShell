@@ -18,6 +18,7 @@ use hyper_util::{
 };
 use metrics::{counter, histogram};
 use openshell_core::proto::open_shell_server::OpenShellServer;
+use openshell_core::proto::supervisor_host::v1::supervisor_host_server::SupervisorHostServer;
 use openshell_core::{
     Config,
     proto::{Provider, UpdateProviderRequest},
@@ -48,7 +49,7 @@ use crate::{
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
-    auth::principal::{OperatorPrincipal, Principal, UserPrincipal},
+    auth::principal::{OperatorPrincipal, Principal, SupervisorHostPrincipal, UserPrincipal},
     auth::workspace_authz::{MinWorkspaceRole, authorize_workspace},
     http_router, service_http_router,
 };
@@ -257,22 +258,31 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.serve_with_verified_certificate(stream, peer_identity, None, source)
+        self.serve_with_verified_certificate(stream, peer_identity, None, source, None)
             .await
     }
 
-    /// TLS listener only: fingerprint and identity must originate from its verified handshake.
+    /// TLS listener only: fingerprint, identity, and supervisor host must
+    /// originate from its verified handshake. A supervisor host connection
+    /// carries no user or operator identity, whatever its certificate says.
     pub async fn serve_with_verified_certificate<S>(
         &self,
         stream: S,
         peer_identity: Option<Identity>,
         certificate_sha256: Option<String>,
         source: ConnectionSource,
+        supervisor_host: Option<SupervisorHostPrincipal>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let operator = if self.state.config.mtls_auth.operator_enabled {
+        let peer_identity = if supervisor_host.is_some() {
+            None
+        } else {
+            peer_identity
+        };
+        let operator = if self.state.config.mtls_auth.operator_enabled && supervisor_host.is_none()
+        {
             peer_identity
                 .as_ref()
                 .filter(|identity| {
@@ -293,6 +303,15 @@ impl MultiplexService {
             openshell,
             self.state.gateway_interceptors.clone(),
             Some(self.state.clone()),
+        );
+        // The private host stream carries launch secrets, so it bypasses the
+        // configurable interceptors.
+        let openshell = SupervisorHostRoute::new(
+            SupervisorHostServer::new(crate::grpc::supervisor_host::SupervisorHostService::new(
+                self.state.clone(),
+            ))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE),
+            openshell,
         );
         let reflection = self.state.reflection_service.clone();
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
@@ -316,6 +335,7 @@ impl MultiplexService {
         )
         .with_peer_certificate(certificate_sha256)
         .with_operator(operator)
+        .with_supervisor_host(supervisor_host)
         .with_connection_source(source)
         .with_logons(self.state.logons.clone());
         let grpc_service =
@@ -368,6 +388,57 @@ impl MultiplexService {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Routes the private supervisor host service past the gateway interceptors
+/// and every other gRPC path to the `OpenShell` service.
+#[derive(Clone)]
+struct SupervisorHostRoute<N> {
+    host: SupervisorHostServer<crate::grpc::supervisor_host::SupervisorHostService>,
+    gateway: N,
+}
+
+impl<N> SupervisorHostRoute<N> {
+    fn new(
+        host: SupervisorHostServer<crate::grpc::supervisor_host::SupervisorHostService>,
+        gateway: N,
+    ) -> Self {
+        Self { host, gateway }
+    }
+}
+
+impl<N> tower::Service<Request<BoxBody>> for SupervisorHostRoute<N>
+where
+    N: tower::Service<Request<BoxBody>, Response = Response<tonic::body::Body>, Error = Infallible>
+        + Clone
+        + Send
+        + 'static,
+    N::Future: Send + 'static,
+{
+    type Response = Response<tonic::body::Body>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.gateway.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<BoxBody>) -> Self::Future {
+        if req
+            .uri()
+            .path()
+            .starts_with(crate::grpc::supervisor_host::SUPERVISOR_HOST_PATH_PREFIX)
+        {
+            let mut host = self.host.clone();
+            Box::pin(async move {
+                <SupervisorHostServer<_> as tower::Service<Request<BoxBody>>>::call(&mut host, req)
+                    .await
+            })
+        } else {
+            let mut gateway = self.gateway.clone();
+            Box::pin(async move { gateway.ready().await?.call(req).await })
+        }
     }
 }
 
@@ -754,6 +825,14 @@ fn gateway_principal_fields(principal: &Principal) -> BTreeMap<String, String> {
             fields.insert("replica_id".to_string(), peer.replica_id.clone());
             fields.insert("pod_uid".to_string(), peer.pod_uid.clone());
         }
+        Principal::SupervisorHost(host) => {
+            fields.insert("kind".to_string(), "supervisor_host".to_string());
+            fields.insert("subject".to_string(), host.identity.subject.clone());
+            fields.insert(
+                "certificate_sha256".to_string(),
+                host.identity.certificate_sha256.clone(),
+            );
+        }
         Principal::Anonymous => {
             fields.insert("kind".to_string(), "anonymous".to_string());
         }
@@ -1046,6 +1125,8 @@ pub struct AuthGrpcRouter<S> {
     mtls_auth_enabled: bool,
     allow_unauthenticated_users: bool,
     operator: Option<OperatorPrincipal>,
+    /// The connection presented the shared supervisor host certificate.
+    supervisor_host: Option<SupervisorHostPrincipal>,
     connection_source: Option<ConnectionSource>,
     logons: audit::Logons,
 }
@@ -1077,6 +1158,7 @@ impl<S> AuthGrpcRouter<S> {
             mtls_auth_enabled,
             allow_unauthenticated_users,
             operator: None,
+            supervisor_host: None,
             connection_source: None,
             logons: audit::Logons::default(),
         }
@@ -1084,6 +1166,12 @@ impl<S> AuthGrpcRouter<S> {
 
     fn with_operator(mut self, operator: Option<OperatorPrincipal>) -> Self {
         self.operator = operator;
+        self
+    }
+
+    /// The verified supervisor host identity of this connection, if any.
+    fn with_supervisor_host(mut self, supervisor_host: Option<SupervisorHostPrincipal>) -> Self {
+        self.supervisor_host = supervisor_host;
         self
     }
 
@@ -1144,6 +1232,7 @@ where
         let mtls_auth_enabled = self.mtls_auth_enabled;
         let allow_unauthenticated_users = self.allow_unauthenticated_users;
         let operator = self.operator.clone();
+        let supervisor_host = self.supervisor_host.clone();
         let connection_source = self.connection_source;
         let logons = self.logons.clone();
         let peer_certificate_sha256 = self.peer_certificate_sha256.clone();
@@ -1163,7 +1252,20 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            let principal = if let Some(operator) = operator {
+            let principal = if let Some(host) = supervisor_host {
+                if req.headers().contains_key(http::header::AUTHORIZATION) {
+                    audit::emit_authentication_failure(
+                        &path,
+                        &origin(req.headers()),
+                        Some(AuthMechanism::SupervisorHost),
+                        AuthFailureReason::ConflictingCredentials,
+                    );
+                    return Ok(status_response(tonic::Status::unauthenticated(
+                        "supervisor host certificates must not be combined with authorization headers",
+                    )));
+                }
+                Principal::SupervisorHost(host)
+            } else if let Some(operator) = operator {
                 if req.headers().contains_key(http::header::AUTHORIZATION) {
                     audit::emit_authentication_failure(
                         &path,
@@ -1270,12 +1372,20 @@ where
                 Principal::Peer(_) if !crate::auth::method_authz::is_peer_callable(&path) => {
                     method_denied("gateway peer principals may not call this method")
                 }
+                Principal::SupervisorHost(_)
+                    if !crate::auth::method_authz::is_supervisor_host_callable(&path) =>
+                {
+                    method_denied("supervisor hosts may call only the supervisor host stream")
+                }
                 Principal::Anonymous => {
                     return Ok(status_response(tonic::Status::unauthenticated(
                         "anonymous callers may not call authenticated methods",
                     )));
                 }
-                Principal::Operator(_) | Principal::Sandbox(_) | Principal::Peer(_) => None,
+                Principal::Operator(_)
+                | Principal::Sandbox(_)
+                | Principal::Peer(_)
+                | Principal::SupervisorHost(_) => None,
             };
             if let Some((denial, status)) = denial {
                 audit::emit_authorization_denial_for(&path, &origin, &principal, denial);
@@ -3479,6 +3589,102 @@ mod tests {
                     assert_eq!(grpc_status(&response).as_deref(), Some("7"));
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn supervisor_host_connections_reach_only_the_host_stream() {
+            let attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
+            let host = SupervisorHostPrincipal {
+                identity: openshell_core::supervisor_host::HostIdentity {
+                    subject: "openshell-supervisor-host".to_string(),
+                    certificate_sha256: "verified-leaf".to_string(),
+                },
+            };
+            // The host realm is set even when mTLS user promotion is on: the
+            // connection carries no peer identity, so it can never be a user.
+            let host_router = |recorder| {
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, true, false)
+                    .with_supervisor_host(Some(host.clone()))
+            };
+            for (method, permitted) in [
+                (attach, true),
+                ("/openshell.v1.OpenShell/ListSandboxes", false),
+                ("/openshell.v1.OpenShell/ConnectSupervisor", false),
+                ("/openshell.v1.OpenShell/GetProviderCredentials", false),
+                ("/openshell.v1.OpenShell/Unknown", false),
+            ] {
+                let (recorder, seen) = PrincipalRecorder::new();
+                let response = host_router(recorder)
+                    .call(empty_request(method))
+                    .await
+                    .unwrap();
+                if permitted {
+                    assert!(grpc_status(&response).is_none(), "{method}");
+                    assert!(matches!(
+                        *seen.lock().unwrap(),
+                        Some(Principal::SupervisorHost(_))
+                    ));
+                } else {
+                    assert_eq!(grpc_status(&response).as_deref(), Some("7"), "{method}");
+                }
+            }
+
+            // A host connection may not also present a bearer identity.
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut request = empty_request(attach);
+            request.headers_mut().insert(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static("Bearer user-token"),
+            );
+            let response = host_router(recorder).call(request).await.unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("16"));
+            assert!(seen.lock().unwrap().is_none());
+
+            // No other principal reaches the host stream: an mTLS user, an
+            // operator, a sandbox, a peer, or an unauthenticated dev user.
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::with_peer_identity(
+                recorder,
+                None,
+                None,
+                Some(mtls_identity("openshell-client")),
+                true,
+                false,
+            )
+            .call(empty_request(attach))
+            .await
+            .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::new(recorder, None, None)
+                .with_operator(Some(operator_principal()))
+                .call(empty_request(attach))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            for principal in [
+                sandbox("sandbox-a"),
+                Principal::Peer(crate::auth::principal::PeerPrincipal {
+                    replica_id: "replica".into(),
+                    pod_uid: "pod".into(),
+                }),
+            ] {
+                let chain = AuthenticatorChain::new(vec![Arc::new(MockAuthenticator::returning(
+                    Ok(Authentication::Accepted(principal)),
+                ))]);
+                let (recorder, _) = PrincipalRecorder::new();
+                let response = AuthGrpcRouter::new(recorder, Some(chain), None)
+                    .call(empty_request(attach))
+                    .await
+                    .unwrap();
+                assert_eq!(grpc_status(&response).as_deref(), Some("7"));
+            }
+            let (recorder, _) = PrincipalRecorder::new();
+            let response = AuthGrpcRouter::new(recorder, None, None)
+                .call(empty_request(attach))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status(&response).as_deref(), Some("7"));
         }
 
         #[tokio::test]

@@ -13,7 +13,7 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
-  - it: deploys one session host without Kubernetes identity in the gateway namespace
+  - it: deploys one instance host without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
       gatewayConfig:
@@ -51,8 +51,8 @@ tests:
             - https://openshell.gateway.svc.cluster.local:8080
             - --address
             - 0.0.0.0:5501
-            - --session-control-tls-dir
-            - /etc/openshell/session-control
+            - --host-tls-dir
+            - /etc/openshell/supervisor-host
             - --runtime-listen
             - 0.0.0.0:5500
             - --session-root
@@ -66,13 +66,13 @@ tests:
           path: spec.template.spec.containers[0].readinessProbe
           value:
             tcpSocket:
-              port: session-control
+              port: health
         documentIndex: 0
       - equal:
           path: spec.template.spec.containers[0].livenessProbe
           value:
             tcpSocket:
-              port: session-control
+              port: health
         documentIndex: 0
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
@@ -80,9 +80,13 @@ tests:
             name: run
             mountPath: /run/openshell
         documentIndex: 0
-      - lengthEqual:
+      - equal:
           path: spec.ports
-          count: 2
+          value:
+            - name: runtime
+              port: 5500
+              targetPort: runtime
+              protocol: TCP
         documentIndex: 1
       - equal:
           path: spec.template.spec.automountServiceAccountToken
@@ -103,9 +107,9 @@ tests:
       - contains:
           path: spec.template.spec.volumes
           content:
-            name: session-control
+            name: supervisor-host
             secret:
-              secretName: openshell-supervisor-control
+              secretName: openshell-supervisor-host
         documentIndex: 0
       - contains:
           path: spec.template.spec.volumes
@@ -132,20 +136,12 @@ tests:
           path: kind
           value: NetworkPolicy
         documentIndex: 2
-      - equal:
-          path: spec.ingress[0]
-          value:
-            from:
-              - podSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: openshell
-                    app.kubernetes.io/instance: openshell
-            ports:
-              - protocol: TCP
-                port: 5501
+      - lengthEqual:
+          path: spec.ingress
+          count: 1
         documentIndex: 2
       - equal:
-          path: spec.ingress[1]
+          path: spec.ingress[0]
           value:
             from:
               - namespaceSelector:
@@ -168,7 +164,7 @@ tests:
           gateway_id: gw-a
     asserts:
       - equal:
-          path: spec.ingress[1].from[0].namespaceSelector
+          path: spec.ingress[0].from[0].namespaceSelector
           value:
             matchLabels:
               openshell.ai/managed-by: openshell
@@ -184,7 +180,7 @@ tests:
           operator_namespace_label: example.com/openshell-workspace=true
     asserts:
       - equal:
-          path: spec.ingress[1].from[0].namespaceSelector
+          path: spec.ingress[0].from[0].namespaceSelector
           value:
             matchLabels:
               example.com/openshell-workspace: "true"
@@ -216,7 +212,7 @@ tests:
           path: metadata.name
           value: openshell-gateway-release-with-a-very-very-long-name-0057
         documentIndex: 1
-  - it: omits the gateway CA when gateway TLS is disabled
+  - it: requires gateway TLS for the host identity
     template: templates/supervisor.yaml
     set:
       server:
@@ -225,18 +221,8 @@ tests:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
     asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_TLS_CA
-            value: /var/run/secrets/openshell-tls/ca.crt
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_ENDPOINT
-            value: http://openshell.gateway.svc.cluster.local:8080
-        documentIndex: 0
+      - failedTemplate:
+          errorMessage: supervisor_topology=gateway requires gateway TLS; the shared supervisor authenticates with a client certificate
   - it: renders the chart-owned shared supervisor connection into gateway TOML
     template: templates/gateway-config.yaml
     set:
@@ -249,7 +235,7 @@ tests:
           pattern: 'supervisor_topology = "gateway"'
       - matchRegex:
           path: data["gateway.toml"]
-          pattern: 'shared_supervisor = \{ control_port = 5501, control_tls_dir = "/etc/openshell-tls/supervisor-control", runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway" \}'
+          pattern: 'shared_supervisor = \{ host_ca_file = "/etc/openshell-tls/supervisor-host/ca.crt", runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway" \}'
   - it: rejects a hand-written shared supervisor connection
     template: templates/supervisor.yaml
     set:

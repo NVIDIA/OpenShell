@@ -61,6 +61,7 @@ pub mod secrets;
 pub mod settings;
 pub mod shell;
 pub mod spiffe;
+pub mod supervisor_host;
 pub mod telemetry;
 pub mod time;
 pub mod token_grant_failure;

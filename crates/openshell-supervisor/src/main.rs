@@ -64,13 +64,15 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     gateway_endpoint: Option<String>,
 
-    /// Shared supervisor listen address, also used for TCP health probes.
+    /// Shared supervisor TCP health listener: it accepts and closes probe
+    /// connections and carries no control traffic.
     #[arg(long, required_if_eq("mode", "shared"))]
     address: Option<std::net::SocketAddr>,
 
-    /// Directory with shared-host session-control TLS credentials.
+    /// Directory with the shared supervisor's host client certificate
+    /// (`tls.crt`, `tls.key`) for its outbound gateway connection.
     #[arg(long, required_if_eq("mode", "shared"))]
-    session_control_tls_dir: Option<PathBuf>,
+    host_tls_dir: Option<PathBuf>,
 
     /// Listener for routed runtime-initiated Sandbox Protocol connections.
     #[arg(long, required_if_eq("mode", "shared"))]
@@ -405,7 +407,7 @@ fn main() -> Result<()> {
     }
     if args.gateway_endpoint.is_some()
         || args.address.is_some()
-        || args.session_control_tls_dir.is_some()
+        || args.host_tls_dir.is_some()
         || args.runtime_listen.is_some()
         || args.session_root.is_some()
     {

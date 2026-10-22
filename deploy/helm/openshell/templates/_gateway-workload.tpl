@@ -197,8 +197,8 @@ spec:
           readOnly: true
         {{- end }}
         {{- if include "openshell.supervisorEnabled" . }}
-        - name: supervisor-control
-          mountPath: /etc/openshell-tls/supervisor-control
+        - name: supervisor-host-ca
+          mountPath: /etc/openshell-tls/supervisor-host
           readOnly: true
         {{- end }}
         {{- with .Values.server.extraVolumeMounts }}
@@ -296,10 +296,14 @@ spec:
             path: ca.crt
     {{- end }}
     {{- if include "openshell.supervisorEnabled" . }}
-    # Admission credential for the shared supervisor's session-control API.
-    - name: supervisor-control
+    # CA of the shared supervisor's host certificate. Only the CA is projected;
+    # the host's private key stays with the supervisor.
+    - name: supervisor-host-ca
       secret:
-        secretName: {{ include "openshell.supervisorName" . }}-control-client
+        secretName: {{ include "openshell.supervisorName" . }}-host
+        items:
+          - key: ca.crt
+            path: ca.crt
     {{- end }}
     {{- if .Values.upstreamProxy.caBundle.configMapName }}
     - name: upstream-proxy-ca

@@ -763,6 +763,9 @@ pub struct ComputeRuntime {
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
     supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
+    /// Desired assignments of the shared supervisor host, when the in-process
+    /// driver installed one.
+    supervisor_host: Option<openshell_core::supervisor_host::SupervisorHostController>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -871,7 +874,25 @@ impl ComputeRuntime {
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
             supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+            supervisor_host: None,
         })
+    }
+
+    /// Serve the shared supervisor host that the in-process driver installed.
+    pub(crate) fn with_supervisor_host(
+        mut self,
+        supervisor_host: Option<openshell_core::supervisor_host::SupervisorHostController>,
+    ) -> Self {
+        self.supervisor_host = supervisor_host;
+        self
+    }
+
+    /// Gateway-owned assignments of the shared supervisor host, if any.
+    #[must_use]
+    pub fn supervisor_host(
+        &self,
+    ) -> Option<&openshell_core::supervisor_host::SupervisorHostController> {
+        self.supervisor_host.as_ref()
     }
 
     pub(crate) fn configure_ssh_identities(
@@ -7850,6 +7871,7 @@ pub fn new_test_runtime_with_driver(
         restart_notify: Arc::new(Notify::new()),
         ssh_identities: Arc::new(OnceLock::new()),
         supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+        supervisor_host: None,
     }
 }
 
@@ -8970,6 +8992,7 @@ mod tests {
             restart_notify: Arc::new(Notify::new()),
             ssh_identities: Arc::new(OnceLock::new()),
             supervisor_ocsf_headers: Arc::new(OnceLock::new()),
+            supervisor_host: None,
         }
     }
 

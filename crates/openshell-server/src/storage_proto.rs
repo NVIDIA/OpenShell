@@ -535,6 +535,7 @@ mod tests {
         let mut compiled_method_count = 0;
         let mut isolation_methods = BTreeSet::new();
         let mut sandbox_protocol_methods = BTreeSet::new();
+        let mut supervisor_host_methods = BTreeSet::new();
         for file in &public.file {
             let package = file.package.as_deref().unwrap_or_default();
             for service in &file.service {
@@ -556,6 +557,14 @@ mod tests {
                             .name
                             .as_deref()
                             .expect("sandbox protocol method name")
+                    }));
+                }
+                // Private gateway-to-shared-supervisor protocol: served by the
+                // gateway but never part of the public SDK surface.
+                if package == "openshell.supervisor.host.v1" {
+                    assert_eq!(service_name, "SupervisorHost");
+                    supervisor_host_methods.extend(service.method.iter().map(|method| {
+                        method.name.as_deref().expect("supervisor host method name")
                     }));
                 }
                 if !matches!(
@@ -594,6 +603,7 @@ mod tests {
             sandbox_protocol_methods,
             BTreeSet::from(["Exchange", "Mediate"])
         );
+        assert_eq!(supervisor_host_methods, BTreeSet::from(["Attach"]));
         for signature in PROVIDER_READINESS_RPC_SIGNATURES {
             assert!(
                 methods.iter().any(|method| method == signature),
@@ -618,7 +628,8 @@ mod tests {
                 + PEER_OWNER_RPC_SIGNATURES.len()
                 + PEER_CONFIG_RPC_SIGNATURES.len()
                 + isolation_methods.len()
-                + sandbox_protocol_methods.len(),
+                + sandbox_protocol_methods.len()
+                + supervisor_host_methods.len(),
             "classify every compiled RPC"
         );
         assert_eq!(
@@ -638,6 +649,11 @@ mod tests {
                 + PEER_CONFIG_RPC_SIGNATURES.len()
         );
         assert!(methods.iter().all(|method| !method.contains(".storage.")));
+        assert!(
+            methods
+                .iter()
+                .all(|method| !method.contains(".supervisor.host."))
+        );
 
         let public_closure = schema_closure(&index, public_roots);
         let durable_closure =

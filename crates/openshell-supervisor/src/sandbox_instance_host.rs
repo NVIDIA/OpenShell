@@ -28,7 +28,7 @@ use std::time::Duration;
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use openshell_core::grpc_client::GatewayCredentials;
 use openshell_ocsf::OcsfJsonSettings;
-use openshell_sandbox_backend::session_control::{
+use openshell_sandbox_backend::sandbox_instance::{
     SandboxInstancePhaseReport, SandboxInstanceStatusReport,
 };
 use openshell_supervisor_network::policy_local::{DenialLogSource, SandboxInstanceDenialLog};
@@ -187,6 +187,16 @@ impl HostedSandboxInstance {
 
 type Instances = Arc<Mutex<HashMap<String, HostedSandboxInstance>>>;
 
+/// Wakes observers of the registry whenever any instance's status changes.
+#[derive(Clone)]
+struct ChangeNotifier(Arc<watch::Sender<u64>>);
+
+impl ChangeNotifier {
+    fn notify(&self) {
+        self.0.send_modify(|changes| *changes += 1);
+    }
+}
+
 fn lock(instances: &Instances) -> MutexGuard<'_, HashMap<String, HostedSandboxInstance>> {
     instances
         .lock()
@@ -205,6 +215,7 @@ pub struct SandboxInstanceHost {
     instances: Instances,
     next_serial: AtomicU64,
     root: PathBuf,
+    changes: ChangeNotifier,
 }
 
 impl SandboxInstanceHost {
@@ -219,7 +230,15 @@ impl SandboxInstanceHost {
             instances: Arc::default(),
             next_serial: AtomicU64::new(0),
             root,
+            changes: ChangeNotifier(Arc::new(watch::Sender::new(0))),
         })
+    }
+
+    /// Notified whenever an instance is admitted, changes phase or readiness,
+    /// or is removed. The value only counts changes.
+    #[must_use]
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.changes.0.subscribe()
     }
 
     /// Admit a sandbox instance and start the runtime `launch` prepares in
@@ -268,7 +287,9 @@ impl SandboxInstanceHost {
         let started = prepare_instance_dir(&dir)
             .map_err(|error| E::from(SandboxInstanceHostError::Files(error.to_string())))
             .and_then(|()| launch(&dir))
-            .and_then(|(bindings, body)| spawn_instance(bindings, body).map_err(E::from));
+            .and_then(|(bindings, body)| {
+                spawn_instance(bindings, body, self.changes.clone()).map_err(E::from)
+            });
         let running = match started {
             Ok(running) => running,
             Err(error) => {
@@ -290,6 +311,7 @@ impl SandboxInstanceHost {
                 removal: None,
             },
         );
+        self.changes.notify();
         Ok(SandboxInstanceAdmitted::Created)
     }
 
@@ -372,9 +394,11 @@ impl SandboxInstanceHost {
                 dir: self.root.join(key),
                 grace,
                 report,
+                changes: self.changes.clone(),
             }
             .run(),
         );
+        self.changes.notify();
         Some((removed, instance.sandbox_id.clone()))
     }
 }
@@ -389,6 +413,7 @@ struct Removal {
     dir: PathBuf,
     grace: Duration,
     report: watch::Sender<Option<SandboxInstanceStatusReport>>,
+    changes: ChangeNotifier,
 }
 
 impl Removal {
@@ -439,6 +464,7 @@ impl Removal {
             }
         }
         self.report.send_replace(Some(status));
+        self.changes.notify();
     }
 }
 
@@ -454,6 +480,7 @@ struct RunningInstance {
 fn spawn_instance(
     bindings: SandboxInstanceBindings,
     body: SandboxInstanceBody,
+    changes: ChangeNotifier,
 ) -> std::result::Result<RunningInstance, SandboxInstanceHostError> {
     let (stop, stop_requested) = watch::channel(false);
     let (abort, abort_requested) = watch::channel(false);
@@ -471,6 +498,7 @@ fn spawn_instance(
                     abort_requested,
                     phase: phase_tx,
                     ready: ready_tx,
+                    changes,
                 },
             );
         })
@@ -492,6 +520,7 @@ struct SandboxInstanceSignals {
     abort_requested: watch::Receiver<bool>,
     phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
+    changes: ChangeNotifier,
 }
 
 /// Reports a hosted sandbox instance's end and revokes its credentials,
@@ -501,6 +530,7 @@ struct SandboxInstanceExit {
     phase: watch::Sender<SandboxInstancePhaseReport>,
     ready: watch::Sender<bool>,
     outcome: Option<SandboxInstancePhaseReport>,
+    changes: ChangeNotifier,
 }
 
 impl Drop for SandboxInstanceExit {
@@ -514,6 +544,7 @@ impl Drop for SandboxInstanceExit {
                 error: "sandbox instance thread ended without reporting a result".to_string(),
             });
         self.phase.send_replace(outcome);
+        self.changes.notify();
         unbind_thread();
     }
 }
@@ -528,12 +559,14 @@ fn run_hosted_sandbox_instance(
         mut abort_requested,
         phase,
         ready,
+        changes,
     } = signals;
     let mut exit = SandboxInstanceExit {
         credentials: bindings.gateway_credentials.clone(),
         phase: phase.clone(),
         ready: ready.clone(),
         outcome: None,
+        changes: changes.clone(),
     };
     bind_thread(bindings);
     let thread_bindings = bindings.clone();
@@ -551,12 +584,13 @@ fn run_hosted_sandbox_instance(
                     let (readiness, mut accepted) = watch::channel(false);
                     let mirror_phase = phase.clone();
                     let mirror_ready = ready.clone();
+                    let mirror_changes = changes.clone();
                     let mirror = tokio::spawn(async move {
                         loop {
                             let is_ready = *accepted.borrow_and_update();
-                            mirror_ready.send_replace(is_ready);
-                            if is_ready {
-                                mirror_phase.send_if_modified(|current| {
+                            let changed = mirror_ready.send_replace(is_ready) != is_ready;
+                            let promoted = is_ready
+                                && mirror_phase.send_if_modified(|current| {
                                     let promote =
                                         *current == SandboxInstancePhaseReport::Starting;
                                     if promote {
@@ -564,18 +598,24 @@ fn run_hosted_sandbox_instance(
                                     }
                                     promote
                                 });
+                            if changed || promoted {
+                                mirror_changes.notify();
                             }
                             if accepted.changed().await.is_err() {
-                                mirror_ready.send_replace(false);
+                                if mirror_ready.send_replace(false) {
+                                    mirror_changes.notify();
+                                }
                                 return;
                             }
                         }
                     });
                     let mut stop = stop_requested.clone();
                     let stop_phase = phase.clone();
+                    let stop_changes = changes.clone();
                     let shutdown = Box::pin(async move {
                         let _ = stop.wait_for(|requested| *requested).await;
                         stop_phase.send_replace(SandboxInstancePhaseReport::Stopping);
+                        stop_changes.notify();
                     });
                     let instance = body(SandboxInstanceControls {
                         shutdown,

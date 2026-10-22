@@ -291,6 +291,11 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        // With the gateway supervisor topology, the driver owns the shared
+        // supervisor's assignments and the gateway serves them to the host.
+        if let Some(controller) = driver.supervisor_host_controller() {
+            context.install_supervisor_host(controller)?;
+        }
         let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),

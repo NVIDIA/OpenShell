@@ -16,15 +16,15 @@ use crate::isolation::{
 use crate::lifecycle::LifecycleGates;
 use crate::sandbox_runtime::{
     BOUNDARY_CERTIFICATE_PATH, BOUNDARY_CONFIG_PATH, BOUNDARY_PRIVATE_KEY_PATH, ClientTlsMaterial,
-    SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames, SupervisorClientTls,
-    boundary_service, boundary_service_matches_mode, control_policy, generate_proxy_ca_material,
-    image_pull_secret_copy, sandbox_bootstrap_secret,
+    SHARED_INSTANCE_KEY, SUPERVISOR_TERMINATION_GRACE_PERIOD_SECONDS, SandboxRuntimeNames,
+    SupervisorClientTls, boundary_service, boundary_service_matches_mode, control_policy,
+    generate_proxy_ca_material, image_pull_secret_copy, sandbox_bootstrap_secret,
     sandbox_owner_reference as sandbox_runtime_sandbox_owner_reference, shared_control_policy,
-    supervisor_bootstrap_secret, supervisor_pod, workload_fence,
+    shared_instance_secret, supervisor_bootstrap_secret, supervisor_pod, workload_fence,
 };
 use crate::shared_supervisor::{
     ANNOTATION_SUPERVISOR_SESSION, ANNOTATION_SUPERVISOR_TOPOLOGY, GATEWAY_TOPOLOGY,
-    SharedSupervisor, SupervisorPlacement, supervisor_placement,
+    SharedSupervisor, SupervisorPlacement, reported, supervisor_placement,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::authentication::v1::{
@@ -69,6 +69,7 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
+use openshell_core::supervisor_host::{AssignmentError, ObservedInstance};
 use openshell_isolation_interface::contract::ResolvedWorkloadIdentity;
 use openshell_sandbox_backend::boundary_protocol::{
     GatewayVerificationKey, SandboxTlsClientConfig, SandboxTlsServerConfig,
@@ -416,7 +417,6 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
 /// Unsupervised shared sandbox instances removed at once by one reconcile pass.
-const SHARED_INSTANCE_GC_CONCURRENCY: usize = 4;
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
 
@@ -892,7 +892,8 @@ pub struct KubernetesComputeDriver {
     lifecycle_gates: Arc<LifecycleGates>,
     config: KubernetesComputeConfig,
     operator_allowlist: Option<OperatorNamespaceAllowlist>,
-    /// Session-control client while new generations use the gateway topology.
+    /// Desired shared sandbox instances while new generations use the gateway
+    /// topology.
     shared_supervisor: Option<SharedSupervisor>,
 }
 
@@ -2368,7 +2369,7 @@ impl KubernetesComputeDriver {
             Ok(runtime_identity) => runtime_identity,
             Err(error) => {
                 warn!(sandbox_id = %sandbox.id, %error, "sandbox-runtime provisioning failed; rolling back Sandbox CR");
-                self.remove_shared_instance(&placement).await;
+                self.remove_shared_instance(&placement);
                 let _ = agent_sandbox_api
                     .api
                     .delete(&kube_name, &DeleteParams::default())
@@ -3025,23 +3026,32 @@ impl KubernetesComputeDriver {
         }
     }
 
-    /// Remove a shared generation's sandbox instance, if any. Instance loss
-    /// also ends supervision when the workload is suspended, so failures only
-    /// log.
-    async fn remove_shared_instance(&self, placement: &SupervisorPlacement) {
+    /// Withdraw a shared generation's sandbox instance, if any, so the host
+    /// stops it. Instance loss also ends supervision when the workload is
+    /// suspended, so a missing configuration only logs.
+    fn remove_shared_instance(&self, placement: &SupervisorPlacement) {
         let SupervisorPlacement::Shared { route } = placement else {
             return;
         };
-        let Some(shared) = &self.shared_supervisor else {
+        if let Some(shared) = &self.shared_supervisor {
+            shared.withdraw(route);
+        } else {
             warn!(
                 route,
-                "shared supervisor is not configured; its sandbox instance cannot be removed"
+                "shared supervisor is not configured; its sandbox instance cannot be withdrawn"
             );
-            return;
-        };
-        if let Err(error) = shared.remove(route).await {
-            warn!(route, %error, "could not remove shared supervisor sandbox instance");
         }
+    }
+
+    /// The gateway-owned assignments of the shared supervisor host, when the
+    /// gateway topology is configured. The gateway serves them to the host.
+    #[must_use]
+    pub fn supervisor_host_controller(
+        &self,
+    ) -> Option<openshell_core::supervisor_host::SupervisorHostController> {
+        self.shared_supervisor
+            .as_ref()
+            .map(|shared| shared.controller().clone())
     }
 
     /// Read operator-provided bootstrap material once per generation, so the
@@ -3475,6 +3485,7 @@ impl KubernetesComputeDriver {
         .provision()
         .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
         let workload_owner = runtime_pod_owner(&workload_pod_name, &workload_pod_uid);
+        let instance_owner = workload_owner.clone();
         let sandbox_secret = sandbox_bootstrap_secret(
             namespace,
             names,
@@ -3542,19 +3553,37 @@ impl KubernetesComputeDriver {
                     vec![workload_owner],
                 )
                 .await?;
-                // Registration only admits the instance; it does not wait for
-                // the runtime, so the gateway can persist this generation
-                // before the supervisor reads its configuration.
-                shared
-                    .register(&shared_instance_registration(
-                        &admission_object,
-                        route,
-                        sandbox_id,
-                        provisioned.runtime_descriptor,
-                        launch_authentication,
-                        proxy_ca,
-                    )?)
-                    .await?;
+                let registration = shared_instance_registration(
+                    &admission_object,
+                    route,
+                    sandbox_id,
+                    provisioned.runtime_descriptor,
+                    launch_authentication,
+                    proxy_ca,
+                )?;
+                // The launch material is persisted with the generation first,
+                // so a restarted gateway rebuilds the host's assignments from
+                // the generation's own resources; assignment then publishes it
+                // to the host without waiting for the runtime.
+                let launch_material = serde_json::to_vec(&registration).map_err(|error| {
+                    KubernetesDriverError::Message(format!(
+                        "encode sandbox instance registration: {error}"
+                    ))
+                })?;
+                secrets
+                    .create(
+                        &PostParams::default(),
+                        &shared_instance_secret(
+                            namespace,
+                            names,
+                            sandbox_id,
+                            launch_material,
+                            instance_owner,
+                        ),
+                    )
+                    .await
+                    .map_err(KubernetesDriverError::from_kube)?;
+                shared.assign(&registration)?;
             }
         }
         pods.patch(
@@ -4040,7 +4069,7 @@ impl KubernetesComputeDriver {
 
         if let Err(error) = restart {
             // The restart patch may not have recorded the sandbox instance yet.
-            self.remove_shared_instance(&placement).await;
+            self.remove_shared_instance(&placement);
             if let Err(rollback_error) = self.stop_sandbox_inner(sandbox_id).await {
                 return Err(KubernetesDriverError::Message(format!(
                     "restart failed: {error}; rollback remains pending: {rollback_error}"
@@ -4165,7 +4194,7 @@ impl KubernetesComputeDriver {
                     .await
             }
             SupervisorPlacement::Shared { .. } => {
-                self.remove_shared_instance(placement).await;
+                self.remove_shared_instance(placement);
                 Ok(())
             }
         }
@@ -4361,8 +4390,7 @@ impl KubernetesComputeDriver {
                 // stop it gracefully; end the instance without delaying the
                 // delete.
                 if let Some(placement @ SupervisorPlacement::Shared { .. }) = placement {
-                    let driver = self.clone();
-                    tokio::spawn(async move { driver.remove_shared_instance(&placement).await });
+                    self.remove_shared_instance(&placement);
                 }
                 {
                     let pod_api = Api::<Pod>::namespaced(self.client.clone(), &obj_namespace);
@@ -4458,20 +4486,12 @@ impl KubernetesComputeDriver {
                 return;
             }
         };
-        // List sandbox instances before Sandboxes: a generation records its
-        // route on its Sandbox before registering, so every instance listed
-        // here whose Sandbox still supervises it appears in the Sandbox list
-        // below.
-        let instances = match &self.shared_supervisor {
-            Some(shared) => match shared.list().await {
-                Ok(list) => Some(list.sessions),
-                Err(error) => {
-                    warn!(%error, "could not list shared supervisor sandbox instances; reconciliation will retry");
-                    None
-                }
-            },
-            None => None,
-        };
+        // Read the desired revision before the list so a lifecycle edit that
+        // lands in between cannot be undone by the resync below.
+        let shared_baseline = self
+            .shared_supervisor
+            .as_ref()
+            .map(SharedSupervisor::revision);
         let list = match tokio::time::timeout(
             KUBE_API_TIMEOUT,
             lookup_api
@@ -4491,9 +4511,11 @@ impl KubernetesComputeDriver {
             }
         };
 
-        if let Some(instances) = instances {
-            self.remove_unsupervised_instances(instances, &list.items)
-                .await;
+        // The shared supervisor's desired set is derived from the Sandbox
+        // resources that may run, so instances of deleted Sandboxes and of
+        // stops that happened while this gateway was down are withdrawn here.
+        if let Some(baseline) = shared_baseline {
+            self.resync_shared_instances(baseline, &list.items).await;
         }
 
         for object in list.items {
@@ -4747,33 +4769,107 @@ impl KubernetesComputeDriver {
         }
     }
 
-    /// Remove shared sandbox instances that no Sandbox's current generation may
-    /// still run, such as those of deleted Sandboxes or of stops that could
-    /// not reach the shared supervisor.
-    async fn remove_unsupervised_instances(
-        &self,
-        instances: Vec<openshell_sandbox_backend::session_control::SandboxInstanceStatusReport>,
-        sandboxes: &[DynamicObject],
-    ) {
+    /// Rebuild the shared supervisor's desired set from the generations that
+    /// may run: their launch material comes from the current assignment or
+    /// from the generation's launch Secret. A failed read keeps the previous
+    /// set, because an incomplete set would stop running instances, and a
+    /// list that raced a lifecycle edit is refused by the controller.
+    async fn resync_shared_instances(&self, baseline: u64, sandboxes: &[DynamicObject]) {
         let Some(shared) = &self.shared_supervisor else {
             return;
         };
-        let supervised = supervised_shared_routes(sandboxes);
-        let orphans = instances
-            .into_iter()
-            .filter(|instance| !supervised.contains(&instance.route));
-        // Removals hold session-control connections while workloads stop.
-        futures::stream::iter(orphans)
-            .for_each_concurrent(SHARED_INSTANCE_GC_CONCURRENCY, |instance| async move {
-                info!(
-                    sandbox_id = instance.sandbox_id,
-                    "removing shared supervisor sandbox instance that no sandbox generation supervises"
-                );
-                if let Err(error) = shared.remove(&instance.route).await {
-                    warn!(sandbox_id = instance.sandbox_id, %error, "could not remove unsupervised shared sandbox instance");
+        let mut assignments = Vec::new();
+        for (object, route) in runnable_shared_generations(sandboxes) {
+            if let Some(assignment) = shared.assignment(&route) {
+                assignments.push(assignment);
+                continue;
+            }
+            let (Ok(sandbox_id), Some(generation)) = (
+                sandbox_id_from_object(object),
+                sandbox_runtime_generation(object),
+            ) else {
+                continue;
+            };
+            let namespace = object
+                .metadata
+                .namespace
+                .as_deref()
+                .unwrap_or(&self.config.namespace);
+            match self
+                .read_shared_instance_registration(namespace, &sandbox_id, generation, &route)
+                .await
+                .and_then(|registration| {
+                    registration
+                        .map(|registration| registration.to_assignment())
+                        .transpose()
+                        .map_err(|error| KubernetesDriverError::Message(error.to_string()))
+                }) {
+                Ok(Some(assignment)) => assignments.push(assignment),
+                Ok(None) => warn!(
+                    sandbox_id,
+                    route, "shared sandbox instance has no launch material; it stays unassigned"
+                ),
+                Err(error) => {
+                    warn!(sandbox_id, route, %error, "could not read shared sandbox instance launch material; keeping the previous assignments");
+                    return;
                 }
-            })
-            .await;
+            }
+        }
+        match shared.resync(baseline, assignments) {
+            Ok(_) | Err(AssignmentError::Conflict { .. }) => {}
+            Err(error) => {
+                warn!(%error, "could not publish the shared sandbox instances; keeping the previous assignments");
+            }
+        }
+    }
+
+    /// Launch material persisted with a shared generation, or `None` when its
+    /// Secret is gone or belongs to a dedicated generation.
+    async fn read_shared_instance_registration(
+        &self,
+        namespace: &str,
+        sandbox_id: &str,
+        generation: &str,
+        route: &str,
+    ) -> Result<
+        Option<openshell_sandbox_backend::sandbox_instance::SandboxInstanceRegistration>,
+        KubernetesDriverError,
+    > {
+        let names = SandboxRuntimeNames::for_generation(sandbox_id, generation);
+        let secrets = Api::<Secret>::namespaced(self.client.clone(), namespace);
+        let secret =
+            tokio::time::timeout(KUBE_API_TIMEOUT, secrets.get_opt(&names.supervisor_secret))
+                .await
+                .map_err(|_| {
+                    KubernetesDriverError::Message(
+                        "timed out reading the shared sandbox instance launch Secret".to_string(),
+                    )
+                })?
+                .map_err(KubernetesDriverError::from_kube)?;
+        let Some(material) = secret
+            .as_ref()
+            .and_then(|secret| secret.data.as_ref())
+            .and_then(|data| data.get(SHARED_INSTANCE_KEY))
+        else {
+            return Ok(None);
+        };
+        // Decoder errors can quote field values, including credentials.
+        let registration: openshell_sandbox_backend::sandbox_instance::SandboxInstanceRegistration =
+            serde_json::from_slice(&material.0).map_err(|_| {
+                KubernetesDriverError::Message(
+                    "shared sandbox instance launch Secret is not a valid registration".to_string(),
+                )
+            })?;
+        if registration.route != route || registration.sandbox_id != sandbox_id {
+            return Err(KubernetesDriverError::Precondition(
+                "shared sandbox instance launch Secret does not match the recorded generation"
+                    .to_string(),
+            ));
+        }
+        registration
+            .validate()
+            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        Ok(Some(registration))
     }
 
     async fn reconcile_sandbox_runtime_suspending(
@@ -4800,9 +4896,9 @@ impl KubernetesComputeDriver {
                 return;
             }
         }
-        // Completion forgets the placement, so end a shared sandbox instance now.
+        // Completion forgets the placement, so withdraw a shared sandbox instance now.
         if let Ok(placement) = supervisor_placement(object) {
-            self.remove_shared_instance(&placement).await;
+            self.remove_shared_instance(&placement);
         }
         if let Err(error) = self
             .delete_sandbox_runtime_supervisor(
@@ -5288,15 +5384,16 @@ fn placement_for_release(object: &DynamicObject, sandbox_id: &str) -> Supervisor
     })
 }
 
-/// Sandbox instance routes of the shared generations that may currently run.
-fn supervised_shared_routes(sandboxes: &[DynamicObject]) -> HashSet<String> {
+/// Shared generations that may currently run, with their sandbox instance
+/// routes: the desired set of the shared supervisor.
+fn runnable_shared_generations(sandboxes: &[DynamicObject]) -> Vec<(&DynamicObject, String)> {
     sandboxes
         .iter()
         .filter(|object| {
             sandbox_runtime_should_run(object) || sandbox_runtime_bootstrap_in_progress(object)
         })
         .filter_map(|object| match supervisor_placement(object) {
-            Ok(SupervisorPlacement::Shared { route }) => Some(route),
+            Ok(SupervisorPlacement::Shared { route }) => Some((object, route)),
             _ => None,
         })
         .collect()
@@ -5328,10 +5425,10 @@ fn shared_instance_registration(
     launch_authentication: &openshell_core::jwt::SandboxLaunchAuthentication,
     proxy_ca: crate::sandbox_runtime::ProxyCaMaterial,
 ) -> Result<
-    openshell_sandbox_backend::session_control::SandboxInstanceRegistration,
+    openshell_sandbox_backend::sandbox_instance::SandboxInstanceRegistration,
     KubernetesDriverError,
 > {
-    use openshell_sandbox_backend::session_control::{
+    use openshell_sandbox_backend::sandbox_instance::{
         ProxyCaMaterial, RegistrationTraceContext, SandboxInstanceRegistration, SecretPem,
     };
     let trace = openshell_otel::current_trace_context_environment();
@@ -5417,11 +5514,20 @@ impl BootstrapControl {
                 }
             }
             Self::SharedInstance { shared, route } => loop {
-                match shared.status(&route).await {
-                    Ok(Some(status)) if status.ready => return true,
-                    Ok(Some(status)) if status.phase.is_terminal() => return false,
-                    Ok(None) => return false,
-                    Ok(Some(_)) | Err(_) => {}
+                match shared.observed(&route) {
+                    ObservedInstance::Reported(status) => {
+                        let status = reported(&status);
+                        if status.ready {
+                            return true;
+                        }
+                        if status.phase.is_terminal() {
+                            return false;
+                        }
+                    }
+                    ObservedInstance::Absent => return false,
+                    // A disconnected or still-reconciling host is not a
+                    // verdict; keep waiting within the bootstrap grace.
+                    ObservedInstance::Pending | ObservedInstance::NoHost => {}
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             },
@@ -6429,26 +6535,37 @@ async fn shared_instance_control_availability(
             }
         }
     };
-    let (instance, fence, control) = tokio::join!(
-        shared.status(route),
+    // Only a host that has reconciled to the assigning snapshot can render a
+    // verdict on the instance; a disconnected or still-reconciling host must
+    // not read as a terminal failure and suspend a running sandbox.
+    let instance = match shared.observed(route) {
+        ObservedInstance::Reported(status) => {
+            let status = reported(&status);
+            if status.sandbox_id != sandbox_id || status.phase.is_terminal() {
+                SandboxRuntimeControlAvailability::Unavailable
+            } else if status.ready {
+                SandboxRuntimeControlAvailability::Available
+            } else {
+                SandboxRuntimeControlAvailability::Degraded
+            }
+        }
+        ObservedInstance::Pending => SandboxRuntimeControlAvailability::Degraded,
+        ObservedInstance::Absent => SandboxRuntimeControlAvailability::Unavailable,
+        ObservedInstance::NoHost => {
+            warn!(
+                sandbox_id,
+                "no shared supervisor host is connected; sandbox instance availability is unknown"
+            );
+            SandboxRuntimeControlAvailability::Unknown
+        }
+    };
+    let (fence, control) = tokio::join!(
         tokio::time::timeout(KUBE_API_TIMEOUT, policies.get_opt(&names.workload_policy)),
         tokio::time::timeout(
             KUBE_API_TIMEOUT,
             policies.get_opt(&names.shared_control_policy)
         ),
     );
-    let instance = match instance {
-        Ok(Some(status)) if status.sandbox_id != sandbox_id || status.phase.is_terminal() => {
-            SandboxRuntimeControlAvailability::Unavailable
-        }
-        Ok(Some(status)) if status.ready => SandboxRuntimeControlAvailability::Available,
-        Ok(Some(_)) => SandboxRuntimeControlAvailability::Degraded,
-        Ok(None) => SandboxRuntimeControlAvailability::Unavailable,
-        Err(error) => {
-            warn!(sandbox_id, %error, "could not determine shared supervisor sandbox instance availability");
-            SandboxRuntimeControlAvailability::Unknown
-        }
-    };
     combine_sandbox_runtime_control_availability([
         instance,
         exists(fence, "workload fence"),
@@ -9462,7 +9579,7 @@ mod tests {
         let stopped = "rt-stopped-route-00001";
         let mut dedicated = sandbox_object_for_test("dedicated", "dedicated");
         dedicated.data = serde_json::json!({"spec": {"operatingMode": "Running"}});
-        let routes = supervised_shared_routes(&[
+        let sandboxes = [
             shared(running, "Running", &[]),
             // A stop in progress still ends its sandbox instance itself.
             shared(
@@ -9472,7 +9589,11 @@ mod tests {
             ),
             shared(stopped, "Suspended", &[]),
             dedicated,
-        ]);
+        ];
+        let routes = runnable_shared_generations(&sandboxes)
+            .into_iter()
+            .map(|(_, route)| route)
+            .collect::<HashSet<_>>();
         assert_eq!(
             routes,
             HashSet::from([running.to_string(), stopping.to_string()])

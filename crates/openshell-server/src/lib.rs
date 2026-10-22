@@ -73,7 +73,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::LazyLock;
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -246,7 +246,7 @@ pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
-pub use tls::TlsAcceptor;
+pub use tls::{PeerRealm, TlsAcceptor, TlsHandshake};
 use tracing_bus::TracingLogBus;
 
 pub(crate) struct ServerStartupConfig {
@@ -933,6 +933,7 @@ pub(crate) async fn run_server(
     }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
+    let supervisor_host = state.compute.supervisor_host();
     let tls_acceptor = if let Some(tls) = &config.tls {
         let acceptor = TlsAcceptor::from_files(
             &tls.cert_path,
@@ -943,6 +944,19 @@ pub(crate) async fn run_server(
             tls.external_key_path.as_deref(),
             tls.external_server_names.clone(),
         )?;
+        // The shared supervisor host authenticates with a client certificate
+        // from its own CA; the handshake accepts it and the connection is
+        // classified as a host, never as a user.
+        let acceptor = match supervisor_host {
+            Some(host) => {
+                info!(
+                    trust_anchor = %host.trust_anchor_path().display(),
+                    "shared supervisor host assignment stream enabled"
+                );
+                acceptor.with_supervisor_host_ca(host.trust_anchor_path())?
+            }
+            None => acceptor,
+        };
 
         // Spawn file-watcher-based TLS certificate reload worker.
         // Watches parent directories of cert/key/CA files and atomically
@@ -950,6 +964,10 @@ pub(crate) async fn run_server(
         acceptor.spawn_reload_worker(shutdown_rx.clone());
 
         Some(acceptor)
+    } else if supervisor_host.is_some() {
+        return Err(Error::config(
+            "the shared supervisor host requires gateway TLS; enable TLS or disable supervisor_topology",
+        ));
     } else {
         info!("TLS disabled — accepting plaintext connections");
         None
@@ -1190,12 +1208,30 @@ fn spawn_gateway_connection(
                     );
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
-                    // acceptor.acceptor() snapshots the current TLS config;
-                    // the returned acceptor owns an Arc that stays alive for
-                    // the full duration of the handshake.
-                    match acceptor.acceptor().accept(stream).await {
+                    // acceptor.handshake() snapshots the current TLS config
+                    // and verifiers together; the snapshot stays alive for
+                    // the handshake and classifies its result.
+                    let handshake = acceptor.handshake();
+                    match handshake.accept(stream).await {
                         Ok(tls_stream) => {
-                            let peer_identity = multiplex::extract_peer_identity(&tls_stream);
+                            // A presented certificate must belong to exactly
+                            // one realm; anything else closes the connection.
+                            let (peer_identity, supervisor_host) = match handshake
+                                .classify(&tls_stream)
+                            {
+                                Ok(PeerRealm::Anonymous) => (None, None),
+                                Ok(PeerRealm::Client) => {
+                                    (multiplex::extract_peer_identity(&tls_stream), None)
+                                }
+                                Ok(PeerRealm::SupervisorHost(identity)) => (
+                                    None,
+                                    Some(auth::principal::SupervisorHostPrincipal { identity }),
+                                ),
+                                Err(e) => {
+                                    warn!(error = %e, client = %addr, "Rejected client certificate");
+                                    return;
+                                }
+                            };
                             let certificate_sha256 =
                                 match multiplex::extract_peer_certificate_sha256(&tls_stream) {
                                     Ok(fingerprint) => fingerprint,
@@ -1210,6 +1246,7 @@ fn spawn_gateway_connection(
                                     peer_identity,
                                     certificate_sha256,
                                     ConnectionSource::Peer(addr),
+                                    supervisor_host,
                                 )
                                 .await
                             {
@@ -1617,9 +1654,23 @@ impl ComputeDriverConfigContext<'_> {
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
+    supervisor_host: &'a OnceLock<openshell_core::supervisor_host::SupervisorHostController>,
 }
 
 impl ComputeDriverBuildContext<'_> {
+    /// Let the gateway serve the shared supervisor host whose desired
+    /// assignments this in-process driver owns. The gateway adds the
+    /// controller's trust anchor to its TLS client roots and routes
+    /// authenticated host streams to it.
+    pub fn install_supervisor_host(
+        &self,
+        controller: openshell_core::supervisor_host::SupervisorHostController,
+    ) -> Result<()> {
+        self.supervisor_host.set(controller).map_err(|_| {
+            Error::config("a compute driver may install only one supervisor host controller")
+        })
+    }
+
     #[must_use]
     pub fn config_context(&self) -> ComputeDriverConfigContext<'_> {
         self.config
@@ -1737,6 +1788,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
+            let supervisor_host = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1746,8 +1798,10 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
+                supervisor_host: &supervisor_host,
             };
             let instance = registration.factory.build(build_context).await?;
+            let supervisor_host = supervisor_host.into_inner();
             match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
@@ -1762,7 +1816,13 @@ async fn build_compute_runtime(
                 .await
                 .map_err(|error| {
                     Error::execution(format!("failed to create compute runtime: {error}"))
-                })?,
+                })?
+                .with_supervisor_host(supervisor_host),
+                ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
+                    return Err(Error::config(
+                        "only an in-process compute driver can install a supervisor host controller",
+                    ));
+                }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {
                     endpoint.name = registration.name;
                     ComputeRuntime::new_remote_driver(

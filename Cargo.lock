@@ -5129,6 +5129,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tokio-tungstenite 0.26.2",
  "tonic",
  "tonic-prost",

@@ -202,7 +202,7 @@ pub enum SupervisorTopology {
     Workspace,
 }
 
-/// Connection to the supervisor Helm deploys for the gateway topology.
+/// The supervisor Helm deploys for the gateway topology.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedSupervisorConfig {
@@ -211,11 +211,10 @@ pub struct SharedSupervisorConfig {
     pub service_namespace: String,
     /// Service port for runtime-initiated Sandbox Protocol connections.
     pub runtime_port: u16,
-    /// Service port for the mutually authenticated session-control API.
-    pub control_port: u16,
-    /// Directory with the session-control client `tls.crt` and `tls.key` and
-    /// the CA `ca.crt` that issued the supervisor's certificate.
-    pub control_tls_dir: String,
+    /// PEM CA certificate that issued the supervisor host's client
+    /// certificate. The gateway accepts that certificate on its own listener
+    /// and classifies the connection as the supervisor host.
+    pub host_ca_file: String,
 }
 
 impl SharedSupervisorConfig {
@@ -225,22 +224,16 @@ impl SharedSupervisorConfig {
                 "shared_supervisor service_name and service_namespace must be DNS labels".into(),
             );
         }
-        if self.runtime_port == 0
-            || self.control_port == 0
-            || self.runtime_port == self.control_port
-        {
-            return Err(
-                "shared_supervisor runtime_port and control_port must be distinct and nonzero"
-                    .into(),
-            );
+        if self.runtime_port == 0 {
+            return Err("shared_supervisor runtime_port must be nonzero".into());
         }
-        if !Path::new(&self.control_tls_dir).is_absolute() {
-            return Err("shared_supervisor control_tls_dir must be absolute".into());
+        if !Path::new(&self.host_ca_file).is_absolute() {
+            return Err("shared_supervisor host_ca_file must be absolute".into());
         }
         Ok(())
     }
 
-    /// DNS name in the supervisor's session-control certificate.
+    /// DNS name of the shared supervisor Service, which sandbox runtimes dial.
     #[must_use]
     pub fn service_host(&self) -> String {
         format!("{}.{}.svc", self.service_name, self.service_namespace)
@@ -1111,8 +1104,7 @@ mod tests {
             service_name: "openshell-supervisor".to_string(),
             service_namespace: "openshell".to_string(),
             runtime_port: 8443,
-            control_port: 9443,
-            control_tls_dir: "/etc/openshell-tls/session-control".to_string(),
+            host_ca_file: "/etc/openshell-tls/supervisor-host/ca.crt".to_string(),
         };
         let gateway = |shared: Option<SharedSupervisorConfig>| KubernetesComputeConfig {
             supervisor_topology: Some(SupervisorTopology::Gateway),
@@ -1133,7 +1125,7 @@ mod tests {
         assert!(unset.validate_supervisor_topology().is_err());
         for invalid in [
             SharedSupervisorConfig {
-                control_port: 8443,
+                runtime_port: 0,
                 ..shared()
             },
             SharedSupervisorConfig {
@@ -1141,7 +1133,7 @@ mod tests {
                 ..shared()
             },
             SharedSupervisorConfig {
-                control_tls_dir: "relative".to_string(),
+                host_ca_file: "relative/ca.crt".to_string(),
                 ..shared()
             },
         ] {

@@ -3,41 +3,67 @@
 
 //! Supervisor shared by the sandboxes of one gateway.
 //!
-//! A compute driver registers each sandbox instance, one running generation
-//! of a stable Sandbox resource, over the session-control API, which accepts
-//! only mutually authenticated TLS clients holding the admission certificate.
-//! A registration carries exactly the gateway-issued credentials of that
-//! generation; the host never acts with any other identity. This module only
-//! validates registrations and turns them into launch material: the
-//! [`SandboxInstanceHost`] registry admits, runs, and removes each instance,
-//! whose runtime connections arrive through one routed listener. Removing a
-//! registration stops only that instance.
+//! The gateway owns which sandbox instances, one running generation of a
+//! stable Sandbox resource each, this process hosts. The host dials the
+//! gateway with its gateway-scoped host certificate, receives complete
+//! assignment snapshots over the private `openshell.supervisor.host.v1`
+//! stream, reconciles the [`SandboxInstanceHost`] registry to each one, and
+//! reports what it observes. An assignment carries exactly the gateway-issued
+//! credentials of its generation; the host never acts with any other identity
+//! toward sandbox APIs. Losing the gateway stream never stops an instance;
+//! only a later snapshot that omits it does. Snapshots are reconciled one at
+//! a time, and a connection finishes the reconciliation it started before the
+//! next connection begins, so a superseded stream can never apply after its
+//! replacement. Runtime connections arrive through one routed listener.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full, Limited};
 use miette::Result;
-use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
-use openshell_sandbox_backend::session_control::{
-    MAX_REGISTRATION_BYTES, SESSIONS_PATH, SandboxInstanceList, SandboxInstanceRegistration,
-    SandboxInstanceStatusReport,
+use openshell_core::proto::supervisor_host::v1::supervisor_host_client::SupervisorHostClient;
+use openshell_core::proto::supervisor_host::v1::{
+    AssignmentSnapshot, HostHeartbeat, HostHello, HostMessage, HostStatus, host_gateway_message,
+    host_message,
 };
+use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
+use openshell_sandbox_backend::sandbox_instance::{
+    SandboxInstancePhaseReport, SandboxInstanceRegistration, SandboxInstanceStatusReport,
+};
+use tokio::sync::watch;
+use tokio_stream::StreamExt as _;
 
 use crate::sandbox_instance_host::{
     SandboxInstanceAdmission, SandboxInstanceAdmitted, SandboxInstanceBody, SandboxInstanceHost,
     SandboxInstanceHostError,
 };
 
-/// Concurrent session-control connections; the only client is the gateway,
-/// whose removals hold a connection while a workload stops.
-const MAX_CONTROL_CONNECTIONS: usize = 64;
-/// Bound on a TLS handshake and on reading one request.
-const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// Interval at which the host sends heartbeats on an idle stream.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// Silence after which the host abandons a stream and reconnects.
+const GATEWAY_SILENCE_TIMEOUT: Duration = Duration::from_mins(1);
+/// Bound on dialing the gateway, on the gateway answering the attach call,
+/// and on it accepting the host.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on queueing one host-to-gateway message; a gateway that cannot
+/// drain the stream this long is treated as lost.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Host-to-gateway messages queued before the stream applies backpressure.
+const OUTBOUND_QUEUE: usize = 16;
+/// Most sandbox instances one snapshot may assign to a host; the gateway
+/// enforces the same bound before it assigns.
+pub const MAX_ASSIGNED_INSTANCES: usize = openshell_core::supervisor_host::MAX_ASSIGNED_INSTANCES;
+/// Largest gateway message the host decodes: a full snapshot of
+/// `MAX_ASSIGNED_INSTANCES` assignments at their largest, plus framing.
+const MAX_GATEWAY_MESSAGE_BYTES: usize = MAX_ASSIGNED_INSTANCES
+    * (openshell_sandbox_backend::sandbox_instance::MAX_LAUNCH_MATERIAL_BYTES + 1024);
+/// Largest host message: a status report is a few hundred bytes per instance.
+const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Process-level inputs of a shared supervisor.
 pub struct SharedHostConfig {
@@ -48,25 +74,31 @@ pub struct SharedHostConfig {
     pub instance_root: PathBuf,
     /// Listener for runtime-initiated Sandbox Protocol connections.
     pub runtime_listen: SocketAddr,
-    /// Time a removed sandbox instance may take to stop its workload.
+    /// Time a withdrawn sandbox instance may take to stop its workload.
     pub removal_grace: Duration,
 }
 
-/// Session-control adapter over the sandbox instance registry and the
-/// routed runtime listener its instances claim routes on.
+/// The sandbox instance registry and the routed runtime listener its
+/// instances claim routes on, reconciled to the gateway's assignments.
 pub struct SharedHost {
     host: SandboxInstanceHost,
     router: Arc<RuntimeRouter>,
     gateway_endpoint: String,
     removal_grace: Duration,
+    /// Assignments of the latest snapshot that could not be admitted, reported
+    /// as failed instances until the gateway withdraws them.
+    rejected: Mutex<BTreeMap<String, SandboxInstanceStatusReport>>,
+    /// Routes of the latest applied snapshot, so a withdrawal whose cleanup
+    /// failed can be retried without the gateway resending the snapshot.
+    desired_routes: Mutex<Option<std::collections::BTreeSet<String>>>,
 }
 
-/// A rejected session-control request.
+/// A rejected sandbox instance assignment.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
     #[error("{0}")]
     Invalid(String),
-    #[error("route is already registered with different launch material")]
+    #[error("route is already hosted with different launch material")]
     Conflict,
     #[error("route is still being removed")]
     Removing,
@@ -98,6 +130,8 @@ impl SharedHost {
             router,
             gateway_endpoint: config.gateway_endpoint,
             removal_grace: config.removal_grace,
+            rejected: Mutex::new(BTreeMap::new()),
+            desired_routes: Mutex::new(None),
         }))
     }
 
@@ -125,18 +159,37 @@ impl SharedHost {
             .admit(admission, |dir| self.instance_launch(registration, dir))
     }
 
-    /// Status of one registered sandbox instance.
+    /// Status of one hosted sandbox instance.
     #[must_use]
     pub fn status(&self, route: &str) -> Option<SandboxInstanceStatusReport> {
         self.host.status(route)
     }
 
-    /// Status of every registered sandbox instance.
+    /// Status of every hosted sandbox instance. An assignment of the latest
+    /// snapshot that could not be admitted is reported as failed, even when
+    /// an earlier instance still runs under its route, so the gateway sees
+    /// the rejection rather than the instance it could not replace.
     #[must_use]
-    pub fn list(&self) -> SandboxInstanceList {
-        SandboxInstanceList {
-            sessions: self.host.list(),
-        }
+    pub fn list(&self) -> Vec<SandboxInstanceStatusReport> {
+        let rejected = self
+            .rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reports = self
+            .host
+            .list()
+            .into_iter()
+            .filter(|hosted| !rejected.contains_key(&hosted.route))
+            .collect::<Vec<_>>();
+        reports.extend(rejected.values().cloned());
+        reports
+    }
+
+    /// Notified whenever a hosted instance is admitted, changes phase or
+    /// readiness, or is removed.
+    #[must_use]
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.host.changes()
     }
 
     /// Stop one sandbox instance, delete its private files, and forget it.
@@ -147,6 +200,124 @@ impl SharedHost {
     /// Stop every sandbox instance, for process shutdown.
     pub async fn remove_all(&self) {
         self.host.remove_all(self.removal_grace).await;
+    }
+
+    /// Make the registry match `snapshot`: admit every assignment and remove
+    /// every hosted instance it omits. Assignments that cannot be admitted are
+    /// reported as failed instances; they never affect a running instance.
+    ///
+    /// # Errors
+    ///
+    /// A malformed snapshot (too many instances, or one route assigned twice)
+    /// is refused as a whole before anything is admitted or removed.
+    pub async fn reconcile(&self, snapshot: &AssignmentSnapshot) -> Result<(), ControlError> {
+        if snapshot.instances.len() > MAX_ASSIGNED_INSTANCES {
+            return Err(ControlError::Invalid(format!(
+                "snapshot assigns {} instances; at most {MAX_ASSIGNED_INSTANCES} are supported",
+                snapshot.instances.len()
+            )));
+        }
+        let mut routes = std::collections::BTreeSet::new();
+        for assignment in &snapshot.instances {
+            if !routes.insert(assignment.route.clone()) {
+                return Err(ControlError::Invalid(
+                    "snapshot assigns one route more than once".to_string(),
+                ));
+            }
+        }
+        *self
+            .desired_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(routes);
+        let mut rejected = BTreeMap::new();
+        for assignment in &snapshot.instances {
+            let outcome = SandboxInstanceRegistration::from_assignment(assignment)
+                .map_err(|error| ControlError::Invalid(error.to_string()))
+                .and_then(|registration| self.register(registration));
+            match outcome {
+                Ok(SandboxInstanceAdmitted::Created) => {
+                    tracing::info!(
+                        route = %assignment.route,
+                        sandbox_id = %assignment.sandbox_id,
+                        "admitted assigned sandbox instance"
+                    );
+                }
+                Ok(SandboxInstanceAdmitted::Unchanged) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        route = %assignment.route,
+                        sandbox_id = %assignment.sandbox_id,
+                        %error,
+                        "rejected assigned sandbox instance"
+                    );
+                    rejected.insert(
+                        assignment.route.clone(),
+                        SandboxInstanceStatusReport {
+                            route: assignment.route.clone(),
+                            sandbox_id: assignment.sandbox_id.clone(),
+                            phase: SandboxInstancePhaseReport::Failed {
+                                error: error.to_string(),
+                            },
+                            ready: false,
+                        },
+                    );
+                }
+            }
+        }
+        *self
+            .rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rejected;
+        self.remove_withdrawn().await;
+        Ok(())
+    }
+
+    /// Remove every hosted instance the latest applied snapshot omits. Also
+    /// run between snapshots: a removal whose file cleanup failed keeps its
+    /// key reserved and reports a failure, and the gateway does not resend an
+    /// unchanged snapshot, so this retries it. Nothing happens before the
+    /// first snapshot of a process, since nothing is known to be withdrawn.
+    pub async fn remove_withdrawn(&self) {
+        let desired = self
+            .desired_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let Some(desired) = desired else {
+            return;
+        };
+        let withdrawn = self
+            .host
+            .list()
+            .into_iter()
+            .filter(|hosted| !desired.contains(&hosted.route))
+            .collect::<Vec<_>>();
+        futures::future::join_all(withdrawn.iter().map(|hosted| async move {
+            tracing::info!(
+                route = %hosted.route,
+                sandbox_id = %hosted.sandbox_id,
+                "removing withdrawn sandbox instance"
+            );
+            self.remove(&hosted.route).await;
+        }))
+        .await;
+    }
+
+    /// Whether an instance the latest applied snapshot omits is still hosted,
+    /// such as one whose removal could not delete its private files.
+    #[must_use]
+    pub fn has_withdrawn_leftovers(&self) -> bool {
+        let desired = self
+            .desired_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(desired) = desired.as_ref() else {
+            return false;
+        };
+        self.host
+            .list()
+            .iter()
+            .any(|hosted| !desired.contains(&hosted.route))
     }
 
     /// Launch material of `registration` with its private files in `dir`.
@@ -258,164 +429,297 @@ fn write_private_file(_path: &Path, _contents: &[u8]) -> Result<()> {
     Err(miette::miette!("shared supervision requires a Unix host"))
 }
 
-type ControlResponse = http::Response<Full<Bytes>>;
-
-fn json_response(status: http::StatusCode, body: &impl serde::Serialize) -> ControlResponse {
-    let body = serde_json::to_vec(body).unwrap_or_default();
-    http::Response::builder()
-        .status(status)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Full::new(Bytes::from(body)))
-        .unwrap_or_default()
+/// How the host reaches the gateway's supervisor host service.
+pub struct GatewayLink {
+    /// Gateway gRPC endpoint; must use `https`, since the host authenticates
+    /// with its client certificate.
+    pub endpoint: String,
+    /// Directory holding the host client certificate `tls.crt` and `tls.key`.
+    pub host_tls_dir: PathBuf,
+    /// PEM CA bundle that issued the gateway's server certificate.
+    pub gateway_ca: PathBuf,
+    /// Server name expected in the gateway certificate, when it differs from
+    /// the endpoint host.
+    pub gateway_server_name: Option<String>,
 }
 
-fn error_response(status: http::StatusCode, message: &str) -> ControlResponse {
-    json_response(status, &serde_json::json!({ "error": message }))
-}
+impl GatewayLink {
+    fn channel_endpoint(&self) -> Result<tonic::transport::Endpoint> {
+        use miette::{IntoDiagnostic as _, WrapErr as _};
 
-async fn handle_control(
-    host: Arc<SharedHost>,
-    request: http::Request<hyper::body::Incoming>,
-) -> ControlResponse {
-    let path = request.uri().path().to_string();
-    let route = path
-        .strip_prefix(SESSIONS_PATH)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .filter(|route| !route.is_empty() && !route.contains('/'));
-    match (request.method().clone(), route) {
-        (http::Method::GET, None) if path == SESSIONS_PATH => {
-            json_response(http::StatusCode::OK, &host.list())
+        if !self.endpoint.starts_with("https://") {
+            return Err(miette::miette!(
+                "the shared supervisor requires an https gateway endpoint for its host identity"
+            ));
         }
-        (http::Method::GET, Some(route)) => host.status(route).map_or_else(
-            || {
-                error_response(
-                    http::StatusCode::NOT_FOUND,
-                    "sandbox instance is not registered",
-                )
-            },
-            |status| json_response(http::StatusCode::OK, &status),
-        ),
-        (http::Method::PUT, Some(route)) => {
-            let route = route.to_string();
-            let body = match tokio::time::timeout(
-                CONTROL_IO_TIMEOUT,
-                Limited::new(request.into_body(), MAX_REGISTRATION_BYTES).collect(),
-            )
-            .await
-            {
-                Ok(Ok(body)) => body.to_bytes(),
-                _ => {
-                    return error_response(
-                        http::StatusCode::PAYLOAD_TOO_LARGE,
-                        "registration body is invalid or too large",
-                    );
-                }
-            };
-            let registration = match serde_json::from_slice::<SandboxInstanceRegistration>(&body) {
-                Ok(registration) if registration.route == route => registration,
-                Ok(_) => {
-                    return error_response(
-                        http::StatusCode::BAD_REQUEST,
-                        "registration route does not match the request path",
-                    );
-                }
-                // Decoder errors can quote field values, including credentials.
-                Err(_) => {
-                    return error_response(
-                        http::StatusCode::BAD_REQUEST,
-                        "registration body is not a valid sandbox instance registration",
-                    );
-                }
-            };
-            match host.register(registration) {
-                Ok(outcome) => {
-                    let status = if outcome == SandboxInstanceAdmitted::Created {
-                        http::StatusCode::CREATED
-                    } else {
-                        http::StatusCode::OK
-                    };
-                    host.status(&route).map_or_else(
-                        || {
-                            error_response(
-                                http::StatusCode::CONFLICT,
-                                "sandbox instance was removed",
-                            )
-                        },
-                        |report| json_response(status, &report),
-                    )
-                }
-                Err(error @ ControlError::Invalid(_)) => {
-                    error_response(http::StatusCode::BAD_REQUEST, &error.to_string())
-                }
-                Err(error @ (ControlError::Conflict | ControlError::Removing)) => {
-                    error_response(http::StatusCode::CONFLICT, &error.to_string())
-                }
-                Err(error @ ControlError::Unavailable(_)) => {
-                    error_response(http::StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
-                }
-            }
+        let read = |path: &Path| {
+            std::fs::read(path)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("read {}", path.display()))
+        };
+        let certificate = read(&self.host_tls_dir.join("tls.crt"))?;
+        let private_key = read(&self.host_tls_dir.join("tls.key"))?;
+        let gateway_ca = read(&self.gateway_ca)?;
+        let mut tls = tonic::transport::ClientTlsConfig::new()
+            .ca_certificate(tonic::transport::Certificate::from_pem(gateway_ca))
+            .identity(tonic::transport::Identity::from_pem(
+                certificate,
+                private_key,
+            ));
+        if let Some(server_name) = self.gateway_server_name.as_deref() {
+            tls = tls.domain_name(server_name);
         }
-        (http::Method::DELETE, Some(route)) => host.remove(route).await.map_or_else(
-            || {
-                error_response(
-                    http::StatusCode::NOT_FOUND,
-                    "sandbox instance is not registered",
-                )
-            },
-            |status| json_response(http::StatusCode::OK, &status),
-        ),
-        _ => error_response(http::StatusCode::NOT_FOUND, "unknown session-control route"),
+        tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+            .into_diagnostic()
+            .wrap_err("invalid gateway endpoint")?
+            .connect_timeout(CONNECT_TIMEOUT)
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true)
+            .keep_alive_timeout(Duration::from_secs(20))
+            .tcp_nodelay(true)
+            .tls_config(tls)
+            .into_diagnostic()
+            .wrap_err("configure gateway TLS")
     }
 }
 
-/// Serve the session-control API until `shutdown` completes. Every
-/// connection must complete mutually authenticated TLS before any request.
-pub async fn serve_session_control(
+/// Everything the host reports for one snapshot revision.
+fn status_message(host: &SharedHost, applied_revision: u64) -> HostMessage {
+    HostMessage {
+        payload: Some(host_message::Payload::Status(HostStatus {
+            applied_revision,
+            instances: host
+                .list()
+                .iter()
+                .map(SandboxInstanceStatusReport::to_proto)
+                .collect(),
+        })),
+    }
+}
+
+/// Why one gateway stream ended.
+enum StreamEnd {
+    /// The gateway rejected or closed the stream; reconnect after a backoff.
+    /// `accepted` records whether the gateway had accepted the host.
+    Lost { accepted: bool },
+}
+
+/// Keep one assignment stream open to the gateway until `shutdown`
+/// completes, reconnecting with backoff. Hosted instances run on across
+/// disconnects.
+pub async fn attach_to_gateway(
     host: Arc<SharedHost>,
-    listener: tokio::net::TcpListener,
-    tls: Arc<rustls::ServerConfig>,
+    link: GatewayLink,
     shutdown: impl Future<Output = ()>,
 ) {
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONTROL_CONNECTIONS));
-    let mut connections = tokio::task::JoinSet::new();
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let mut connection_epoch = 0_u64;
+    let mut backoff = RECONNECT_BACKOFF_MIN;
     tokio::pin!(shutdown);
     loop {
-        tokio::select! {
-            () = &mut shutdown => break,
-            accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                };
-                let Ok(slot) = slots.clone().try_acquire_owned() else {
-                    continue;
-                };
-                openshell_core::net::set_tcp_nodelay_best_effort(&stream);
-                let acceptor = acceptor.clone();
-                let host = host.clone();
-                connections.spawn(async move {
-                    let _slot = slot;
-                    let Ok(Ok(stream)) =
-                        tokio::time::timeout(CONTROL_IO_TIMEOUT, acceptor.accept(stream)).await
-                    else {
-                        tracing::debug!("rejected session-control connection without admission TLS");
-                        return;
-                    };
-                    let service = hyper::service::service_fn(move |request| {
-                        let host = host.clone();
-                        async move {
-                            Ok::<_, std::convert::Infallible>(handle_control(host, request).await)
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .timer(hyper_util::rt::TokioTimer::new())
-                        .header_read_timeout(CONTROL_IO_TIMEOUT)
-                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
-                        .await;
-                });
-            }
-            Some(_) = connections.join_next(), if !connections.is_empty() => {}
+        connection_epoch += 1;
+        let hello = HostHello {
+            instance_id: instance_id.clone(),
+            connection_epoch,
+        };
+        let StreamEnd::Lost { accepted } = tokio::select! {
+            end = run_stream(&host, &link, hello) => end,
+            () = &mut shutdown => return,
+        };
+        if accepted {
+            backoff = RECONNECT_BACKOFF_MIN;
         }
+        tracing::info!(
+            retry_in_secs = backoff.as_secs(),
+            "gateway assignment stream lost; hosted sandbox instances keep running"
+        );
+        tokio::select! {
+            () = tokio::time::sleep(backoff) => {}
+            () = &mut shutdown => return,
+        }
+        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
+}
+
+/// One connection and stream to the gateway.
+///
+/// Snapshots are reconciled on a separate task so heartbeats and status
+/// reports keep flowing while instances stop; at most one reconciliation runs
+/// at a time, only the newest unapplied snapshot is kept, and the stream does
+/// not end until a running reconciliation has finished.
+async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello) -> StreamEnd {
+    let lost = |accepted| StreamEnd::Lost { accepted };
+    let endpoint = match link.channel_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            tracing::error!(%error, "invalid gateway link configuration");
+            return lost(false);
+        }
+    };
+    let channel = match endpoint.connect().await {
+        Ok(channel) => channel,
+        Err(error) => {
+            tracing::warn!(%error, "could not connect to the gateway");
+            return lost(false);
+        }
+    };
+    let mut client = SupervisorHostClient::new(channel)
+        .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
+    let (tx, rx) = tokio::sync::mpsc::channel::<HostMessage>(OUTBOUND_QUEUE);
+    let send = |message: HostMessage| {
+        let tx = tx.clone();
+        async move { tx.send_timeout(message, SEND_TIMEOUT).await.is_ok() }
+    };
+    if !send(HostMessage {
+        payload: Some(host_message::Payload::Hello(hello)),
+    })
+    .await
+    {
+        return lost(false);
+    }
+    let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let mut inbound = match tokio::time::timeout(CONNECT_TIMEOUT, attach).await {
+        Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) => {
+            tracing::warn!(%status, "gateway refused the supervisor host stream");
+            return lost(false);
+        }
+        Err(_) => {
+            tracing::warn!("gateway did not answer the supervisor host stream in time");
+            return lost(false);
+        }
+    };
+    let mut changes = host.changes();
+    changes.mark_unchanged();
+    let mut applied_revision = 0_u64;
+    // Highest snapshot revision received on this stream, applied or not, so a
+    // snapshot that arrives behind a newer in-flight one is never applied.
+    let mut received_revision = 0_u64;
+    let mut accepted = false;
+    let accept_deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
+    let mut last_heard = tokio::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The reconciliation in flight and the newest snapshot waiting for it.
+    // A retry of withdrawals whose cleanup failed runs through the same slot,
+    // so at most one reconciliation touches the registry at a time.
+    let mut applying: Option<tokio::task::JoinHandle<Result<Option<u64>, ControlError>>> = None;
+    let mut queued: Option<AssignmentSnapshot> = None;
+    let start = |snapshot: AssignmentSnapshot| {
+        let host = host.clone();
+        tokio::spawn(async move {
+            host.reconcile(&snapshot).await?;
+            Ok(Some(snapshot.revision))
+        })
+    };
+    let retry_withdrawn = || {
+        let host = host.clone();
+        tokio::spawn(async move {
+            host.remove_withdrawn().await;
+            Ok(None)
+        })
+    };
+    let end = loop {
+        tokio::select! {
+            message = inbound.next() => {
+                let payload = match message {
+                    Some(Ok(message)) => message.payload,
+                    Some(Err(status)) => {
+                        tracing::warn!(%status, "gateway assignment stream failed");
+                        break lost(accepted);
+                    }
+                    None => break lost(accepted),
+                };
+                last_heard = tokio::time::Instant::now();
+                match payload {
+                    Some(host_gateway_message::Payload::Accepted(accepted_message)) => {
+                        accepted = true;
+                        tracing::info!(session = %accepted_message.session_id, "gateway accepted the supervisor host");
+                        // Report what runs before any snapshot arrives.
+                        if !send(status_message(host, applied_revision)).await {
+                            break lost(accepted);
+                        }
+                    }
+                    Some(host_gateway_message::Payload::Rejected(rejected)) => {
+                        tracing::error!(reason = %rejected.reason, "gateway rejected the supervisor host");
+                        break lost(accepted);
+                    }
+                    Some(host_gateway_message::Payload::Assignments(snapshot)) => {
+                        if !accepted {
+                            tracing::warn!("gateway sent assignments before accepting the host");
+                            break lost(accepted);
+                        }
+                        if snapshot.revision <= received_revision {
+                            tracing::debug!(revision = snapshot.revision, received_revision, "ignoring stale assignment snapshot");
+                            continue;
+                        }
+                        received_revision = snapshot.revision;
+                        if applying.is_some() {
+                            queued = Some(snapshot);
+                        } else {
+                            applying = Some(start(snapshot));
+                        }
+                    }
+                    Some(host_gateway_message::Payload::Heartbeat(_)) | None => {}
+                }
+            }
+            applied = async { applying.as_mut().expect("polled only while applying").await }, if applying.is_some() => {
+                applying = None;
+                match applied {
+                    Ok(Ok(revision)) => {
+                        if let Some(revision) = revision {
+                            applied_revision = revision;
+                        }
+                        changes.mark_unchanged();
+                        if !send(status_message(host, applied_revision)).await {
+                            break lost(accepted);
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "refused a malformed assignment snapshot");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "assignment reconciliation task failed");
+                    }
+                }
+                if let Some(snapshot) = queued.take() {
+                    applying = Some(start(snapshot));
+                }
+            }
+            notified = changes.changed() => {
+                if notified.is_err() {
+                    break lost(accepted);
+                }
+                if accepted && !send(status_message(host, applied_revision)).await {
+                    break lost(accepted);
+                }
+            }
+            _ = heartbeat.tick() => {
+                if !accepted && tokio::time::Instant::now() > accept_deadline {
+                    tracing::warn!("gateway did not accept the supervisor host in time");
+                    break lost(accepted);
+                }
+                if last_heard.elapsed() > GATEWAY_SILENCE_TIMEOUT {
+                    tracing::warn!("gateway assignment stream went silent; reconnecting");
+                    break lost(accepted);
+                }
+                let beat = HostMessage { payload: Some(host_message::Payload::Heartbeat(HostHeartbeat {})) };
+                if !send(beat).await {
+                    break lost(accepted);
+                }
+                // Withdrawn instances whose cleanup failed are retried at the
+                // heartbeat cadence, never concurrently with a snapshot.
+                if applying.is_none() && queued.is_none() && host.has_withdrawn_leftovers() {
+                    applying = Some(retry_withdrawn());
+                }
+            }
+        }
+    };
+    // Finish the reconciliation this stream started before another stream
+    // can begin one; the queued snapshot belongs to a session that is gone.
+    if let Some(applying) = applying {
+        let _ = applying.await;
+    }
+    end
 }

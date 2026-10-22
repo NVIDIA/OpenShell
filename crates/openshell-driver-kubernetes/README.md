@@ -192,27 +192,45 @@ keeps its established name) when the generation starts. Every later lifecycle de
 never reinterprets a running generation, and an unknown or incomplete record
 fails closed.
 
+- **Assignments.** The gateway owns which instances the shared supervisor
+  hosts. The driver publishes that set into a
+  `openshell_core::supervisor_host::SupervisorHostController`, installed into
+  the gateway through the compute-driver build context, and the gateway serves
+  it to the supervisor over the private `openshell.supervisor.host.v1` stream.
+  The supervisor dials the gateway with a client certificate issued by the CA
+  at `shared_supervisor.host_ca_file`; that identity authorizes only the
+  assignment stream.
 - **Create and start.** The driver creates a per-sandbox egress allowance
   `os-shared-control-<id>` from the workload Pod to the Pods the shared
   supervisor's Service selects, on the runtime port, binds its UID and
-  resourceVersion into the boundary evidence, and registers the sandbox
-  instance over session control before releasing the workload Pod.
-  Registration does not wait for the runtime, so create still returns before
-  the gateway persists the generation. The runtime identity's last component is
-  the instance route, which no Pod UID can equal, so `authenticate_sandbox` cannot vouch for a shared
-  generation.
-- **Readiness.** A shared generation is available while its sandbox instance
-  is registered for the sandbox and accepted by the gateway and its fence and
-  egress allowance exist. A missing or ended instance is unavailable, and
-  reconciliation suspends the workload; an unreachable supervisor is unknown.
-- **Stop and delete.** The driver removes the sandbox instance before
-  suspending or deleting the workload. Removal is best effort because ending the
-  workload ends supervision anyway. Reconciliation removes instances that no
-  Sandbox's current generation may run; it lists instances before Sandboxes,
-  because a generation records its route before registering it.
-- **Isolation.** The admission credential is separate from every instance's
-  credentials. Sandboxes cannot reach session control, and the routing preface
-  only selects which generation-pinned TLS identity the supervisor demands.
+  resourceVersion into the boundary evidence, persists the instance's launch
+  material in the generation's `os-supervisor-<id>-<generation>` Secret (key
+  `instance.json`, owned by the workload Pod), and then assigns the instance
+  before releasing the workload Pod. Assignment does not wait for the
+  supervisor, so create still returns before the gateway persists the
+  generation. The runtime identity's last component is the instance route,
+  which no Pod UID can equal, so `authenticate_sandbox` cannot vouch for a
+  shared generation.
+- **Readiness.** A shared generation is available while the supervisor
+  reports its instance as accepted by the gateway and its fence and egress
+  allowance exist. An instance the supervisor has reconciled past and does not
+  host, or reports as ended, is unavailable, and reconciliation suspends the
+  workload. A disconnected supervisor is unknown and a supervisor that has not
+  yet reconciled to the assignment is degraded; neither suspends anything.
+- **Stop and delete.** The driver withdraws the instance before suspending or
+  deleting the workload, and the generation cleanup deletes its launch
+  Secret. Every reconciliation also rebuilds the desired set from the Sandbox
+  resources that may run, reading launch material from the current assignment
+  or the launch Secret, so instances of deleted Sandboxes and of stops made
+  while the gateway was down are withdrawn, and a restarted gateway recovers
+  its assignments before it sends anything. The rebuild is compare-and-replace
+  against the revision read before the list, so it never undoes a lifecycle
+  edit that raced it.
+- **Isolation.** The host certificate is separate from every instance's
+  credentials and from the ordinary client CA; the gateway refuses it on every
+  other RPC and refuses every other identity on the assignment stream.
+  Sandboxes cannot reach the stream, and the routing preface only selects
+  which generation-pinned TLS identity the supervisor demands.
 
 The topology does not support upstream proxies or provider SPIFFE identity, and
 the shared supervisor is a single point of failure for the sandboxes it hosts.

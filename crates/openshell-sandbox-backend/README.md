@@ -136,10 +136,12 @@ handshake. Handshakes are bounded globally and per route, and an
 authenticated connection only fills its own instance's spare queue. A routed
 instance waits up to five minutes for its first connection, since it is
 registered before its workload Pod is scheduled, and the usual connect window
-afterwards. `session_control` defines the registration, status, and removal
-contract between a compute driver and the shared supervisor, including its
-mutually authenticated TLS configuration; its `/v1/sessions` paths and JSON
-fields keep their established wire names.
+afterwards. `sandbox_instance` defines the launch material and status of one
+hosted instance: `SandboxInstanceRegistration` is carried as the JSON
+`launch_material` of a `SandboxInstanceAssignment` on the gateway's private
+`openshell.supervisor.host.v1` stream, validated against the assignment's
+route, sandbox, and generation, and `SandboxInstanceStatusReport` converts to
+and from the stream's status message.
 
 Runtime-initiated transport supports TCP, protected Unix sockets, and host
 vsock listeners. These share bounded TLS handshakes, the authenticated spare

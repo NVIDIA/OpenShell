@@ -4,6 +4,8 @@
 //! Supervisor host shared by the sandboxes of one gateway.
 
 use miette::Result;
+#[cfg(unix)]
+use std::future::Future;
 
 pub fn run(args: crate::Args) -> Result<()> {
     run_platform(args)
@@ -22,9 +24,9 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let gateway_endpoint = args
         .gateway_endpoint
         .ok_or_else(|| miette::miette!("--gateway-endpoint is required for --mode=shared"))?;
-    let session_control_tls_dir = args.session_control_tls_dir.ok_or_else(|| {
-        miette::miette!("--session-control-tls-dir is required for --mode=shared")
-    })?;
+    let host_tls_dir = args
+        .host_tls_dir
+        .ok_or_else(|| miette::miette!("--host-tls-dir is required for --mode=shared"))?;
     let runtime_listen = args
         .runtime_listen
         .ok_or_else(|| miette::miette!("--runtime-listen is required for --mode=shared"))?;
@@ -32,6 +34,18 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let instance_root = args
         .session_root
         .ok_or_else(|| miette::miette!("--session-root is required for --mode=shared"))?;
+    // The host verifies the gateway the way every sandbox instance does.
+    let gateway_ca = std::env::var_os(openshell_core::sandbox_env::TLS_CA)
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            miette::miette!(
+                "{} is required for --mode=shared",
+                openshell_core::sandbox_env::TLS_CA
+            )
+        })?;
+    let gateway_server_name = std::env::var(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME)
+        .ok()
+        .filter(|name| !name.is_empty());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -61,63 +75,75 @@ fn run_platform(args: crate::Args) -> Result<()> {
             )
             .init();
 
-        // Install shutdown handlers before the control listener starts
-        // answering health probes.
+        // Install shutdown handlers before the health listener starts
+        // answering probes.
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .into_diagnostic()?;
         let mut interrupt =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                 .into_diagnostic()?;
-        let tls_file = |name: &str| {
-            let path = session_control_tls_dir.join(name);
-            std::fs::read(&path)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("read session-control TLS file {}", path.display()))
+        let link = openshell_supervisor::shared_host::GatewayLink {
+            endpoint: gateway_endpoint.clone(),
+            host_tls_dir,
+            gateway_ca,
+            gateway_server_name,
         };
-        let control_tls = openshell_sandbox_backend::session_control::server_tls_config(
-            &tls_file("tls.crt")?,
-            &tls_file("tls.key")?,
-            &tls_file("ca.crt")?,
-        )
-        .map_err(|error| miette::miette!("{error}"))?;
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {
                 gateway_endpoint,
                 instance_root,
                 runtime_listen,
-                removal_grace: openshell_sandbox_backend::session_control::INSTANCE_REMOVAL_GRACE,
+                removal_grace: openshell_sandbox_backend::sandbox_instance::INSTANCE_REMOVAL_GRACE,
             },
         )?;
-        let control = tokio::net::TcpListener::bind(address)
+        let health = tokio::net::TcpListener::bind(address)
             .await
             .into_diagnostic()
-            .wrap_err("bind session-control listener")?;
+            .wrap_err("bind health listener")?;
         tracing::info!(
             runtime = %host.runtime_addr(),
-            control = %address,
-            "Shared supervisor ready for sandbox instances"
+            health = %address,
+            "Shared supervisor ready for sandbox instance assignments"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);
-        let serve = tokio::spawn(openshell_supervisor::shared_host::serve_session_control(
+        let wait_stopped = |mut stopped: tokio::sync::watch::Receiver<bool>| async move {
+            let _ = stopped.wait_for(|stop| *stop).await;
+        };
+        let probes = tokio::spawn(serve_health(health, wait_stopped(stopped.clone())));
+        let attachment = tokio::spawn(openshell_supervisor::shared_host::attach_to_gateway(
             host.clone(),
-            control,
-            control_tls,
-            async move {
-                let mut stopped = stopped;
-                let _ = stopped.wait_for(|stop| *stop).await;
-            },
+            link,
+            wait_stopped(stopped),
         ));
         tokio::select! {
             _ = terminate.recv() => {}
             _ = interrupt.recv() => {}
         }
         stop.send_replace(true);
-        let _ = serve.await;
+        let _ = probes.await;
+        let _ = attachment.await;
         // Sandboxes lose supervision with this process and fail closed.
         host.remove_all().await;
         Ok(())
     })
+}
+
+/// Answer kubelet `tcpSocket` probes: accept and close. Liveness means the
+/// process runs; sandbox instance readiness is reported to the gateway.
+#[cfg(unix)]
+async fn serve_health(listener: tokio::net::TcpListener, shutdown: impl Future<Output = ()>) {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => {
+                if accepted.is_err() {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
 }
 
 #[cfg(not(unix))]

@@ -6,15 +6,26 @@
 //! Each runtime generation records where its supervisor runs when it starts.
 //! Every later lifecycle decision reads that record, so changing the gateway
 //! topology setting never reinterprets an existing generation.
+//!
+//! The gateway owns which sandbox instances the shared supervisor hosts. The
+//! driver publishes that set into a [`SupervisorHostController`], which the
+//! gateway serves to the supervisor over the private supervisor host stream,
+//! and reads the host's observations back from it. The durable source of the
+//! set is the generation's Sandbox resource plus its launch Secret, so a
+//! restarted gateway rebuilds it before publishing anything, and a full
+//! resync is compare-and-replace against the revision it started from.
 
-use std::time::Duration;
+use std::path::PathBuf;
 
-use bytes::Bytes;
-use http_body_util::{BodyExt as _, Full};
 use kube::core::DynamicObject;
-use openshell_sandbox_backend::session_control::{
-    INSTANCE_REMOVAL_TIMEOUT, SESSIONS_PATH, SandboxInstanceList, SandboxInstanceRegistration,
-    SandboxInstanceStatusReport,
+use openshell_core::proto::supervisor_host::v1::{
+    SandboxInstanceAssignment, SandboxInstanceStatus,
+};
+use openshell_core::supervisor_host::{
+    AssignmentError, ObservedInstance, SupervisorHostController,
+};
+use openshell_sandbox_backend::sandbox_instance::{
+    SandboxInstanceRegistration, SandboxInstanceStatusReport,
 };
 
 use crate::config::SharedSupervisorConfig;
@@ -27,11 +38,6 @@ pub const ANNOTATION_SUPERVISOR_TOPOLOGY: &str = "openshell.ai/sandbox-runtime-s
 /// annotation key keeps its established `-session` name.
 pub const ANNOTATION_SUPERVISOR_SESSION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 pub const GATEWAY_TOPOLOGY: &str = "gateway";
-
-/// Bound on one session-control request, including connection and TLS.
-/// Removals wait for the sandbox instance's workload to stop and use the
-/// contract's longer bound instead.
-const SESSION_CONTROL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where a generation's supervisor runs, as recorded when it started.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,187 +77,89 @@ pub fn supervisor_placement(
     }
 }
 
-/// Client for the shared supervisor's session-control API. It authenticates
-/// with the gateway's admission certificate, which only Helm issues.
+/// The gateway's desired set of shared sandbox instances and the host's
+/// observations of them. The controller is the only owner of that state;
+/// this type only translates between the driver's launch material and its
+/// wire form.
 #[derive(Clone, Debug)]
 pub struct SharedSupervisor {
     config: SharedSupervisorConfig,
+    controller: SupervisorHostController,
 }
 
 impl SharedSupervisor {
     pub fn new(config: SharedSupervisorConfig) -> Self {
-        Self { config }
+        let controller = SupervisorHostController::new(PathBuf::from(&config.host_ca_file));
+        Self { config, controller }
     }
 
     pub fn config(&self) -> &SharedSupervisorConfig {
         &self.config
     }
 
-    /// Register a generation; an identical registration is accepted again.
-    pub async fn register(
+    /// The controller the gateway serves to the supervisor host.
+    pub fn controller(&self) -> &SupervisorHostController {
+        &self.controller
+    }
+
+    /// Assign a generation's sandbox instance; an identical assignment
+    /// changes nothing. Refused as a precondition when the host is at
+    /// capacity, so the create fails before its workload runs.
+    pub fn assign(
         &self,
         registration: &SandboxInstanceRegistration,
-    ) -> Result<SandboxInstanceStatusReport, KubernetesDriverError> {
-        let body = serde_json::to_vec(registration).map_err(|error| {
-            KubernetesDriverError::Message(format!("encode sandbox instance registration: {error}"))
-        })?;
-        let (status, body) = self
-            .request(
-                http::Method::PUT,
-                &format!("{SESSIONS_PATH}/{}", registration.route),
-                Some(body),
-            )
-            .await?;
-        match status {
-            http::StatusCode::CREATED | http::StatusCode::OK => decode(&body),
-            http::StatusCode::CONFLICT => Err(KubernetesDriverError::Precondition(
-                "shared supervisor already hosts this route with different launch material"
-                    .to_string(),
-            )),
-            status => Err(rejected("register sandbox instance", status, &body)),
-        }
+    ) -> Result<(), KubernetesDriverError> {
+        let assignment = registration
+            .to_assignment()
+            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
+        self.controller
+            .assign(assignment)
+            .map_err(|error| KubernetesDriverError::Precondition(error.to_string()))
     }
 
-    /// Status of one sandbox instance, or `None` when it is not registered.
-    pub async fn status(
+    /// Withdraw a generation's sandbox instance so the host stops it.
+    pub fn withdraw(&self, route: &str) {
+        self.controller.unassign(route);
+    }
+
+    /// Current desired revision, read before deriving a full list for
+    /// [`Self::resync`].
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.controller.revision()
+    }
+
+    /// The current assignment of a route, if any, so a resync keeps the
+    /// launch material it already holds instead of reading the Secret again.
+    #[must_use]
+    pub fn assignment(&self, route: &str) -> Option<SandboxInstanceAssignment> {
+        self.controller.assignment(route)
+    }
+
+    /// Replace the desired set with the generations that may run, derived
+    /// from Sandbox resources and their launch Secrets while the revision was
+    /// `baseline`. The first call initializes the gateway's view; until then
+    /// nothing is sent to the host. A list that raced a lifecycle edit is
+    /// refused and derived again on the next reconciliation.
+    pub fn resync(
         &self,
-        route: &str,
-    ) -> Result<Option<SandboxInstanceStatusReport>, KubernetesDriverError> {
-        let (status, body) = self
-            .request(http::Method::GET, &format!("{SESSIONS_PATH}/{route}"), None)
-            .await?;
-        match status {
-            http::StatusCode::OK => decode(&body).map(Some),
-            http::StatusCode::NOT_FOUND => Ok(None),
-            status => Err(rejected("read sandbox instance status", status, &body)),
-        }
+        baseline: u64,
+        assignments: Vec<SandboxInstanceAssignment>,
+    ) -> Result<u64, AssignmentError> {
+        self.controller.replace_assignments(baseline, assignments)
     }
 
-    /// Stop and forget one sandbox instance. A missing instance is already
-    /// removed.
-    pub async fn remove(&self, route: &str) -> Result<(), KubernetesDriverError> {
-        let (status, body) = self
-            .request(
-                http::Method::DELETE,
-                &format!("{SESSIONS_PATH}/{route}"),
-                None,
-            )
-            .await?;
-        match status {
-            http::StatusCode::OK | http::StatusCode::NOT_FOUND => Ok(()),
-            status => Err(rejected("remove sandbox instance", status, &body)),
-        }
-    }
-
-    /// Every sandbox instance the shared supervisor hosts.
-    pub async fn list(&self) -> Result<SandboxInstanceList, KubernetesDriverError> {
-        let (status, body) = self.request(http::Method::GET, SESSIONS_PATH, None).await?;
-        match status {
-            http::StatusCode::OK => decode(&body),
-            status => Err(rejected("list sandbox instances", status, &body)),
-        }
-    }
-
-    async fn request(
-        &self,
-        method: http::Method,
-        path: &str,
-        body: Option<Vec<u8>>,
-    ) -> Result<(http::StatusCode, Bytes), KubernetesDriverError> {
-        let deadline = if method == http::Method::DELETE {
-            INSTANCE_REMOVAL_TIMEOUT
-        } else {
-            SESSION_CONTROL_TIMEOUT
-        };
-        tokio::time::timeout(deadline, self.request_once(method, path, body))
-            .await
-            .map_err(|_| {
-                KubernetesDriverError::Message(
-                    "timed out calling the shared supervisor session-control API".to_string(),
-                )
-            })?
-    }
-
-    async fn request_once(
-        &self,
-        method: http::Method,
-        path: &str,
-        body: Option<Vec<u8>>,
-    ) -> Result<(http::StatusCode, Bytes), KubernetesDriverError> {
-        let unavailable = |what: &str, error: &dyn std::fmt::Display| {
-            KubernetesDriverError::Message(format!("shared supervisor {what}: {error}"))
-        };
-        // Read the admission material per request so rotated Secrets apply.
-        let directory = std::path::Path::new(&self.config.control_tls_dir);
-        let read = |name: &str| {
-            std::fs::read(directory.join(name))
-                .map_err(|error| unavailable(&format!("session-control TLS file {name}"), &error))
-        };
-        let tls = openshell_sandbox_backend::session_control::client_tls_config(
-            &read("tls.crt")?,
-            &read("tls.key")?,
-            &read("ca.crt")?,
-        )
-        .map_err(|error| unavailable("session-control TLS", &error))?;
-        let host = self.config.service_host();
-        let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|error| unavailable("session-control server name", &error))?;
-        let addresses = tokio::net::lookup_host((host.as_str(), self.config.control_port))
-            .await
-            .map_err(|error| unavailable("resolve", &error))?
-            .collect::<Vec<_>>();
-        let stream = openshell_core::net::connect_tcp_nodelay_best_effort(&addresses)
-            .await
-            .map_err(|error| unavailable("connect", &error))?;
-        let stream = tokio_rustls::TlsConnector::from(tls)
-            .connect(server_name, stream)
-            .await
-            .map_err(|error| unavailable("TLS", &error))?;
-        let (mut sender, connection) =
-            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
-                .await
-                .map_err(|error| unavailable("HTTP handshake", &error))?;
-        tokio::spawn(connection);
-        let request = http::Request::builder()
-            .method(method)
-            .uri(path)
-            .header(http::header::HOST, host)
-            .header(http::header::CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(body.unwrap_or_default())))
-            .map_err(|error| unavailable("request", &error))?;
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(|error| unavailable("request", &error))?;
-        let status = response.status();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .map_err(|error| unavailable("response", &error))?
-            .to_bytes();
-        Ok((status, body))
+    /// The host's view of one route.
+    #[must_use]
+    pub fn observed(&self, route: &str) -> ObservedInstance {
+        self.controller.observed(route)
     }
 }
 
-fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, KubernetesDriverError> {
-    serde_json::from_slice(body).map_err(|error| {
-        KubernetesDriverError::Message(format!("decode shared supervisor response: {error}"))
-    })
-}
-
-fn rejected(what: &str, status: http::StatusCode, body: &[u8]) -> KubernetesDriverError {
-    let detail = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("error")
-                .and_then(|error| error.as_str().map(str::to_string))
-        })
-        .unwrap_or_default();
-    KubernetesDriverError::Message(format!(
-        "shared supervisor rejected {what} ({status}): {detail}"
-    ))
+/// The host's report of one instance, in the driver's terms.
+#[must_use]
+pub fn reported(status: &SandboxInstanceStatus) -> SandboxInstanceStatusReport {
+    SandboxInstanceStatusReport::from_proto(status)
 }
 
 #[cfg(test)]
