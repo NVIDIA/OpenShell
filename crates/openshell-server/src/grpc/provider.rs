@@ -5715,6 +5715,55 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn broker_failure_log_names_authenticated_sandbox() {
+            let state = test_server_state_without_provider_profiles().await;
+            let mut request = Request::new(
+                openshell_core::proto::GetSandboxProviderAccessTokenRequest {
+                    credential_key: SECRET.to_string(),
+                },
+            );
+            request
+                .extensions_mut()
+                .insert(Principal::Sandbox(SandboxPrincipal {
+                    sandbox_id: "broker-sandbox".to_string(),
+                    source: SandboxIdentitySource::BootstrapJwt {
+                        issuer: SECRET.to_string(),
+                    },
+                    trust_domain: None,
+                }));
+            request
+                .metadata_mut()
+                .insert("x-request-id", REQUEST_ID.parse().unwrap());
+
+            let output = GrantTraceBuffer::default();
+            let writer = output.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(move || writer.clone())
+                .finish();
+            let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
+            let error = crate::grpc::provider::access_token::handle(&state, request)
+                .await
+                .unwrap_err();
+            drop(capture);
+
+            let failure = assert_generic(&error, Code::Unauthenticated);
+            let logs = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+            assert!(
+                logs.contains(&format!(
+                    "dynamic token grant failed request_id={REQUEST_ID} code={} stage={}",
+                    failure.code(),
+                    failure.stage().code(),
+                )),
+                "{logs}"
+            );
+            assert!(logs.contains("sandbox_id=broker-sandbox"), "{logs}");
+            assert!(!logs.contains(SECRET), "{logs}");
+        }
+
+        #[tokio::test]
         async fn missing_expired_or_unresolvable_subject_credential_is_generic() {
             let config = openshell_core::Config::new(None).with_credential_drivers(["test-static"]);
             let credentials = crate::credentials::CredentialRuntime::from_config(&config).unwrap();

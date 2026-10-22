@@ -30,8 +30,9 @@ API socket. That resolver owns the instance's token cache and HTTP client and
 uses the gateway only for the intermediate exchange of RFC 8693 grants.
 Without a socket, its grants fail closed. Shared sandbox instances use
 `GatewayTokenGrantResolver`, which holds only the instance's authenticated
-`GatewayEndpoint`. Each admitted operation forwards a configured dynamic
-credential key and request ID; the gateway derives the sandbox identity,
+gateway channel, connected on the first grant and reused. Each admitted
+operation forwards a configured dynamic credential key and request ID; the
+gateway derives the sandbox identity,
 validates current authorization, resolves grant parameters, and obtains the
 final access token, which the resolver validates. No SPIRE client, SVID,
 intermediate token, or grant cache is used in the shared supervisor. `mise run test:spire-delegation` exercises the gateway's
