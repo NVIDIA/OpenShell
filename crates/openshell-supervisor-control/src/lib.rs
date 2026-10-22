@@ -38,7 +38,8 @@ pub mod proto {
 
 pub use controller::{
     AssignmentError, HOST_HEARTBEAT_INTERVAL, HostIdentity, MAX_ASSIGNED_INSTANCES,
-    MAX_REPORTED_INSTANCES, ObservedInstance, SupervisorCredential, SupervisorHostController,
+    MAX_REPORTED_INSTANCES, ObservedInstance, SharedObservation, SupervisorCredential,
+    SupervisorHostController,
 };
 pub use coordinator::{
     InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline, RecoveryOutcome,

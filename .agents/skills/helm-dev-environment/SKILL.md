@@ -71,7 +71,7 @@ gatewayConfig:
 The gateway chart creates a single-replica shared supervisor Deployment,
 Service, NetworkPolicy, and an empty `<release>-supervisor-token` Secret in
 the release namespace, regardless of shared/managed/operator workspace mode.
-The gateway mints a supervisor token from its sandbox-JWT signing key, writes
+The gateway publisher mints a supervisor token from its sandbox-JWT signing key, writes
 it into that Secret (the gateway Role may `get`/`patch` only that Secret), and
 renews it at half its lifetime; the supervisor mounts the Secret and presents
 the token on the private `openshell.supervisor.host.v1` assignment stream,
@@ -95,6 +95,15 @@ OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-workspace-manage
 OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
   mise run e2e:kubernetes:shared-supervisor
 ```
+
+With replicated gateway storage, the existing sandbox reconciler lease holder
+also owns the shared supervisor assignment stream and token renewal. Standbys
+refuse `Attach` with `UNAVAILABLE`; the supervisor retries through a fresh
+connection, so its configured gateway endpoint must reach all eligible replicas
+without sticky routing to a standby. A new leader recovers durable assignments
+before publishing. Instances keep running during reconnection. Sandbox creates
+through a standby may wait for driver reconciliation and the leader observations
+carried by the next lease renewal; expired observations mean unknown supervision.
 
 `mise run e2e:kubernetes:shared-supervisor-spiffe` installs pinned SPIRE charts
 (`ci/values-spire-delegation-stack.yaml`, removed again on exit) and the

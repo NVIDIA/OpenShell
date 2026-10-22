@@ -9,14 +9,20 @@
 //!
 //! The lease payload is a small JSON blob — no protobuf definition needed.
 //! CAS via `put_if` / `delete_if` provides cross-replica safety; the lease
-//! is an optimization to reduce contention, not a correctness mechanism.
+//! also fences the shared supervisor's assignment publisher. Each holder
+//! stops publishing at a conservative local deadline, including when storage
+//! is unavailable. Credential-free supervisor observations ride the same CAS
+//! so foreground requests on standby replicas can read the leader's view.
 
 use crate::persistence::{PersistenceError, Store, WriteCondition};
 use openshell_core::time::now_ms;
+use openshell_supervisor_control::SharedObservation;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 
 const LEASE_OBJECT_TYPE: &str = "reconciler_lease";
 const LEASE_SINGLETON_ID: &str = "singleton";
@@ -42,6 +48,8 @@ pub enum LeaseError {
 struct LeasePayload {
     holder: String,
     acquired_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervisor_observations: Option<BTreeMap<String, SharedObservation>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,15 +59,23 @@ pub struct LeaseRecord {
     pub acquired_at_ms: i64,
     pub resource_version: u64,
     pub updated_at_ms: i64,
+    pub supervisor_observations: Option<BTreeMap<String, SharedObservation>>,
 }
 
 #[derive(Debug)]
 pub struct LeaseGuard {
     resource_version: u64,
     acquired_at_ms: i64,
+    /// Conservative local bound: measured before the CAS, so delayed storage
+    /// responses never extend publication beyond this lease's lifetime.
+    deadline: Instant,
 }
 
 impl LeaseGuard {
+    pub fn deadline(&self) -> Instant {
+        self.deadline
+    }
+
     #[allow(dead_code)]
     pub fn resource_version(&self) -> u64 {
         self.resource_version
@@ -87,10 +103,12 @@ impl ReconcilerLease {
 
     /// Attempt to create the lease record. Succeeds only if no lease exists.
     pub async fn try_acquire(&self) -> Result<LeaseGuard, LeaseError> {
+        let deadline = Instant::now() + self.ttl;
         let acquired_at_ms = now_ms();
         let payload = LeasePayload {
             holder: self.replica_id.clone(),
             acquired_at_ms,
+            supervisor_observations: None,
         };
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| PersistenceError::Encode(e.to_string()))?;
@@ -111,6 +129,7 @@ impl ReconcilerLease {
             Ok(result) => Ok(LeaseGuard {
                 resource_version: result.resource_version,
                 acquired_at_ms,
+                deadline,
             }),
             Err(PersistenceError::UniqueViolation { .. }) => Err(LeaseError::AlreadyHeld),
             Err(e) => Err(LeaseError::Store(e)),
@@ -127,10 +146,12 @@ impl ReconcilerLease {
             return Err(LeaseError::AlreadyHeld);
         }
 
+        let deadline = Instant::now() + self.ttl;
         let acquired_at_ms = now_ms();
         let payload = LeasePayload {
             holder: self.replica_id.clone(),
             acquired_at_ms,
+            supervisor_observations: None,
         };
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| PersistenceError::Encode(e.to_string()))?;
@@ -151,6 +172,7 @@ impl ReconcilerLease {
             Ok(result) => Ok(LeaseGuard {
                 resource_version: result.resource_version,
                 acquired_at_ms,
+                deadline,
             }),
             Err(PersistenceError::Conflict { .. }) => Err(LeaseError::Conflict),
             Err(e) => Err(LeaseError::Store(e)),
@@ -170,9 +192,21 @@ impl ReconcilerLease {
     /// Renew the lease by CAS-writing the same payload to bump
     /// `updated_at_ms` and `resource_version`.
     pub async fn renew(&self, guard: &mut LeaseGuard) -> Result<(), LeaseError> {
+        self.renew_with_observations(guard, None).await
+    }
+
+    /// Publish credential-free supervisor observations with the same CAS that
+    /// renews ownership. A former owner cannot overwrite a new owner's view.
+    pub async fn renew_with_observations(
+        &self,
+        guard: &mut LeaseGuard,
+        supervisor_observations: Option<BTreeMap<String, SharedObservation>>,
+    ) -> Result<(), LeaseError> {
+        let deadline = Instant::now() + self.ttl;
         let payload = LeasePayload {
             holder: self.replica_id.clone(),
             acquired_at_ms: guard.acquired_at_ms,
+            supervisor_observations,
         };
         let payload_bytes =
             serde_json::to_vec(&payload).map_err(|e| PersistenceError::Encode(e.to_string()))?;
@@ -192,6 +226,7 @@ impl ReconcilerLease {
         {
             Ok(result) => {
                 guard.resource_version = result.resource_version;
+                guard.deadline = deadline;
                 Ok(())
             }
             Err(PersistenceError::Conflict { .. }) => Err(LeaseError::Conflict),
@@ -236,8 +271,18 @@ impl ReconcilerLease {
             acquired_at_ms: payload.acquired_at_ms,
             resource_version: record.resource_version,
             updated_at_ms: record.updated_at_ms,
+            supervisor_observations: payload.supervisor_observations,
         }))
     }
+}
+
+/// Remaining freshness of a lease observation. Future timestamps never grant
+/// more than one TTL; readers also bound the cached view with a local timer.
+pub fn remaining_ttl(updated_at_ms: i64, ttl: Duration) -> Duration {
+    let age_ms = now_ms().saturating_sub(updated_at_ms).max(0);
+    ttl.saturating_sub(Duration::from_millis(
+        u64::try_from(age_ms).unwrap_or(u64::MAX),
+    ))
 }
 
 /// Derive a stable replica identity for lease ownership.
@@ -289,6 +334,57 @@ mod tests {
 
         let record = l.read().await.unwrap().expect("lease should exist");
         assert_eq!(record.holder, "replica-1");
+    }
+
+    #[tokio::test]
+    async fn supervisor_observations_share_lease_cas_and_clear_on_takeover() {
+        let store = test_store().await;
+        // A zero TTL lets the test deterministically steal without wall-clock sleeps.
+        let first = lease(store.clone(), "replica-1", Duration::ZERO);
+        let second = lease(store, "replica-2", LEASE_TTL);
+        let mut guard = first.try_acquire().await.unwrap();
+        let observations = BTreeMap::from([("rt-a".to_string(), SharedObservation::Pending)]);
+        first
+            .renew_with_observations(&mut guard, Some(observations.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.read().await.unwrap().unwrap().supervisor_observations,
+            Some(observations.clone())
+        );
+        // Simulate expiration using the same TTL-zero contender as existing
+        // lease tests. Acquisition clears every previous owner's observation.
+        let stealer = lease(second.store.clone(), "replica-2", Duration::ZERO);
+        let mut replacement = stealer.acquire_or_steal().await.unwrap();
+        assert!(
+            second
+                .read()
+                .await
+                .unwrap()
+                .unwrap()
+                .supervisor_observations
+                .is_none()
+        );
+        assert!(matches!(
+            first
+                .renew_with_observations(&mut guard, Some(observations.clone()))
+                .await,
+            Err(LeaseError::Conflict)
+        ));
+        second
+            .renew_with_observations(&mut replacement, Some(observations.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.read().await.unwrap().unwrap().supervisor_observations,
+            Some(observations)
+        );
+        assert!(matches!(
+            first.release(guard).await,
+            Err(LeaseError::Conflict)
+        ));
+        second.release(replacement).await.unwrap();
+        assert!(second.read().await.unwrap().is_none());
     }
 
     #[tokio::test]

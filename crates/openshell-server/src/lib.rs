@@ -253,33 +253,46 @@ fn spawn_supervisor_token_refresh(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
+        let mut next_mint = tokio::time::Instant::now();
+        let mut credential = controller.credential();
         loop {
-            let delay = match authority.mint_supervisor_token(ttl) {
-                Ok(minted) => {
-                    let remaining = minted.expires_at.saturating_sub(
-                        i64::try_from(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map_or(0, |elapsed| elapsed.as_secs()),
-                        )
-                        .unwrap_or(i64::MAX),
-                    );
-                    controller.publish_credential(
-                        openshell_supervisor_control::SupervisorCredential {
-                            token: minted.token,
-                            expires_at: minted.expires_at,
-                        },
-                    );
-                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
-                        .max(Duration::from_secs(1))
-                }
-                Err(error) => {
-                    warn!(%error, "failed to mint the supervisor token; retrying");
-                    Duration::from_secs(10)
-                }
-            };
+            if credential.has_changed().unwrap_or(false) && credential.borrow_and_update().is_none()
+            {
+                next_mint = tokio::time::Instant::now();
+            }
+            if !controller.is_publisher() {
+                // Mint promptly when this replica acquires the existing lease;
+                // standbys never compete to overwrite the supervisor's token.
+                next_mint = tokio::time::Instant::now();
+            } else if tokio::time::Instant::now() >= next_mint {
+                let delay = match authority.mint_supervisor_token(ttl) {
+                    Ok(minted) => {
+                        let remaining = minted.expires_at.saturating_sub(
+                            i64::try_from(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map_or(0, |elapsed| elapsed.as_secs()),
+                            )
+                            .unwrap_or(i64::MAX),
+                        );
+                        controller.publish_credential(
+                            openshell_supervisor_control::SupervisorCredential {
+                                token: minted.token,
+                                expires_at: minted.expires_at,
+                            },
+                        );
+                        Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                            .max(Duration::from_secs(1))
+                    }
+                    Err(error) => {
+                        warn!(%error, "failed to mint the supervisor token; retrying");
+                        Duration::from_secs(10)
+                    }
+                };
+                next_mint = tokio::time::Instant::now() + delay;
+            }
             tokio::select! {
-                () = tokio::time::sleep(delay) => {}
+                () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 changed = shutdown_rx.changed() => {
                     if changed.is_err() || *shutdown_rx.borrow() {
                         return;
@@ -289,6 +302,7 @@ fn spawn_supervisor_token_refresh(
         }
     });
 }
+
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;

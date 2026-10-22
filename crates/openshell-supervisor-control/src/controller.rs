@@ -29,11 +29,14 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
+use crate::SandboxInstanceStatusReport;
 use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
     HostMessage, HostStatus, SandboxInstanceAssignment, SandboxInstanceStatus,
@@ -96,6 +99,33 @@ pub enum ObservedInstance {
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
+}
+
+/// Credential-free observations carried by the gateway's existing reconciler
+/// lease. Routes are generation-specific; an omitted route is unknown, never
+/// evidence that a newly created instance is absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SharedObservation {
+    Pending,
+    Absent,
+    Reported(SandboxInstanceStatusReport),
+}
+
+#[derive(Clone, Copy)]
+enum Publisher {
+    Standalone,
+    Standby,
+    Lease(Instant),
+}
+
+impl Publisher {
+    fn active(self) -> bool {
+        match self {
+            Self::Standalone => true,
+            Self::Standby => false,
+            Self::Lease(deadline) => Instant::now() < deadline,
+        }
+    }
 }
 
 struct Assigned {
@@ -163,6 +193,10 @@ struct Observed {
 }
 
 struct Inner {
+    publisher: Mutex<Publisher>,
+    /// Standbys read only lease-fenced observations, never another replica's
+    /// desired state or credentials. The local deadline also bounds cached reads.
+    mirror: Mutex<Option<(Instant, BTreeMap<String, SharedObservation>)>>,
     desired: Mutex<Desired>,
     /// Latest supervisor token the gateway minted; `None` until the first.
     credential: watch::Sender<Option<SupervisorCredential>>,
@@ -216,6 +250,8 @@ impl SupervisorHostController {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
+                publisher: Mutex::new(Publisher::Standalone),
+                mirror: Mutex::new(None),
                 desired: Mutex::new(Desired::default()),
                 credential: watch::Sender::new(None),
                 revision: watch::Sender::new(0),
@@ -224,9 +260,102 @@ impl SupervisorHostController {
         }
     }
 
+    /// Require the existing gateway reconciler lease before serving a host.
+    /// Call before exposing this controller on a replicated gateway.
+    pub fn require_leadership(&self) {
+        self.stop_publishing();
+    }
+
+    /// Start a new reconciler term. Discard the previous replica-local view:
+    /// only a fresh complete recovery may initialize this term's assignments.
+    /// Bumping the revision fences recovery work begun in an earlier term.
+    pub fn start_publishing(&self, deadline: Instant) {
+        let mut publisher = lock(&self.inner.publisher);
+        let mut desired = lock(&self.inner.desired);
+        let revision = desired.revision + 1;
+        *desired = Desired {
+            revision,
+            ..Desired::default()
+        };
+        *lock(&self.inner.mirror) = None;
+        Self::disconnect(&mut lock(&self.inner.observed));
+        *publisher = Publisher::Lease(deadline);
+        self.inner.revision.send_replace(revision);
+    }
+
+    /// Extend publication only after the existing lease was renewed.
+    pub fn renew_publishing(&self, deadline: Instant) {
+        let mut publisher = lock(&self.inner.publisher);
+        if matches!(*publisher, Publisher::Lease(_)) && publisher.active() {
+            *publisher = Publisher::Lease(deadline);
+        }
+    }
+
+    /// Revoke publication before releasing the lease or waiting for worker
+    /// cleanup. Existing sandbox instances survive their stream closing.
+    pub fn stop_publishing(&self) {
+        let mut publisher = lock(&self.inner.publisher);
+        *publisher = Publisher::Standby;
+        Self::disconnect(&mut lock(&self.inner.observed));
+        self.inner.credential.send_replace(None);
+    }
+
+    fn disconnect(observed: &mut Observed) {
+        if let Some(session) = observed.session.take() {
+            session.superseded.send_replace(true);
+        }
+        observed.status = None;
+    }
+
+    #[must_use]
+    pub fn is_publisher(&self) -> bool {
+        lock(&self.inner.publisher).active()
+    }
+
+    /// Snapshot observations for the next CAS renewal of the reconciler
+    /// lease. Contains no launch material or bearer tokens.
+    #[must_use]
+    pub fn shared_observations(&self) -> Option<BTreeMap<String, SharedObservation>> {
+        let publisher = lock(&self.inner.publisher);
+        if !publisher.active() {
+            return None;
+        }
+        let desired = lock(&self.inner.desired);
+        let observed = lock(&self.inner.observed);
+        observed.session.as_ref()?;
+        Some(
+            desired
+                .assignments
+                .keys()
+                .map(|route| {
+                    let value = match Self::observe(&desired, &observed, route) {
+                        ObservedInstance::Reported(status) => SharedObservation::Reported(
+                            SandboxInstanceStatusReport::from_proto(&status),
+                        ),
+                        ObservedInstance::Absent => SharedObservation::Absent,
+                        _ => SharedObservation::Pending,
+                    };
+                    (route.clone(), value)
+                })
+                .collect(),
+        )
+    }
+
+    /// Replace the standby's view from a fresh read of the existing lease.
+    /// Failed reads, absent owners, and expired leases clear it immediately.
+    pub fn mirror_observations(
+        &self,
+        observations: Option<(Instant, BTreeMap<String, SharedObservation>)>,
+    ) {
+        *lock(&self.inner.mirror) = observations;
+    }
+
     /// Publish a freshly minted supervisor token for delivery to the host.
     pub fn publish_credential(&self, credential: SupervisorCredential) {
-        self.inner.credential.send_replace(Some(credential));
+        let publisher = lock(&self.inner.publisher);
+        if publisher.active() {
+            self.inner.credential.send_replace(Some(credential));
+        }
     }
 
     /// The current supervisor token and every renewal after it.
@@ -274,7 +403,7 @@ impl SupervisorHostController {
         assignments: impl IntoIterator<Item = SandboxInstanceAssignment>,
     ) -> Result<u64, AssignmentError> {
         let mut desired = lock(&self.inner.desired);
-        if desired.initialized && desired.revision != baseline {
+        if desired.revision != baseline {
             return Err(AssignmentError::Conflict {
                 baseline,
                 current: desired.revision,
@@ -375,8 +504,30 @@ impl SupervisorHostController {
     /// What the connected host reports for `route`.
     #[must_use]
     pub fn observed(&self, route: &str) -> ObservedInstance {
-        let desired = lock(&self.inner.desired);
-        let observed = lock(&self.inner.observed);
+        let publisher = lock(&self.inner.publisher);
+        if !publisher.active() {
+            let mirror = lock(&self.inner.mirror);
+            return match mirror
+                .as_ref()
+                .filter(|(deadline, _)| Instant::now() < *deadline)
+                .and_then(|(_, observations)| observations.get(route))
+            {
+                Some(SharedObservation::Reported(status)) => {
+                    ObservedInstance::Reported(status.to_proto())
+                }
+                Some(SharedObservation::Absent) => ObservedInstance::Absent,
+                Some(SharedObservation::Pending) => ObservedInstance::Pending,
+                None => ObservedInstance::NoHost,
+            };
+        }
+        Self::observe(
+            &lock(&self.inner.desired),
+            &lock(&self.inner.observed),
+            route,
+        )
+    }
+
+    fn observe(desired: &Desired, observed: &Observed, route: &str) -> ObservedInstance {
         if observed.session.is_none() {
             return ObservedInstance::NoHost;
         }
@@ -405,6 +556,11 @@ impl SupervisorHostController {
         identity: HostIdentity,
         mut inbound: Streaming<HostMessage>,
     ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
+        if !self.is_publisher() {
+            return Err(Status::unavailable(
+                "reconnect to the gateway reconciler leader",
+            ));
+        }
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
                 payload: Some(host_message::Payload::Hello(hello)),
@@ -463,6 +619,12 @@ impl SupervisorHostController {
         identity: HostIdentity,
         hello: &HostHello,
     ) -> Result<(u64, watch::Receiver<bool>), Status> {
+        let publisher = lock(&self.inner.publisher);
+        if !publisher.active() {
+            return Err(Status::unavailable(
+                "reconnect to the gateway reconciler leader",
+            ));
+        }
         let mut observed = lock(&self.inner.observed);
         if let Some(current) = &observed.session
             && current.instance_id == hello.instance_id
@@ -575,7 +737,7 @@ impl SupervisorHostController {
         tokio::pin!(credential_expiry);
         let mut revision = self.inner.revision.subscribe();
         let mut sent_revision = 0;
-        let mut last_heard = tokio::time::Instant::now();
+        let mut last_heard = Instant::now();
         let mut heartbeat = tokio::time::interval(HOST_HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // A send that cannot complete within the bound ends the session, so a
@@ -594,11 +756,22 @@ impl SupervisorHostController {
             }
         };
         loop {
+            let publisher = *lock(&self.inner.publisher);
+            if !publisher.active() || *superseded.borrow() {
+                return;
+            }
+            let lease_expiry = async move {
+                if let Publisher::Lease(deadline) = publisher {
+                    tokio::time::sleep_until(deadline).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::pin!(lease_expiry);
             let current = *revision.borrow_and_update();
-            if current > sent_revision {
-                let Some(snapshot) = self.snapshot() else {
-                    continue;
-                };
+            if current > sent_revision
+                && let Some(snapshot) = self.snapshot()
+            {
                 tracing::debug!(
                     session = session_id,
                     revision = snapshot.revision,
@@ -606,13 +779,19 @@ impl SupervisorHostController {
                     "sending supervisor host assignment snapshot"
                 );
                 let revision_sent = snapshot.revision;
-                if !send(host_gateway_message::Payload::Assignments(snapshot)).await {
-                    return;
+                tokio::select! {
+                    biased;
+                    _ = superseded.changed() => return,
+                    () = &mut lease_expiry => return,
+                    delivered = send(host_gateway_message::Payload::Assignments(snapshot)) => {
+                        if !delivered { return; }
+                    }
                 }
                 self.record_sent(session_id, revision_sent);
                 sent_revision = current;
             }
             tokio::select! {
+                () = &mut lease_expiry => {},
                 changed = revision.changed() => {
                     if changed.is_err() {
                         return;
@@ -620,13 +799,13 @@ impl SupervisorHostController {
                 }
                 message = inbound.next() => match message {
                     Some(Ok(HostMessage { payload: Some(host_message::Payload::Status(status)) })) => {
-                        last_heard = tokio::time::Instant::now();
+                        last_heard = Instant::now();
                         if let Err(reason) = self.record_status(session_id, status) {
                             tracing::warn!(session = session_id, reason, "dropped supervisor host status report");
                         }
                     }
                     Some(Ok(HostMessage { payload: Some(host_message::Payload::Heartbeat(_)) })) => {
-                        last_heard = tokio::time::Instant::now();
+                        last_heard = Instant::now();
                     }
                     Some(Ok(_)) => {
                         let _ = tx
@@ -650,8 +829,13 @@ impl SupervisorHostController {
                         tracing::warn!(session = session_id, "supervisor host stream went silent; closing it");
                         return;
                     }
-                    if !send(host_gateway_message::Payload::Heartbeat(HostGatewayHeartbeat {})).await {
-                        return;
+                    tokio::select! {
+                        biased;
+                        _ = superseded.changed() => return,
+                        () = &mut lease_expiry => return,
+                        delivered = send(host_gateway_message::Payload::Heartbeat(HostGatewayHeartbeat {})) => {
+                            if !delivered { return; }
+                        }
                     }
                 }
                 _ = superseded.changed() => return,
@@ -784,6 +968,94 @@ mod tests {
             Err(AssignmentError::Capacity)
         );
         assert_eq!(controller.assign(assignment("rt-0", b"x")), Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leadership_fences_old_sessions_recovery_and_cached_observations() {
+        let controller = SupervisorHostController::new();
+        controller
+            .replace_assignments(0, [assignment("rt-old", b"old")])
+            .unwrap();
+        let old_baseline = controller.revision();
+        controller.require_leadership();
+        let identity = HostIdentity {
+            subject: "openshell-supervisor:test".to_string(),
+            token_id: "token".to_string(),
+            expires_at: i64::MAX,
+        };
+        let hello = HostHello {
+            instance_id: "boot".to_string(),
+            connection_epoch: 1,
+        };
+        assert_eq!(
+            controller
+                .begin_session(identity.clone(), &hello)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+        controller.start_publishing(Instant::now() + Duration::from_secs(30));
+        assert!(!controller.is_initialized());
+        assert!(controller.assignment("rt-old").is_none());
+        assert!(controller.replace_assignments(old_baseline, []).is_err());
+        // No authoritative empty snapshot before the new term's full recovery.
+        assert!(controller.snapshot().is_none());
+        controller
+            .replace_assignments(controller.revision(), [assignment("rt-new", b"new")])
+            .unwrap();
+        let (session, revoked) = controller.begin_session(identity.clone(), &hello).unwrap();
+        controller.record_sent(session, controller.revision());
+        controller
+            .record_status(session, status(controller.revision(), &["rt-new"]))
+            .unwrap();
+
+        let standby = SupervisorHostController::new();
+        standby.require_leadership();
+        standby.mirror_observations(Some((
+            Instant::now() + Duration::from_secs(30),
+            controller.shared_observations().unwrap(),
+        )));
+        assert!(
+            matches!(standby.observed("rt-new"), ObservedInstance::Reported(status) if status.ready)
+        );
+        assert_eq!(
+            standby.observed("rt-created-on-standby"),
+            ObservedInstance::NoHost
+        );
+
+        // Renewing extends the local bound, but a cached standby view expires
+        // unless it too reads a fresh lease. Expiry is unknown, never absent.
+        tokio::time::advance(Duration::from_secs(20)).await;
+        controller.renew_publishing(Instant::now() + Duration::from_secs(30));
+        tokio::time::advance(Duration::from_secs(11)).await;
+        assert!(controller.is_publisher());
+        assert_eq!(standby.observed("rt-new"), ObservedInstance::NoHost);
+        controller.stop_publishing();
+        assert!(*revoked.borrow());
+        assert!(controller.record_status(session, status(0, &[])).is_err());
+        assert_eq!(controller.observed("rt-new"), ObservedInstance::NoHost);
+        assert_eq!(
+            controller
+                .begin_session(identity.clone(), &hello)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+
+        controller.start_publishing(Instant::now() + Duration::from_secs(30));
+        assert!(!controller.is_initialized());
+        assert!(controller.snapshot().is_none());
+        tokio::time::advance(Duration::from_secs(31)).await;
+        // A late renewal cannot revive an expired term.
+        controller.renew_publishing(Instant::now() + Duration::from_secs(30));
+        assert!(!controller.is_publisher());
+        assert_eq!(
+            controller
+                .begin_session(identity, &hello)
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
     }
 
     #[test]

@@ -687,6 +687,23 @@ returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
 `openshell_server_mutation_lock_timeouts_total` nor
 `openshell_server_mutation_lock_errors_total` counts it.
 
+With `supervisor_topology = "gateway"` and replicated gateway storage, the
+shared supervisor's assignment stream belongs to the existing sandbox
+reconciler lease holder. Look for `acquired reconciler lease` and `supervisor
+host attached` on the same gateway Pod. A standby returns `UNAVAILABLE` with
+`reconnect to the gateway reconciler leader`; the supervisor retries using a
+fresh connection. Its gateway endpoint must balance across eligible replicas;
+remove session affinity that pins retries to a standby. Hosted workloads
+continue running during reconnection. After takeover, the new leader recovers
+durable assignments before sending its first snapshot.
+
+Creates through a standby can take an extra driver reconciliation interval
+before the leader assigns their instances. The standby reads readiness from
+observations carried by the reconciler lease, refreshed on renewal (10
+seconds) and polled every 5 seconds. An expired or unreadable lease means
+unknown supervision, not instance failure. Check gateway storage connectivity
+and lease-renewal logs when readiness lags across all sandboxes.
+
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
 owner over the internal `PeerRelay` RPC. Check the headless peer Service,
