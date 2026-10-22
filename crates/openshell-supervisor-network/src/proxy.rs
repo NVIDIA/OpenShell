@@ -161,6 +161,31 @@ fn build_proxy_connection_error_event(
         .build()
 }
 
+fn build_peer_identity_denial_event(
+    addresses: Option<(SocketAddr, SocketAddr)>,
+) -> openshell_ocsf::OcsfEvent {
+    let message = "Proxy peer identity unavailable; request denied";
+    if let Some((peer, _)) = addresses {
+        return NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Denied)
+            .disposition(DispositionId::Blocked)
+            .severity(SeverityId::Medium)
+            .status(StatusId::Failure)
+            .src_endpoint_addr(peer.ip(), peer.port())
+            .message(message)
+            .status_detail("proxy_peer_identity_unavailable")
+            .build();
+    }
+    BaseEventBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity_name("Proxy peer identity denial")
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .message(message)
+        .unmapped("denial_reason", "proxy_peer_identity_unavailable")
+        .build()
+}
+
 fn build_mediation_lane_failure_event(message: String) -> openshell_ocsf::OcsfEvent {
     BaseEventBuilder::new(openshell_ocsf::ctx::ctx())
         .activity_name("Network mediation source failure")
@@ -226,6 +251,38 @@ const CLOUD_METADATA_IPS: &[IpAddr] = &[
     IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
 ];
 
+async fn bind_direct_listener(
+    address: SocketAddr,
+    prebound: Option<Arc<std::net::TcpListener>>,
+) -> Result<TcpListener> {
+    if let Some(listener) = prebound {
+        if listener.local_addr().into_diagnostic()? != address {
+            return Err(miette::miette!(
+                "prebound proxy socket differs from trusted bind address"
+            ));
+        }
+        let socket = listener.try_clone().into_diagnostic()?;
+        socket.set_nonblocking(true).into_diagnostic()?;
+        TcpListener::from_std(socket).into_diagnostic()
+    } else {
+        TcpListener::bind(address).await.into_diagnostic()
+    }
+}
+
+async fn resolve_direct_peer(
+    resolver: Arc<dyn crate::run::ProxyPeerIdentityResolver>,
+    addresses: Option<(SocketAddr, SocketAddr)>,
+) -> std::result::Result<ContractBinaryIdentity, ResolveError> {
+    let (peer, local) = addresses.ok_or(ResolveError::NotFound)?;
+    tokio::task::spawn_blocking(move || resolver.resolve(peer, local))
+        .await
+        .unwrap_or_else(|_| {
+            Err(ResolveError::Failed(
+                "proxy peer attribution task failed".to_string(),
+            ))
+        })
+}
+
 pub struct ProxyHandle {
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
@@ -256,14 +313,17 @@ impl ProxyHandle {
         backend_host_gateway: Option<IpAddr>,
         network_mediation_source: Option<Arc<NetworkMediationSource>>,
         policy_dns_store: Option<Arc<ResolvedEndpointStore>>,
-        direct_listener_identity: Option<ContractBinaryIdentity>,
-        required_proxy_authorization: Option<Arc<str>>,
+        direct_listener: Option<crate::run::ProxyListenerConfig>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
         // network namespace is available (e.g. missing CAP_NET_ADMIN) and the
         // policy doesn't specify an explicit address.
         let default_addr: SocketAddr = ([127, 0, 0, 1], 3128).into();
+        let bind_addr = direct_listener
+            .as_ref()
+            .map(|config| config.bind_addr)
+            .or(bind_addr);
         let http_addr = bind_addr.or(policy.http_addr).unwrap_or(default_addr);
 
         // Only enforce loopback restriction when not using network namespace override
@@ -274,15 +334,25 @@ impl ProxyHandle {
         }
 
         let source_backed = network_mediation_source.is_some();
-        if source_backed && required_proxy_authorization.is_some() {
+        if source_backed && direct_listener.is_some() {
             return Err(miette::miette!(
-                "proxy authorization cannot be required for a network mediation source"
+                "direct listener configuration cannot be used with a network mediation source"
             ));
         }
+        let prebound_listener = direct_listener
+            .as_ref()
+            .and_then(|config| config.listener.clone());
+        let peer_identity_resolver = direct_listener
+            .as_ref()
+            .and_then(|config| config.identity_resolver.clone());
+        let direct_listener_identity = direct_listener
+            .as_ref()
+            .map(|config| config.binary_identity.clone());
+        let required_proxy_authorization = direct_listener.and_then(|config| config.authorization);
         let listener = if source_backed {
             None
         } else {
-            Some(TcpListener::bind(http_addr).await.into_diagnostic()?)
+            Some(bind_direct_listener(http_addr, prebound_listener).await?)
         };
         let local_addr = match listener.as_ref() {
             Some(listener) => listener.local_addr().into_diagnostic()?,
@@ -454,22 +524,21 @@ impl ProxyHandle {
                     let listener = listener
                         .as_ref()
                         .expect("listener exists without a mediation source");
-                    listener
-                        .accept()
-                        .await
-                        .map(|(stream, _)| {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
                             set_tcp_nodelay_best_effort(&stream);
                             let workload_addr = stream.peer_addr().ok();
                             let proxy_addr = stream.local_addr().ok();
                             let stream: BoundaryDuplexStream = Box::new(stream);
-                            (
+                            Ok((
                                 stream,
                                 direct_listener_identity.clone().map(Ok),
                                 workload_addr.zip(proxy_addr),
                                 None,
-                            )
-                        })
-                        .map_err(ProxyAcceptError::Listener)
+                            ))
+                        }
+                        Err(error) => Err(ProxyAcceptError::Listener(error)),
+                    }
                 };
                 match accepted {
                     Ok((stream, supplied_identity, socket_addrs, transparent_destination)) => {
@@ -497,6 +566,7 @@ impl ProxyHandle {
                         let atx = activity_tx.clone();
                         let endpoint_observations = endpoint_observation_tx.clone();
                         let required_authorization = required_proxy_authorization.clone();
+                        let peer_identity_resolver = peer_identity_resolver.clone();
                         tokio::spawn(async move {
                             #[allow(clippy::large_futures)]
                             if let Err(err) = handle_mediated_connection(
@@ -520,6 +590,7 @@ impl ProxyHandle {
                                 atx,
                                 endpoint_observations,
                                 required_authorization,
+                                peer_identity_resolver,
                             )
                             .await
                             {
@@ -2367,6 +2438,7 @@ async fn handle_tcp_connection(
         activity_tx,
         endpoint_observation_tx,
         None,
+        None,
     ))
     .await
 }
@@ -2432,6 +2504,7 @@ async fn handle_mediated_connection(
     activity_tx: Option<ActivitySender>,
     endpoint_observation_tx: Option<EndpointObservationSender>,
     required_proxy_authorization: Option<Arc<str>>,
+    peer_identity_resolver: Option<Arc<dyn crate::run::ProxyPeerIdentityResolver>>,
 ) -> Result<()> {
     // Bind observations to the policy/provider inventory active when this
     // connection was accepted, even if configuration changes while it runs.
@@ -2548,6 +2621,35 @@ async fn handle_mediated_connection(
         .await?;
         return Ok(());
     }
+    // Resolve only authenticated requests, on a worker separate from acceptance.
+    // A failed attribution must also deny local proxy routes before dispatch.
+    let supplied_identity = if let Some(resolver) = peer_identity_resolver {
+        match resolve_direct_peer(resolver, socket_addrs).await {
+            Ok(identity)
+                if identity_cache
+                    .verify_or_cache_supplied_identity(&identity)
+                    .is_ok() =>
+            {
+                Some(Ok(identity))
+            }
+            _ => {
+                ocsf_emit!(build_peer_identity_denial_event(socket_addrs));
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "identity_unavailable",
+                        "Proxy peer identity could not be verified",
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else {
+        supplied_identity
+    };
     let mut lines = request.split("\r\n");
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -7120,6 +7222,372 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    struct PeerResolver<F>(F);
+
+    impl<F> crate::run::ProxyPeerIdentityResolver for PeerResolver<F>
+    where
+        F: Fn(SocketAddr, SocketAddr) -> std::result::Result<ContractBinaryIdentity, ResolveError>
+            + Send
+            + Sync,
+    {
+        fn resolve(
+            &self,
+            peer: SocketAddr,
+            local: SocketAddr,
+        ) -> std::result::Result<ContractBinaryIdentity, ResolveError> {
+            (self.0)(peer, local)
+        }
+    }
+
+    fn direct_identity(path: &str) -> ContractBinaryIdentity {
+        ContractBinaryIdentity {
+            executable: ContractExecutableIdentity {
+                path: executable_path(path),
+                digest: Some("11".repeat(32).parse().unwrap()),
+            },
+            ancestors: Vec::new(),
+            cmdline_paths: Vec::new(),
+        }
+    }
+
+    fn direct_config() -> crate::run::ProxyListenerConfig {
+        let listener = Arc::new(std::net::TcpListener::bind("127.0.0.1:0").unwrap());
+        crate::run::ProxyListenerConfig {
+            bind_addr: listener.local_addr().unwrap(),
+            authorization: Some(Arc::from("Basic test-generation")),
+            binary_identity: direct_identity("/usr/bin/allowed"),
+            listener: Some(listener),
+            identity_resolver: None,
+        }
+    }
+
+    async fn start_direct_proxy(
+        config: crate::run::ProxyListenerConfig,
+        source: Option<Arc<NetworkMediationSource>>,
+    ) -> Result<ProxyHandle> {
+        let data = policy_with_native_executable_paths(
+            r#"
+network_policies:
+  verified:
+    name: verified
+    endpoints:
+      - host: 192.0.2.1
+        port: 443
+    binaries:
+      - path: /usr/bin/allowed
+"#,
+        );
+        let engine = Arc::new(
+            OpaEngine::from_strings_with_binary_identity_required(
+                include_str!("../data/sandbox-policy.rego"),
+                &data,
+                true,
+            )
+            .unwrap(),
+        );
+        let (_ready_tx, ready_rx) = tokio::sync::watch::channel(true);
+        ProxyHandle::start_with_bind_addr(
+            &ProxyPolicy { http_addr: None },
+            None,
+            engine,
+            Arc::new(BinaryIdentityCache::new()),
+            Arc::new(AtomicU32::new(0)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ready_rx,
+            &upstream_proxy::UpstreamProxyArgs::default(),
+            None,
+            source,
+            None,
+            Some(config),
+        )
+        .await
+    }
+
+    async fn direct_response(
+        client: &mut TcpStream,
+        request_line: &str,
+        authorization: Option<&str>,
+    ) -> String {
+        let authorization = authorization.map_or_else(String::new, |value| {
+            format!("Proxy-Authorization: {value}\r\n")
+        });
+        client
+            .write_all(
+                format!("{request_line}\r\nHost: 192.0.2.1:443\r\n{authorization}\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.read_to_string(&mut response),
+        )
+        .await
+        .expect("proxy must respond promptly")
+        .unwrap();
+        response
+    }
+
+    const DIRECT_CONNECT: &str = "CONNECT 192.0.2.1:443 HTTP/1.1";
+    const DIRECT_AUTHORIZATION: &str = "Basic test-generation";
+
+    #[tokio::test]
+    async fn direct_listener_serves_prebound_socket_and_preserves_owner_reservation() {
+        let config = direct_config();
+        let address = config.bind_addr;
+        let owner = config.listener.clone().unwrap();
+        let mut mismatch = config.clone();
+        mismatch.bind_addr.set_port(0);
+        assert!(start_direct_proxy(mismatch, None).await.is_err());
+        assert!(!format!("{config:?}").contains(DIRECT_AUTHORIZATION));
+        let mut proxy = start_direct_proxy(config, None).await.unwrap();
+        assert_eq!(proxy.http_addr(), Some(address));
+        let exited = proxy.take_exit_receiver().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        // The configured identity passes OPA and reaches the missing-TLS guard.
+        // A literal documentation IP avoids external DNS and no upstream is dialed.
+        let response =
+            direct_response(&mut client, DIRECT_CONNECT, Some(DIRECT_AUTHORIZATION)).await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        drop(client);
+        drop(proxy);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), exited)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::net::TcpListener::bind(address).unwrap_err().kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        drop(owner);
+        assert!(std::net::TcpListener::bind(address).is_ok());
+
+        // Existing static composition can also let the proxy bind its own socket.
+        let mut config = direct_config();
+        config.listener = None;
+        config.bind_addr.set_port(0);
+        config.authorization = None;
+        let proxy = start_direct_proxy(config, None).await.unwrap();
+        let mut client = TcpStream::connect(proxy.http_addr().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            direct_response(&mut client, DIRECT_CONNECT, None)
+                .await
+                .starts_with("HTTP/1.1 503")
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_listener_attributes_each_peer_and_denies_resolver_failures() {
+        const CHILD: &str = "OPENSHELL_TEST_DIRECT_PROXY_EVENTS_CHILD";
+        // Tracing callsite interest is process-wide. Like the policy DNS audit
+        // fixture, isolate capture from concurrent tests' subscribers.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "proxy::tests::direct_listener_attributes_each_peer_and_denies_resolver_failures",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let capture = openshell_ocsf::test_support::OcsfCapture::default();
+        let _capture_guard = capture.install();
+        let identities = Arc::new(std::sync::Mutex::new(TestHashMap::new()));
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut config = direct_config();
+        let address = config.bind_addr;
+        config.identity_resolver = Some(Arc::new(PeerResolver({
+            let identities = identities.clone();
+            let observed = observed.clone();
+            move |peer, local| {
+                assert_eq!(local, address);
+                observed.fetch_add(1, Ordering::SeqCst);
+                let identity = *identities
+                    .lock()
+                    .unwrap()
+                    .get(&peer)
+                    .expect("exact peer tuple");
+                match identity {
+                    "not-found" => Err(ResolveError::NotFound),
+                    "failed" => Err(ResolveError::Failed("ambiguous peer".into())),
+                    "panic" => panic!("resolver worker failed"),
+                    "missing-digest" => {
+                        let mut identity = direct_identity("/usr/bin/allowed");
+                        identity.executable.digest = None;
+                        Ok(identity)
+                    }
+                    "changed-digest" => {
+                        let mut identity = direct_identity("/usr/bin/allowed");
+                        identity.executable.digest = Some("22".repeat(32).parse().unwrap());
+                        Ok(identity)
+                    }
+                    path => Ok(direct_identity(path)),
+                }
+            }
+        })));
+        let _proxy = start_direct_proxy(config, None).await.unwrap();
+        for (identity, request, expected) in [
+            ("/usr/bin/allowed", DIRECT_CONNECT, "503"),
+            ("/usr/bin/denied", DIRECT_CONNECT, "403"),
+            ("not-found", DIRECT_CONNECT, "403"),
+            ("failed", DIRECT_CONNECT, "403"),
+            ("panic", DIRECT_CONNECT, "403"),
+            ("not-found", "GET http://policy.local/ HTTP/1.1", "403"),
+            ("missing-digest", "GET http://policy.local/ HTTP/1.1", "403"),
+            ("changed-digest", "GET http://policy.local/ HTTP/1.1", "403"),
+            (
+                "missing-digest",
+                "GET http://gcp.metadata.openshell.internal/computeMetadata/v1/ HTTP/1.1",
+                "403",
+            ),
+        ] {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            identities
+                .lock()
+                .unwrap()
+                .insert(client.local_addr().unwrap(), identity);
+            let response = direct_response(&mut client, request, Some(DIRECT_AUTHORIZATION)).await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {expected}")),
+                "{identity}: {response}"
+            );
+            if matches!(
+                identity,
+                "not-found" | "failed" | "panic" | "missing-digest" | "changed-digest"
+            ) {
+                assert!(response.contains("identity_unavailable"), "{response}");
+            }
+        }
+        assert_eq!(observed.load(Ordering::SeqCst), 9);
+        // Authentication runs before the trusted resolver, even for local routes.
+        let mut client = TcpStream::connect(address).await.unwrap();
+        assert!(
+            direct_response(&mut client, DIRECT_CONNECT, Some("Basic wrong"))
+                .await
+                .starts_with("HTTP/1.1 407")
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 9);
+        let denials = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.base().status_detail.as_deref() == Some("proxy_peer_identity_unavailable")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(denials.len(), 7);
+        for event in denials {
+            let event = serde_json::to_value(event).unwrap();
+            assert_eq!(event["action_id"], 2);
+            assert_eq!(event["src_endpoint"]["ip"], "127.0.0.1");
+        }
+        let no_tuple_event = serde_json::to_value(build_peer_identity_denial_event(None)).unwrap();
+        assert!(no_tuple_event.get("src_endpoint").is_none());
+        assert_eq!(
+            no_tuple_event["unmapped"]["denial_reason"],
+            "proxy_peer_identity_unavailable"
+        );
+        assert!(matches!(
+            resolve_direct_peer(
+                Arc::new(PeerResolver(|_, _| {
+                    panic!("a missing tuple must not reach the resolver")
+                })),
+                None
+            )
+            .await,
+            Err(ResolveError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_listener_slow_resolver_does_not_block_other_connections() {
+        let mut config = direct_config();
+        let address = config.bind_addr;
+        let blocked_peer = Arc::new(std::sync::atomic::AtomicU16::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        config.identity_resolver = Some(Arc::new(PeerResolver({
+            let blocked_peer = blocked_peer.clone();
+            let started = started.clone();
+            move |peer: SocketAddr, _| {
+                if peer.port() == blocked_peer.load(Ordering::SeqCst) {
+                    started.notify_one();
+                    // Dropping the sender on assertion failure also releases this worker.
+                    let _ = wait
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(10));
+                }
+                Ok(direct_identity("/usr/bin/allowed"))
+            }
+        })));
+        let _proxy = start_direct_proxy(config, None).await.unwrap();
+        let mut first = TcpStream::connect(address).await.unwrap();
+        blocked_peer.store(first.local_addr().unwrap().port(), Ordering::SeqCst);
+        first.write_all(format!("{DIRECT_CONNECT}\r\nHost: 192.0.2.1:443\r\nProxy-Authorization: {DIRECT_AUTHORIZATION}\r\n\r\n").as_bytes()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        let mut second = TcpStream::connect(address).await.unwrap();
+        assert!(
+            direct_response(&mut second, DIRECT_CONNECT, Some(DIRECT_AUTHORIZATION))
+                .await
+                .starts_with("HTTP/1.1 503")
+        );
+        release.send(()).unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            first.read_to_string(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"));
+    }
+
+    #[tokio::test]
+    async fn direct_listener_configuration_is_rejected_for_transparent_mediation() {
+        for (listener, resolver) in [(true, false), (false, true)] {
+            let mut config = direct_config();
+            config.authorization = None;
+            if !listener {
+                config.listener = None;
+            }
+            if resolver {
+                config.identity_resolver =
+                    Some(Arc::new(PeerResolver(|_, _| Err(ResolveError::NotFound))));
+            }
+            let result = start_direct_proxy(
+                config,
+                Some(rpc_test::network(Arc::new(FailedMediationSource))),
+            )
+            .await;
+            let Err(error) = result else {
+                panic!("incompatible composition accepted");
+            };
+            assert!(
+                error.to_string().contains("direct listener configuration"),
+                "{error}"
+            );
+        }
+    }
+
     // These contract tests use host-native absolute identities and matching
     // policy declarations. Relative-path rejection remains independently tested.
     fn native_identity_engine(rego: &str, source: &str) -> Result<OpaEngine> {
@@ -7720,6 +8188,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
                 None,
                 None,
                 None,
+                None,
             ))
             .await
             .unwrap();
@@ -8142,6 +8611,7 @@ process: { run_as_user: sandbox, run_as_group: sandbox }
             None,
             None,
             None,
+            None,
         ));
         workload
             .write_all(b"GET /v1/policy/current HTTP/1.1\r\nHost: policy.local\r\nConnection: close\r\n\r\n")
@@ -8266,6 +8736,7 @@ network_policies:
             Arc::new(None),
             Arc::new(None),
             Arc::new(None),
+            None,
             None,
             None,
             None,
@@ -8883,7 +9354,6 @@ network_policies: {}
             &upstream_proxy::UpstreamProxyArgs::default(),
             None,
             Some(rpc_test::network(Arc::new(FailedMediationSource))),
-            None,
             None,
             None,
         )

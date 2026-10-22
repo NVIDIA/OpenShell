@@ -40,13 +40,43 @@ use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
 use openshell_core::endpoint_status::EndpointObservationSender;
 
+/// Authoritative peer attribution supplied by trusted supervisor composition.
+///
+/// The proxy calls this on a blocking worker for each accepted direct connection.
+/// Implementations must return promptly, bind identity to the exact socket tuple,
+/// and reject missing or ambiguous evidence instead of synthesizing an identity.
+pub trait ProxyPeerIdentityResolver: Send + Sync {
+    /// Resolve the executable responsible for a connection.
+    ///
+    /// # Errors
+    ///
+    /// Return an error when the connection cannot be attributed reliably. The
+    /// proxy denies and audits the request without using the static identity.
+    fn resolve(
+        &self,
+        peer: SocketAddr,
+        local: SocketAddr,
+    ) -> std::result::Result<
+        openshell_isolation_interface::contract::BinaryIdentity,
+        openshell_isolation_interface::contract::ResolveError,
+    >;
+}
+
 /// Concrete listener options supplied by trusted supervisor composition.
 /// This is not an isolation-backend capability or a serialized launch contract.
 #[derive(Clone)]
 pub struct ProxyListenerConfig {
     pub bind_addr: SocketAddr,
-    pub authorization: Arc<str>,
+    /// Required Proxy-Authorization value, when the integration needs one.
+    pub authorization: Option<Arc<str>>,
+    /// Identity used only when no per-connection resolver is configured.
     pub binary_identity: openshell_isolation_interface::contract::BinaryIdentity,
+    /// Serve a duplicate of this socket without releasing its reservation.
+    /// The caller can retain its own copy through workload cleanup. The bound
+    /// address must exactly match `bind_addr`, including the assigned port.
+    pub listener: Option<Arc<std::net::TcpListener>>,
+    /// Overrides the static identity with authoritative per-connection evidence.
+    pub identity_resolver: Option<Arc<dyn ProxyPeerIdentityResolver>>,
 }
 
 impl std::fmt::Debug for ProxyListenerConfig {
@@ -55,6 +85,8 @@ impl std::fmt::Debug for ProxyListenerConfig {
             .field("bind_addr", &self.bind_addr)
             .field("authorization", &"<redacted>")
             .field("binary_identity", &self.binary_identity)
+            .field("prebound", &self.listener.is_some())
+            .field("peer_identity_resolver", &self.identity_resolver.is_some())
             .finish()
     }
 }
@@ -555,12 +587,7 @@ pub async fn run_networking(
             mediated_policy_dns
                 .as_ref()
                 .map(|runtime| runtime.store.clone()),
-            proxy_listener
-                .as_ref()
-                .map(|proxy| proxy.binary_identity.clone()),
-            proxy_listener
-                .as_ref()
-                .map(|proxy| proxy.authorization.clone()),
+            proxy_listener,
         )
         .await?;
         Some(proxy_handle)
