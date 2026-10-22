@@ -18,13 +18,15 @@ const (
 )
 
 // ProviderProfile defines a provider type template with credentials schema,
-// endpoints, binaries, and discovery configuration.
+// files, endpoints, binaries, and discovery configuration.
 type ProviderProfile struct {
-	ID               string
-	DisplayName      string
-	Description      string
-	Category         ProfileCategory
-	Credentials      []ProfileCredential
+	ID          string
+	DisplayName string
+	Description string
+	Category    ProfileCategory
+	Credentials []ProfileCredential
+	// Files is EXPERIMENTAL. This API and its behavior may change or be removed.
+	Files            []ProfileFile
 	Endpoints        []NetworkEndpoint
 	Binaries         []NetworkBinary
 	InferenceCapable bool
@@ -35,19 +37,31 @@ type ProviderProfile struct {
 	Scope            string
 }
 
+// ProfileFile declares non-secret content served at a virtual sandbox path.
+// EXPERIMENTAL: This API and its behavior may change or be removed.
+type ProfileFile struct {
+	Path    string
+	Content string
+	EnvVar  string
+}
+
 // ProfileCredential defines a single credential required by a provider profile.
 type ProfileCredential struct {
-	Name         string
-	Description  string
-	EnvVars      []string
-	Required     bool
-	Secret       bool
-	Refresh      *ProfileCredentialRefresh
-	AuthStyle    string
-	HeaderName   string
-	QueryParam   string
-	PathTemplate string
-	TokenGrant   *CredentialTokenGrant
+	Name        string
+	Description string
+	EnvVars     []string
+	Required    bool
+	// StablePlaceholder uses an opaque identity-bound resolver handle across
+	// value-only external provider updates. It does not change secret
+	// classification or bypass endpoint authorization.
+	StablePlaceholder bool
+	Secret            bool
+	Refresh           *ProfileCredentialRefresh
+	AuthStyle         string
+	HeaderName        string
+	QueryParam        string
+	PathTemplate      string
+	TokenGrant        *CredentialTokenGrant
 }
 
 // ProfileCredentialRefresh declares how a profile credential is refreshed.

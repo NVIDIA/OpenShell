@@ -39,6 +39,20 @@ pub(super) enum McpProtocolVersionError {
 }
 
 impl McpProtocolVersionError {
+    /// Explain a rejected revision using validated header metadata.
+    ///
+    /// Missing headers select the 2025-03-26 fallback. Only the validated parser
+    /// may identify that case; duplicate or hop-by-hop headers must keep their
+    /// own rejection reason without being described as absent.
+    pub(super) fn rejection_detail(self, request: &L7Request) -> String {
+        match self {
+            Self::NotAllowed(version) => {
+                format!("{self}; {}", selected_revision_context(request, version))
+            }
+            _ => self.to_string(),
+        }
+    }
+
     /// Return the HTTP status for this transport or policy rejection.
     #[must_use]
     pub(super) const fn http_status(self) -> &'static str {
@@ -68,26 +82,43 @@ impl std::fmt::Display for McpProtocolVersionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidHeader => formatter.write_str(
-                "MCP-Protocol-Version must contain one non-empty end-to-end header value",
+                "MCP-Protocol-Version must contain one non-empty end-to-end header value; send exactly one revision, without duplicates, comma-separated values, or Connection nomination",
             ),
             Self::UnsupportedHeaderValue => {
-                formatter.write_str("MCP-Protocol-Version names an unsupported protocol version")
+                formatter.write_str("MCP-Protocol-Version names a revision unsupported by this OpenShell build; use a supported client/server revision permitted by mcp.versions")
             }
             Self::InvalidRequestMetadata => {
-                formatter.write_str("MCP request headers must match the inspected request metadata")
+                formatter.write_str("MCP request headers must match the inspected request metadata; send MCP-Protocol-Version, Mcp-Method, and any required Mcp-Name consistently with the 2026-07-28 message")
             }
             Self::MethodNotAllowed => {
-                formatter.write_str("MCP protocol version 2026-07-28 requires HTTP POST")
+                formatter.write_str("MCP protocol version 2026-07-28 requires HTTP POST; send a POST message instead of a legacy GET stream or DELETE session request")
             }
             Self::NotAllowed(version) => write!(
                 formatter,
-                "MCP protocol version {version} is not allowed by endpoint policy"
+                "MCP protocol version {version} is not allowed by endpoint policy; use a client/server revision permitted by mcp.versions"
             ),
         }
     }
 }
 
 impl std::error::Error for McpProtocolVersionError {}
+
+/// Describe how the request selected its MCP revision.
+///
+/// Initial and post-middleware inspection supply their current request so the
+/// explanation describes the headers used for that selection.
+pub(super) fn selected_revision_context(
+    request: &L7Request,
+    version: McpProtocolVersion,
+) -> String {
+    match request_protocol_version_header(&request.raw_header) {
+        Ok(None) => format!(
+            "selected MCP revision {version} from the missing MCP-Protocol-Version header fallback; send the client/server revision explicitly in that header"
+        ),
+        Ok(Some(_)) => format!("selected MCP revision {version} from MCP-Protocol-Version"),
+        Err(_) => format!("selected MCP revision {version}"),
+    }
+}
 
 /// Select and authorize the protocol revision for one MCP HTTP request.
 ///

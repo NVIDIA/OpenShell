@@ -99,7 +99,7 @@ macro_rules! impl_actor_process_setter {
             /// Set the acting process.
             #[must_use]
             pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
-                self.actor = Some($crate::objects::Actor { process });
+                self.actor = Some($crate::objects::Actor::process(process));
                 self
             }
         }
@@ -135,6 +135,7 @@ macro_rules! impl_src_endpoint_addr_setter {
 }
 
 mod api_activity;
+mod authentication;
 mod base;
 mod config;
 mod finding;
@@ -145,6 +146,7 @@ mod process;
 mod ssh;
 
 pub use api_activity::ApiActivityBuilder;
+pub use authentication::AuthenticationBuilder;
 pub use base::BaseEventBuilder;
 pub use config::ConfigStateChangeBuilder;
 pub use finding::DetectionFindingBuilder;
@@ -211,6 +213,7 @@ impl EventContext {
             profiles: profiles.iter().map(|s| (*s).to_string()).collect(),
             uid: Some(uuid::Uuid::new_v4().to_string()),
             log_source: None,
+            correlation_uid: None,
         }
     }
 
@@ -277,6 +280,22 @@ pub(crate) fn test_sandbox_context() -> EventContext {
         proxy_ip: "10.42.0.1".parse().unwrap(),
         proxy_port: 3128,
         origin: EventOrigin::Supervisor,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_gateway_context() -> EventContext {
+    EventContext {
+        sandbox_id: String::new(),
+        sandbox_name: String::new(),
+        container_image: String::new(),
+        hostname: "openshell-gateway-0".to_string(),
+        product_version: "0.1.0".to_string(),
+        proxy_ip: IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        proxy_port: 0,
+        origin: EventOrigin::Gateway {
+            name: "openshell".to_string(),
+        },
     }
 }
 

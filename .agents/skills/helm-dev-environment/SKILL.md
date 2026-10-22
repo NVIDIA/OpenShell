@@ -38,8 +38,8 @@ and preloads the default sandbox image into k3d so the first sandbox create
 does not wait on a large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
-current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
-`openshell-dev-tmutch`). Each worktree therefore gets its own isolated cluster and its
+current git branch (e.g. branch `chore/1234-local-dev/octocat` → cluster
+`openshell-dev-octocat`). Each worktree therefore gets its own isolated cluster and its
 own `kubeconfig` file. Override with `HELM_K3S_CLUSTER_NAME` to force a specific name
 or share one cluster across worktrees.
 
@@ -56,6 +56,27 @@ Override with env vars before running `helm:k3s:create`:
 - `HELM_K3S_COLLECTOR_IMAGE` (default:
   `mcr.microsoft.com/dotnet/aspire-dashboard:latest`)
 - `HELM_K3S_COLLECTOR_HEALTH_TIMEOUT` (default: `120` seconds)
+
+### Shared supervisor plumbing
+
+Set `gatewayConfig.openshell.drivers.kubernetes.supervisor_topology`
+using a values file (the table key is literally `openshell.drivers.kubernetes`):
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+```
+
+The gateway chart creates a separate, single-replica shared-host placeholder Deployment
+in the release namespace, regardless of shared/managed/operator workspace mode.
+Use a supervisor image built from this branch: `--mode=shared` is new.
+The chart sets `--gateway-endpoint` from the gateway's gRPC endpoint and
+`--address` to `0.0.0.0:5501`. Check its rollout and TCP health probes on this
+listener (container port `supervisor`, 5501). The outbound gateway connection and
+session RPCs are not implemented yet; sandboxes
+still use dedicated supervisors. `workspace` is reserved and rejected. Omit the
+field to disable it.
 
 ### 2. Deploy OpenShell
 
@@ -81,9 +102,21 @@ The Skaffold flow builds distinct `gateway`, `sandbox`, and `supervisor` images
 and deploys the OpenShell Helm chart. The Kubernetes driver creates a
 capability-free workload Pod and a directly managed capability-free supervisor
 Pod. One namespace-wide NetworkPolicy denies direct egress from every OpenShell
-workload Pod. The
+workload Pod. New sandbox generations use `runtime-initiated` control: the sandbox
+runtime dials its supervisor through `os-supervisor-<id>`. The legacy
+`os-boundary-<id>` Service keeps selecting the workload for old gateways during
+rolling upgrades. New gateways create both Services and bind the control-mode
+annotation to its runtime generation. The driver adds a per-sandbox
+`os-control-<id>` NetworkPolicy for that path only. Existing running generations
+keep their connection until replaced; stop/start and gateway recovery that
+recreates both Pods upgrade legacy generations automatically. Use compatible
+gateway, supervisor, and sandbox runtime images together; there is no legacy
+rollout flag. The
 `pkiInitJob` hook (a pre-install Job that runs `openshell-gateway generate-certs`)
-generates mTLS secrets on first install. The default Skaffold values export
+generates gateway and CLI TLS secrets on first install. Supervisor Pods project
+only `ca.crt` and authenticate gateway RPCs with sandbox bearer tokens. User
+client certificates and private keys remain outside supervisor and workload Pods.
+The default Skaffold values export
 gateway and Kubernetes-driver traces to the collector service installed by
 `helm:k3s:create`. Envoy Gateway is opt-in; see the Optional Add-ons section.
 
@@ -233,8 +266,9 @@ cd ../../..
 KUBECONFIG=kubeconfig mise run helm:gateway:apply
 ```
 
-`values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
-`GRPCRoute` in the `openshell` namespace. The `high-availability` profile
+`values-gateway.yaml` creates the `openshell` `Gateway` (listener on port 80,
+class `eg`) and an `openshell` `GRPCRoute` in the `openshell` namespace. The
+`high-availability` profile
 installs the Envoy Gateway Helm chart and layers both
 `values-high-availability.yaml` and `values-gateway.yaml` onto the OpenShell
 release.
@@ -446,6 +480,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
+| `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |

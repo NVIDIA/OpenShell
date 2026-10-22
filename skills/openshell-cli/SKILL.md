@@ -161,6 +161,24 @@ Profile-backed providers always contribute policy unless a gateway-global
 policy is active. Static credential endpoint binding remains independently
 enforced.
 
+### Label and select providers
+
+Attach labels during provider creation with repeatable `--label KEY=VALUE`
+flags. Labels work with each credential source. List selectors require every
+comma-separated key-value pair to match and apply before pagination.
+
+```shell
+openshell provider create --name public-pypi --type pypi --label env=dev --label team=ml
+openshell provider list --label-selector env=dev,team=ml
+openshell provider list --all-workspaces --label-selector team=ml --output json
+openshell provider get public-pypi
+```
+
+Use an imported profile, such as `pypi` in this example. `get` displays labels;
+structured list output includes them. `--all-workspaces` requires Platform
+Admin access. Preserve the selector and workspace scope when passing the next
+`--page-token`. Labels cannot be changed or removed after provider creation.
+
 ### Inspect and manage provider profiles
 
 ```shell
@@ -195,6 +213,8 @@ openshell provider delete my-github
 ```
 
 `provider update` does not take `--type`. It updates credentials, config, or credential expiry on the existing provider.
+
+For an external updater whose workload must retain its original environment reference, use a credential profile with `stable_placeholder: true` and a gateway and supervisor that support that mode. The CLI checks gateway support before importing or updating the opt-in. The default remains `false`, preserving existing revision-scoped behavior and ordinary legacy gateway operation. Preserve the supervisor-issued value; never manufacture a placeholder. After the supervisor installs a value-only update, the retained reference resolves the current credential only at its effective host, port, and path binding. Replacement, expiry, changed binding, or an activated detach prevents old authority from resolving. Remove the opt-in and activate that change before downgrading the gateway. See the provider profiles documentation for the lifecycle contract and its separation from gateway-managed refresh and `token_grant`.
 
 ### Configure credential refresh
 
@@ -242,12 +262,22 @@ When OAuth refresh fails, inspect the `RECOVERY` and `FAILURE_CODE` columns from
 `LAST_ERROR`. `retry` means the worker will try again, `reauthorize` means the
 user must obtain a new OAuth grant and run `provider refresh configure`,
 `fix_configuration` means an operator must repair the OAuth client, scopes, or
-administrator policy, and `investigate` means the issuer returned an
-unrecognized response. The gateway parks `reauthorize` records until a manual
-rotate or reconfiguration. It retries
+administrator policy, and `investigate` can mean an unrecognized issuer
+response or an interrupted mint with an uncertain outcome. The gateway parks
+`reauthorize` records until a manual rotate or reconfiguration. It retries
 `fix_configuration` records hourly so externally repaired configuration can
 recover without rapid token-endpoint traffic. The existing access credential
 remains usable only until its recorded expiry.
+
+`refresh_in_progress` and `refresh_committing` can indicate active work. Check
+gateway health and refresh status again before treating them as failures;
+concurrent refresh requests wait for the active mint. If a gateway interruption
+leaves either marker behind and rotation reports an uncertain previous mint,
+the gateway will not reuse the grant automatically. Investigate the issuer state,
+then run `provider refresh configure` with a valid grant. Obtain a new OAuth
+grant first if the previous refresh token may have been consumed. Do not clear
+the marker directly or repeatedly rotate it; reconfiguration revokes old
+workload handles, so restart processes holding them.
 
 ---
 
@@ -261,7 +291,6 @@ openshell sandbox create \
   --provider my-github \
   --provider my-claude \
   --policy ./my-policy.yaml \
-  --upload .:/workspace \
   --label team=agents \
   -- claude
 ```
@@ -273,9 +302,11 @@ Key flags:
 - `--gpu [COUNT]`: Request the driver's default GPU selection or a specific GPU count
 - `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--driver-config-json`: Pass experimental driver-specific sandbox configuration
-- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, and `--driver-config-json`.
+- `--template NAME`: Create from a named sandbox workload template. Conflicts with inline workload flags such as `--from`, `--gpu`, `--cpu`, `--memory`, `--env`, `--env-from`, and `--driver-config-json`.
 - `--label KEY=VALUE`: Add labels for later selection (repeatable)
+- `--annotation KEY=VALUE`: Add non-secret metadata such as file paths (repeatable)
 - `--env KEY=VALUE`: Set non-secret sandbox environment variables (repeatable); use `--provider` for credentials
+- `--env-from KEY[=ENVVAR]`: Read a sandbox environment value from the CLI process environment without putting its value in arguments; use `--provider` to keep credentials hidden from the workload
 - `--tty`: Allocate a retained PTY for the canonical main process
 - `--restart-policy never|on-failure|always`: Select gateway-owned main-process restart behavior; `never` is the default
 - `--approval-mode manual|auto`: Control handling of agent-authored policy proposals; `manual` is the default
@@ -285,6 +316,8 @@ Key flags:
 - `--detach`: Start the canonical main process without attaching
 - `--forward [BIND_ADDRESS:]PORT`: Forward a local port and keep the sandbox alive
 - `--editor vscode|cursor`: Open a remote editor after creation and keep the sandbox alive
+
+If the driver rejects foreground attachment during create validation, use `--detach`.
 
 `--detach` adds no attachment grace period. When the canonical process exits,
 its terminal phase is reported immediately. A foreground create declares one
@@ -398,7 +431,11 @@ openshell sandbox upload my-sandbox ./src
 openshell sandbox download my-sandbox output ./local-output
 ```
 
-Uploads honor `.gitignore` by default. Add `--no-git-ignore` only when ignored files are intentionally in scope.
+Uploads use bounded streaming and wait for sandbox input consumption; the 4 MiB process-input budget is not a total upload-size limit. Upgrade both the CLI and the supervisor runtime used by the sandbox. An older supervisor rejects the upload protocol before file data is sent. Failed or canceled uploads may leave incomplete files in the destination; check it before retrying or remove the partial files.
+
+Uploads inside a Git work tree honor `.gitignore` by default and stop if Git filtering fails or selects no files. Sources confirmed to be outside a Git work tree upload without filtering, with a warning that `.gitignore` rules are not applied. Git must be available to determine whether filtering applies; broken or inaccessible repositories stop the upload. Add `--no-git-ignore` for an intentional unfiltered upload. This also applies to `sandbox create --upload`.
+
+`sandbox create --upload` checks every upload locally before provisioning and creates no sandbox if one is rejected. If a transfer fails after provisioning, the sandbox remains running and earlier uploads may have completed. Retry with `sandbox upload` against that sandbox, or remove it with `sandbox delete`.
 
 Uploads preserve symlinks, including dangling symlinks, instead of dereferencing their targets. A symlink source bypasses Git-aware filtering so the link itself is archived.
 
@@ -411,9 +448,13 @@ within it.
 ### Execute a non-interactive command
 
 ```bash
-openshell sandbox exec --name my-sandbox --workdir /workspace -- ls -la
+openshell sandbox exec my-sandbox --workdir /workspace -- ls -la
 openshell sandbox exec --name my-sandbox --env MODE=test -- cargo test
 ```
+
+The sandbox is a positional name or `--name`, not both; omit it to use the
+last-used sandbox. `--` is required and everything after it is the remote
+command, so put options such as `--tty` before it.
 
 `sandbox exec` starts an independent sibling process and streams output. After
 stdout and stderr drain, it returns the remote command's exit code if delivery
@@ -485,6 +526,15 @@ stopped or completed. Starting a retained `Completed` or
 `Error/MainProcessFailed` sandbox launches a fresh canonical-main instance and
 invalidates SSH sessions from the previous runtime generation. Delete remains
 the operation that removes retained state.
+
+The sandbox's SSH host identity survives stop/start and runtime restarts.
+API clients can read its public fingerprint from the sandbox resource or
+SSH-session response and pin it to the sandbox ID. Recreating a deleted
+sandbox, even under the same name, creates a different identity. See the
+[sandbox SSH documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
+for verification behavior and release compatibility.
+
+For an infrastructure `Error` on a backend that supports restarting stopped sandboxes, fix the reported cause, run `sandbox stop`, and wait for it to succeed before running `sandbox start`. This retains the sandbox and persistent workspace but cannot recover deleted resources or storage. For a provisioning timeout, wait for cleanup to finish, then run `sandbox start` directly.
 
 ---
 
@@ -659,6 +709,8 @@ openshell rule history dev
 ```
 
 Review the proposed scope, candidate hash, prover findings, and application errors before approval. Treat `rule approve-all --include-security-flagged` as a high-risk bulk action.
+
+`validation unavailable` blocks approval until the gateway can analyze both the current and proposed policies. It is not an accepted-risk finding.
 
 ---
 
@@ -857,6 +909,8 @@ openshell settings set --global --key ocsf_json_enabled --value true
 openshell settings set --global --key ocsf_schema_version --value "1.1"
 ```
 
+Enabling `ocsf_json_enabled` adds compact `OCSF-JSON` records to the supervisor's stderr, alongside shorthand, and to its JSONL file when file storage is available. Collect these records through the supervisor's platform logs (`docker logs`, `podman logs`, or `kubectl logs`); `openshell logs` still serves shorthand. Match the `OCSF-JSON` marker after the timestamp and parse the remainder as JSON. See the published [OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export) for delivery and retention limits.
+
 Global mutations prompt for confirmation. Use `--yes` only in reviewed automation.
 
 `policy_validation_failure_mode` is gateway startup configuration, not a
@@ -882,11 +936,13 @@ openshell sandbox create \
   --name my-app \
   --from my-app:latest \
   --expose 8080 \
+  --expose-authorization-mode bearer-passthrough \
   --detach \
   -- ./start-server.sh
 
 # Expose and manage an HTTP service through the gateway.
-openshell service expose my-app 8080 web
+openshell service expose my-app 8080 web \
+  --authorization-mode bearer-passthrough
 openshell service list my-app
 openshell service list my-app --output json
 openshell service get my-app web
@@ -900,6 +956,19 @@ workspaces. A sandbox name and `--all-workspaces` are mutually exclusive.
 request and keeps the sandbox running. Add `--output json` for automation; the
 result contains a `service_urls` map whose empty key is the unnamed endpoint.
 Use `openshell service expose` after creation to add or update named endpoints.
+
+Exposed services strip `Authorization` by default. Select
+`bearer-passthrough` only when the application inside the sandbox authenticates
+its own clients. This mode accepts either no `Authorization` header or exactly
+one non-empty Bearer credential and forwards that value unchanged. It rejects
+duplicate, malformed, or non-Bearer authorization before contacting the
+application. The application remains responsible for validating the token, and
+the raw token reaches the sandbox process, so never log it. Service routes
+bypass control-plane RPC authorization, but they still use the gateway's
+existing listener, domain routing, and TLS configuration, including any client
+certificate requirement. See the published
+[sandbox service documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview.md)
+for the complete security contract.
 
 Prefer loopback binds unless the user explicitly needs LAN-visible local access.
 

@@ -60,6 +60,13 @@
           pkg-config
           # Coverage.
           lcov
+          # mise dependencies
+          mise
+          cmakeMinimal
+          zlib
+          openssl_3_5
+          xz
+          gh
           kubernetes-helm
           syft
           trivy
@@ -119,15 +126,29 @@
           qemuPkgs = testGuestPkgs;
           firmwarePkgs = testGuestPkgs;
         };
-        testMachines = import ./tests/config.nix {
+        testMachines = import ./tests/tmachine/config.nix {
           inherit pkgs toolchains;
           qemuPkgs = tmachineRuntimePkgs;
           firmwarePkgs = tmachineRuntimePkgs;
         };
-        artifacts = pkgs.callPackage ./tests/artifacts.nix { inherit rustToolchain toolchains; };
+        artifacts = pkgs.callPackage ./tests/tmachine/artifacts.nix { inherit rustToolchain toolchains; };
+        checkProtobufCompatibility = pkgs.writeShellApplication {
+          name = "check-protobuf-compatibility";
+          runtimeInputs = [
+            pkgs.buf
+            pkgs.git
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./tasks/scripts}/check_proto_compatibility.py "$@"
+          '';
+        };
       in
       {
         apps = {
+          check-protobuf-compatibility = {
+            type = "app";
+            program = "${checkProtobufCompatibility}/bin/check-protobuf-compatibility";
+          };
           build-artifacts = {
             type = "app";
             program = "${artifacts.all}/bin/build-artifacts";
@@ -135,6 +156,18 @@
           build-artifacts-binaries = {
             type = "app";
             program = "${artifacts.binaries}/bin/build-artifacts-binaries";
+          };
+          build-artifacts-vm-driver = {
+            type = "app";
+            program = "${artifacts.vmDriver}/bin/build-artifacts-vm-driver";
+          };
+          build-artifacts-deb = {
+            type = "app";
+            program = "${artifacts.deb}/bin/build-artifacts-deb";
+          };
+          build-artifacts-rpm = {
+            type = "app";
+            program = "${artifacts.rpm}/bin/build-artifacts-rpm";
           };
           build-artifacts-test-archives = {
             type = "app";
@@ -161,6 +194,11 @@
         };
 
         packages = {
+          # Expose app derivations so CI can prepare them before executing once.
+          check-protobuf-compatibility = checkProtobufCompatibility;
+          build-artifacts-test-archives = artifacts.testArchives;
+          build-artifacts-test-images = artifacts.testImages;
+          build-artifacts-helm = artifacts.helm;
           vm-runtime = vmRuntime;
           tmachine = testMachines.package;
           tmachine-config = testMachines.config;
@@ -181,7 +219,7 @@
               ];
 
               shellHook = ''
-                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/ansible/ansible.cfg"
+                export ANSIBLE_CONFIG="$(git rev-parse --show-toplevel)/tests/tmachine/ansible/ansible.cfg"
               '';
             }
           );

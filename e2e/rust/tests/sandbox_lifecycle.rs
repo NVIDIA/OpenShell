@@ -9,9 +9,11 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use openshell_e2e::harness::binary::{openshell_cmd, openshell_tty_cmd};
-use openshell_e2e::harness::cli::{run_cli, wait_for_sandbox_phase};
+use openshell_e2e::harness::cli::{
+    run_cli, wait_for_sandbox_exec_contains, wait_for_sandbox_phase,
+};
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
-use openshell_e2e::harness::sandbox::{SandboxGuard, unique_sandbox_name};
+use openshell_e2e::harness::sandbox::{E2E_WORKLOAD_IMAGE, SandboxGuard, unique_sandbox_name};
 use serial_test::serial;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::time::{Instant, sleep};
@@ -110,6 +112,28 @@ async fn delete_sandbox(name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
+}
+
+#[tokio::test]
+#[serial(sandbox_lifecycle)]
+async fn sandbox_exec_outlives_startup_recovery_deadline() {
+    let mut sandbox = SandboxGuard::create(&[])
+        .await
+        .expect("create sandbox for exec recovery deadline");
+    let output = tokio::time::timeout(
+        Duration::from_secs(60),
+        sandbox.exec(&["sh", "-c", "sleep 31; printf past-recovery-deadline"]),
+    )
+    .await;
+    let next = sandbox.exec(&["printf", "fresh-exec"]).await;
+    sandbox.cleanup().await;
+
+    assert_eq!(
+        output.expect("exec timed out").expect("exec failed"),
+        "past-recovery-deadline",
+        "expiration must not terminate an admitted command"
+    );
+    assert_eq!(next.expect("fresh exec after expiration"), "fresh-exec");
 }
 
 #[tokio::test]
@@ -1278,45 +1302,81 @@ async fn canonical_main_exit_255_is_not_retried_as_transport_failure() {
 #[tokio::test]
 #[serial(sandbox_lifecycle)]
 async fn on_failure_policy_replaces_runtime_and_preserves_workspace() {
-    const FIRST_MARKER: &str = "initial-main-ready";
     const SCRIPT: &str = r#"
 marker=/sandbox/.openshell-restart-e2e
 if [ -e "$marker" ]; then
   printf 'replacement-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/replacement-run
-  printf 'replacement-main-ready\n'
   sleep 300
 else
   touch "$marker"
   printf 'initial-%s\n' "$(cat /proc/sys/kernel/random/uuid)" > /sandbox/initial-run
-  printf 'initial-main-ready\n'
-  sleep 2
+  while [ ! -e /sandbox/.openshell-restart-release ]; do sleep 0.05; done
   exit 17
 fi
 "#;
 
-    let mut sandbox = SandboxGuard::create_keep_with_args(
-        &["--restart-policy", "on-failure"],
-        &["sh", "-lc", SCRIPT],
-        FIRST_MARKER,
+    let mut sandbox = SandboxGuard::manage_existing(unique_sandbox_name());
+    let (output, exit_code) = run_cli(&[
+        "sandbox",
+        "create",
+        "--name",
+        &sandbox.name,
+        "--from",
+        E2E_WORKLOAD_IMAGE,
+        "--detach",
+        "--restart-policy",
+        "on-failure",
+        "--",
+        "sh",
+        "-lc",
+        SCRIPT,
+    ])
+    .await;
+    assert_eq!(
+        exit_code, 0,
+        "create sandbox with OnFailure policy: {output}"
+    );
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", "/sandbox/initial-run"],
+        "initial-",
+        SANDBOX_RESTART_TIMEOUT,
     )
     .await
-    .expect("create sandbox with OnFailure restart policy");
+    .expect("initial main process should write its workspace marker");
+
+    let initial_details = sandbox_details(&sandbox.name).await;
+    let initial_instance = extract_field(&initial_details, "Main process instance")
+        .expect("initial main process instance");
+    sandbox
+        .exec(&["touch", "/sandbox/.openshell-restart-release"])
+        .await
+        .expect("release initial main process");
 
     let deadline = Instant::now() + SANDBOX_RESTART_TIMEOUT;
-    let mut observed_replacement_starting = false;
+    let mut last_runs = Err("replacement is not ready".to_string());
     let final_details = loop {
         let details = sandbox_details(&sandbox.name).await;
-        observed_replacement_starting |= details.contains("Phase: Starting");
-        if observed_replacement_starting
-            && details.contains("Phase: Ready")
-            && details.contains("Restart count: 1")
+        let replacement_instance = extract_field(&details, "Main process instance")
+            .is_some_and(|instance| instance != "-" && instance != initial_instance);
+        if details.contains("Phase: Ready")
+            && extract_field(&details, "Restart count").as_deref() == Some("1")
+            && replacement_instance
         {
-            break details;
+            last_runs = sandbox
+                .exec(&["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
+                .await;
+            if let Ok(runs) = &last_runs
+                && runs.contains("initial-")
+                && runs.contains("replacement-")
+            {
+                break details;
+            }
         }
         assert!(
             Instant::now() < deadline,
             "sandbox did not complete its policy-driven restart within \
-             {SANDBOX_RESTART_TIMEOUT:?}; last details:\n{details}"
+             {SANDBOX_RESTART_TIMEOUT:?}; last details:\n{details}\nworkspace: {last_runs:?}"
         );
         sleep(Duration::from_millis(250)).await;
     };
@@ -1325,19 +1385,6 @@ fi
         final_details.contains("Restart policy: on-failure"),
         "restart policy should remain visible after replacement:\n{final_details}"
     );
-    let runs = sandbox
-        .exec(&["cat", "/sandbox/initial-run", "/sandbox/replacement-run"])
-        .await
-        .expect("replacement sandbox should retain the first run's workspace");
-    assert!(
-        runs.contains("initial-"),
-        "missing initial run marker:\n{runs}"
-    );
-    assert!(
-        runs.contains("replacement-"),
-        "missing replacement run marker:\n{runs}"
-    );
-
     sandbox.cleanup().await;
 }
 

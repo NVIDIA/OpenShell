@@ -125,12 +125,100 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 ## View Job Logs
 
+For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
+
+`Pre-release` temporarily omits Codex Security from its `Security Scan` job.
+`Release` uses the passing prerelease qualification result. Other scanners and
+qualification gates still run. Use the standalone
+`Codex Security Release Qualification` workflow for manual investigation.
+
+For `Codex Security`, an exit code of 2 with partial coverage is an incomplete
+scan, not a HIGH/CRITICAL threshold failure. Check the execution diagnostics in
+the job summary and the `codex-security-diagnostics-<run>-<attempt>` artifact on
+scan failure. It contains fixed status values, aggregate coverage counts, and
+disk space before, after, and the minimum sampled every five seconds. Missing
+coverage or manifest documents indicate no readable final report was available;
+deferred items or surfaces needing follow-up can explain partial coverage.
+Sampling cannot rule out a disk spike between samples.
+
+Artifacts and logs in this public repository are public. Never upload the raw
+scan directory, `report.md`, `coverage.json`, findings, agent state, or scanner
+logs. Coverage reasons and notes are free text and may disclose vulnerabilities.
+The public diagnostic intentionally omits them; detailed review needs an
+approved private destination. Helpers must come from the workflow revision,
+not from the candidate under scan.
+
+`setup-nix` retries development-shell preparation once when `prepare-shell`
+is enabled. Inspect both attempts in the job log; `setup-rust` assumes the
+shell has already been prepared. Cargo, lint, and test commands are not retried.
+Direct Nix builds and app dependency preparation also retry once; apps run
+once after preparation succeeds. Skipped dependent E2E suites indicate blocked
+coverage.
+
 For `Trivy Changes`, inspect the `Resolve PR baseline` step for the base and head
 SHAs. PR runs compare the tested merge commit with its
 first parent; change detection and scans must use the same pair. On reruns, do
 not substitute the current `main` tip or the event's older PR base SHA. Merge
 groups and manual runs use their explicit baseline. Findings are reported by
 `Reject new high or critical findings`; distinguish those from scanner failures.
+
+For `Protobuf Compatibility`, check the logged train and comparison baseline.
+Branch Checks compares the prospective merge tree with its target; release qualification
+compares the tagged candidate with the previous stable release. Both use
+the shared `check-protobuf-compatibility` action with `nix run .#check-protobuf-compatibility -- <ref>`.
+During `0.x`, a minor train permits compatibility findings
+as warnings; a patch train or no active train rejects them. Compare the current
+train's version with the latest stable release; commit messages are irrelevant.
+Compilation, baseline, and tool errors remain fatal. The `protobuf_compatibility` suite participates in
+the `release-tag-v1` qualification profile. Pre-release calls the reusable
+`release-qualification.yml` workflow after building, in parallel with publication. Release
+selects the latest passing prerelease for the requested version and branch,
+verifies its qualification evidence, creates the stable tag at its exact commit,
+then rebuilds and publishes without rerunning qualification. The promotion job
+summary and `stable-promotion-*` artifact record the candidate and evidence.
+Failed, cancelled, or skipped required suites fail
+qualification; stable publication is blocked, while published pre-release
+artifacts remain available. The Pre-release failure notification includes the
+run link. Both callers share `release-build.yml` and `release-publish.yml`.
+Qualification evidence remains in Actions; publishing a copy to OCI storage is best effort.
+Snap Store uploads happen only for stable releases after qualification passes.
+
+For a release notes preview, dispatch `release.yml` with `notes-only=true` and
+`tag=<stable-tag>`. The generator resolves the previous reachable stable tag;
+only `release-notes.yml` exposes an optional `previous-stable-tag` override.
+This runs the same
+`release-notes.yml` generator as stable publication and retains the `release-notes`
+artifact. Promotion, tag creation, builds, qualification, and publication are
+skipped. Check the `Prepare release notes` step before diagnosing model or
+GitHub API failures; it requires `LLM_INFERENCE_API_KEY`, `ANTHROPIC_BASE_URL`, and
+`ANTHROPIC_MODEL` in the repository Actions settings.
+
+Pre-release also runs `release-notes.yml` after building, alongside publication
+and qualification, and keeps the notes only in the `release-notes` artifact.
+This job is advisory: a notes failure emits a warning without failing the
+prerelease run or blocking promotion. Stable publication reuses the promoted
+prerelease's `release-notes` artifact, retagged, and generates notes only when
+that preview is unavailable. The `Select Qualified Prerelease` summary says
+which happened.
+
+For `Codex Compatibility Review`, inspect its job summary and the
+`compatibility-review-run-<run-id>-attempt-<attempt>` artifact. Confirm the
+candidate and baseline SHAs before interpreting findings. `complete` describes
+execution and coverage, not compatibility: also read the assessment and findings.
+An `error`, incomplete coverage, or missing artifact means no clean review is
+available. Findings are advisory. The review targets breaking changes with high
+reasoning effort. Risk acceptance needs a linked author or verified-maintainer
+comment or review, not a PR description, general approval, or bot report.
+The full report keeps all findings and prior-comment links. `comment.md` includes
+only new or materially changed findings; unchanged reviews post no comment. Check
+the full artifact linked by qualification even when the bot is silent.
+The review is scheduled independently of Security Scan. The two Codex workflows
+share the `codex-release-review` concurrency group with `queue: max`, retaining
+up to 100 pending reviews while preventing overlapping API usage across runs.
+Either review can run first; other security scanners run in parallel.
+The qualification caller waits for both reviews to finish. Do not
+rerun Release or Pre-release to debug this reviewer. Use its dedicated manual workflow
+with an existing candidate tag; that path does not publish release artifacts.
 
 View logs for a specific run:
 

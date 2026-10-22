@@ -5,14 +5,16 @@ pub mod config;
 pub mod driver;
 pub mod grpc;
 pub mod isolation;
+mod lifecycle;
 pub mod otel_tracing;
 mod resource_admission;
 mod sandbox_runtime;
 
 pub use config::{
     DEFAULT_GATEWAY_ID, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
-    KubernetesComputeConfig, KubernetesImagePullPolicy, KubernetesSandboxRuntimeConfig,
-    ManagedSshIngressConfig, WorkspaceMode, managed_namespace_prefix,
+    KubernetesComputeConfig, KubernetesControlConnection, KubernetesImagePullPolicy,
+    KubernetesSandboxRuntimeConfig, ManagedSshIngressConfig, SupervisorTopology, WorkspaceMode,
+    managed_namespace_prefix,
 };
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

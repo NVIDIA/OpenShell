@@ -3,6 +3,8 @@
 
 //! Process and access-plane assembly for the capability-free sandbox boundary.
 
+use crate::native_api::{BoundaryExec, BoundaryLoopbackConnector};
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -12,7 +14,6 @@ use miette::WrapErr as _;
 use miette::{IntoDiagnostic as _, Result};
 use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_isolation_interface::contract::{BoundaryExec, BoundaryLoopbackConnector};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, LaunchTypeId, Process as OcsfProcess,
     ProcessActivityBuilder, SeverityId, StatusId, ocsf_emit,
@@ -28,7 +29,7 @@ fn ocsf_ctx() -> &'static openshell_ocsf::EventContext {
 /// inside its boundary.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn spawn_workload(
-    launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+    launcher: &crate::linux::workload_launcher::WorkloadLauncher,
     program: &str,
     args: &[String],
     workdir: Option<&str>,
@@ -54,7 +55,7 @@ pub async fn spawn_workload(
         crate::process::validate_oci_workspace_as_effective_identity(std::path::Path::new(
             workspace_root,
         ))
-        .wrap_err("image workspace validation failed")?;
+        .wrap_err(openshell_core::driver_utils::WORKSPACE_VALIDATION_ERROR_CONTEXT)?;
     }
 
     #[cfg(target_os = "linux")]
@@ -69,11 +70,7 @@ pub async fn spawn_workload(
 
     let boundary_runtime = boundary_runtime
         .unwrap_or_else(crate::boundary_io::BoundaryRuntimeState::new_exclusive_pid_namespace);
-    let mut user_environment: std::collections::HashMap<String, String> =
-        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
-            .ok()
-            .and_then(|json| serde_json::from_str(&json).ok())
-            .unwrap_or_default();
+    let mut user_environment = crate::process::configured_user_environment();
     user_environment.retain(|key, _value| !crate::process::is_proxy_env_var(key));
     let loopback_connector: Arc<dyn BoundaryLoopbackConnector> = Arc::new(
         crate::boundary_io::LocalLoopbackConnector::new(Some(boundary_runtime.clone())),
@@ -113,7 +110,11 @@ pub async fn spawn_workload(
     )?;
 
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    let main_session = crate::main_session::MainSession::new(handle.take_io(), handle.pid());
+    let main_session = crate::main_session::MainSession::new(
+        handle.take_io(),
+        handle.pid(),
+        Some(crate::container_log::ContainerLog::process_agent_output()),
+    );
     let (terminal, signal_lock) = handle.signaling_state();
     boundary_runtime
         .register_process_group(handle.pid(), terminal.clone(), signal_lock.clone())

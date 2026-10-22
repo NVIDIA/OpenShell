@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: acme-config
+display_name: Acme client configuration
+description: Non-secret settings installed as a managed sandbox file
+category: other
+files:
+  - path: client.toml
+    env_var: ACME_CONFIG_FILE
+    content: |
+      endpoint = "{{config.endpoint}}"
+      project = "{{config.project}}"

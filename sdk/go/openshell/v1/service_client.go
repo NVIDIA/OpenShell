@@ -19,13 +19,18 @@ func newServiceClient(conn grpc.ClientConnInterface) *serviceClient {
 	return &serviceClient{client: pb.NewOpenShellClient(conn)}
 }
 
-func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool) (*ServiceEndpoint, error) {
+func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serviceName string, targetPort uint32, domain bool, opts ...ExposeServiceOptions) (*ServiceEndpoint, error) {
+	authorizationMode := ServiceAuthorizationModeStrip
+	if len(opts) > 0 && opts[0].AuthorizationMode != 0 {
+		authorizationMode = opts[0].AuthorizationMode
+	}
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
-		Sandbox:        sandboxName,
-		WorkspaceScope: namedWorkspaceScope(workspace),
-		Name:           serviceName,
-		TargetPort:     targetPort,
-		Domain:         domain,
+		Sandbox:           sandboxName,
+		WorkspaceScope:    namedWorkspaceScope(workspace),
+		Name:              serviceName,
+		TargetPort:        targetPort,
+		Domain:            domain,
+		AuthorizationMode: pb.ServiceAuthorizationMode(authorizationMode),
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

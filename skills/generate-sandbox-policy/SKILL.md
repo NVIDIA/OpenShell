@@ -30,15 +30,18 @@ The user's input falls into one of three tiers. Work with whatever the user prov
 The user provides API endpoints and a broad intent. No API docs needed.
 
 Examples:
+
 - "Allow curl to hit api.github.com, read-only"
 - "Give claude full access to api.anthropic.com"
 - "Let /usr/bin/myapp talk to internal-svc:8080 but only for reading"
 
 This is sufficient for:
+
 - **L4-only** policies (host:port + binary checks, no method or path rules)
 - **Preset-based L7** policies (`read-only`, `read-write`, `full` on all paths)
 
 For this tier, default to:
+
 - `access: read-only` when the user says "read", "browse", "view", "query", "fetch"
 - `access: read-write` when the user says "read-write", "create", "update" (but not "delete")
 - `access: full` when the user says "full access", "everything", "unrestricted"
@@ -53,8 +56,9 @@ For this tier, default to:
 The user knows some API paths but doesn't have full docs.
 
 Examples:
+
 - "Allow GET on /api/v1/models and POST on /api/v1/completions at integrate.api.nvidia.com"
-- "Read-only on /repos/** at api.github.com, but also allow POST on /repos/*/issues"
+- "Read-only on /repos/** at api.github.com, but also allow POST on /repos/*/*/issues"
 
 Generate explicit `rules` for the known paths. If the user also wants broader access beyond the specific paths, combine with a catch-all rule or suggest a preset instead.
 
@@ -121,11 +125,13 @@ Ask these when the user's intent is broad and more specificity is possible:
 When the user mentions a recognizable API host but hasn't provided docs, and the current tier is **Minimal**, attempt to upgrade to **Full** by searching for the API documentation online.
 
 **When to trigger:**
+
 - The host is a well-known public API (e.g., `api.github.com`, `api.anthropic.com`, `api.openai.com`, `integrate.api.nvidia.com`, `api.stripe.com`, `api.slack.com`, `api.gitlab.com`)
 - The user has NOT already provided API docs
 - The user has NOT explicitly asked for a broad preset ("just read-only, nothing fancy")
 
 **How to do it:**
+
 1. Tell the user: "I can look up the REST API docs for [service] to help generate a more precise policy. Want me to do that?"
 2. If the user agrees (or hasn't declined), search for the docs:
    - Search the web with a query like `"[service name] REST API documentation endpoints"` or `"[service name] OpenAPI spec"`
@@ -134,6 +140,7 @@ When the user mentions a recognizable API host but hasn't provided docs, and the
 4. Use the discovered endpoints to offer tighter scoping: "I found [N] endpoints in the [service] API. Based on your intent, I can narrow the policy to just [subset]. Want me to do that, or keep the broader preset?"
 
 **When to skip:**
+
 - The user explicitly asked for a broad preset or said "don't bother with docs"
 - The API is internal, private, or not publicly documented
 - The host is not recognizable as a well-known service
@@ -148,6 +155,7 @@ If the user confirms the policy must stay broad (they don't know the paths, need
 ### Iteration
 
 You may need to go back and forth a few times. Keep the loop tight:
+
 1. Ask one batch of clarifying questions (group related questions together)
 2. Update your understanding based on the answer
 3. If the answer reveals further scoping opportunities, ask a follow-up
@@ -160,6 +168,7 @@ You may need to go back and forth a few times. Keep the loop tight:
 Read the published [policy schema reference](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema) before generating or changing a policy. Published documentation is the authority for the current schema; do not infer fields from examples in this skill.
 
 Key sections to reference:
+
 - **Policy Schema Reference** — top-level structure
 - **`network_policies`** — rule structure
 - **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules, allowed_ips
@@ -230,15 +239,21 @@ Only needed for the **Moderate** and **Full** tiers. Translate API path paramete
 | API path | Glob pattern |
 |----------|-------------|
 | `/repos/{owner}/{repo}` | `/repos/*/*` |
-| `/repos/{owner}/{repo}/issues` | `/repos/*/issues` |
-| `/repos/{owner}/{repo}/issues/{id}` | `/repos/*/issues/*` |
+| `/repos/{owner}/{repo}/issues` | `/repos/*/*/issues` |
+| `/repos/{owner}/{repo}/issues/{id}` | `/repos/*/*/issues/*` |
 | `/api/v1/models/{model_id}/versions/{version}` | `/api/v1/models/*/versions/*` |
 | All sub-paths under `/api/v1/` | `/api/v1/**` |
 
-Path matching uses the runtime `glob` engine. Both `*` and `**` may cross `/`
-boundaries; `?` matches one character, and bracket classes such as `[0-9]` and
-`[!0]` are supported. Prefer segment-shaped patterns such as
-`/repos/*/issues` for readability, but do not rely on `*` to stop at `/`.
+In REST rule paths, `*` stops at `/`, while a whole-segment `**` crosses `/`.
+For example, `/api/v1/**` covers descendants but not `/api/v1` itself; add an
+explicit rule for that path when needed. `?` matches one character except `/`,
+and bracket classes such as `[0-9]` are supported.
+
+The endpoint `path` selector has separate semantics: `/api/v1/**` includes
+`/api/v1` itself, and `*` in other patterns can cross `/`. These semantics apply
+both to selecting the endpoint's configuration and to deciding which endpoints'
+allow and deny rules apply. See the published policy schema's
+[matcher semantics](https://docs.nvidia.com/openshell/latest/how-it-works/policies/schema#matcher-semantics).
 
 ### Building the Explicit Rules List
 
@@ -342,7 +357,11 @@ Use `allowed_ips` to pin the addresses an endpoint may reach. When it is set, ev
 - **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
 - **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
 
-Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** regardless of `allowed_ips`.
+The supervisor resolver is authoritative for hostname-only authorization. When a Linux explicit-proxy deployment exposes the workload process namespace to the supervisor, a sandbox `/etc/hosts` entry such as a Kubernetes `hostAliases` mapping is honored for an ordinary endpoint only if it sets `allowed_ips` to the exact IP or a narrow CIDR. OpenShell's driver-managed host-gateway aliases use a separate trusted IP pin.
+
+Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), unspecified, and cloud metadata addresses are **always blocked** as upstream destinations regardless of `allowed_ips`.
+
+The Google Cloud metadata emulator reserves `127.0.0.1:8174` in Linux sandboxes. OpenShell handles SDK discovery locally through the supervisor; do not add an `allowed_ips` exception or grant access to the host cloud metadata service. See the [Google provider documentation](https://docs.nvidia.com/openshell/latest/how-it-works/providers/google.md).
 
 ```yaml
 # Example: Pin an internal service to a known private IP range
@@ -512,6 +531,8 @@ When the user explicitly requests `process.run_as_user` or
 (`4294967295`). Warn that a low numeric identity inherits permissions granted
 to the same ID on image files, mounted volumes, or devices.
 
+For MicroVM, numeric selectors must match the resolved owner of the sandbox's writable overlay. User and group are checked independently; either mismatch prevents startup. If the owner UID:GID is unknown, omit the selectors or use `sandbox` so the driver retains that identity. Do not choose another numeric identity or suggest that the policy can change an existing overlay's owner. For example, with an owner of `1000:1000`, a request for UID `10000` must be rejected with an explanation and the omission/`sandbox` alternatives, rather than generating a policy that the VM cannot start.
+
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 
 ### Mode C: Present Only (no file write)
@@ -528,6 +549,7 @@ Show the generated policy YAML with:
 ## Step 8: Confirm and Refine
 
 After presenting or applying the policy, ask if the user wants to:
+
 - Tighten or loosen any rules
 - Add more endpoints or binaries
 - Switch between enforce/audit mode

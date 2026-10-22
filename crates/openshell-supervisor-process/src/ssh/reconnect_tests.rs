@@ -3,12 +3,14 @@
 
 //! Exercise a half-open gateway path through the production supervisor frame bridge.
 
+#[cfg(test)]
+use openshell_sandbox_backend::test_support as rpc_test;
+
 use super::tests::{AcceptAnyServerKey, RejectingExec, TestLoopbackConnector};
 use super::*;
 use openshell_core::proto::{RelayFrame, relay_frame};
-use openshell_isolation_interface::contract::{
-    BackendError, BoundaryExitStatus, BoundaryProcess, BoundarySignal, ProcessAttachment,
-};
+use openshell_isolation_interface::contract::{BackendError, BoundaryExitStatus, BoundarySignal};
+use openshell_sandbox_backend::ProcessAttachment;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -27,7 +29,7 @@ enum RelayMode {
 struct RetainedProcess(AtomicUsize);
 
 #[async_trait::async_trait]
-impl BoundaryProcess for RetainedProcess {
+impl rpc_test::BoundaryProcess for RetainedProcess {
     async fn wait(&self) -> Result<BoundaryExitStatus, BackendError> {
         std::future::pending().await
     }
@@ -62,7 +64,7 @@ impl CanonicalProcess {
                 stderr: None,
                 terminal: None,
             },
-            process.clone(),
+            rpc_test::process(process.clone()),
         );
         Self {
             session,
@@ -111,7 +113,13 @@ impl Connection {
     async fn with_window(main: Arc<MainSession>, window: Option<u32>) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("ssh.sock");
-        let (listener, mut config, _) = ssh_server_init(&socket, &None, false).unwrap();
+        let (listener, mut config, _) = ssh_server_init(
+            &socket,
+            &None,
+            false,
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+        )
+        .unwrap();
         // Preserve whether production enables probes. Only shorten the interval.
         let config_mut = Arc::get_mut(&mut config).unwrap();
         config_mut.keepalive_interval = config_mut.keepalive_interval.map(|_| TEST_INTERVAL);
@@ -120,8 +128,8 @@ impl Connection {
             let _ = handle_connection(
                 stream,
                 config,
-                Arc::new(TestLoopbackConnector),
-                Arc::new(RejectingExec),
+                rpc_test::loopback(Arc::new(TestLoopbackConnector)),
+                rpc_test::exec(Arc::new(RejectingExec)),
                 Some(main),
                 TEST_INTERVAL * 4,
             )
@@ -407,7 +415,13 @@ async fn waiting_writer_eof_cancels_acquisition() {
 #[tokio::test]
 async fn production_config_probes_before_the_receive_deadline() {
     let dir = tempfile::tempdir().unwrap();
-    let (_, config, _) = ssh_server_init(&dir.path().join("ssh.sock"), &None, false).unwrap();
+    let (_, config, _) = ssh_server_init(
+        &dir.path().join("ssh.sock"),
+        &None,
+        false,
+        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap(),
+    )
+    .unwrap();
     assert_eq!(config.keepalive_interval, Some(Duration::from_secs(15)));
     assert_eq!(config.keepalive_max, 3);
     assert_eq!(SSH_PEER_TIMEOUT, Duration::from_mins(1));

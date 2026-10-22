@@ -5,7 +5,8 @@
 
 mod helpers;
 
-use helpers::{EnvVarGuard, build_ca, build_client_cert, build_server_cert};
+use helpers::TempDir;
+use helpers::{Environment, build_ca, build_client_cert, build_server_cert};
 use openshell_bootstrap::load_last_sandbox;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -27,8 +28,9 @@ use openshell_core::proto::{
     ReportEndpointStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
     SandboxCondition, SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus,
     SandboxStreamEvent, SandboxTemplateResponse, SandboxWorkloadTemplate, ServiceStatus,
-    SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event,
+    SettingValue, SupervisorMessage, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event, tcp_forward_frame,
+    tcp_forward_init,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -36,7 +38,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -70,12 +71,20 @@ struct SandboxState {
     vm_error_with_observed_exit: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    ready_before_create_returns: Arc<AtomicBool>,
     terminal_before_relay: Arc<AtomicBool>,
     terminal_after_provisional_container_exit: Arc<AtomicBool>,
     provisional_container_exit_without_result: Arc<AtomicBool>,
     provisional_container_exit_sent: Arc<Notify>,
     ssh_session_failures_remaining: Arc<AtomicUsize>,
     ssh_session_requests: Arc<AtomicUsize>,
+    ssh_session_revocations: Arc<AtomicUsize>,
+    /// Reject token-less `ForwardTcp` inits the way a gateway that predates
+    /// principal-authorized TCP forwards does.
+    forward_requires_session_token: Arc<AtomicBool>,
+    /// Every `TcpForwardInit` received, including rejected ones.
+    forward_inits: Arc<Mutex<Vec<TcpForwardInit>>>,
+    forward_token_rejections: Arc<AtomicUsize>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
     gateway_config_requests: Arc<AtomicUsize>,
     providers: Arc<Mutex<Vec<Provider>>>,
@@ -92,6 +101,13 @@ struct TestOpenShell {
 
 #[tonic::async_trait]
 impl OpenShell for TestOpenShell {
+    async fn peer_notify_config_update(
+        &self,
+        _request: tonic::Request<openshell_core::proto::PeerNotifyConfigUpdateRequest>,
+    ) -> Result<Response<openshell_core::proto::PeerNotifyConfigUpdateResponse>, Status> {
+        Err(Status::unimplemented("not used by this test server"))
+    }
+
     async fn peer_report_provider_readiness(
         &self,
         _request: tonic::Request<openshell_core::proto::ReportProviderReadinessRequest>,
@@ -194,7 +210,17 @@ impl OpenShell for TestOpenShell {
             }),
             ..Sandbox::default()
         };
-        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        sandbox.set_phase(
+            if self
+                .state
+                .ready_before_create_returns
+                .load(Ordering::SeqCst)
+            {
+                SandboxPhase::Ready as i32
+            } else {
+                SandboxPhase::Provisioning as i32
+            },
+        );
         Ok(Response::new(SandboxResponse {
             sandbox: Some(sandbox),
             service_urls,
@@ -508,6 +534,9 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
+        self.state
+            .ssh_session_revocations
+            .fetch_add(1, Ordering::SeqCst);
         Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
@@ -523,6 +552,13 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<CreateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         Ok(Response::new(ProviderResponse::default()))
+    }
+
+    async fn get_provider_credentials(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderCredentialsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderCredentialsResponse>, Status> {
+        Err(Status::unimplemented("not used by this mock"))
     }
 
     async fn get_provider(
@@ -677,6 +713,10 @@ impl OpenShell for TestOpenShell {
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
+        let ready_before_create_returns = self
+            .state
+            .ready_before_create_returns
+            .load(Ordering::SeqCst);
         let terminal_before_relay = self.state.terminal_before_relay.load(Ordering::SeqCst);
         let terminal_after_provisional_container_exit = self
             .state
@@ -723,6 +763,18 @@ impl OpenShell for TestOpenShell {
             }
             let mut ready = provisioning.clone();
             ready.set_phase(SandboxPhase::Ready as i32);
+            if ready_before_create_returns {
+                // A watch starts with the current snapshot. Keep it open so
+                // stream closure cannot hide a client that ignores Ready.
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                        cursor: String::new(),
+                    }))
+                    .await;
+                tx.closed().await;
+                return;
+            }
             let mut completed = provisioning.clone();
             completed.status = Some(SandboxStatus {
                 exit_code: Some(0),
@@ -1064,15 +1116,60 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::TcpForwardFrame, Status>,
-    >;
+    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<Result<TcpForwardFrame, Status>>;
 
+    /// Echo relay: validates the init frame like the gateway does, then sends
+    /// every `Data` frame straight back.
     async fn forward_tcp(
         &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+        request: tonic::Request<tonic::Streaming<TcpForwardFrame>>,
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        let mut inbound = request.into_inner();
+        let Some(TcpForwardFrame {
+            payload: Some(tcp_forward_frame::Payload::Init(init)),
+        }) = inbound.message().await?
+        else {
+            return Err(Status::invalid_argument(
+                "first TcpForwardFrame must be init",
+            ));
+        };
+        self.state.forward_inits.lock().await.push(init.clone());
+        if init.authorization_token.is_empty() {
+            if self
+                .state
+                .forward_requires_session_token
+                .load(Ordering::SeqCst)
+            {
+                self.state
+                    .forward_token_rejections
+                    .fetch_add(1, Ordering::SeqCst);
+                // Verbatim status of a gateway that still requires a session
+                // token for every ForwardTcp stream.
+                return Err(Status::unauthenticated(
+                    "authorization_token is required for ForwardTcp",
+                ));
+            }
+        } else if init.authorization_token != "test-token" {
+            return Err(Status::unauthenticated("SSH session token not found"));
+        }
+
+        let (tx, rx) = mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Ok(Some(frame)) = inbound.message().await {
+                let Some(tcp_forward_frame::Payload::Data(data)) = frame.payload else {
+                    continue;
+                };
+                let echo = TcpForwardFrame {
+                    payload: Some(tcp_forward_frame::Payload::Data(data)),
+                };
+                if tx.send(Ok(echo)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn create_workspace(
@@ -1161,7 +1258,7 @@ async fn run_server() -> TestServer {
             .unwrap();
     });
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = helpers::tempdir().unwrap();
     let ca_path = dir.path().join("ca.crt");
     let cert_path = dir.path().join("tls.crt");
     let key_path = dir.path().join("tls.key");
@@ -1470,7 +1567,7 @@ exec env OPENSHELL_FAKE_FORWARD_MODE=sleep "$helper" -N -o "ProxyCommand=/tmp/op
     FakeUnreachableForward { log_path, pid_path }
 }
 
-fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
+fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> Environment {
     test_env_with(fake_ssh_dir, xdg_dir, &[])
 }
 
@@ -1478,7 +1575,7 @@ fn test_env_with(
     fake_ssh_dir: &TempDir,
     xdg_dir: &TempDir,
     extra: &[(&'static str, String)],
-) -> EnvVarGuard {
+) -> Environment {
     let path = format!(
         "{}:{}",
         fake_ssh_dir.path().display(),
@@ -1497,7 +1594,7 @@ fn test_env_with(
         .map(|(key, value)| (*key, value.as_str()))
         .collect::<Vec<_>>();
 
-    EnvVarGuard::set(&pairs)
+    Environment::from_pairs(&pairs)
 }
 
 async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
@@ -1641,654 +1738,810 @@ async fn sandbox_create_tolerates_an_unreachable_profile_catalog() {
     // Nothing derives provider authority from it: a provider is attached only
     // when the user names one.
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    server
-        .openshell
-        .state
-        .fail_list_provider_profiles
-        .store(true, Ordering::SeqCst);
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("catalog-unavailable"),
-            command: &["claude".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("an unreachable catalog must not block sandbox creation");
+            server
+                .openshell
+                .state
+                .fail_list_provider_profiles
+                .store(true, Ordering::SeqCst);
 
-    let requests = server.openshell.state.create_requests.lock().await;
-    assert_eq!(requests.len(), 1, "the sandbox should still be created");
-    assert!(
-        requests[0]
-            .spec
-            .as_ref()
-            .is_none_or(|spec| spec.providers.is_empty()),
-        "no provider should be attached without an explicit --provider"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("catalog-unavailable"),
+                    command: &["claude".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("an unreachable catalog must not block sandbox creation");
+
+            let requests = server.openshell.state.create_requests.lock().await;
+            assert_eq!(requests.len(), 1, "the sandbox should still be created");
+            assert!(
+                requests[0]
+                    .spec
+                    .as_ref()
+                    .is_none_or(|spec| spec.providers.is_empty()),
+                "no provider should be attached without an explicit --provider"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("default-command"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert!(deleted_names(&server).await.is_empty());
-    assert_eq!(
-        load_last_sandbox("openshell", "default").as_deref(),
-        Some("default-command"),
-        "default sandboxes should be persisted as last-used"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("default-command"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            assert!(deleted_names(&server).await.is_empty());
+            assert_eq!(
+                load_last_sandbox("openshell", "default").as_deref(),
+                Some("default-command"),
+                "default sandboxes should be persisted as last-used"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_without_inferred_provider_skips_gateway_config() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("no-provider-config"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed without reading gateway config");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert_eq!(
-        server
-            .openshell
-            .state
-            .gateway_config_requests
-            .load(Ordering::SeqCst),
-        0,
-        "commands without an inferred provider must not require global gateway settings"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("no-provider-config"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed without reading gateway config");
+
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .gateway_config_requests
+                    .load(Ordering::SeqCst),
+                0,
+                "commands without an inferred provider must not require global gateway settings"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_sends_cpu_and_memory_limits_only() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("resources"),
-            cpu: Some("500m"),
-            memory: Some("2Gi"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let resources = requests[0]
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.resources.as_ref())
-        .expect("resource limits should be sent");
-    let limits = resources
-        .fields
-        .get("limits")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("resources"),
+                    cpu: Some("500m"),
+                    memory: Some("2Gi"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            let resources = requests[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .and_then(|template| template.resources.as_ref())
+                .expect("resource limits should be sent");
+            let limits = resources
+                .fields
+                .get("limits")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StructValue(inner) => Some(inner),
+                    _ => None,
+                })
+                .expect("limits should be a struct");
+
+            assert_eq!(
+                limits
+                    .fields
+                    .get("cpu")
+                    .and_then(|value| value.kind.as_ref())
+                    .and_then(|kind| match kind {
+                        prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                        _ => None,
+                    }),
+                Some("500m")
+            );
+            assert_eq!(
+                limits
+                    .fields
+                    .get("memory")
+                    .and_then(|value| value.kind.as_ref())
+                    .and_then(|kind| match kind {
+                        prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                        _ => None,
+                    }),
+                Some("2Gi")
+            );
+            assert!(!resources.fields.contains_key("requests"));
         })
-        .expect("limits should be a struct");
-
-    assert_eq!(
-        limits
-            .fields
-            .get("cpu")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("500m")
-    );
-    assert_eq!(
-        limits
-            .fields
-            .get("memory")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("2Gi")
-    );
-    assert!(!resources.fields.contains_key("requests"));
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_persists_exact_trailing_argv_as_main_process() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
-    let command = vec![
-        "/opt/agent binary".to_string(),
-        "--prompt=keep spaces".to_string(),
-        "literal * $HOME".to_string(),
-    ];
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("canonical-main"),
-            command: &command,
-            tty_override: Some(false),
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let command = vec![
+                "/opt/agent binary".to_string(),
+                "--prompt=keep spaces".to_string(),
+                "literal * $HOME".to_string(),
+            ];
 
-    let requests = create_requests(&server).await;
-    let spec = requests[0]
-        .spec
-        .as_ref()
-        .expect("sandbox spec should be persisted at create time");
-    assert_eq!(spec.command, command);
-    assert!(!spec.tty);
-    assert!(requests[0].await_main_process_attachment);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("canonical-main"),
+                    command: &command,
+                    tty_override: Some(false),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            let spec = requests[0]
+                .spec
+                .as_ref()
+                .expect("sandbox spec should be persisted at create time");
+            assert_eq!(spec.command, command);
+            assert!(!spec.tty);
+            assert!(requests[0].await_main_process_attachment);
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn detached_command_does_not_declare_main_process_attachment() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("detached-main"),
-            command: &["echo".into(), "OK".into()],
-            detach: true,
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("detached sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    assert!(!requests[0].await_main_process_attachment);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("detached-main"),
+                    command: &["echo".into(), "OK".into()],
+                    detach: true,
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("detached sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            assert!(!requests[0].await_main_process_attachment);
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn detached_ephemeral_command_delegates_cleanup_to_gateway() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("detached-ephemeral-main"),
-            keep: false,
-            command: &["worker".into()],
-            detach: true,
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("detached ephemeral sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    assert!(!requests[0].await_main_process_attachment);
-    assert_eq!(
-        requests[0]
-            .annotations
-            .get("openshell.nvidia.com/retention")
-            .map(String::as_str),
-        Some("ephemeral")
-    );
-    assert!(
-        deleted_names(&server).await.is_empty(),
-        "the gateway owns cleanup after a detached canonical process exits"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("detached-ephemeral-main"),
+                    keep: false,
+                    command: &["worker".into()],
+                    detach: true,
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("detached ephemeral sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            assert!(!requests[0].await_main_process_attachment);
+            assert_eq!(
+                requests[0]
+                    .annotations
+                    .get("openshell.nvidia.com/retention")
+                    .map(String::as_str),
+                Some("ephemeral")
+            );
+            assert!(
+                deleted_names(&server).await.is_empty(),
+                "the gateway owns cleanup after a detached canonical process exits"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_sends_annotations() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+
+            let source = "/home/you/my policy.yaml=1".to_string();
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("annotated"),
+                    keep: true,
+                    command: &["echo".into(), "OK".into()],
+                    annotations: HashMap::from([(
+                        "policy-source-file".to_string(),
+                        source.clone(),
+                    )]),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            assert_eq!(
+                requests[0]
+                    .annotations
+                    .get("policy-source-file")
+                    .map(String::as_str),
+                Some(source.as_str())
+            );
+            assert!(
+                !requests[0]
+                    .annotations
+                    .contains_key("openshell.nvidia.com/retention"),
+                "a kept sandbox must not be marked ephemeral"
+            );
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn ephemeral_sandbox_create_keeps_annotations_and_retention() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("annotated-ephemeral"),
+                    keep: false,
+                    command: &["echo".into(), "OK".into()],
+                    annotations: HashMap::from([("owner".to_string(), "platform".to_string())]),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let annotations = &create_requests(&server).await[0].annotations;
+            assert_eq!(
+                annotations.get("owner").map(String::as_str),
+                Some("platform")
+            );
+            assert_eq!(
+                annotations
+                    .get("openshell.nvidia.com/retention")
+                    .map(String::as_str),
+                Some("ephemeral")
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_sends_driver_config_json() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("driver-config"),
-            driver_config_json: Some(
-                r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#,
-            ),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let driver_config = requests[0]
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .and_then(|template| template.driver_config.as_ref())
-        .expect("driver config should be sent");
-    let kubernetes = driver_config
-        .fields
-        .get("kubernetes")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("driver-config"),
+                    driver_config_json: Some(
+                        r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#,
+                    ),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            let driver_config = requests[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.as_ref())
+                .and_then(|template| template.driver_config.as_ref())
+                .expect("driver config should be sent");
+            let kubernetes = driver_config
+                .fields
+                .get("kubernetes")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StructValue(inner) => Some(inner),
+                    _ => None,
+                })
+                .expect("kubernetes block should be a struct");
+            let pod = kubernetes
+                .fields
+                .get("pod")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StructValue(inner) => Some(inner),
+                    _ => None,
+                })
+                .expect("pod block should be a struct");
+
+            assert_eq!(
+                pod.fields
+                    .get("priority_class_name")
+                    .and_then(|value| value.kind.as_ref())
+                    .and_then(|kind| match kind {
+                        prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                        _ => None,
+                    }),
+                Some("batch-low")
+            );
         })
-        .expect("kubernetes block should be a struct");
-    let pod = kubernetes
-        .fields
-        .get("pod")
-        .and_then(|value| value.kind.as_ref())
-        .and_then(|kind| match kind {
-            prost_types::value::Kind::StructValue(inner) => Some(inner),
-            _ => None,
-        })
-        .expect("pod block should be a struct");
-
-    assert_eq!(
-        pod.fields
-            .get("priority_class_name")
-            .and_then(|value| value.kind.as_ref())
-            .and_then(|kind| match kind {
-                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
-                _ => None,
-            }),
-        Some("batch-low")
-    );
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_with_template_sends_workload_template_name() {
     let server = run_server().await;
     add_provider(&server, "github", "github").await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("from-template"),
-            template: Some("gpu-kata"),
-            providers: &["github".to_string()],
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let request = requests.first().expect("create request should be recorded");
-    assert_eq!(request.workload_template, "gpu-kata");
-    let spec = request
-        .spec
-        .as_ref()
-        .expect("governance spec should be sent");
-    assert_eq!(spec.providers, vec!["github".to_string()]);
-    assert!(spec.template.is_none());
-    assert!(spec.environment.is_empty());
-    assert!(spec.resource_requirements.is_none());
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("from-template"),
+                    template: Some("gpu-kata"),
+                    providers: &["github".to_string()],
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            let request = requests.first().expect("create request should be recorded");
+            assert_eq!(request.workload_template, "gpu-kata");
+            let spec = request
+                .spec
+                .as_ref()
+                .expect("governance spec should be sent");
+            assert_eq!(spec.providers, vec!["github".to_string()]);
+            assert!(spec.template.is_none());
+            assert!(spec.environment.is_empty());
+            assert!(spec.resource_requirements.is_none());
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_template_create_sends_non_default_workspace_in_scope_and_metadata() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_template_create(
-        &server.endpoint,
-        "gpu-kata",
-        Some("registry.example.com/agent:latest"),
-        Some("2"),
-        Some("4Gi"),
-        Some(GpuResourceRequirements { count: Some(1) }),
-        Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
-        Some("5m"),
-        Some(3),
-        HashMap::from([("team".to_string(), "runtime".to_string())]),
-        HashMap::from([("owner".to_string(), "platform".to_string())]),
-        HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
-        "table",
-        "team-a",
-        &tls,
-        true,
-    )
-    .await
-    .expect("template create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
 
-    let requests = template_create_requests(&server).await;
-    let request = requests
-        .first()
-        .expect("template create request should be recorded");
-    assert_eq!(selected_workspace(&request.workspace_scope), Some("team-a"));
-    let template = request.template.as_ref().expect("template should be sent");
-    let metadata = template.metadata.as_ref().expect("metadata should be sent");
-    assert_eq!(metadata.name, "gpu-kata");
-    assert_eq!(metadata.workspace, "team-a");
-    assert_eq!(metadata.labels.get("team"), Some(&"runtime".to_string()));
-    assert_eq!(
-        metadata.annotations.get("owner"),
-        Some(&"platform".to_string())
-    );
+            run::sandbox_template_create(
+                &server.endpoint,
+                "gpu-kata",
+                Some("registry.example.com/agent:latest"),
+                Some("2"),
+                Some("4Gi"),
+                Some(GpuResourceRequirements { count: Some(1) }),
+                Some(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#),
+                Some("5m"),
+                Some(3),
+                HashMap::from([("team".to_string(), "runtime".to_string())]),
+                HashMap::from([("owner".to_string(), "platform".to_string())]),
+                HashMap::from([("FEATURE_FLAG".to_string(), "on".to_string())]),
+                "table",
+                "team-a",
+                &tls,
+                true,
+            )
+            .await
+            .expect("template create should succeed");
 
-    let spec = template.spec.as_ref().expect("spec should be sent");
-    let workload = spec.workload.as_ref().expect("workload should be sent");
-    assert_eq!(workload.image, "registry.example.com/agent:latest");
-    assert_eq!(
-        workload.environment.get("FEATURE_FLAG"),
-        Some(&"on".to_string())
-    );
-    let resources = workload
-        .resources
-        .as_ref()
-        .expect("resources should be sent");
-    assert_eq!(resources.cpu, "2");
-    assert_eq!(resources.memory, "4Gi");
-    assert_eq!(resources.gpu.as_ref().and_then(|gpu| gpu.count), Some(1));
-    assert!(spec.driver_config.is_some());
-    let startup = spec
-        .desired_service_level
-        .as_ref()
-        .and_then(|service_level| service_level.startup.as_ref())
-        .expect("startup service level should be sent");
-    assert_eq!(startup.max_burst, 3);
-    assert_eq!(
-        startup
-            .ready_within
-            .as_ref()
-            .map(|duration| duration.seconds),
-        Some(300)
-    );
+            let requests = template_create_requests(&server).await;
+            let request = requests
+                .first()
+                .expect("template create request should be recorded");
+            assert_eq!(selected_workspace(&request.workspace_scope), Some("team-a"));
+            let template = request.template.as_ref().expect("template should be sent");
+            let metadata = template.metadata.as_ref().expect("metadata should be sent");
+            assert_eq!(metadata.name, "gpu-kata");
+            assert_eq!(metadata.workspace, "team-a");
+            assert_eq!(metadata.labels.get("team"), Some(&"runtime".to_string()));
+            assert_eq!(
+                metadata.annotations.get("owner"),
+                Some(&"platform".to_string())
+            );
+
+            let spec = template.spec.as_ref().expect("spec should be sent");
+            let workload = spec.workload.as_ref().expect("workload should be sent");
+            assert_eq!(workload.image, "registry.example.com/agent:latest");
+            assert_eq!(
+                workload.environment.get("FEATURE_FLAG"),
+                Some(&"on".to_string())
+            );
+            let resources = workload
+                .resources
+                .as_ref()
+                .expect("resources should be sent");
+            assert_eq!(resources.cpu, "2");
+            assert_eq!(resources.memory, "4Gi");
+            assert_eq!(resources.gpu.as_ref().and_then(|gpu| gpu.count), Some(1));
+            assert!(spec.driver_config.is_some());
+            let startup = spec
+                .desired_service_level
+                .as_ref()
+                .and_then(|service_level| service_level.startup.as_ref())
+                .expect("startup service level should be sent");
+            assert_eq!(startup.max_burst, 3);
+            assert_eq!(
+                startup
+                    .ready_within
+                    .as_ref()
+                    .map(|duration| duration.seconds),
+                Some(300)
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_template_list_and_delete_send_workspace_requests() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_template_list(
-        &server.endpoint,
-        25,
-        "next-template-page",
-        Some("team=runtime"),
-        false,
-        "table",
-        "default",
-        false,
-        &tls,
-    )
-    .await
-    .expect("template list should succeed");
-    run::sandbox_template_delete(&server.endpoint, &["gpu-kata".to_string()], "default", &tls)
-        .await
-        .expect("template delete should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
 
-    let list_requests = template_list_requests(&server).await;
-    let list_request = list_requests
-        .first()
-        .expect("template list request should be recorded");
-    assert_eq!(list_request.page_size, 25);
-    assert_eq!(list_request.page_token, "next-template-page");
-    assert_eq!(list_request.label_selector, "team=runtime");
-    assert_eq!(
-        selected_workspace(&list_request.workspace_scope),
-        Some("default")
-    );
+            run::sandbox_template_list(
+                &server.endpoint,
+                25,
+                "next-template-page",
+                Some("team=runtime"),
+                false,
+                "table",
+                "default",
+                false,
+                &tls,
+            )
+            .await
+            .expect("template list should succeed");
+            run::sandbox_template_delete(
+                &server.endpoint,
+                &["gpu-kata".to_string()],
+                "default",
+                &tls,
+            )
+            .await
+            .expect("template delete should succeed");
 
-    let delete_requests = template_delete_requests(&server).await;
-    let delete_request = delete_requests
-        .first()
-        .expect("template delete request should be recorded");
-    assert_eq!(delete_request.name, "gpu-kata");
-    assert_eq!(
-        selected_workspace(&delete_request.workspace_scope),
-        Some("default")
-    );
+            let list_requests = template_list_requests(&server).await;
+            let list_request = list_requests
+                .first()
+                .expect("template list request should be recorded");
+            assert_eq!(list_request.page_size, 25);
+            assert_eq!(list_request.page_token, "next-template-page");
+            assert_eq!(list_request.label_selector, "team=runtime");
+            assert_eq!(
+                selected_workspace(&list_request.workspace_scope),
+                Some("default")
+            );
+
+            let delete_requests = template_delete_requests(&server).await;
+            let delete_request = delete_requests
+                .first()
+                .expect("template delete request should be recorded");
+            assert_eq!(delete_request.name, "gpu-kata");
+            assert_eq!(
+                selected_workspace(&delete_request.workspace_scope),
+                Some("default")
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_template_create_allows_omitted_image() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_template_create(
-        &server.endpoint,
-        "base",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        HashMap::new(),
-        HashMap::new(),
-        HashMap::new(),
-        "table",
-        "default",
-        &tls,
-        true,
-    )
-    .await
-    .expect("template create without image should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
 
-    let requests = template_create_requests(&server).await;
-    let request = requests
-        .first()
-        .expect("template create request should be recorded");
-    let workload = request
-        .template
-        .as_ref()
-        .and_then(|template| template.spec.as_ref())
-        .and_then(|spec| spec.workload.as_ref())
-        .expect("workload should be sent");
-    assert_eq!(workload.image, "");
+            run::sandbox_template_create(
+                &server.endpoint,
+                "base",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                "table",
+                "default",
+                &tls,
+                true,
+            )
+            .await
+            .expect("template create without image should succeed");
+
+            let requests = template_create_requests(&server).await;
+            let request = requests
+                .first()
+                .expect("template create request should be recorded");
+            let workload = request
+                .template
+                .as_ref()
+                .and_then(|template| template.spec.as_ref())
+                .and_then(|spec| spec.workload.as_ref())
+                .expect("workload should be sent");
+            assert_eq!(workload.image, "");
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_sends_gpu_default_request() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("gpu-default"),
-            gpu_requirements: Some(gpu_requirements(None)),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let gpu = requests[0]
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-        .and_then(|requirements| requirements.gpu.as_ref())
-        .expect("GPU requirement should be sent");
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("gpu-default"),
+                    gpu_requirements: Some(gpu_requirements(None)),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
 
-    assert_eq!(gpu.count, None);
+            let requests = create_requests(&server).await;
+            let gpu = requests[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.resource_requirements.as_ref())
+                .and_then(|requirements| requirements.gpu.as_ref())
+                .expect("GPU requirement should be sent");
+
+            assert_eq!(gpu.count, None);
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_sends_gpu_count_request() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("gpu-two"),
-            gpu_requirements: Some(gpu_requirements(Some(2))),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let gpu = requests[0]
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-        .and_then(|requirements| requirements.gpu.as_ref())
-        .expect("GPU requirement should be sent");
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("gpu-two"),
+                    gpu_requirements: Some(gpu_requirements(Some(2))),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
 
-    assert_eq!(gpu.count, Some(2));
+            let requests = create_requests(&server).await;
+            let gpu = requests[0]
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.resource_requirements.as_ref())
+                .and_then(|requirements| requirements.gpu.as_ref())
+                .expect("GPU requirement should be sent");
+
+            assert_eq!(gpu.count, Some(2));
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_skips_inferred_provider_without_local_credentials() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("no-inferred-provider"),
-            command: &["claude".into(), "--version".into()],
-            tty_override: Some(true),
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed without inferred provider");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let providers = requests[0]
-        .spec
-        .as_ref()
-        .expect("sandbox spec should be sent")
-        .providers
-        .clone();
-    assert!(
-        providers.is_empty(),
-        "missing local credentials should skip inferred providers, got {providers:?}"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("no-inferred-provider"),
+                    command: &["claude".into(), "--version".into()],
+                    tty_override: Some(true),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed without inferred provider");
+
+            let requests = create_requests(&server).await;
+            let providers = requests[0]
+                .spec
+                .as_ref()
+                .expect("sandbox spec should be sent")
+                .providers
+                .clone();
+            assert!(
+                providers.is_empty(),
+                "missing local credentials should skip inferred providers, got {providers:?}"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -2299,39 +2552,43 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         .state
         .vm_error_after_started
         .store(true, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env_with(
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env_with(
         &fake_ssh_dir,
         &xdg_dir,
         &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
-    );
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
-
-    let started_at = Instant::now();
-    let err = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("vm-error"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
     )
-    .await
-    .expect_err("sandbox create should fail on terminal VM error");
+    .run_async(async {
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
 
-    assert!(
-        started_at.elapsed() < Duration::from_secs(2),
-        "terminal VM errors should not wait for the provisioning timeout"
-    );
-    let rendered = err.to_string();
-    assert!(rendered.contains("sandbox entered error phase while provisioning"));
-    assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
-    assert!(!rendered.contains("timed out"));
+        let started_at = Instant::now();
+        let err = run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("vm-error"),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        )
+        .await
+        .expect_err("sandbox create should fail on terminal VM error");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "terminal VM errors should not wait for the provisioning timeout"
+        );
+        let rendered = err.to_string();
+        assert!(rendered.contains("sandbox entered error phase while provisioning"));
+        assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+        assert!(!rendered.contains("timed out"));
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2347,29 +2604,85 @@ async fn sandbox_create_preserves_vm_error_when_exit_code_is_observed() {
         .state
         .vm_error_with_observed_exit
         .store(true, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    let err = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("vm-error-with-exit"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+
+            let err = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("vm-error-with-exit"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect_err("an observed process exit must not hide the infrastructure error");
+
+            let rendered = err.to_string();
+            assert!(rendered.contains("sandbox entered error phase while provisioning"));
+            assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn sandbox_create_accepts_ready_before_create_returns() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .ready_before_create_returns
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
     )
-    .await
-    .expect_err("an observed process exit must not hide the infrastructure error");
+    .run_async(async {
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
 
-    let rendered = err.to_string();
-    assert!(rendered.contains("sandbox entered error phase while provisioning"));
-    assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+        let exit_code = tokio::time::timeout(
+            Duration::from_secs(10),
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("already-ready"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            ),
+        )
+        .await
+        .expect("creation must finish while the watch remains open")
+        .expect("an already-Ready sandbox must not wait for a new provisioning transition");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(create_requests(&server).await.len(), 1);
+        assert_eq!(
+            server
+                .openshell
+                .state
+                .ssh_session_requests
+                .load(Ordering::SeqCst),
+            1,
+            "the initial Ready snapshot must allow the command to attach"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2380,29 +2693,33 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         .state
         .vm_slow_progress_before_ready
         .store(true, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env_with(
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env_with(
         &fake_ssh_dir,
         &xdg_dir,
         &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
-    );
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
-
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("vm-slow-progress"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
     )
-    .await
-    .expect("sandbox create should not time out while VM progress is active");
+    .run_async(async {
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
+
+        run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("vm-slow-progress"),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        )
+        .await
+        .expect("sandbox create should not time out while VM progress is active");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2413,36 +2730,40 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         .state
         .vm_log_churn_before_ready
         .store(true, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env_with(
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env_with(
         &fake_ssh_dir,
         &xdg_dir,
         &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
-    );
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
-
-    let started_at = Instant::now();
-    let err = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("vm-log-churn"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
     )
-    .await
-    .expect_err("sandbox create should time out when only logs arrive");
+    .run_async(async {
+        let tls = test_tls(&server);
+        install_fake_ssh(&fake_ssh_dir);
 
-    assert!(
-        started_at.elapsed() < Duration::from_secs(2),
-        "logs should not extend the provisioning timeout"
-    );
-    assert!(err.to_string().contains("sandbox provisioning timed out"));
+        let started_at = Instant::now();
+        let err = run::sandbox_create(
+            &server.endpoint,
+            "openshell",
+            run::SandboxCreateConfig {
+                name: Some("vm-log-churn"),
+                command: &["echo".into(), "OK".into()],
+                ..test_config()
+            },
+            "default",
+            &tls,
+        )
+        .await
+        .expect_err("sandbox create should time out when only logs arrive");
+
+        assert!(
+            started_at.elapsed() < Duration::from_secs(2),
+            "logs should not extend the provisioning timeout"
+        );
+        assert!(err.to_string().contains("sandbox provisioning timed out"));
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -2458,35 +2779,39 @@ async fn sandbox_create_retries_terminal_attachment_until_relay_registers() {
         .state
         .ssh_session_failures_remaining
         .store(1, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    let exit_code = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("fast-command"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should wait for the declared terminal attachment relay");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert_eq!(exit_code, 0);
-    assert_eq!(
-        server
-            .openshell
-            .state
-            .ssh_session_requests
-            .load(Ordering::SeqCst),
-        2
-    );
+            let exit_code = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("fast-command"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should wait for the declared terminal attachment relay");
+
+            assert_eq!(exit_code, 0);
+            assert_eq!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_requests
+                    .load(Ordering::SeqCst),
+                2
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -2497,32 +2822,36 @@ async fn sandbox_create_waits_for_main_result_after_provisional_container_exit()
         .state
         .terminal_after_provisional_container_exit
         .store(true, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    let exit_code = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("fast-ephemeral-command"),
-            keep: false,
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("a provisional container exit must yield to the canonical main-process result");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert_eq!(exit_code, 0);
-    assert_eq!(
-        deleted_names(&server).await,
-        vec![vec!["fast-ephemeral-command".to_string()]]
-    );
+            let exit_code = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("fast-ephemeral-command"),
+                    keep: false,
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a provisional container exit must yield to the canonical main-process result");
+
+            assert_eq!(exit_code, 0);
+            assert_eq!(
+                deleted_names(&server).await,
+                vec![vec!["fast-ephemeral-command".to_string()]]
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -2533,9 +2862,10 @@ async fn sandbox_create_bounds_provisional_container_exit_reconciliation() {
         .state
         .provisional_container_exit_without_result
         .store(true, Ordering::SeqCst);
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir).run_async(async {
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
 
@@ -2590,312 +2920,358 @@ async fn sandbox_create_bounds_provisional_container_exit_reconciliation() {
         "provisional container exit returned before reconciliation: {reconciliation_elapsed:?}"
     );
     assert!(deleted_names(&server).await.is_empty());
+    }).await;
 }
 
 #[tokio::test]
 async fn sandbox_create_deletes_command_sessions_with_no_keep() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("ephemeral-command"),
-            keep: false,
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert_eq!(
-        deleted_names(&server).await,
-        vec![vec!["ephemeral-command".to_string()]]
-    );
-    let requests = create_requests(&server).await;
-    assert_eq!(
-        requests[0]
-            .annotations
-            .get("openshell.nvidia.com/retention")
-            .map(String::as_str),
-        Some("ephemeral")
-    );
-    assert_eq!(
-        load_last_sandbox("openshell", "default"),
-        None,
-        "no-keep sandboxes should not be persisted as last-used"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("ephemeral-command"),
+                    keep: false,
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            assert_eq!(
+                deleted_names(&server).await,
+                vec![vec!["ephemeral-command".to_string()]]
+            );
+            let requests = create_requests(&server).await;
+            assert_eq!(
+                requests[0]
+                    .annotations
+                    .get("openshell.nvidia.com/retention")
+                    .map(String::as_str),
+                Some("ephemeral")
+            );
+            assert_eq!(
+                load_last_sandbox("openshell", "default"),
+                None,
+                "no-keep sandboxes should not be persisted as last-used"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_returns_exact_main_status_after_no_keep_cleanup() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    let exit_code = run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("ephemeral-failure"),
-            keep: false,
-            command: &["sh".into(), "-c".into(), "exit 7".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("a main-process failure is a command result, not a cleanup error");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
 
-    assert_eq!(exit_code, 7);
-    assert_eq!(
-        deleted_names(&server).await,
-        vec![vec!["ephemeral-failure".to_string()]]
-    );
+            let exit_code = run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("ephemeral-failure"),
+                    keep: false,
+                    command: &["sh".into(), "-c".into(), "exit 7".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("a main-process failure is a command result, not a cleanup error");
+
+            assert_eq!(exit_code, 7);
+            assert_eq!(
+                deleted_names(&server).await,
+                vec![vec!["ephemeral-failure".to_string()]]
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("ephemeral-shell"),
-            keep: false,
-            tty_override: Some(true),
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create shell should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert_eq!(
-        deleted_names(&server).await,
-        vec![vec!["ephemeral-shell".to_string()]]
-    );
-    assert_eq!(
-        load_last_sandbox("openshell", "default"),
-        None,
-        "no-keep shell sessions should not be persisted as last-used"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("ephemeral-shell"),
+                    keep: false,
+                    tty_override: Some(true),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create shell should succeed");
+
+            assert_eq!(
+                deleted_names(&server).await,
+                vec![vec!["ephemeral-shell".to_string()]]
+            );
+            assert_eq!(
+                load_last_sandbox("openshell", "default"),
+                None,
+                "no-keep shell sessions should not be persisted as last-used"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("persistent-keep"),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    assert!(deleted_names(&server).await.is_empty());
-    assert_eq!(
-        load_last_sandbox("openshell", "default").as_deref(),
-        Some("persistent-keep"),
-        "persistent sandboxes should remain selectable as last-used"
-    );
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("persistent-keep"),
+                    command: &["echo".into(), "OK".into()],
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            assert!(deleted_names(&server).await.is_empty());
+            assert_eq!(
+                load_last_sandbox("openshell", "default").as_deref(),
+                Some("persistent-keep"),
+                "persistent sandboxes should remain selectable as last-used"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_forwarding_ssh(&fake_ssh_dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forward_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("persistent-forward"),
-            keep: false,
-            forward: Some(openshell_core::forward::ForwardSpec::new(forward_port)),
-            command: &["echo".into(), "OK".into()],
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create with forward should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_forwarding_ssh(&fake_ssh_dir);
+            let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+            let (forward_port, result) = Box::pin(with_free_forward_port(|spec| async move {
+                run::sandbox_create(
+                    endpoint,
+                    "openshell",
+                    run::SandboxCreateConfig {
+                        name: Some("persistent-forward"),
+                        keep: false,
+                        forward: Some(spec),
+                        command: &["echo".into(), "OK".into()],
+                        ..test_config()
+                    },
+                    "default",
+                    tls,
+                )
+                .await
+            }))
+            .await;
+            result.expect("sandbox create with forward should succeed");
 
-    assert!(deleted_names(&server).await.is_empty());
-    let record =
-        openshell_core::forward::read_forward_pid("default", "persistent-forward", forward_port)
+            assert!(deleted_names(&server).await.is_empty());
+            let record = openshell_core::forward::read_forward_pid(
+                "default",
+                "persistent-forward",
+                forward_port,
+            )
             .expect("fake forward should be tracked");
-    let _ = std::process::Command::new("kill")
-        .arg(record.pid.to_string())
-        .status();
+            let _ = std::process::Command::new("kill")
+                .arg(record.pid.to_string())
+                .status();
+        })
+        .await;
 }
 
 #[tokio::test]
 async fn sandbox_create_exposes_service_after_ready_and_keeps_sandbox() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("sandbox"),
+                    keep: false,
+                    expose: Some(4500),
+                    expose_authorization_mode:
+                        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
+                    detach: true,
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create with service exposure should succeed");
+
+            assert!(deleted_names(&server).await.is_empty());
+            let create_requests = create_requests(&server).await;
+            assert_eq!(create_requests.len(), 1);
+            assert_eq!(create_requests[0].service_exposures.len(), 1);
+            assert_eq!(create_requests[0].service_exposures[0].service, "");
+            assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
+            assert_eq!(
+                create_requests[0].service_exposures[0].authorization_mode(),
+                openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+            );
+            assert!(expose_service_requests(&server).await.is_empty());
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn service_expose_forwards_bearer_passthrough_mode() {
+    let server = run_server().await;
     let tls = test_tls(&server);
 
-    run::sandbox_create(
+    run::service_expose(
         &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("sandbox"),
-            keep: false,
-            expose: Some(4500),
-            detach: true,
-            ..test_config()
-        },
+        "sandbox",
+        "codex",
+        4500,
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough,
         "default",
         &tls,
     )
     .await
-    .expect("sandbox create with service exposure should succeed");
+    .expect("service expose should succeed");
 
-    assert!(deleted_names(&server).await.is_empty());
-    let create_requests = create_requests(&server).await;
-    assert_eq!(create_requests.len(), 1);
-    assert_eq!(create_requests[0].service_exposures.len(), 1);
-    assert_eq!(create_requests[0].service_exposures[0].service, "");
-    assert_eq!(create_requests[0].service_exposures[0].target_port, 4500);
-    assert!(expose_service_requests(&server).await.is_empty());
+    let requests = expose_service_requests(&server).await;
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].authorization_mode(),
+        openshell_core::proto::ServiceAuthorizationMode::BearerPassthrough
+    );
 }
 
 #[tokio::test]
 async fn sandbox_forward_background_tracks_owned_child_when_pid_discovery_fails() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_forwarding_ssh(&fake_ssh_dir);
-    install_fake_pgrep_no_match(&fake_ssh_dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forward_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    run::sandbox_forward(
-        &server.endpoint,
-        "owned-forward",
-        &spec,
-        true,
-        &tls,
-        "default",
-    )
-    .await
-    .expect("background forward should track the owned SSH child without PID discovery");
-    let record =
-        openshell_core::forward::read_forward_pid("default", "owned-forward", forward_port)
-            .expect("owned background forward should write a PID file");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_forwarding_ssh(&fake_ssh_dir);
+            install_fake_pgrep_no_match(&fake_ssh_dir);
+            let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+            let (forward_port, result) = with_free_forward_port(|spec| async move {
+                run::sandbox_forward(endpoint, "owned-forward", &spec, true, tls, "default").await
+            })
+            .await;
+            result.expect(
+                "background forward should track the owned SSH child without PID discovery",
+            );
+            let record =
+                openshell_core::forward::read_forward_pid("default", "owned-forward", forward_port)
+                    .expect("owned background forward should write a PID file");
 
-    assert!(
-        openshell_core::forward::stop_forward("default", "owned-forward", forward_port)
-            .expect("tracked fake forward should stop"),
-        "tracked fake forward should be recognized as alive and stopped",
-    );
-    assert!(
-        wait_for_process_exit(record.pid, Duration::from_secs(2)).await,
-        "tracked fake forward process should exit after stop"
-    );
+            assert!(
+                openshell_core::forward::stop_forward("default", "owned-forward", forward_port)
+                    .expect("tracked fake forward should stop"),
+                "tracked fake forward should be recognized as alive and stopped",
+            );
+            assert!(
+                wait_for_process_exit(record.pid, Duration::from_secs(2)).await,
+                "tracked fake forward process should exit after stop"
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 #[ignore = "flaky under concurrent test execution"]
 async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forward_port = listener.local_addr().unwrap().port();
-    drop(listener);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(
-        &server.endpoint,
-        "foreground-forward",
-        &spec,
-        false,
-        &tls,
-        "default",
-    )
-    .await
-    .expect_err("foreground forward should fail when ssh exits before listener readiness");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("ssh exited before local forward listener opened"),
-        "error should explain that ssh exited before listener readiness, got: {msg}",
-    );
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
+            let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+            let (_, result) = with_free_forward_port(|spec| async move {
+                run::sandbox_forward(endpoint, "foreground-forward", &spec, false, tls, "default")
+                    .await
+            })
+            .await;
+            let err = result.expect_err(
+                "foreground forward should fail when ssh exits before listener readiness",
+            );
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("ssh exited before local forward listener opened"),
+                "error should explain that ssh exited before listener readiness, got: {msg}",
+            );
+        })
+        .await;
 }
 
 #[tokio::test]
 #[ignore = "flaky under concurrent test execution"]
 async fn sandbox_forward_background_terminates_owned_child_when_listener_never_opens() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+
+    test_env(&fake_ssh_dir, &xdg_dir).run_async(async {
     let tls = test_tls(&server);
     let fake_forward = install_fake_unreachable_forwarding_ssh(&fake_ssh_dir);
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let forward_port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
-    let err = run::sandbox_forward(
-        &server.endpoint,
-        "unreachable-forward",
-        &spec,
-        true,
-        &tls,
-        "default",
-    )
-    .await
-    .expect_err("background forward should fail when the listener never opens");
+    let (endpoint, tls) = (server.endpoint.as_str(), &tls);
+    let (forward_port, result) = with_free_forward_port(|spec| async move {
+        run::sandbox_forward(endpoint, "unreachable-forward", &spec, true, tls, "default").await
+    })
+    .await;
+    let err = result.expect_err("background forward should fail when the listener never opens");
     let msg = format!("{err}");
     assert!(
         msg.contains("ssh process started but local forward listener was not reachable"),
@@ -2930,47 +3306,52 @@ async fn sandbox_forward_background_terminates_owned_child_when_listener_never_o
             log.trim(),
         );
     }
+    }).await;
 }
 
 #[tokio::test]
 async fn sandbox_create_sends_environment_variables() {
     let server = run_server().await;
-    let fake_ssh_dir = tempfile::tempdir().unwrap();
-    let xdg_dir = tempfile::tempdir().unwrap();
-    let _env = test_env(&fake_ssh_dir, &xdg_dir);
-    let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
 
-    run::sandbox_create(
-        &server.endpoint,
-        "openshell",
-        run::SandboxCreateConfig {
-            name: Some("env-test"),
-            command: &["echo".into(), "OK".into()],
-            environment: HashMap::from([
-                ("FOO".into(), "bar".into()),
-                ("BAZ".into(), "qux=with=equals".into()),
-            ]),
-            ..test_config()
-        },
-        "default",
-        &tls,
-    )
-    .await
-    .expect("sandbox create should succeed");
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            let tls = test_tls(&server);
+            install_fake_ssh(&fake_ssh_dir);
 
-    let requests = create_requests(&server).await;
-    let environment = &requests[0]
-        .spec
-        .as_ref()
-        .expect("spec should be present")
-        .environment;
-    assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
-    assert_eq!(
-        environment.get("BAZ").map(String::as_str),
-        Some("qux=with=equals")
-    );
-    assert_eq!(environment.len(), 2);
+            run::sandbox_create(
+                &server.endpoint,
+                "openshell",
+                run::SandboxCreateConfig {
+                    name: Some("env-test"),
+                    command: &["echo".into(), "OK".into()],
+                    environment: HashMap::from([
+                        ("FOO".into(), "bar".into()),
+                        ("BAZ".into(), "qux=with=equals".into()),
+                    ]),
+                    ..test_config()
+                },
+                "default",
+                &tls,
+            )
+            .await
+            .expect("sandbox create should succeed");
+
+            let requests = create_requests(&server).await;
+            let environment = &requests[0]
+                .spec
+                .as_ref()
+                .expect("spec should be present")
+                .environment;
+            assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
+            assert_eq!(
+                environment.get("BAZ").map(String::as_str),
+                Some("qux=with=equals")
+            );
+            assert_eq!(environment.len(), 2);
+        })
+        .await;
 }
 
 #[tokio::test]
@@ -3029,6 +3410,16 @@ async fn run_cli_sandbox_create_with_xdg(
     name: &str,
     extra_args: &[&str],
 ) -> std::process::Output {
+    run_cli_sandbox_create_with_xdg_and_env(server, xdg_dir, name, extra_args, &[]).await
+}
+
+async fn run_cli_sandbox_create_with_xdg_and_env(
+    server: &TestServer,
+    xdg_dir: &TempDir,
+    name: &str,
+    extra_args: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
     let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_openshell"));
     for (key, _) in std::env::vars().filter(|(k, _)| k.starts_with("OPENSHELL_")) {
         cmd.env_remove(&key);
@@ -3046,6 +3437,7 @@ async fn run_cli_sandbox_create_with_xdg(
         "--no-auto-providers",
     ])
     .args(extra_args)
+    .envs(environment.iter().copied())
     .env("XDG_CONFIG_HOME", xdg_dir.path())
     .env("HOME", xdg_dir.path())
     .env("OPENSHELL_PROVISION_TIMEOUT", "5")
@@ -3059,9 +3451,169 @@ async fn run_cli_sandbox_create(
     name: &str,
     extra_args: &[&str],
 ) -> std::process::Output {
-    let xdg_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
     prepare_cli_xdg(server, &xdg_dir);
     run_cli_sandbox_create_with_xdg(server, &xdg_dir, name, extra_args).await
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_is_rejected_before_provisioning_when_planning_fails() {
+    let server = run_server().await;
+    let source = tempfile::tempdir().unwrap();
+    fs::create_dir(source.path().join("runs")).unwrap();
+    fs::write(source.path().join("runs/marker.txt"), "dummy content").unwrap();
+    fs::write(source.path().join(".gitignore"), "runs/\n").unwrap();
+    let plain = tempfile::tempdir().unwrap();
+    fs::write(plain.path().join("ok.txt"), "ok").unwrap();
+
+    // A broken repository must not be mistaken for a non-repository source.
+    fs::create_dir(source.path().join(".git")).unwrap();
+    let path = source.path().join("runs");
+    let args = ["--detach", "--upload", path.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-no-repository", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("Git filtering failed"), "{stderr}");
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(!stderr.contains("was created"), "{stderr}");
+
+    fs::remove_dir(source.path().join(".git")).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(source.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let result = run_cli_sandbox_create(&server, "upload-empty-selection", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+    assert!(
+        stderr.contains("Git returned 0 uploadable paths"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("--no-git-ignore"), "{stderr}");
+    assert!(!stderr.contains("was created"), "{stderr}");
+
+    // A valid earlier upload must not get through when a later one is rejected.
+    let args = [
+        "--detach",
+        "--upload",
+        plain.path().to_str().unwrap(),
+        "--upload",
+        path.to_str().unwrap(),
+    ];
+    let result = run_cli_sandbox_create(&server, "upload-later-rejected", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("filtering selected no files"), "{stderr}");
+
+    let missing = plain.path().join("missing");
+    let args = ["--detach", "--upload", missing.to_str().unwrap()];
+    let result = run_cli_sandbox_create(&server, "upload-missing", &args).await;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{stderr}");
+    assert!(stderr.contains("local path does not exist"), "{stderr}");
+
+    assert_eq!(
+        create_requests(&server).await.len(),
+        0,
+        "a rejected upload plan must not provision a sandbox",
+    );
+    assert_eq!(
+        server
+            .openshell
+            .state
+            .ssh_session_requests
+            .load(Ordering::SeqCst),
+        0,
+        "a rejected upload plan must not open an SSH session",
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_upload_warns_and_reaches_ssh_outside_git_repository() {
+    let server = run_server().await;
+    let fake_ssh_dir = helpers::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
+    test_env(&fake_ssh_dir, &xdg_dir)
+        .run_async(async {
+            install_executable_script(&fake_ssh_dir, "ssh", "#!/bin/sh\nexit 7\n");
+            let source = tempfile::tempdir().unwrap();
+            fs::write(source.path().join("marker.txt"), "dummy content").unwrap();
+            let args = ["--detach", "--upload", source.path().to_str().unwrap()];
+            let result = run_cli_sandbox_create(&server, "upload-non-repository", &args).await;
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            // The fake SSH transport fails; preflight must still let it try.
+            assert!(!result.status.success(), "{stderr}");
+            assert!(stderr.contains("outside a Git work tree"), "{stderr}");
+            assert!(
+                stderr.contains(".gitignore rules are not applied"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("Git filtering failed"), "{stderr}");
+            // A transfer failure after provisioning keeps the sandbox and says so.
+            assert!(
+                stderr.contains("Sandbox 'upload-non-repository' was created and still exists"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("openshell sandbox upload"), "{stderr}");
+            assert!(stderr.contains("openshell sandbox delete"), "{stderr}");
+            assert_eq!(create_requests(&server).await.len(), 1);
+            assert!(
+                server
+                    .openshell
+                    .state
+                    .ssh_session_requests
+                    .load(Ordering::SeqCst)
+                    > 0,
+                "an upload outside a repository must reach the SSH transport",
+            );
+        })
+        .await;
+}
+
+async fn run_cli_sandbox_create_with_env(
+    server: &TestServer,
+    name: &str,
+    extra_args: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
+    let xdg_dir = helpers::tempdir().unwrap();
+    prepare_cli_xdg(server, &xdg_dir);
+    run_cli_sandbox_create_with_xdg_and_env(server, &xdg_dir, name, extra_args, environment).await
+}
+
+#[tokio::test]
+async fn sandbox_create_env_from_reaches_request() {
+    let server = run_server().await;
+    let value = "qualification-value-not-in-argv";
+
+    let output = run_cli_sandbox_create_with_env(
+        &server,
+        "env-from-test",
+        &["--env-from", "SANDBOX_VALUE=HOST_VALUE", "--output=json"],
+        &[("HOST_VALUE", value)],
+    )
+    .await;
+    assert!(
+        output.status.success(),
+        "sandbox create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = create_requests(&server).await;
+    let environment = &requests[0]
+        .spec
+        .as_ref()
+        .expect("spec should be present")
+        .environment;
+    assert_eq!(
+        environment.get("SANDBOX_VALUE").map(String::as_str),
+        Some(value)
+    );
 }
 
 async fn run_cli_sandbox_template_create(
@@ -3069,7 +3621,7 @@ async fn run_cli_sandbox_template_create(
     name: &str,
     extra_args: &[&str],
 ) -> std::process::Output {
-    let xdg_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
     let tls_dir = xdg_dir.path().join("openshell/gateways/openshell/mtls");
     fs::create_dir_all(&tls_dir).unwrap();
     for filename in ["ca.crt", "tls.crt", "tls.key"] {
@@ -3195,7 +3747,7 @@ fn write_oidc_test_credentials(
 async fn sandbox_create_fails_before_mutation_when_expired_oidc_refresh_is_rejected() {
     let server = run_server().await;
     let issuer = run_rejected_oidc_refresh_server().await;
-    let xdg_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
     prepare_cli_xdg(&server, &xdg_dir);
 
     write_oidc_test_credentials(&server, &xdg_dir, &issuer, 0);
@@ -3231,7 +3783,7 @@ async fn sandbox_create_fails_before_mutation_when_expired_oidc_refresh_is_rejec
 async fn sandbox_create_continues_with_unexpired_cached_token_when_refresh_fails() {
     let server = run_server().await;
     let issuer = run_rejected_oidc_refresh_server().await;
-    let xdg_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = helpers::tempdir().unwrap();
     prepare_cli_xdg(&server, &xdg_dir);
     let expires_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3364,4 +3916,246 @@ async fn sandbox_template_create_suppresses_credential_env_warnings() {
 
     let requests = template_create_requests(&server).await;
     assert_eq!(requests.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// `openshell forward service` (`run::service_forward_tcp`)
+// ---------------------------------------------------------------------------
+
+/// Pick a free loopback port for the forward to bind.
+fn reserve_local_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// Run a CLI forward on a free loopback port, retrying on a new port if another
+/// process takes it first. The CLI checks the port before it binds it, which can
+/// be seconds later for `sandbox create`, so a concurrent test can claim it
+/// either before the check or between the check and the fake `ssh`'s bind.
+async fn with_free_forward_port<F, Fut, T>(mut forward: F) -> (u16, miette::Result<T>)
+where
+    F: FnMut(openshell_core::forward::ForwardSpec) -> Fut,
+    Fut: Future<Output = miette::Result<T>>,
+{
+    for _ in 0..10 {
+        let port = reserve_local_port();
+        let result = forward(openshell_core::forward::ForwardSpec::new(port)).await;
+        if !matches!(&result, Err(err) if lost_forward_port(err)) {
+            return (port, result);
+        }
+    }
+    panic!("another process took the forward port on every attempt");
+}
+
+/// Whether a forward failed because another process holds its port: the CLI's
+/// check found it in use, or the fake `ssh` exited 255 when it could not bind.
+fn lost_forward_port(err: &miette::Report) -> bool {
+    err.chain().any(|cause| {
+        let cause = cause.to_string();
+        cause.contains("is already in use")
+            || (cause.starts_with("ssh exited with status") && cause.contains("exit status: 255"))
+    })
+}
+
+#[test]
+fn fake_forward_exits_like_ssh_when_its_port_is_taken() {
+    let dir = helpers::tempdir().unwrap();
+    let fake_forward = install_fake_forward_process_helper(&dir);
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+
+    let status = std::process::Command::new(fake_forward)
+        .env("OPENSHELL_FAKE_FORWARD_MODE", "listen")
+        .args(["-N", "-L", &format!("{port}:127.0.0.1:22"), "sandbox"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+
+    assert_eq!(
+        status.code(),
+        Some(255),
+        "ssh -o ExitOnForwardFailure=yes exits 255 when it cannot bind"
+    );
+}
+
+#[tokio::test]
+async fn forward_retries_when_ssh_loses_the_port_after_the_check() {
+    use miette::WrapErr;
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut attempts = 0;
+    let (_, result) = with_free_forward_port(|spec| {
+        attempts += 1;
+        let first = attempts == 1;
+        async move {
+            if first {
+                let status = std::process::ExitStatus::from_raw(255 << 8);
+                return Err(miette::miette!(
+                    "ssh exited with status {status} before local forward listener opened on \
+                     127.0.0.1:{}",
+                    spec.port
+                ))
+                .wrap_err("ssh process started but local forward listener was not reachable");
+            }
+            Ok(())
+        }
+    })
+    .await;
+
+    result.expect("the second port should succeed");
+    assert_eq!(attempts, 2);
+}
+
+fn spawn_service_forward(
+    server: &TestServer,
+    sandbox: &str,
+    port: u16,
+) -> tokio::task::JoinHandle<Result<(), miette::Report>> {
+    let endpoint = server.endpoint.clone();
+    let tls = test_tls(server);
+    let sandbox = sandbox.to_string();
+    tokio::spawn(async move {
+        run::service_forward_tcp(
+            &endpoint,
+            &sandbox,
+            Some(&format!("127.0.0.1:{port}")),
+            "127.0.0.1",
+            8080,
+            &tls,
+            "default",
+        )
+        .await
+    })
+}
+
+/// Send `payload` through the local forward, expect the mock gateway to echo it
+/// back, then close the local connection.
+async fn echo_through_local_forward<T>(
+    forward: &tokio::task::JoinHandle<T>,
+    port: u16,
+    payload: &[u8],
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        assert!(
+            !forward.is_finished(),
+            "service forward exited before the local listener opened"
+        );
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(stream) => break stream,
+            Err(err) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "local forward on 127.0.0.1:{port} never opened: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    };
+    stream.write_all(payload).await.unwrap();
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut echoed))
+        .await
+        .expect("echo through the forward timed out")
+        .expect("echo through the forward failed");
+    assert_eq!(echoed, payload);
+}
+
+async fn wait_for_count(counter: &AtomicUsize, expected: usize, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while counter.load(Ordering::SeqCst) < expected {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), expected, "{what}");
+}
+
+fn forward_tokens(inits: &[TcpForwardInit]) -> Vec<&str> {
+    inits
+        .iter()
+        .map(|init| init.authorization_token.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn service_forward_omits_session_tokens_when_the_gateway_authorizes_the_principal() {
+    let server = run_server().await;
+    let state = &server.openshell.state;
+    let port = reserve_local_port();
+    let forward = spawn_service_forward(&server, "svc-sandbox", port);
+
+    echo_through_local_forward(&forward, port, b"first connection").await;
+    echo_through_local_forward(&forward, port, b"second connection").await;
+
+    let inits = state.forward_inits.lock().await.clone();
+    assert_eq!(inits.len(), 2, "one ForwardTcp stream per local connection");
+    for init in &inits {
+        assert!(
+            init.authorization_token.is_empty(),
+            "TCP forwards carry no session token"
+        );
+        assert_eq!(init.sandbox, "svc-sandbox");
+        assert_eq!(init.workspace, "default");
+        assert_eq!(
+            init.service_id,
+            "service-forward:svc-sandbox:127.0.0.1:8080"
+        );
+        assert_eq!(
+            init.target,
+            Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            }))
+        );
+    }
+    assert_eq!(
+        state.ssh_session_requests.load(Ordering::SeqCst),
+        0,
+        "no CreateSshSession per forwarded connection"
+    );
+    assert_eq!(
+        state.ssh_session_revocations.load(Ordering::SeqCst),
+        0,
+        "nothing to revoke"
+    );
+    assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 0);
+    forward.abort();
+}
+
+#[tokio::test]
+async fn service_forward_falls_back_to_session_tokens_once_for_a_legacy_gateway() {
+    let server = run_server().await;
+    let state = &server.openshell.state;
+    state
+        .forward_requires_session_token
+        .store(true, Ordering::SeqCst);
+    let port = reserve_local_port();
+    let forward = spawn_service_forward(&server, "svc-sandbox", port);
+
+    // First connection: the token-less open is rejected once, the CLI mints a
+    // session, retries on the same local socket, and data still flows.
+    echo_through_local_forward(&forward, port, b"first connection").await;
+    wait_for_count(&state.ssh_session_revocations, 1, "revocation").await;
+    let inits = state.forward_inits.lock().await.clone();
+    assert_eq!(forward_tokens(&inits), vec!["", "test-token"]);
+    assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 1);
+
+    // Second connection on the same forward: straight to token mode, no
+    // second rejection, one more create/revoke pair.
+    echo_through_local_forward(&forward, port, b"second connection").await;
+    wait_for_count(&state.ssh_session_revocations, 2, "revocations").await;
+    let inits = state.forward_inits.lock().await.clone();
+    assert_eq!(forward_tokens(&inits), vec!["", "test-token", "test-token"]);
+    assert_eq!(state.forward_token_rejections.load(Ordering::SeqCst), 1);
+    assert_eq!(state.ssh_session_requests.load(Ordering::SeqCst), 2);
+    assert!(
+        inits
+            .iter()
+            .all(|init| matches!(init.target, Some(tcp_forward_init::Target::Tcp(_))))
+    );
+    forward.abort();
 }

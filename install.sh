@@ -72,7 +72,7 @@ NOTES:
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
     x86_64/aarch64, depending on the host package manager. Set
     OPENSHELL_INSTALL_METHOD=snap to install the OpenShell snap instead; hosts
-    that already have the OpenShell snap keep refreshing it. Snap installs use
+    that already have the OpenShell snap keep refreshing it. snap installs use
     latest/stable by default and latest/edge for dev, and do not support
     explicit release tags or prereleases. The OpenShell snap requires a running
     Docker Engine installed from a system package or Docker's package
@@ -455,12 +455,15 @@ resolve_latest_prerelease_tag() {
     }
 
     for _run_id in $_run_ids; do
-      _successful="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
-        .status == "completed" and .conclusion == "success" and
-        (.path | startswith(".github/workflows/release-tag.yml"))')" || {
+      # Packages are published before qualification; a failed or running
+      # qualification must not hide an already-published candidate.
+      _release_workflow="$(gh api "repos/${REPO}/actions/runs/${_run_id}" --jq '
+        (.path | split("@")[0]) |
+        . == ".github/workflows/release-prerelease.yml" or
+        . == ".github/workflows/release-tag.yml"')" || {
         error "failed to check prerelease workflow run ${_run_id}"
       }
-      if [ "$_successful" = "true" ]; then
+      if [ "$_release_workflow" = "true" ]; then
         printf '%s\n' "$_tag"
         return 0
       fi
@@ -935,8 +938,19 @@ start_user_gateway() {
 
   info "registering local gateway as ${TARGET_USER}..."
   register_local_gateway
-  wait_for_local_gateway_listener
+  wait_for_local_gateway_listener user_gateway_service_failed
   wait_for_local_gateway_status
+}
+
+# Succeeds when the gateway user service has failed or is waiting to restart
+# after a failure. A unit that is starting or running does not match, even if
+# it failed before it was restarted.
+user_gateway_service_failed() {
+  _unit_state="$(as_target_user systemctl --user show openshell-gateway -p ActiveState -p SubState 2>/dev/null)" || return 1
+  case "$_unit_state" in
+    *ActiveState=failed* | *SubState=auto-restart*) return 0 ;;
+  esac
+  return 1
 }
 
 dump_local_gateway_diagnostics() {
@@ -970,13 +984,18 @@ dump_snap_gateway_diagnostics() {
 
   info "OpenShell snap service status:"
   as_root snap services openshell >&2 || true
+  info "OpenShell snap user service status for ${TARGET_USER}:"
+  as_target_user snap services openshell.user-gateway >&2 || true
   info "OpenShell snap connections:"
-  as_root snap connections openshell >&2 || true
+  snap connections openshell >&2 || true
   if has_cmd journalctl; then
-    info "last ${_lines} lines from the OpenShell snap gateway journal:"
-    as_root journalctl -b -u snap.openshell.gateway.service --no-pager -n "$_lines" >&2 || true
+    info "last ${_lines} lines from the legacy OpenShell snap gateway journal:"
+    journalctl -b -u snap.openshell.system-gateway.service --no-pager -n "$_lines" >&2 || true
+    info "last ${_lines} lines from the OpenShell snap user gateway journal:"
+    as_target_user journalctl --user -u snap.openshell.user-gateway --no-pager -n "$_lines" >&2 || true
   fi
-  as_root snap logs openshell.gateway -n="$_lines" >&2 || true
+  as_root snap logs openshell.system-gateway -n="$_lines" >&2 || true
+  as_target_user snap logs openshell.user-gateway -n="$_lines" >&2 || true
 }
 
 dump_homebrew_gateway_diagnostics() {
@@ -1015,10 +1034,14 @@ dump_user_service_gateway_diagnostics() {
   fi
 }
 
+# An optional command name stops the wait early when it succeeds, so a service
+# that already failed does not run out the full timeout.
 wait_for_local_gateway_listener() {
+  _failed_check="${1:-}"
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
+  _service_failed=0
   _probe_url="$(local_gateway_endpoint)/"
   _mtls_dir="${TARGET_HOME}/.config/openshell/gateways/openshell/mtls"
 
@@ -1030,12 +1053,19 @@ wait_for_local_gateway_listener() {
       info "local gateway listener is reachable"
       return 0
     fi
+    if [ -n "$_failed_check" ] && "$_failed_check"; then
+      _service_failed=1
+      break
+    fi
     sleep 1
     _elapsed=$((_elapsed + 1))
   done
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   dump_local_gateway_diagnostics
+  if [ "$_service_failed" -eq 1 ]; then
+    error "the openshell-gateway service failed to start; fix the cause shown above, then run: systemctl --user restart openshell-gateway"
+  fi
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
@@ -1228,7 +1258,7 @@ openshell_snap_channel() {
   case "${OPENSHELL_VERSION:-}" in
     dev) printf '%s\n' "latest/edge" ;;
     '') printf '%s\n' "latest/stable" ;;
-    *) error "Snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
+    *) error "snap installs do not support OPENSHELL_VERSION=${OPENSHELL_VERSION}; use a native package" ;;
   esac
 }
 
@@ -1237,10 +1267,10 @@ wait_for_docker_daemon() {
   _elapsed=0
   _last_output=""
 
-  info "waiting for Docker daemon to become reachable..."
+  info "waiting for Docker daemon at /var/run/docker.sock to become reachable..."
   while [ "$_elapsed" -lt "$_timeout" ]; do
-    if _last_output="$(as_root docker info 2>&1)"; then
-      info "Docker daemon is reachable"
+    if _last_output="$(as_root env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info 2>&1)"; then
+      info "Docker daemon at /var/run/docker.sock is reachable"
       return 0
     fi
     sleep 1
@@ -1249,10 +1279,39 @@ wait_for_docker_daemon() {
 
   [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
   if snap list docker >/dev/null 2>&1; then
-    as_root snap services docker >&2 || true
-    as_root snap changes >&2 || true
+    snap services docker >&2 || true
+    snap changes >&2 || true
   fi
-  error "Docker daemon did not become reachable within ${_timeout}s"
+  error "Docker daemon at /var/run/docker.sock did not become reachable within ${_timeout}s"
+}
+
+wait_for_user_docker_daemon() {
+  _timeout="${OPENSHELL_INSTALL_DOCKER_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+
+  info "waiting for Docker daemon at /var/run/docker.sock to become reachable as ${TARGET_USER}..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(as_target_user env -u DOCKER_HOST -u DOCKER_CONTEXT docker --host unix:///var/run/docker.sock info 2>&1)"; then
+      info "Docker daemon at /var/run/docker.sock is reachable as ${TARGET_USER}"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  error "Docker daemon at /var/run/docker.sock did not become reachable as ${TARGET_USER} within ${_timeout}s. Ensure ${TARGET_USER} can access the Docker socket, then log out and back in after changing group membership."
+}
+
+snap_gateway_mode() {
+  _mode="$(as_root snap get openshell gateway-mode 2>/dev/null || true)"
+  case "$_mode" in
+    user | system) printf '%s\n' "$_mode" ;;
+    disable) error "OpenShell snap gateway mode is disabled. Complete the gateway transition with 'sudo snap set openshell gateway-mode=user' or 'sudo snap set openshell gateway-mode=system', then rerun the installer." ;;
+    '') error "OpenShell snap gateway mode was not initialized" ;;
+    *) error "unsupported OpenShell snap gateway mode: ${_mode}" ;;
+  esac
 }
 
 # Copy the snap gateway's client bundle into the target user's snap state
@@ -1271,13 +1330,13 @@ copy_snap_client_bundle() {
   done
 }
 
-# Snap revisions that require mTLS ship the post-refresh hook that migrates
+# snap revisions that require mTLS ship the post-refresh hook that migrates
 # older plaintext configs.
 snap_gateway_uses_mtls() {
   [ -e "${OPENSHELL_SNAP_DIR:-/snap/openshell/current}/meta/hooks/post-refresh" ]
 }
 
-register_snap_gateway() {
+register_system_snap_gateway() {
   _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
 
   if snap_gateway_uses_mtls; then
@@ -1309,9 +1368,33 @@ register_snap_gateway() {
   esac
 }
 
+register_user_snap_gateway() {
+  _register_bin="${OPENSHELL_REGISTER_BIN:-/snap/bin/openshell}"
+  _endpoint="https://127.0.0.1:${LOCAL_GATEWAY_PORT}"
+
+  if _add_output="$(as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell 2>&1)"; then
+    [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
+    return 0
+  else
+    _add_status=$?
+  fi
+
+  case "$_add_output" in
+    *"already exists"*)
+      info "local gateway already exists; removing and re-adding it..."
+      remove_snap_gateway_registration
+      as_target_user "$_register_bin" gateway add "$_endpoint" --local --name openshell
+      ;;
+    *)
+      printf '%s\n' "$_add_output" >&2
+      return "$_add_status"
+      ;;
+  esac
+}
+
 # The mTLS gateway rejects TLS handshakes without a client certificate, so
 # probe it with the root-owned client bundle.
-wait_for_snap_gateway_listener() {
+wait_for_system_snap_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
   _last_output=""
@@ -1343,9 +1426,47 @@ wait_for_snap_gateway_listener() {
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
+wait_for_user_snap_gateway_listener() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
+  _elapsed=0
+  _last_output=""
+  _tls_dir="${TARGET_HOME}/snap/openshell/common/.local/state/openshell/tls"
+  _probe_url="https://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+
+  info "waiting for local gateway listener to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(as_target_user curl -sS --max-time 2 \
+      --cacert "${_tls_dir}/ca.crt" \
+      --cert "${_tls_dir}/client/tls.crt" \
+      --key "${_tls_dir}/client/tls.key" \
+      -o /dev/null "$_probe_url" 2>&1)"; then
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  dump_local_gateway_diagnostics
+  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
 install_linux_snap() {
   require_cmd snap
   set_linux_target_runtime_dir
+
+  if snap list openshell >/dev/null 2>&1; then
+    _existing_snap=true
+    _existing_mode="$(as_root snap get openshell gateway-mode 2>/dev/null || true)"
+  else
+    _existing_snap=false
+    _existing_mode=user
+  fi
+
+  if [ "$_existing_mode" = disable ]; then
+    error "OpenShell snap gateway mode is disabled. Complete the gateway transition with 'sudo snap set openshell gateway-mode=user' or 'sudo snap set openshell gateway-mode=system', then rerun the installer."
+  fi
 
   if snap list docker >/dev/null 2>&1; then
     error "the Docker snap is not currently compatible with OpenShell because its AppArmor confinement prevents OpenShell's hardened containers from starting.
@@ -1356,24 +1477,45 @@ Remove the Docker snap and install Docker Engine from a system package or Docker
 Install Docker Engine from a system package or Docker's package repository, then rerun this installer. The Docker snap is not currently compatible with OpenShell."
   fi
   info "using existing Docker installation"
-  wait_for_docker_daemon
+  if [ "$_existing_mode" = user ]; then
+    wait_for_user_docker_daemon
+  else
+    wait_for_docker_daemon
+  fi
 
   _channel="$(openshell_snap_channel)"
-  if snap list openshell >/dev/null 2>&1; then
+  if [ "$_existing_snap" = true ]; then
     info "refreshing OpenShell snap from ${_channel}..."
     as_root snap refresh openshell --channel="$_channel"
-    warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
   else
     info "installing OpenShell snap from ${_channel}..."
     as_root snap install openshell --channel="$_channel"
   fi
 
-  as_root snap restart openshell.gateway
+  _gateway_mode="$(snap_gateway_mode)"
+  if [ "$_gateway_mode" = system ]; then
+    warn "restarting the OpenShell gateway to use the refreshed snap; active sandbox sessions will be interrupted"
+    as_root snap restart openshell.system-gateway
+  else
+    # In case refreshing from an old snap which had a globally-enabled user
+    # gateway service, globally disable it, then just enable for the target user
+    as_root systemctl --global disable snap.openshell.user-gateway.service
+    as_target_user systemctl --user daemon-reload
+    as_target_user systemctl --user enable --now snap.openshell.user-gateway.service
+    if [ "$_existing_snap" = true ]; then
+      warn "restarting the OpenShell user gateway to use the refreshed snap; active sandbox sessions will be interrupted"
+      as_target_user systemctl --user restart snap.openshell.user-gateway.service
+    fi
+  fi
 
-  info "installed OpenShell snap from ${_channel}"
-  wait_for_snap_gateway_listener
   info "registering local gateway as ${TARGET_USER}..."
-  register_snap_gateway
+  if [ "$_gateway_mode" = system ]; then
+    wait_for_system_snap_gateway_listener
+    register_system_snap_gateway
+  else
+    wait_for_user_snap_gateway_listener
+    register_user_snap_gateway
+  fi
   OPENSHELL_REGISTER_BIN="/snap/bin/openshell"
   wait_for_local_gateway_status
 }

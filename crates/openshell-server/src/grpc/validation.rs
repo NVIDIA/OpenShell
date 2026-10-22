@@ -481,6 +481,33 @@ pub(super) fn validate_annotations(
     Ok(())
 }
 
+/// Annotation key prefix owned by the gateway.
+const RESERVED_ANNOTATION_PREFIX: &str = "internal.openshell.ai/";
+
+/// Validate annotations supplied by an API caller.
+///
+/// Same as [`validate_annotations`], but also rejects keys under the
+/// gateway-owned `internal.openshell.ai/` prefix. The gateway keeps session
+/// and runtime state there and trusts it on read.
+pub(super) fn validate_caller_annotations(
+    annotations: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_annotations(annotations, field_name)?;
+    if let Some(key) = annotations
+        .keys()
+        .find(|key| key.starts_with(RESERVED_ANNOTATION_PREFIX))
+    {
+        return Err(invalid_argument(
+            field_name,
+            format!(
+                "{field_name} key '{key}' uses the reserved '{RESERVED_ANNOTATION_PREFIX}' prefix"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// OPENSHELL_* keys that are allowed in exec environment. The Python SDK's
 /// `exec_python()` sends a serialized callable via this key.
 const EXEC_ALLOWED_OPENSHELL_KEYS: &[&str] = &["OPENSHELL_PYFUNC_B64"];
@@ -2402,6 +2429,31 @@ mod tests {
     }
 
     // ---- Exec validation ----
+
+    #[test]
+    fn validate_static_fields_rejects_independent_process_identity_changes() {
+        let baseline = ProtoSandboxPolicy {
+            process: Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "1001".into(),
+            }),
+            ..Default::default()
+        };
+        for (user, group) in [
+            ("10000", "1001"),
+            ("sandbox", "10001"),
+            ("", "1001"),
+            ("sandbox", ""),
+        ] {
+            let mut changed = baseline.clone();
+            changed.process = Some(openshell_core::proto::ProcessPolicy {
+                run_as_user: user.into(),
+                run_as_group: group.into(),
+            });
+            let error = validate_static_fields_unchanged(&baseline, &changed).unwrap_err();
+            assert!(error.message().contains("process policy cannot be changed"));
+        }
+    }
 
     #[test]
     fn reject_control_chars_allows_normal_values() {

@@ -25,15 +25,11 @@ on:
         required: false
         type: string
         default: ""
-      conformance-artifact-prefix:
-        required: false
-        type: string
-        default: ""
       suite-matrix:
         required: false
         type: string
         default: >-
-          [{"suite":"python","cmd":"mise run --no-deps --skip-deps e2e:python","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-python","cmd":"mise run --no-deps --skip-deps e2e:oidc-python:docker","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-pkce-docker","cmd":"mise run --no-deps --skip-deps e2e:oidc-pkce:docker","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"rust-docker","cmd":"mise run --no-deps --skip-deps e2e:rust","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"mcp","cmd":"mise run --no-deps --skip-deps e2e:mcp","apt_packages":"","python_proto":false,"mcp":true}]
+          [{"suite":"python","cmd":"mise run --no-deps --skip-deps e2e:python","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-python","cmd":"mise run --no-deps --skip-deps e2e:oidc-python:docker","apt_packages":"","python_proto":true,"mcp":false},{"suite":"oidc-pkce-docker","cmd":"mise run --no-deps --skip-deps e2e:oidc-pkce:docker","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"rust-docker","cmd":"mise run --no-deps --skip-deps e2e:rust","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"rust-docker-push","cmd":"mise run --no-deps --skip-deps e2e:rust:push","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"oci-image","cmd":"mise run --no-deps --skip-deps e2e:oci-image","apt_packages":"openssh-client","python_proto":false,"mcp":false},{"suite":"mcp","cmd":"mise run --no-deps --skip-deps e2e:mcp","apt_packages":"","python_proto":false,"mcp":true}]
 
 permissions:
   actions: read
@@ -50,7 +46,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(inputs.suite-matrix) }}
     container:
-      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70
+      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70@sha256:ffa96b8009de6e28bbf157060440c3abb312d3bcda444e9571c539c8c6115615
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -71,8 +67,6 @@ jobs:
           persist-credentials: false
 
       - uses: ./.github/actions/setup-e2e-cli
-        with:
-          conformance-artifact-prefix: ${{ inputs.conformance-artifact-prefix }}
 
       - uses: ./.github/actions/setup-e2e-gateway
         with:

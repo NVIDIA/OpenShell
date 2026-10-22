@@ -71,9 +71,10 @@ Common findings:
 
 - `No active gateway`: register one with `openshell gateway add <endpoint>`.
 - Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
-- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a local mTLS bundle does not match the gateway CA, or TLS termination does not match the gateway listener.
-- A Snap refresh restarts the gateway with its migrated mTLS config. The secure Snap gateway uses `https://127.0.0.1:17670` and requires a client bundle in the user's Snap state. Refresh replaces insecure configs without keeping a copy; follow the published Snap installation steps to re-register an old HTTP client.
+- TLS/certificate errors: the endpoint scheme or trust chain is wrong, a CLI mTLS bundle does not match the gateway CA, a supervisor is missing the gateway CA, or TLS termination does not match the gateway listener. Workloads and supervisors should not contain a user TLS client certificate or private key.
+- Fresh snap installations select `gateway-mode=user`, but the user gateway is globally disabled by default. `install.sh` enables `snap.openshell.user-gateway.service` only for its target user; direct snap installations must select one user and run `systemctl --user enable --now snap.openshell.user-gateway.service` from that user's session. Do not enable it for multiple concurrently logged-in users: every instance binds to `127.0.0.1:17670`, so later instances fail with an address-in-use error. Older snap revisions could leave the unit globally enabled; remove that state with `sudo systemctl disable --global snap.openshell.user-gateway.service`, then disable and stop the service from every other affected user's session. The global command does not stop running user services. Setting `gateway-mode=user` disables the system gateway without changing any user's service. To change the selected user, disable and stop the current user's unit before enabling the new user's unit. Upgraded installations retain their system-owned state through `openshell.system-gateway`. Existing HTTPS registrations continue to work after the service rename. Follow the published snap installation steps to enroll a new user, replace an old HTTP registration, or change modes safely through the `disable` maintenance state. If `gateway-mode=disable`, no local snap gateway is expected to run.
 - `Unauthenticated` from an edge or OIDC gateway: refresh stored credentials with `openshell gateway login [name]`, then retry. Use `gateway logout` only when intentionally clearing local credentials.
+- Operator credential retrieval requires direct gateway mTLS, `[openshell.gateway.mtls_auth] operator_enabled = true`, and a verified certificate with exact `OU=operator`. OIDC admin roles and forwarded certificate headers do not grant access. Do not combine the operator certificate with an `Authorization` header. Enabling this role grants gateway-wide administration; never repair a denial by issuing operator certificates to ordinary users. See the published gateway authentication and provider references.
 - A direct development endpoint with a private or self-signed certificate can be isolated with `--gateway-endpoint <url> --gateway-insecure`; do not persist or recommend insecure verification for shared gateways.
 
 ### Step 2: Identify the Compute Platform
@@ -93,6 +94,15 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 
 Before debugging the compute platform, inspect gateway logs for failures in dependencies initialized before the listener becomes ready.
 
+The gateway container uses a Distroless Debian runtime. For OS-library
+vulnerability findings, check the deployed image digest and package version;
+deploy a rebuilt gateway image with the patched base. Updating the gateway
+binary alone does not update the libraries supplied by its container image.
+
+For stable releases, inspect the version tag or deployed digest. Promotion
+preserves the qualified prerelease's commit-SHA image tags; those tags do not
+identify the stable rebuild. See [image contents verification](https://docs.nvidia.com/openshell/latest/security/verify-image-contents).
+
 For resource-admission failures, distinguish disabled caller driver config from
 missing resource approval. Helm defaults `server.drivers.kubernetes.allowDriverConfig`
 to false and `resourceAdmission.enabled` to true. Existing PVCs, RuntimeClasses,
@@ -104,6 +114,11 @@ and the generation copies (`openshell.ai/component=image-pull`) in the workspace
 namespace. Legacy workloads without
 admission provenance need recreation. Do not
 automatically label control-plane resources or disable enforcement as a repair.
+
+For Kubernetes mount-path conflicts, move caller PVC mounts away from
+`/.openshell` and `/run` to a data path such as `/data` or below `/sandbox`.
+These driver-managed paths remain reserved even for approved resources and
+`sub_path` mounts; changing approval labels does not resolve a path conflict.
 
 For out-of-tree compute drivers, also check that their versioned admission-policy
 acknowledgement matches the gateway's policy. Configure standalone driver policy
@@ -130,11 +145,13 @@ WebSocket tunnel for edge-proxy CLI access is off unless
 and RPM package startup migrates only exact package-generated v1 defaults. If
 an upgraded package still reports an unsupported version, inspect the active prefix or `~/.config/openshell/gateway.toml`; an edited v1 file must
 follow the published schema-v2 migration steps and must not be overwritten.
-Guest TLS CA, certificate, and key paths are the exception to driver ownership:
-configure the complete bundle under `[openshell.gateway]`, and the gateway
-injects it only into the selected local driver. TLS-enabled Docker, Podman, and
-VM drivers fail startup when neither those paths nor the package-managed local
-bundle is available; Kubernetes projects its bundle through a Secret.
+The supervisor gateway CA is the exception to driver ownership: configure
+`guest_tls_ca` under `[openshell.gateway]`, and the gateway injects it only into
+the selected local driver. Remove the retired `guest_tls_cert` and
+`guest_tls_key` fields. TLS-enabled Docker, Podman, and VM drivers fail startup
+when neither that CA nor the package-managed local CA is available. Kubernetes
+projects only the gateway CA from a Secret into supervisor Pods; supervisors
+authenticate gateway RPCs with sandbox bearer tokens.
 
 Custom names use `[openshell.drivers.<name>].socket_path`. A launch-time `--compute-driver-socket` override may also use `docker`, `podman`, `kubernetes`, or `vm`; the endpoint then takes precedence over built-in construction. First-party standalone drivers require the socket parent directory to be owned by the driver's effective UID, force its mode to `0700`, create the socket with mode `0600`, and accept only peers with that same UID. Check the parent and socket separately with `stat`; a gateway running under a different UID cannot connect even when filesystem permissions or group membership would otherwise allow it. Operator-supplied drivers must provide equivalent access control appropriate to their implementation. Check gateway logs for connection errors, `GetCapabilities` failures, missing peer metadata, protocol-major mismatch, unmet required capabilities, or an unexpected advertised driver name. `openshell gateway info` reports successful startup negotiations. The advertised name is diagnostic metadata; negotiated features control optional behavior. The gateway does not create or supervise operator-supplied driver processes or sockets.
 
@@ -211,6 +228,8 @@ rationale, configured and effective modes, active generation, and the explicit
 `previous_policy_active` state.
 
 The published supervisor image uses a shell-free distroless Debian 13 base.
+For custom builds using `SUPERVISOR_BASE_IMAGE`, check the selected base's GNU
+runtime libraries, CA certificates, and inherited user and working directory.
 Use container logs, engine inspection and the configured exec health probe for
 diagnostics; `exec ... sh`, package installation and in-container shell scripts
 are unavailable. Workload shells belong to the separate sandbox image. Preserve
@@ -237,6 +256,16 @@ gateway errors and exhausted transient retries terminate startup; inspect those
 errors as connectivity, authorization, or lifecycle failures.
 
 ### Step 4: Check Docker-Backed Gateways
+
+The sandbox container's log holds the sandbox runtime's warnings and the
+main process's stdout and stderr when it runs without a TTY. The supervisor
+container's log holds supervisor diagnostics and OCSF shorthand. With
+`ocsf_json_enabled=true`, it also contains compact `OCSF-JSON` records for
+log collectors. Read these through `docker logs <supervisor-container>`;
+`docker cp` does not expose the live `/var/log` tmpfs, and workload exec
+accesses a separate filesystem. See the published
+[OCSF JSON export guide](https://docs.nvidia.com/openshell/latest/observability/ocsf-json-export)
+for the marker format and delivery limits.
 
 ```bash
 docker info
@@ -280,21 +309,47 @@ Common findings:
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
 - Sandbox fails before readiness with an identity-resolution error: inspect the image's OCI `USER` and matching `/etc/passwd` and `/etc/group` entries, or explicitly set both process identity fields in policy. Numeric workload identities `1` through `4294967294` are accepted; root, the invalid identity sentinel, and missing identities are rejected.
 - Sandbox fails before readiness with an OCI workspace validation error: inspect the image's `WorkingDir` using the immutable image ID reported by the gateway. Empty, `/`, and explicit `/sandbox` use the managed `/sandbox` compatibility workspace. Any other workdir must be an absolute normalized directory with no symlink components; the final policy UID, primary GID, and supplementary groups must pass the kernel's effective traverse/write checks, including POSIX ACL and LSM decisions. OpenShell does not create, chown, or chmod a non-default image workdir.
-- Docker also rejects an image `VOLUME` that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Docker and Podman also reject an image `VOLUME` or driver mount that covers the workdir or one of its parents because the runtime would mask the immutable path before validation. Move the `VOLUME` below the workspace or remove the declaration.
+- Custom Docker and Podman workspace changes live in the workload container's writable layer, not a managed named volume. Stop/start of the same container retains them; removing or replacing that container does not. Export files you need before deleting the sandbox.
 - A workdir rejected as a special filesystem or OpenShell control-path collision cannot be made valid with permissions. Move the image workdir away from kernel-backed mounts and the concrete supervisor, TLS, token, runtime, and socket paths named in the error.
 - Local Docker gateway setup cannot copy `openshell-sandbox` after exporting a supervisor image: the sandbox runtime and supervisor are separate artifacts. The runtime image must provide `/openshell-sandbox`; the supervisor image provides `/openshell-supervisor`.
 - Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify the sibling binary next to `openshell-gateway`, or that the configured `sandbox_runtime_image` contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and the supervisor's gateway endpoint.
-- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. If several paths share a host and port, a failure before the path is known remains in logs. Verify the actual operation when current tool availability matters.
+- SSH host-key startup errors: use matching gateway, compute-driver, and supervisor releases. The gateway retains each sandbox's SSH key in its configured credential store and sends it only through the supervisor bootstrap bundle. Check credential-driver availability and compare the public `host_key_fingerprint` from sandbox JSON output; never print the bootstrap bundle or private key. A missing stored key for a sandbox with a fingerprint is an error, not permission to replace its identity. See the [sandbox SSH identity documentation](https://docs.nvidia.com/openshell/latest/how-it-works/sandboxes/overview).
+- Calls to an external tool server fail while the sandbox is Ready: inspect `Tool server connections` in `openshell sandbox get <name>`. For configured MCP-over-HTTP endpoints, JSON output exposes each address together with `last_result` and `last_reported_at` in `endpoint_statuses`. Select the endpoint by host, path, and ports, then check the reported failure boundary. `last_reported_at` records gateway acceptance time and can advance when retained evidence is accepted after a reset. Results do not expire or prove current availability; `HttpResponseReceived` can still contain a tool error. For token grant failures on any HTTP protocol, including failures before endpoint selection, inspect `last_token_grant_failure` in JSON output. It contains the bounded destination and cause, survives unrelated successful traffic, and clears on matching grant success or a policy, provider, or supervisor reset. If several paths share a host and port, other failures before the path is known, such as TLS failures, remain only in logs. A `CredentialUnavailable` result from a failed dynamic token grant also carries `last_failure` with a closed-set `code`, `stage`, `recovery_action`, the provider and credential names, and the `request_id` that the workload received in its `x-openshell-request-id` response header. Search `openshell logs <name>` for that ID: the supervisor's `Token grant failed` line carries the code and stage for every endpoint, and the gateway's `dynamic token grant failed` line appears when the gateway hop failed. Verify the actual operation when current tool availability matters.
 - On Docker Desktop, repeated `Policy fetch failed after 5 attempts` messages
-  can mean host networking is disabled. Enable host networking in Docker
-  Desktop, ensure Enhanced Container Isolation is disabled, and verify the
-  gateway's primary endpoint is reachable from a host-networked container.
+  can mean the supervisor's selected network mode cannot reach the gateway.
+  Check the gateway's `Selected Docker supervisor networking` log. The default
+  `supervisor_network_mode = "host"` uses host networking; `auto` also selects
+  host. Host mode requires Desktop host networking enabled; set `bridge`
+  explicitly to use the bridge network. Bridge mode uses `host.docker.internal`
+  for the Desktop host and requires a bridge-reachable listener on native Linux. Explicit
+  `grpc_endpoint` values must be reachable in the selected mode, including any
+  remapped published port, with matching TLS certificate names. The local
+  `gateway:docker` task discovers its endpoint unless `OPENSHELL_GRPC_ENDPOINT`
+  supplies an override. The OTLP collector endpoint must also be reachable
+  from the supervisor's selected network. Mode selection does not bypass
+  Landlock/seccomp qualification. Bridge mode and `host.docker.internal`
+  gateway endpoints discover Docker's host address once at driver startup.
+  If discovery fails, check that the configured supervisor image can run
+  `--help` and the Docker API permits container creation, startup, archive
+  download, and removal. `host_gateway_ip` overrides discovery if needed. See the
+  published [Docker configuration](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration.md)
+  for the current networking options.
 - Sandbox runtime image exits before printing `openshell-sandbox --version`: verify the configured image contains a static executable at `/openshell-sandbox`.
-- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: confirm the selected isolation backend advertises TCP mediation, then inspect the sandbox and supervisor logs for protected-channel setup or listener failures. A driver that cannot supply the required outer egress fence and authenticated runtime channel must reject the policy before starting the agent.
+- A sandbox with explicit `protocol: tcp` endpoints fails before workload readiness: inspect supervisor and backend logs for policy rejection, network-mediation initialization, protected-channel setup, or listener failures. A backend that cannot enforce the admitted policy must reject it before starting workload code.
 - Supervisor runtime validation fails: verify `supervisor_image` contains an `/openshell-supervisor` executable from the same release as the sandbox runtime, and that the dynamic loader and shared libraries it links against are available inside that image. `docker run --rm --network none --entrypoint /openshell-supervisor <supervisor_image> --version` should print that release; a `no such file or directory` error for a binary that exists means the loader or a library is missing. The supervisor runs from its own image and does not need to be static; only `/openshell-sandbox` must be.
+- New Docker and Podman sandboxes dial the supervisor over a separate private
+  Unix socket volume; the workload keeps `network=none`. Check both containers'
+  mounts and socket-directory ownership if attachment times out. Existing
+  containers retain their saved legacy transport through restart. New VM
+  generations dial host CID 2 over vsock; libkrun forwards to a protected host
+  Unix socket, while QEMU uses a per-guest host port. Keep supervisor and runtime
+  binaries compatible when creating new generations.
+- Sandbox startup reports an `isolation control contract` failure: inspect the supervisor and sandbox-runtime image versions and update them together. An older runtime or incompatible isolation capability set fails before workload startup. See the published Sandbox Runtimes documentation for trusted image override precedence.
 - The sandbox fails its enforcement probe: inspect the sandbox log for the exact nested seccomp user-notification, task-memory, Landlock, loopback DNS, or socket-injection check that failed. A runtime may return `ENOSYS` for `process_vm_readv` and `process_vm_writev` while satisfying the production parent-to-workload-child task-memory probe through `/proc/<pid>/mem`; only failure of both backends is fatal. Do not add capabilities or switch to an unconfined seccomp profile; use a runtime whose default profile permits the unprivileged probe.
 - A GPU sandbox fails because Docker reports no discovered NVIDIA CDI devices: verify `.DiscoveredDevices` contains entries such as `nvidia.com/gpu=all`, verify `/etc/cdi` or `/var/run/cdi` contains a generated NVIDIA spec, and check that `nvidia-cdi-refresh.service` and `nvidia-cdi-refresh.path` from NVIDIA Container Toolkit are enabled and healthy. The service is a one-shot unit, so `inactive (dead)` can be normal after a successful run; use `systemctl status` and `journalctl` to distinguish success from a skipped or failed refresh. Restart `nvidia-cdi-refresh.service` to regenerate missing or stale CDI specs, then restart or reload Docker and re-check `docker info`.
+- Docker or Podman rejects an explicit `cdi_devices` selector: use a CDI qualified name (`<vendor>/<class>=<name>`), not a host-device path. Syntax validation accepts other vendors; it does not establish that the runtime has the device or that its GPU workload is supported. Consult the published GPU selection documentation for request requirements.
 
 #### Corporate upstream proxy
 
@@ -371,6 +426,17 @@ Common findings:
   probe and the companion supervisor's private health check. Do not add
   capabilities, attach a workload network, or disable the runtime seccomp
   profile. There is no sandbox nftables or nested-network setup to repair.
+- Gateway fails to start with an `additional_ca_bundle` error: the Podman
+  driver validates the setting at startup. The file must exist on the gateway
+  host, be non-empty, and contain at least one PEM certificate.
+- Inspected HTTPS to a private-CA destination fails (for example
+  `curl: (52) Empty reply from server`), or the supervisor exits at startup,
+  with `additional_ca_bundle` set: the supervisor container needs the CA, not
+  just the workload. Check
+  `podman inspect <sandbox>-supervisor --format '{{json .Mounts}}'` for a
+  read-only bind of the bundle at `/etc/openshell/tls/additional/ca-bundle.pem`,
+  and `--format '{{json .Config.Cmd}}'` for `--additional-ca-bundle` with that
+  path. The `sandbox` role container must not have the mount.
 - On Linux, verify that the host-networked Podman supervisor can reach the
   gateway's primary loopback endpoint. On macOS, verify Podman Machine's
   host-loopback forwarding or configure an explicit `grpc_endpoint`.
@@ -421,6 +487,13 @@ the release. Look for failed installs, unexpected values, missing namespace, wro
 image tag, TLS settings that do not match the registered endpoint, and
 scheduling failures.
 
+When checking a Helm values migration, compare the rendered `gateway.toml`
+with the intended `gatewayConfig` tables. Explicit resource-admission settings
+and the Kubernetes Secrets credential namespace take precedence over deprecated
+aliases. Confirm the credential driver's namespace matches its Role and
+RoleBinding. An unset workload `image_pull_policy` uses Kubernetes defaults;
+the global Helm pull policy applies to runtime and supervisor images.
+
 The chart mounts the `gateway.toml` ConfigMap key directly at
 `/etc/openshell/gateway.toml` as a read-only `subPath` file. This avoids the
 atomic-writer symlink exposed by a ConfigMap directory mount because the gateway
@@ -444,8 +517,9 @@ retained Kubernetes Secret for the shared KEK, injects it into gateway pods, and
 stores encrypted credential envelopes in the OpenShell database. For
 `workload.kind=deployment` or multi-replica gateways, confirm
 `server.externalDbSecret` points at a shared database. A render/install error
-mentioning `server.credentialDrivers` means the values selected multiple
-external credential backends.
+mentioning multiple credential drivers means the
+`gatewayConfig.openshell.gateway.credential_drivers` list selected more than
+one external credential backend.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload when it is
@@ -457,17 +531,159 @@ kubectl -n <namespace> get deployment,service,pod -l app.kubernetes.io/name=<pos
 kubectl -n <namespace> logs deployment/<postgres-workload> --tail=200
 ```
 
-Multi-replica gateways serialize cross-object sandbox and provider mutations
-with a PostgreSQL advisory lock. If those RPCs stall while ordinary reads and
-health checks remain responsive, inspect long-running database sessions and
-advisory-lock waiters. Do not print the database URI or Secret contents into
-logs:
+Gateways that use an external PostgreSQL database guard cross-object
+mutations with PostgreSQL advisory locks at three levels: one global key, one
+key per workspace, and one key per sandbox, each taken shared or exclusive.
+Sandbox operations on different sandboxes do not wait on each other's locks;
+provider and workspace-profile changes block guarded sandbox mutations in
+their workspace; gateway-global policy and settings changes block every
+guarded mutation. Guarded sandbox mutations are sandbox create, provider
+attach and detach, sandbox-scoped policy and settings changes, and supervisor
+configuration, policy status, and endpoint status reports. Lifecycle paths
+(start, stop, delete, restart, supervisor connection and process-exit state,
+driver-watch updates, and reconcile) take only a process-local shared global
+and exclusive sandbox lock, with no time limit and no mutation advisory lock
+(start, restart, and delete also take the SSH identity key below), so only
+a global change on the same replica blocks them directly. Provider,
+workspace-profile, and other replicas' global changes delay them only while
+another operation on the same sandbox waits behind the change, holding that
+sandbox's key. Provisioning-deadline expiry also takes
+its workspace key locally, so provider and workspace-profile changes on the
+same replica can delay it. Each
+replica takes its advisory locks on a dedicated lock pool of PostgreSQL
+connections, one per guard, 4 by default (gateway config
+`database_lock_max_connections`), so at most that many guarded
+operations per replica hold or wait for PostgreSQL locks at once.
+`openshell_server_mutation_lock_connections_in_use` shows how many are checked
+out, against `openshell_server_mutation_lock_connections_capacity`. Its data
+pool (`database_max_connections`, 10 by default) is separate. Helm deployments
+set both keys under `gatewayConfig.openshell.gateway`.
+The gateway logs both sizes at startup in
+`sizing Postgres connection pools`. A request cancelled during its lock wait
+frees its slot while its backend keeps waiting, with any keys it took, until
+the 10-second deadline, so `pg_locks` can briefly show more lock sessions from
+one pod. A guard that waits on a PostgreSQL lock
+keeps its connection while it waits, so contention on one key can fill the
+pool and make unrelated guarded operations on that replica queue for a
+connection, within the same 10-second limit.
+
+A lock wait longer than 10 seconds returns `UNAVAILABLE` with reason
+`MUTATION_LOCK_TIMEOUT` and the message "... timed out waiting for a
+concurrent mutation; retry the request", logs
+`mutation lock acquisition timed out` with `scope`, `waited_ms`, and `detail`
+fields, and increments `openshell_server_mutation_lock_timeouts_total`. The
+`detail` field says where the wait stopped:
+
+- `waiting for a local mutation lock`: another operation on the same replica
+  holds a conflicting key.
+- `waiting for a mutation lock connection`: every lock-pool connection of that
+  replica was in use, by waiters or by holders slowed by a compute driver,
+  credential backend, middleware, or provider profile source call, or a local
+  wait left less than a second to open one. `pg_locks` shows no row for the
+  timed-out operation. Look for the pod's granted or waiting advisory-lock
+  rows by `client_addr`, and find the holder they wait on.
+- `waiting for a PostgreSQL advisory lock`, or PostgreSQL's own
+  `canceling statement due to lock timeout`: a conflicting key is held on
+  another connection, usually by another replica or by an older gateway during
+  an upgrade. `pg_locks` shows the holder and the waiters.
+
+A starting gateway resets stale endpoint status one sandbox at a time before it
+binds its listeners. It retries lock timeouts there for the first 30 seconds of
+that scan, then logs
+`tool server endpoint-status startup reconciliation gave up on a sandbox` with
+the `sandbox_id` and exits with
+`tool server endpoint-status startup reconciliation failed`. A pod that
+restarts with that error during a rollout or scale-out is waiting behind a
+long holder: find it as above. When the scan finishes, its waits and timeouts
+are already in the lock metrics at the pod's first scrape, so read the counter
+and `_count` values on the new pod: `rate()` and `increase()` take that first
+scrape as their baseline and do not show them. A scan that fails exits before
+the metrics endpoint starts, so its timeouts appear in the gateway log only.
+
+A lock connection that PostgreSQL does not open, although at least a second of
+the 10-second limit remained, is not a lock timeout. The request fails with
+`INTERNAL` and "could not open a mutation lock connection", and the gateway
+logs `mutation lock acquisition failed` and increments
+`openshell_server_mutation_lock_errors_total` instead of the timeout counter.
+A lock statement that fails for another reason, such as a PostgreSQL restart,
+is counted the same way. PostgreSQL refused the connection, ran out of
+connection slots, was starting up, or did not answer. Check the PostgreSQL logs for "too many
+clients already", "remaining connection slots are reserved", or "the database
+system is starting up", and compare
+`SELECT count(*) FROM pg_stat_activity` with `SHOW max_connections`. Each
+replica opens up to its data plus lock pool sizes, 14 with the defaults.
+
+A gateway log line `timed out returning PostgreSQL mutation lock connection;
+discarded connection` means returning a lock session stalled for 5 seconds and
+the gateway dropped it; that slot stays busy for up to those 5 seconds. The
+warning does not identify the PostgreSQL backend. Healthy guards also hold
+idle advisory-lock sessions while validation and writes use separate data
+connections. Neither an idle duration nor a matching `client_addr` proves
+that a holder is orphaned, even when it blocks a timed-out request.
+
+Guarded work has no time limit of its own. A holder slowed by a compute
+driver, credential backend, middleware, or provider profile source call keeps
+its locks until that call returns, and conflicting acquisitions on every
+replica time out after 10 seconds. When it releases a lock held longer than
+10 seconds, its gateway logs
+`mutation lock held longer than the lock wait timeout` with `scope` and
+`held_ms`, and `openshell_server_mutation_lock_hold_seconds` records every
+hold by scope. Neither reports a hold that is still in progress. Before treating a long-held
+advisory lock as orphaned, check the gateway pod at its `client_addr` for
+these warnings and for slow dependency calls. A pod that logs them is still
+running slow guarded work, so fix that dependency or stop the pod instead of
+terminating its lock sessions:
+
+```bash
+kubectl -n openshell logs <gateway-pod> --since=1h \
+  | grep 'mutation lock held longer than the lock wait timeout'
+```
+
+Before using `SELECT pg_terminate_backend(<pid>)`, conclusively map that
+backend to its owning gateway process and confirm that process has stopped
+or can no longer write. If the owner is still running, stop it first and
+verify its exit; terminating or failing readiness alone is insufficient. Killing
+its lock session while it can still write removes exclusion from an active
+mutation. Recheck the backend PID and `backend_start` before terminating the
+confirmed orphan: pod IPs and PIDs can be reused, and a database proxy can
+hide several gateways behind one `client_addr`. If ownership cannot be
+established, investigate connectivity instead of choosing a backend by IP or
+idle state. Setting PostgreSQL
+`tcp_keepalives_idle`, `tcp_keepalives_interval`, and `tcp_keepalives_count`
+(for example 60, 10, and 6) bounds how long such sessions survive.
+
+If mutations stall or time out while reads and health checks work, inspect
+advisory-lock holders and waiters. Do not print the database URI or Secret
+contents into logs:
 
 ```sql
-SELECT pid, granted, waitstart
-FROM pg_locks
-WHERE locktype = 'advisory';
+SELECT l.pid, l.mode, l.granted, l.waitstart, l.classid, l.objid,
+       a.client_addr, a.backend_start, a.state,
+       now() - a.state_change AS in_state_for
+FROM pg_locks l
+JOIN pg_stat_activity a USING (pid)
+WHERE l.locktype = 'advisory'
+ORDER BY l.granted, l.waitstart;
 ```
+
+Gateways hold these locks at session level outside any transaction, so a
+holder (`granted = t`) usually shows `state = idle`. It still holds the lock,
+and `in_state_for` approximates how long. `client_addr` is the holding
+gateway pod's IP, or the pooler's IP when a connection pooler sits in between.
+
+The global key appears as `classid = 1330660686` and `objid = 1397247052`
+(key `0x4F50454E53484C4C`). Older gateways during a rolling upgrade take that
+key exclusively for every guarded mutation, so mutations can queue behind
+them until the rollout finishes.
+
+SSH host identity provisioning and cleanup, in sandbox create, start,
+restart, and delete, take one more fleet-wide key, `classid = 1330860872` and
+`objid = 1213158228` (key `0x4F535348484F5354`), on a data connection instead
+of the lock pool, with a 10-second PostgreSQL `lock_timeout`. Sandbox create
+holds its mutation guard while it waits for that key. A wait that runs out
+returns `UNAVAILABLE` with "lock sandbox SSH identity failed", and neither
+`openshell_server_mutation_lock_timeouts_total` nor
+`openshell_server_mutation_lock_errors_total` counts it.
 
 For multi-replica gateway installs, supervisor and client session traffic may
 be served by a non-owner gateway replica and relayed to the current supervisor
@@ -504,6 +720,41 @@ name and load the chart CA plus client identity from
 `OPENSHELL_PEER_TLS_KEY_FILE`. If peer calls fail during TLS negotiation, verify
 the `peer-client-tls` volume exists, those files are readable, and the server
 certificate includes the name in `OPENSHELL_PEER_TLS_SERVER_NAME`.
+
+To check per-replica capacity on a multi-replica gateway, read each gateway
+pod's metrics and the autoscaler:
+
+```bash
+for pod in $(kubectl -n openshell get pod \
+    -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+    -o jsonpath='{range .items[?(@.spec.containers[0].name=="openshell-gateway")]}{.metadata.name}{" "}{end}'); do
+  echo "${pod}"
+  kubectl get --raw "/api/v1/namespaces/openshell/pods/${pod}:9090/proxy/metrics" \
+    | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total|mutation_lock_(timeouts_total|errors_total|connections))'
+done
+kubectl -n openshell get hpa
+kubectl -n openshell describe hpa openshell
+```
+
+The JSONPath filter keeps only pods whose first container is the gateway
+(`openshell-gateway`). It skips certificate hook Job pods, which older charts
+labeled like gateway pods. The metrics port is `service.metricsPort` (default
+`9090`).
+
+The API server proxy connects to each pod from the control plane. A
+NetworkPolicy that accepts the metrics port only from a monitoring namespace
+blocks it unless the policy also allows the control plane. In that case,
+read one pod at a time through `kubectl port-forward`, which reaches the pod
+through the kubelet and is not blocked by NetworkPolicy:
+
+```bash
+kubectl -n openshell port-forward pod/<gateway-pod> 9090:9090 >/dev/null &
+pf_pid=$!
+sleep 2
+curl -s http://localhost:9090/metrics \
+  | grep -E '^openshell_server_(supervisor_sessions|relay_pending|relay_rejected_total|routed_request_attempts_total|mutation_lock_(timeouts_total|errors_total|connections))'
+kill "${pf_pid}"
+```
 
 Check required Helm deployment secrets:
 
@@ -574,7 +825,9 @@ Less commonly, `UnknownCA` can occur if the gateway's client-verification CA
 is misconfigured.  The default `clientCaFromServerTlsSecret=true` is correct
 for all configurations — the internal server certificate is always signed by
 the chart CA (the same CA that signs the client cert), so its `ca.crt` is
-the right trust anchor.  Only override this if you intentionally mount a
+the right trust anchor. Supervisor Pods project only `ca.crt` from the copied
+Secret; `tls.crt` and `tls.key` are reserved for user clients and must not be
+visible in a sandbox. Only override this if you intentionally mount a
 separate client CA via `server.tls.clientCaSecretName`.  Verify the mounted
 client CA matches the CA that signed the client certificate:
 
@@ -583,8 +836,9 @@ kubectl -n openshell get statefulset openshell -o jsonpath='{.spec.template.spec
 # Should show items filter for ca.crt from openshell-server-tls
 ```
 
-If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
-render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
+If `gatewayConfig.openshell.drivers.kubernetes.provider_spiffe_workload_api_socket_path`
+is set, the gateway should still render `[openshell.gateway.gateway_jwt]` and
+mount the `sandbox-jwt` Secret.
 SPIRE is used by both the gateway and sandbox supervisors for dynamic provider
 token grants. The gateway pod must mount the `spiffe-workload-api` CSI volume
 and set `OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET`; supervisor Pods must
@@ -595,7 +849,7 @@ Verify that SPIRE is installed, the CSI driver is available, and the Kubernetes
 driver config includes `provider_spiffe_workload_api_socket_path`:
 
 ```bash
-helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
+helm -n openshell get values openshell | grep provider_spiffe_workload_api_socket_path
 kubectl get pods -A | grep -E 'spire|spiffe'
 kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
 kubectl -n openshell get pod -l app.kubernetes.io/name=helm-chart -o jsonpath="{.items[*].spec.containers[*].env[?(@.name==\"OPENSHELL_GATEWAY_SPIFFE_WORKLOAD_API_SOCKET\")].value}{\"\n\"}"
@@ -640,7 +894,7 @@ kubectl -n openshell get "${GATEWAY_DEPLOYMENT}" -o jsonpath="{.spec.template.sp
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
-The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes.
+The gateway, sandbox, and supervisor images should use the same release tag. A stale runtime image can make sandbox behavior lag behind gateway policy or protocol changes. Kubernetes sandboxes take the configured supervisor and runtime images each time they start, so a sandbox that kept running through an upgrade uses its previous images until its next stop and start.
 
 For vulnerability reports, record the running image digest and scan that exact
 artifact. The gateway includes a pinned Distroless base; the supervisor includes
@@ -739,6 +993,12 @@ remain unchanged. A generation-bound session-token rejection usually means the
 supervisor is presenting credentials from a runtime that was replaced; inspect
 the persisted generation before retrying bootstrap.
 
+The Kubernetes driver serializes lifecycle mutations and runtime reconciliation
+per sandbox within one driver instance. A busy sandbox is checked again on the
+next reconciliation pass. If restart still loses its supervisor, compare the
+Sandbox and Pod UIDs and identify which gateway or external driver process
+performed cleanup; the local mutation gate does not coordinate separate processes.
+
 ```bash
 helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
 kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
@@ -761,10 +1021,64 @@ per-sandbox Service, split immutable bootstrap Secrets, and a gated supervisor
 Pod before releasing either Pod. The supervisor Pod runs
 `/openshell-supervisor`. Both Pods use the
 same resolved non-root identity, request no capabilities, drop `ALL`, disable
-privilege escalation, and use `RuntimeDefault` seccomp. The supervisor reaches
-the sandbox over per-sandbox TLS with server-certificate verification plus
-bootstrap-token client authentication, and owns gateway policy, provider
-credentials, DNS, and mediated upstream connections.
+privilege escalation, and use `RuntimeDefault` seccomp. The supervisor and
+sandbox talk over per-sandbox TLS with server-certificate verification plus
+bootstrap-token client authentication; the supervisor owns gateway policy,
+provider credentials, DNS, and mediated upstream connections.
+
+Each sandbox records which side opens that connection in the Sandbox annotation
+`openshell.ai/sandbox-runtime-control-connection`, bound to
+`openshell.ai/sandbox-runtime-control-generation`. A missing marker or a
+different current runtime generation means
+`supervisor-initiated`: the `os-boundary-<id>` Service selects the workload Pod
+and the supervisor dials it. With `runtime-initiated` (used for new
+generations), a separate `os-supervisor-<id>` Service selects the supervisor Pod, the sandbox runtime dials
+it, and a per-sandbox NetworkPolicy `os-control-<id>` admits only that
+connection at both the workload (egress) and the supervisor (ingress). The
+Service publishes the supervisor before it is Ready, because readiness follows
+the runtime's attach. If the runtime logs `cannot reach the supervisor`, check
+that the CNI applied both directions of `os-control-<id>`.
+Stop/start upgrades legacy sandboxes to runtime-initiated control, as does
+gateway recovery that recreates both Pods. Existing running generations keep
+their current connection until replaced. Check the mode first when a sandbox
+never becomes ready, especially after changing images:
+
+```bash
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> \
+  -o jsonpath='{.metadata.annotations.openshell\.ai/sandbox-runtime-control-connection}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-boundary-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get service os-supervisor-<sandbox-id> -o jsonpath='{.spec.selector}{"\n"}'
+kubectl -n <sandbox-namespace> get networkpolicy os-control-<sandbox-id> -o yaml
+```
+
+A `runtime-initiated` sandbox needs a gateway, supervisor image, and sandbox
+runtime image that all support the mode. An older supervisor or runtime fails
+to decode its launch descriptor, so the sandbox cannot start or restart.
+Old gateways can restart sandboxes by creating their own compatible pair;
+`os-boundary-<id>` always keeps its workload selector. New gateways also create
+it for new sandboxes, alongside the supervisor Service. Upgrade the images
+together within each generation. There is no legacy rollout flag.
+Adding the supervisor endpoint on restart requires `create` and `get` on
+Services in the sandbox namespace. For a `Forbidden` restart error, check the
+gateway ServiceAccount with `kubectl auth can-i create services --namespace
+<sandbox-namespace> --as system:serviceaccount:<gateway-namespace>:<gateway-service-account>`.
+Do not edit the annotation, Service selector, or `os-control-<id>` policy:
+reconciliation suspends a sandbox whose Service or control policy no longer
+matches its recorded mode.
+
+The supervisor loads its startup configuration through the polling RPCs and
+opens `ConnectSupervisor` once the workload runs. When the gateway runs with
+`config_delivery_mode = "push"`, it accepts the session with
+`config_push_enabled` and a bootstrap update. The supervisor applies the
+bootstrap, stops polling, and receives later updates on that stream. Every
+update must contain both the sandbox configuration and the provider
+environment it names. A reconnect to a gateway in poll mode resumes polling.
+
+If live policy or provider changes do not reach a sandbox in push mode, inspect
+gateway and supervisor logs for bootstrap build failures, updates missing a
+configuration part, apply failures, or the two-minute bootstrap timeout. Do not
+add gateway credentials to the workload Pod; configuration delivery terminates
+in the separate supervisor.
 
 Inspect all driver-managed resources when a Kubernetes sandbox remains Starting
 or loses readiness:
@@ -896,13 +1210,20 @@ Use the VM driver logs and host diagnostics available in the user's environment.
 
 - The VM driver process is running and reachable by the gateway.
 - The runtime rootfs exists and matches the expected architecture.
-- `mke2fs` or `mkfs.ext4` and `debugfs` from e2fsprogs are installed; explicit
-  `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
+- `mke2fs` or `mkfs.ext4`, `debugfs`, and `e2fsck` from e2fsprogs are installed. Run `openshell-gateway config preflight` with the intended local VM configuration, service account, and environment to check the selected paths and versions before startup. A remote endpoint reports that host checks were not performed. Explicit `sandbox_uid`/`sandbox_gid` does not remove this prerequisite.
 - A persisted overlay identity error is resolved from its owner marker, overlay
   upper layer, prepared rootfs, explicit config, or current image. Do not assign
   `10001:10001` unless the persisted state reports that legacy identity.
 - Host virtualization support is enabled.
 - The sandbox supervisor can establish its authenticated gateway session.
+
+For `vm.mounts` (virtiofs host bind mounts) failures, also verify:
+
+- `[openshell.drivers.vm]` sets `allow_driver_config = true` and `enable_bind_mounts = true`; an external VM driver needs `--enable-bind-mounts` and `allow_driver_config` in `--admission-config-json`.
+- `[openshell.drivers.vm.resource_admission]` sets `enabled = false`; bind mounts are rejected while resource admission is on.
+- The libkrun runtime exports `krun_add_virtiofs4`; otherwise the driver reports "VM bind mounts need a libkrun runtime with virtiofs support". The driver extracts its runtime under `$XDG_DATA_HOME/openshell/vm-runtime/<version>/` (default `~/.local/share`). Check with `nm -D <dir>/libkrun.so | grep krun_add_virtiofs4` on Linux or `nm -gU <dir>/libkrun.dylib | grep krun_add_virtiofs4` on macOS.
+- The sandbox launches on libkrun. GPU sandboxes and QEMU launches do not support VM mounts.
+- On Linux with a non-root gateway, file creation in a read-write mount fails unless `sandbox_uid`/`sandbox_gid` match the gateway user's UID/GID. Compare `id -u`/`id -g` of the gateway user with the configured values.
 
 Then run:
 
@@ -940,17 +1261,26 @@ credential failures.
 | Symptom | Likely cause | Check |
 |---|---|---|
 | `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
+| Collector receives no OCSF log records, or `openshell.ocsf.gap` records | `[openshell.gateway.otlp.ocsf]` missing or without `enabled = true`, an unreachable or non-gRPC endpoint, or export failures and queue pressure | Check `[openshell.gateway.otlp.ocsf]` for `enabled = true` and the endpoint it resolves to, the gateway's `OTLP exporting enabled` startup log for `ocsf_endpoint`, export warnings, and `openshell_ocsf_otlp_*` metrics. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | Gateway OCSF JSONL stops growing, has gaps, or is rejected by a SIEM | File errors, queue pressure, shipper falling behind retention, or a schema mismatch | Inspect gateway warnings and `openshell_ocsf_log_*` metrics; check `[openshell.gateway.ocsf_log]`, `schema_version`, directory permissions, free space, per-replica paths, and shipper rotation checkpoints. See the published [gateway configuration reference](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/configuration). |
 | `BatchSpanProcessor.ExportError` repeatedly reports connection refused on `127.0.0.1:4317` | The local gateway started with OTLP configured but the collector forwarding task later stopped, or the config was created manually | Restart `gateway:docker`, `gateway:podman`, or `gateway:vm` so it re-detects the listener; inspect the generated `gateway.toml` for `[openshell.gateway.otlp]` |
 | Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
 | Docker or Podman sandbox never registers | Wrong gateway endpoint, unavailable host networking, or supervisor startup failure | Gateway logs and supervisor container logs |
 | CPU-only VM startup reports that read-only `/proc` cannot be removed | Older supervisors can infer GPU requirements from host devices | Check gateway, VM driver, and bundled supervisor versions; use matching updated artifacts. CPU-only VMs do not require read-write `/proc`. |
 | Docker GPU sandbox fails before startup | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
-| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
+| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>`; if the gateway PVC is unbound because the cluster has no default `StorageClass`, set `server.dataStorageClass` to a valid one, and size the claim with `server.dataStorageSize` |
+| `helm upgrade` fails on a forbidden update to the gateway StatefulSet after changing `server.dataStorageSize` or `server.dataStorageClass` | `volumeClaimTemplates` is immutable on an existing StatefulSet | `kubectl -n openshell delete statefulset openshell --cascade=orphan`, then re-upgrade; the orphaned PVC keeps its original size and class, so grow it with in-place PVC expansion or copy the data to a new claim |
 | Kubernetes sandbox pod stuck pending, workspace PVC unbound | Cluster has no default `StorageClass` and OpenShell does not set `storageClassName` on the workspace PVC (clusters with a default `StorageClass` bind fine without it) | `kubectl -n openshell describe pvc`; set `server.workspaceStorageClass` (gateway config `workspace_storage_class`) to a valid `StorageClass` |
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| Mutating RPCs return `UNAVAILABLE` with "timed out waiting for a concurrent mutation" | Advisory-lock contention, a full lock pool on one replica (4 connections unless `database_lock_max_connections` is set), a slow PostgreSQL, or older gateways still running during an upgrade | `openshell_server_mutation_lock_timeouts_total`, `openshell_server_mutation_lock_connections_in_use` against its capacity, the `detail` field of `mutation lock acquisition timed out` in gateway logs, `mutation lock held longer than the lock wait timeout` warnings and `openshell_server_mutation_lock_hold_seconds`, the `pg_locks` query in Step 6 |
+| Mutating RPCs return `INTERNAL` with "could not open a mutation lock connection" | PostgreSQL out of connection slots, restarting, or unreachable | `openshell_server_mutation_lock_errors_total`, PostgreSQL logs, `SELECT count(*) FROM pg_stat_activity` against `max_connections`, `database_max_connections` and `database_lock_max_connections`, the connection sizing in the High Availability guide |
+| `helm upgrade` fails with an `autoscaling.*` message | HPA values invalid: missing `resources.requests` (or `resources.limits`), `maxReplicas` above 1 without `server.externalDbSecret` (or on a StatefulSet without `workload.allowMultiReplicaStatefulSet`), no metric target, or min/max out of order. "`minReplicas` and `maxReplicas` are not set" means `--reuse-values` kept a release without the chart's autoscaling defaults | Fix the values named in the error; upgrade with `--reset-then-reuse-values` instead of `--reuse-values` |
+| HPA shows `<unknown>` targets | No metrics-server for CPU/memory, or the metrics adapter does not serve the custom metric | `kubectl -n openshell describe hpa openshell`, `kubectl get --raw /apis/custom.metrics.k8s.io/v1beta1` |
+| One replica holds most sessions after a rollout | Expected: sessions stay where they reconnected | `openshell_server_supervisor_sessions` per pod; it fades as sandboxes are recreated |
+| Gateway or `<release>-certgen` hook pod rejected with `violates PodSecurity "restricted:latest"` | The rendered container lacks `runAsNonRoot` or `seccompProfile`: an older chart version does not set them, or an override in `securityContext` / `pkiInitJob.securityContext` unset them | `kubectl -n openshell get events --field-selector reason=FailedCreate`; upgrade the chart, then remove overrides that unset those fields |
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
-| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | The `openshell-sandbox` service account lacks the privileged SCC it needs | `oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell`; remove with `remove-scc-from-user` when done |
+| OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
+| OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
@@ -969,8 +1299,10 @@ credential failures.
 | Custom compute driver is unavailable | Driver process/socket missing, inaccessible, or selected name does not match its endpoint/config key | Socket ownership/mode, driver service logs, gateway `GetCapabilities` logs |
 | Sandbox remains `Stopping` or `Starting` | Driver stop/start failed, retained resource is missing, or a fresh supervisor has not connected | Gateway and driver logs; `docker inspect`, `podman inspect`, Agent Sandbox status/PVC, or VM state marker and launcher process |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
-| Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Envoy Gateway CRDs | Install Envoy Gateway and enable `grpcRoute` before applying the optional ingress resources |
+| Gateway API resources fail with `the server could not find the requested resource` | Optional Gateway API resources were applied without Gateway API CRDs | Install the standard Gateway API CRDs and selected controller, then enable `grpcRoute` before applying the optional ingress resources |
+| A custom GatewayClass does not program the chart-created Gateway, or its proxy Service conflicts with the OpenShell Service | The selected controller is unavailable, or the default `grpcRoute.gateway.name` reuses the OpenShell Service name | Check `kubectl get gatewayclass,gateway,grpcroute -A`; set a distinct Gateway name such as `<fullname>-ingress`. For an existing Gateway, set `gateway.create=false` plus `gateway.name`, `gateway.namespace`, and optional `gateway.sectionName` |
 | HTTPS ingress (`grpcRoute.gateway.listener.protocol=HTTPS`) connection resets or TLS handshake hangs | Envoy terminates TLS but the gateway pod still expects TLS, so the plaintext backend hop fails | Set `server.disableTls=true` so Envoy forwards plaintext to the pod; verify the listener `certificateRefs` Secret exists in the release namespace and `openshell status` over `https://<host>` |
+| With `grpcRoute.replicaRouting.enabled=true`, sandbox SSH, forward, or exec still relay through a peer replica | A `<release>-replica-<i>` Service has no endpoint, so Envoy returns `Unavailable` and the CLI retries unrouted | `kubectl -n openshell get endpoints <release>-replica-0 <release>-replica-1`; confirm `workload.kind=statefulset` and the GRPCRoute status is `Accepted`/`ResolvedRefs` |
 | HTTPS ingress returns `Unauthenticated` after connecting | TLS terminates at Envoy, so the gateway never sees a client cert; no OIDC issuer is configured for identity | Configure `server.oidc.issuer` and register with `openshell gateway add https://<host> --oidc-issuer <url>`, or set `server.auth.allowUnauthenticatedUsers=true` for a trusted-proxy/dev cluster |
 | External server `Certificate` never becomes Ready with `certManager.serverIssuerRef` set | ACME issuer rejected internal-only SANs, a loopback IP, or a `commonName` absent from the SANs | `kubectl -n openshell describe certificate openshell-server-external`; confirm `certManager.serverDnsNames` lists only real, externally-resolvable hostnames |
 | Sandbox supervisors fail TLS handshake with `UnknownCA` after configuring `certManager.serverIssuerRef` | `server.grpcEndpoint` is set to the external hostname, forcing supervisors to receive the ACME cert (via SNI) which they can't verify against chart CA | Remove `server.grpcEndpoint` or set it to the internal service name; supervisors should connect via internal service name to receive the internal cert |
@@ -991,7 +1323,7 @@ When handing results back to the user, include:
 
 ## Package Configuration Preflight
 
-For a Debian, Ubuntu, or Snap gateway that stops before certificate generation or
+For a Debian, Ubuntu, or snap gateway that stops before certificate generation or
 daemon startup, validate the selected configuration without starting the service:
 
 ```shell

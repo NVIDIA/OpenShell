@@ -1359,6 +1359,9 @@ fn create_sandbox_request(spec: SandboxSpec) -> proto::CreateSandboxRequest {
             .map(|exposure| proto::SandboxServiceExposure {
                 service: exposure.service,
                 target_port: u32::from(exposure.target_port),
+                authorization_mode: proto::ServiceAuthorizationMode::from(
+                    exposure.authorization_mode,
+                ) as i32,
             })
             .collect(),
     }
@@ -1397,6 +1400,9 @@ fn create_sandbox_from_template_request(
             .map(|exposure| proto::SandboxServiceExposure {
                 service: exposure.service,
                 target_port: u32::from(exposure.target_port),
+                authorization_mode: proto::ServiceAuthorizationMode::from(
+                    exposure.authorization_mode,
+                ) as i32,
             })
             .collect(),
     }
