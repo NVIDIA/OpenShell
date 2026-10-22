@@ -33,7 +33,7 @@ use crate::auth::principal::Principal;
 use crate::config_delivery::MAX_SUPERVISOR_CONFIG_MESSAGE_BYTES;
 use crate::config_delivery::session::{self as config_session, ConfigSessionState};
 use crate::gateway_metrics::{
-    self, GaugeSlot, PeerRpc, RelayCapacity, RelayKind, RelayRejection, RelayRoute,
+    self, GaugeSlot, PeerRpc, RedirectReason, RelayCapacity, RelayKind, RelayRejection, RelayRoute,
     RoutedRequestTimer,
 };
 use crate::grpc::provider_readiness::ProviderReadinessEvidence;
@@ -1860,6 +1860,22 @@ fn may_redirect(hello: &SupervisorHello, shutting_down: bool) -> bool {
     hello.supports_session_redirect && (!hello.redirected || shutting_down)
 }
 
+/// Whether admitting this hello here goes against this replica's ring: the
+/// supervisor was redirected, yet the ring names another replica as the
+/// sandbox's owner. An empty ring has no opinion. This is only counted; the
+/// session is still served so a stale ring or a failed redirect dial cannot
+/// make the sandbox unreachable.
+fn is_off_ring_admission(
+    hello: &SupervisorHello,
+    ring: &crate::gateway_ring::GatewayRing,
+    self_replica_id: &str,
+) -> bool {
+    hello.redirected
+        && ring
+            .owner_for(&hello.sandbox_id)
+            .is_some_and(|owner| owner != self_replica_id)
+}
+
 fn ring_redirect(
     self_replica_id: &str,
     preferred_replica_id: &str,
@@ -2530,9 +2546,18 @@ pub async fn handle_connect_supervisor(
         // Capacity 1 and a fresh receiver, so this cannot block. Dropping the
         // sender ends the stream, which closes the supervisor's connection.
         let _ = tx.send(Ok(message)).await;
+        gateway_metrics::record_session_redirect(RedirectReason::Connect);
         drop(tx);
         return Ok(Response::new(Box::pin(ReceiverStream::new(rx))));
     }
+
+    // Read while the hello is whole, and counted only once the session is
+    // accepted. A hello that was not redirected takes no ring lock.
+    let off_ring = hello.redirected
+        && state
+            .gateway_ring
+            .read()
+            .is_ok_and(|ring| is_off_ring_admission(&hello, &ring, &state.replica_id));
 
     // Build the bootstrap only for a session this replica keeps.
     let config_push = captured_seq.map(|captured_seq| ConfigPushSetup {
@@ -2578,6 +2603,9 @@ pub async fn handle_connect_supervisor(
     tokio::spawn(accept_supervisor_session(setup))
         .await
         .map_err(|error| Status::internal(format!("supervisor session setup failed: {error}")))??;
+    if off_ring {
+        gateway_metrics::record_off_ring_admission();
+    }
 
     Ok(Response::new(stream))
 }
@@ -2805,19 +2833,24 @@ async fn wait_for_replacement_owner(
 }
 
 /// Queue a shutdown redirect for a supervisor that supports one. Returns
-/// whether a redirect is now queued for the supervisor.
+/// whether a redirect is now queued for the supervisor, and counts it only
+/// then.
 fn queue_shutdown_redirect(
     tx: &mpsc::Sender<GatewayMessage>,
     supports_session_redirect: bool,
     redirect: impl FnOnce() -> Option<SessionRedirect>,
 ) -> bool {
-    supports_session_redirect
+    let queued = supports_session_redirect
         && redirect().is_some_and(|redirect| {
             tx.try_send(GatewayMessage {
                 payload: Some(gateway_message::Payload::SessionRedirect(redirect)),
             })
             .is_ok()
-        })
+        });
+    if queued {
+        gateway_metrics::record_session_redirect(RedirectReason::Shutdown);
+    }
+    queued
 }
 
 /// An accepted supervisor session, shared by the handlers for its messages.
@@ -3079,6 +3112,11 @@ mod tests {
             .expect("gateway message")
     }
 
+    const SHUTDOWN_REDIRECTS: &str =
+        "openshell_server_supervisor_session_redirects_total{reason=\"shutdown\"}";
+    const CONNECT_REDIRECTS: &str =
+        "openshell_server_supervisor_session_redirects_total{reason=\"connect\"}";
+
     #[tokio::test]
     async fn supervisor_without_config_push_is_accepted() {
         let state = state_with_sandbox("sb-legacy").await;
@@ -3331,12 +3369,14 @@ mod tests {
 
     #[test]
     fn shutdown_redirect_is_queued_only_when_supported_available_and_sent() {
+        let metrics = MetricsCapture::install();
         let (tx, mut rx) = mpsc::channel(1);
         assert!(queue_shutdown_redirect(&tx, true, || Some(test_redirect())));
         assert!(matches!(
             rx.try_recv().unwrap().payload,
             Some(gateway_message::Payload::SessionRedirect(_))
         ));
+        assert_eq!(metrics.value(SHUTDOWN_REDIRECTS), Some(1));
 
         assert!(!queue_shutdown_redirect(&tx, true, || None));
         assert!(!queue_shutdown_redirect(&tx, false, || {
@@ -3350,6 +3390,12 @@ mod tests {
             true,
             || Some(test_redirect())
         ));
+        assert_eq!(
+            metrics.value(SHUTDOWN_REDIRECTS),
+            Some(1),
+            "only the queued redirect counts"
+        );
+        assert_eq!(metrics.value(CONNECT_REDIRECTS), None);
     }
 
     #[tokio::test]
@@ -5494,6 +5540,60 @@ mod tests {
         assert!(!may_redirect(&hello, true));
     }
 
+    /// A sandbox id the ring places on `owner`.
+    fn sandbox_owned_by(ring: &crate::gateway_ring::GatewayRing, owner: &str) -> String {
+        (0..300)
+            .map(|i| format!("sb-{i}"))
+            .find(|id| ring.owner_for(id) == Some(owner))
+            .unwrap_or_else(|| panic!("the ring places no sandbox on {owner}"))
+    }
+
+    fn redirect_capable_hello(sandbox_id: &str, redirected: bool) -> SupervisorHello {
+        SupervisorHello {
+            sandbox_id: sandbox_id.to_string(),
+            instance_id: "instance".to_string(),
+            redirected,
+            supports_session_redirect: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn off_ring_admission_is_a_redirected_hello_whose_ring_owner_is_another_replica() {
+        let ring = crate::gateway_ring::GatewayRing::new(["gw-0", "gw-1", "gw-2"]);
+        let sandbox_id = sandbox_owned_by(&ring, "gw-1");
+        let hello = redirect_capable_hello(&sandbox_id, true);
+
+        assert!(is_off_ring_admission(&hello, &ring, "gw-0"));
+        assert!(is_off_ring_admission(&hello, &ring, "gw-2"));
+        assert!(!is_off_ring_admission(&hello, &ring, "gw-1"));
+        // A replica missing from its own stale ring still sees another owner.
+        assert!(is_off_ring_admission(&hello, &ring, "gw-3"));
+        assert!(!is_off_ring_admission(
+            &redirect_capable_hello(&sandbox_id, false),
+            &ring,
+            "gw-0"
+        ));
+        assert!(!is_off_ring_admission(
+            &hello,
+            &crate::gateway_ring::GatewayRing::default(),
+            "gw-0"
+        ));
+    }
+
+    /// With two replicas every non-owner is also the owner's successor, so a
+    /// handoff to it must still count.
+    #[test]
+    fn off_ring_admission_counts_on_a_two_replica_ring() {
+        let ring = crate::gateway_ring::GatewayRing::new(["gw-a", "gw-b"]);
+        let sandbox_id = sandbox_owned_by(&ring, "gw-a");
+        assert!(is_off_ring_admission(
+            &redirect_capable_hello(&sandbox_id, true),
+            &ring,
+            "gw-b"
+        ));
+    }
+
     #[test]
     fn ring_redirect_serves_locally_when_this_replica_is_preferred() {
         assert!(ring_redirect("gw-0", "gw-0", Some("https://gw-0:8443".to_string())).is_none());
@@ -5510,5 +5610,149 @@ mod tests {
     fn ring_redirect_serves_locally_for_placeholder_endpoints() {
         assert!(ring_redirect("gw-0", "gw-1", Some(String::new())).is_none());
         assert!(ring_redirect("gw-0", "gw-1", Some("local://gw-1".to_string())).is_none());
+    }
+
+    /// Name this replica and point its ring at another replica for every
+    /// sandbox.
+    fn place_sandboxes_on(state: &mut Arc<ServerState>, self_replica_id: &str, owner: &str) {
+        Arc::get_mut(state)
+            .expect("test state is not shared yet")
+            .replica_id = self_replica_id.to_string();
+        *state.gateway_ring.write().unwrap() = crate::gateway_ring::GatewayRing::new([owner]);
+    }
+
+    #[tokio::test]
+    async fn redirected_supervisor_admitted_against_the_ring_counts_off_ring() {
+        let metrics = MetricsCapture::install();
+        let mut state = state_with_sandbox("sb-off-ring").await;
+        place_sandboxes_on(&mut state, "gw-self-ut", "gw-owner-ut");
+
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_hello(
+            &state,
+            redirect_capable_hello("sb-off-ring", true),
+        )
+        .await
+        .expect("a redirected supervisor is served even when the ring names another owner");
+        assert!(matches!(
+            first_gateway_message(&mut harness).await.payload,
+            Some(gateway_message::Payload::SessionAccepted(_))
+        ));
+
+        assert_eq!(
+            metrics.value(gateway_metrics::SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL),
+            Some(1)
+        );
+        let rendered = metrics.render();
+        assert!(!rendered.contains(gateway_metrics::SUPERVISOR_SESSION_REDIRECTS_TOTAL));
+        for id in ["sb-", "gw-self-ut", "gw-owner-ut"] {
+            assert!(!rendered.contains(id), "{id} must not appear in metrics");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_session_setup_does_not_count_an_off_ring_admission() {
+        let metrics = MetricsCapture::install();
+        let mut state = state_with_sandbox("sb-off-ring-owned").await;
+        place_sandboxes_on(&mut state, "gw-self-ut", "gw-owner-ut");
+        // Another supervisor instance holds a fresh owner record, so owner
+        // publication fails inside the spawned session setup.
+        let _owner = SupervisorOwnerIndex::new(state.store.clone(), OWNER_TTL)
+            .publish(
+                "sb-off-ring-owned",
+                "session-other",
+                "instance-other",
+                0,
+                "gw-owner-ut",
+                "http://gw-owner-ut:8080",
+            )
+            .await
+            .unwrap();
+
+        let Err(status) = crate::grpc::test_support::connect_supervisor_stream_with_hello(
+            &state,
+            redirect_capable_hello("sb-off-ring-owned", true),
+        )
+        .await
+        else {
+            panic!("a sandbox owned by another supervisor instance must not be admitted");
+        };
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+        assert_eq!(
+            metrics.value(gateway_metrics::SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL),
+            None
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_connect_redirect_is_counted_once() {
+        let metrics = MetricsCapture::install();
+        let schema =
+            crate::persistence::test_postgres::TestSchema::create("connect_redirect").await;
+        let mut state =
+            crate::grpc::test_support::test_server_state_for_store(schema.connect_store().await)
+                .await;
+        place_sandboxes_on(&mut state, "gw-self-pg", "gw-owner-pg");
+        state
+            .gateway_peers
+            .write()
+            .unwrap()
+            .insert("gw-owner-pg".to_string(), "http://127.0.0.1:9".to_string());
+        state
+            .store
+            .put_message(&sandbox_record("sb-redirect-pg", "sb-redirect-pg"))
+            .await
+            .unwrap();
+
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_hello(
+            &state,
+            redirect_capable_hello("sb-redirect-pg", false),
+        )
+        .await
+        .expect("a redirect is a successful response");
+        let Some(gateway_message::Payload::SessionRedirect(redirect)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionRedirect");
+        };
+        assert_eq!(redirect.owner_replica_id, "gw-owner-pg");
+        assert_eq!(metrics.value(CONNECT_REDIRECTS), Some(1));
+        assert_eq!(metrics.value(SHUTDOWN_REDIRECTS), None);
+        assert_eq!(
+            metrics.value(gateway_metrics::SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL),
+            None
+        );
+        assert!(!state.supervisor_sessions.has_session("sb-redirect-pg"));
+        let rendered = metrics.render();
+        for id in ["sb-redirect-pg", "gw-self-pg", "gw-owner-pg"] {
+            assert!(!rendered.contains(id), "{id} must not appear in metrics");
+        }
+        drop(harness);
+
+        // A stopping replica redirects even an already-redirected supervisor
+        // at connect, which counts as a connect redirect, not a shutdown one.
+        state.gateway_shutting_down.store(true, Ordering::Release);
+        let mut harness = crate::grpc::test_support::connect_supervisor_stream_with_hello(
+            &state,
+            redirect_capable_hello("sb-redirect-pg", true),
+        )
+        .await
+        .expect("a redirect is a successful response");
+        let Some(gateway_message::Payload::SessionRedirect(redirect)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionRedirect from a stopping replica");
+        };
+        assert_eq!(redirect.owner_replica_id, "gw-owner-pg");
+        assert_eq!(metrics.value(CONNECT_REDIRECTS), Some(2));
+        assert_eq!(metrics.value(SHUTDOWN_REDIRECTS), None);
+        assert_eq!(
+            metrics.value(gateway_metrics::SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL),
+            None
+        );
+        drop(harness);
+
+        state.store.close().await;
+        schema.drop_schema().await;
     }
 }

@@ -8,6 +8,7 @@
 //! kept in the store rather than read from Kubernetes so it works for any
 //! multi-replica deployment and adds no API server load.
 
+use crate::gateway_metrics;
 use crate::gateway_ring::GatewayRing;
 use crate::persistence::{PersistenceError, PersistenceResult, Store, WriteCondition};
 use openshell_core::time::now_ms;
@@ -179,6 +180,10 @@ pub fn spawn_membership_worker(
 
     let index = GatewayMemberIndex::new(state.store.clone(), MEMBER_TTL);
     let replica_id = state.replica_id.clone();
+    // Export the ring's size now (empty until the first refresh), so only
+    // replicas that join the ring carry the gauge, and they carry it from the
+    // start.
+    publish_ring(&state, GatewayRing::clone);
 
     Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
@@ -209,9 +214,7 @@ pub fn spawn_membership_worker(
                         .into_iter()
                         .map(|member| (member.replica_id, member.peer_endpoint))
                         .collect();
-                    if let Ok(mut slot) = state.gateway_ring.write() {
-                        *slot = ring;
-                    }
+                    publish_ring(&state, |_| ring);
                     if let Ok(mut slot) = state.gateway_peers.write() {
                         *slot = peers;
                     }
@@ -242,24 +245,18 @@ async fn leave_ring(state: &crate::ServerState, index: &GatewayMemberIndex, repl
                 .into_iter()
                 .map(|member| (member.replica_id, member.peer_endpoint))
                 .collect();
-            if let Ok(mut slot) = state.gateway_ring.write() {
-                *slot = ring.without(replica_id);
-            }
+            publish_ring(state, |_| ring.without(replica_id));
             if let Ok(mut slot) = state.gateway_peers.write() {
                 *slot = peers;
             }
         }
         Ok(Err(error)) => {
             tracing::warn!(%error, "gateway membership: shutdown ring refresh failed");
-            if let Ok(mut slot) = state.gateway_ring.write() {
-                *slot = slot.without(replica_id);
-            }
+            publish_ring(state, |ring| ring.without(replica_id));
         }
         Err(_) => {
             tracing::warn!("gateway membership: shutdown ring refresh timed out");
-            if let Ok(mut slot) = state.gateway_ring.write() {
-                *slot = slot.without(replica_id);
-            }
+            publish_ring(state, |ring| ring.without(replica_id));
         }
     }
     match tokio::time::timeout(SHUTDOWN_STORE_TIMEOUT, index.deregister(replica_id)).await {
@@ -273,11 +270,23 @@ fn clear_ring_if_stale(state: &crate::ServerState, last_refreshed: tokio::time::
     if last_refreshed.elapsed() <= MEMBER_TTL {
         return;
     }
-    if let Ok(mut slot) = state.gateway_ring.write() {
-        *slot = GatewayRing::default();
-    }
+    publish_ring(state, |_| GatewayRing::default());
     if let Ok(mut slot) = state.gateway_peers.write() {
         slot.clear();
+    }
+}
+
+/// Replace this replica's placement ring with `next(current ring)` and record
+/// its size as `openshell_server_gateway_ring_members` under the same write
+/// lock.
+///
+/// This is the only sanctioned non-test writer of `ServerState::gateway_ring`:
+/// writing the slot anywhere else lets the gauge drift from the ring. A
+/// poisoned lock leaves both unchanged.
+fn publish_ring(state: &crate::ServerState, next: impl FnOnce(&GatewayRing) -> GatewayRing) {
+    if let Ok(mut slot) = state.gateway_ring.write() {
+        *slot = next(&slot);
+        gateway_metrics::record_gateway_ring_members(slot.replica_count());
     }
 }
 
@@ -307,6 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn leaving_points_ring_at_new_replicas_and_not_departed_ones() {
+        let metrics = gateway_metrics::MetricsCapture::install();
         let state = crate::grpc::test_support::test_server_state().await;
         let index = GatewayMemberIndex::new(state.store.clone(), MEMBER_TTL);
         index.register("gw-old", "https://gw-old").await.unwrap();
@@ -325,6 +335,10 @@ mod tests {
         let ring = state.gateway_ring.read().unwrap().clone();
         assert_eq!(ring.owner_for("sb-1"), Some("gw-new"));
         assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(1)
+        );
+        assert_eq!(
             state
                 .gateway_peers
                 .read()
@@ -341,6 +355,215 @@ mod tests {
             .map(|member| member.replica_id)
             .collect();
         assert_eq!(remaining, vec!["gw-new"]);
+    }
+
+    #[tokio::test]
+    async fn leaving_without_a_membership_read_keeps_the_cached_ring_without_this_replica() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        publish_ring(&state, |_| GatewayRing::new(["gw-a", "gw-stopping"]));
+        // Only the index's store is closed, so the shutdown membership read
+        // fails while the state's store stays open.
+        let store = Arc::new(crate::persistence::test_store().await);
+        store.close().await;
+        let index = GatewayMemberIndex::new(store, MEMBER_TTL);
+
+        leave_ring(&state, &index, "gw-stopping").await;
+
+        let ring = state.gateway_ring.read().unwrap().clone();
+        assert_eq!(ring.owner_for("sb-1"), Some("gw-a"));
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_after_a_timed_out_membership_read_keeps_the_cached_ring_without_this_replica()
+    {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        publish_ring(&state, |_| GatewayRing::new(["gw-a", "gw-stopping"]));
+        // The listener accepts TCP but never answers the PostgreSQL handshake, so
+        // the shutdown read hangs past SHUTDOWN_STORE_TIMEOUT instead of failing.
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "postgres://openshell@127.0.0.1:{}/openshell",
+            silent.local_addr().unwrap().port()
+        );
+        let index = GatewayMemberIndex::new(
+            Arc::new(Store::Postgres(
+                crate::persistence::PostgresStore::connect_lazy_for_tests(&url, 1),
+            )),
+            MEMBER_TTL,
+        );
+
+        // The paused clock jumps to each timeout while the socket stays silent.
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        leave_ring(&state, &index, "gw-stopping").await;
+        // Both the read and the deregister must hit their timeouts; a read that
+        // failed fast would take the Ok(Err) branch and finish sooner.
+        assert!(
+            started.elapsed() >= SHUTDOWN_STORE_TIMEOUT * 2,
+            "the membership read must time out, not fail fast"
+        );
+
+        let ring = state.gateway_ring.read().unwrap().clone();
+        assert_eq!(ring.replica_count(), 1);
+        assert_eq!(ring.owner_for("sb-1"), Some("gw-a"));
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(1)
+        );
+        drop(silent);
+    }
+
+    #[tokio::test]
+    async fn stale_ring_is_cleared_only_after_the_member_ttl() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        publish_ring(&state, |_| GatewayRing::new(["gw-a", "gw-b"]));
+        *state.gateway_peers.write().unwrap() = HashMap::from([
+            ("gw-a".to_string(), "https://gw-a".to_string()),
+            ("gw-b".to_string(), "https://gw-b".to_string()),
+        ]);
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(2)
+        );
+
+        clear_ring_if_stale(&state, tokio::time::Instant::now());
+        assert_eq!(state.gateway_ring.read().unwrap().replica_count(), 2);
+        assert_eq!(state.gateway_peers.read().unwrap().len(), 2);
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(2)
+        );
+
+        let last_refreshed = tokio::time::Instant::now()
+            .checked_sub(MEMBER_TTL + Duration::from_millis(1))
+            .expect("the monotonic clock is past one member TTL");
+        clear_ring_if_stale(&state, last_refreshed);
+        assert!(state.gateway_ring.read().unwrap().is_empty());
+        assert!(state.gateway_peers.read().unwrap().is_empty());
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn poisoned_ring_lock_publishes_no_ring_size() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        let ring = Arc::clone(&state.gateway_ring);
+        let _ = std::thread::spawn(move || {
+            let _guard = ring.write().unwrap();
+            panic!("poison the placement ring lock");
+        })
+        .join();
+        assert!(state.gateway_ring.is_poisoned());
+
+        publish_ring(&state, |_| GatewayRing::new(["gw-a", "gw-b"]));
+
+        assert_eq!(metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS), None);
+    }
+
+    #[tokio::test]
+    async fn single_replica_store_neither_joins_the_ring_nor_exports_its_size() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        // SQLite keeps the replica out even with a peer endpoint.
+        Arc::get_mut(&mut state)
+            .expect("test state is not shared yet")
+            .peer_endpoint = Some("http://gw-self:8081".to_string());
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        assert!(spawn_membership_worker(state, MEMBER_REFRESH_INTERVAL, shutdown_rx).is_none());
+        assert_eq!(metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_replica_without_peer_endpoint_neither_joins_the_ring_nor_exports_its_size() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let schema =
+            crate::persistence::test_postgres::TestSchema::create("membership_no_peer").await;
+        let mut state =
+            crate::grpc::test_support::test_server_state_for_store(schema.connect_store().await)
+                .await;
+        // peer_endpoint is env-derived; pin it so the test does not depend on the environment.
+        Arc::get_mut(&mut state)
+            .expect("test state is not shared yet")
+            .peer_endpoint = None;
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        assert!(
+            spawn_membership_worker(state.clone(), MEMBER_REFRESH_INTERVAL, shutdown_rx).is_none()
+        );
+        assert_eq!(metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS), None);
+        assert!(
+            !metrics
+                .render()
+                .contains(gateway_metrics::GATEWAY_RING_MEMBERS)
+        );
+
+        state.store.close().await;
+        schema.drop_schema().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_membership_worker_exports_ring_size() {
+        let metrics = gateway_metrics::MetricsCapture::install();
+        let schema =
+            crate::persistence::test_postgres::TestSchema::create("membership_worker").await;
+        let mut state =
+            crate::grpc::test_support::test_server_state_for_store(schema.connect_store().await)
+                .await;
+        {
+            let state = Arc::get_mut(&mut state).expect("test state is not shared yet");
+            state.replica_id = "gw-self".to_string();
+            state.peer_endpoint = Some("http://gw-self:8081".to_string());
+        }
+        GatewayMemberIndex::new(state.store.clone(), MEMBER_TTL)
+            .register("gw-other", "http://gw-other:8081")
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let worker = spawn_membership_worker(state.clone(), Duration::from_millis(50), shutdown_rx)
+            .expect("a PostgreSQL replica with a peer endpoint joins the ring");
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(0)
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS) != Some(2) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first refresh publishes both replicas");
+        assert_eq!(state.gateway_ring.read().unwrap().replica_count(), 2);
+
+        // Leaving re-reads membership and keeps only the other replica.
+        shutdown_tx.send(true).unwrap();
+        tokio::time::timeout(SHUTDOWN_MEMBERSHIP_TIMEOUT, worker)
+            .await
+            .expect("the worker leaves the ring")
+            .expect("membership worker task");
+        let ring = state.gateway_ring.read().unwrap().clone();
+        assert_eq!(ring.owner_for("sb-1"), Some("gw-other"));
+        assert_eq!(
+            metrics.value(gateway_metrics::GATEWAY_RING_MEMBERS),
+            Some(1)
+        );
+
+        state.store.close().await;
+        schema.drop_schema().await;
     }
 
     #[tokio::test]

@@ -319,7 +319,9 @@ pub struct ServerState {
 
     /// Latest placement ring, refreshed from live gateway membership. Decides
     /// which replica *should* own a sandbox; the owner record in the store
-    /// remains authoritative for which one does.
+    /// remains authoritative for which one does. Production code writes it
+    /// only through `gateway_members::publish_ring`, which keeps the
+    /// ring-members gauge in step.
     pub gateway_ring: Arc<std::sync::RwLock<gateway_ring::GatewayRing>>,
 
     /// Peer endpoints of live replicas, keyed by replica ID. Refreshed

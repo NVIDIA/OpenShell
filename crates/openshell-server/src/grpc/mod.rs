@@ -1051,10 +1051,33 @@ pub mod test_support {
         features: StreamFeatures,
         connection_epoch: u64,
     ) -> Result<SupervisorStreamHarness, tonic::Status> {
+        connect_supervisor_stream_with_hello(
+            state,
+            SupervisorHello {
+                sandbox_id: sandbox_id.into(),
+                instance_id: "instance".into(),
+                supports_config_push: features == StreamFeatures::Apply,
+                connection_epoch,
+                supports_provider_readiness: false,
+                redirected: false,
+                supports_session_redirect: false,
+            },
+        )
+        .await
+    }
+
+    /// Serve `state` on loopback and open a supervisor stream that sends
+    /// `hello` as-is, authenticated as the sandbox the hello names. Returns
+    /// the gRPC status when the gateway rejects the stream before accepting
+    /// it.
+    pub async fn connect_supervisor_stream_with_hello(
+        state: &Arc<ServerState>,
+        hello: SupervisorHello,
+    ) -> Result<SupervisorStreamHarness, tonic::Status> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let principal = Principal::Sandbox(SandboxPrincipal {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_id: hello.sandbox_id.clone(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
             },
@@ -1080,15 +1103,7 @@ pub mod test_support {
         let (outbound, rx) = mpsc::channel(4);
         outbound
             .send(SupervisorMessage {
-                payload: Some(supervisor_message::Payload::Hello(SupervisorHello {
-                    sandbox_id: sandbox_id.into(),
-                    instance_id: "instance".into(),
-                    supports_config_push: features == StreamFeatures::Apply,
-                    connection_epoch,
-                    supports_provider_readiness: false,
-                    redirected: false,
-                    supports_session_redirect: false,
-                })),
+                payload: Some(supervisor_message::Payload::Hello(hello)),
             })
             .await
             .unwrap();
@@ -1228,6 +1243,26 @@ pub mod test_support {
             Config::new(None)
                 .with_database_url("sqlite::memory:?cache=shared")
                 .with_credential_drivers(["test-static"]),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        )))
+    }
+
+    /// Build a test state on a store the caller provides, such as a disposable
+    /// `PostgreSQL` schema. Like the states above, it sets up the default
+    /// workspace, test compute runtime, provider sources, and credential
+    /// drivers, but configures no database URL and seeds no provider profiles.
+    pub async fn test_server_state_for_store(store: Store) -> Arc<ServerState> {
+        let store = Arc::new(store);
+        crate::ensure_default_workspace(&store).await.unwrap();
+        let compute = new_test_runtime(store.clone()).await;
+        with_test_provider_profile_sources(Arc::new(ServerState::new(
+            Config::new(None).with_credential_drivers(["test-static"]),
             store,
             compute,
             SandboxIndex::new(),

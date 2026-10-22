@@ -29,12 +29,17 @@ pub const MUTATION_LOCK_CONNECTIONS_IN_USE: &str =
     "openshell_server_mutation_lock_connections_in_use";
 pub const MUTATION_LOCK_CONNECTIONS_CAPACITY: &str =
     "openshell_server_mutation_lock_connections_capacity";
+pub const GATEWAY_RING_MEMBERS: &str = "openshell_server_gateway_ring_members";
 // Counters
 pub const RELAY_REJECTED_TOTAL: &str = "openshell_server_relay_rejected_total";
 pub const RELAY_EXPIRED_TOTAL: &str = "openshell_server_relay_expired_total";
 pub const ROUTED_REQUEST_ATTEMPTS_TOTAL: &str = "openshell_server_routed_request_attempts_total";
 pub const MUTATION_LOCK_TIMEOUTS_TOTAL: &str = "openshell_server_mutation_lock_timeouts_total";
 pub const MUTATION_LOCK_ERRORS_TOTAL: &str = "openshell_server_mutation_lock_errors_total";
+pub const SUPERVISOR_SESSION_REDIRECTS_TOTAL: &str =
+    "openshell_server_supervisor_session_redirects_total";
+pub const SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL: &str =
+    "openshell_server_supervisor_session_off_ring_admissions_total";
 // Histograms (explicit buckets, see BUCKETED_HISTOGRAMS)
 pub const RELAY_CLAIM_DURATION_SECONDS: &str = "openshell_server_relay_claim_duration_seconds";
 pub const PEER_REQUEST_DURATION_SECONDS: &str = "openshell_server_peer_request_duration_seconds";
@@ -120,6 +125,27 @@ impl RelayRejection {
         match self {
             Self::ReplicaCapacity => "replica_capacity",
             Self::SandboxCapacity => "sandbox_capacity",
+        }
+    }
+}
+
+/// Event that sent a supervisor session redirect: a supervisor connecting, or this replica
+/// shutting down. A stopping replica's connect-time redirects count as `Connect`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RedirectReason {
+    /// `ConnectSupervisor` answered the hello with a redirect instead of accepting the session.
+    Connect,
+    /// A stopping replica queued a redirect on an established session.
+    Shutdown,
+}
+
+impl RedirectReason {
+    pub const ALL: [Self; 2] = [Self::Connect, Self::Shutdown];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Shutdown => "shutdown",
         }
     }
 }
@@ -269,6 +295,13 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         Unit::Count,
         "Maximum pending relay channels on one gateway replica."
     );
+    // Not zero-initialized: only replicas that join the placement ring record it, so SQLite
+    // gateways and replicas without a peer endpoint export nothing instead of a misleading 0.
+    describe_gauge!(
+        GATEWAY_RING_MEMBERS,
+        Unit::Count,
+        "Gateway replicas in this replica's placement ring, including itself."
+    );
     describe_counter!(
         ROUTED_REQUEST_ATTEMPTS_TOTAL,
         Unit::Count,
@@ -283,6 +316,16 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         RELAY_EXPIRED_TOTAL,
         Unit::Count,
         "Pending relay channels dropped because the supervisor did not connect back in time."
+    );
+    describe_counter!(
+        SUPERVISOR_SESSION_REDIRECTS_TOTAL,
+        Unit::Count,
+        "Supervisor sessions redirected to the ring-preferred replica, counted when the redirect is sent at connect or queued at shutdown."
+    );
+    describe_counter!(
+        SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL,
+        Unit::Count,
+        "Redirected supervisor sessions admitted although this replica's ring names another owner for the sandbox."
     );
     describe_counter!(
         MUTATION_LOCK_TIMEOUTS_TOTAL,
@@ -346,6 +389,10 @@ pub fn describe_and_initialize(relay: RelayCapacity, mutation_lock_connections: 
         counter!(RELAY_REJECTED_TOTAL, LABEL_REASON => reason.label()).increment(0);
     }
     counter!(RELAY_EXPIRED_TOTAL).increment(0);
+    for reason in RedirectReason::ALL {
+        counter!(SUPERVISOR_SESSION_REDIRECTS_TOTAL, LABEL_REASON => reason.label()).increment(0);
+    }
+    counter!(SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL).increment(0);
     for scope in LockScope::ALL {
         counter!(MUTATION_LOCK_TIMEOUTS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
         counter!(MUTATION_LOCK_ERRORS_TOTAL, LABEL_SCOPE => scope.label()).increment(0);
@@ -423,6 +470,23 @@ impl Drop for GaugeSlot {
 
 pub fn record_relay_rejected(reason: RelayRejection) {
     counter!(RELAY_REJECTED_TOTAL, LABEL_REASON => reason.label()).increment(1);
+}
+
+/// One supervisor session redirect, labeled by the step that sent it: `Connect` once the
+/// redirect is on the response stream, `Shutdown` once it is queued on the session.
+pub fn record_session_redirect(reason: RedirectReason) {
+    counter!(SUPERVISOR_SESSION_REDIRECTS_TOTAL, LABEL_REASON => reason.label()).increment(1);
+}
+
+/// A redirected supervisor session was admitted although this replica's ring names another
+/// owner for its sandbox. Recorded only after the session is accepted.
+pub fn record_off_ring_admission() {
+    counter!(SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL).increment(1);
+}
+
+/// Replicas in this replica's placement ring. Recorded together with each ring write.
+pub fn record_gateway_ring_members(count: usize) {
+    gauge!(GATEWAY_RING_MEMBERS).set(count_as_f64(count));
 }
 
 /// `count` pending relays were dropped unclaimed (late claim or reaper).
@@ -653,9 +717,24 @@ mod tests {
                 "openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}",
                 0,
             ),
+            (
+                "openshell_server_supervisor_session_redirects_total{reason=\"connect\"}",
+                0,
+            ),
+            (
+                "openshell_server_supervisor_session_redirects_total{reason=\"shutdown\"}",
+                0,
+            ),
+            (
+                "openshell_server_supervisor_session_off_ring_admissions_total",
+                0,
+            ),
         ] {
             assert_eq!(metrics.value(series), Some(expected), "{series}");
         }
+        // Described only, so it renders nothing, not even HELP, until the ring is published.
+        assert_eq!(metrics.value(GATEWAY_RING_MEMBERS), None);
+        assert!(!metrics.render().contains(GATEWAY_RING_MEMBERS));
         for kind in ["ssh", "tcp"] {
             for route in ["local", "peer"] {
                 let series = format!(
@@ -697,6 +776,27 @@ mod tests {
             metrics.value("openshell_server_mutation_lock_errors_total{scope=\"sandbox\"}"),
             Some(0)
         );
+    }
+
+    #[test]
+    fn placement_metrics_export_help_and_type_once_present() {
+        let metrics = MetricsCapture::install();
+        describe_and_initialize(RelayCapacity { per_replica: 256 }, None);
+        record_gateway_ring_members(3);
+
+        let rendered = metrics.render();
+        for (name, kind) in [
+            (SUPERVISOR_SESSION_REDIRECTS_TOTAL, "counter"),
+            (SUPERVISOR_SESSION_OFF_RING_ADMISSIONS_TOTAL, "counter"),
+            (GATEWAY_RING_MEMBERS, "gauge"),
+        ] {
+            assert!(rendered.contains(&format!("# HELP {name} ")), "{name} HELP");
+            assert!(
+                rendered.contains(&format!("# TYPE {name} {kind}")),
+                "{name} TYPE"
+            );
+        }
+        assert_eq!(metrics.value(GATEWAY_RING_MEMBERS), Some(3));
     }
 
     #[test]
