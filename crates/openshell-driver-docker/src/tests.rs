@@ -614,6 +614,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
             cdi_supported: false,
             cdi_spec_dirs: Vec::new(),
             wsl_all_gpu_fallback_enabled: false,
+            nvidia_wsl_supported: false,
         },
         sandbox_pids_limit: openshell_core::config::default_sandbox_pids_limit(),
         enable_bind_mounts: false,
@@ -4957,4 +4958,128 @@ fn normalize_pull_reference_appends_latest_only_when_untagged() {
         normalize_pull_reference("registry:5000/team/app:v1"),
         "registry:5000/team/app:v1"
     );
+}
+
+#[test]
+fn wsl_gpu_requires_desktop_daemon_and_wsl_kernel() {
+    for (os, kernel, expected) in [
+        ("Docker Desktop", "6.6.87.2-microsoft-standard-WSL2", true),
+        ("Docker Desktop", "6.12-linuxkit", false),
+        ("Ubuntu 24.04", "6.6-microsoft-standard-WSL2", false),
+        ("Docker Desktop", "", false),
+    ] {
+        let info = SystemInfo {
+            operating_system: Some(os.into()),
+            kernel_version: Some(kernel.into()),
+            ..Default::default()
+        };
+        assert_eq!(wsl_gpu::supported_daemon(&info), expected, "{os} {kernel}");
+    }
+}
+
+#[test]
+fn wsl_gpu_rejects_implicit_or_conflicting_selection() {
+    let mut driver_config: DockerSandboxDriverConfig =
+        serde_json::from_value(serde_json::json!({"nvidia_wsl_gpus":"all"})).unwrap();
+    let default_gpu = GpuResourceRequirements { count: None };
+    assert!(wsl_gpu::validate_request(Some(&default_gpu), &driver_config, true).is_ok());
+    assert!(wsl_gpu::validate_request(Some(&default_gpu), &driver_config, false).is_err());
+    assert!(wsl_gpu::validate_request(None, &driver_config, true).is_err());
+    for count in [0, 1, 2] {
+        assert!(
+            wsl_gpu::validate_request(
+                Some(&GpuResourceRequirements { count: Some(count) }),
+                &driver_config,
+                true
+            )
+            .is_err()
+        );
+    }
+    driver_config.cdi_devices = Some(vec!["nvidia.com/gpu=all".into()]);
+    assert!(wsl_gpu::validate_request(Some(&default_gpu), &driver_config, true).is_err());
+    for value in [
+        serde_json::json!(true),
+        serde_json::json!("0"),
+        serde_json::json!("auto"),
+    ] {
+        assert!(
+            serde_json::from_value::<DockerSandboxDriverConfig>(
+                serde_json::json!({"nvidia_wsl_gpus":value})
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn wsl_gpu_creation_preserves_enforcement_and_requires_operator_opt_in() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.resource_requirements = Some(gpu_resources(None));
+    spec.template.as_mut().unwrap().driver_config = Some(prost_types::Struct {
+        fields: std::iter::once((
+            "nvidia_wsl_gpus".into(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue("all".into())),
+            },
+        ))
+        .collect(),
+    });
+    let mut config = runtime_config();
+    config.gpu.nvidia_wsl_supported = true;
+    config.resource_admission.enabled = true;
+    let validated = DockerComputeDriver::validated_sandbox(&sandbox, &config).unwrap();
+    let body = build_container_create_body_with_gpu_devices(
+        &sandbox,
+        &config,
+        &validated.driver_config,
+        None,
+    )
+    .unwrap();
+    let host = body.host_config.unwrap();
+    assert_eq!(host.device_requests, Some(vec![wsl_gpu::device_request()]));
+    assert_eq!(host.network_mode.as_deref(), Some("none"));
+    assert_eq!(host.cap_drop, Some(vec!["ALL".into()]));
+    assert!(host.cap_add.as_ref().is_none_or(Vec::is_empty));
+    assert!(
+        host.security_opt
+            .unwrap()
+            .iter()
+            .any(|option| option.contains("no-new-privileges"))
+    );
+    assert!(!host.privileged.unwrap_or(false));
+    config.allow_driver_config = false;
+    assert!(DockerComputeDriver::validated_sandbox(&sandbox, &config).is_err());
+}
+
+#[test]
+fn wsl_gpu_restart_rejects_selection_and_identity_tampering() {
+    let mut boundary = admission_boundary_config(None);
+    boundary
+        .resource_claims
+        .insert(wsl_gpu::SELECTION_CLAIM.into(), "all".into());
+    let valid = serde_json::json!({"Id":"container-test", "HostConfig":{"DeviceRequests":[{"Driver":"nvidia","Count":-1,"Capabilities":[["gpu"]]}]}});
+    wsl_gpu::admit_persisted(&serde_json::from_value(valid.clone()).unwrap(), &boundary).unwrap();
+    for (pointer, replacement) in [
+        ("/Id", serde_json::json!("foreign")),
+        ("/HostConfig/DeviceRequests", serde_json::json!([])),
+        (
+            "/HostConfig/DeviceRequests/0/Driver",
+            serde_json::json!("cdi"),
+        ),
+        ("/HostConfig/DeviceRequests/0/Count", serde_json::json!(1)),
+        (
+            "/HostConfig/DeviceRequests/0/Capabilities",
+            serde_json::json!([["compute"]]),
+        ),
+    ] {
+        let mut changed = valid.clone();
+        *changed.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            wsl_gpu::admit_persisted(&serde_json::from_value(changed).unwrap(), &boundary).is_err(),
+            "{pointer}"
+        );
+    }
+    boundary.resource_claims.remove(wsl_gpu::SELECTION_CLAIM);
+    assert!(wsl_gpu::admit_persisted(&serde_json::from_value(valid).unwrap(), &boundary).is_err());
 }

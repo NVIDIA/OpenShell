@@ -1135,6 +1135,30 @@ companion supervisor. The bundle extends trust for the TLS connection to an
 and the combined trust bundle exposed to workload processes. The gateway-host
 path is never mounted into or exposed to the workload container.
 
+#### Docker Desktop WSL GPU injection
+
+On a Docker Desktop WSL2 daemon, an operator can opt into NVIDIA runtime
+injection when a usable CDI route is unavailable. Enable `allow_driver_config`
+for the Docker driver and keep resource admission enabled. Request all GPUs
+explicitly:
+
+```shell
+openshell sandbox create --gpu \
+  --driver-config-json '{"docker":{"nvidia_wsl_gpus":"all"}}' \
+  --from <workload-image> -- <command>
+```
+
+This mode grants every GPU exposed by the Docker daemon. It rejects an explicit
+GPU count or `cdi_devices` selection, and never runs automatically after a CDI
+failure. Ordinary GPU requests continue to use CDI. Native Linux Docker inside
+WSL, macOS Docker Desktop, and Jetson are outside this mode.
+
+OpenShell creates the workload with NVIDIA injection, retains its isolated
+network and non-root identity, and checks the recorded GPU selection before
+restart. Docker Desktop must have working NVIDIA GPU support and host networking
+enabled for the supervisor. Additional host bind mounts and disabled resource
+admission are not required.
+
 ### Podman
 
 Each Podman sandbox uses two containers. The workload container runs `openshell-sandbox` with `network=none`; the supervisor container runs on the host network and initiates policy-approved upstream connections. A private volume carries their authenticated Unix-domain socket. Configure the supervisor gateway CA once under `[openshell.gateway]`; the gateway validates and injects it into the selected local driver. The supervisor authenticates RPCs with a sandbox bearer token.

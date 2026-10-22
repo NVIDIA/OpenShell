@@ -159,6 +159,22 @@ retain legacy baseline handling on restart. Admission checks persisted context
 for existing containers and the creation context for new ones. Non-GPU sandboxes
 receive no CDI context or spec mounts.
 
+## Docker Desktop WSL NVIDIA injection
+
+`driver_config.nvidia_wsl_gpus = "all"` explicitly selects NVIDIA injection
+through the normal workload creation path. It requires a GPU resource request
+without a count, and a Docker daemon reporting Docker Desktop and a WSL2 kernel.
+It conflicts with CDI selection and does not change ordinary CDI requests.
+The driver rechecks daemon eligibility during preflight and provisioning.
+
+The protected boundary config and runtime descriptor both record the all-GPU
+selection. Admission compares the exact NVIDIA device request and immutable
+container identity before restart/reconciliation, independently of resource
+label enforcement. The generic GPU claim enables the existing workload-side
+WSL device/library baseline. No supervisor credentials or CDI projections are
+copied into a replacement container. Real WSL CUDA and lifecycle qualification
+is required before treating this route as validated.
+
 ## Driver Config Mounts
 
 The gateway forwards the `docker` block from `--driver-config-json`. Supported

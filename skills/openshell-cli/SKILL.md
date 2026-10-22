@@ -354,6 +354,12 @@ config opt-in. Consult the published gateway configuration reference before
 changing admission settings; do not recommend disabling admission to bypass a
 denial. Put driver config on a template only when it should be reused.
 
+Docker Desktop WSL builds exposing `docker.nvidia_wsl_gpus` can explicitly
+request `"all"` with an uncounted `--gpu` request. This requires operator-enabled
+driver config and grants all daemon GPUs; never substitute it for a requested
+count or CDI ID, or enable it automatically after a failed CDI request. Consult
+the installed version's gateway configuration documentation before use.
+
 ### Manage sandbox workload templates
 
 ```bash
