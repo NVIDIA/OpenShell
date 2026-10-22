@@ -287,8 +287,19 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         // With the gateway supervisor topology, the gateway owns the shared
         // supervisor's assignments and token; the driver adapts them to
-        // Kubernetes objects.
+        // Kubernetes objects. The experimental shared supervisor topology
+        // does not support the network supervisor additional destination CA;
+        // refuse the combination fail-closed rather than silently
+        // supervising generations without the operator's trust bundle.
+        let network_trust = context.network_trust_bundle().cloned();
         let driver = if config.shared_supervisor.is_some() {
+            if network_trust.is_some() {
+                return Err(openshell_core::Error::execution(
+                    "the experimental shared supervisor topology does not support the \
+                     network supervisor additional destination CA"
+                        .to_string(),
+                ));
+            }
             openshell_driver_kubernetes::KubernetesComputeDriver::with_shared_supervision(
                 config,
                 context.shutdown_receiver(),
@@ -299,6 +310,7 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             openshell_driver_kubernetes::KubernetesComputeDriver::new(
                 config,
                 context.shutdown_receiver(),
+                network_trust,
             )
             .await
         }
@@ -369,6 +381,9 @@ impl openshell_server::ComputeDriverFactory for DockerFactory {
             context.gateway_bind_address(),
             context.gateway_log_level(),
             &config,
+            context
+                .network_trust_bundle()
+                .map(openshell_core::NetworkSupervisorTrustBundle::artifact_path),
         )
         .await
         .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
@@ -432,9 +447,14 @@ impl openshell_server::ComputeDriverFactory for PodmanFactory {
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
         require_guest_tls_for_local_driver(&context, "podman")?;
         apply_guest_tls(&mut config.guest_tls_ca, context.guest_tls_ca());
-        let driver = openshell_driver_podman::PodmanComputeDriver::new(config)
-            .await
-            .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
+        let driver = openshell_driver_podman::PodmanComputeDriver::new(
+            config,
+            context
+                .network_trust_bundle()
+                .map(openshell_core::NetworkSupervisorTrustBundle::artifact_path),
+        )
+        .await
+        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
         let driver = openshell_driver_podman::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),
@@ -520,6 +540,9 @@ impl openshell_server::ComputeDriverFactory for VmFactory {
             context.gateway_name(),
             &config,
             context.otlp_config(),
+            context
+                .network_trust_bundle()
+                .map(openshell_core::NetworkSupervisorTrustBundle::artifact_path),
         )
         .await?;
         Ok(openshell_server::ComputeDriverInstance::ManagedRemote(
