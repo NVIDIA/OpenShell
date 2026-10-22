@@ -107,7 +107,7 @@ carried by the next lease renewal; expired observations mean unknown supervision
 
 `mise run e2e:kubernetes:shared-supervisor-spiffe` installs pinned SPIRE charts
 (`ci/values-spire-delegation-stack.yaml`, removed again on exit) and the
-`openshell.gateway.experimental_spiffe_delegation` overlay
+`openshell.gateway.spiffe_delegation` overlay
 (`ci/values-supervisor-spiffe.yaml`), then registers sandbox
 identities with `ClusterStaticEntry` resources. `mise run test:spire-delegation`
 checks delegated issuance and identity selection against a local SPIRE server

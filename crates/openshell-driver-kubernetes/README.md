@@ -255,7 +255,7 @@ fails closed.
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
 - **Workload identity.** The gateway owns SPIRE delegation and provider-token
-  exchange when `openshell.gateway.experimental_spiffe_delegation` is configured.
+  exchange when `openshell.gateway.spiffe_delegation` is configured.
   Shared supervisors receive final access tokens through their authenticated
   sessions. No SPIFFE socket is mounted in a shared supervisor or workload Pod.
   The existing Workload API option supplies the gateway's component identity

@@ -85,9 +85,9 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
 
-## Experimental sandbox identity broker
+## Sandbox identity broker
 
-`openshell.gateway.experimental_spiffe_delegation` enables gateway-owned SPIRE
+`openshell.gateway.spiffe_delegation` enables gateway-owned SPIRE
 acquisition for the Kubernetes shared supervisor. The private admin
 socket is mounted only in the gateway. `GetSandboxProviderAccessToken` accepts an
 endpoint-bound configured credential key; sandbox identity comes from the

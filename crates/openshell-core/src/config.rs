@@ -205,17 +205,17 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
     Ok(value.to_ascii_lowercase())
 }
 
-/// Experimental gateway-owned SPIRE delegation for sandbox provider grants.
+/// Gateway-owned SPIRE delegation for sandbox provider grants.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExperimentalSpiffeDelegationConfig {
+pub struct SpiffeDelegationConfig {
     pub admin_socket_path: String,
     pub spiffe_id_prefix: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_socket_group: Option<u32>,
 }
 
-impl ExperimentalSpiffeDelegationConfig {
+impl SpiffeDelegationConfig {
     /// Reject ambiguous host paths and identities before opening the SPIRE socket.
     pub fn validate(&self, gateway_id: &str) -> Result<(), String> {
         let path = std::path::Path::new(&self.admin_socket_path);
@@ -230,7 +230,7 @@ impl ExperimentalSpiffeDelegationConfig {
                 .any(|part| part.is_empty() || part == "." || part == "..")
             || self.admin_socket_group == Some(0)
         {
-            return Err("experimental_spiffe_delegation requires a canonical absolute admin socket path in a dedicated directory and a non-root socket group".into());
+            return Err("spiffe_delegation requires a canonical absolute admin socket path in a dedicated directory and a non-root socket group".into());
         }
         crate::spiffe::SandboxSpiffeIdPrefix::parse(&self.spiffe_id_prefix)?
             .sandbox_spiffe_id(gateway_id, "sandbox")?;
@@ -303,7 +303,7 @@ pub struct Config {
     /// flow (issue #1354).
     pub gateway_jwt: Option<GatewayJwtConfig>,
     /// Gateway-only access to SPIRE; shared supervisors receive access tokens.
-    pub experimental_spiffe_delegation: Option<ExperimentalSpiffeDelegationConfig>,
+    pub spiffe_delegation: Option<SpiffeDelegationConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -975,7 +975,7 @@ impl Config {
             provider_profile_sources: vec![GatewayProviderProfileSourceConfig::User],
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
-            experimental_spiffe_delegation: None,
+            spiffe_delegation: None,
             database_url: String::new(),
             database_max_connections: None,
             database_lock_max_connections: None,

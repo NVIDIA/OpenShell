@@ -9,7 +9,7 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
 {{- if not (get $oidcRuntimeConfig "issuer") -}}{{- $oidcRuntimeConfig = .Values.server.oidc | default dict -}}{{- end -}}
 {{- $kubernetesRuntimeConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
-{{- $delegation := get $gatewayConfig "openshell.gateway.experimental_spiffe_delegation" | default dict -}}
+{{- $delegation := get $gatewayConfig "openshell.gateway.spiffe_delegation" | default dict -}}
 {{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
 {{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
 {{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
