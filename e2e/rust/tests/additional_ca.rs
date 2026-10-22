@@ -93,7 +93,13 @@ network_policies:
         access: full
         enforcement: enforce
     binaries:
-      - path: /usr/bin/curl
+      # The network-policy binary identity is the resolved /proc/<pid>/exe
+      # target, so the versioned real binaries must be allowlisted rather
+      # than the unversioned symlinks: python3.12 on the Noble fixture image
+      # (/usr/bin/python3 -> python3.12) and on the uv-based Kubernetes/VM
+      # workload image (/usr/local/bin/python3 -> python3.12).
+      - path: /usr/bin/python3.12
+      - path: /usr/local/bin/python3.12
 "#
     );
     file.write_all(policy.as_bytes())
@@ -455,23 +461,40 @@ fn inspect_vm_overlay() -> Result<(), String> {
         std::env::var("OPENSHELL_E2E_ADDITIONAL_CA_CERT")
             .map_err(|error| format!("additional CA source path missing: {error}"))?,
     );
-    let mut overlays = std::fs::read_dir(state_dir.join("sandboxes"))
+    let mut sandboxes = std::fs::read_dir(state_dir.join("sandboxes"))
         .map_err(|error| format!("read VM sandbox state: {error}"))?
         .filter_map(Result::ok)
-        .map(|entry| entry.path().join("overlay.ext4"))
-        .filter(|path| path.is_file())
+        .map(|entry| entry.path())
+        .filter(|path| path.join("overlay.ext4").is_file())
         .collect::<Vec<_>>();
-    overlays.sort();
-    let [overlay] = overlays.as_slice() else {
+    sandboxes.sort();
+    let [sandbox_state] = sandboxes.as_slice() else {
         return Err(format!(
-            "expected one VM sandbox overlay, found {overlays:?}"
+            "expected one VM sandbox overlay, found {sandboxes:?}"
         ));
     };
+    let overlay = sandbox_state.join("overlay.ext4");
 
-    let debugfs_read = |guest_path: &str| -> Result<Vec<u8>, String> {
+    // Host-only delivery: the driver stages the normalized destination CA as
+    // a driver-owned artifact beside the sandbox state, where the host
+    // supervisor consumes it. The guest never receives CA material through
+    // its overlay, rootfs, argv, or console.
+    let staged = std::fs::read(sandbox_state.join("additional-ca.crt"))
+        .map_err(|error| format!("read host-staged VM destination CA: {error}"))?;
+    let source = std::fs::read(&source_ca)
+        .map_err(|error| format!("read additional CA source for digest comparison: {error}"))?;
+    if Sha256::digest(&staged) != Sha256::digest(&source) {
+        return Err(
+            "host-staged VM destination CA digest does not match normalized source".to_string(),
+        );
+    }
+
+    // debugfs exits successfully even for missing inodes, so presence is
+    // detected from the "Inode:" stat header rather than the exit status.
+    let overlay_has = |guest_path: &str| -> Result<bool, String> {
         let output = Command::new("debugfs")
-            .args(["-R", &format!("cat {guest_path}")])
-            .arg(overlay)
+            .args(["-R", &format!("stat {guest_path}")])
+            .arg(&overlay)
             .output()
             .map_err(|error| format!("run debugfs overlay inspection: {error}"))?;
         if !output.status.success() {
@@ -480,36 +503,24 @@ fn inspect_vm_overlay() -> Result<(), String> {
                 String::from_utf8_lossy(&output.stderr)
             ));
         }
-        Ok(output.stdout)
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(stdout.contains("Inode:"))
     };
-
-    let staged = debugfs_read("/upper/etc/openshell-tls/additional-ca.crt")?;
-    let source = std::fs::read(&source_ca)
-        .map_err(|error| format!("read additional CA source for digest comparison: {error}"))?;
-    if Sha256::digest(&staged) != Sha256::digest(&source) {
-        return Err(
-            "VM overlay destination CA digest does not match normalized source".to_string(),
-        );
+    for guest_path in [
+        "/upper/etc/openshell-tls/additional-ca.crt",
+        "/etc/openshell-tls/additional-ca.crt",
+    ] {
+        if overlay_has(guest_path)? {
+            return Err(format!(
+                "VM guest overlay received CA material at {guest_path}; the \
+                 destination CA must stay host-only"
+            ));
+        }
     }
 
-    let args = String::from_utf8(debugfs_read("/upper/opt/openshell/supervisor-args")?)
-        .map_err(|error| format!("VM supervisor argument marker is not UTF-8: {error}"))?;
-    let lines = args.lines().collect::<Vec<_>>();
-    if lines != ["--additional-ca-bundle", ADDITIONAL_CA_MOUNT_PATH] {
-        return Err(format!(
-            "unexpected VM supervisor argument marker: {lines:?}"
-        ));
-    }
-
-    let console = overlay
-        .parent()
-        .expect("overlay has sandbox state parent")
-        .join("rootfs-console.log");
+    let console = sandbox_state.join("rootfs-console.log");
     let console = std::fs::read_to_string(&console)
         .map_err(|error| format!("read VM serial log: {error}"))?;
-    if !console.contains("supervisor arguments from driver: 2 entries") {
-        return Err("VM serial log did not confirm driver-owned supervisor argv".to_string());
-    }
     if console.contains("-----BEGIN CERTIFICATE-----") {
         return Err("VM serial log disclosed certificate material".to_string());
     }
@@ -936,39 +947,82 @@ fn delete_kubernetes_config_map(identity: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn hostname_validation_script(
-    matching_url: &str,
-    mismatch_url: &str,
-    mismatch_connect: &str,
-) -> String {
+/// Exec argv that fetches `url` with the workload's default TLS verification
+/// and prints the body. Exits nonzero when validation fails, so a failed exec
+/// surfaces the verification error. Uses python3 because the Kubernetes and
+/// VM workload images do not ship curl.
+fn python_fetch_argv(driver: &str, url: &str) -> Vec<String> {
+    let script = format!(
+        "import sys, urllib.request\ntry:\n    with urllib.request.urlopen({url:?}, timeout=30) as response:\n        sys.stdout.write(response.read().decode())\nexcept Exception as error:\n    sys.exit(str(error))\n"
+    );
+    vec![
+        python_binary_for_driver(driver).to_string(),
+        "-c".to_string(),
+        script,
+    ]
+}
+
+fn python_binary_for_driver(driver: &str) -> &'static str {
+    match driver {
+        // The container-engine lanes run the Noble fixture image.
+        "docker" | "podman" => "/usr/bin/python3",
+        // The Kubernetes and VM lanes run the uv-based workload image, where
+        // python3 lives under /usr/local/bin and curl is not present.
+        _ => "/usr/local/bin/python3",
+    }
+}
+
+fn hostname_validation_script(matching_host: &str, port: u16) -> String {
     format!(
-        r#"set -eu
-response="$(curl --fail --silent --show-error --max-time 30 '{matching_url}')"
-test "$response" = '{{"additional_ca":"trusted"}}'
-set +e
-curl --fail --silent --show-error --verbose --max-time 15 --connect-to '{mismatch_connect}' '{mismatch_url}' >/tmp/mismatch.out 2>/tmp/mismatch.err
-mismatch_status=$?
-set -e
-# --connect-to proves the mismatch uses the same reachable fixture as the
-# matching request, while preserving the mismatch URL and TLS SNI. The
-# fixture's private CA is trusted, so curl status 60 must specifically be its
-# hostname-verification failure, not an untrusted issuer or routing error.
-if [ "$mismatch_status" -ne 60 ]; then
-  echo "hostname mismatch returned curl status $mismatch_status, expected 60" >&2
-  cat /tmp/mismatch.err >&2
-  exit 1
-fi
-if ! grep -Fq "no alternative certificate subject name matches target host name '{MISMATCH_HOST}'" /tmp/mismatch.err; then
-  echo "hostname mismatch did not report hostname verification failure" >&2
-  cat /tmp/mismatch.err >&2
-  exit 1
-fi
-curl --fail --silent --show-error --max-time 30 https://example.com/ >/dev/null
-echo matching-host-trusted
-echo hostname-mismatch-rejected
-echo public-root-trusted
-echo {READY_MARKER}
-while true; do sleep 1; done"#,
+        r#"
+import json
+import socket
+import ssl
+import sys
+import time
+import urllib.request
+
+port = {port}
+matching_host = {matching_host:?}
+mismatch_host = {MISMATCH_HOST:?}
+
+# 1. The matching destination must validate through the workload trust
+#    store (system roots plus the provisioned destination CA).
+with urllib.request.urlopen("https://" + matching_host + ":%d/" % port, timeout=30) as response:
+    body = response.read()
+if json.loads(body) != {{"additional_ca": "trusted"}}:
+    sys.exit("unexpected matching-host body: %r" % (body,))
+print("matching-host-trusted", flush=True)
+
+# 2. Hostname mismatch against the same reachable fixture: connect to the
+# matching host's address while presenting the mismatch hostname as TLS
+# SNI. The fixture's private CA is trusted, so the failure must be the
+# hostname check itself, not an untrusted issuer or a routing error.
+address = socket.getaddrinfo(matching_host, port, proto=socket.IPPROTO_TCP)[0][4]
+sock = socket.create_connection(address, timeout=15)
+try:
+    context = ssl.create_default_context()
+    try:
+        context.wrap_socket(sock, server_hostname=mismatch_host)
+    except ssl.SSLCertVerificationError as error:
+        message = str(error).lower()
+        if "mismatch" not in message and "doesn't match" not in message:
+            sys.exit("unexpected hostname verification error: %s" % error)
+    else:
+        sys.exit("hostname mismatch was accepted by the destination trust")
+finally:
+    sock.close()
+print("hostname-mismatch-rejected", flush=True)
+
+# 3. Public roots must keep validating alongside the destination CA.
+with urllib.request.urlopen("https://example.com/", timeout=30) as response:
+    response.read()
+print("public-root-trusted", flush=True)
+
+print({READY_MARKER:?}, flush=True)
+while True:
+    time.sleep(1)
+"#,
     )
 }
 
@@ -982,13 +1036,11 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     let policy = write_policy(port).expect("write additional CA e2e policy");
     let policy_path = policy.path().to_str().expect("policy path must be UTF-8");
     let matching_url = format!("https://host.openshell.internal:{port}/");
-    let mismatch_url = format!("https://{MISMATCH_HOST}:{port}/");
-    let mismatch_connect = format!("{MISMATCH_HOST}:{port}:host.openshell.internal:{port}");
-    let script = hostname_validation_script(&matching_url, &mismatch_url, &mismatch_connect);
+    let script = hostname_validation_script("host.openshell.internal", port);
 
     let mut sandbox = SandboxGuard::create_keep_with_args(
         &["--policy", policy_path],
-        &["sh", "-lc", &script],
+        &[python_binary_for_driver(driver), "-c", script.as_str()],
         READY_MARKER,
     )
     .await
@@ -1027,16 +1079,10 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     replace_staged_material(driver, kubernetes_identity.as_deref())
         .expect("replace staged destination trust with invalid material");
     if driver == "kubernetes" || driver == "vm" {
+        let fetch_argv = python_fetch_argv(driver, &matching_url);
+        let fetch_argv = fetch_argv.iter().map(String::as_str).collect::<Vec<_>>();
         let output = sandbox
-            .exec(&[
-                "curl",
-                "--fail",
-                "--silent",
-                "--show-error",
-                "--max-time",
-                "30",
-                &matching_url,
-            ])
+            .exec(&fetch_argv)
             .await
             .expect("running supervisor retains startup trust after staged material changes");
         assert!(
@@ -1052,7 +1098,7 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     } else if driver == "vm" {
         let mut retained_snapshot_sandbox = SandboxGuard::create_keep_with_args(
             &["--policy", policy_path],
-            &["sh", "-lc", &script],
+            &[python_binary_for_driver(driver), "-c", script.as_str()],
             READY_MARKER,
         )
         .await
@@ -1086,16 +1132,13 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     )
     .await
     .expect("create lifecycle sandbox using restored destination CA");
+    let lifecycle_fetch_argv = python_fetch_argv(driver, &matching_url);
+    let lifecycle_fetch_argv = lifecycle_fetch_argv
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let private_ca_output = lifecycle_sandbox
-        .exec(&[
-            "curl",
-            "--fail",
-            "--silent",
-            "--show-error",
-            "--max-time",
-            "30",
-            &matching_url,
-        ])
+        .exec(&lifecycle_fetch_argv)
         .await
         .expect("lifecycle sandbox trusts the private CA before removal");
     assert!(
@@ -1146,22 +1189,34 @@ async fn additional_ca_trusts_matching_and_public_hosts_and_rejects_mismatch() {
     );
 
     let removed_validation_script = format!(
-        r#"set -eu
-test "$(cat {LIFECYCLE_DURABLE_PATH})" = "{LIFECYCLE_DURABLE_MARKER}"
-test ! -e '{ADDITIONAL_CA_MOUNT_PATH}'
-set +e
-curl --fail --silent --show-error --max-time 30 '{matching_url}' >/tmp/removed.out 2>/tmp/removed.err
-removed_status=$?
-set -e
-if [ "$removed_status" -eq 0 ]; then
-  echo "private CA remained trusted after configuration removal" >&2
-  exit 1
-fi
-echo gateway-authenticated-exec-works
-echo same-sandbox-private-ca-rejected"#
+        r#"import os
+import sys
+import urllib.request
+
+marker = open({LIFECYCLE_DURABLE_PATH:?}).read().strip()
+if marker != {LIFECYCLE_DURABLE_MARKER:?}:
+    sys.exit("lifecycle durable marker was lost across the restart")
+if os.path.exists({ADDITIONAL_CA_MOUNT_PATH:?}):
+    sys.exit("destination CA mount path survived configuration removal")
+try:
+    urllib.request.urlopen({matching_url:?}, timeout=30).read()
+except Exception:
+    print("same-sandbox-private-ca-rejected", flush=True)
+else:
+    sys.exit("private CA remained trusted after configuration removal")
+print("gateway-authenticated-exec-works", flush=True)"#
     );
+    let removed_validation_argv = [
+        python_binary_for_driver(driver).to_string(),
+        "-c".to_string(),
+        removed_validation_script,
+    ];
+    let removed_validation_argv = removed_validation_argv
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
     let removed_validation_output = lifecycle_sandbox
-        .exec(&["sh", "-lc", &removed_validation_script])
+        .exec(&removed_validation_argv)
         .await
         .expect("gateway-authenticated exec should work after lifecycle restart");
     assert!(
