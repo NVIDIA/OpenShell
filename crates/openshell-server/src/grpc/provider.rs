@@ -5744,9 +5744,7 @@ mod tests {
                 .with_writer(move || writer.clone())
                 .finish();
             let capture = crate::otel_tracing::test_exporter::install_scoped(subscriber);
-            let error = crate::grpc::provider::access_token::handle(&state, request)
-                .await
-                .unwrap_err();
+            let error = access_token::handle(&state, request).await.unwrap_err();
             drop(capture);
 
             let failure = assert_generic(&error, Code::Unauthenticated);
