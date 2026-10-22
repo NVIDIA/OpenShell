@@ -15,7 +15,7 @@
 //! `mtls/` directory. `OPENSHELL_WORKSPACE` selects the workspace.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use openshell_sdk::{ClientConfig, ClientIdentity, Health, OpenShellClient, ServiceStatus};
 
@@ -160,24 +160,35 @@ impl Gateway {
     /// Wait until the gateway accepts a connection and reports itself
     /// healthy, retrying until `timeout`.
     ///
+    /// The whole wait, including each connect and health call, is bounded by
+    /// `timeout`, so a gateway that accepts connections but never answers
+    /// cannot hang it.
+    ///
     /// This is a readiness check for whoever brings the environment up, run
     /// once before its tests. Tests themselves connect once and fail fast.
     pub async fn wait_ready(&self, timeout: Duration) -> Result<Health> {
-        let started = Instant::now();
-        loop {
-            let error = match self.check_health().await {
-                Ok(health) => return Ok(health),
-                Err(error) => error,
-            };
-            if started.elapsed() >= timeout {
-                return Err(error.context(format!(
-                    "gateway at {} not ready after {}s",
-                    self.endpoint,
-                    timeout.as_secs()
-                )));
+        let mut last_error = None;
+        let outcome = tokio::time::timeout(timeout, async {
+            loop {
+                match self.check_health().await {
+                    Ok(health) => return health,
+                    Err(error) => last_error = Some(error),
+                }
+                tokio::time::sleep(READY_INTERVAL).await;
             }
-            tokio::time::sleep(READY_INTERVAL).await;
-        }
+        })
+        .await;
+        outcome.map_err(|_| {
+            let message = format!(
+                "gateway at {} not ready after {}s",
+                self.endpoint,
+                timeout.as_secs()
+            );
+            match last_error.take() {
+                Some(error) => error.context(message),
+                None => Error::msg(message),
+            }
+        })
     }
 
     async fn check_health(&self) -> Result<Health> {
@@ -223,4 +234,35 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     std::fs::read(path)
         .map_err(Error::from_display)
         .context(format!("read {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    use super::Gateway;
+
+    /// A peer that accepts connections and never answers must not hang the
+    /// readiness wait: the timeout covers the connect and health calls too.
+    #[tokio::test]
+    async fn wait_ready_gives_up_on_a_gateway_that_never_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        std::thread::spawn(move || {
+            // Hold every connection open without reading or replying.
+            let held: Vec<_> = listener.incoming().flatten().collect();
+            drop(held);
+        });
+
+        let gateway = Gateway::from_endpoint(endpoint, "default".to_string());
+        let started = Instant::now();
+        let error = gateway
+            .wait_ready(Duration::from_secs(1))
+            .await
+            .expect_err("an unresponsive gateway is not ready");
+
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(error.to_string().contains("not ready after 1s"), "{error}");
+    }
 }

@@ -153,16 +153,24 @@ impl Context {
     /// others and cleanup takes about one timeout however many there are.
     pub(crate) async fn cleanup(&self) -> Vec<String> {
         let names: Vec<String> = lock(&self.sandboxes).iter().cloned().collect();
+        // The timeout wraps the whole delete, not just the wait for it, so a
+        // gateway that never answers the delete cannot hang cleanup.
         let results = futures::future::join_all(names.iter().map(|name| async move {
-            self.client
-                .delete_sandbox(
-                    name,
-                    DeleteOptions {
-                        allow_missing: true,
-                    },
-                )
-                .await?;
-            self.client.wait_deleted(name, CLEANUP_TIMEOUT, None).await
+            let delete = async {
+                self.client
+                    .delete_sandbox(
+                        name,
+                        DeleteOptions {
+                            allow_missing: true,
+                        },
+                    )
+                    .await?;
+                self.client.wait_deleted(name, CLEANUP_TIMEOUT, None).await
+            };
+            match tokio::time::timeout(CLEANUP_TIMEOUT, delete).await {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err(format!("timed out after {}s", CLEANUP_TIMEOUT.as_secs())),
+            }
         }))
         .await;
         let mut failures = Vec::new();
