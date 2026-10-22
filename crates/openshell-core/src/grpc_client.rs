@@ -370,7 +370,6 @@ impl tonic::service::Interceptor for AuthInterceptor {
     }
 }
 
-
 /// Configure server-authenticated TLS for the gateway control-plane endpoint.
 ///
 /// Trust only the configured gateway CA. Destination, system, and proxy
@@ -388,7 +387,6 @@ fn configure_gateway_tls(
         .into_diagnostic()
         .wrap_err("failed to configure TLS")
 }
-
 
 /// Build the plain (un-intercepted) gRPC channel.
 ///

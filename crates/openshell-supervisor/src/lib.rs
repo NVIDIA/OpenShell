@@ -4622,8 +4622,6 @@ mod tests {
             bindings,
             None,
             None,
-            None,
-            None,
         )
         .await
         .expect_err("missing admission cannot authorize startup");
