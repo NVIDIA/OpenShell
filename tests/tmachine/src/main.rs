@@ -5,11 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use config::{Config, Environment, Installer, Machine};
-
-mod ansible;
-mod config;
-mod qemu;
+use tmachine::config::{Config, Environment, Installer, Machine};
+use tmachine::{install, setup, test};
 
 #[derive(Parser)]
 #[command(name = "tmachine")]
@@ -40,12 +37,14 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    // A SIGTERM from CI cancellation must not leave QEMU holding the SSH port.
+    tmachine::cleanup_on_signals();
     let config = Config::load(&cli.config)?;
 
     match cli.command {
         Command::Setup { environment } => {
             let (machine, environment) = find_environment(&config, &environment)?;
-            qemu::setup(&machine, &environment).await?;
+            setup(&machine, &environment).await?;
         }
         Command::Install {
             environment,
@@ -53,7 +52,7 @@ async fn main() -> Result<()> {
         } => {
             let (machine, environment) = find_environment(&config, &environment)?;
             let installer = find_installer(&config, &installer)?;
-            qemu::install(&machine, &environment, &installer).await?;
+            install(&machine, &environment, &installer).await?;
         }
         Command::Test {
             environment,
@@ -67,7 +66,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .find(|candidate| candidate.name == testsuite)
                 .with_context(|| format!("testsuite {testsuite:?} is not defined"))?;
-            qemu::test(&machine, &environment, &installer, testsuite).await?;
+            test(&machine, &environment, &installer, testsuite).await?;
         }
     }
 
