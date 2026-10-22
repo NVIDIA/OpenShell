@@ -1028,6 +1028,9 @@ impl KubernetesComputeDriver {
         };
 
         let shared_supervisor = config.shared_supervisor.clone().map(SharedSupervisor::new);
+        if let Some(shared) = &shared_supervisor {
+            shared.spawn_token_secret_writer(client.clone(), shutdown_rx.clone());
+        }
         if shared_supervisor.is_some()
             && (config.supervisor_otlp_endpoint.is_some()
                 || config.supervisor_ocsf_export.is_some())

@@ -6,8 +6,10 @@
 //!
 //! The gateway owns the desired set of sandbox instances a shared supervisor
 //! runs. A compute driver publishes that set here; the gateway's gRPC server
-//! hands each authenticated host stream to [`SupervisorHostController::attach`],
-//! which sends complete snapshots and records what the host reports.
+//! hands each host stream authenticated by a supervisor token to
+//! [`SupervisorHostController::attach`], which sends complete snapshots and
+//! records what the host reports. The gateway also mints that token and
+//! publishes each renewal here for the driver to deliver to the host.
 //!
 //! Desired state is uninitialized until the driver has derived it from its
 //! durable records once. Nothing is sent before that, so a restarted gateway
@@ -23,9 +25,8 @@
 //! delayed hello from an older connection of the current process is refused.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
 use tokio_stream::StreamExt as _;
@@ -57,13 +58,28 @@ pub const MAX_ASSIGNED_INSTANCES: usize = 256;
 /// instances still being removed.
 pub const MAX_REPORTED_INSTANCES: usize = 4 * MAX_ASSIGNED_INSTANCES;
 
-/// Verified identity of a connected supervisor host.
+/// Verified identity of a connected supervisor host: the claims of the
+/// supervisor token that authenticated its stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostIdentity {
-    /// Subject common name of the host certificate.
+    /// Subject of the supervisor token (`openshell-supervisor:<gateway_id>`).
     pub subject: String,
-    /// SHA-256 fingerprint of the verified host certificate.
-    pub certificate_sha256: String,
+    /// `jti` of the supervisor token.
+    pub token_id: String,
+    /// `exp` of the supervisor token (Unix seconds). The gateway ends the
+    /// stream when it passes; the host reconnects with a renewed token.
+    pub expires_at: i64,
+}
+
+/// The current supervisor token, as the gateway mints and renews it.
+///
+/// A compute driver delivers it to the supervisor process by whatever means
+/// its deployment packaging provides; the Kubernetes driver writes a Secret.
+#[derive(Clone, Debug)]
+pub struct SupervisorCredential {
+    pub token: crate::jwt::SecretJwt,
+    /// Unix seconds.
+    pub expires_at: i64,
 }
 
 /// What the gateway knows about one assigned route on the host.
@@ -146,8 +162,9 @@ struct Observed {
 }
 
 struct Inner {
-    trust_anchor: PathBuf,
     desired: Mutex<Desired>,
+    /// Latest supervisor token the gateway minted; `None` until the first.
+    credential: watch::Sender<Option<SupervisorCredential>>,
     /// Current desired revision; 0 while uninitialized.
     revision: watch::Sender<u64>,
     observed: Mutex<Observed>,
@@ -160,11 +177,16 @@ pub struct SupervisorHostController {
     inner: Arc<Inner>,
 }
 
+impl Default for SupervisorHostController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl std::fmt::Debug for SupervisorHostController {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SupervisorHostController")
-            .field("trust_anchor", &self.inner.trust_anchor)
             .finish_non_exhaustive()
     }
 }
@@ -189,24 +211,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl SupervisorHostController {
-    /// A controller whose hosts authenticate with certificates issued by the
-    /// CA at `trust_anchor`.
     #[must_use]
-    pub fn new(trust_anchor: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
-                trust_anchor,
                 desired: Mutex::new(Desired::default()),
+                credential: watch::Sender::new(None),
                 revision: watch::Sender::new(0),
                 observed: Mutex::new(Observed::default()),
             }),
         }
     }
 
-    /// PEM CA certificate that issues supervisor host client certificates.
+    /// Publish a freshly minted supervisor token for delivery to the host.
+    pub fn publish_credential(&self, credential: SupervisorCredential) {
+        self.inner.credential.send_replace(Some(credential));
+    }
+
+    /// The current supervisor token and every renewal after it.
     #[must_use]
-    pub fn trust_anchor_path(&self) -> &Path {
-        &self.inner.trust_anchor
+    pub fn credential(&self) -> watch::Receiver<Option<SupervisorCredential>> {
+        self.inner.credential.subscribe()
     }
 
     /// The driver has derived the complete desired set at least once.
@@ -403,6 +428,7 @@ impl SupervisorHostController {
             ));
         }
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
+        let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
         tx.send(Ok(HostGatewayMessage {
             payload: Some(host_gateway_message::Payload::Accepted(HostAccepted {
@@ -418,7 +444,7 @@ impl SupervisorHostController {
         let controller = self.clone();
         tokio::spawn(async move {
             controller
-                .run_session(session_id, inbound, tx, superseded)
+                .run_session(session_id, expires_at, inbound, tx, superseded)
                 .await;
             controller.end_session(session_id);
         });
@@ -533,10 +559,16 @@ impl SupervisorHostController {
     async fn run_session(
         &self,
         session_id: u64,
+        expires_at: i64,
         mut inbound: Streaming<HostMessage>,
         tx: mpsc::Sender<Result<HostGatewayMessage, Status>>,
         mut superseded: watch::Receiver<bool>,
     ) {
+        // A bearer is verified once per stream, so the stream lives no longer
+        // than the token did. Hosted instances are unaffected; the host
+        // reconnects with the renewed token it has been delivered.
+        let credential_expiry = tokio::time::sleep(credential_remaining(expires_at));
+        tokio::pin!(credential_expiry);
         let mut revision = self.inner.revision.subscribe();
         let mut sent_revision = 0;
         let mut last_heard = tokio::time::Instant::now();
@@ -619,9 +651,23 @@ impl SupervisorHostController {
                     }
                 }
                 _ = superseded.changed() => return,
+                () = &mut credential_expiry => {
+                    tracing::info!(session = session_id, "supervisor token expired; closing the stream for reconnection");
+                    return;
+                }
             }
         }
     }
+}
+
+/// Time until `expires_at` (Unix seconds); zero once it has passed.
+fn credential_remaining(expires_at: i64) -> Duration {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+        });
+    Duration::from_secs(u64::try_from(expires_at.saturating_sub(now)).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -656,7 +702,7 @@ mod tests {
 
     #[test]
     fn full_resyncs_initialize_once_and_then_compare_and_replace() {
-        let controller = SupervisorHostController::new(PathBuf::from("/ca.crt"));
+        let controller = SupervisorHostController::new();
         let revision = controller.inner.revision.subscribe();
         // Edits before the first full list wait for it.
         controller
@@ -738,15 +784,16 @@ mod tests {
 
     #[test]
     fn sessions_fence_stale_streams_epochs_and_acks() {
-        let controller = SupervisorHostController::new(PathBuf::from("/ca.crt"));
+        let controller = SupervisorHostController::new();
         controller
             .replace_assignments(0, [assignment("rt-a", b"a")])
             .unwrap();
         assert_eq!(controller.observed("rt-a"), ObservedInstance::NoHost);
 
         let identity = HostIdentity {
-            subject: "host".to_string(),
-            certificate_sha256: "00".to_string(),
+            subject: "openshell-supervisor:test".to_string(),
+            token_id: "token".to_string(),
+            expires_at: i64::MAX,
         };
         let hello = |instance_id: &str, connection_epoch| HostHello {
             instance_id: instance_id.to_string(),

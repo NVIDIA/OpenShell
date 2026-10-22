@@ -197,9 +197,17 @@ fails closed.
   `openshell_core::supervisor_host::SupervisorHostController`, installed into
   the gateway through the compute-driver build context, and the gateway serves
   it to the supervisor over the private `openshell.supervisor.host.v1` stream.
-  The supervisor dials the gateway with a client certificate issued by the CA
-  at `shared_supervisor.host_ca_file`; that identity authorizes only the
-  assignment stream.
+  The supervisor dials the gateway over TLS with a gateway-minted supervisor
+  token (see the `openshell-supervisor` README); that token authorizes only
+  the assignment stream.
+- **Supervisor token delivery.** The gateway mints the supervisor token from
+  its `gateway_jwt` signing key and renews it at half its lifetime (the
+  `gateway_jwt` extension-token TTL, 15 minutes by default, bounded to one
+  hour). The driver's part is delivery only: it watches the controller for
+  each renewal and replaces the `token` key of the chart-created
+  `shared_supervisor.token_secret_name` Secret in `service_namespace`, which
+  the supervisor Pod mounts. A missing Secret or a denied patch is logged and
+  retried; a token published while a retry waits supersedes the retry.
 - **Create and start.** The driver creates a per-sandbox egress allowance
   `os-shared-control-<id>` from the workload Pod to the Pods the shared
   supervisor's Service selects, on the runtime port, binds its UID and
@@ -226,11 +234,12 @@ fails closed.
   its assignments before it sends anything. The rebuild is compare-and-replace
   against the revision read before the list, so it never undoes a lifecycle
   edit that raced it.
-- **Isolation.** The host certificate is separate from every instance's
-  credentials and from the ordinary client CA; the gateway refuses it on every
-  other RPC and refuses every other identity on the assignment stream.
-  Sandboxes cannot reach the stream, and the routing preface only selects
-  which generation-pinned TLS identity the supervisor demands.
+- **Isolation.** The supervisor token is a profile of its own, separate from
+  every instance's credentials; the gateway refuses it on every other RPC and
+  refuses every other identity on the assignment stream, and ends a stream
+  when the token that opened it expires. Sandboxes cannot reach the stream,
+  and the routing preface only selects which generation-pinned TLS identity
+  the supervisor demands.
 
 The topology does not support upstream proxies or provider SPIFFE identity, and
 the shared supervisor is a single point of failure for the sandboxes it hosts.

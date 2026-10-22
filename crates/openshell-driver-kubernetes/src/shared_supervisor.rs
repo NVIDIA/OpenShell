@@ -14,19 +14,28 @@
 //! set is the generation's Sandbox resource plus its launch Secret, so a
 //! restarted gateway rebuilds it before publishing anything, and a full
 //! resync is compare-and-replace against the revision it started from.
+//!
+//! The gateway also mints the supervisor token the supervisor presents on
+//! that stream and publishes each renewal into the controller; the driver's
+//! only part in authentication is delivery, writing the current token into
+//! the Secret the supervisor Pod mounts.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::time::Duration;
 
+use k8s_openapi::api::core::v1::Secret;
+use kube::api::{Api, ObjectMeta, Patch, PatchParams};
 use kube::core::DynamicObject;
 use openshell_core::proto::supervisor_host::v1::{
     SandboxInstanceAssignment, SandboxInstanceStatus,
 };
 use openshell_core::supervisor_host::{
-    AssignmentError, ObservedInstance, SupervisorHostController,
+    AssignmentError, ObservedInstance, SupervisorCredential, SupervisorHostController,
 };
 use openshell_sandbox_backend::sandbox_instance::{
     SandboxInstanceRegistration, SandboxInstanceStatusReport,
 };
+use tracing::{info, warn};
 
 use crate::config::SharedSupervisorConfig;
 use crate::driver::KubernetesDriverError;
@@ -38,6 +47,11 @@ pub const ANNOTATION_SUPERVISOR_TOPOLOGY: &str = "openshell.ai/sandbox-runtime-s
 /// annotation key keeps its established `-session` name.
 pub const ANNOTATION_SUPERVISOR_SESSION: &str = "openshell.ai/sandbox-runtime-supervisor-session";
 pub const GATEWAY_TOPOLOGY: &str = "gateway";
+/// Key of the supervisor token in `shared_supervisor.token_secret_name`.
+pub const TOKEN_SECRET_KEY: &str = "token";
+/// Annotation recording the token's expiry (Unix seconds) for operators.
+pub const ANNOTATION_TOKEN_EXPIRES_AT: &str = "openshell.ai/supervisor-token-expires-at";
+const TOKEN_WRITE_RETRY: Duration = Duration::from_secs(5);
 
 /// Where a generation's supervisor runs, as recorded when it started.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,8 +103,74 @@ pub struct SharedSupervisor {
 
 impl SharedSupervisor {
     pub fn new(config: SharedSupervisorConfig) -> Self {
-        let controller = SupervisorHostController::new(PathBuf::from(&config.host_ca_file));
-        Self { config, controller }
+        Self {
+            config,
+            controller: SupervisorHostController::new(),
+        }
+    }
+
+    /// Keep the supervisor token Secret current with every token the gateway
+    /// publishes, until shutdown. The Secret itself is deployment packaging
+    /// (the chart creates it empty); the driver only replaces its token. A
+    /// failed write is retried until it succeeds or a newer token supersedes
+    /// it.
+    pub fn spawn_token_secret_writer(
+        &self,
+        client: kube::Client,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        let secrets = Api::<Secret>::namespaced(client, &self.config.service_namespace);
+        let name = self.config.token_secret_name.clone();
+        let mut credential = self.controller.credential();
+        tokio::spawn(async move {
+            loop {
+                let current = credential.borrow_and_update().clone();
+                if let Some(current) = current {
+                    while let Err(error) = write_token_secret(&secrets, &name, &current).await {
+                        match &error {
+                            kube::Error::Api(response) if response.code == 404 => warn!(
+                                secret = %name,
+                                "the supervisor token Secret does not exist; the chart creates it, \
+                                 restore it (helm upgrade) so the shared supervisor can authenticate"
+                            ),
+                            kube::Error::Api(response) if response.code == 403 => warn!(
+                                secret = %name,
+                                "the gateway may not patch the supervisor token Secret; check the \
+                                 chart's gateway Role"
+                            ),
+                            _ => warn!(
+                                secret = %name,
+                                %error,
+                                "failed to write the supervisor token Secret; retrying"
+                            ),
+                        }
+                        tokio::select! {
+                            () = tokio::time::sleep(TOKEN_WRITE_RETRY) => {}
+                            changed = shutdown_rx.changed() => {
+                                if changed.is_err() || *shutdown_rx.borrow() {
+                                    return;
+                                }
+                            }
+                        }
+                        if credential.has_changed().unwrap_or(true) {
+                            break;
+                        }
+                    }
+                }
+                tokio::select! {
+                    changed = credential.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn config(&self) -> &SharedSupervisorConfig {
@@ -160,6 +240,37 @@ impl SharedSupervisor {
 #[must_use]
 pub fn reported(status: &SandboxInstanceStatus) -> SandboxInstanceStatusReport {
     SandboxInstanceStatusReport::from_proto(status)
+}
+
+/// Replace the token in the chart-created Secret.
+async fn write_token_secret(
+    secrets: &Api<Secret>,
+    name: &str,
+    credential: &SupervisorCredential,
+) -> Result<(), kube::Error> {
+    let secret = Secret {
+        metadata: ObjectMeta {
+            annotations: Some(BTreeMap::from([(
+                ANNOTATION_TOKEN_EXPIRES_AT.to_string(),
+                credential.expires_at.to_string(),
+            )])),
+            ..ObjectMeta::default()
+        },
+        string_data: Some(BTreeMap::from([(
+            TOKEN_SECRET_KEY.to_string(),
+            credential.token.expose_secret().to_string(),
+        )])),
+        ..Secret::default()
+    };
+    secrets
+        .patch(name, &PatchParams::default(), &Patch::Merge(&secret))
+        .await?;
+    info!(
+        secret = %name,
+        expires_at = credential.expires_at,
+        "wrote the supervisor token Secret"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

@@ -32,10 +32,10 @@ pub enum Principal {
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
     /// Gateway replica authenticated for internal peer RPCs.
     Peer(PeerPrincipal),
-    /// The gateway's shared supervisor host, authenticated at the connection
-    /// level by a certificate from the host CA. It may call only the
-    /// supervisor host stream and never acts for a user or a sandbox.
-    SupervisorHost(SupervisorHostPrincipal),
+    /// The gateway's shared supervisor, authenticated by a gateway-minted
+    /// supervisor token. It may call only the supervisor assignment stream
+    /// and never acts for a user or a sandbox.
+    Supervisor(SupervisorPrincipal),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
     #[allow(dead_code)]
@@ -85,10 +85,10 @@ pub struct SandboxPrincipal {
     pub trust_domain: Option<String>,
 }
 
-/// Shared supervisor host caller.
+/// Shared supervisor caller.
 #[derive(Debug, Clone)]
-pub struct SupervisorHostPrincipal {
-    /// Verified host certificate identity.
+pub struct SupervisorPrincipal {
+    /// Claims of the verified supervisor token.
     pub identity: openshell_core::supervisor_host::HostIdentity,
 }
 
@@ -130,7 +130,7 @@ impl Principal {
             Self::Operator(operator) => format!("operator:{}", operator.identity.subject),
             Self::Sandbox(sandbox) => format!("sandbox:{}", sandbox.sandbox_id),
             Self::Peer(peer) => format!("peer:{}", peer.replica_id),
-            Self::SupervisorHost(host) => format!("supervisor-host:{}", host.identity.subject),
+            Self::Supervisor(supervisor) => format!("supervisor:{}", supervisor.identity.subject),
             Self::Anonymous => "anonymous".to_string(),
         }
     }

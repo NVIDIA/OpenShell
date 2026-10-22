@@ -4,10 +4,9 @@
 //! The private `openshell.supervisor.host.v1` service: the gateway end of the
 //! shared supervisor's assignment stream.
 //!
-//! The router admits only connections whose client certificate verified
-//! against the supervisor host CA, so the handler sees a
-//! [`Principal::SupervisorHost`] and hands the stream to the controller the
-//! in-process compute driver installed.
+//! The router admits only requests bearing a verified supervisor token, so
+//! the handler sees a [`Principal::Supervisor`] and hands the stream to the
+//! controller the in-process compute driver installed.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -45,10 +44,10 @@ impl SupervisorHost for SupervisorHostService {
         request: Request<Streaming<HostMessage>>,
     ) -> Result<Response<Self::AttachStream>, Status> {
         let identity = match request.extensions().get::<Principal>() {
-            Some(Principal::SupervisorHost(host)) => host.identity.clone(),
+            Some(Principal::Supervisor(supervisor)) => supervisor.identity.clone(),
             _ => {
                 return Err(Status::permission_denied(
-                    "the supervisor host stream requires a supervisor host certificate",
+                    "the supervisor assignment stream requires a supervisor token",
                 ));
             }
         };

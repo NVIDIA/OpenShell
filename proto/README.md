@@ -92,8 +92,9 @@ identifies the service being exposed.
 a gateway and the supervisor process it shares among its sandboxes: the
 supervisor attaches, the gateway sends complete assignment snapshots, and the
 supervisor reports what it hosts. It is a version-locked deployment protocol
-served on the gateway listener but authorized only for the supervisor host
-certificate. It is not imported by `openshell.proto`, so SDK generation and
+served on the gateway listener but authorized only for the gateway-minted
+supervisor token (`auth_mode: "supervisor"`). It is not imported by
+`openshell.proto`, so SDK generation and
 gRPC reflection exclude it; the server's schema inventory test classifies it
 explicitly. `SandboxInstanceAssignment.launch_material` carries the existing
 JSON sandbox instance registration of `openshell-sandbox-backend` and is

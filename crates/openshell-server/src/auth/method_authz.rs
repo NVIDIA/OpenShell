@@ -26,9 +26,9 @@ pub enum AuthMode {
     Peer,
     /// Only a verified mTLS operator may call this method.
     Operator,
-    /// Only the gateway's shared supervisor host, authenticated by its
-    /// gateway-scoped host certificate, may call this method.
-    SupervisorHost,
+    /// Only the gateway's shared supervisor, authenticated by its
+    /// gateway-minted supervisor token, may call this method.
+    Supervisor,
 }
 
 /// Coarse role mapping. Maps to the configured `admin_role` /
@@ -98,7 +98,7 @@ pub fn is_user_callable(method: &str) -> bool {
             | AuthMode::Unauthenticated
             | AuthMode::Peer
             | AuthMode::Operator
-            | AuthMode::SupervisorHost,
+            | AuthMode::Supervisor,
         ) => false,
         Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
     }
@@ -119,13 +119,13 @@ pub fn is_peer_callable(method: &str) -> bool {
     matches!(lookup(method).map(|m| m.auth_mode), Some(AuthMode::Peer))
 }
 
-/// `true` if the method is callable by the shared supervisor host, and by
-/// nothing else.
+/// `true` if the method is callable by the shared supervisor, and by nothing
+/// else.
 #[must_use]
-pub fn is_supervisor_host_callable(method: &str) -> bool {
+pub fn is_supervisor_callable(method: &str) -> bool {
     matches!(
         lookup(method).map(|m| m.auth_mode),
-        Some(AuthMode::SupervisorHost)
+        Some(AuthMode::Supervisor)
     )
 }
 
@@ -190,14 +190,15 @@ mod tests {
             assert!(!is_user_callable(path));
             assert!(is_peer_callable(path));
         }
-        // The supervisor host stream is reachable only with a host identity.
+        // The supervisor assignment stream is reachable only with a
+        // supervisor token.
         let host_attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
-        assert!(is_supervisor_host_callable(host_attach));
+        assert!(is_supervisor_callable(host_attach));
         assert!(!is_user_callable(host_attach));
         assert!(!is_operator_callable(host_attach));
         assert!(!is_sandbox_callable(host_attach));
         assert!(!is_peer_callable(host_attach));
-        assert!(!is_supervisor_host_callable(
+        assert!(!is_supervisor_callable(
             "/openshell.v1.OpenShell/ConnectSupervisor"
         ));
         // Unauthenticated methods are not "user callable" — they're

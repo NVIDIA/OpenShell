@@ -761,7 +761,6 @@ async fn real_tls_operator_boundary_and_admin_capabilities() {
                             identity,
                             fingerprint,
                             crate::auth::audit::ConnectionSource::Peer(peer),
-                            None,
                         )
                         .await;
                 }

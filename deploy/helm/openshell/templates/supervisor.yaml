@@ -13,10 +13,11 @@
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
 # One supervisor process hosting a sandbox instance per sandbox generation.
-# The process dials the gateway with its host certificate and receives its
-# assignments from it; nothing but sandbox runtimes and kubelet probes connect
-# to it. The Pod holds no Kubernetes identity of its own: each instance acts
-# only with the credentials the gateway issued for its generation.
+# The process dials the gateway over TLS with the supervisor token the gateway
+# mints for it and receives its assignments from it; nothing but sandbox
+# runtimes and kubelet probes connect to it. The Pod holds no Kubernetes
+# identity of its own: each instance acts only with the credentials the
+# gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -61,8 +62,8 @@ spec:
             - {{ $endpoint | quote }}
             - --address
             - 0.0.0.0:5501
-            - --host-tls-dir
-            - /etc/openshell/supervisor-host
+            - --token-file
+            - /etc/openshell/supervisor-token/token
             - --runtime-listen
             - 0.0.0.0:{{ get $shared "runtime_port" }}
             - --session-root
@@ -112,8 +113,8 @@ spec:
               mountPath: /run/openshell
             - name: logs
               mountPath: /var/log
-            - name: supervisor-host
-              mountPath: /etc/openshell/supervisor-host
+            - name: supervisor-token
+              mountPath: /etc/openshell/supervisor-token
               readOnly: true
             {{- if $gatewayTls }}
             - name: gateway-ca
@@ -125,9 +126,9 @@ spec:
           emptyDir: {}
         - name: logs
           emptyDir: {}
-        - name: supervisor-host
+        - name: supervisor-token
           secret:
-            secretName: {{ $name }}-host
+            secretName: {{ $name }}-token
         {{- if $gatewayTls }}
         - name: gateway-ca
           secret:
@@ -190,4 +191,18 @@ spec:
   egress:
     - {}
 {{- end }}
+---
+# Delivery of the gateway-minted supervisor token. The chart creates the
+# Secret empty; the gateway replaces its `token` on every renewal, and the
+# supervisor re-reads the mounted file on each connection attempt. Helm
+# upgrades leave the live token in place.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $name }}-token
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+type: Opaque
 {{- end }}

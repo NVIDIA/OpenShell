@@ -241,12 +241,59 @@ fn spawn_gateway_extension_token_refresh(
         }
     });
 }
+
+/// Mint the shared supervisor's token and renew it at half its lifetime so
+/// the delivered copy is never close to expiry when the supervisor restarts
+/// or reconnects. Minting failures are logged and retried shortly.
+fn spawn_supervisor_token_refresh(
+    authority: Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>,
+    ttl: Duration,
+    controller: openshell_core::supervisor_host::SupervisorHostController,
+    mut shutdown_rx: watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        loop {
+            let delay = match authority.mint_supervisor_token(ttl) {
+                Ok(minted) => {
+                    let remaining = minted.expires_at.saturating_sub(
+                        i64::try_from(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map_or(0, |elapsed| elapsed.as_secs()),
+                        )
+                        .unwrap_or(i64::MAX),
+                    );
+                    controller.publish_credential(
+                        openshell_core::supervisor_host::SupervisorCredential {
+                            token: minted.token,
+                            expires_at: minted.expires_at,
+                        },
+                    );
+                    Duration::from_secs(u64::try_from(remaining).unwrap_or(0) / 2)
+                        .max(Duration::from_secs(1))
+                }
+                Err(error) => {
+                    warn!(%error, "failed to mint the supervisor token; retrying");
+                    Duration::from_secs(10)
+                }
+            };
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
 pub use auth::audit::ConnectionSource;
 pub use multiplex::{MultiplexService, MultiplexedService};
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
 use sandbox_watch::SandboxWatchBus;
-pub use tls::{PeerRealm, TlsAcceptor, TlsHandshake};
+pub use tls::TlsAcceptor;
 use tracing_bus::TracingLogBus;
 
 pub(crate) struct ServerStartupConfig {
@@ -744,6 +791,37 @@ pub(crate) async fn run_server(
     if let Some(issuer) = extension_jwt_issuer {
         spawn_gateway_extension_token_refresh(issuer, gateway_extension_credentials);
     }
+    // The shared supervisor authenticates with a token this gateway mints
+    // from its launch-signing key and carries only over TLS, so the topology
+    // needs both.
+    if let Some(controller) = state.compute.supervisor_host() {
+        let (authority, jwt) = state
+            .sandbox_session_jwt_authority
+            .clone()
+            .zip(config.gateway_jwt.as_ref())
+            .ok_or_else(|| {
+                Error::config(
+                    "the shared supervisor requires gateway_jwt signing material to mint \
+                     supervisor tokens; configure [openshell.gateway.gateway_jwt] or disable \
+                     supervisor_topology",
+                )
+            })?;
+        if config.tls.is_none() {
+            return Err(Error::config(
+                "the shared supervisor requires gateway TLS; its token travels only over TLS. \
+                 Enable TLS or disable supervisor_topology",
+            ));
+        }
+        let ttl = jwt.token_ttl().clamp(
+            openshell_core::jwt::MIN_SESSION_TOKEN_TTL,
+            openshell_core::jwt::MAX_SESSION_TOKEN_TTL,
+        );
+        info!(
+            ttl_secs = ttl.as_secs(),
+            "shared supervisor assignment stream enabled; minting supervisor tokens"
+        );
+        spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
+    }
 
     if state.sandbox_session_jwt_authority.is_some()
         && state.compute.supports_sandbox_authentication()
@@ -933,7 +1011,6 @@ pub(crate) async fn run_server(
     }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
-    let supervisor_host = state.compute.supervisor_host();
     let tls_acceptor = if let Some(tls) = &config.tls {
         let acceptor = TlsAcceptor::from_files(
             &tls.cert_path,
@@ -944,19 +1021,6 @@ pub(crate) async fn run_server(
             tls.external_key_path.as_deref(),
             tls.external_server_names.clone(),
         )?;
-        // The shared supervisor host authenticates with a client certificate
-        // from its own CA; the handshake accepts it and the connection is
-        // classified as a host, never as a user.
-        let acceptor = match supervisor_host {
-            Some(host) => {
-                info!(
-                    trust_anchor = %host.trust_anchor_path().display(),
-                    "shared supervisor host assignment stream enabled"
-                );
-                acceptor.with_supervisor_host_ca(host.trust_anchor_path())?
-            }
-            None => acceptor,
-        };
 
         // Spawn file-watcher-based TLS certificate reload worker.
         // Watches parent directories of cert/key/CA files and atomically
@@ -964,10 +1028,6 @@ pub(crate) async fn run_server(
         acceptor.spawn_reload_worker(shutdown_rx.clone());
 
         Some(acceptor)
-    } else if supervisor_host.is_some() {
-        return Err(Error::config(
-            "the shared supervisor host requires gateway TLS; enable TLS or disable supervisor_topology",
-        ));
     } else {
         info!("TLS disabled — accepting plaintext connections");
         None
@@ -1208,30 +1268,12 @@ fn spawn_gateway_connection(
                     );
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
-                    // acceptor.handshake() snapshots the current TLS config
-                    // and verifiers together; the snapshot stays alive for
-                    // the handshake and classifies its result.
-                    let handshake = acceptor.handshake();
-                    match handshake.accept(stream).await {
+                    // acceptor.acceptor() snapshots the current TLS config;
+                    // the returned acceptor owns an Arc that stays alive for
+                    // the full duration of the handshake.
+                    match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
-                            // A presented certificate must belong to exactly
-                            // one realm; anything else closes the connection.
-                            let (peer_identity, supervisor_host) = match handshake
-                                .classify(&tls_stream)
-                            {
-                                Ok(PeerRealm::Anonymous) => (None, None),
-                                Ok(PeerRealm::Client) => {
-                                    (multiplex::extract_peer_identity(&tls_stream), None)
-                                }
-                                Ok(PeerRealm::SupervisorHost(identity)) => (
-                                    None,
-                                    Some(auth::principal::SupervisorHostPrincipal { identity }),
-                                ),
-                                Err(e) => {
-                                    warn!(error = %e, client = %addr, "Rejected client certificate");
-                                    return;
-                                }
-                            };
+                            let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             let certificate_sha256 =
                                 match multiplex::extract_peer_certificate_sha256(&tls_stream) {
                                     Ok(fingerprint) => fingerprint,
@@ -1246,7 +1288,6 @@ fn spawn_gateway_connection(
                                     peer_identity,
                                     certificate_sha256,
                                     ConnectionSource::Peer(addr),
-                                    supervisor_host,
                                 )
                                 .await
                             {
@@ -1658,10 +1699,10 @@ pub struct ComputeDriverBuildContext<'a> {
 }
 
 impl ComputeDriverBuildContext<'_> {
-    /// Let the gateway serve the shared supervisor host whose desired
-    /// assignments this in-process driver owns. The gateway adds the
-    /// controller's trust anchor to its TLS client roots and routes
-    /// authenticated host streams to it.
+    /// Let the gateway serve the shared supervisor whose desired assignments
+    /// this in-process driver owns. The gateway mints the supervisor token,
+    /// publishes each renewal into the controller for the driver to deliver,
+    /// and routes streams authenticated by that token to it.
     pub fn install_supervisor_host(
         &self,
         controller: openshell_core::supervisor_host::SupervisorHostController,

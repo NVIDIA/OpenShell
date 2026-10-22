@@ -564,6 +564,15 @@ pub async fn connect_channel_pub(gateway: &GatewayEndpoint) -> Result<AuthedChan
     connect_channel(gateway).await
 }
 
+/// Build a credential-free gateway channel for callers that attach their own bearer.
+///
+/// Uses the supervisor-side transport settings: server-authenticated TLS from
+/// `OPENSHELL_TLS_CA` and `OPENSHELL_GATEWAY_TLS_SERVER_NAME` for `https`
+/// endpoints, plaintext for `http` ones.
+pub async fn connect_gateway_channel(endpoint: &str) -> Result<Channel> {
+    build_plain_channel(endpoint).await
+}
+
 /// Report installed provider state for the current authenticated supervisor session.
 ///
 /// The observation must carry the session ID returned by `ConnectSupervisor`.

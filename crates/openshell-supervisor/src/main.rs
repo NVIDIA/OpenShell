@@ -69,10 +69,11 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     address: Option<std::net::SocketAddr>,
 
-    /// Directory with the shared supervisor's host client certificate
-    /// (`tls.crt`, `tls.key`) for its outbound gateway connection.
+    /// File holding the supervisor token the gateway issues for the shared
+    /// supervisor's assignment stream. Re-read on every connection attempt,
+    /// so a renewed token takes effect without a restart.
     #[arg(long, required_if_eq("mode", "shared"))]
-    host_tls_dir: Option<PathBuf>,
+    token_file: Option<PathBuf>,
 
     /// Listener for routed runtime-initiated Sandbox Protocol connections.
     #[arg(long, required_if_eq("mode", "shared"))]
@@ -407,7 +408,7 @@ fn main() -> Result<()> {
     }
     if args.gateway_endpoint.is_some()
         || args.address.is_some()
-        || args.host_tls_dir.is_some()
+        || args.token_file.is_some()
         || args.runtime_listen.is_some()
         || args.session_root.is_some()
     {

@@ -207,10 +207,10 @@ pub async fn authorize_workspace(
             workspace,
             grant: AuthGrant::Sandbox,
         }),
-        Principal::Peer(_) | Principal::SupervisorHost(_) => Err(deny(
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(deny(
             principal,
             AuthzDenial::MethodNotPermitted,
-            "gateway peer and supervisor host principals cannot perform workspace operations",
+            "gateway peer and supervisor principals cannot perform workspace operations",
         )),
         Principal::Anonymous => Err(Status::unauthenticated("authentication required")),
     }
@@ -244,8 +244,8 @@ pub fn require_platform_admin(admin_role: &str, principal: &Principal) -> Result
         }
         Principal::User(_) => "platform admin role required for cross-workspace operations",
         Principal::Sandbox(_) => "sandbox principals cannot perform cross-workspace operations",
-        Principal::Peer(_) | Principal::SupervisorHost(_) => {
-            "gateway peer and supervisor host principals cannot perform cross-workspace operations"
+        Principal::Peer(_) | Principal::Supervisor(_) => {
+            "gateway peer and supervisor principals cannot perform cross-workspace operations"
         }
         Principal::Anonymous => return Err(Status::unauthenticated("authentication required")),
     };

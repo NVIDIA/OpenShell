@@ -4,9 +4,11 @@
 //! Gateway-minted session and extension JWTs.
 //!
 //! [`SandboxSessionJwtAuthority`] mints and verifies generation-bound sandbox
-//! session tokens. [`ExtensionJwtIssuer`] mints explicitly typed credentials
-//! for supervisor middleware and gateway interceptors and publishes the
-//! corresponding JWKS metadata.
+//! session tokens, and with the same key the shared supervisor's token for
+//! the private assignment stream (its own `typ` and claims, see
+//! [`super::supervisor_token`]). [`ExtensionJwtIssuer`] mints explicitly
+//! typed credentials for supervisor middleware and gateway interceptors and
+//! publishes the corresponding JWKS metadata.
 //!
 //! Algorithm: `EdDSA` (Ed25519). Pinned via `Validation::algorithms` to
 //! prevent algorithm-confusion attacks.
@@ -35,9 +37,10 @@ use x509_parser::{oid_registry::OID_SIG_ED25519, prelude::FromDer, x509::Subject
 
 use openshell_core::SandboxSessionId;
 use openshell_core::jwt::{
-    AuthenticatedSandboxSession, CredentialEpoch, GATEWAY_SESSION_JWT_TYPE, SandboxId,
-    SandboxLaunchAuthentication, SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer,
-    SessionJwtVerifier, SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle,
+    AuthenticatedSandboxSession, AuthenticatedSupervisor, CredentialEpoch,
+    GATEWAY_SESSION_JWT_TYPE, MintedSessionToken, SandboxId, SandboxLaunchAuthentication,
+    SandboxRuntimeIdentity, SessionJwtError, SessionJwtIssuer, SessionJwtVerifier,
+    SessionTokenProfile, SessionVerificationKey, SupervisorAuthBundle, SupervisorJwtVerifier,
     SystemJwtClock,
 };
 use openshell_core::sandbox_generation::SandboxGenerationId;
@@ -102,6 +105,7 @@ pub struct MintedToken {
 pub struct SandboxSessionJwtAuthority {
     issuer: SessionJwtIssuer,
     gateway_verifier: SessionJwtVerifier,
+    supervisor_verifier: SupervisorJwtVerifier,
     gateway_id: String,
     verification_keys: Vec<SessionVerificationKey>,
 }
@@ -148,12 +152,16 @@ impl SandboxSessionJwtAuthority {
             gateway_id,
             SessionTokenProfile::Gateway,
             verification_keys.clone(),
-            clock,
+            clock.clone(),
         )
         .map_err(|error| error.to_string())?;
+        let supervisor_verifier =
+            SupervisorJwtVerifier::new(gateway_id, verification_keys.clone(), clock)
+                .map_err(|error| error.to_string())?;
         Ok(Self {
             issuer,
             gateway_verifier,
+            supervisor_verifier,
             gateway_id: gateway_id.to_string(),
             verification_keys,
         })
@@ -273,6 +281,34 @@ impl SandboxSessionJwtAuthority {
                 AuthMechanism::SandboxJwt,
                 session_failure_reason(&error),
                 Status::unauthenticated(format!("invalid gateway session: {error}")),
+            )
+        })
+    }
+
+    /// Mint the shared supervisor's token for the assignment stream. Its
+    /// lifetime is bounded on its own; the session lifetime may be
+    /// non-expiring.
+    pub fn mint_supervisor_token(
+        &self,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_token(ttl)
+    }
+
+    /// Verify a presented supervisor token.
+    pub fn verify_supervisor_token(
+        &self,
+        token: &str,
+    ) -> Result<AuthenticatedSupervisor, AuthRejection> {
+        self.supervisor_verifier.verify(token).map_err(|error| {
+            let reason = match error {
+                SessionJwtError::SubjectMismatch => AuthFailureReason::AudienceOrIssuerMismatch,
+                ref other => session_failure_reason(other),
+            };
+            AuthRejection::new(
+                AuthMechanism::SupervisorToken,
+                reason,
+                Status::unauthenticated(format!("invalid supervisor token: {error}")),
             )
         })
     }

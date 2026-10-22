@@ -2788,8 +2788,8 @@ async fn resolve_sandbox_by_name_for_principal(
         Principal::User(_) | Principal::Operator(_) => {
             sandbox.ok_or_else(|| Status::not_found("sandbox not found"))
         }
-        Principal::Peer(_) | Principal::SupervisorHost(_) => Err(Status::permission_denied(
-            "gateway peer and supervisor host principals may not resolve sandbox configuration",
+        Principal::Peer(_) | Principal::Supervisor(_) => Err(Status::permission_denied(
+            "gateway peer and supervisor principals may not resolve sandbox configuration",
         )),
         Principal::Anonymous => Err(Status::unauthenticated(
             "sandbox-scoped methods require an authenticated caller",

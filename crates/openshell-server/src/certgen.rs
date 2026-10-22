@@ -12,10 +12,6 @@
 //! - **Kubernetes JWT-only mode** (`--jwt-only`): create only the
 //!   sandbox-JWT signing Secret. Used when another controller, such as
 //!   cert-manager, owns the TLS Secrets.
-//! - **Kubernetes client-only mode** (`--client-only`): create only the client
-//!   TLS Secret of a fresh private PKI (certificate, key, and CA), with no
-//!   server certificate and no sandbox-JWT signing key. Issues the shared
-//!   supervisor's host identity; the gateway mounts the Secret's `ca.crt`.
 //! - **Local mode** (`--output-dir <DIR>`): write PEMs to the local package
 //!   filesystem layout. Used by systemd units' `ExecStartPre`. Also copies
 //!   client materials to
@@ -32,9 +28,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_bootstrap::pki::{
-    DEFAULT_SERVER_SANS, PkiBundle, generate_pki, generate_supervisor_host_pki,
-};
+use openshell_bootstrap::pki::{DEFAULT_SERVER_SANS, PkiBundle, generate_pki};
 use openshell_core::paths::{create_dir_restricted, set_file_owner_only};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -44,7 +38,6 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Args, Debug)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct CertgenArgs {
     /// Write PEMs to a filesystem directory instead of Kubernetes Secrets.
     /// When set, the kube-related flags are not required.
@@ -58,7 +51,7 @@ pub struct CertgenArgs {
     namespace: Option<String>,
 
     /// Name of the server TLS Secret (`kubernetes.io/tls`) to create.
-    #[arg(long, required_unless_present_any = ["output_dir", "jwt_only", "client_only"])]
+    #[arg(long, required_unless_present_any = ["output_dir", "jwt_only"])]
     server_secret_name: Option<String>,
 
     /// Name of the client TLS Secret (`kubernetes.io/tls`) to create.
@@ -68,21 +61,13 @@ pub struct CertgenArgs {
     /// Name of the sandbox-JWT signing-key Secret (`Opaque`) to create.
     /// Holds `signing.pem`, `public.pem`, and `kid` keys. Mounted on the
     /// gateway pod (only) so it can mint and validate per-sandbox JWTs.
-    #[arg(long, required_unless_present_any = ["output_dir", "client_only"])]
+    #[arg(long, required_unless_present = "output_dir")]
     jwt_secret_name: Option<String>,
 
     /// Create only the sandbox-JWT signing-key Secret in Kubernetes mode.
     /// This is used when another controller owns TLS Secret provisioning.
     #[arg(long, conflicts_with = "output_dir")]
     jwt_only: bool,
-
-    /// Create only the client TLS Secret of a fresh private PKI in Kubernetes
-    /// mode: the shared supervisor host's certificate, key, and issuing CA.
-    #[arg(
-        long,
-        conflicts_with_all = ["output_dir", "jwt_only", "jwt_secret_name", "server_secret_name", "server_sans", "backend_ca_configmap_name"]
-    )]
-    client_only: bool,
 
     /// Extra Subject Alternative Name for the server certificate. Repeatable.
     /// Auto-detected as an IP address or DNS name.
@@ -138,11 +123,7 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
     if let Some(dir) = args.output_dir.as_deref() {
         run_local(dir, &args.server_sans)
     } else {
-        let bundle = if args.client_only {
-            generate_supervisor_host_pki()?
-        } else {
-            generate_pki(&args.server_sans)?
-        };
+        let bundle = generate_pki(&args.server_sans)?;
         run_kubernetes(&args, &bundle).await?;
 
         if let Some(ref cm_name) = args.backend_ca_configmap_name {
@@ -222,47 +203,14 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         return Ok(());
     }
 
-    let client_name = args
-        .client_secret_name
-        .as_deref()
-        .ok_or_else(|| miette::miette!("--client-secret-name is required"))?;
-    if args.client_only {
-        if api
-            .get_opt(client_name)
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read secret {client_name}"))?
-            .is_some()
-        {
-            info!(
-                namespace = %namespace,
-                client = %client_name,
-                "client TLS secret already exists, skipping."
-            );
-            return Ok(());
-        }
-        let client_secret = tls_secret(
-            client_name,
-            &bundle.client_cert_pem,
-            &bundle.client_key_pem,
-            &bundle.ca_cert_pem,
-        );
-        api.create(&PostParams::default(), &client_secret)
-            .await
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create secret {client_name}"))?;
-        info!(
-            namespace = %namespace,
-            client = %client_name,
-            "client TLS secret created."
-        );
-        return Ok(());
-    }
-
     let server_name = args
         .server_secret_name
         .as_deref()
         .ok_or_else(|| miette::miette!("--server-secret-name is required"))?;
+    let client_name = args
+        .client_secret_name
+        .as_deref()
+        .ok_or_else(|| miette::miette!("--client-secret-name is required"))?;
     let server_exists = api
         .get_opt(server_name)
         .await
@@ -1037,37 +985,6 @@ mod tests {
     };
     use openshell_bootstrap::pki::generate_pki;
     use std::path::Path;
-
-    #[derive(clap::Parser)]
-    struct Cli {
-        #[command(flatten)]
-        args: super::CertgenArgs,
-    }
-
-    #[test]
-    fn client_only_mode_needs_only_the_client_secret_and_refuses_the_rest() {
-        use clap::Parser as _;
-        let client_only = [
-            "generate-certs",
-            "--namespace=gateway",
-            "--client-only",
-            "--client-secret-name=client",
-        ];
-        assert!(Cli::try_parse_from(client_only).unwrap().args.client_only);
-        for conflicting in [
-            "--jwt-secret-name=jwt",
-            "--jwt-only",
-            "--server-secret-name=server",
-            "--server-san=example.test",
-            "--output-dir=/tmp/pki",
-        ] {
-            let mut args = client_only.to_vec();
-            args.push(conflicting);
-            assert!(Cli::try_parse_from(args).is_err(), "{conflicting}");
-        }
-        let missing_client = ["generate-certs", "--namespace=gateway", "--client-only"];
-        assert!(Cli::try_parse_from(missing_client).is_err());
-    }
 
     // ── Kubernetes-mode decision ──
 

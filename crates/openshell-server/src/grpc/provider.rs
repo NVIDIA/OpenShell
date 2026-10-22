@@ -4294,7 +4294,7 @@ async fn exchange_provider_subject_token_inner(
             | Principal::User(_)
             | Principal::Operator(_)
             | Principal::Peer(_)
-            | Principal::SupervisorHost(_),
+            | Principal::Supervisor(_),
         ) => Some(tonic::Code::PermissionDenied),
         Some(Principal::Anonymous) | None => Some(tonic::Code::Unauthenticated),
     };

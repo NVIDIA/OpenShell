@@ -123,22 +123,30 @@ backend or enable a Windows workload runtime.
 
 ## Shared supervisor host
 
-`openshell-supervisor --mode=shared --gateway-endpoint <gateway-url> --host-tls-dir <dir> --address <ip:port>`
+`openshell-supervisor --mode=shared --gateway-endpoint <https-gateway-url> --token-file <file> --address <ip:port>`
 hosts the sandbox instances of many sandboxes in one process for the
 Kubernetes gateway supervisor topology. It is Unix-only. The host opens no
 control listener: it dials the gateway and receives its assignments from it.
 
 - **Gateway attachment.** The host dials `--gateway-endpoint` (which must be
-  `https`) with the client certificate in `--host-tls-dir` (`tls.crt`,
-  `tls.key`), verifying the gateway with `OPENSHELL_TLS_CA` and
+  `https`), verifying the gateway with `OPENSHELL_TLS_CA` and
   `OPENSHELL_GATEWAY_TLS_SERVER_NAME` like every sandbox instance does, and
   opens the private `openshell.supervisor.host.v1/SupervisorHost.Attach`
-  stream (`proto/supervisor_host.proto`). The certificate comes from a CA the
-  gateway trusts only for this stream; the host identity authorizes nothing
-  else, and the host never acts with any other identity and has no Kubernetes
-  identity. The stream starts with a hello carrying a per-process instance id
-  and a connection epoch; the gateway supersedes an older stream of the same
-  process and refuses a delayed older connection.
+  stream (`proto/supervisor_host.proto`) with the **supervisor token** in
+  `--token-file` as its bearer. The gateway mints that token with its
+  launch-signing key under a profile of its own (`typ`
+  `openshell-supervisor+jwt`, subject `openshell-supervisor:<gateway_id>`,
+  no sandbox, generation, or epoch claims) and keeps the file fresh through
+  its deployment packaging (the Helm chart's `<release>-supervisor-token`
+  Secret). The token authorizes nothing but this stream; sandbox, extension,
+  user, operator, and peer credentials are refused on it. The host re-reads
+  the file on every connection attempt and treats a missing, malformed, or
+  expired token as a reason to retry later, and the gateway ends a stream
+  when the token that opened it expires, so the host reconnects with the
+  renewed one. The host never acts with any other identity and has no
+  Kubernetes identity. The stream starts with a hello carrying a per-process
+  instance id and a connection epoch; the gateway supersedes an older stream
+  of the same process and refuses a delayed older connection.
 - **Assignments.** The gateway owns the desired set and sends it as complete
   `AssignmentSnapshot`s with session-scoped revisions. `shared_host::SharedHost::reconcile`
   validates the snapshot as a whole (at most 256 instances, no route twice),

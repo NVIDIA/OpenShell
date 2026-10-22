@@ -196,11 +196,6 @@ spec:
           mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
-        {{- if include "openshell.supervisorEnabled" . }}
-        - name: supervisor-host-ca
-          mountPath: /etc/openshell-tls/supervisor-host
-          readOnly: true
-        {{- end }}
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -291,16 +286,6 @@ spec:
     - name: vault-ca
       configMap:
         name: {{ $vaultCaConfigMapName }}
-        items:
-          - key: ca.crt
-            path: ca.crt
-    {{- end }}
-    {{- if include "openshell.supervisorEnabled" . }}
-    # CA of the shared supervisor's host certificate. Only the CA is projected;
-    # the host's private key stays with the supervisor.
-    - name: supervisor-host-ca
-      secret:
-        secretName: {{ include "openshell.supervisorName" . }}-host
         items:
           - key: ca.crt
             path: ca.crt

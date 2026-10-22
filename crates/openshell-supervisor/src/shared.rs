@@ -24,9 +24,9 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let gateway_endpoint = args
         .gateway_endpoint
         .ok_or_else(|| miette::miette!("--gateway-endpoint is required for --mode=shared"))?;
-    let host_tls_dir = args
-        .host_tls_dir
-        .ok_or_else(|| miette::miette!("--host-tls-dir is required for --mode=shared"))?;
+    let token_file = args
+        .token_file
+        .ok_or_else(|| miette::miette!("--token-file is required for --mode=shared"))?;
     let runtime_listen = args
         .runtime_listen
         .ok_or_else(|| miette::miette!("--runtime-listen is required for --mode=shared"))?;
@@ -34,18 +34,20 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let instance_root = args
         .session_root
         .ok_or_else(|| miette::miette!("--session-root is required for --mode=shared"))?;
-    // The host verifies the gateway the way every sandbox instance does.
-    let gateway_ca = std::env::var_os(openshell_core::sandbox_env::TLS_CA)
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| {
-            miette::miette!(
-                "{} is required for --mode=shared",
-                openshell_core::sandbox_env::TLS_CA
-            )
-        })?;
-    let gateway_server_name = std::env::var(openshell_core::sandbox_env::GATEWAY_TLS_SERVER_NAME)
-        .ok()
-        .filter(|name| !name.is_empty());
+    // The supervisor token travels only over TLS; the host verifies the
+    // gateway the way every sandbox instance does, with `OPENSHELL_TLS_CA`
+    // and `OPENSHELL_GATEWAY_TLS_SERVER_NAME`.
+    if !gateway_endpoint.starts_with("https://") {
+        return Err(miette::miette!(
+            "--gateway-endpoint must be https for --mode=shared"
+        ));
+    }
+    if std::env::var_os(openshell_core::sandbox_env::TLS_CA).is_none() {
+        return Err(miette::miette!(
+            "{} is required for --mode=shared",
+            openshell_core::sandbox_env::TLS_CA
+        ));
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -85,9 +87,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
                 .into_diagnostic()?;
         let link = openshell_supervisor::shared_host::GatewayLink {
             endpoint: gateway_endpoint.clone(),
-            host_tls_dir,
-            gateway_ca,
-            gateway_server_name,
+            token_file,
         };
         let host = openshell_supervisor::shared_host::SharedHost::start(
             openshell_supervisor::shared_host::SharedHostConfig {

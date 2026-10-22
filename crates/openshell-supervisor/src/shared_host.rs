@@ -5,12 +5,13 @@
 //!
 //! The gateway owns which sandbox instances, one running generation of a
 //! stable Sandbox resource each, this process hosts. The host dials the
-//! gateway with its gateway-scoped host certificate, receives complete
-//! assignment snapshots over the private `openshell.supervisor.host.v1`
-//! stream, reconciles the [`SandboxInstanceHost`] registry to each one, and
-//! reports what it observes. An assignment carries exactly the gateway-issued
-//! credentials of its generation; the host never acts with any other identity
-//! toward sandbox APIs. Losing the gateway stream never stops an instance;
+//! gateway presenting the supervisor token the gateway minted for it,
+//! receives complete assignment snapshots over the private
+//! `openshell.supervisor.host.v1` stream, reconciles the
+//! [`SandboxInstanceHost`] registry to each one, and reports what it
+//! observes. An assignment carries exactly the gateway-issued credentials of
+//! its generation; the host never acts with any other identity toward
+//! sandbox APIs. Losing the gateway stream never stops an instance;
 //! only a later snapshot that omits it does. Snapshots are reconciled one at
 //! a time, and a connection finishes the reconciliation it started before the
 //! next connection begins, so a superseded stream can never apply after its
@@ -21,7 +22,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use miette::Result;
 use openshell_core::proto::supervisor_host::v1::supervisor_host_client::SupervisorHostClient;
@@ -29,6 +30,7 @@ use openshell_core::proto::supervisor_host::v1::{
     AssignmentSnapshot, HostHeartbeat, HostHello, HostMessage, HostStatus, host_gateway_message,
     host_message,
 };
+use openshell_extension_core::BearerTokenSlot;
 use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
 use openshell_sandbox_backend::sandbox_instance::{
     SandboxInstancePhaseReport, SandboxInstanceRegistration, SandboxInstanceStatusReport,
@@ -431,55 +433,43 @@ fn write_private_file(_path: &Path, _contents: &[u8]) -> Result<()> {
 
 /// How the host reaches the gateway's supervisor host service.
 pub struct GatewayLink {
-    /// Gateway gRPC endpoint; must use `https`, since the host authenticates
-    /// with its client certificate.
+    /// Gateway gRPC endpoint; must be `https`, since the supervisor token is
+    /// a bearer. Server-authenticated TLS follows the sandbox instance
+    /// conventions (`OPENSHELL_TLS_CA`, `OPENSHELL_GATEWAY_TLS_SERVER_NAME`).
     pub endpoint: String,
-    /// Directory holding the host client certificate `tls.crt` and `tls.key`.
-    pub host_tls_dir: PathBuf,
-    /// PEM CA bundle that issued the gateway's server certificate.
-    pub gateway_ca: PathBuf,
-    /// Server name expected in the gateway certificate, when it differs from
-    /// the endpoint host.
-    pub gateway_server_name: Option<String>,
+    /// File holding the gateway-minted supervisor token. It is read on every
+    /// connection attempt, so the gateway's renewals take effect at the next
+    /// reconnect without a restart.
+    pub token_file: PathBuf,
 }
 
 impl GatewayLink {
-    fn channel_endpoint(&self) -> Result<tonic::transport::Endpoint> {
+    /// Read the current supervisor token. A missing, empty, malformed, or
+    /// already expired token is an error; the gateway keeps the file fresh,
+    /// so the caller retries later.
+    fn read_token(&self) -> Result<BearerTokenSlot> {
         use miette::{IntoDiagnostic as _, WrapErr as _};
 
-        if !self.endpoint.starts_with("https://") {
+        let contents = std::fs::read_to_string(&self.token_file)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("read supervisor token {}", self.token_file.display()))?;
+        let token = openshell_core::jwt::SecretJwt::parse(contents.trim())
+            .map_err(|_| miette::miette!("the supervisor token file holds no token yet"))?;
+        let expires_at = openshell_core::jwt::parse_exp_secs(token.expose_secret())
+            .ok_or_else(|| miette::miette!("the supervisor token is not an expiring JWT"))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        if expires_at <= now {
             return Err(miette::miette!(
-                "the shared supervisor requires an https gateway endpoint for its host identity"
+                "the supervisor token expired {} s ago; waiting for the gateway to renew it",
+                now.saturating_sub(expires_at)
             ));
         }
-        let read = |path: &Path| {
-            std::fs::read(path)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("read {}", path.display()))
-        };
-        let certificate = read(&self.host_tls_dir.join("tls.crt"))?;
-        let private_key = read(&self.host_tls_dir.join("tls.key"))?;
-        let gateway_ca = read(&self.gateway_ca)?;
-        let mut tls = tonic::transport::ClientTlsConfig::new()
-            .ca_certificate(tonic::transport::Certificate::from_pem(gateway_ca))
-            .identity(tonic::transport::Identity::from_pem(
-                certificate,
-                private_key,
-            ));
-        if let Some(server_name) = self.gateway_server_name.as_deref() {
-            tls = tls.domain_name(server_name);
-        }
-        tonic::transport::Endpoint::from_shared(self.endpoint.clone())
-            .into_diagnostic()
-            .wrap_err("invalid gateway endpoint")?
-            .connect_timeout(CONNECT_TIMEOUT)
-            .http2_keep_alive_interval(Duration::from_secs(10))
-            .keep_alive_while_idle(true)
-            .keep_alive_timeout(Duration::from_secs(20))
-            .tcp_nodelay(true)
-            .tls_config(tls)
-            .into_diagnostic()
-            .wrap_err("configure gateway TLS")
+        BearerTokenSlot::new(token.expose_secret(), expires_at.saturating_mul(1000))
+            .map_err(|error| miette::miette!("{error}"))
     }
 }
 
@@ -549,21 +539,30 @@ pub async fn attach_to_gateway(
 /// not end until a running reconciliation has finished.
 async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello) -> StreamEnd {
     let lost = |accepted| StreamEnd::Lost { accepted };
-    let endpoint = match link.channel_endpoint() {
-        Ok(endpoint) => endpoint,
+    if !link.endpoint.starts_with("https://") {
+        tracing::error!("the supervisor token requires an https gateway endpoint");
+        return lost(false);
+    }
+    let token = match link.read_token() {
+        Ok(token) => token,
         Err(error) => {
-            tracing::error!(%error, "invalid gateway link configuration");
+            tracing::warn!(%error, "no usable supervisor token; will retry");
             return lost(false);
         }
     };
-    let channel = match endpoint.connect().await {
-        Ok(channel) => channel,
-        Err(error) => {
+    let connect = openshell_core::grpc_client::connect_gateway_channel(&link.endpoint);
+    let channel = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) => {
             tracing::warn!(%error, "could not connect to the gateway");
             return lost(false);
         }
+        Err(_) => {
+            tracing::warn!("connecting to the gateway timed out");
+            return lost(false);
+        }
     };
-    let mut client = SupervisorHostClient::new(channel)
+    let mut client = SupervisorHostClient::with_interceptor(channel, token.interceptor())
         .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
     let (tx, rx) = tokio::sync::mpsc::channel::<HostMessage>(OUTBOUND_QUEUE);

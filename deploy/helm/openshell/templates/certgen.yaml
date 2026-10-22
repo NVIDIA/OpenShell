@@ -1,8 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- $supervisor := include "openshell.supervisorEnabled" . }}
-{{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled $supervisor }}
+{{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
 {{- $hookName := printf "%s-certgen" (include "openshell.fullname" .) }}
 {{- $ns := .Release.Namespace }}
 apiVersion: v1
@@ -121,27 +120,6 @@ spec:
             {{- if and .Values.grpcRoute.backendTLSPolicy.enabled (not .Values.certManager.enabled) }}
             - --backend-ca-configmap-name={{ include "openshell.backendCaConfigMapName" . }}
             {{- end }}
-        {{- end }}
-        {{- if $supervisor }}
-        {{- $supervisorName := include "openshell.supervisorName" . }}
-        # Private PKI for the shared supervisor's host identity: the supervisor
-        # presents the client certificate to the gateway, which trusts only
-        # the CA.
-        - name: supervisor-certgen
-          image: {{ include "openshell.image" . | quote }}
-          imagePullPolicy: {{ .Values.gateway.image.pullPolicy | default .Values.global.image.pullPolicy }}
-          securityContext:
-            {{- toYaml .Values.pkiInitJob.securityContext | nindent 12 }}
-          env:
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          command: ["/usr/local/bin/openshell-gateway"]
-          args:
-            - generate-certs
-            - --client-only
-            - --client-secret-name={{ $supervisorName }}-host
         {{- end }}
 {{- if and .Values.certManager.enabled .Values.grpcRoute.backendTLSPolicy.enabled }}
 ---

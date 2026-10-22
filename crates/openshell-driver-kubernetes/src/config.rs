@@ -211,10 +211,10 @@ pub struct SharedSupervisorConfig {
     pub service_namespace: String,
     /// Service port for runtime-initiated Sandbox Protocol connections.
     pub runtime_port: u16,
-    /// PEM CA certificate that issued the supervisor host's client
-    /// certificate. The gateway accepts that certificate on its own listener
-    /// and classifies the connection as the supervisor host.
-    pub host_ca_file: String,
+    /// Secret in `service_namespace` the driver keeps current with the
+    /// gateway-minted supervisor token (key `token`); the supervisor Pod
+    /// mounts it and presents the token on its assignment stream.
+    pub token_secret_name: String,
 }
 
 impl SharedSupervisorConfig {
@@ -227,8 +227,8 @@ impl SharedSupervisorConfig {
         if self.runtime_port == 0 {
             return Err("shared_supervisor runtime_port must be nonzero".into());
         }
-        if !Path::new(&self.host_ca_file).is_absolute() {
-            return Err("shared_supervisor host_ca_file must be absolute".into());
+        if !is_dns_subdomain(&self.token_secret_name) {
+            return Err("shared_supervisor token_secret_name must be a DNS subdomain name".into());
         }
         Ok(())
     }
@@ -238,6 +238,21 @@ impl SharedSupervisorConfig {
     pub fn service_host(&self) -> String {
         format!("{}.{}.svc", self.service_name, self.service_namespace)
     }
+}
+
+/// RFC 1123 subdomain, as Kubernetes object names require.
+fn is_dns_subdomain(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
 }
 
 fn is_dns_label(value: &str) -> bool {
@@ -1104,7 +1119,7 @@ mod tests {
             service_name: "openshell-supervisor".to_string(),
             service_namespace: "openshell".to_string(),
             runtime_port: 8443,
-            host_ca_file: "/etc/openshell-tls/supervisor-host/ca.crt".to_string(),
+            token_secret_name: "openshell-supervisor-token".to_string(),
         };
         let gateway = |shared: Option<SharedSupervisorConfig>| KubernetesComputeConfig {
             supervisor_topology: Some(SupervisorTopology::Gateway),
@@ -1133,7 +1148,7 @@ mod tests {
                 ..shared()
             },
             SharedSupervisorConfig {
-                host_ca_file: "relative/ca.crt".to_string(),
+                token_secret_name: "Not_A_Secret_Name".to_string(),
                 ..shared()
             },
         ] {
