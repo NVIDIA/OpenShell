@@ -91,11 +91,11 @@ pub struct SupervisorCredential {
 pub enum ObservedInstance {
     /// No host session is connected.
     NoHost,
-    /// A host is connected but has not reconciled to the snapshot that
-    /// assigned this route.
+    /// A host is connected, but this gateway has not recovered the route's
+    /// assignment yet or the host has not reconciled the snapshot assigning it.
     Pending,
-    /// The host reconciled to that snapshot (or the route is not assigned)
-    /// and does not host the route.
+    /// The host reconciled to the snapshot assigning this route and does
+    /// not host it.
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
@@ -200,7 +200,7 @@ struct Inner {
     desired: Mutex<Desired>,
     /// Latest supervisor token the gateway minted; `None` until the first.
     credential: watch::Sender<Option<SupervisorCredential>>,
-    /// Current desired revision; 0 while uninitialized.
+    /// Monotonic local revision, also bumped at the start of a new term.
     revision: watch::Sender<u64>,
     observed: Mutex<Observed>,
 }
@@ -371,8 +371,8 @@ impl SupervisorHostController {
         lock(&self.inner.desired).initialized
     }
 
-    /// Current desired revision: 0 while uninitialized. Read it before
-    /// deriving a full list for [`Self::replace_assignments`]; the
+    /// Current desired revision, including the fence for this leadership
+    /// term. Read it before deriving a full list for [`Self::replace_assignments`]; the
     /// coordinator does so through
     /// [`SharedSupervision::begin_recovery`](crate::SharedSupervision::begin_recovery).
     #[must_use]
@@ -393,8 +393,8 @@ impl SupervisorHostController {
     /// durable records while the revision was `baseline`.
     ///
     /// Initializes the controller; edits made before initialization are
-    /// applied on top of the list. After initialization the replacement is
-    /// compare-and-replace: when the revision moved past `baseline` while
+    /// applied on top of the list. The replacement is compare-and-replace:
+    /// when the revision moved past `baseline` while
     /// the list was being derived, nothing changes and the conflict is
     /// returned so the caller derives the list again.
     pub fn replace_assignments(
@@ -531,6 +531,16 @@ impl SupervisorHostController {
         if observed.session.is_none() {
             return ObservedInstance::NoHost;
         }
+        let Some(assigned) = desired
+            .assignments
+            .get(route)
+            .filter(|_| desired.initialized)
+        else {
+            // A create can have reached another replica before this leader's
+            // recovery discovers its durable assignment. Never suspend that
+            // workload based on a snapshot that did not assign it.
+            return ObservedInstance::Pending;
+        };
         let Some(status) = &observed.status else {
             return ObservedInstance::Pending;
         };
@@ -541,11 +551,10 @@ impl SupervisorHostController {
         {
             return ObservedInstance::Reported(instance.clone());
         }
-        match desired.assignments.get(route) {
-            Some(assigned) if assigned.revision > status.applied_revision => {
-                ObservedInstance::Pending
-            }
-            _ => ObservedInstance::Absent,
+        if assigned.revision > status.applied_revision {
+            ObservedInstance::Pending
+        } else {
+            ObservedInstance::Absent
         }
     }
 
@@ -1000,10 +1009,12 @@ mod tests {
         assert!(controller.replace_assignments(old_baseline, []).is_err());
         // No authoritative empty snapshot before the new term's full recovery.
         assert!(controller.snapshot().is_none());
+        let (session, revoked) = controller.begin_session(identity.clone(), &hello).unwrap();
+        controller.record_status(session, status(0, &[])).unwrap();
+        assert_eq!(controller.observed("rt-new"), ObservedInstance::Pending);
         controller
             .replace_assignments(controller.revision(), [assignment("rt-new", b"new")])
             .unwrap();
-        let (session, revoked) = controller.begin_session(identity.clone(), &hello).unwrap();
         controller.record_sent(session, controller.revision());
         controller
             .record_status(session, status(controller.revision(), &["rt-new"]))
@@ -1108,7 +1119,7 @@ mod tests {
         // A newer assignment is pending until the host reconciles past it.
         controller.assign(assignment("rt-b", b"b")).unwrap();
         assert_eq!(controller.observed("rt-b"), ObservedInstance::Pending);
-        assert_eq!(controller.observed("rt-unknown"), ObservedInstance::Absent);
+        assert_eq!(controller.observed("rt-unknown"), ObservedInstance::Pending);
         controller.record_sent(current, 2);
         controller.record_status(current, status(2, &[])).unwrap();
         assert_eq!(controller.observed("rt-b"), ObservedInstance::Absent);

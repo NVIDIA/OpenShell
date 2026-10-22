@@ -89,7 +89,10 @@ leader includes credential-free, generation-routed instance observations in
 the same compare-and-swap write that renews the reconciler lease. Standbys use
 that view for readiness; they never publish assignments from it. Missing,
 unreadable, or expired observations mean unknown supervision, not an absent
-instance. Observations are eventually consistent with lease renewals (10
+instance. A route the leader has not recovered yet stays pending, even if
+its connected host has already acknowledged a snapshot without that route.
+Only an acknowledged assignment can establish that an instance is absent.
+Observations are eventually consistent with lease renewals (10
 seconds) and standby polls (5 seconds); driver reconciliation can add up to its
 normal interval before a remote lifecycle change reaches the supervisor.
 
