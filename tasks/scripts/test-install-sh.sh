@@ -845,6 +845,24 @@ if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-prover)" != "opens
   exit 1
 fi
 
+cat >"${tmpdir}/checksums" <<'EOF'
+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  openshell-0.1.5-1xx86_64xrpm
+bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  openshell-0.1.5-1.x86_64.rpm
+cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc  openshell-gateway-0.1.5-1.x86_64.rpm
+EOF
+
+rpm_err="${tmpdir}/rpm_err"
+if [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell 2>"$rpm_err")" != "openshell-0.1.5-1.x86_64.rpm" ] ||
+  [ "$(find_rpm_asset "${tmpdir}/checksums" x86_64 openshell-gateway 2>>"$rpm_err")" != "openshell-gateway-0.1.5-1.x86_64.rpm" ]; then
+  echo "FAIL: RPM fallback must match a literal dot" >&2
+  exit 1
+fi
+if [ -s "$rpm_err" ]; then
+  echo "FAIL: RPM package selection must not print to stderr" >&2
+  cat "$rpm_err" >&2
+  exit 1
+fi
+
 mock_gh_log="${tmpdir}/gh.log"
 PLATFORM=linux
 linux_package_method() {
