@@ -104,3 +104,49 @@ tests:
             name: supervisor-token
             secret:
               secretName: openshell-supervisor-token
+  - it: omits the gateway admin socket when delegation is disabled
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+          provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spiffe-workload-api
+            mountPath: /spiffe-workload-api
+            readOnly: true
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: spire-agent-admin
+          any: true
+  - it: mounts SPIRE delegation only into the gateway
+    template: templates/statefulset.yaml
+    set:
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+        openshell.gateway.experimental_spiffe_delegation:
+          admin_socket_path: /run/spire/admin/admin.sock
+          spiffe_id_prefix: spiffe://example.org/openshell
+          admin_socket_group: 10035
+    asserts:
+      - contains:
+          path: spec.template.spec.securityContext.supplementalGroups
+          content: 10035
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: spire-agent-admin
+            mountPath: /run/spire/admin
+            readOnly: true
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: spire-agent-admin
+            hostPath:
+              path: /run/spire/admin
+              type: Directory

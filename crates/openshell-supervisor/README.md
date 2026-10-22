@@ -64,8 +64,9 @@ is a single path component, then, under the registry lock, accepts the same
 launch fingerprint for an occupied key again, rejects a different one, and
 rejects any admission while the key is being removed. A new instance gets an
 empty private directory under the host root, and `sandbox_instance_launch`
-prepares its bindings and body there. A failed admission leaves no entry and
-no files.
+prepares its bindings and body there. A failed admission retains no entry;
+its directory is deleted on a best-effort basis, and the next admission of the
+key must delete any stale files before reusing it.
 
 Removing an instance stops its workload, shuts down only its runtime, which
 drops its runtime route, and revokes its gateway credentials; only then is its
@@ -179,10 +180,13 @@ control listener: it dials the gateway and receives its assignments from it.
   reports only that the process runs. SIGTERM and SIGINT stop every instance,
   which ends their workloads' supervision.
 
-Sandbox instances get no upstream proxy, extra CA bundle, or provider workload identity:
-the Kubernetes driver refuses the topology when an upstream proxy or provider
-SPIFFE identity is configured, so a workload never silently loses them. The
-host also initializes no OTLP trace or OCSF exporters, because one process
+Sandbox instances get no upstream proxy or extra CA bundle: the Kubernetes driver
+refuses the topology when an upstream proxy is configured, so a workload never
+silently loses it. The process's own SPIFFE identity never stands in for a
+sandbox. Shared sandbox instances obtain final provider access tokens through the gateway's
+`GetSandboxProviderAccessToken` RPC. They hold no SPIRE socket, SVID, or
+intermediate token. The gateway owns identity authorization, acquisition,
+exchange, and caching. The host also initializes no OTLP trace or OCSF exporters, because one process
 cannot export each instance's records with that instance's collector headers and
 identity. Its console logs and each instance's gateway log push remain, and the
 Kubernetes driver warns at startup when the gateway configures supervisor

@@ -788,8 +788,8 @@ pub struct SandboxInstanceConfig {
     pub main_exit_marker: Option<std::path::PathBuf>,
     /// Parent of the startup span.
     pub trace_context: Option<RegistrationTraceContext>,
-    /// SPIFFE Workload API socket for provider token grants; absent fails closed.
-    pub provider_workload_api_socket: Option<std::path::PathBuf>,
+    /// How this instance obtains provider access tokens.
+    pub provider_identity: openshell_supervisor_network::run::ProviderIdentitySource,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
 }
 
@@ -937,7 +937,7 @@ pub async fn run_sandbox_instance(
         admitted_isolation_backend,
         main_exit_marker,
         trace_context,
-        provider_workload_api_socket,
+        provider_identity,
         proxy_tls,
     } = config;
     // The owner binds the event context and log sink to the instance's
@@ -1277,7 +1277,7 @@ pub async fn run_sandbox_instance(
                 sandbox_id: sandbox_id.clone(),
                 sandbox_name: sandbox_name_for_agg.clone(),
                 gateway: gateway.clone(),
-                provider_workload_api_socket,
+                provider_identity,
                 denial_log,
                 proxy_tls,
             },
@@ -4365,7 +4365,7 @@ mod tests {
             admitted_isolation_backend: None,
             main_exit_marker: None,
             trace_context: None,
-            provider_workload_api_socket: None,
+            provider_identity: openshell_supervisor_network::run::ProviderIdentitySource::default(),
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
         };
         let bindings = SandboxInstanceBindings::dedicated(

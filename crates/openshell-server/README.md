@@ -84,3 +84,22 @@ runs under `mise run test:rust:postgres` (see `TESTING.md`) and still accepts
 `OPENSHELL_REFRESH_TEST_DATABASE_URL` pointing to a disposable PostgreSQL database.
 It exercises independent sessions without the local mutex. Do not point this
 fixture at an existing deployment database.
+
+## Experimental sandbox identity broker
+
+`openshell.gateway.experimental_spiffe_delegation` enables gateway-owned SPIRE
+acquisition for the Kubernetes shared supervisor. The private admin
+socket is mounted only in the gateway. `GetSandboxProviderAccessToken` accepts an
+endpoint-bound configured credential key; sandbox identity comes from the
+verified, currently authorized session JWT. Provider attachment and profile
+configuration determine the endpoint, audience, and scopes. The gateway performs
+RFC 7523 or both RFC 8693 exchanges and returns only the final access token.
+Its bounded cache is isolated by sandbox generation, credential epoch, provider
+revision, and grant. The session is authorized again around each SPIRE and
+token-service call. A cache hit and a fresh token then pass the same final
+check: the grant configuration still matches and the session is still
+authorized. A fresh token is cached only after that check. Startup validates
+the delegation settings, and gateway state construction parses them once and
+returns a configuration error when they are invalid; each request still fetches
+a new SVID and the agent's current JWT bundle. SPIRE still trusts the gateway as a
+delegate for its agent's available registration scope.

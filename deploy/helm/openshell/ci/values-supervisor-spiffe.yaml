@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# E2E overlay: the gateway obtains each sandbox's stable SPIFFE
+# identity from the node's SPIRE agent (ci/values-spire-delegation-stack.yaml)
+# for provider token grants. The gateway keeps its own Workload API identity
+# for the RFC 8693 intermediate exchange.
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+    provider_spiffe_workload_api_socket_path: /spiffe-workload-api/spire-agent.sock
+  openshell.gateway.experimental_spiffe_delegation:
+    admin_socket_path: /run/spire/agent/sockets/csi.spiffe.io/admin/admin.sock
+    spiffe_id_prefix: spiffe://openshell.local/openshell
+    admin_socket_group: 10035

@@ -35,11 +35,12 @@ use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
 };
-use crate::l7::token_grant_injection::SpiffeTokenGrantResolver;
+use crate::l7::token_grant_injection::TokenGrantResolver;
 use crate::opa::OpaEngine;
 use crate::policy_local::{DenialLogSource, PolicyLocalContext};
 use crate::proxy::ProxyHandle;
-use crate::token_grant::SandboxInstanceTokenGrants;
+pub use crate::token_grant::ProviderIdentitySource;
+use crate::token_grant::{GatewayTokenGrantResolver, SpiffeTokenGrantResolver};
 use openshell_core::endpoint_status::EndpointObservationSender;
 use openshell_core::grpc_client::GatewayEndpoint;
 
@@ -203,9 +204,8 @@ pub struct SandboxInstanceNetwork {
     pub sandbox_name: Option<String>,
     /// Gateway access with this instance's credentials.
     pub gateway: Option<GatewayEndpoint>,
-    /// SPIFFE Workload API socket for provider token grants. Without one,
-    /// grants fail closed.
-    pub provider_workload_api_socket: Option<std::path::PathBuf>,
+    /// How this instance obtains provider access tokens.
+    pub provider_identity: ProviderIdentitySource,
     /// Source served by `policy.local` `/v1/denials`.
     pub denial_log: DenialLogSource,
     /// Proxy interception CA and trust-file directory.
@@ -304,15 +304,26 @@ pub async fn run_networking(
         sandbox_id,
         sandbox_name,
         gateway,
-        provider_workload_api_socket,
+        provider_identity,
         denial_log,
         proxy_tls,
     } = instance;
-    let token_grants = SpiffeTokenGrantResolver::new(SandboxInstanceTokenGrants::new(
-        gateway.clone(),
-        sandbox_id.clone(),
-        provider_workload_api_socket,
-    ));
+    // Choose how this instance obtains provider tokens once, for every grant.
+    let token_grants: Arc<dyn TokenGrantResolver> = match (provider_identity, gateway.clone()) {
+        (ProviderIdentitySource::Gateway, Some(gateway)) => {
+            Arc::new(GatewayTokenGrantResolver::new(gateway))
+        }
+        // Nothing can issue this sandbox's tokens without a gateway; a
+        // resolver without a workload identity fails every grant closed.
+        (ProviderIdentitySource::Gateway, None) => Arc::new(SpiffeTokenGrantResolver::new(
+            None,
+            sandbox_id.clone(),
+            None,
+        )),
+        (ProviderIdentitySource::WorkloadApi(socket), gateway) => Arc::new(
+            SpiffeTokenGrantResolver::new(gateway, sandbox_id.clone(), socket),
+        ),
+    };
     let policy_local_ctx = Arc::new(
         PolicyLocalContext::new(
             retained_proto.cloned(),
@@ -322,7 +333,7 @@ pub async fn run_networking(
             workspace_rx,
         )
         .with_denial_log(denial_log)
-        .with_token_grants(Arc::new(token_grants)),
+        .with_token_grants(token_grants),
     );
 
     // Readiness signal for the proxy accept loop: the proxy binds the TCP

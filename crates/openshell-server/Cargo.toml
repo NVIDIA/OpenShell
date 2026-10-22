@@ -43,6 +43,7 @@ libc = "0.2"
 tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tonic-reflection = { workspace = true }
 prost = { workspace = true }
+tonic-prost = { workspace = true }
 prost-reflect = { workspace = true }
 prost-types = { workspace = true }
 

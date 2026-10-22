@@ -5,6 +5,8 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+pub(super) mod access_token;
+
 use crate::compute::MutationScope;
 #[cfg(test)]
 use crate::credentials::RefreshMaterialScope;
@@ -8675,17 +8677,20 @@ mod tests {
         // Model a second gateway replica: it shares the durable database and
         // credential backend, but owns an independent sandbox synchronization
         // guard, so process-local serialization cannot hide this race.
-        let second_state = Arc::new(ServerState::new_with_credentials(
-            first_state.config.clone(),
-            Arc::clone(&first_state.store),
-            crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-            first_state.credentials.clone(),
-        ));
+        let second_state = Arc::new(
+            ServerState::new_with_credentials(
+                first_state.config.clone(),
+                Arc::clone(&first_state.store),
+                crate::compute::new_test_runtime(Arc::clone(&first_state.store)).await,
+                crate::sandbox_index::SandboxIndex::new(),
+                crate::sandbox_watch::SandboxWatchBus::new(),
+                crate::tracing_bus::TracingLogBus::new(),
+                Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
+                None,
+                first_state.credentials.clone(),
+            )
+            .unwrap(),
+        );
         let request = |client_secret: &str| ConfigureProviderRefreshRequest {
             request_id: String::new(),
             provider: "configure-create-race".to_string(),

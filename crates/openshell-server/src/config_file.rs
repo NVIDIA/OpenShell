@@ -189,6 +189,9 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
     #[serde(default)]
+    pub experimental_spiffe_delegation:
+        Option<openshell_core::config::ExperimentalSpiffeDelegationConfig>,
+    #[serde(default)]
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
     pub ocsf_log: Option<OcsfLogConfig>,

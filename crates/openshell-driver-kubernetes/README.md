@@ -254,9 +254,15 @@ fails closed.
   when the token that opened it expires. Sandboxes cannot reach the stream,
   and the routing preface only selects which generation-pinned TLS identity
   the supervisor demands.
+- **Workload identity.** The gateway owns SPIRE delegation and provider-token
+  exchange when `openshell.gateway.experimental_spiffe_delegation` is configured.
+  Shared supervisors receive final access tokens through their authenticated
+  sessions. No SPIFFE socket is mounted in a shared supervisor or workload Pod.
+  The existing Workload API option supplies the gateway's component identity
+  for the RFC 8693 intermediate exchange.
 
-The topology does not support upstream proxies or provider SPIFFE identity, and
-the shared supervisor is a single point of failure for the sandboxes it hosts.
+The topology does not support upstream proxies, and the shared supervisor is a
+single point of failure for the sandboxes it hosts.
 Shared sandbox instances export no supervisor OTLP traces or OCSF events; the driver
 warns at startup when the gateway configures that export.
 When the setting is removed, reconciliation suspends shared generations, and a

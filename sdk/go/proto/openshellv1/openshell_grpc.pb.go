@@ -77,6 +77,7 @@ const (
 	OpenShell_ReportSandboxConfiguration_FullMethodName    = "/openshell.v1.OpenShell/ReportSandboxConfiguration"
 	OpenShell_GetSandboxProviderEnvironment_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
 	OpenShell_ExchangeProviderSubjectToken_FullMethodName  = "/openshell.v1.OpenShell/ExchangeProviderSubjectToken"
+	OpenShell_GetSandboxProviderAccessToken_FullMethodName = "/openshell.v1.OpenShell/GetSandboxProviderAccessToken"
 	OpenShell_GetSandboxLogs_FullMethodName                = "/openshell.v1.OpenShell/GetSandboxLogs"
 	OpenShell_PushSandboxLogs_FullMethodName               = "/openshell.v1.OpenShell/PushSandboxLogs"
 	OpenShell_ConnectSupervisor_FullMethodName             = "/openshell.v1.OpenShell/ConnectSupervisor"
@@ -252,6 +253,9 @@ type OpenShellClient interface {
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
 	ExchangeProviderSubjectToken(ctx context.Context, in *ExchangeProviderSubjectTokenRequest, opts ...grpc.CallOption) (*ExchangeProviderSubjectTokenResponse, error)
+	// Obtain the final provider token for the authenticated sandbox session.
+	// SPIFFE assertions and intermediate credentials remain in the gateway.
+	GetSandboxProviderAccessToken(ctx context.Context, in *GetSandboxProviderAccessTokenRequest, opts ...grpc.CallOption) (*GetSandboxProviderAccessTokenResponse, error)
 	// Fetch recent sandbox logs (one-shot).
 	GetSandboxLogs(ctx context.Context, in *GetSandboxLogsRequest, opts ...grpc.CallOption) (*GetSandboxLogsResponse, error)
 	// Push sandbox supervisor logs to the server (client-streaming).
@@ -914,6 +918,16 @@ func (c *openShellClient) ExchangeProviderSubjectToken(ctx context.Context, in *
 	return out, nil
 }
 
+func (c *openShellClient) GetSandboxProviderAccessToken(ctx context.Context, in *GetSandboxProviderAccessTokenRequest, opts ...grpc.CallOption) (*GetSandboxProviderAccessTokenResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSandboxProviderAccessTokenResponse)
+	err := c.cc.Invoke(ctx, OpenShell_GetSandboxProviderAccessToken_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *openShellClient) GetSandboxLogs(ctx context.Context, in *GetSandboxLogsRequest, opts ...grpc.CallOption) (*GetSandboxLogsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetSandboxLogsResponse)
@@ -1378,6 +1392,9 @@ type OpenShellServer interface {
 	// Exchange a stored provider subject token for an intermediate token scoped
 	// to the calling supervisor's SPIFFE identity.
 	ExchangeProviderSubjectToken(context.Context, *ExchangeProviderSubjectTokenRequest) (*ExchangeProviderSubjectTokenResponse, error)
+	// Obtain the final provider token for the authenticated sandbox session.
+	// SPIFFE assertions and intermediate credentials remain in the gateway.
+	GetSandboxProviderAccessToken(context.Context, *GetSandboxProviderAccessTokenRequest) (*GetSandboxProviderAccessTokenResponse, error)
 	// Fetch recent sandbox logs (one-shot).
 	GetSandboxLogs(context.Context, *GetSandboxLogsRequest) (*GetSandboxLogsResponse, error)
 	// Push sandbox supervisor logs to the server (client-streaming).
@@ -1646,6 +1663,9 @@ func (UnimplementedOpenShellServer) GetSandboxProviderEnvironment(context.Contex
 }
 func (UnimplementedOpenShellServer) ExchangeProviderSubjectToken(context.Context, *ExchangeProviderSubjectTokenRequest) (*ExchangeProviderSubjectTokenResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExchangeProviderSubjectToken not implemented")
+}
+func (UnimplementedOpenShellServer) GetSandboxProviderAccessToken(context.Context, *GetSandboxProviderAccessTokenRequest) (*GetSandboxProviderAccessTokenResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSandboxProviderAccessToken not implemented")
 }
 func (UnimplementedOpenShellServer) GetSandboxLogs(context.Context, *GetSandboxLogsRequest) (*GetSandboxLogsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSandboxLogs not implemented")
@@ -2701,6 +2721,24 @@ func _OpenShell_ExchangeProviderSubjectToken_Handler(srv interface{}, ctx contex
 	return interceptor(ctx, in, info, handler)
 }
 
+func _OpenShell_GetSandboxProviderAccessToken_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSandboxProviderAccessTokenRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(OpenShellServer).GetSandboxProviderAccessToken(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: OpenShell_GetSandboxProviderAccessToken_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(OpenShellServer).GetSandboxProviderAccessToken(ctx, req.(*GetSandboxProviderAccessTokenRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _OpenShell_GetSandboxLogs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetSandboxLogsRequest)
 	if err := dec(in); err != nil {
@@ -3400,6 +3438,10 @@ var OpenShell_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExchangeProviderSubjectToken",
 			Handler:    _OpenShell_ExchangeProviderSubjectToken_Handler,
+		},
+		{
+			MethodName: "GetSandboxProviderAccessToken",
+			Handler:    _OpenShell_GetSandboxProviderAccessToken_Handler,
 		},
 		{
 			MethodName: "GetSandboxLogs",

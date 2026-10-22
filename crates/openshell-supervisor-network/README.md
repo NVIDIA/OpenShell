@@ -18,11 +18,23 @@ dependency only.
 ## Sandbox instance inputs
 
 `run_networking` takes a `SandboxInstanceNetwork` with the sandbox identity,
-the sandbox instance's `GatewayEndpoint`, the SPIFFE Workload API socket for
+the sandbox instance's `GatewayEndpoint`, the `ProviderIdentitySource` for
 provider token grants, the `policy.local` denial source, and proxy CA files.
 None of these are read from the process environment, so one process can run
-several sandbox instances. Each instance owns its provider token cache and
-HTTP client; a token acquired for one sandbox is never served to another.
-Without a Workload API socket, token grants fail closed. A process hosting
-several instances serves `/v1/denials` from a per-instance
-`SandboxInstanceDenialLog` instead of the shared shorthand log files.
+several sandbox instances. `run_networking` selects the instance's token grant
+resolver once from its identity source; a token acquired for one sandbox is
+never served to another.
+
+A dedicated supervisor uses `SpiffeTokenGrantResolver` with its SPIFFE Workload
+API socket. That resolver owns the instance's token cache and HTTP client and
+uses the gateway only for the intermediate exchange of RFC 8693 grants.
+Without a socket, its grants fail closed. Shared sandbox instances use
+`GatewayTokenGrantResolver`, which holds only the instance's authenticated
+`GatewayEndpoint`. Each admitted operation forwards a configured dynamic
+credential key and request ID; the gateway derives the sandbox identity,
+validates current authorization, resolves grant parameters, and obtains the
+final access token, which the resolver validates. No SPIRE client, SVID,
+intermediate token, or grant cache is used in the shared supervisor. `mise run test:spire-delegation` exercises the gateway's
+SPIRE acquisition client against a real server and agent. A process hosting several instances serves
+`/v1/denials` from a per-instance `SandboxInstanceDenialLog` instead of the shared
+shorthand log files.

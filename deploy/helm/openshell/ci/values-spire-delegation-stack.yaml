@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SPIRE hardened chart values for the shared-supervisor SPIRE delegation e2e.
+# The agent exposes its admin socket on the host for the gateway
+# only, and authorizes the gateway's default SPIFFE ID
+# (spiffe://<trust-domain>/ns/<namespace>/sa/<service-account>) as a delegate.
+# Sandbox registration entries are created by the test, as an operator would.
+global:
+  spire:
+    clusterName: openshell-e2e
+    jwtIssuer: https://spire.openshell.local
+    trustDomain: openshell.local
+
+spire-server:
+  defaultJwtSvidTTL: 5m
+
+spire-agent:
+  # The agent keeps root for workload attestation but creates its admin
+  # socket (mode 0770) with this group, which only the gateway
+  # joins (experimental_spiffe_delegation.admin_socket_group).
+  podSecurityContext:
+    runAsUser: 0
+    runAsGroup: 10035
+  authorizedDelegates:
+    - spiffe://openshell.local/ns/openshell/sa/openshell
+  sockets:
+    admin:
+      enabled: true
+      mountOnHost: true
+
+spiffe-oidc-discovery-provider:
+  enabled: false

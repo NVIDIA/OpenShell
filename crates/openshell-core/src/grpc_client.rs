@@ -1578,6 +1578,46 @@ pub async fn exchange_provider_subject_token(
     ))
 }
 
+/// Obtain only the final access token; the gateway selects and verifies the
+/// sandbox identity and resolves all grant parameters from its configuration.
+#[tracing::instrument(name = "supervisor.gateway.get_provider_access_token", skip_all)]
+pub async fn get_sandbox_provider_access_token(
+    gateway: &GatewayEndpoint,
+    credential_key: &str,
+    request_id: Option<&str>,
+) -> std::result::Result<ProviderSubjectTokenExchangeResult, TokenGrantFailure> {
+    let endpoint = token_grant_gateway_endpoint(gateway.url())?;
+    let mut client = connect(&gateway.with_url(endpoint.as_str()))
+        .await
+        .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Unavailable))?;
+    let mut request = tonic::Request::new(crate::proto::GetSandboxProviderAccessTokenRequest {
+        credential_key: credential_key.to_string(),
+    });
+    if let Some(value) = request_id.and_then(|value| value.parse().ok()) {
+        request.metadata_mut().insert("x-request-id", value);
+    }
+    let response = tokio::time::timeout(
+        Duration::from_mins(1),
+        client.get_sandbox_provider_access_token(request),
+    )
+    .await
+    .map_err(|_| gateway_grant_failure(TokenGrantFailureKind::Timeout))?
+    .map_err(|status| provider_subject_token_exchange_status(&status, &endpoint))?
+    .into_inner();
+    // connect() and the response boundary both reject locally revoked sandbox
+    // instance credentials.
+    if gateway.credentials().is_revoked() {
+        return Err(gateway_grant_failure(
+            TokenGrantFailureKind::WorkloadIdentityRejected,
+        ));
+    }
+    provider_subject_token_exchange_result(crate::proto::ExchangeProviderSubjectTokenResponse {
+        access_token: response.access_token,
+        expires_after: response.expires_after,
+        token_type: response.token_type,
+    })
+}
+
 /// Attach the exchange's request ID as `x-request-id` gRPC metadata.
 ///
 /// A value that is not valid metadata is omitted, never rewritten.

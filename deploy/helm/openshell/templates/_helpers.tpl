@@ -379,6 +379,26 @@ fullname, so the name never collapses into another release resource's name.
 {{- end }}
 
 {{/*
+SPIRE delegation belongs to the gateway. The private node admin socket is
+never mounted in a supervisor or sandbox Pod.
+*/}}
+{{- define "openshell.validateSpiffeDelegation" -}}
+{{- $delegation := .delegation -}}
+{{- $admin := get $delegation "admin_socket_path" | default "" -}}
+{{- $prefix := get $delegation "spiffe_id_prefix" | default "" -}}
+{{- $canonical := "^(/[A-Za-z0-9_.-]+){2,}$" -}}
+{{- if or (not (regexMatch $canonical $admin)) (regexMatch "/\\.\\.?(/|$)" $admin) -}}
+{{- fail "experimental_spiffe_delegation.admin_socket_path must be a canonical absolute UNIX socket path below a dedicated directory" -}}
+{{- end -}}
+{{- if and (hasKey $delegation "admin_socket_group") (not (regexMatch "^[1-9][0-9]*$" (toString (get $delegation "admin_socket_group")))) -}}
+{{- fail "experimental_spiffe_delegation.admin_socket_group must be a positive group ID" -}}
+{{- end -}}
+{{- if not (regexMatch "^spiffe://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*$" $prefix) -}}
+{{- fail "experimental_spiffe_delegation.spiffe_id_prefix must be spiffe://<trust-domain>[/<segment>...]" -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Pod labels of the shared supervisor; its Service selects exactly these.
 */}}
 {{- define "openshell.supervisorSelectorLabels" -}}
@@ -641,8 +661,8 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if ne (get $gateway "compute_driver" | default "kubernetes") "kubernetes" -}}
 {{- fail "supervisor_topology requires the kubernetes compute driver" -}}
 {{- end -}}
-{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") (get $kubernetes "provider_spiffe_workload_api_socket_path") -}}
-{{- fail "supervisor_topology=gateway does not support upstream proxy settings or provider SPIFFE identity" -}}
+{{- if or (get $kubernetes "https_proxy") (get $kubernetes "proxy_ca_bundle") (get $kubernetes "proxy_auth_secret_name") -}}
+{{- fail "supervisor_topology=gateway does not support upstream proxy settings" -}}
 {{- end -}}
 {{- if .Values.server.disableTls -}}
 {{- fail "supervisor_topology=gateway requires gateway TLS; the supervisor token travels only over TLS" -}}
@@ -650,6 +670,13 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (eq (get $kubernetes "workspace_mode" | default "shared") "operator") (not (regexMatch "^[A-Za-z0-9][-A-Za-z0-9_./]*==?[-A-Za-z0-9_.]*$" (get $kubernetes "operator_namespace_label" | default ""))) -}}
 {{- fail "supervisor_topology=gateway in operator workspace mode requires operator_namespace_label of the form key=value" -}}
 {{- end -}}
+{{- end -}}
+{{- $delegation := get (.Values.gatewayConfig | default dict) "openshell.gateway.experimental_spiffe_delegation" | default dict -}}
+{{- if $delegation -}}
+{{- if ne (get $kubernetes "supervisor_topology" | default "") "gateway" -}}
+{{- fail "experimental_spiffe_delegation requires supervisor_topology=gateway" -}}
+{{- end -}}
+{{- include "openshell.validateSpiffeDelegation" (dict "delegation" $delegation) -}}
 {{- end -}}
 {{- if hasKey (get (.Values.gatewayConfig | default dict) "openshell.drivers.kubernetes" | default dict) "shared_supervisor" -}}
 {{- fail "shared_supervisor is rendered by the chart; set only supervisor_topology" -}}

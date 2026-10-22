@@ -251,7 +251,9 @@ impl SandboxInstanceHost {
     ///
     /// Rejects an occupied key with different launch material or one still
     /// being removed, and fails when the instance cannot be prepared or
-    /// started. A failed admission leaves no instance and no private files.
+    /// started. A failed admission retains no instance; deleting its private
+    /// directory is best effort, and the next admission of the key deletes
+    /// any stale files before reuse.
     pub fn admit<E: From<SandboxInstanceHostError>>(
         &self,
         admission: SandboxInstanceAdmission,

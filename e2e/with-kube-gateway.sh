@@ -54,6 +54,14 @@
 #   installing OpenShell. This is used by HA CI so the gateway can run multiple
 #   replicas without requiring the OpenShell chart to own a database.
 #
+# SPIRE delegation fixture:
+#   Set OPENSHELL_E2E_KUBE_SPIRE_DELEGATION=1 to install pinned SPIRE hardened
+#   charts (ci/values-spire-delegation-stack.yaml) before OpenShell, with the
+#   agent admin socket exposed for the shared supervisor. The fixture needs a
+#   cluster without SPIRE CRDs and creates a fresh namespace
+#   (OPENSHELL_E2E_SPIRE_NAMESPACE, default openshell-e2e-spire); it removes
+#   both, and the registration entries tests label with that namespace, on exit.
+#
 # Credential-driver fixture:
 #   Set OPENSHELL_E2E_CREDENTIAL_DRIVERS=1 to enable one credential storage
 #   backend. Set OPENSHELL_E2E_CREDENTIAL_DRIVER to `kubernetes-secrets` or
@@ -114,6 +122,12 @@ VAULT_DEV_ROOT_TOKEN="${OPENSHELL_E2E_VAULT_DEV_ROOT_TOKEN:-root}"
 VAULT_CA_CONFIG_MAP="openbao-ca"
 VAULT_DNS_ALIAS="${VAULT_RELEASE_NAME}-0"
 VAULT_CA_FILE="${WORKDIR}/openbao-ca.crt"
+SPIRE_FIXTURE_DEPLOYED=0
+SPIRE_NAMESPACE="${OPENSHELL_E2E_SPIRE_NAMESPACE:-openshell-e2e-spire}"
+SPIRE_CRDS=(clusterspiffeids.spire.spiffe.io clusterstaticentries.spire.spiffe.io clusterfederatedtrustdomains.spire.spiffe.io)
+SPIRE_CHART_REPO="https://spiffe.github.io/helm-charts-hardened/"
+SPIRE_CHART_VERSION="${OPENSHELL_E2E_SPIRE_CHART_VERSION:-0.30.3}"
+SPIRE_CRDS_CHART_VERSION="${OPENSHELL_E2E_SPIRE_CRDS_CHART_VERSION:-0.6.1}"
 CORPORATE_PROXY_FIXTURE_DEPLOYED=0
 CORPORATE_PROXY_FIXTURE_SECRET="openshell-e2e-proxy-auth"
 CORPORATE_PROXY_FIXTURE_CA_CONFIGMAP="openshell-e2e-proxy-ca"
@@ -481,6 +495,53 @@ provision_vault_auth() {
     ttl=1h >/dev/null
 }
 
+deploy_spire_fixture() {
+  # The fixture owns only what it creates: refuse a cluster that already has
+  # the namespace or SPIRE CRDs, so cleanup can never remove another install.
+  local crd
+  for crd in "${SPIRE_CRDS[@]}"; do
+    if kctl get crd "${crd}" >/dev/null 2>&1; then
+      echo "ERROR: CRD ${crd} already exists; the SPIRE fixture needs a cluster without SPIRE." >&2
+      exit 2
+    fi
+  done
+  if ! kctl create namespace "${SPIRE_NAMESPACE}" >/dev/null; then
+    echo "ERROR: could not create a fresh SPIRE fixture namespace ${SPIRE_NAMESPACE}; set OPENSHELL_E2E_SPIRE_NAMESPACE to an unused name." >&2
+    exit 2
+  fi
+  SPIRE_FIXTURE_DEPLOYED=1
+  echo "Installing SPIRE ${SPIRE_CHART_VERSION} fixture in namespace ${SPIRE_NAMESPACE}..."
+  helmctl install spire-crds spire-crds --repo "${SPIRE_CHART_REPO}" \
+    --version "${SPIRE_CRDS_CHART_VERSION}" \
+    --namespace "${SPIRE_NAMESPACE}" --wait
+  helmctl install spire spire --repo "${SPIRE_CHART_REPO}" \
+    --version "${SPIRE_CHART_VERSION}" \
+    --namespace "${SPIRE_NAMESPACE}" \
+    --values "${ROOT}/deploy/helm/openshell/ci/values-spire-delegation-stack.yaml" \
+    --wait --timeout 5m
+  kctl -n "${SPIRE_NAMESPACE}" rollout status daemonset/spire-agent --timeout=180s
+  # Tests label the registration entries they create with this namespace.
+  export OPENSHELL_E2E_SPIRE_NAMESPACE="${SPIRE_NAMESPACE}"
+}
+
+cleanup_spire_fixture() {
+  [ "${SPIRE_FIXTURE_DEPLOYED}" = "1" ] || return 0
+  kctl delete clusterstaticentries.spire.spiffe.io \
+    -l "openshell.ai/e2e-spire-fixture=${SPIRE_NAMESPACE}" --ignore-not-found \
+    >/dev/null 2>&1 || true
+  helmctl uninstall spire --namespace "${SPIRE_NAMESPACE}" --wait --timeout 120s \
+    >/dev/null 2>&1 || true
+  helmctl uninstall spire-crds --namespace "${SPIRE_NAMESPACE}" --wait --timeout 60s \
+    >/dev/null 2>&1 || true
+  # The CRD chart keeps its CRDs on uninstall. None existed before the
+  # fixture, so these are the fixture's own.
+  kctl delete crd "${SPIRE_CRDS[@]}" --ignore-not-found --wait=false \
+    >/dev/null 2>&1 || true
+  kctl delete namespace "${SPIRE_NAMESPACE}" --wait=true --timeout=120s \
+    --ignore-not-found >/dev/null 2>&1 || true
+  SPIRE_FIXTURE_DEPLOYED=0
+}
+
 cleanup_vault_fixture() {
   [ -n "${KUBE_CONTEXT}" ] || return 0
   [ -n "${VAULT_NAMESPACE}" ] || return 0
@@ -566,6 +627,8 @@ cleanup() {
   if [ "${VAULT_FIXTURE_DEPLOYED}" = "1" ]; then
     cleanup_vault_fixture
   fi
+
+  cleanup_spire_fixture
 
   if [ "${ENVOY_GATEWAY_CONFIG_APPLIED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
     if command -v kubectl >/dev/null 2>&1; then
@@ -753,6 +816,7 @@ run_scenario() {
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  export OPENSHELL_E2E_HOST_GATEWAY_IP="${HOST_GATEWAY_IP}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \
@@ -1395,6 +1459,9 @@ if use_envoy_gateway; then
   helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-gateway.yaml")
   install_envoy_gateway
 fi
+if [ "${OPENSHELL_E2E_KUBE_SPIRE_DELEGATION:-0}" = "1" ]; then
+  deploy_spire_fixture
+fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   # --- Multi-scenario mode: test all database backends ---
@@ -1491,6 +1558,7 @@ else
   export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
   export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
   export OPENSHELL_E2E_KUBE_RELEASE="${RELEASE_NAME}"
+  export OPENSHELL_E2E_HOST_GATEWAY_IP="${HOST_GATEWAY_IP}"
   export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
   e2e_import_example_provider_profiles \

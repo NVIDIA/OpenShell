@@ -29,21 +29,28 @@
 //!
 //! ## Sandbox instance scope
 //!
-//! Each sandbox instance owns a [`SandboxInstanceTokenGrants`]: its token cache,
-//! HTTP client, gateway credentials, sandbox ID, and SPIFFE Workload API
-//! socket. A token is never served to another sandbox. Without a configured
-//! Workload API socket, grants fail closed with a configuration failure.
+//! Each sandbox instance selects one resolver when its networking starts, from
+//! its [`ProviderIdentitySource`]. A token is never served to another sandbox.
+//!
+//! A dedicated supervisor uses a [`SpiffeTokenGrantResolver`], which presents
+//! the supervisor's own identity from a SPIFFE Workload API socket and owns
+//! the instance's token cache and HTTP client. Without a socket, its grants
+//! fail closed with a configuration failure. A shared supervisor uses a
+//! [`GatewayTokenGrantResolver`], which requests only the final provider access
+//! token from the gateway; the gateway owns SPIRE acquisition, exchange, and
+//! caching.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use openshell_core::grpc_client::GatewayEndpoint;
 use openshell_core::oauth::{
     self, ACCESS_TOKEN_TYPE, OAuthTokenResponse, TokenExchangeParams, TokenGrantClient,
-    TokenGrantParams, effective_client_assertion_type, effective_token_type,
+    TokenGrantParams, effective_client_assertion_type, effective_token_type, token_cache_ttl,
 };
 use openshell_core::proto::ProviderCredentialTokenGrantType;
 use openshell_core::token_grant_failure::{
@@ -51,9 +58,7 @@ use openshell_core::token_grant_failure::{
 };
 use spiffe::{WorkloadApiClient, WorkloadApiError};
 
-const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
-const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
-const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
+use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
 
 /// Cached access token with expiration metadata.
 #[derive(Clone)]
@@ -86,7 +91,7 @@ impl TokenCache {
         }
     }
 
-    /// Store a token with expiration time.
+    /// Forget every cached token.
     fn set(&self, provider_name: String, access_token: String, expires_at_ms: i64) {
         if let Ok(mut tokens) = self.tokens.write() {
             tokens.insert(
@@ -100,12 +105,31 @@ impl TokenCache {
     }
 }
 
-/// Provider token grants owned by one supervised sandbox.
+/// How a sandbox instance obtains provider access tokens.
+#[derive(Debug)]
+pub enum ProviderIdentitySource {
+    /// Acquire tokens with this supervisor's own identity from a SPIFFE
+    /// Workload API socket, for a supervisor dedicated to one sandbox.
+    /// Without a socket, every grant fails closed.
+    WorkloadApi(Option<PathBuf>),
+    /// Request final tokens from the gateway, which owns the sandbox's
+    /// workload identity.
+    Gateway,
+}
+
+impl Default for ProviderIdentitySource {
+    fn default() -> Self {
+        Self::WorkloadApi(None)
+    }
+}
+
+/// Provider token grants acquired with this supervisor's SPIFFE identity.
 ///
 /// The cache, HTTP connection pool, gateway credentials, sandbox ID, and
-/// workload identity socket all belong to this sandbox instance, so a token acquired
-/// for one sandbox is never served to another.
-pub struct SandboxInstanceTokenGrants {
+/// Workload API socket all belong to one sandbox instance, so a token
+/// acquired for one sandbox is never served to another. The gateway is used
+/// only for the intermediate exchange of RFC 8693 token exchange grants.
+pub struct SpiffeTokenGrantResolver {
     cache: TokenCache,
     // Initialization failures stay bounded and typed; acquisition must not panic.
     http_client: Result<TokenGrantClient, TokenGrantFailure>,
@@ -114,9 +138,9 @@ pub struct SandboxInstanceTokenGrants {
     workload_api_socket: Option<PathBuf>,
 }
 
-impl SandboxInstanceTokenGrants {
-    /// Grants authenticated as `sandbox_id` through `gateway`. A missing
-    /// Workload API socket makes every grant fail closed.
+impl SpiffeTokenGrantResolver {
+    /// Grants authenticated as `sandbox_id` through `gateway`. A missing or
+    /// empty socket makes every grant fail closed.
     #[must_use]
     pub fn new(
         gateway: Option<GatewayEndpoint>,
@@ -130,6 +154,14 @@ impl SandboxInstanceTokenGrants {
             sandbox_id: sandbox_id.filter(|value| !value.trim().is_empty()),
             workload_api_socket: workload_api_socket.filter(|path| !path.as_os_str().is_empty()),
         }
+    }
+
+    async fn fetch_jwt_svid(&self, audience: &str) -> Result<String, TokenGrantFailure> {
+        let socket_path = self
+            .workload_api_socket
+            .as_deref()
+            .ok_or_else(configuration_failure)?;
+        fetch_jwt_svid_from_socket(socket_path, audience).await
     }
 
     /// Obtain an `OAuth2` access token for a provider using JWT client assertion grant.
@@ -150,22 +182,22 @@ impl SandboxInstanceTokenGrants {
     /// - JWT-SVID fetch fails
     /// - Token service request fails
     /// - Token response is invalid
-    pub async fn obtain_provider_token(
+    async fn obtain_provider_token(
         &self,
-        request: ObtainProviderTokenRequest<'_>,
+        request: TokenGrantRequest<'_>,
     ) -> Result<String, TokenGrantFailure> {
         let grant_type = ProviderCredentialTokenGrantType::try_from(request.grant_type)
             .map_err(|_| configuration_failure())?;
-        obtain_provider_token_with_grant(
+        let token = obtain_provider_token_with_grant(
             ObtainProviderTokenInput {
                 cache: &self.cache,
-                provider_name: request.provider_name,
+                provider_name: request.provider_key,
                 token_endpoint: request.token_endpoint,
                 jwt_svid_audience: request.jwt_svid_audience,
                 client_assertion_type: request.client_assertion_type,
                 audience: request.audience,
                 scopes: request.scopes,
-                cache_ttl_override: request.cache_ttl_override,
+                cache_ttl_override: request.cache_ttl,
                 grant_type,
                 requested_token_type: request.requested_token_type,
             },
@@ -176,7 +208,7 @@ impl SandboxInstanceTokenGrants {
                     | ProviderCredentialTokenGrantType::Unspecified => None,
                     ProviderCredentialTokenGrantType::TokenExchange => {
                         let (provider, credential_key) =
-                            parse_provider_credential_key(request.provider_name)?;
+                            parse_provider_credential_key(request.provider_key)?;
                         let gateway = self.gateway.as_ref().ok_or_else(configuration_failure)?;
                         openshell_core::grpc_client::token_grant_gateway_endpoint(gateway.url())?;
                         let sandbox_id = self
@@ -187,15 +219,11 @@ impl SandboxInstanceTokenGrants {
                     }
                 };
                 let http_client = self.http_client.as_ref().map_err(|failure| *failure)?;
-                let socket_path = self
-                    .workload_api_socket
-                    .as_deref()
-                    .ok_or_else(configuration_failure)?;
                 // Fetch JWT-SVID with authorization server as audience
                 // For RFC 7523, the JWT assertion's aud claim identifies the issuer/realm
-                let jwt_svid = fetch_jwt_svid_from_socket(socket_path, &jwt_audience).await?;
+                let jwt_svid = self.fetch_jwt_svid(&jwt_audience).await?;
 
-                match exchange_context {
+                let response = match exchange_context {
                     None => {
                         // Perform OAuth2 JWT client assertion grant. The audience
                         // parameter in the token request specifies the resource server.
@@ -240,27 +268,58 @@ impl SandboxInstanceTokenGrants {
                         )
                         .await
                     }
-                }
+                }?;
+                Ok(response)
             },
         )
-        .await
+        .await?;
+        Ok(token)
     }
 }
 
-/// One provider token request; see [`SandboxInstanceTokenGrants::obtain_provider_token`].
-pub struct ObtainProviderTokenRequest<'a> {
-    pub provider_name: &'a str,
-    pub token_endpoint: &'a str,
-    pub jwt_svid_audience: &'a str,
-    pub client_assertion_type: &'a str,
-    pub audience: &'a str,
-    pub scopes: &'a [String],
-    pub cache_ttl_override: Option<Duration>,
-    pub grant_type: i32,
-    pub requested_token_type: &'a str,
-    /// Supervisor-minted ID of the HTTP exchange that needs the token. It is
-    /// sent to the gateway and token service; a cache hit sends nothing.
-    pub request_id: &'a str,
+impl TokenGrantResolver for SpiffeTokenGrantResolver {
+    fn obtain<'a>(
+        &'a self,
+        request: TokenGrantRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
+        Box::pin(self.obtain_provider_token(request))
+    }
+}
+
+/// Final provider access tokens from the gateway, for a sandbox instance whose
+/// supervisor holds no workload identity of its own.
+///
+/// It forwards only the credential key and request ID over the instance's
+/// authenticated gateway connection and validates the returned token. The
+/// gateway authorizes, acquires, exchanges, and caches; this resolver holds
+/// no cache, SVID, intermediate token, or HTTP client.
+pub struct GatewayTokenGrantResolver {
+    gateway: GatewayEndpoint,
+}
+
+impl GatewayTokenGrantResolver {
+    #[must_use]
+    pub fn new(gateway: GatewayEndpoint) -> Self {
+        Self { gateway }
+    }
+}
+
+impl TokenGrantResolver for GatewayTokenGrantResolver {
+    fn obtain<'a>(
+        &'a self,
+        request: TokenGrantRequest<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<String, TokenGrantFailure>> + Send + 'a>> {
+        Box::pin(async move {
+            let token = openshell_core::grpc_client::get_sandbox_provider_access_token(
+                &self.gateway,
+                request.provider_key,
+                Some(request.request_id),
+            )
+            .await?;
+            validate_access_token(&token.access_token)?;
+            Ok(token.access_token)
+        })
+    }
 }
 
 struct ObtainProviderTokenInput<'a> {
@@ -413,23 +472,6 @@ async fn perform_token_exchange(
 
 pub use oauth::validate_access_token;
 
-fn token_cache_ttl(cache_ttl_override: Option<Duration>, expires_in: i64) -> Duration {
-    if let Some(cache_ttl_override) = cache_ttl_override {
-        return cache_ttl_override;
-    }
-
-    let ttl = if expires_in > 0 {
-        expires_in.min(MAX_TOKEN_EXPIRES_IN_SECONDS)
-    } else {
-        DEFAULT_TOKEN_CACHE_TTL_SECONDS
-    };
-
-    Duration::from_secs(
-        u64::try_from(ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1))
-            .unwrap_or(u64::MAX),
-    )
-}
-
 /// Derive the issuer/realm URL from a token endpoint URL.
 ///
 /// For Keycloak token endpoints like:
@@ -512,9 +554,8 @@ pub mod test_support {
     //! socket or OAuth service is contacted, and no process-wide cache is used.
 
     use super::*;
-    use crate::l7::token_grant_injection::{TokenGrantRequest, TokenGrantResolver};
+    use openshell_core::oauth::MAX_TOKEN_EXPIRES_IN_SECONDS;
     use std::collections::HashSet;
-    use std::pin::Pin;
     use std::sync::Mutex;
 
     /// One actual acquisition, excluding requests served from the cache.
@@ -652,7 +693,10 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::oauth::{ACCESS_TOKEN_TYPE, DEFAULT_CLIENT_ASSERTION_TYPE};
+    use openshell_core::oauth::{
+        ACCESS_TOKEN_TYPE, DEFAULT_CLIENT_ASSERTION_TYPE, DEFAULT_TOKEN_CACHE_TTL_SECONDS,
+        MAX_TOKEN_EXPIRES_IN_SECONDS, TOKEN_CACHE_EXPIRY_SKEW_SECONDS,
+    };
     use std::collections::HashMap;
     use std::sync::{
         Arc,

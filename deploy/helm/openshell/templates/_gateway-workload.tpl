@@ -9,6 +9,7 @@ Gateway pod template shared by the StatefulSet and Deployment workload shapes.
 {{- $oidcRuntimeConfig := get $gatewayConfig "openshell.gateway.oidc" | default dict -}}
 {{- if not (get $oidcRuntimeConfig "issuer") -}}{{- $oidcRuntimeConfig = .Values.server.oidc | default dict -}}{{- end -}}
 {{- $kubernetesRuntimeConfig := include "openshell.effectiveKubernetesConfig" . | fromYaml -}}
+{{- $delegation := get $gatewayConfig "openshell.gateway.experimental_spiffe_delegation" | default dict -}}
 {{- $spiffeSocketPath := get $kubernetesRuntimeConfig "provider_spiffe_workload_api_socket_path" -}}
 {{- $hasExternalCredentialDriver := or (eq (include "openshell.credentialDriverEnabled" (list . "kubernetes-secrets")) "true") (eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true") -}}
 {{- $vaultCredentialDriverEnabled := eq (include "openshell.credentialDriverEnabled" (list . "vault")) "true" -}}
@@ -46,7 +47,11 @@ spec:
         - host.docker.internal
         - host.openshell.internal
   {{- end }}
-  {{- with .Values.podSecurityContext }}
+  {{- $podSecurity := deepCopy (.Values.podSecurityContext | default dict) }}
+  {{- with $delegation.admin_socket_group }}
+  {{- $_ := set $podSecurity "supplementalGroups" (append (get $podSecurity "supplementalGroups" | default list) (int64 .) | uniq) }}
+  {{- end }}
+  {{- with $podSecurity }}
   securityContext:
     {{- toYaml . | nindent 4 }}
   {{- end }}
@@ -196,6 +201,11 @@ spec:
           mountPath: {{ dir $spiffeSocketPath | quote }}
           readOnly: true
         {{- end }}
+        {{- if $delegation }}
+        - name: spire-agent-admin
+          mountPath: {{ dir (get $delegation "admin_socket_path") | quote }}
+          readOnly: true
+        {{- end }}
         {{- with .Values.server.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -297,6 +307,12 @@ spec:
         items:
           - key: {{ .Values.upstreamProxy.caBundle.key | default "ca.crt" | quote }}
             path: ca.crt
+    {{- end }}
+    {{- if $delegation }}
+    - name: spire-agent-admin
+      hostPath:
+        path: {{ dir (get $delegation "admin_socket_path") | quote }}
+        type: Directory
     {{- end }}
     {{- if $spiffeSocketPath }}
     - name: spiffe-workload-api
