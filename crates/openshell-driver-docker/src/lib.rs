@@ -7,6 +7,7 @@
 
 mod isolation;
 pub mod otel_tracing;
+mod wsl_gpu;
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -359,6 +360,7 @@ struct DockerGpuRuntimeCapabilities {
     #[cfg(test)]
     cdi_spec_dirs: Vec<String>,
     wsl_all_gpu_fallback_enabled: bool,
+    nvidia_wsl_supported: bool,
 }
 
 impl DockerGpuRuntimeCapabilities {
@@ -1007,6 +1009,7 @@ struct DockerSandboxDriverConfig {
         deserialize_with = "deserialize_optional_non_empty_string_list"
     )]
     cdi_devices: Option<Vec<String>>,
+    nvidia_wsl_gpus: Option<wsl_gpu::AllGpus>,
     mounts: Vec<DockerDriverMountConfig>,
 }
 
@@ -1170,6 +1173,7 @@ impl DockerComputeDriver {
             #[cfg(test)]
             cdi_spec_dirs,
             wsl_all_gpu_fallback_enabled,
+            nvidia_wsl_supported: wsl_gpu::supported_daemon(&info),
         };
         validate_docker_app_armor_profile(docker_config.app_armor_profile.as_ref(), &info)?;
         let gateway_port = gateway_bind_address.port();
@@ -1297,7 +1301,8 @@ impl DockerComputeDriver {
                     limit_supported: true,
                 }),
                 gpu: Some(GpuResourceCapabilities {
-                    default_selection_supported: self.config.gpu.cdi_supported,
+                    default_selection_supported: self.config.gpu.cdi_supported
+                        || self.config.gpu.nvidia_wsl_supported,
                     count_selection_supported: self.config.gpu.cdi_supported,
                 }),
             }),
@@ -1354,7 +1359,15 @@ impl DockerComputeDriver {
             }
         }
         let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-        Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
+        if driver_config.nvidia_wsl_gpus.is_some() {
+            wsl_gpu::validate_request(
+                gpu_requirements,
+                &driver_config,
+                config.gpu.nvidia_wsl_supported,
+            )?;
+        } else {
+            Self::validate_gpu_request(gpu_requirements, config.gpu.cdi_supported, &driver_config)?;
+        }
         Ok(ValidatedDockerSandbox {
             template,
             driver_config,
@@ -1486,13 +1499,6 @@ impl DockerComputeDriver {
         &self,
         container: &bollard::models::ContainerInspectResponse,
     ) -> Result<(), Status> {
-        // Only CDI containers carry a projection context, so other containers
-        // are admitted without depending on the bootstrap file.
-        if !self.config.resource_admission.enabled || !has_cdi_device_request(container) {
-            return self
-                .admit_container_resources_with_cdi_context(container, None)
-                .await;
-        }
         let sandbox_id = container
             .config
             .as_ref()
@@ -1501,8 +1507,28 @@ impl DockerComputeDriver {
             .ok_or_else(|| Status::failed_precondition("sandbox lacks identity"))?;
         let path =
             docker_boundary_state_dir_by_id(sandbox_id, &self.config)?.join(BOUNDARY_CONFIG_FILE);
-        let cdi_context = read_docker_cdi_context(&path).await?;
-        self.admit_container_resources_with_cdi_context(container, cdi_context.as_ref())
+        let has_gpu_request = container
+            .host_config
+            .as_ref()
+            .and_then(|host| host.device_requests.as_ref())
+            .is_some_and(|requests| !requests.is_empty());
+        // Preserve admission of older CPU fixtures without a bootstrap. For a
+        // provisioned workload, always check the protected selection, even if
+        // its Docker device request was removed.
+        if !has_gpu_request
+            && !tokio::fs::try_exists(&path)
+                .await
+                .map_err(|error| Status::unavailable(error.to_string()))?
+        {
+            return self
+                .admit_container_resources_with_cdi_context(container, None)
+                .await;
+        }
+        // Read protected selection even when the inspected device request was removed.
+        // Provisioning uses the explicit creation context before this file exists.
+        let boundary = read_docker_boundary_config(&path).await?;
+        wsl_gpu::admit_persisted(container, &boundary)?;
+        self.admit_container_resources_with_cdi_context(container, boundary.cdi_context.as_ref())
             .await
     }
 
@@ -1684,6 +1710,19 @@ impl DockerComputeDriver {
             u32,
         ) -> Result<Vec<String>, CdiGpuSelectionError>,
     ) -> Result<Option<Vec<String>>, Status> {
+        if driver_config.nvidia_wsl_gpus.is_some() {
+            let info = self
+                .docker
+                .info()
+                .await
+                .map_err(|err| internal_status("query Docker daemon info", err))?;
+            wsl_gpu::validate_request(
+                gpu_requirements,
+                driver_config,
+                wsl_gpu::supported_daemon(&info),
+            )?;
+            return Ok(None);
+        }
         if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
             validate_cdi_gpu_device_request(
                 gpu_requirements,
@@ -2164,7 +2203,12 @@ impl DockerComputeDriver {
                 ));
             }
         };
-        let outer_fence_error = match validate_docker_outer_fence(&inspected) {
+        let outer_fence_error = match validate_docker_outer_fence(&inspected).and_then(|()| {
+            wsl_gpu::admit_request(
+                &inspected,
+                validated.driver_config.nvidia_wsl_gpus.is_some(),
+            )
+        }) {
             Ok(()) => self
                 .admit_container_resources_with_cdi_context(&inspected, cdi_context.as_ref())
                 .await
@@ -4716,7 +4760,7 @@ fn validate_cdi_spec_mount_config(
 
 /// A missing or undecodable bootstrap is persistent and fails admission.
 /// Other read errors may be transient and defer admission to the next pass.
-async fn read_docker_cdi_context(path: &Path) -> Result<Option<CdiContext>, Status> {
+async fn read_docker_boundary_config(path: &Path) -> Result<BoundaryConfig, Status> {
     let contents = tokio::fs::read(path).await.map_err(|error| {
         let message = format!("read Docker sandbox bootstrap for admission: {error}");
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -4730,7 +4774,12 @@ async fn read_docker_cdi_context(path: &Path) -> Result<Option<CdiContext>, Stat
             "decode Docker sandbox bootstrap for admission: {error}"
         ))
     })?;
-    Ok(config.cdi_context)
+    Ok(config)
+}
+
+#[cfg(test)]
+async fn read_docker_cdi_context(path: &Path) -> Result<Option<CdiContext>, Status> {
+    Ok(read_docker_boundary_config(path).await?.cdi_context)
 }
 
 /// Replace the file atomically so concurrent readers never see a partial write.
@@ -5049,6 +5098,10 @@ async fn prepare_docker_boundary_files(
     workload_identity: &ResolvedWorkloadIdentity,
     cdi_context: Option<&CdiContext>,
 ) -> Result<(), Status> {
+    let nvidia_wsl_all = DockerComputeDriver::validated_sandbox(sandbox, config)?
+        .driver_config
+        .nvidia_wsl_gpus
+        .is_some();
     let directory = docker_boundary_state_dir(sandbox, config)?;
     let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
         .map_err(Status::failed_precondition)?;
@@ -5064,7 +5117,7 @@ async fn prepare_docker_boundary_files(
     let tls = generate_sandbox_tls_material(session_id)
         .map_err(|error| Status::internal(format!("generate Docker boundary TLS: {error}")))?;
     let verification_keys = gateway_verification_keys(&launch_authentication.verification_keys)?;
-    let provisioning = isolation::DockerBoundarySpec {
+    let mut provisioning = isolation::DockerBoundarySpec {
         boundary_id: sandbox.id.clone(),
         generation: launch_authentication
             .supervisor
@@ -5077,7 +5130,7 @@ async fn prepare_docker_boundary_files(
         verification_keys,
         container_id: container_id.to_string(),
         image_identity: image.id.clone(),
-        gpu_requested: cdi_context.is_some(),
+        gpu_requested: cdi_context.is_some() || nvidia_wsl_all,
         cdi_context: cdi_context.cloned(),
         listener_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
         control_socket: PathBuf::from(BOUNDARY_SOCKET_MOUNT_PATH),
@@ -5099,6 +5152,16 @@ async fn prepare_docker_boundary_files(
     }
     .provision()
     .map_err(|error| Status::failed_precondition(error.to_string()))?;
+    if nvidia_wsl_all {
+        provisioning
+            .boundary_config
+            .resource_claims
+            .insert(wsl_gpu::SELECTION_CLAIM.into(), "all".into());
+        provisioning
+            .runtime_descriptor
+            .resource_claims
+            .insert(wsl_gpu::SELECTION_CLAIM.into(), "all".into());
+    }
     let boundary_config = provisioning
         .boundary_config
         .encode()
@@ -6367,13 +6430,27 @@ fn build_container_create_body_for_image(
         ..Default::default()
     });
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
-    let device_requests = gpu_device_ids.map(|device_ids| {
-        vec![DeviceRequest {
-            driver: Some("cdi".to_string()),
-            device_ids: Some(device_ids.to_vec()),
-            ..Default::default()
-        }]
-    });
+    let device_requests = if driver_config.nvidia_wsl_gpus.is_some() {
+        wsl_gpu::validate_request(
+            driver_gpu_requirements(spec.resource_requirements.as_ref()),
+            driver_config,
+            config.gpu.nvidia_wsl_supported,
+        )?;
+        if gpu_device_ids.is_some() {
+            return Err(Status::invalid_argument(
+                "WSL NVIDIA injection cannot include CDI device IDs",
+            ));
+        }
+        Some(vec![wsl_gpu::device_request()])
+    } else {
+        gpu_device_ids.map(|device_ids| {
+            vec![DeviceRequest {
+                driver: Some("cdi".to_string()),
+                device_ids: Some(device_ids.to_vec()),
+                ..Default::default()
+            }]
+        })
+    };
     let mut labels = template.labels.clone();
     labels.insert(
         "openshell.ai/private-image-volume-targets".into(),

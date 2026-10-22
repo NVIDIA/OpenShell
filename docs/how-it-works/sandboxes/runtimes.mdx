@@ -77,11 +77,12 @@ The gateway does not start or supervise extension drivers. Restrict the socket s
 
 ## Size Sandboxes
 
-Use `--cpu`, `--memory`, and `--gpu` on `openshell sandbox create` to request resources. `--gpu` alone requests one GPU; `--gpu COUNT` requests more.
+Use `--cpu`, `--memory`, and `--gpu` on `openshell sandbox create` to request resources. `--gpu` alone uses the driver's default selection, normally one GPU; `--gpu COUNT` requests a specific count. The explicit Docker Desktop WSL all-GPU mode described below overrides the default selection and rejects a count.
 
 | Driver | CPU and memory | GPU |
 |---|---|---|
-| Docker, Podman | Runtime limits | NVIDIA CDI devices |
+| Docker | Runtime limits | NVIDIA CDI devices, or explicit all-GPU injection on Docker Desktop WSL |
+| Podman | Runtime limits | NVIDIA CDI devices |
 | Kubernetes | Container requests and limits | `nvidia.com/gpu` resource limit |
 | MicroVM | Ignored; use `vcpus` and `mem_mib` | One GPU through `gpu_device_ids` |
 
@@ -119,7 +120,7 @@ socket_path = "/var/run/docker.sock"
 
 Common options in `[openshell.drivers.docker]` are `socket_path`, `grpc_endpoint`, `sandbox_runtime_image`, `supervisor_image`, `image_pull_policy`, and `sandbox_pids_limit`. When `socket_path` is unset, the driver uses the socket found by auto-detection.
 
-Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For GPU sandboxes, configure Docker CDI before starting the gateway.
+Docker Desktop must have host networking enabled, and it cannot use Enhanced Container Isolation. Set `grpc_endpoint` when sandboxes cannot reach the gateway on host loopback. For ordinary GPU requests, configure Docker CDI before starting the gateway. On Docker Desktop WSL with working NVIDIA GPU support, an operator can instead enable [explicit all-GPU injection](/how-it-works/gateways/configuration#docker-desktop-wsl-gpu-injection). This mode preserves OpenShell's workload isolation and lifecycle ownership; it does not run automatically after CDI failure.
 
 For Docker GPU/CDI sandboxes, OpenShell uses Docker's selected CDI device IDs
 and daemon-reported CDI spec directories to build a workload CDI context. The
