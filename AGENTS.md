@@ -53,7 +53,6 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `crates/openshell-driver-mxc/` | Microsoft MXC compute driver | In-process Windows AppContainer and isolation-session compute backend |
 | `crates/openshell-prover/` | Policy prover | Policy verification and proof generation |
 | `crates/openshell-prover-cli/` | Policy prover CLI | Standalone local policy boundary checks |
-| `crates/openshell-server-macros/` | Server macros | Compile-time helpers for gateway RPC authorization |
 | `crates/openshell-supervisor-middleware/` | Middleware runtime | Generic middleware registry, remote service integration, and chain execution |
 | `crates/openshell-supervisor-middleware-builtins/` | Built-in middleware | First-party in-process middleware implementations |
 | `crates/openshell-supervisor-network/` | Network supervisor | Proxying, L7 enforcement, policy evaluation, and provider credential injection |

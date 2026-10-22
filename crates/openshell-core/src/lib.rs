@@ -100,7 +100,7 @@ mod build_version;
 ///
 /// Emitted by `build.rs` via `tonic_build::configure().file_descriptor_set_path(...)`.
 /// Used by tests in `openshell-server` to enumerate every RPC and verify that
-/// each one has an `#[rpc_auth(...)]` declaration on its handler.
+/// each one declares the `openshell.options.v1.authorization` proto option.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));
 
 #[cfg(test)]
