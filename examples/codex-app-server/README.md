@@ -78,6 +78,7 @@ openshell sandbox create \
   --name codex-app-server \
   --from openshell/codex-app-server:local \
   --expose 4500 \
+  --expose-readiness-path /readyz \
   --detach \
   --no-tty \
   --provider codex \
@@ -94,6 +95,21 @@ The create result includes the exposed endpoint:
   }
 }
 ```
+
+Check application readiness before connecting:
+
+```shell
+openshell service get codex-app-server
+openshell service list codex-app-server --output json
+```
+
+The gateway continuously checks Codex's `/readyz` endpoint. One passing check
+sets `Ready`; it remains ready through two failures and changes to `Not ready`
+after three consecutive failures. One passing check restores `Ready`.
+`Unknown` means no conclusive current observation is available. Checks run every
+five seconds with a one-second timeout and continue while the sandbox runs.
+They do not restart Codex or prevent clients from connecting. The endpoint
+checks the listener's readiness; it does not verify credentials or model access.
 
 Convert the returned URL to its WebSocket scheme and connect the local client,
 replacing `<gateway-port>` with the port from the create result:

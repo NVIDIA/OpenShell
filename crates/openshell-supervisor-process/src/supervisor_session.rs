@@ -904,8 +904,13 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
             let expected_ssh_peer_pid = context.expected_ssh_peer_pid;
             let terminating = Arc::clone(context.terminating);
 
-            let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
-            ocsf_emit!(event);
+            if relay_open.health_check {
+                debug!(%channel_id, "supervisor session: opening HTTP health check relay");
+            } else {
+                let event =
+                    relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
+                ocsf_emit!(event);
+            }
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
@@ -921,6 +926,10 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                 .await
                 {
                     Ok(()) => {
+                        if event_open.health_check {
+                            debug!(%channel_id, "supervisor session: HTTP health check relay closed");
+                            return;
+                        }
                         let event = relay_closed_event(
                             openshell_ocsf::ctx::ctx(),
                             &event_open,
@@ -929,6 +938,10 @@ fn handle_gateway_message(msg: &GatewayMessage, context: &GatewayMessageContext<
                         ocsf_emit!(event);
                     }
                     Err(e) => {
+                        if event_open.health_check {
+                            debug!(%channel_id, error = %e, "supervisor session: HTTP health check relay failed");
+                            return;
+                        }
                         let event = relay_failed_event(
                             openshell_ocsf::ctx::ctx(),
                             &event_open,
@@ -1439,6 +1452,7 @@ mod ocsf_event_tests {
 
     fn ssh_relay_open(channel_id: &str) -> RelayOpen {
         RelayOpen {
+            health_check: false,
             channel_id: channel_id.to_string(),
             target: Some(relay_open::Target::Ssh(
                 openshell_core::proto::SshRelayTarget::default(),
@@ -1449,6 +1463,7 @@ mod ocsf_event_tests {
 
     fn tcp_relay_open(channel_id: &str, host: &str, port: u32) -> RelayOpen {
         RelayOpen {
+            health_check: false,
             channel_id: channel_id.to_string(),
             target: Some(relay_open::Target::Tcp(TcpRelayTarget {
                 host: host.to_string(),

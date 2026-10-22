@@ -43,6 +43,17 @@ use crate::supervisor_owner::{
 };
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
+// Header-only probes intentionally close the bridge before application bodies
+// finish. Preserve diagnostics without warning on routine probe cancellation.
+macro_rules! relay_bridge_warn {
+    ($health_check:expr, $($fields:tt)*) => {
+        if $health_check {
+            debug!($($fields)*);
+        } else {
+            warn!($($fields)*);
+        }
+    };
+}
 const OWNER_RENEW_TIMEOUT: Duration = Duration::from_secs(5);
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a stopping replica waits for a redirected supervisor to publish its
@@ -386,6 +397,7 @@ struct PendingRelay {
 pub struct ClaimedRelay {
     pub stream: tokio::io::DuplexStream,
     pub sandbox_id: String,
+    pub health_check: bool,
 }
 
 impl std::fmt::Debug for SupervisorSessionRegistry {
@@ -878,6 +890,7 @@ impl SupervisorSessionRegistry {
     > {
         let channel_id = Uuid::new_v4().to_string();
         let relay_open = RelayOpen {
+            health_check: false,
             channel_id: channel_id.clone(),
             target: Some(target),
             service_id,
@@ -1019,6 +1032,14 @@ impl SupervisorSessionRegistry {
         true
     }
 
+    fn is_health_check_relay(&self, channel_id: &str) -> bool {
+        self.pending_relays
+            .lock()
+            .unwrap()
+            .get(channel_id)
+            .is_some_and(|pending| pending.relay_open.health_check)
+    }
+
     /// Claim a pending relay channel. Called by the `/relay/{channel_id}` HTTP handler
     /// when the supervisor's reverse CONNECT arrives.
     ///
@@ -1030,7 +1051,7 @@ impl SupervisorSessionRegistry {
         channel_id: &str,
         principal: Option<&Principal>,
     ) -> Result<ClaimedRelay, Status> {
-        let (sender, sandbox_id) = {
+        let (sender, sandbox_id, health_check) = {
             let mut map = self.pending_relays.lock().unwrap();
             let pending = map
                 .get(channel_id)
@@ -1061,11 +1082,14 @@ impl SupervisorSessionRegistry {
             // The rest of the entry, including its gauge slot, drops at the end of this
             // statement while the lock is still held, so `relay_pending` never exceeds capacity.
             let PendingRelay {
-                sender, sandbox_id, ..
+                sender,
+                sandbox_id,
+                relay_open,
+                ..
             } = map
                 .remove(channel_id)
                 .expect("pending relay existed before removal");
-            (sender, sandbox_id)
+            (sender, sandbox_id, relay_open.health_check)
         };
 
         // Create a duplex stream pair: one end for the gateway bridge, one for
@@ -1080,6 +1104,7 @@ impl SupervisorSessionRegistry {
         Ok(ClaimedRelay {
             stream: supervisor_stream,
             sandbox_id,
+            health_check,
         })
     }
 
@@ -1244,7 +1269,12 @@ async fn handle_relay_stream_inner(
     let claimed = registry.claim_relay(&channel_id, principal.as_ref())?;
     let sandbox_id = claimed.sandbox_id;
     let supervisor_side = claimed.stream;
-    info!(channel_id = %channel_id, sandbox_id = %sandbox_id, "relay stream: claimed pending relay, bridging");
+    let health_check = claimed.health_check;
+    if claimed.health_check {
+        debug!(channel_id = %channel_id, sandbox_id = %sandbox_id, "HTTP health check: bridging relay");
+    } else {
+        info!(channel_id = %channel_id, sandbox_id = %sandbox_id, "relay stream: claimed pending relay, bridging");
+    }
 
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_side);
 
@@ -1268,13 +1298,15 @@ async fn handle_relay_stream_inner(
                     if let Err(e) =
                         tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
-                        warn!(channel_id = %channel_id_in, error = %e, "relay stream: write to duplex failed");
+                        relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %e, "relay stream: write to duplex failed");
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    if let Some(state) = state_in.as_ref()
+                    if health_check {
+                        debug!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %e, "relay stream: health check inbound closed");
+                    } else if let Some(state) = state_in.as_ref()
                         && expected_transport_close_during_sandbox_teardown(
                             state,
                             &sandbox_id_in,
@@ -1318,7 +1350,7 @@ async fn handle_relay_stream_inner(
                     }
                 }
                 Err(e) => {
-                    warn!(channel_id = %channel_id_out, error = %e, "relay stream: read from duplex failed");
+                    relay_bridge_warn!(health_check, channel_id = %channel_id_out, error = %e, "relay stream: read from duplex failed");
                     break;
                 }
             }
@@ -1584,6 +1616,7 @@ pub async fn open_routed_relay_with_target(
 > {
     let channel_id = Uuid::new_v4().to_string();
     let relay_open = RelayOpen {
+        health_check: false,
         channel_id: channel_id.clone(),
         target: Some(target),
         service_id,
@@ -1731,6 +1764,7 @@ pub async fn open_routed_relay_with_message(
                 .await
                 {
                     Ok(relay) => return Ok(relay),
+                    Err(status) if is_relay_target_failure(&status) => return Err(status),
                     Err(status) => {
                         warn!(
                             sandbox_id,
@@ -1877,6 +1911,20 @@ fn ring_redirect(
     })
 }
 
+fn relay_target_failure(message: &str) -> Status {
+    openshell_core::rpc_error::failed_precondition("RELAY_TARGET_FAILED", message)
+}
+
+pub(crate) fn is_relay_target_failure(status: &Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && openshell_core::rpc_error::decode_details(status).is_some_and(|details| {
+            details.error_info().is_some_and(|info| {
+                info.domain == openshell_core::rpc_error::ERROR_DOMAIN
+                    && info.reason == "RELAY_TARGET_FAILED"
+            })
+        })
+}
+
 async fn open_peer_relay(
     state: &Arc<ServerState>,
     owner_peer_endpoint: String,
@@ -1907,6 +1955,7 @@ async fn connect_peer_relay(
     sandbox_id: &str,
     relay_open: RelayOpen,
 ) -> Result<tokio::io::DuplexStream, Status> {
+    let health_check = relay_open.health_check;
     let mut timer = RoutedRequestTimer::relay(relay_kind(&relay_open), RelayRoute::Peer);
     let token = state
         .peer_routes
@@ -1936,15 +1985,26 @@ async fn connect_peer_relay(
         .inspect_err(|s| timer.local_error(s))?;
 
     let result = client.peer_relay(ReceiverStream::new(out_rx)).await;
-    // Record the owner's code before the remap below hides it as `unavailable`.
+    // Target failures are conclusive application observations. Preserve their
+    // structured reason and the healthy peer channel instead of retrying them
+    // as an owner/transport outage.
     timer.finish(&result);
     let response = result.map_err(|err| {
+        if is_relay_target_failure(&err) {
+            return err;
+        }
         state.peer_routes.evict_channel(owner_peer_endpoint);
         Status::unavailable(format!("gateway peer relay RPC failed: {err}"))
     })?;
     let inbound = response.into_inner();
     let (gateway_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
-    spawn_peer_bridge(bridge_stream, inbound, out_tx, sandbox_id.to_string());
+    spawn_peer_bridge(
+        bridge_stream,
+        inbound,
+        out_tx,
+        sandbox_id.to_string(),
+        health_check,
+    );
     Ok(gateway_stream)
 }
 
@@ -1991,20 +2051,26 @@ pub async fn handle_peer_relay(
         return Err(Status::invalid_argument("relay channel_id is required"));
     }
 
-    info!(
-        sandbox_id = %init.sandbox_id,
-        channel_id = %relay_open.channel_id,
-        requester = %peer.replica_id,
-        "gateway peer relay: opening local supervisor relay"
-    );
+    if relay_open.health_check {
+        debug!(sandbox_id = %init.sandbox_id, channel_id = %relay_open.channel_id,
+            "gateway peer relay: opening HTTP health check");
+    } else {
+        info!(
+            sandbox_id = %init.sandbox_id,
+            channel_id = %relay_open.channel_id,
+            requester = %peer.replica_id,
+            "gateway peer relay: opening local supervisor relay"
+        );
+    }
 
+    let health_check = relay_open.health_check;
     let (channel_id, relay_rx) = state
         .supervisor_sessions
         .open_relay_with_message(&init.sandbox_id, relay_open, Duration::from_secs(5))
         .await?;
     let supervisor_stream = match tokio::time::timeout(Duration::from_secs(10), relay_rx).await {
         Ok(Ok(Ok(stream))) => stream,
-        Ok(Ok(Err(status))) => return Err(status),
+        Ok(Ok(Err(status))) => return Err(relay_target_failure(status.message())),
         Ok(Err(_)) => return Err(Status::unavailable("relay channel dropped")),
         Err(_) => return Err(Status::deadline_exceeded("relay open timed out")),
     };
@@ -2016,6 +2082,7 @@ pub async fn handle_peer_relay(
         out_tx,
         init.sandbox_id,
         channel_id,
+        health_check,
     );
     let stream: Pin<
         Box<dyn tokio_stream::Stream<Item = Result<PeerRelayFrame, Status>> + Send + 'static>,
@@ -2028,6 +2095,7 @@ fn spawn_peer_bridge(
     mut inbound: tonic::Streaming<PeerRelayFrame>,
     out_tx: mpsc::Sender<PeerRelayFrame>,
     sandbox_id: String,
+    health_check: bool,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(bridge_stream);
     let sandbox_id_in = sandbox_id.clone();
@@ -2045,13 +2113,13 @@ fn spawn_peer_bridge(
                     if let Err(err) =
                         tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
-                        warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: write to duplex failed");
+                        relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: write to duplex failed");
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: inbound errored");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, error = %err, "gateway peer relay: inbound errored");
                     break;
                 }
             }
@@ -2076,7 +2144,7 @@ fn spawn_peer_bridge(
                     }
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "gateway peer relay: read from duplex failed");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id, error = %err, "gateway peer relay: read from duplex failed");
                     break;
                 }
             }
@@ -2090,6 +2158,7 @@ fn spawn_peer_owner_bridge(
     out_tx: mpsc::Sender<Result<PeerRelayFrame, Status>>,
     sandbox_id: String,
     channel_id: String,
+    health_check: bool,
 ) {
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_stream);
     let sandbox_id_in = sandbox_id.clone();
@@ -2108,13 +2177,13 @@ fn spawn_peer_owner_bridge(
                     if let Err(err) =
                         tokio::io::AsyncWriteExt::write_all(&mut write_half, &data).await
                     {
-                        warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: write to supervisor relay failed");
+                        relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: write to supervisor relay failed");
                         break;
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: inbound errored");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "gateway peer relay owner: inbound errored");
                     break;
                 }
             }
@@ -2139,7 +2208,7 @@ fn spawn_peer_owner_bridge(
                     }
                 }
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "gateway peer relay owner: read from supervisor relay failed");
+                    relay_bridge_warn!(health_check, sandbox_id = %sandbox_id, channel_id = %channel_id, error = %err, "gateway peer relay owner: read from supervisor relay failed");
                     break;
                 }
             }
@@ -2992,24 +3061,32 @@ async fn handle_supervisor_message(
         Some(supervisor_message::Payload::Heartbeat(_)) => {}
         Some(supervisor_message::Payload::RelayOpenResult(result)) => {
             if result.success {
-                info!(
+                debug!(
                     sandbox_id = %sandbox_id,
                     session_id = %session_id,
                     channel_id = %result.channel_id,
                     "supervisor session: relay opened successfully"
                 );
             } else {
+                let health_check = state
+                    .supervisor_sessions
+                    .is_health_check_relay(&result.channel_id);
                 let failed = state
                     .supervisor_sessions
                     .fail_pending_relay(&result.channel_id, result.error.clone());
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    session_id = %session_id,
-                    channel_id = %result.channel_id,
-                    error = %result.error,
-                    pending_relay_failed = failed,
-                    "supervisor session: relay open failed"
-                );
+                if health_check || !failed {
+                    debug!(channel_id = %result.channel_id, error = %result.error,
+                        "supervisor session: health or cancelled relay open failed");
+                } else {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        session_id = %session_id,
+                        channel_id = %result.channel_id,
+                        error = %result.error,
+                        pending_relay_failed = failed,
+                        "supervisor session: relay open failed"
+                    );
+                }
             }
         }
         Some(supervisor_message::Payload::RelayClose(close)) => {
@@ -3560,6 +3637,7 @@ mod tests {
             sender: relay_tx,
             sandbox_id: sandbox_id.to_string(),
             relay_open: RelayOpen {
+                health_check: false,
                 channel_id: "ch-test".to_string(),
                 target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
                 service_id: String::new(),
@@ -4797,6 +4875,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum FakePeerReply {
         Status(tonic::Code),
+        TargetFailure,
         EmptyOk,
     }
 
@@ -4837,6 +4916,19 @@ mod tests {
                 .header("grpc-message", "fake peer")
                 .body(Empty::new().boxed_unsync())
                 .unwrap(),
+            FakePeerReply::TargetFailure => {
+                use base64::Engine as _;
+                let status = relay_target_failure("target connection refused");
+                builder
+                    .header("grpc-status", i32::from(status.code()).to_string())
+                    .header("grpc-message", status.message())
+                    .header(
+                        "grpc-status-details-bin",
+                        base64::engine::general_purpose::STANDARD_NO_PAD.encode(status.details()),
+                    )
+                    .body(Empty::new().boxed_unsync())
+                    .unwrap()
+            }
             // One empty message (5-byte frame header, zero length), then grpc-status 0. This
             // decodes as a default response for any unary RPC, and gives streaming calls an OK
             // header.
@@ -4876,6 +4968,7 @@ mod tests {
 
     fn peer_relay_open(channel_id: &str) -> RelayOpen {
         RelayOpen {
+            health_check: false,
             channel_id: channel_id.to_string(),
             target: Some(relay_open::Target::Ssh(SshRelayTarget {})),
             service_id: String::new(),
@@ -5272,6 +5365,45 @@ mod tests {
             local_relay_outcome(&metrics, "local_error", "cancelled"),
             Some(1)
         );
+    }
+
+    #[tokio::test]
+    async fn peer_target_failure_is_conclusive_without_retry_or_channel_eviction() {
+        let metrics = MetricsCapture::install();
+        let state = crate::grpc::test_support::test_server_state().await;
+        seed_peer_token(&state);
+        let endpoint = spawn_fake_peer(FakePeerReply::TargetFailure).await;
+        state
+            .peer_routes
+            .store_owner("sbx-down", &owner_at(&endpoint));
+        let error = open_routed_relay_with_message(
+            &state,
+            "sbx-down",
+            RelayOpen {
+                health_check: true,
+                target: Some(relay_open::Target::Tcp(
+                    openshell_core::proto::TcpRelayTarget {
+                        host: "127.0.0.1".into(),
+                        port: 4500,
+                    },
+                )),
+                ..peer_relay_open("ch-health")
+            },
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(is_relay_target_failure(&error));
+        assert!(
+            state
+                .peer_routes
+                .channels
+                .lock()
+                .unwrap()
+                .contains_key(&endpoint)
+        );
+        assert!(state.peer_routes.cached_owner("sbx-down").is_some());
+        assert_eq!(metrics.value("openshell_server_routed_request_attempts_total{operation=\"relay\",route=\"peer\",relay_kind=\"tcp\",outcome=\"remote_error\",grpc_code=\"failed_precondition\"}"), Some(1));
     }
 
     #[tokio::test]

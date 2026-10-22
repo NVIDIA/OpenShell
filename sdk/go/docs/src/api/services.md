@@ -18,6 +18,23 @@ if err != nil {
 fmt.Printf("Service available at: %s\n", endpoint.URL)
 ```
 
+Set a readiness path to require HTTP 2xx responses from the application:
+
+```go
+endpoint, err := client.Services().Expose(ctx, "default", "my-sandbox", "web", 8080, true,
+    v1.ExposeServiceOptions{
+        ReadinessCheck: &v1.HTTPReadinessCheck{Path: "/readyz"},
+    })
+```
+
+Without a readiness check, any HTTP response at `/` indicates responsiveness.
+`Get` and `List` return cached observations in `endpoint.Health`, including the
+state, check time, HTTP status code when available, and message. A nil health
+value from an older gateway means unknown. Checks run every five seconds with
+a one-second timeout; three consecutive failures mark unhealthy and one success
+restores health. Observations expire after 15 seconds and reset when the runtime
+or service changes. Health does not control routing or sandbox lifecycle.
+
 ## List
 
 `List` returns a lazy pager over exposed services. Use `ListAll` to collect

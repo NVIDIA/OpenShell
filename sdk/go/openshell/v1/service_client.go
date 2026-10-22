@@ -24,6 +24,10 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 	if len(opts) > 0 && opts[0].AuthorizationMode != 0 {
 		authorizationMode = opts[0].AuthorizationMode
 	}
+	var readiness *pb.HttpReadinessCheck
+	if len(opts) > 0 && opts[0].ReadinessCheck != nil {
+		readiness = &pb.HttpReadinessCheck{Path: opts[0].ReadinessCheck.Path}
+	}
 	resp, err := s.client.ExposeService(ctx, &pb.ExposeServiceRequest{
 		Sandbox:           sandboxName,
 		WorkspaceScope:    namedWorkspaceScope(workspace),
@@ -31,6 +35,7 @@ func (s *serviceClient) Expose(ctx context.Context, workspace, sandboxName, serv
 		TargetPort:        targetPort,
 		Domain:            domain,
 		AuthorizationMode: pb.ServiceAuthorizationMode(authorizationMode),
+		ReadinessCheck:    readiness,
 	})
 	if err != nil {
 		return nil, converter.FromGRPCError(err)

@@ -587,6 +587,8 @@ sandbox_scoped_mutation!(
         Ok(ServiceEndpointResponse {
             endpoint: Some(reference.restore(store).await?),
             url,
+            // A replay preserves durable mutation outcome, not historical health.
+            health: None,
         })
     }
 );

@@ -701,7 +701,12 @@ describe('watchLogs', () => {
 describe('create', () => {
   it('sends create-time service exposures', async () => {
     let created: {
-      serviceExposures?: Array<{ service?: string; targetPort?: number; authorizationMode?: number }>;
+      serviceExposures?: Array<{
+        service?: string;
+        targetPort?: number;
+        authorizationMode?: number;
+        readinessCheck?: { path: string };
+      }>;
     } = {};
     const sandbox = client({
       createSandbox: (req) => {
@@ -719,7 +724,7 @@ describe('create', () => {
     const result = await sandbox.create({
       image: 'img',
       serviceExposures: [
-        { targetPort: 4500 },
+        { targetPort: 4500, readinessPath: '/readyz' },
         {
           service: 'metrics',
           targetPort: 9090,
@@ -746,6 +751,8 @@ describe('create', () => {
       '': 'https://sb.example.test/',
       metrics: 'https://metrics.sb.example.test/',
     });
+    expect(created.serviceExposures?.[0].readinessCheck?.path).toBe('/readyz');
+    expect(created.serviceExposures?.[1].readinessCheck).toBeUndefined();
   });
 
   it('sends the curated policy through spec.policy', async () => {

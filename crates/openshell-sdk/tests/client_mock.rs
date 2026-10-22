@@ -1156,6 +1156,7 @@ async fn create_sandbox_passes_spec_through() {
         labels: labels.clone(),
         gpu: true,
         service_exposures: vec![ServiceExposure {
+            readiness_path: Some("/readyz".to_string()),
             service: "web".to_string(),
             target_port: 8080,
             authorization_mode: ServiceAuthorizationMode::BearerPassthrough,
@@ -1178,6 +1179,14 @@ async fn create_sandbox_passes_spec_through() {
     assert_eq!(observed.service_exposures.len(), 1);
     assert_eq!(observed.service_exposures[0].service, "web");
     assert_eq!(observed.service_exposures[0].target_port, 8080);
+    assert_eq!(
+        observed.service_exposures[0]
+            .readiness_check
+            .as_ref()
+            .unwrap()
+            .path,
+        "/readyz"
+    );
     assert_eq!(
         observed.service_exposures[0].authorization_mode(),
         proto::ServiceAuthorizationMode::BearerPassthrough

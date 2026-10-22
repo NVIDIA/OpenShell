@@ -7,8 +7,8 @@ use std::sync::Arc;
 use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
     DeleteServiceRequest, DeleteServiceResponse, ExposeServiceRequest, GetServiceRequest,
-    ListServicesRequest, ListServicesResponse, Sandbox, ServiceAuthorizationMode, ServiceEndpoint,
-    ServiceEndpointResponse,
+    HttpReadinessCheck, ListServicesRequest, ListServicesResponse, Sandbox,
+    ServiceAuthorizationMode, ServiceEndpoint, ServiceEndpointResponse,
 };
 use openshell_core::{GetResourceVersion, ObjectId, ObjectName, ObjectWorkspace};
 use prost::Message as _;
@@ -52,6 +52,7 @@ pub(super) async fn handle_expose_service(
             .ensure_active()?;
     let authorization_mode =
         validate_service_exposure_request(&req.name, req.target_port, req.authorization_mode)?;
+    crate::service_health::validate_readiness_check(req.readiness_check.as_ref())?;
     expose_service_endpoint(
         state,
         &workspace,
@@ -59,6 +60,7 @@ pub(super) async fn handle_expose_service(
         &req.name,
         req.target_port,
         authorization_mode,
+        req.readiness_check,
     )
     .await
 }
@@ -90,6 +92,7 @@ pub(super) async fn expose_service_endpoint(
     service: &str,
     target_port: u32,
     authorization_mode: ServiceAuthorizationMode,
+    readiness_check: Option<HttpReadinessCheck>,
 ) -> Result<Response<ServiceEndpointResponse>, Status> {
     let sandbox_name = sandbox.object_name();
 
@@ -103,6 +106,14 @@ pub(super) async fn expose_service_endpoint(
         .await
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))?;
 
+    let readiness_check = readiness_check
+        .or_else(|| existing.as_ref().and_then(|ep| ep.readiness_check.clone()))
+        .map(|mut check| {
+            if check.path.is_empty() {
+                check.path = "/".to_string();
+            }
+            check
+        });
     let (id, created_at_ms, condition, created) = if let Some(existing) = existing {
         // Update path: preserve id and created_at, use CAS to prevent conflicts
         let resource_version = existing
@@ -153,6 +164,7 @@ pub(super) async fn expose_service_endpoint(
         target_port,
         domain: true,
         authorization_mode: authorization_mode as i32,
+        readiness_check,
     };
 
     // Single-attempt CAS write: fails with ABORTED on concurrent modification
@@ -179,10 +191,9 @@ pub(super) async fn expose_service_endpoint(
         .unwrap_or_default();
     service_routing::emit_service_endpoint_config_event(&endpoint, &url, created);
 
-    Ok(Response::new(ServiceEndpointResponse {
-        endpoint: Some(endpoint),
-        url,
-    }))
+    Ok(Response::new(
+        service_endpoint_response(state, endpoint).await,
+    ))
 }
 
 pub(super) async fn handle_get_service(
@@ -207,7 +218,9 @@ pub(super) async fn handle_get_service(
         .await?
         .ok_or_else(|| Status::not_found("service endpoint not found"))?;
 
-    Ok(Response::new(service_endpoint_response(state, endpoint)))
+    Ok(Response::new(
+        service_endpoint_response(state, endpoint).await,
+    ))
 }
 
 pub(super) async fn handle_list_services(
@@ -280,11 +293,10 @@ pub(super) async fn handle_list_services(
         .list_message_page::<ServiceEndpoint>(query, after.as_ref(), pagination.page_size())
         .await
         .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
-    let services = page
-        .messages
-        .into_iter()
-        .map(|ep| service_endpoint_response(state, ep))
-        .collect();
+    let mut services = Vec::with_capacity(page.messages.len());
+    for endpoint in page.messages {
+        services.push(service_endpoint_response(state, endpoint).await);
+    }
     let next_page_token = pagination.next_object_token(page.next_cursor.as_ref());
     Ok(Response::new(ListServicesResponse {
         services,
@@ -363,7 +375,7 @@ async fn get_service_endpoint(
         .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))
 }
 
-fn service_endpoint_response(
+async fn service_endpoint_response(
     state: &Arc<ServerState>,
     mut endpoint: ServiceEndpoint,
 ) -> ServiceEndpointResponse {
@@ -379,7 +391,9 @@ fn service_endpoint_response(
     let url =
         service_routing::endpoint_url(&state.config, workspace, &endpoint.sandbox, &endpoint.name)
             .unwrap_or_default();
+    let health = Some(crate::service_health::endpoint_health(state, &endpoint).await);
     ServiceEndpointResponse {
+        health,
         endpoint: Some(endpoint),
         url,
     }
@@ -463,6 +477,96 @@ mod tests {
     #[test]
     fn validates_good_endpoint_name() {
         validate_endpoint_name("service", "web-api", 28).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_configuration_is_validated_normalized_and_preserved_on_update() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "my-sandbox").await;
+        let mut request = ExposeServiceRequest {
+            sandbox: "my-sandbox".to_string(),
+            workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            name: "web".to_string(),
+            target_port: 8080,
+            readiness_check: Some(HttpReadinessCheck {
+                path: "https://other-host/".to_string(),
+            }),
+            ..Default::default()
+        };
+        let error = handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            get_service_endpoint(&state, "default", "my-sandbox", "web")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        request.readiness_check = Some(HttpReadinessCheck {
+            path: String::new(),
+        });
+        let created = handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            created
+                .endpoint
+                .as_ref()
+                .unwrap()
+                .readiness_check
+                .as_ref()
+                .unwrap()
+                .path,
+            "/"
+        );
+        assert_eq!(
+            created.health.unwrap().state,
+            openshell_core::proto::ServiceHealthState::Unknown as i32
+        );
+
+        request.readiness_check = Some(HttpReadinessCheck {
+            path: "/readyz".to_string(),
+        });
+        handle_expose_service(&state, authed_request(request.clone()))
+            .await
+            .unwrap();
+        request.readiness_check = None;
+        request.target_port = 4500;
+        let updated = handle_expose_service(&state, authed_request(request))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            updated
+                .endpoint
+                .as_ref()
+                .unwrap()
+                .readiness_check
+                .as_ref()
+                .unwrap()
+                .path,
+            "/readyz"
+        );
+        let version = updated.endpoint.as_ref().unwrap().get_resource_version();
+        let read = handle_get_service(
+            &state,
+            authed_request(GetServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                name: "web".to_string(),
+                workspace_scope: Some(openshell_core::proto::workspace_selector("default")),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            read.endpoint.unwrap().get_resource_version(),
+            version,
+            "health reads must not mutate the endpoint"
+        );
     }
 
     #[test]
@@ -587,6 +691,7 @@ mod tests {
         let exposed = handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                readiness_check: None,
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -783,6 +888,7 @@ mod tests {
             handle_expose_service(
                 &state1,
                 authed_request(ExposeServiceRequest {
+                    readiness_check: None,
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -802,6 +908,7 @@ mod tests {
             handle_expose_service(
                 &state2,
                 authed_request(ExposeServiceRequest {
+                    readiness_check: None,
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -855,6 +962,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                readiness_check: None,
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -875,6 +983,7 @@ mod tests {
             handle_expose_service(
                 &state1,
                 authed_request(ExposeServiceRequest {
+                    readiness_check: None,
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -894,6 +1003,7 @@ mod tests {
             handle_expose_service(
                 &state2,
                 authed_request(ExposeServiceRequest {
+                    readiness_check: None,
                     request_id: String::new(),
                     sandbox: "my-sandbox".to_string(),
                     workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -985,6 +1095,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                readiness_check: None,
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -1002,6 +1113,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                readiness_check: None,
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
@@ -1146,6 +1258,7 @@ mod tests {
         handle_expose_service(
             &state,
             authed_request(ExposeServiceRequest {
+                readiness_check: None,
                 request_id: String::new(),
                 sandbox: "my-sandbox".to_string(),
                 workspace_scope: Some(openshell_core::proto::workspace_selector(
