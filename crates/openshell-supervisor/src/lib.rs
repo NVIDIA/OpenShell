@@ -4441,7 +4441,7 @@ async fn install_builtin_middleware_registry(opa_engine: &OpaEngine) -> Result<(
         Vec::new(),
     )
     .await?;
-    opa_engine.replace_middleware_registry(registry)
+    opa_engine.replace_middleware_registry(registry).map(|_| ())
 }
 
 /// Wait the configured poll interval, but never past the point at which an
@@ -4487,6 +4487,25 @@ struct MiddlewareRegistryReconciliation<'a> {
     status: &'a mut MiddlewareRegistryStatus,
 }
 
+/// Build the CONFIG event recorded when a new middleware registry is
+/// installed. Installing it advances the policy engine generation, so the
+/// event records the generation it activated.
+fn middleware_registry_reloaded_event(service_count: usize, active_generation: u64) -> OcsfEvent {
+    ConfigStateChangeBuilder::new(ocsf_ctx())
+        .severity(SeverityId::Informational)
+        .status(StatusId::Success)
+        .state(StateId::Enabled, "loaded")
+        .unmapped(
+            "supervisor_middleware_service_count",
+            serde_json::json!(service_count),
+        )
+        .unmapped("active_generation", serde_json::json!(active_generation))
+        .message(format!(
+            "Supervisor middleware registry reloaded [service_count:{service_count}]"
+        ))
+        .build()
+}
+
 async fn reconcile_middleware_registry(
     opa_engine: &OpaEngine,
     middleware_connector: &MiddlewareConnector,
@@ -4503,7 +4522,7 @@ async fn reconcile_middleware_registry(
     .await
     .and_then(|registry| opa_engine.replace_middleware_registry(registry))
     {
-        Ok(()) => {
+        Ok(active_generation) => {
             retain_extension_credentials(
                 reconciliation.extension_credentials,
                 reconciliation.desired_services,
@@ -4514,21 +4533,10 @@ async fn reconcile_middleware_registry(
                 .current_services
                 .extend_from_slice(reconciliation.desired_services);
             *reconciliation.status = MiddlewareRegistryStatus::Synchronized;
-            ocsf_emit!(
-                ConfigStateChangeBuilder::new(ocsf_ctx())
-                    .severity(SeverityId::Informational)
-                    .status(StatusId::Success)
-                    .state(StateId::Enabled, "loaded")
-                    .unmapped(
-                        "supervisor_middleware_service_count",
-                        serde_json::json!(reconciliation.current_services.len())
-                    )
-                    .message(format!(
-                        "Supervisor middleware registry reloaded [service_count:{}]",
-                        reconciliation.current_services.len()
-                    ))
-                    .build()
-            );
+            ocsf_emit!(middleware_registry_reloaded_event(
+                reconciliation.current_services.len(),
+                active_generation,
+            ));
         }
         Err(error) => {
             // Emit only on the transition into the failed state to avoid
@@ -7817,6 +7825,19 @@ network_policies:
         let json = event.to_json().unwrap();
         assert_eq!(json["unmapped"]["policy_hash"], "sha256:same");
         assert!(json["unmapped"].get("active_generation").is_none());
+    }
+
+    #[test]
+    fn middleware_registry_reload_records_active_generation() {
+        let json = middleware_registry_reloaded_event(2, 7).to_json().unwrap();
+        assert_eq!(json["unmapped"]["supervisor_middleware_service_count"], 2);
+        assert_eq!(json["unmapped"]["active_generation"], 7);
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap()
+                .contains("Supervisor middleware registry reloaded [service_count:2]")
+        );
     }
 }
 

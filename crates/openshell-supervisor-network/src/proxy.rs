@@ -1251,7 +1251,7 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, None, error);
+            emit_transparent_mapping_denial(workload_addr, original, None, error, None);
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1295,6 +1295,7 @@ async fn handle_transparent_tcp_connection(
             original,
             Some(&host),
             MappingLookupError::EndpointMismatch,
+            Some(decision.policy_generation),
         );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
@@ -1313,6 +1314,7 @@ async fn handle_transparent_tcp_connection(
             original,
             Some(&host),
             MappingLookupError::StalePolicy,
+            Some(decision.policy_generation),
         );
         emit_activity(&activity_tx, true, "transparent_tcp_mapping");
         return Ok(());
@@ -1325,7 +1327,13 @@ async fn handle_transparent_tcp_connection(
     ) {
         Ok(mapping) => mapping,
         Err(error) => {
-            emit_transparent_mapping_denial(workload_addr, original, Some(&host), error);
+            emit_transparent_mapping_denial(
+                workload_addr,
+                original,
+                Some(&host),
+                error,
+                Some(decision.policy_generation),
+            );
             emit_activity(&activity_tx, true, "transparent_tcp_mapping");
             return Ok(());
         }
@@ -1579,7 +1587,28 @@ fn emit_transparent_mapping_denial(
     original: SocketAddr,
     mapped_host: Option<&str>,
     error: MappingLookupError,
+    policy_generation: Option<u64>,
 ) {
+    egress_emit!(build_transparent_mapping_denial_event(
+        workload,
+        original,
+        mapped_host,
+        error,
+        policy_generation,
+    ));
+}
+
+/// `policy_generation` is the generation of the egress decision made before
+/// the mapping check, or `None` when the open failed before policy
+/// evaluation.
+#[cfg(target_os = "linux")]
+fn build_transparent_mapping_denial_event(
+    workload: SocketAddr,
+    original: SocketAddr,
+    mapped_host: Option<&str>,
+    error: MappingLookupError,
+    policy_generation: Option<u64>,
+) -> openshell_ocsf::OcsfEvent {
     let detail = match error {
         MappingLookupError::Missing => "transparent_tcp_mapping_missing",
         MappingLookupError::Expired => "transparent_tcp_mapping_expired",
@@ -1589,19 +1618,21 @@ fn emit_transparent_mapping_denial(
         | MappingLookupError::InvalidMapping
         | MappingLookupError::LockPoisoned => "transparent_tcp_destination_denied",
     };
-    egress_emit!(
-        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(transparent_destination_endpoint(original, mapped_host))
-            .src_endpoint_addr(workload.ip(), workload.port())
-            .message(format!("Transparent TCP denied: {error}"))
-            .status_detail(detail)
-            .build()
-    );
+    let mut builder = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
+        .activity(ActivityId::Open)
+        .action(ActionId::Denied)
+        .disposition(DispositionId::Blocked)
+        .severity(SeverityId::Medium)
+        .status(StatusId::Failure)
+        .dst_endpoint(transparent_destination_endpoint(original, mapped_host))
+        .src_endpoint_addr(workload.ip(), workload.port());
+    if let Some(generation) = policy_generation {
+        builder = builder.firewall_rule_at_generation("-", "opa", generation);
+    }
+    builder
+        .message(format!("Transparent TCP denied: {error}"))
+        .status_detail(detail)
+        .build()
 }
 
 #[cfg(target_os = "linux")]
@@ -8535,6 +8566,44 @@ process: {{ run_as_user: sandbox, run_as_group: sandbox }}
             json["firewall_rule"],
             serde_json::json!({"name": "-", "type": "opa", "version": "1"})
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mapping_denial_after_evaluation_records_the_decision_generation() {
+        let workload: SocketAddr = "10.0.0.5:40000".parse().unwrap();
+        let original: SocketAddr = "198.18.0.2:443".parse().unwrap();
+
+        let stale = build_transparent_mapping_denial_event(
+            workload,
+            original,
+            Some("api.example.test"),
+            MappingLookupError::StalePolicy,
+            Some(5),
+        );
+        let stale = serde_json::to_value(stale).unwrap();
+        assert_eq!(
+            stale["status_detail"],
+            "transparent_tcp_mapping_stale_policy"
+        );
+        assert_eq!(
+            stale["firewall_rule"],
+            serde_json::json!({"name": "-", "type": "opa", "version": "5"})
+        );
+
+        let before_evaluation = build_transparent_mapping_denial_event(
+            workload,
+            original,
+            None,
+            MappingLookupError::Missing,
+            None,
+        );
+        let before_evaluation = serde_json::to_value(before_evaluation).unwrap();
+        assert_eq!(
+            before_evaluation["status_detail"],
+            "transparent_tcp_mapping_missing"
+        );
+        assert!(before_evaluation.get("firewall_rule").is_none());
     }
 
     #[test]

@@ -892,7 +892,9 @@ impl OpaEngine {
 
     /// Replace the complete middleware service registry and invalidate
     /// existing tunnels so subsequent requests use the new service set.
-    pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<()> {
+    /// Install a new middleware registry and return the policy generation it
+    /// activated.
+    pub fn replace_middleware_registry(&self, registry: MiddlewareRegistry) -> Result<u64> {
         // Generation changes serialize through the engine lock so guarded
         // publication cannot overlap any runtime generation transition.
         let _engine = self
@@ -904,8 +906,7 @@ impl OpaEngine {
             .write()
             .map_err(|_| miette::miette!("middleware runner lock poisoned"))?;
         *runner = runner.with_replacement_registry(registry);
-        self.advance_generation();
-        Ok(())
+        Ok(self.advance_generation())
     }
 
     pub(crate) fn middleware_runner(&self) -> Result<ChainRunner> {
@@ -8537,6 +8538,17 @@ network_policies:
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn replacing_the_middleware_registry_returns_the_activated_generation() {
+        let engine = test_engine();
+        let before = engine.current_generation();
+        let activated = engine
+            .replace_middleware_registry(MiddlewareRegistry::default())
+            .unwrap();
+        assert_eq!(activated, before + 1);
+        assert_eq!(engine.current_generation(), activated);
     }
 
     #[test]
