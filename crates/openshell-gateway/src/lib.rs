@@ -285,17 +285,24 @@ impl openshell_server::ComputeDriverFactory for KubernetesFactory {
             .map(str::to_string);
         config.supervisor_ocsf_export = supervisor_ocsf_export(context.otlp_config());
         config.supervisor_gateway_name = Some(context.gateway_name().to_string());
-        let driver = openshell_driver_kubernetes::KubernetesComputeDriver::new(
-            config,
-            context.shutdown_receiver(),
-        )
-        .await
-        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
-        // With the gateway supervisor topology, the driver owns the shared
-        // supervisor's assignments and the gateway serves them to the host.
-        if let Some(controller) = driver.supervisor_host_controller() {
-            context.install_supervisor_host(controller)?;
+        // With the gateway supervisor topology, the gateway owns the shared
+        // supervisor's assignments and token; the driver adapts them to
+        // Kubernetes objects.
+        let driver = if config.shared_supervisor.is_some() {
+            openshell_driver_kubernetes::KubernetesComputeDriver::with_shared_supervision(
+                config,
+                context.shutdown_receiver(),
+                context.shared_supervision(),
+            )
+            .await
+        } else {
+            openshell_driver_kubernetes::KubernetesComputeDriver::new(
+                config,
+                context.shutdown_receiver(),
+            )
+            .await
         }
+        .map_err(|error| openshell_core::Error::execution(error.to_string()))?;
         let driver = openshell_driver_kubernetes::ComputeDriverService::new_in_process(driver);
         Ok(openshell_server::ComputeDriverInstance::InProcess(
             std::sync::Arc::new(driver),

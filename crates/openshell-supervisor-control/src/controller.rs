@@ -5,19 +5,20 @@
 //! (`openshell.supervisor.host.v1`).
 //!
 //! The gateway owns the desired set of sandbox instances a shared supervisor
-//! runs. A compute driver publishes that set here; the gateway's gRPC server
-//! hands each host stream authenticated by a supervisor token to
+//! runs. The [`SharedSupervision`](crate::SharedSupervision) coordinator
+//! publishes that set here on behalf of a compute driver; the gateway's gRPC
+//! server hands each host stream authenticated by a supervisor token to
 //! [`SupervisorHostController::attach`], which sends complete snapshots and
 //! records what the host reports. The gateway also mints that token and
 //! publishes each renewal here for the driver to deliver to the host.
 //!
-//! Desired state is uninitialized until the driver has derived it from its
-//! durable records once. Nothing is sent before that, so a restarted gateway
-//! can never present an empty map as authoritative and stop running
+//! Desired state is uninitialized until the complete set has been derived
+//! from durable records once. Nothing is sent before that, so a restarted
+//! gateway can never present an empty map as authoritative and stop running
 //! instances. An explicit empty snapshot, after initialization, does stop
-//! them. Full resyncs are compare-and-replace against the revision the driver
-//! read before it started, so a list that raced a lifecycle edit never
-//! resurrects a withdrawn instance or discards a new one.
+//! them. Full resyncs are compare-and-replace against the revision read
+//! before the records were listed, so a list that raced a lifecycle edit
+//! never resurrects a withdrawn instance or discards a new one.
 //!
 //! Exactly one host serves a gateway: a new attach from a newer connection of
 //! the same host process, or from a new host process, supersedes the current
@@ -33,7 +34,7 @@ use tokio_stream::StreamExt as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Status, Streaming};
 
-use crate::proto::supervisor_host::v1::{
+use crate::proto::{
     AssignmentSnapshot, HostAccepted, HostGatewayHeartbeat, HostGatewayMessage, HostHello,
     HostMessage, HostStatus, SandboxInstanceAssignment, SandboxInstanceStatus,
     host_gateway_message, host_message,
@@ -77,7 +78,7 @@ pub struct HostIdentity {
 /// its deployment packaging provides; the Kubernetes driver writes a Secret.
 #[derive(Clone, Debug)]
 pub struct SupervisorCredential {
-    pub token: crate::jwt::SecretJwt,
+    pub token: openshell_core::jwt::SecretJwt,
     /// Unix seconds.
     pub expires_at: i64,
 }
@@ -234,14 +235,17 @@ impl SupervisorHostController {
         self.inner.credential.subscribe()
     }
 
-    /// The driver has derived the complete desired set at least once.
+    /// The complete desired set has been derived from durable records at
+    /// least once.
     #[must_use]
     pub fn is_initialized(&self) -> bool {
         lock(&self.inner.desired).initialized
     }
 
     /// Current desired revision: 0 while uninitialized. Read it before
-    /// deriving a full list for [`Self::replace_assignments`].
+    /// deriving a full list for [`Self::replace_assignments`]; the
+    /// coordinator does so through
+    /// [`SharedSupervision::begin_recovery`](crate::SharedSupervision::begin_recovery).
     #[must_use]
     pub fn revision(&self) -> u64 {
         lock(&self.inner.desired).revision
@@ -256,8 +260,8 @@ impl SupervisorHostController {
             .map(|assigned| assigned.assignment.clone())
     }
 
-    /// Replace the whole desired set with `assignments`, derived from the
-    /// driver's durable records while the revision was `baseline`.
+    /// Replace the whole desired set with `assignments`, derived from
+    /// durable records while the revision was `baseline`.
     ///
     /// Initializes the controller; edits made before initialization are
     /// applied on top of the list. After initialization the replacement is

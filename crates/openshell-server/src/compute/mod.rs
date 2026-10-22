@@ -763,9 +763,9 @@ pub struct ComputeRuntime {
     restart_notify: Arc<Notify>,
     ssh_identities: Arc<OnceLock<crate::ssh_identity::SshIdentityStore>>,
     supervisor_ocsf_headers: Arc<OnceLock<openshell_core::jwt::SecretOtlpHeaders>>,
-    /// Desired assignments of the shared supervisor host, when the in-process
-    /// driver installed one.
-    supervisor_host: Option<openshell_core::supervisor_host::SupervisorHostController>,
+    /// Desired assignments of the shared supervisor host, when the gateway
+    /// coordinates one for the in-process driver.
+    supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
 }
 
 impl fmt::Debug for ComputeRuntime {
@@ -878,10 +878,11 @@ impl ComputeRuntime {
         })
     }
 
-    /// Serve the shared supervisor host that the in-process driver installed.
+    /// Serve the shared supervisor host the gateway coordinates for the
+    /// in-process driver.
     pub(crate) fn with_supervisor_host(
         mut self,
-        supervisor_host: Option<openshell_core::supervisor_host::SupervisorHostController>,
+        supervisor_host: Option<openshell_supervisor_control::SupervisorHostController>,
     ) -> Self {
         self.supervisor_host = supervisor_host;
         self
@@ -891,7 +892,7 @@ impl ComputeRuntime {
     #[must_use]
     pub fn supervisor_host(
         &self,
-    ) -> Option<&openshell_core::supervisor_host::SupervisorHostController> {
+    ) -> Option<&openshell_supervisor_control::SupervisorHostController> {
         self.supervisor_host.as_ref()
     }
 

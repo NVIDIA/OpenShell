@@ -97,7 +97,7 @@ supervisor token (`auth_mode: "supervisor"`). It is not imported by
 `openshell.proto`, so SDK generation and
 gRPC reflection exclude it; the server's schema inventory test classifies it
 explicitly. `SandboxInstanceAssignment.launch_material` carries the existing
-JSON sandbox instance registration of `openshell-sandbox-backend` and is
+JSON sandbox instance registration of `openshell-supervisor-control` and is
 marked secret.
 
 ## Isolation backend protocol

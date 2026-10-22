@@ -94,7 +94,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
                 gateway_endpoint,
                 instance_root,
                 runtime_listen,
-                removal_grace: openshell_sandbox_backend::sandbox_instance::INSTANCE_REMOVAL_GRACE,
+                removal_grace: openshell_supervisor_control::INSTANCE_REMOVAL_GRACE,
             },
         )?;
         let health = tokio::net::TcpListener::bind(address)

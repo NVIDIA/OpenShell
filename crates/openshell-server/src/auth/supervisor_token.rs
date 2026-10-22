@@ -17,7 +17,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use jsonwebtoken::decode_header;
 use openshell_core::jwt::SUPERVISOR_JWT_TYPE;
-use openshell_core::supervisor_host::HostIdentity;
+use openshell_supervisor_control::HostIdentity;
 
 use super::authenticator::{AuthRejection, Authentication, Authenticator, bearer_credential};
 use super::principal::{Principal, SupervisorPrincipal};

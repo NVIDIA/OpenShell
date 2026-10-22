@@ -38,7 +38,7 @@ use std::time::Duration;
 use tracing::{Instrument as _, debug, info, warn};
 
 use openshell_core::PolicyValidationFailureMode;
-use openshell_sandbox_backend::sandbox_instance::RegistrationTraceContext;
+use openshell_supervisor_control::RegistrationTraceContext;
 
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfidenceId, ConfigStateChangeBuilder,

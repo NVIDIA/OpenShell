@@ -89,7 +89,7 @@ pub struct SandboxPrincipal {
 #[derive(Debug, Clone)]
 pub struct SupervisorPrincipal {
     /// Claims of the verified supervisor token.
-    pub identity: openshell_core::supervisor_host::HostIdentity,
+    pub identity: openshell_supervisor_control::HostIdentity,
 }
 
 /// Gateway peer caller.

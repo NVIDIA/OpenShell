@@ -4508,6 +4508,7 @@ dependencies = [
  "openshell-otel-test-support",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-supervisor-control",
  "opentelemetry",
  "opentelemetry_sdk",
  "prost",
@@ -5033,6 +5034,7 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
+ "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "opentelemetry",
@@ -5112,6 +5114,7 @@ dependencies = [
  "openshell-otel",
  "openshell-policy",
  "openshell-sandbox-backend",
+ "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
  "openshell-supervisor-network",
@@ -5137,6 +5140,23 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "openshell-supervisor-control"
+version = "0.0.0"
+dependencies = [
+ "openshell-core",
+ "openshell-otel",
+ "openshell-sandbox-backend",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

@@ -3566,7 +3566,7 @@ mod tests {
         async fn supervisor_tokens_reach_only_the_assignment_stream() {
             let attach = "/openshell.supervisor.host.v1.SupervisorHost/Attach";
             let supervisor = Principal::Supervisor(crate::auth::principal::SupervisorPrincipal {
-                identity: openshell_core::supervisor_host::HostIdentity {
+                identity: openshell_supervisor_control::HostIdentity {
                     subject: "openshell-supervisor:test".to_string(),
                     token_id: "token".to_string(),
                     expires_at: i64::MAX,

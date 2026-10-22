@@ -32,7 +32,7 @@ use openshell_core::proto::supervisor_host::v1::{
 };
 use openshell_extension_core::BearerTokenSlot;
 use openshell_sandbox_backend::runtime_routed::RuntimeRouter;
-use openshell_sandbox_backend::sandbox_instance::{
+use openshell_supervisor_control::{
     SandboxInstancePhaseReport, SandboxInstanceRegistration, SandboxInstanceStatusReport,
 };
 use tokio::sync::watch;
@@ -59,11 +59,11 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const OUTBOUND_QUEUE: usize = 16;
 /// Most sandbox instances one snapshot may assign to a host; the gateway
 /// enforces the same bound before it assigns.
-pub const MAX_ASSIGNED_INSTANCES: usize = openshell_core::supervisor_host::MAX_ASSIGNED_INSTANCES;
+pub const MAX_ASSIGNED_INSTANCES: usize = openshell_supervisor_control::MAX_ASSIGNED_INSTANCES;
 /// Largest gateway message the host decodes: a full snapshot of
 /// `MAX_ASSIGNED_INSTANCES` assignments at their largest, plus framing.
-const MAX_GATEWAY_MESSAGE_BYTES: usize = MAX_ASSIGNED_INSTANCES
-    * (openshell_sandbox_backend::sandbox_instance::MAX_LAUNCH_MATERIAL_BYTES + 1024);
+const MAX_GATEWAY_MESSAGE_BYTES: usize =
+    MAX_ASSIGNED_INSTANCES * (openshell_supervisor_control::MAX_LAUNCH_MATERIAL_BYTES + 1024);
 /// Largest host message: a status report is a few hundred bytes per instance.
 const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 

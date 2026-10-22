@@ -20,7 +20,6 @@ mod runtime;
 mod runtime_initiated;
 pub mod runtime_routed;
 pub mod sandbox_auth;
-pub mod sandbox_instance;
 pub mod stream_adapter;
 
 pub use openshell_core::proto::sandbox::backend::v1 as backend_proto;

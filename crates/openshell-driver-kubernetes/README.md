@@ -192,48 +192,62 @@ keeps its established name) when the generation starts. Every later lifecycle de
 never reinterprets a running generation, and an unknown or incomplete record
 fails closed.
 
-- **Assignments.** The gateway owns which instances the shared supervisor
-  hosts. The driver publishes that set into a
-  `openshell_core::supervisor_host::SupervisorHostController`, installed into
-  the gateway through the compute-driver build context, and the gateway serves
-  it to the supervisor over the private `openshell.supervisor.host.v1` stream.
-  The supervisor dials the gateway over TLS with a gateway-minted supervisor
-  token (see the `openshell-supervisor` README); that token authorizes only
-  the assignment stream.
-- **Supervisor token delivery.** The gateway mints the supervisor token from
-  its `gateway_jwt` signing key and renews it at half its lifetime (the
-  `gateway_jwt` extension-token TTL, 15 minutes by default, bounded to one
-  hour). The driver's part is delivery only: it watches the controller for
-  each renewal and replaces the `token` key of the chart-created
+- **Ownership.** The gateway owns which instances the shared supervisor
+  hosts. It constructs an `openshell_supervisor_control::SharedSupervision`
+  when the gateway binary builds this driver with
+  `KubernetesComputeDriver::with_shared_supervision`, serves its assignments
+  to the supervisor over the private `openshell.supervisor.host.v1` stream,
+  and mints the supervisor token the supervisor dials it with over TLS (see
+  the `openshell-supervisor` README); that token authorizes only the
+  assignment stream. The coordinator owns the control contracts (launch
+  material is persisted before an instance is assigned, recovery is
+  compare-and-replace against a baseline read before the list, an incomplete
+  recovery never replaces the published set, host observations are
+  interpreted once); this driver adapts them to Kubernetes objects. The
+  standalone driver binary cannot host the topology and refuses a
+  configuration that selects it.
+- **Supervisor token delivery.** The gateway renews the token at half its
+  lifetime (the `gateway_jwt` extension-token TTL, 15 minutes by default,
+  bounded to one hour) and the coordinator retries a failed delivery until it
+  succeeds or a newer token supersedes it. The driver's part is the write: it
+  replaces the `token` key of the chart-created
   `shared_supervisor.token_secret_name` Secret in `service_namespace`, which
-  the supervisor Pod mounts. A missing Secret or a denied patch is logged and
-  retried; a token published while a retry waits supersedes the retry.
+  the supervisor Pod mounts, and names a missing Secret or a denied patch in
+  the retried error.
 - **Create and start.** The driver creates a per-sandbox egress allowance
   `os-shared-control-<id>` from the workload Pod to the Pods the shared
   supervisor's Service selects, on the runtime port, binds its UID and
-  resourceVersion into the boundary evidence, persists the instance's launch
-  material in the generation's `os-supervisor-<id>-<generation>` Secret (key
+  resourceVersion into the boundary evidence, and builds the instance's
+  registration (route, sandbox name, main process spec and agent image from
+  the Sandbox resource, the provisioned runtime descriptor, the generation's
+  launch credentials, its proxy CA, and the current trace context). The
+  coordinator validates and encodes it, persists the launch material through
+  the driver into the generation's `os-supervisor-<id>-<generation>` Secret (key
   `instance.json`, owned by the workload Pod), and then assigns the instance
-  before releasing the workload Pod. Assignment does not wait for the
-  supervisor, so create still returns before the gateway persists the
+  before the driver releases the workload Pod. Assignment does not wait for
+  the supervisor, so create still returns before the gateway persists the
   generation. The runtime identity's last component is the instance route,
   which no Pod UID can equal, so `authenticate_sandbox` cannot vouch for a
   shared generation.
-- **Readiness.** A shared generation is available while the supervisor
-  reports its instance as accepted by the gateway and its fence and egress
-  allowance exist. An instance the supervisor has reconciled past and does not
-  host, or reports as ended, is unavailable, and reconciliation suspends the
-  workload. A disconnected supervisor is unknown and a supervisor that has not
-  yet reconciled to the assignment is degraded; neither suspends anything.
+- **Readiness.** A shared generation is available while the coordinator
+  reports its instance as supervised and accepted by the gateway and the
+  driver finds its fence and egress allowance. An instance the supervisor has
+  reconciled past and does not host, hosts for another sandbox, or reports as
+  ended is unavailable, and reconciliation suspends the workload. A
+  disconnected supervisor is unknown and a supervisor that has not yet
+  reconciled to the assignment is degraded; neither suspends anything.
+  Bootstrap completion waits on the same verdict within the bootstrap grace.
 - **Stop and delete.** The driver withdraws the instance before suspending or
   deleting the workload, and the generation cleanup deletes its launch
-  Secret. Every reconciliation also rebuilds the desired set from the Sandbox
-  resources that may run, reading launch material from the current assignment
-  or the launch Secret, so instances of deleted Sandboxes and of stops made
-  while the gateway was down are withdrawn, and a restarted gateway recovers
-  its assignments before it sends anything. The rebuild is compare-and-replace
-  against the revision read before the list, so it never undoes a lifecycle
-  edit that raced it.
+  Secret. Every reconciliation also recovers the desired set from the Sandbox
+  resources that may run: the driver begins the recovery before it lists
+  them, lists the shared generations that may run with their routes, and
+  reads each launch Secret's bytes on request; the coordinator reuses current
+  assignments, decodes and binds persisted material to the recorded route and
+  sandbox, keeps the previous set when any read fails, and refuses a list
+  that raced a lifecycle edit. Instances of deleted Sandboxes and of stops
+  made while the gateway was down are withdrawn, and a restarted gateway
+  recovers its assignments before it sends anything.
 - **Isolation.** The supervisor token is a profile of its own, separate from
   every instance's credentials; the gateway refuses it on every other RPC and
   refuses every other identity on the assignment stream, and ends a stream

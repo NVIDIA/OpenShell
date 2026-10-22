@@ -20,6 +20,7 @@ openshell-core = { path = "../openshell-core", default-features = false, feature
 openshell-extension-core = { path = "../openshell-extension-core" }
 openshell-isolation-interface = { path = "../openshell-isolation-interface" }
 openshell-sandbox-backend = { path = "../openshell-sandbox-backend" }
+openshell-supervisor-control = { path = "../openshell-supervisor-control" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-otel = { path = "../openshell-otel" }
 openshell-policy = { path = "../openshell-policy" }

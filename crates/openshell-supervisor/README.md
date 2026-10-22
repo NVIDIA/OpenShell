@@ -151,7 +151,7 @@ control listener: it dials the gateway and receives its assignments from it.
   `AssignmentSnapshot`s with session-scoped revisions. `shared_host::SharedHost::reconcile`
   validates the snapshot as a whole (at most 256 instances, no route twice),
   decodes each assignment's launch material (the JSON
-  `SandboxInstanceRegistration` of `openshell-sandbox-backend`), admits it into
+  `SandboxInstanceRegistration` of `openshell-supervisor-control`), admits it into
   the `SandboxInstanceHost` registry keyed by route with the registration
   digest as its fingerprint, and removes every hosted route the snapshot
   omits. An identical assignment is a no-op; one that cannot be admitted

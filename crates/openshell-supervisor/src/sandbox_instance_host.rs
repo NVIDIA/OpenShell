@@ -28,9 +28,7 @@ use std::time::Duration;
 use miette::{IntoDiagnostic as _, Result, WrapErr as _};
 use openshell_core::grpc_client::GatewayCredentials;
 use openshell_ocsf::OcsfJsonSettings;
-use openshell_sandbox_backend::sandbox_instance::{
-    SandboxInstancePhaseReport, SandboxInstanceStatusReport,
-};
+use openshell_supervisor_control::{SandboxInstancePhaseReport, SandboxInstanceStatusReport};
 use openshell_supervisor_network::policy_local::{DenialLogSource, SandboxInstanceDenialLog};
 use openshell_supervisor_process::log_push::LogSink;
 use tokio::sync::watch;

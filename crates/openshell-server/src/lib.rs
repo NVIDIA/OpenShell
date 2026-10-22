@@ -248,7 +248,7 @@ fn spawn_gateway_extension_token_refresh(
 fn spawn_supervisor_token_refresh(
     authority: Arc<auth::sandbox_jwt::SandboxSessionJwtAuthority>,
     ttl: Duration,
-    controller: openshell_core::supervisor_host::SupervisorHostController,
+    controller: openshell_supervisor_control::SupervisorHostController,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -264,7 +264,7 @@ fn spawn_supervisor_token_refresh(
                         .unwrap_or(i64::MAX),
                     );
                     controller.publish_credential(
-                        openshell_core::supervisor_host::SupervisorCredential {
+                        openshell_supervisor_control::SupervisorCredential {
                             token: minted.token,
                             expires_at: minted.expires_at,
                         },
@@ -1695,21 +1695,20 @@ impl ComputeDriverConfigContext<'_> {
 pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
-    supervisor_host: &'a OnceLock<openshell_core::supervisor_host::SupervisorHostController>,
+    shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
 }
 
 impl ComputeDriverBuildContext<'_> {
-    /// Let the gateway serve the shared supervisor whose desired assignments
-    /// this in-process driver owns. The gateway mints the supervisor token,
-    /// publishes each renewal into the controller for the driver to deliver,
-    /// and routes streams authenticated by that token to it.
-    pub fn install_supervisor_host(
-        &self,
-        controller: openshell_core::supervisor_host::SupervisorHostController,
-    ) -> Result<()> {
-        self.supervisor_host.set(controller).map_err(|_| {
-            Error::config("a compute driver may install only one supervisor host controller")
-        })
+    /// The gateway's coordination of a shared supervisor host, for an
+    /// in-process driver whose configuration places new generations on it.
+    /// The gateway owns the desired set, serves it to the host over the
+    /// private assignment stream, mints the supervisor token, and publishes
+    /// each renewal for the driver to deliver. Created on first request; every
+    /// call returns the same coordination.
+    pub fn shared_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
+        self.shared_supervision
+            .get_or_init(openshell_supervisor_control::SharedSupervision::new)
+            .clone()
     }
 
     #[must_use]
@@ -1829,7 +1828,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
-            let supervisor_host = OnceLock::new();
+            let shared_supervision = OnceLock::new();
             let build_context = ComputeDriverBuildContext {
                 config: ComputeDriverConfigContext {
                     driver_name: &registration.name,
@@ -1839,10 +1838,12 @@ async fn build_compute_runtime(
                     driver_startup,
                 },
                 shutdown_rx,
-                supervisor_host: &supervisor_host,
+                shared_supervision: &shared_supervision,
             };
             let instance = registration.factory.build(build_context).await?;
-            let supervisor_host = supervisor_host.into_inner();
+            let supervisor_host = shared_supervision
+                .into_inner()
+                .map(|supervision| supervision.controller().clone());
             match instance {
                 ComputeDriverInstance::InProcess(driver) => ComputeRuntime::from_driver(
                     registration.name,
@@ -1861,7 +1862,7 @@ async fn build_compute_runtime(
                 .with_supervisor_host(supervisor_host),
                 ComputeDriverInstance::ManagedRemote(_) if supervisor_host.is_some() => {
                     return Err(Error::config(
-                        "only an in-process compute driver can install a supervisor host controller",
+                        "only an in-process compute driver can use the gateway's shared supervision",
                     ));
                 }
                 ComputeDriverInstance::ManagedRemote(mut endpoint) => {

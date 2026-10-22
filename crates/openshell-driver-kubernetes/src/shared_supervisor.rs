@@ -7,18 +7,14 @@
 //! Every later lifecycle decision reads that record, so changing the gateway
 //! topology setting never reinterprets an existing generation.
 //!
-//! The gateway owns which sandbox instances the shared supervisor hosts. The
-//! driver publishes that set into a [`SupervisorHostController`], which the
-//! gateway serves to the supervisor over the private supervisor host stream,
-//! and reads the host's observations back from it. The durable source of the
-//! set is the generation's Sandbox resource plus its launch Secret, so a
-//! restarted gateway rebuilds it before publishing anything, and a full
-//! resync is compare-and-replace against the revision it started from.
-//!
-//! The gateway also mints the supervisor token the supervisor presents on
-//! that stream and publishes each renewal into the controller; the driver's
-//! only part in authentication is delivery, writing the current token into
-//! the Secret the supervisor Pod mounts.
+//! The gateway owns which sandbox instances the shared supervisor hosts and
+//! coordinates them through `openshell_supervisor_control::SharedSupervision`,
+//! which it constructs and hands to this driver. The driver's part is
+//! Kubernetes: the placement record on the Sandbox resource, the launch
+//! Secret the coordinator persists launch material into and reads it back
+//! from, the egress allowance from the workload to the supervisor's Service,
+//! and delivery of the gateway-minted supervisor token into the Secret the
+//! supervisor Pod mounts.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -26,16 +22,8 @@ use std::time::Duration;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::{Api, ObjectMeta, Patch, PatchParams};
 use kube::core::DynamicObject;
-use openshell_core::proto::supervisor_host::v1::{
-    SandboxInstanceAssignment, SandboxInstanceStatus,
-};
-use openshell_core::supervisor_host::{
-    AssignmentError, ObservedInstance, SupervisorCredential, SupervisorHostController,
-};
-use openshell_sandbox_backend::sandbox_instance::{
-    SandboxInstanceRegistration, SandboxInstanceStatusReport,
-};
-use tracing::{info, warn};
+use openshell_supervisor_control::{SharedSupervision, SupervisorCredential, deliver_credentials};
+use tracing::info;
 
 use crate::config::SharedSupervisorConfig;
 use crate::driver::KubernetesDriverError;
@@ -91,163 +79,62 @@ pub fn supervisor_placement(
     }
 }
 
-/// The gateway's desired set of shared sandbox instances and the host's
-/// observations of them. The controller is the only owner of that state;
-/// this type only translates between the driver's launch material and its
-/// wire form.
+/// The shared supervisor as this driver reaches it: the Helm-deployed
+/// Service and token Secret it is configured with, and the gateway's
+/// coordination of its sandbox instances.
 #[derive(Clone, Debug)]
 pub struct SharedSupervisor {
     config: SharedSupervisorConfig,
-    controller: SupervisorHostController,
+    supervision: SharedSupervision,
 }
 
 impl SharedSupervisor {
-    pub fn new(config: SharedSupervisorConfig) -> Self {
+    pub fn new(config: SharedSupervisorConfig, supervision: SharedSupervision) -> Self {
         Self {
             config,
-            controller: SupervisorHostController::new(),
+            supervision,
         }
     }
 
     /// Keep the supervisor token Secret current with every token the gateway
     /// publishes, until shutdown. The Secret itself is deployment packaging
-    /// (the chart creates it empty); the driver only replaces its token. A
-    /// failed write is retried until it succeeds or a newer token supersedes
-    /// it.
+    /// (the chart creates it empty); the driver only replaces its token.
     pub fn spawn_token_secret_writer(
         &self,
         client: kube::Client,
-        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) {
         let secrets = Api::<Secret>::namespaced(client, &self.config.service_namespace);
         let name = self.config.token_secret_name.clone();
-        let mut credential = self.controller.credential();
-        tokio::spawn(async move {
-            loop {
-                let current = credential.borrow_and_update().clone();
-                if let Some(current) = current {
-                    while let Err(error) = write_token_secret(&secrets, &name, &current).await {
-                        match &error {
-                            kube::Error::Api(response) if response.code == 404 => warn!(
-                                secret = %name,
-                                "the supervisor token Secret does not exist; the chart creates it, \
-                                 restore it (helm upgrade) so the shared supervisor can authenticate"
-                            ),
-                            kube::Error::Api(response) if response.code == 403 => warn!(
-                                secret = %name,
-                                "the gateway may not patch the supervisor token Secret; check the \
-                                 chart's gateway Role"
-                            ),
-                            _ => warn!(
-                                secret = %name,
-                                %error,
-                                "failed to write the supervisor token Secret; retrying"
-                            ),
-                        }
-                        tokio::select! {
-                            () = tokio::time::sleep(TOKEN_WRITE_RETRY) => {}
-                            changed = shutdown_rx.changed() => {
-                                if changed.is_err() || *shutdown_rx.borrow() {
-                                    return;
-                                }
-                            }
-                        }
-                        if credential.has_changed().unwrap_or(true) {
-                            break;
-                        }
-                    }
-                }
-                tokio::select! {
-                    changed = credential.changed() => {
-                        if changed.is_err() {
-                            return;
-                        }
-                    }
-                    changed = shutdown_rx.changed() => {
-                        if changed.is_err() || *shutdown_rx.borrow() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
+        tokio::spawn(deliver_credentials(
+            self.supervision.credentials(),
+            shutdown_rx,
+            TOKEN_WRITE_RETRY,
+            move |credential| {
+                let secrets = secrets.clone();
+                let name = name.clone();
+                async move { write_token_secret(&secrets, &name, &credential).await }
+            },
+        ));
     }
 
     pub fn config(&self) -> &SharedSupervisorConfig {
         &self.config
     }
 
-    /// The controller the gateway serves to the supervisor host.
-    pub fn controller(&self) -> &SupervisorHostController {
-        &self.controller
-    }
-
-    /// Assign a generation's sandbox instance; an identical assignment
-    /// changes nothing. Refused as a precondition when the host is at
-    /// capacity, so the create fails before its workload runs.
-    pub fn assign(
-        &self,
-        registration: &SandboxInstanceRegistration,
-    ) -> Result<(), KubernetesDriverError> {
-        let assignment = registration
-            .to_assignment()
-            .map_err(|error| KubernetesDriverError::Message(error.to_string()))?;
-        self.controller
-            .assign(assignment)
-            .map_err(|error| KubernetesDriverError::Precondition(error.to_string()))
-    }
-
-    /// Withdraw a generation's sandbox instance so the host stops it.
-    pub fn withdraw(&self, route: &str) {
-        self.controller.unassign(route);
-    }
-
-    /// Current desired revision, read before deriving a full list for
-    /// [`Self::resync`].
-    #[must_use]
-    pub fn revision(&self) -> u64 {
-        self.controller.revision()
-    }
-
-    /// The current assignment of a route, if any, so a resync keeps the
-    /// launch material it already holds instead of reading the Secret again.
-    #[must_use]
-    pub fn assignment(&self, route: &str) -> Option<SandboxInstanceAssignment> {
-        self.controller.assignment(route)
-    }
-
-    /// Replace the desired set with the generations that may run, derived
-    /// from Sandbox resources and their launch Secrets while the revision was
-    /// `baseline`. The first call initializes the gateway's view; until then
-    /// nothing is sent to the host. A list that raced a lifecycle edit is
-    /// refused and derived again on the next reconciliation.
-    pub fn resync(
-        &self,
-        baseline: u64,
-        assignments: Vec<SandboxInstanceAssignment>,
-    ) -> Result<u64, AssignmentError> {
-        self.controller.replace_assignments(baseline, assignments)
-    }
-
-    /// The host's view of one route.
-    #[must_use]
-    pub fn observed(&self, route: &str) -> ObservedInstance {
-        self.controller.observed(route)
+    /// The gateway's coordination of the host's sandbox instances.
+    pub fn supervision(&self) -> &SharedSupervision {
+        &self.supervision
     }
 }
 
-/// The host's report of one instance, in the driver's terms.
-#[must_use]
-pub fn reported(status: &SandboxInstanceStatus) -> SandboxInstanceStatusReport {
-    SandboxInstanceStatusReport::from_proto(status)
-}
-
-/// Replace the token in the chart-created Secret.
+/// Replace the token in the chart-created Secret. The error names what an
+/// operator must restore when the write cannot succeed on its own.
 async fn write_token_secret(
     secrets: &Api<Secret>,
     name: &str,
     credential: &SupervisorCredential,
-) -> Result<(), kube::Error> {
+) -> Result<(), String> {
     let secret = Secret {
         metadata: ObjectMeta {
             annotations: Some(BTreeMap::from([(
@@ -264,7 +151,18 @@ async fn write_token_secret(
     };
     secrets
         .patch(name, &PatchParams::default(), &Patch::Merge(&secret))
-        .await?;
+        .await
+        .map_err(|error| match &error {
+            kube::Error::Api(response) if response.code == 404 => format!(
+                "the supervisor token Secret {name} does not exist; the chart creates it, \
+                 restore it (helm upgrade) so the shared supervisor can authenticate"
+            ),
+            kube::Error::Api(response) if response.code == 403 => format!(
+                "the gateway may not patch the supervisor token Secret {name}; check the \
+                 chart's gateway Role"
+            ),
+            _ => format!("failed to write the supervisor token Secret {name}: {error}"),
+        })?;
     info!(
         secret = %name,
         expires_at = credential.expires_at,
