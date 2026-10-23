@@ -50,6 +50,11 @@ jobs:
             family: conformance
             package: sandbox
             runner: ubuntu-24.04
+          - environment: ubuntu-docker-rootful-keycloak
+            installer: deb
+            family: features
+            package: keycloak
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -77,13 +82,14 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cache/tmachine
-          # tmachine keys its disk layers on a hash of the Ansible tree and
+          # tmachine keys its disk layers on a hash of the Ansible tree, the
+          # environments' setup inputs (such as the Keycloak realm file) and
           # the cache versions in setup.rs and install.rs. actions/cache
           # doesn't save after an exact key hit, so a key that misses one of
           # those would rebuild the changed layers on every run. No
           # restore-keys fallback: restoring an older entry would carry its
           # stale disks into the new one, which then only grows.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/install.rs') }}
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix', 'tests/tmachine/src/qemu/setup.rs', 'tests/tmachine/src/qemu/install.rs', 'scripts/keycloak-realm.json') }}
 
       - name: Download integration inputs
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
