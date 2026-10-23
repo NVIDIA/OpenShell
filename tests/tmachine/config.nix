@@ -53,6 +53,21 @@ let
         };
       }
       {
+        name = "ubuntu-docker-rootful-keycloak";
+        machine = "ubuntu";
+        setup = {
+          use_galaxy = true;
+          playbooks = [
+            "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/docker.yaml"
+            "ansible/playbooks/keycloak.yaml"
+          ];
+          inputs = {
+            keycloak_realm_file = "../../scripts/keycloak-realm.json";
+          };
+        };
+      }
+      {
         name = "ubuntu-k3s";
         machine = "ubuntu";
         setup = {

@@ -204,6 +204,24 @@ an explicit matrix and runs the runner once per row. Branch E2E calls it when
 the `test:e2e` label is set. It is advisory for now. To run a suite in another
 environment on CI, add a row.
 
+**Environments with services.** A suite that needs something besides the
+gateway, such as an OIDC issuer, runs in a tmachine environment that provides
+it. The environment's setup starts the service (with a restart policy, since
+setup is cached as a disk) and writes how to reach it as `OPENSHELL_TEST_*`
+lines in `/etc/openshell-test/env.d/<service>.env`. The runner passes those
+variables to the tests and rejects names without that prefix. A suite-local
+fixture reads them with plain environment variables, so you can run the suite
+against your own deployment by setting them yourself. See the
+`ubuntu-docker-rootful-keycloak` environment in `tests/tmachine/config.nix`,
+`tests/tmachine/ansible/playbooks/keycloak.yaml` and
+`tests/suites/features/keycloak`:
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful-keycloak --installer deb \
+  --family features --package keycloak
+```
+
 The older conformance, feature and driver lanes in `.github/workflows/` still
 run through the tmachine testsuites in `tests/tmachine/config.nix`. They move
 to the runner as their suites move to testkit.

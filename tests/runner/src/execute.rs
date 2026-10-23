@@ -7,7 +7,9 @@
 //!
 //! Tests find the gateway the way the CLI does, so the runner points them at
 //! the one the installer registered with `OPENSHELL_GATEWAY` and at the
-//! installed CLI with `OPENSHELL_BIN`.
+//! installed CLI with `OPENSHELL_BIN`. Anything else the environment provides,
+//! such as Keycloak, the tests learn from the variables it publishes (see
+//! [`crate::test_env`]).
 //!
 //! Adapted from the executor in Evan Lezar's NVIDIA/OpenShell#4629.
 
@@ -21,6 +23,7 @@ use tmachine::config::Config;
 
 use crate::bundle::{Bundle, PROFILE, READY_BINARY};
 use crate::report::{Status, decide_status};
+use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
 /// How long the gateway has to become healthy after the environment is up.
@@ -126,13 +129,15 @@ async fn provision(config: &Config, environment: &str, installer: &str) -> Resul
 }
 
 /// The environment variables that point the tests at the system under test:
-/// the registered gateway, if known, and the installed CLI.
-pub fn guest_env(gateway: Option<&str>, openshell_bin: &str) -> Vec<String> {
+/// the registered gateway, if known, the installed CLI, and what the
+/// environment publishes for tests (see [`test_env`]).
+pub fn guest_env(gateway: Option<&str>, openshell_bin: &str, test_env: &[String]) -> Vec<String> {
     let mut vars = Vec::new();
     if let Some(gateway) = gateway {
         vars.push(format!("OPENSHELL_GATEWAY={gateway}"));
     }
     vars.push(format!("OPENSHELL_BIN={openshell_bin}"));
+    vars.extend(test_env.iter().cloned());
     vars
 }
 
@@ -166,7 +171,10 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         !openshell_bin.is_empty(),
         "the installer did not put openshell on the guest's PATH"
     );
-    let env = guest_env(run.gateway, openshell_bin);
+    let test_env = test_env::read(session)
+        .await
+        .context("read the variables the environment publishes for tests")?;
+    let env = guest_env(run.gateway, openshell_bin, &test_env);
 
     let guest = GUEST_DIR;
     checked(
@@ -279,15 +287,26 @@ mod tests {
     #[test]
     fn points_tests_at_the_gateway_and_the_cli() {
         assert_eq!(
-            guest_env(Some("openshell"), "/usr/bin/openshell"),
+            guest_env(Some("openshell"), "/usr/bin/openshell", &[]),
             [
                 "OPENSHELL_GATEWAY=openshell",
                 "OPENSHELL_BIN=/usr/bin/openshell",
             ]
         );
         assert_eq!(
-            guest_env(None, "/usr/bin/openshell"),
+            guest_env(None, "/usr/bin/openshell", &[]),
             ["OPENSHELL_BIN=/usr/bin/openshell"]
+        );
+        assert_eq!(
+            guest_env(
+                None,
+                "/usr/bin/openshell",
+                &["OPENSHELL_TEST_KEYCLOAK_ISSUER=http://127.0.0.1:8180/realms/openshell".into()]
+            ),
+            [
+                "OPENSHELL_BIN=/usr/bin/openshell",
+                "OPENSHELL_TEST_KEYCLOAK_ISSUER=http://127.0.0.1:8180/realms/openshell",
+            ]
         );
     }
 }

@@ -81,6 +81,22 @@ impl Cli {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_with_env(dir, &[], args).await
+    }
+
+    /// Like [`Cli::run_in`], with extra environment variables for the CLI,
+    /// such as a credential it reads by name. Values are not included in
+    /// [`CliOutput::command`] or in errors, so they can hold secrets.
+    pub async fn run_with_env<I, S>(
+        &self,
+        dir: Option<&Path>,
+        env: &[(&str, &str)],
+        args: I,
+    ) -> Result<CliOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<_> = args
             .into_iter()
             .map(|arg| arg.as_ref().to_os_string())
@@ -111,6 +127,7 @@ impl Cli {
         if let Some(dir) = dir {
             process.current_dir(dir);
         }
+        process.envs(env.iter().copied());
 
         let output = tokio::time::timeout(CLI_TIMEOUT, process.output())
             .await

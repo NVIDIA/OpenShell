@@ -48,6 +48,11 @@ jobs:
             family: conformance
             package: sandbox
             runner: ubuntu-24.04
+          - environment: ubuntu-docker-rootful-keycloak
+            installer: deb
+            family: features
+            package: keycloak
+            runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     steps:
@@ -77,7 +82,7 @@ jobs:
           # actions/cache doesn't save after an exact key hit, so a fixed key
           # would rebuild the changed layers on every run. Key on the playbooks
           # and fall back to the newest entry for the same runner.
-          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix') }}
+          key: tmachine-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tests/tmachine/ansible/**', 'tests/tmachine/images.nix', 'scripts/keycloak-realm.json') }}
           restore-keys: |
             tmachine-${{ runner.os }}-${{ runner.arch }}-
 
