@@ -13,18 +13,29 @@ use crate::proto::{ExchangeFrame, exchange_frame::Payload};
 pub const SANDBOX_PROTOCOL_CAPABILITY: &str = "openshell.sandbox.protocol";
 /// Optional backend support for `SuspendBoundary` and `ResumeBoundary`.
 pub const SUSPEND_RESUME_CAPABILITY: &str = "openshell.sandbox.suspend-resume";
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+/// Optional: the runtime accepts a gateway-granted supervisor takeover.
+///
+/// The grant travels on Attach (`supervisor_takeover`). A supervisor holding
+/// one must not send it, or resume a workload it does not own, unless the
+/// runtime advertises this; an older runtime keeps rejecting replacement
+/// supervisors.
+pub const SUPERVISOR_TAKEOVER_CAPABILITY: &str = "openshell.sandbox.supervisor-takeover";
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
-/// The built-in runtime supports fresh launches; suspend/resume is optional.
+/// The built-in runtime supports fresh launches and supervisor takeover;
+/// suspend/resume is optional.
 #[must_use]
 pub fn metadata(implementation: &str) -> PeerMetadata {
-    let capabilities = vec![SANDBOX_PROTOCOL_CAPABILITY.to_string()];
+    let required = vec![SANDBOX_PROTOCOL_CAPABILITY.to_string()];
     PeerMetadata {
         protocol_version: Some(PROTOCOL_VERSION),
         implementation_name: implementation.to_string(),
         implementation_version: openshell_core::VERSION.to_string(),
-        supported_capabilities: capabilities.clone(),
-        required_capabilities: capabilities,
+        supported_capabilities: vec![
+            SANDBOX_PROTOCOL_CAPABILITY.to_string(),
+            SUPERVISOR_TAKEOVER_CAPABILITY.to_string(),
+        ],
+        required_capabilities: required,
     }
 }
 

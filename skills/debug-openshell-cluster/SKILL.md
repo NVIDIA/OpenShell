@@ -1144,6 +1144,79 @@ done
 Any `no` result can strand recovery before workload Pod creation. Upgrade the
 OpenShell chart rather than treating missing workload Pods as Pod failures.
 
+#### Shared supervisor high availability
+
+With `supervisor_topology = "gateway"`, `supervisor.replicas` of 2 or more runs
+the `<release>-supervisor` Deployment as a pool. The chart then renders
+`high_availability = true` in `shared_supervisor`, rolls one member at a time,
+prefers separate nodes, gives each member a 60-second grace period to leave,
+and adds a `<release>-supervisor` PodDisruptionBudget with `maxUnavailable: 1`.
+Each member takes its identity from `OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`,
+`OPENSHELL_SUPERVISOR_POOL_MEMBER_UID`, and `OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP`
+(Pod name, UID, and IP). One replica renders none of this and has no failover.
+
+```bash
+kubectl -n openshell get deployment,poddisruptionbudget,pod -l app.kubernetes.io/component=supervisor -o wide
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'supervisor_topology|shared_supervisor'
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+  -c openshell-gateway --prefix --tail=500 | grep -E 'supervisor pool|taking over a shared sandbox instance'
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell-supervisor --prefix --tail=500 \
+  | grep -Ei 'takeover|sandbox instance'
+kubectl -n <sandbox-namespace> logs -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=workload \
+  --tail=200 | grep -E 'sandbox-supervisor-|Supervisor takeover'
+```
+
+Each sandbox instance runs on one member, and a live owner keeps it. The
+gateway logs `shared supervisor pool enabled; reconciling pool membership and
+ownership` at startup. When an owner's process exits, its node is lost, or it
+leaves, the gateway logs `taking over a shared sandbox instance from a failed
+supervisor` with `from`, `to`, and `term`, revokes the previous owner's
+credentials for that sandbox, and grants the instance to a live member.
+Runtimes dial the supervisor Service, and a member that does not own the
+instance redirects the runtime to the owner's Pod IP on the runtime port, so
+the workload must reach every supervisor Pod IP. The replacement and the
+sandbox runtime both log `Supervisor takeover confirmed; previous owner
+fenced`. The sandbox keeps its Pod, generation, PIDs, and memory; open proxied
+connections and exec or SSH streams break and must reconnect.
+
+The sandbox runtime writes these OCSF findings to the workload Pod log:
+
+- `sandbox-supervisor-connection-lost`: the runtime lost its supervisor and
+  froze the workload.
+- `sandbox-supervisor-recovery-expired`: no replacement confirmed within the
+  recovery timeout, so the runtime terminated the workload.
+- `sandbox-supervisor-takeover-denied`: the runtime refused a supervisor
+  without a valid grant for the current term, such as a fenced owner returning.
+
+The recovery timeout is `recovery_timeout_secs` (Helm
+`supervisor.recoveryTimeoutSeconds`, 10 to 300 seconds), or 60 seconds in a
+pool and 30 seconds otherwise. A graceful leave hands instances over at once.
+A lost node takes up to the 15-second membership TTL plus a 2-second
+reconcile pass to detect, before the replacement starts, so a short timeout
+terminates workloads that would have recovered. A gateway replica that just
+started waits 30 seconds before it takes over instances whose owner looks
+failed, so members cut off by a gateway restart reconnect first. With one
+replica, or when no live member takes over before the timeout, the workload
+ends in `sandbox-supervisor-recovery-expired`.
+
+`supervisor pool reconciliation failed; retrying` means a gateway replica could
+not read or write the pool's store records: `supervisor_pool_member` (one per
+member, refreshed by the gateway replica serving its stream; older than 15
+seconds means dead) and `supervisor_instance_owner` (one per instance, written
+with compare-and-swap, naming the owner and its term). Check the database. To
+read them on PostgreSQL without changing them:
+
+```sql
+SELECT object_type, id,
+       (extract(epoch FROM now()) * 1000)::bigint - updated_at_ms AS age_ms,
+       convert_from(payload, 'UTF8') AS record
+FROM objects
+WHERE object_type IN ('supervisor_pool_member', 'supervisor_instance_owner')
+ORDER BY object_type, id;
+```
+
+Do not edit or delete these records; the gateway fences takeovers with them.
+
 #### Corporate upstream proxy
 
 When the deployment routes sandbox egress through a corporate HTTP forward
@@ -1285,6 +1358,7 @@ credential failures.
 | OpenShift gateway pod fails to start with an SCC/`runAsUser` error (e.g. `unable to validate against any security context constraint`) | Chart's default `podSecurityContext`/`securityContext` hardcodes `runAsUser`/`fsGroup`, which the restricted-v2 SCC rejects; it must instead inject the namespace-assigned UID/GID range | `oc -n openshell describe pod <pod>`; deploy with `podSecurityContext: null` and clear `securityContext.runAsUser` (see `deploy/helm/openshell/ci/values-openshift-scc.yaml`) |
 | OpenShift `<release>-supervisor` Deployment never creates pods after setting `supervisor_topology = "gateway"` (SCC `runAsUser`/`fsGroup` not in the namespace range) | `supervisor.podSecurityContext` defaults `runAsUser`, `runAsGroup`, and `fsGroup` to 65534, outside the namespace's assigned UID/GID ranges | `kubectl -n openshell get events --field-selector reason=FailedCreate`; compare with the `openshift.io/sa.scc.*` annotations from `oc describe ns openshell`; set `supervisor.podSecurityContext.runAsUser`, `.runAsGroup`, and `.fsGroup` to `null`, as `deploy/helm/openshell/ci/values-openshift-scc.yaml` does, and keep `runAsNonRoot` and `seccompProfile` |
 | Shared sandboxes stay `Starting` or report `unavailable` readiness with `supervisor_topology = "gateway"`, gateway logs say no shared supervisor host is connected | The `<release>-supervisor` Pod cannot reach or authenticate to the gateway: wrong `OPENSHELL_TLS_CA`, the `<release>-supervisor-token` Secret is missing or still empty (gateway logs `wrote the supervisor token Secret` once it has delivered a token; `no usable supervisor token` in the supervisor means it has not), or the gateway was deployed without TLS or without the sandbox-JWT signing key | `kubectl -n openshell logs deployment/<release>-supervisor` for `gateway accepted the supervisor host` or a refusal; gateway logs for `supervisor host attached`, `wrote the supervisor token Secret`, or `failed to write the supervisor token Secret`; `kubectl -n openshell get secret <release>-supervisor-token -o jsonpath='{.metadata.annotations}'` shows the token expiry; the gateway refuses to start the topology without TLS or `gateway_jwt` |
+| Shared sandbox workloads terminate after a supervisor Pod or node failure (`sandbox-supervisor-recovery-expired`) | One supervisor replica (no failover), no live pool member took over, or the recovery timeout is shorter than detection plus takeover | `supervisor.replicas` and the `<release>-supervisor` PodDisruptionBudget; gateway `taking over a shared sandbox instance` logs; workload Pod `sandbox-supervisor-*` findings; `supervisor.recoveryTimeoutSeconds`. See "Shared supervisor high availability" in Step 6 |
 | OpenShift sandbox pod fails to start (`unable to validate against any security context constraint`) | An explicit sandbox UID/GID override or custom security context conflicts with the namespace's SCC range | Inspect pod events and the namespace's `openshift.io/sa.scc.uid-range` and `openshift.io/sa.scc.supplemental-groups` annotations; remove incompatible `sandbox_uid` / `sandbox_gid` overrides so the driver uses the namespace-assigned identity. Current sandbox pods use `restricted-v2` without a privileged SCC grant; see the [OpenShift guide](https://docs.nvidia.com/openshell/latest/kubernetes/openshift) and [RFC 0012](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0012-isolation-backend/README.md#motivation). |
 | OpenShift self-hosted Vault/OpenBao credential store pod never schedules (waits time out with `no matching resources found`) | The store's Helm chart pins `runAsUser`/`fsGroup`/seccomp, which restricted-v2 rejects, so the StatefulSet controller never creates the pod | Deploy the store's chart in its OpenShift mode (`--set global.openshift=true` for the OpenBao/Vault chart) so the namespace SCC assigns a compliant security context — no manual SCC grant needed |
 | Vault credential driver returns HTTP 403 / `Vault Kubernetes auth denied the configured role` on provider create | Vault's `auth/kubernetes` method or the gateway login role is not provisioned, or the role is not bound to the gateway service account and namespace | In Vault: `bao auth enable kubernetes` and `bao write auth/kubernetes/config kubernetes_host=... kubernetes_ca_cert=@...`; ensure the login role's `bound_service_account_names`/`bound_service_account_namespaces` match the gateway SA and namespace and its policy grants the credential paths |

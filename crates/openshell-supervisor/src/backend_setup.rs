@@ -38,6 +38,8 @@ pub struct BackendServices {
     pub ca_file_paths: Arc<Mutex<Option<(PathBuf, PathBuf)>>>,
     pub provider_credentials: ProviderCredentialState,
     pub sandbox_bearer: SessionBearerTokenSlot,
+    /// Gateway-granted authority to replace the generation's current owner.
+    pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
 }
 
 /// Startup result; native payload decoding never reaches shared runtime
@@ -324,17 +326,19 @@ impl PreparedBackend for OpenShellLaunch {
         services: BackendServices,
     ) -> std::result::Result<BuiltBackend, BackendError> {
         let payload = self.descriptor.backend_descriptor()?.payload;
+        let mut backend = openshell_sandbox_backend::OpenShellRuntimeBackend::new(
+            services.ca_file_paths,
+            services.provider_credentials,
+            services.sandbox_bearer,
+        )
+        .with_transport(self.transport);
+        if let Some(takeover) = services.takeover {
+            backend = backend.with_takeover(takeover);
+        }
         Ok(BuiltBackend {
             payload,
             proxy_listener: None,
-            backend: Arc::new(
-                openshell_sandbox_backend::OpenShellRuntimeBackend::new(
-                    services.ca_file_paths,
-                    services.provider_credentials,
-                    services.sandbox_bearer,
-                )
-                .with_transport(self.transport),
-            ),
+            backend: Arc::new(backend),
         })
     }
 }

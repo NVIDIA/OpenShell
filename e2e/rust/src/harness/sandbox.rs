@@ -232,10 +232,20 @@ impl SandboxGuard {
     /// Unlike [`SandboxGuard::create_keep`], this does not open an attachment,
     /// which lets tests control competing and reconnecting clients directly.
     pub async fn create_detached_main(command: &[&str]) -> Result<Self, String> {
+        Self::create_detached_main_with_args(&[], command).await
+    }
+
+    /// Like [`SandboxGuard::create_detached_main`], but forwards extra flags
+    /// to `sandbox create` before the `-- <command>` separator.
+    pub async fn create_detached_main_with_args(
+        create_args: &[&str],
+        command: &[&str],
+    ) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create").arg("--detach");
-        add_unique_name_if_missing(&mut cmd, &[]);
-        add_test_image_if_missing(&mut cmd, &[]);
+        add_unique_name_if_missing(&mut cmd, create_args);
+        add_test_image_if_missing(&mut cmd, create_args);
+        cmd.args(create_args);
         cmd.arg("--")
             .args(command)
             .stdout(Stdio::piped())

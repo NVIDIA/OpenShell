@@ -69,6 +69,17 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Shared supervisor replicas, used only when gatewayConfig selects
+  # supervisor_topology = "gateway". 1 runs a single shared supervisor with no
+  # failover. 2 or more form a high-availability pool: when a member fails or
+  # leaves, another member takes over its sandboxes without restarting their
+  # workloads.
+  replicas: 1
+  # -- (int) Seconds a sandbox workload stays frozen after losing its shared
+  # supervisor before the sandbox runtime terminates it, when
+  # supervisor_topology = "gateway". Must be an integer from 10 to 300. Null
+  # uses 60 seconds in a high-availability pool and 30 seconds otherwise.
+  recoveryTimeoutSeconds: null
   # Pod security context for the shared supervisor Deployment, rendered only
   # when gatewayConfig selects supervisor_topology = "gateway". On OpenShift,
   # set the user and group IDs to null so the restricted-v2 SCC can assign the

@@ -4892,6 +4892,7 @@ mod tests {
                         sandbox_id: "sandbox-a".to_string(),
                         source: SandboxIdentitySource::BootstrapJwt {
                             issuer: "openshell-gateway:test".to_string(),
+                            auth_epoch: None,
                         },
                         trust_domain: None,
                     }),

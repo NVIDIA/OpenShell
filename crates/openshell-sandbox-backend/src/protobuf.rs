@@ -385,11 +385,20 @@ impl WireMessage for w::SessionSnapshotWire {
                     })
                 })
                 .collect::<Result<_, FrameError>>()?,
+            bound_policy: self
+                .bound_policy
+                .as_ref()
+                .map(|policy| policy.to_proto())
+                .transpose()?,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
         Ok(Self {
             generation: v.generation,
+            bound_policy: v
+                .bound_policy
+                .map(|policy| w::SandboxPolicyWire::from_proto(policy).map(Box::new))
+                .transpose()?,
             processes: v
                 .processes
                 .into_iter()
@@ -441,9 +450,11 @@ impl WireMessage for w::RequestEnvelope {
             W::Attach {
                 supervisor_instance_id,
                 policy,
+                supervisor_takeover,
             } => P::Attach(p::Attach {
                 supervisor_instance_id: supervisor_instance_id.to_string(),
                 policy: Some(policy.to_proto()?),
+                supervisor_takeover: supervisor_takeover.clone(),
             }),
             W::Confirm => P::Confirm(p::Confirm {}),
             W::StartAgent {
@@ -525,6 +536,7 @@ impl WireMessage for w::RequestEnvelope {
             P::Attach(v) => W::Attach {
                 supervisor_instance_id: parse(&v.supervisor_instance_id)?,
                 policy: Box::new(w::SandboxPolicyWire::from_proto(required(v.policy)?)?),
+                supervisor_takeover: v.supervisor_takeover,
             },
             P::Confirm(_) => W::Confirm,
             P::StartAgent(v) => W::StartAgent {
@@ -794,6 +806,7 @@ mod tests {
             request: Some(p::request_envelope::Request::Attach(p::Attach {
                 supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
                 policy: None,
+                supervisor_takeover: None,
             })),
         };
         assert!(w::RequestEnvelope::from_proto(attach).is_err());

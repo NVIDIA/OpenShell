@@ -406,6 +406,108 @@ pub async fn rotate_gateway_token(
     Ok(next.clone())
 }
 
+/// Outcome of advancing a sandbox's credential epoch for a supervisor takeover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverIdentity {
+    /// The epoch now equals the takeover's; earlier credentials are revoked.
+    Advanced,
+    /// The takeover's epoch was already in force (a retried transaction).
+    AlreadyAdvanced,
+    /// The takeover must not proceed: the sandbox is gone, stopping, or runs
+    /// another generation, or a later term already replaced this one.
+    Refused(&'static str),
+}
+
+/// Phases in which a running generation may change supervisor owner.
+fn takeover_allowed(phase: SandboxPhase) -> bool {
+    matches!(
+        phase,
+        SandboxPhase::Provisioning
+            | SandboxPhase::Starting
+            | SandboxPhase::Ready
+            | SandboxPhase::Error
+            | SandboxPhase::Completed
+            | SandboxPhase::Unknown
+    )
+}
+
+/// Advance the persisted credential epoch of `generation` to `auth_epoch`
+/// and start a new gateway-token lineage, so every credential of earlier
+/// supervisor terms is rejected by every gateway replica. Ordinary refresh
+/// never changes the epoch; only an ownership takeover calls this.
+///
+/// Stop and delete win: a sandbox that is stopping, stopped, deleting, or
+/// gone, or that runs another generation, refuses the takeover.
+pub async fn advance_identity_for_takeover(
+    store: &Store,
+    sandbox_id: &str,
+    generation: &str,
+    auth_epoch: CredentialEpoch,
+    gateway_token_id: Uuid,
+) -> Result<TakeoverIdentity, crate::persistence::PersistenceError> {
+    const ATTEMPTS: u32 = 5;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let Some(sandbox) = store.get_message::<Sandbox>(sandbox_id).await? else {
+            return Ok(TakeoverIdentity::Refused("sandbox no longer exists"));
+        };
+        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+        if !takeover_allowed(phase) {
+            return Ok(TakeoverIdentity::Refused(
+                "sandbox is stopping, stopped, restarting, or deleting",
+            ));
+        }
+        let Some(metadata) = sandbox.metadata.as_ref() else {
+            return Ok(TakeoverIdentity::Refused(
+                "sandbox identity metadata is missing",
+            ));
+        };
+        let Ok(current) = PersistedSandboxIdentity::read(&metadata.annotations) else {
+            return Ok(TakeoverIdentity::Refused(
+                "sandbox runtime identity is invalid",
+            ));
+        };
+        if current.runtime_generation.as_str() != generation {
+            return Ok(TakeoverIdentity::Refused(
+                "sandbox runs another runtime generation",
+            ));
+        }
+        if current.auth_epoch == auth_epoch {
+            // Only the intent that advanced the term may grant it; its
+            // credentials name its own token lineage.
+            return Ok(if current.gateway_token_id == gateway_token_id {
+                TakeoverIdentity::AlreadyAdvanced
+            } else {
+                TakeoverIdentity::Refused("another takeover already holds this term")
+            });
+        }
+        if current.auth_epoch > auth_epoch {
+            return Ok(TakeoverIdentity::Refused(
+                "a later supervisor term replaced this takeover",
+            ));
+        }
+        let next = PersistedSandboxIdentity {
+            runtime_generation: current.runtime_generation.clone(),
+            auth_epoch,
+            gateway_token_id,
+            refresh_replay: None,
+        };
+        match store
+            .update_message_cas::<Sandbox, _>(sandbox_id, metadata.resource_version, |sandbox| {
+                if let Some(metadata) = sandbox.metadata.as_mut() {
+                    next.write(&mut metadata.annotations);
+                }
+            })
+            .await
+        {
+            Ok(_) => return Ok(TakeoverIdentity::Advanced),
+            Err(crate::persistence::PersistenceError::Conflict { .. }) if attempt < ATTEMPTS => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

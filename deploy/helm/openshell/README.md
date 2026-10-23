@@ -610,6 +610,8 @@ discovery endpoint or its TLS CA.
 | supervisor.podSecurityContext.runAsNonRoot | bool | `true` | Require the shared supervisor to run as a non-root user. |
 | supervisor.podSecurityContext.runAsUser | int | `65534` | UID assigned to the shared supervisor pod. |
 | supervisor.podSecurityContext.seccompProfile.type | string | `"RuntimeDefault"` | Seccomp profile applied to the shared supervisor pod. |
+| supervisor.recoveryTimeoutSeconds | int | `nil` | Seconds a sandbox workload stays frozen after losing its shared supervisor before the sandbox runtime terminates it, when supervisor_topology = "gateway". Must be an integer from 10 to 300. Null uses 60 seconds in a high-availability pool and 30 seconds otherwise. |
+| supervisor.replicas | int | `1` | Shared supervisor replicas, used only when gatewayConfig selects supervisor_topology = "gateway". 1 runs a single shared supervisor with no failover. 2 or more form a high-availability pool: when a member fails or leaves, another member takes over its sandboxes without restarting their workloads. |
 | supervisor.sandboxRuntime.boundaryPort | int | `5500` | Workload boundary TLS listener port. |
 | tolerations | list | `[]` | Tolerations for the gateway pod. |
 | upstreamProxy | object | `{"authAllowInsecure":false,"authSecret":{"key":"","name":""},"caBundle":{"configMapName":"","key":"ca.crt"},"connectByHostname":false,"noProxy":"","url":""}` | Operator-owned corporate forward proxy for policy-approved TLS egress from Kubernetes sandboxes. The workload cannot select or override it. |

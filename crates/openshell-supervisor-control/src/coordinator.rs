@@ -17,6 +17,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -44,6 +45,32 @@ pub enum LaunchError<E> {
     /// the generation back before its workload runs.
     #[error("{0}")]
     Refused(AssignmentError),
+    /// No pool member could be recorded as the instance's owner. The material
+    /// was persisted; the caller rolls the generation back.
+    #[error("{0}")]
+    Unplaced(String),
+}
+
+/// The launch term of a new pool instance, to record before it is assigned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlacementRequest {
+    pub route: String,
+    pub sandbox_id: String,
+    pub generation: String,
+    /// Credential epoch of the launch credentials.
+    pub auth_epoch: u64,
+}
+
+/// Outcome of recording a launch owner.
+pub type PlacementFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+
+/// The gateway's durable placement of pool instances, installed by the
+/// gateway when the host is a supervisor pool.
+pub trait InstancePlacement: Send + Sync + std::fmt::Debug {
+    /// Durably record the owner of a new instance's launch term: the pool
+    /// member the consistent-hash ring prefers among live members, and its
+    /// current process. Fails when no member is live.
+    fn place_launch(&self, request: PlacementRequest) -> PlacementFuture;
 }
 
 /// Revision of the desired set read before the driver listed its durable
@@ -91,8 +118,9 @@ pub enum InstanceSupervision {
     Unknown,
 }
 
-/// The gateway's coordination of one shared supervisor host: the desired set
-/// it publishes, the token it delivers, and the observations it reads back.
+/// The gateway's coordination of one shared supervisor host or pool: the
+/// desired set it publishes, the token it delivers, and the observations it
+/// reads back.
 ///
 /// Clones share one controller. The gateway keeps one for serving the host's
 /// stream and minting its token, and gives one to the compute driver.
@@ -105,6 +133,21 @@ impl SharedSupervision {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Supervise with a pool of shared supervisor replicas (high
+    /// availability) instead of one host. The gateway must then install its
+    /// placement with
+    /// [`SupervisorHostController::install_placement`] before instances
+    /// launch.
+    pub fn enable_pool(&self) {
+        self.controller.enable_pool();
+    }
+
+    /// Whether instances are supervised by a pool.
+    #[must_use]
+    pub fn is_pool(&self) -> bool {
+        self.controller.is_pool()
     }
 
     /// The controller the gateway serves to the host and publishes the
@@ -143,6 +186,25 @@ impl SharedSupervision {
         persist(assignment.launch_material.clone())
             .await
             .map_err(LaunchError::Persist)?;
+        if self.controller.is_pool() {
+            // The owner of the launch term is durable before any member is
+            // assigned the instance, so every gateway replica agrees on it
+            // and a later failure of that member is recovered by takeover.
+            let placement = self.controller.placement().ok_or_else(|| {
+                LaunchError::Unplaced(
+                    "the supervisor pool is not ready to place sandbox instances".to_string(),
+                )
+            })?;
+            placement
+                .place_launch(PlacementRequest {
+                    route: registration.route.clone(),
+                    sandbox_id: registration.sandbox_id.clone(),
+                    generation: registration.auth.runtime_generation.to_string(),
+                    auth_epoch: registration.auth.auth_epoch.get(),
+                })
+                .await
+                .map_err(LaunchError::Unplaced)?;
+        }
         self.controller
             .assign(assignment)
             .map_err(LaunchError::Refused)
@@ -243,7 +305,10 @@ impl SharedSupervision {
     /// What the host's observations say about the instance of `sandbox_id`
     /// on `route`. Only a host that has reconciled to the assigning snapshot
     /// renders a verdict; a disconnected or still-reconciling host is not
-    /// evidence that a running instance is gone.
+    /// evidence that a running instance is gone. For a pool only the owning
+    /// process's host renders it, so an instance being taken over by another
+    /// member reads as degraded or unknown, never unavailable, until its new
+    /// owner has reconciled.
     #[must_use]
     pub fn supervision(&self, route: &str, sandbox_id: &str) -> InstanceSupervision {
         match self.controller.observed(route) {
@@ -318,6 +383,7 @@ mod tests {
             sandbox_id: "sandbox-a".to_string(),
             generation: "gen".to_string(),
             launch_material: b"opaque".to_vec(),
+            takeover: None,
         };
         // An assignment made before the first recovery is carried by it.
         supervision.controller().assign(assigned.clone()).unwrap();

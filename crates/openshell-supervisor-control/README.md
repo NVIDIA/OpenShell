@@ -23,7 +23,20 @@ re-implementing the control contracts.
   delayed older hello is refused, and reports from superseded streams, acks
   of revisions never sent, regressing acks, and oversized reports are
   dropped. A stream ends when the token that opened it expires; hosted
-  instances keep running. At most 256 instances are assigned.
+  instances keep running. A lone host runs at most 256 instances.
+- **Supervisor pool.** With `enable_pool`, several hosts (pool members) are
+  served at once and each instance has one durable owner: a member, its
+  process, and an ownership term. The gateway's pool reconciler replaces the
+  `PoolView` as a whole (`update_pool`, keeping owners placed since its
+  records were listed). Each member's snapshot carries the instances its
+  process owns (a takeover term with its credentials, or with the term alone
+  when another gateway replica minted them), `stop_routes` for withdrawn
+  instances it owns, `keep_routes` for owned instances whose launch material
+  this gateway has not loaded yet, and the route directory for runtime
+  redirects. Omission means release, never stop. Nothing is sent before both
+  the desired set and the pool view have loaded. Only the owning process's
+  session renders a verdict on an instance. A pool holds up to 4096 instances;
+  placement keeps each member at 256.
 - `registration`: `SandboxInstanceRegistration` is the JSON launch material
   one assignment carries and the driver persists with the generation. It
   grants the supervisor exactly that generation's gateway and Sandbox Protocol
@@ -36,7 +49,9 @@ re-implementing the control contracts.
   to the compute driver. `launch` validates the driver's registration,
   persists the encoded launch material through the driver's operation, and
   only then assigns the instance; a host at capacity is refused before the
-  workload runs. `begin_recovery` captures
+  workload runs. For a pool, the gateway's installed `InstancePlacement`
+  durably records the launch term's owner before the assignment, and a launch
+  no member can take is refused (`LaunchError::Unplaced`). `begin_recovery` captures
   the revision before the driver lists its durable records and
   `complete_recovery` reuses current assignments, reads the rest through the
   driver's operation, binds each to its recorded route and sandbox, and keeps

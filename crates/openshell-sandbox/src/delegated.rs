@@ -219,6 +219,12 @@ pub struct AgentSignaler {
 
 #[cfg(unix)]
 impl AgentSignaler {
+    /// Process ID of the agent's process group leader.
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     fn deliver(&self, signal: nix::sys::signal::Signal) -> Result<()> {
         let _guard = self
             .signal_lock

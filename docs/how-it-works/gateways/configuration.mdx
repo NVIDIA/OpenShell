@@ -939,6 +939,11 @@ sandbox_runtime_image_pull_policy = "if_not_present"
 # Defaults to the gateway version; override to pin a specific build.
 # supervisor_image             = "ghcr.io/nvidia/openshell/supervisor:<version>"
 supervisor_image_pull_policy   = "if_not_present"
+# Supervise new sandboxes with one shared supervisor Deployment instead of a
+# supervisor Pod per sandbox. Helm deploys it and renders shared_supervisor
+# from the chart's supervisor.* values.
+# supervisor_topology          = "gateway"
+# shared_supervisor            = { service_name = "openshell-supervisor", service_namespace = "openshell", runtime_port = 5500, token_secret_name = "openshell-supervisor-token", high_availability = true, recovery_timeout_secs = 60 }
 
 # Optional corporate forward proxy for policy-approved TLS egress. The sandbox
 # workload cannot select or override these settings. http:// and https:// proxy
@@ -1047,6 +1052,20 @@ In managed workspace mode, the Kubernetes driver copies each explicitly named
 `image_pull_secrets` Secret from `namespace` into the managed workspace
 namespace on sandbox creation. Shared and operator modes require the Secret to
 already exist in the sandbox namespace.
+
+With `supervisor_topology = "gateway"`, `shared_supervisor` tells the gateway
+how to reach the shared supervisor that the Helm chart deploys. The chart
+renders `shared_supervisor` and rejects a hand-written one, so set the chart's
+`supervisor.replicas` and `supervisor.recoveryTimeoutSeconds` values instead.
+These `shared_supervisor` fields control failover:
+
+| Field | Default | Behavior |
+|---|---|---|
+| `high_availability` | `false` | Runs the shared supervisor as a pool whose members take over each other's sandboxes. Requires two or more replicas. Helm sets it when `supervisor.replicas` is 2 or more. |
+| `recovery_timeout_secs` | `60` with `high_availability`, otherwise `30` | Seconds, from 10 to 300, that a sandbox keeps its workload frozen after losing its supervisor before the sandbox runtime terminates it. Helm renders `supervisor.recoveryTimeoutSeconds`. |
+
+For failover behavior, refer to
+[Shared Supervisor High Availability](/kubernetes/high-availability#shared-supervisor-high-availability).
 
 For token-exchange provider profiles, the gateway also needs access to its own
 SPIFFE Workload API socket. In Helm deployments, set

@@ -165,8 +165,10 @@ impl NativeLinuxSandboxAuditEvidence {
 ///
 /// The supervisor generates this value in memory and presents it on every
 /// attach, including transport reconnects. The sandbox pins the first value it
-/// accepts for its process lifetime, so a replacement supervisor cannot reuse
-/// launch credentials to take over an existing runtime generation.
+/// accepts, so a replacement supervisor cannot reuse launch credentials to
+/// take over an existing runtime generation. Only a gateway-signed takeover
+/// grant for a higher credential epoch, naming the replacement's identity,
+/// moves the pin (see [`crate::sandbox_auth`]).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SupervisorInstanceId(uuid::Uuid);
 
@@ -459,6 +461,11 @@ pub enum BoundaryListener {
         /// sandbox instances. Absent for a dedicated supervisor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<String>,
+        /// The shared supervisor is a pool whose members redirect a runtime
+        /// to the member that hosts its route. Requires `route`; redirects
+        /// stay on the port of `addresses`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        route_redirects: bool,
     },
     /// Dial the supervisor over the driver's protected shared Unix socket.
     RuntimeInitiatedUnix {
@@ -577,7 +584,21 @@ pub struct BoundaryConfig {
     /// Driver-resolved environment exposed only to workload processes.
     #[serde(default)]
     pub child_env: std::collections::HashMap<String, String>,
+    /// How long the runtime keeps a workload frozen after losing its
+    /// supervisor before terminating it, when a deployment needs longer than
+    /// the default to recover supervision (see
+    /// [`SUPERVISOR_RECOVERY_TIMEOUT_RANGE`]). Absent uses the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_recovery_timeout_secs: Option<u32>,
 }
+
+/// Default time a runtime keeps a workload frozen, after losing its
+/// supervisor, for an authenticated supervisor to recover it.
+pub const DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Accepted bounds of [`BoundaryConfig::supervisor_recovery_timeout_secs`].
+/// Recovery is always bounded: a workload never runs unsupervised, and a
+/// frozen workload is terminated once its deadline passes.
+pub const SUPERVISOR_RECOVERY_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 10..=300;
 
 impl fmt::Debug for BoundaryConfig {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -603,11 +624,30 @@ impl fmt::Debug for BoundaryConfig {
             .field("workload_identity", &self.workload_identity)
             .field("provisioning_evidence", &self.provisioning_evidence)
             .field("child_env_keys", &self.child_env.keys().collect::<Vec<_>>())
+            .field(
+                "supervisor_recovery_timeout_secs",
+                &self.supervisor_recovery_timeout_secs,
+            )
             .finish()
     }
 }
 
 impl BoundaryConfig {
+    /// The bounded recovery deadline this runtime enforces.
+    pub fn supervisor_recovery_timeout(&self) -> Result<Duration, BackendError> {
+        match self.supervisor_recovery_timeout_secs {
+            None => Ok(DEFAULT_SUPERVISOR_RECOVERY_TIMEOUT),
+            Some(seconds) if SUPERVISOR_RECOVERY_TIMEOUT_RANGE.contains(&seconds) => {
+                Ok(Duration::from_secs(u64::from(seconds)))
+            }
+            Some(_) => Err(BackendError::Descriptor(format!(
+                "supervisor recovery timeout must be between {} and {} seconds",
+                SUPERVISOR_RECOVERY_TIMEOUT_RANGE.start(),
+                SUPERVISOR_RECOVERY_TIMEOUT_RANGE.end()
+            ))),
+        }
+    }
+
     /// Serialize the protected driver-owned boundary configuration.
     pub fn encode(&self) -> Result<Vec<u8>, BackendError> {
         serde_json::to_vec(self)
@@ -778,6 +818,10 @@ pub enum Request {
     Attach {
         supervisor_instance_id: SupervisorInstanceId,
         policy: Box<SandboxPolicyWire>,
+        /// Gateway-signed takeover grant, present only when this process
+        /// replaces the generation's current owner.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supervisor_takeover: Option<String>,
     },
     Confirm,
     StartAgent {
@@ -859,9 +903,11 @@ impl fmt::Debug for Request {
             Self::Attach {
                 supervisor_instance_id: _,
                 policy: _,
+                supervisor_takeover,
             } => formatter
                 .debug_struct("Attach")
                 .field("policy", &"<redacted>")
+                .field("takeover", &supervisor_takeover.is_some())
                 .finish(),
             Self::Confirm => formatter.write_str("Confirm"),
             Self::StartAgent {
@@ -1015,6 +1061,10 @@ pub struct MediationTimingWire {
 pub struct SessionSnapshotWire {
     pub generation: String,
     pub processes: Vec<ProcessSnapshotWire>,
+    /// Launch controls bound by the first attach, if any. A replacement
+    /// supervisor reattaches with exactly these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound_policy: Option<Box<SandboxPolicyWire>>,
 }
 
 /// Stable generation-scoped process state available to a replacement supervisor.
@@ -1889,6 +1939,30 @@ mod tests {
         let encoded = serde_json::to_vec(&transport).expect("encode transport");
         let decoded: SandboxTransport = serde_json::from_slice(&encoded).expect("decode transport");
         assert_eq!(decoded, transport);
+    }
+
+    #[test]
+    fn route_redirects_leave_existing_listener_encodings_unchanged() {
+        let route = crate::runtime_routed::new_route_handle();
+        let listener = |route_redirects| BoundaryListener::RuntimeInitiatedTlsTcp {
+            authority: "supervisor.openshell.svc".to_string(),
+            addresses: vec!["192.0.2.10:7443".parse().expect("test address")],
+            tls: SandboxTlsServerConfig {
+                certificate_chain_path: PathBuf::from("/run/openshell/sandbox.crt"),
+                private_key_path: PathBuf::from("/run/openshell/sandbox.key"),
+            },
+            route: Some(route.clone()),
+            route_redirects,
+        };
+        // Configurations written before the field existed decode unchanged.
+        let encoded = serde_json::to_value(listener(false)).expect("encode listener");
+        assert!(encoded.get("route_redirects").is_none());
+        let decoded: BoundaryListener = serde_json::from_value(encoded).expect("decode listener");
+        assert_eq!(decoded, listener(false));
+        let encoded = serde_json::to_value(listener(true)).expect("encode listener");
+        assert_eq!(encoded["route_redirects"], true);
+        let decoded: BoundaryListener = serde_json::from_value(encoded).expect("decode listener");
+        assert_eq!(decoded, listener(true));
     }
 
     #[test]

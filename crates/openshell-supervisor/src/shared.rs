@@ -3,6 +3,12 @@
 
 //! Supervisor host shared by the sandboxes of one gateway.
 
+/// How long a leaving pool member waits for the gateway to move its sandbox
+/// instances to other members before it relinquishes the rest. Shorter than
+/// the Pod's termination grace period.
+#[cfg(unix)]
+const POOL_LEAVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+
 use miette::Result;
 #[cfg(unix)]
 use std::future::Future;
@@ -34,6 +40,25 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let instance_root = args
         .session_root
         .ok_or_else(|| miette::miette!("--session-root is required for --mode=shared"))?;
+    let pool = match (
+        args.pool_member_id,
+        args.pool_member_uid,
+        args.pool_advertise_ip,
+    ) {
+        (None, None, None) => None,
+        (Some(name), Some(uid), Some(advertise_ip)) => {
+            Some(openshell_supervisor::shared_host::PoolIdentity {
+                member_id: name,
+                member_uid: uid,
+                runtime_address: std::net::SocketAddr::new(advertise_ip, runtime_listen.port()),
+            })
+        }
+        _ => {
+            return Err(miette::miette!(
+                "a supervisor pool member needs --pool-member-id, --pool-member-uid, and --pool-advertise-ip"
+            ));
+        }
+    };
     // The supervisor token travels only over TLS; the host verifies the
     // gateway the way every sandbox instance does, with `OPENSHELL_TLS_CA`
     // and `OPENSHELL_GATEWAY_TLS_SERVER_NAME`.
@@ -95,6 +120,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
                 instance_root,
                 runtime_listen,
                 removal_grace: openshell_supervisor_control::INSTANCE_REMOVAL_GRACE,
+                pool,
             },
         )?;
         let health = tokio::net::TcpListener::bind(address)
@@ -104,6 +130,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
         tracing::info!(
             runtime = %host.runtime_addr(),
             health = %address,
+            pool_member = host.pool().map(|pool| pool.member_id.as_str()),
             "Shared supervisor ready for sandbox instance assignments"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);
@@ -120,11 +147,16 @@ fn run_platform(args: crate::Args) -> Result<()> {
             _ = terminate.recv() => {}
             _ = interrupt.recv() => {}
         }
+        // A pool member hands its instances to other members while it still
+        // hears from the gateway.
+        host.leave(POOL_LEAVE_TIMEOUT).await;
         stop.send_replace(true);
         let _ = probes.await;
         let _ = attachment.await;
-        // Sandboxes lose supervision with this process and fail closed.
-        host.remove_all().await;
+        // A lone shared supervisor's sandboxes lose supervision with this
+        // process and fail closed; a pool member relinquishes what it still
+        // hosts to the member the gateway grants it to.
+        host.shut_down().await;
         Ok(())
     })
 }

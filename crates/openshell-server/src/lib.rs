@@ -47,6 +47,7 @@ mod ssh_identity;
 mod ssh_sessions;
 mod storage_proto;
 mod supervisor_owner;
+mod supervisor_pool;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -820,6 +821,16 @@ pub(crate) async fn run_server(
             ttl_secs = ttl.as_secs(),
             "shared supervisor assignment stream enabled; minting supervisor tokens"
         );
+        if controller.is_pool() {
+            info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+            supervisor_pool::SupervisorPool::new(
+                state.store.clone(),
+                controller.clone(),
+                authority.clone(),
+                state.replica_id.clone(),
+            )
+            .start(shutdown_rx.clone());
+        }
         spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
     }
 

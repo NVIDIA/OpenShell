@@ -37,12 +37,13 @@ pub mod proto {
 }
 
 pub use controller::{
-    AssignmentError, HOST_HEARTBEAT_INTERVAL, HostIdentity, MAX_ASSIGNED_INSTANCES,
-    MAX_REPORTED_INSTANCES, ObservedInstance, SupervisorCredential, SupervisorHostController,
+    AssignmentError, ConnectedMember, HOST_HEARTBEAT_INTERVAL, HostIdentity, InstanceOwner,
+    MAX_ASSIGNED_INSTANCES, MAX_REPORTED_INSTANCES, MemberView, ObservedInstance,
+    POOL_HEARTBEAT_INTERVAL, PoolView, SupervisorCredential, SupervisorHostController,
 };
 pub use coordinator::{
-    InstanceSupervision, LaunchError, RecoverableInstance, RecoveryBaseline, RecoveryOutcome,
-    SharedSupervision,
+    InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture, PlacementRequest,
+    RecoverableInstance, RecoveryBaseline, RecoveryOutcome, SharedSupervision,
 };
 pub use credential::deliver_credentials;
 pub use registration::{

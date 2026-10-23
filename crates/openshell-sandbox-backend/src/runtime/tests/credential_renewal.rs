@@ -69,6 +69,8 @@ async fn renewing_boundary_client(
             mediation_ready: false,
             provider_environment_generation: 0,
             confirmation: test_confirmation(),
+            attach_snapshots: Arc::default(),
+            received: Arc::default(),
         },
         expected_token: Arc::new(std::sync::RwLock::new("a".repeat(32))),
         failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -108,6 +110,7 @@ async fn renewing_boundary_client(
         .call_idempotent(Request::Attach {
             supervisor_instance_id: client.supervisor_instance_id,
             policy: Box::new(SandboxPolicyWire::from(sandbox().policy)),
+            supervisor_takeover: None,
         })
         .await
         .unwrap();

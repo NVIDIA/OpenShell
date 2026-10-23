@@ -194,6 +194,7 @@ impl TestSetup {
                 HashMap::from([("TEST_CONFIG".into(), "initial".into())]),
             ),
             sandbox_bearer: self.auth.sandbox_bearer_slot().unwrap(),
+            takeover: None,
         }
     }
 }
@@ -324,6 +325,7 @@ impl PreparedBackend for TestLaunch {
                             snapshot: SessionSnapshotWire {
                                 generation: generation.clone(),
                                 processes,
+                                bound_policy: None,
                             },
                         }
                     }
@@ -844,6 +846,7 @@ async fn shared_startup_uses_selected_backend_through_readiness_and_shutdown() {
             provider_workload_api_socket: None,
             // The binary loads the proxy trust directory from its environment.
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+            takeover: None,
         };
         let bindings = crate::SandboxInstanceBindings::dedicated(
             &config,

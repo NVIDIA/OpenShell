@@ -80,6 +80,24 @@ supervisor nor runs workload code. Policy discovery is followed by the existing
 attach, mediation setup, confirm, and explicit start sequence. The existing
 connection registry continues to govern supervisor replacement and recovery.
 
+## Supervisor takeover
+
+`sandbox_auth::SandboxConnectionRegistry` pins the first supervisor process
+that attaches. Protocol 1.1 adds `openshell.sandbox.supervisor-takeover`: a
+supervisor holding a `BoundaryTakeover` (a gateway-signed grant for a later
+credential epoch naming the sandbox, generation, and its process identity)
+attaches with the grant, and the runtime stages it and promotes it at
+confirmation. A grant is never sent to a runtime that does not advertise the
+capability; that supervisor fails closed instead. The registry tracks the
+accepted epoch, the pinned process, and the highest epoch any granted attach
+reached, so a lower grant cannot promote after a higher one disconnected.
+Ordinary credential refresh never changes the epoch. The replacement adopts
+the main and exec processes from the attach snapshot instead of starting the
+agent, and the snapshot reports the policy the runtime bound at launch. Once
+confirmed, it forgets the grant and re-attaches without it to refresh the
+snapshot, so reconnects of the same process never depend on the grant's
+lifetime.
+
 Sandbox and generation identity come from the verified bearer, rather than
 duplicate fields on `OpenBoundaryRequest`. Attach supplies policy; confirmation
 reports resource claims from backend-owned provisioned state, which the
@@ -180,6 +198,20 @@ afterwards. The launch material and status of one hosted instance
 (`SandboxInstanceRegistration`, `SandboxInstanceStatusReport`) are defined by
 `openshell-supervisor-control`, which depends on this crate for the runtime
 descriptor and route validation.
+
+In a supervisor pool, one member hosts each route, but a runtime reaches an
+arbitrary member. A runtime configured with `route_redirects` sends preface
+version `2`, which the member answers before any TLS with a status byte, a
+length byte, and a runtime listener address as ASCII `ip:port` (IPv6
+bracketed): `1` accepts, naming the member itself (empty before it has a
+route directory), and the handshake proceeds as for version 1; `2` redirects
+to the owner; `3` reports the route unknown and carries no address. A member
+redirects routes it does not host according to the gateway's route directory
+(`RuntimeRouter::set_directory`), never to its own address, and the directory
+also wins over a local registration it no longer agrees with, which is being
+released. Replies are unauthenticated hints like the handle: the member must
+still complete the pinned TLS handshake, and every request still carries the
+bearer token. Version 1 prefaces receive no reply.
 
 Runtime-initiated transport supports TCP, protected Unix sockets, and host
 vsock listeners. These share bounded TLS handshakes, the authenticated spare

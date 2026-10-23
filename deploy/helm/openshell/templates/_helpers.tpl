@@ -388,6 +388,53 @@ app.kubernetes.io/component: supervisor
 {{- end }}
 
 {{/*
+A chart value as a whole number, or nothing when it is not one. Helm parses
+YAML numbers as float64, so whole floats count; booleans, strings, and
+fractions do not.
+*/}}
+{{- define "openshell.wholeNumber" -}}
+{{- if has (kindOf .) (list "int" "int8" "int16" "int32" "int64" "uint" "uint8" "uint16" "uint32" "uint64" "float32" "float64") -}}
+{{- $whole := int64 . -}}
+{{- if eq (float64 .) (float64 $whole) -}}{{- $whole -}}{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Shared supervisor replica count: 1 for a single shared supervisor, 2 or more
+for a high-availability pool. A missing value (for example after `helm upgrade
+--reuse-values` from a release that predates it) means 1.
+*/}}
+{{- define "openshell.supervisorReplicas" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "replicas" -}}
+{{- if or (not (hasKey $supervisor "replicas")) (kindIs "invalid" $value) -}}
+1
+{{- else -}}
+{{- $replicas := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $replicas "") (lt (int64 $replicas) 1) -}}
+{{- fail "supervisor.replicas must be 1 for a single shared supervisor or an integer of at least 2 for a high-availability pool" -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Seconds a sandbox runtime keeps its workload frozen after losing the shared
+supervisor, or nothing when unset so the gateway applies its default.
+*/}}
+{{- define "openshell.supervisorRecoveryTimeoutSeconds" -}}
+{{- $supervisor := .Values.supervisor | default dict -}}
+{{- $value := get $supervisor "recoveryTimeoutSeconds" -}}
+{{- if and (hasKey $supervisor "recoveryTimeoutSeconds") (not (kindIs "invalid" $value)) (ne (toString $value) "") -}}
+{{- $timeout := include "openshell.wholeNumber" $value -}}
+{{- if or (eq $timeout "") (lt (int64 $timeout) 10) (gt (int64 $timeout) 300) -}}
+{{- fail "supervisor.recoveryTimeoutSeconds must be an integer between 10 and 300, or null for the default" -}}
+{{- end -}}
+{{- $timeout -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Namespace selector for the sandbox namespaces of this gateway's workspace
 mode: the shared namespace, the managed namespaces it labels, or the
 operator-labeled namespaces.
@@ -617,9 +664,20 @@ like user-supplied schema-v2 fields during compatibility resolution. */}}
 {{- if not (hasKey $kubernetes "supervisor_image") -}}{{- $_ := set $kubernetes "supervisor_image" (include "openshell.supervisorImage" .) -}}{{- end -}}
 {{- if not (hasKey $runtimeConfig "boundary_port") -}}{{- $_ := set $runtimeConfig "boundary_port" 5500 -}}{{- end -}}
 {{- $_ := set $kubernetes "sandbox_runtime" $runtimeConfig -}}
-{{/* The chart owns the shared supervisor and the Secret that delivers its token. */}}
+{{/* The chart owns the shared supervisor and the Secret that delivers its token.
+high_availability appears only for a pool of two or more replicas and
+recovery_timeout_secs only when set, so a default single replica renders the
+connection unchanged. */}}
 {{- if include "openshell.supervisorEnabled" . -}}
-{{- $_ := set $kubernetes "shared_supervisor" (dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "token_secret_name" (printf "%s-token" (include "openshell.supervisorName" .))) -}}
+{{- $shared := dict "service_name" (include "openshell.supervisorName" .) "service_namespace" .Release.Namespace "runtime_port" 5500 "token_secret_name" (printf "%s-token" (include "openshell.supervisorName" .)) -}}
+{{- if gt (int64 (include "openshell.supervisorReplicas" .)) 1 -}}
+{{- $_ := set $shared "high_availability" true -}}
+{{- end -}}
+{{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
+{{- if $recoveryTimeout -}}
+{{- $_ := set $shared "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
+{{- end -}}
+{{- $_ := set $kubernetes "shared_supervisor" $shared -}}
 {{- end -}}
 {{- toYaml $kubernetes -}}
 {{- end }}

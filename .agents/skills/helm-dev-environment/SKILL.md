@@ -68,8 +68,9 @@ gatewayConfig:
     supervisor_topology: gateway
 ```
 
-The gateway chart creates a single-replica shared supervisor Deployment,
-Service, NetworkPolicy, and an empty `<release>-supervisor-token` Secret in
+The gateway chart creates a shared supervisor Deployment (one replica unless
+`supervisor.replicas` is 2 or more), Service, NetworkPolicy, and an empty
+`<release>-supervisor-token` Secret in
 the release namespace, regardless of shared/managed/operator workspace mode.
 The gateway mints a supervisor token from its sandbox-JWT signing key, writes
 it into that Secret (the gateway Role may `get`/`patch` only that Secret), and
@@ -95,6 +96,66 @@ OPENSHELL_E2E_KUBE_EXTRA_VALUES=deploy/helm/openshell/ci/values-workspace-manage
 OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
   mise run e2e:kubernetes:shared-supervisor
 ```
+
+### Shared supervisor high availability
+
+`supervisor.replicas` of 2 or more makes the shared supervisor a pool. The
+chart then renders `high_availability = true` in `shared_supervisor` (plus
+`recovery_timeout_secs` when `supervisor.recoveryTimeoutSeconds` is set), a
+RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with preferred
+hostname anti-affinity and a 60-second grace period, the pool identity env vars
+(`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`, `_MEMBER_UID`, `_ADVERTISE_IP` from the
+Pod name, UID, and IP), and a `maxUnavailable: 1` PodDisruptionBudget.
+`ci/values-supervisor-ha.yaml` selects two replicas and a 60-second recovery
+timeout. The topology needs gateway TLS: the e2e harness keeps it on with
+`ci/values-tls-port-forward.yaml` and `OPENSHELL_E2E_KUBE_TLS=1`, which reaches
+the gateway over mTLS through its port-forward. `mise run
+e2e:kubernetes:shared-supervisor-ha` sets both, creates a task-scoped k3d
+cluster, kills the supervisor Pod that owns a sandbox, and checks that the
+sandbox keeps its Pod, generation, main process, and in-memory state.
+
+On k3d, deploy the pool with the Skaffold profile, which layers the overlay and
+turns gateway TLS back on over `ci/values-skaffold.yaml`:
+
+```bash
+cd deploy/helm/openshell
+KUBECONFIG=../../../kubeconfig skaffold run -p shared-supervisor-high-availability
+cd ../../..
+```
+
+The plaintext registration from `helm:skaffold:run` does not apply. Keep
+`mise run helm:k3s:forward` running and set up the client certificate as in
+"With mTLS enabled" under
+[Connecting through the forwarding task](#connecting-through-the-forwarding-task).
+Both members share the single k3d node, so exercise Pod failures:
+
+```bash
+export KUBECONFIG=kubeconfig OPENSHELL_GATEWAY_ENDPOINT=https://localhost:8090
+openshell sandbox create --detach --name ha-probe -- sh -c 'echo $$ > /sandbox/main.pid; exec sleep infinity'
+openshell sandbox exec --name ha-probe --no-tty -- cat /sandbox/main.pid
+openshell sandbox get ha-probe  # note the sandbox ID
+# The member that admitted the instance owns it.
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell-supervisor --prefix --tail=-1 \
+  | grep 'admitted assigned sandbox instance' | grep <sandbox-id>
+# Force-delete the owner, the closest local stand-in for a crash.
+kubectl -n openshell delete pod <owner-pod> --grace-period=0 --force
+kubectl -n openshell logs -l app.kubernetes.io/name=openshell,app.kubernetes.io/instance=openshell \
+  -c openshell-gateway --prefix --tail=200 | grep 'taking over a shared sandbox instance'
+kubectl -n openshell logs -l openshell.ai/sandbox-id=<sandbox-id>,openshell.ai/boundary-role=workload \
+  --tail=200 | grep -E 'sandbox-supervisor-|Supervisor takeover confirmed'
+openshell sandbox exec --name ha-probe --no-tty -- cat /sandbox/main.pid  # same PID
+```
+
+A plain `kubectl delete pod` exercises the graceful leave instead: the member
+announces it is leaving and the gateway hands its instances over at once. A
+member that stops without announcing it, as on node loss, is declared dead
+only after the 15-second membership TTL.
+`kubectl -n openshell rollout restart deployment/openshell-supervisor` replaces
+every member one at a time. The PID must survive each case, while an open
+`sandbox connect` or `exec` stream breaks and must reconnect. A
+`sandbox-supervisor-recovery-expired` finding in the workload log means no
+replacement confirmed within the recovery timeout, so the runtime terminated
+the workload.
 
 ### 2. Deploy OpenShell
 
@@ -498,6 +559,8 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
+| `deploy/helm/openshell/ci/values-supervisor.yaml`, `ci/values-supervisor-ha.yaml` | Shared supervisor topology overlays: one replica, or a two-replica high-availability pool (Skaffold profile `shared-supervisor-high-availability`) |
+| `deploy/helm/openshell/ci/values-tls-port-forward.yaml` | Keeps gateway TLS on over the Skaffold values for e2e topologies that need it (`OPENSHELL_E2E_KUBE_TLS=1`) |
 | `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |

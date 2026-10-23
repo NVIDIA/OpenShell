@@ -378,6 +378,12 @@ pub enum KubernetesControlPath {
         /// Verified per-sandbox shared control policy coordinates.
         control_policy_uid: String,
         control_policy_resource_version: String,
+        /// The shared supervisor is a pool: a replica that does not own the
+        /// route redirects the runtime to the one that does.
+        route_redirects: bool,
+        /// How long the runtime keeps the workload frozen awaiting a
+        /// replacement supervisor; `None` keeps the runtime default.
+        recovery_timeout_secs: Option<u32>,
     },
 }
 
@@ -450,6 +456,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
         ]);
         let mut supervisor_namespace = None;
         let mut shared_port = None;
+        let mut supervisor_recovery_timeout_secs = None;
         let (listener, transport) = match self.control_path {
             KubernetesControlPath::SupervisorInitiated {
                 boundary_listener,
@@ -486,6 +493,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                         addresses: vec![supervisor_address],
                         tls: self.sandbox_tls,
                         route: None,
+                        route_redirects: false,
                     },
                     SandboxTransport::RuntimeInitiatedTcp {
                         authority: control_authority,
@@ -500,7 +508,10 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 route,
                 control_policy_uid,
                 control_policy_resource_version,
+                route_redirects,
+                recovery_timeout_secs,
             } => {
+                supervisor_recovery_timeout_secs = recovery_timeout_secs;
                 resource_claims.insert(
                     "kubernetes.control_policy_uid".to_string(),
                     control_policy_uid,
@@ -517,6 +528,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                         addresses: vec![supervisor_address],
                         tls: self.sandbox_tls,
                         route: Some(route.clone()),
+                        route_redirects,
                     },
                     SandboxTransport::RuntimeInitiatedRouted {
                         authority: control_authority,
@@ -566,6 +578,7 @@ impl KubernetesSandboxRuntimeBoundarySpec {
                 workload_identity: self.workload_identity.clone(),
                 provisioning_evidence: provisioning_evidence.clone(),
                 child_env: self.child_env,
+                supervisor_recovery_timeout_secs,
             },
             runtime_descriptor: SandboxRuntimeDescriptor {
                 boundary_id: self.boundary_id,

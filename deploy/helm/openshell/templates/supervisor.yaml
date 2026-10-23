@@ -12,12 +12,14 @@
 {{- $endpoint := get $kubernetes "grpc_endpoint" }}
 {{- $endpointUrl := urlParse $endpoint }}
 {{- $gatewayTls := and (not .Values.server.disableTls) .Values.server.tls.clientTlsSecretName }}
-# One supervisor process hosting a sandbox instance per sandbox generation.
-# The process dials the gateway over TLS with the supervisor token the gateway
-# mints for it and receives its assignments from it; nothing but sandbox
-# runtimes and kubelet probes connect to it. The Pod holds no Kubernetes
-# identity of its own: each instance acts only with the credentials the
-# gateway issued for its generation.
+{{- $replicas := int64 (include "openshell.supervisorReplicas" .) }}
+{{- $pool := gt $replicas 1 }}
+# One supervisor process per replica hosts a sandbox instance for each sandbox
+# generation placed on it. The process dials the gateway over TLS with the
+# supervisor token the gateway mints for it and receives its assignments from
+# it; nothing but sandbox runtimes and kubelet probes connect to it. The Pod
+# holds no Kubernetes identity of its own: each instance acts only with the
+# credentials the gateway issued for its generation.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -27,10 +29,23 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 spec:
-  # Instances live in this process; a second replica could not serve them.
+  # Each instance lives in the process hosting it. A single replica has no
+  # failover, so Recreate replaces it outright. Two or more replicas form a
+  # high-availability pool that rolls one member at a time, starting a new
+  # member before an old one leaves; the gateway hands a failed or leaving
+  # member's instances to the remaining members.
+  {{- if $pool }}
+  replicas: {{ $replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- else }}
   replicas: 1
   strategy:
     type: Recreate
+  {{- end }}
   selector:
     matchLabels:
       {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
@@ -41,7 +56,13 @@ spec:
     spec:
       automountServiceAccountToken: false
       enableServiceLinks: false
+      {{- if $pool }}
+      # A stopping member announces that it is leaving, and the gateway moves
+      # its instances to the remaining members before it exits.
+      terminationGracePeriodSeconds: 60
+      {{- else }}
       terminationGracePeriodSeconds: 30
+      {{- end }}
       {{- with ($imagePullSecrets | uniq) }}
       imagePullSecrets:
         {{- range . }}
@@ -51,6 +72,19 @@ spec:
       {{- with .Values.supervisor.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $pool }}
+      # Prefer separate nodes, so losing one node leaves members to take over
+      # its instances.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    {{- include "openshell.supervisorSelectorLabels" . | nindent 20 }}
+                topologyKey: kubernetes.io/hostname
       {{- end }}
       containers:
         - name: supervisor
@@ -80,6 +114,23 @@ spec:
             {{- if eq (get $endpointUrl "scheme") "https" }}
             - name: OPENSHELL_GATEWAY_TLS_SERVER_NAME
               value: {{ get $endpointUrl "hostname" | quote }}
+            {{- end }}
+            {{- if $pool }}
+            # Pool membership: the Pod name and UID identify this member, and
+            # other members redirect the runtimes of its instances to its Pod
+            # IP.
+            - name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OPENSHELL_SUPERVISOR_POOL_MEMBER_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             {{- end }}
           ports:
             - name: runtime
@@ -205,4 +256,22 @@ metadata:
     {{- include "openshell.labels" . | nindent 4 }}
     app.kubernetes.io/component: supervisor
 type: Opaque
+{{- if $pool }}
+---
+# Voluntary disruptions, such as node drains, evict one member at a time, so
+# the remaining members can take over its instances.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: supervisor
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "openshell.supervisorSelectorLabels" . | nindent 6 }}
+{{- end }}
 {{- end }}

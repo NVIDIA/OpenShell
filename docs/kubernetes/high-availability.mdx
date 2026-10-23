@@ -4,7 +4,7 @@
 title: "High Availability"
 sidebar-title: "High Availability"
 description: "Run multiple OpenShell gateway replicas on Kubernetes with shared PostgreSQL, authenticated peer routing, capacity metrics, and optional autoscaling."
-keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover, Autoscaling, HPA, Metrics"
+keywords: "Generative AI, Cybersecurity, Kubernetes, High Availability, HA, Gateway, PostgreSQL, Replicas, Failover, Autoscaling, HPA, Metrics, Shared Supervisor"
 position: 3
 ---
 
@@ -503,6 +503,69 @@ While gateways from the earlier release and the new release run together
 during the upgrade, the older replicas serialize every mutation across the
 fleet. Mutations can be slower and can briefly fail under load until the
 rollout finishes.
+
+## Shared Supervisor High Availability
+
+With `supervisor_topology = "gateway"`, one shared supervisor Deployment in the
+release namespace supervises new sandboxes instead of a supervisor Pod per
+sandbox. The topology requires gateway TLS and does not support upstream proxy
+settings or provider SPIFFE identity. By default, the Deployment runs one
+replica and has no failover. Run two or more replicas as a pool when sandboxes
+must stay supervised through the loss of a supervisor Pod or node.
+
+Add these values to your release:
+
+```yaml
+gatewayConfig:
+  openshell.drivers.kubernetes:
+    supervisor_topology: gateway
+
+supervisor:
+  replicas: 2
+  # Optional. From 10 to 300 seconds; defaults to 60 in a pool.
+  recoveryTimeoutSeconds: 90
+```
+
+With two or more replicas, the chart enables high availability in the gateway
+configuration and prefers to schedule the supervisor Pods on different nodes.
+It replaces them one at a time during rollouts, and its PodDisruptionBudget
+lets voluntary disruptions, such as node drains, evict one supervisor Pod at a
+time.
+
+Each sandbox runs on one pool member, and a healthy member keeps its
+sandboxes. When a member's process exits, its node fails, or it shuts down, the
+gateway moves each of its sandboxes to a live member, first revoking every
+credential the previous member held for that sandbox. The sandbox runtime
+freezes the workload when it loses its supervisor and resumes it after the
+replacement confirms the takeover.
+
+A takeover does not restart the sandbox. The sandbox keeps its Pod, its running
+processes and their PIDs, and its in-memory state. The replacement adopts the
+agent and exec processes and keeps the sandbox CA, SSH host key, and
+[binary identity](/security/best-practices#binary-identity-binding) pins.
+Proxied connections and interactive exec and SSH sessions that are open during
+the failure break, and clients must reconnect.
+
+`supervisor.recoveryTimeoutSeconds` limits how long a workload stays frozen.
+If no replacement confirms the takeover in time, the sandbox runtime terminates
+the workload instead of letting it run unsupervised. When unset, the limit is
+60 seconds in a pool and 30 seconds with one replica. The gateway takes up to
+17 seconds to detect a failed node, or 30 seconds right after a gateway replica
+starts, and the replacement then needs time to take over, so keep the limit
+well above that. A single replica has no
+failover, so a supervisor failure terminates the workloads it supervises when
+the limit passes. A pool fails over only to a live member, so keep at least two
+members running.
+
+Check the supervisor Pods and their disruption budget:
+
+```shell
+kubectl -n openshell get deployment,poddisruptionbudget openshell-supervisor
+kubectl -n openshell get pods -l app.kubernetes.io/name=openshell-supervisor -o wide
+```
+
+If you changed the chart's generated names with `nameOverride` or
+`fullnameOverride`, use the rendered `<fullname>-supervisor` name instead.
 
 ## Next Steps
 

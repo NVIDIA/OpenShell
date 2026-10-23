@@ -32,6 +32,10 @@
 # files, relative to the repository root or absolute, to layer additional chart
 # configuration on top of ci/values-skaffold.yaml.
 #
+# Set OPENSHELL_E2E_KUBE_TLS=1 with an overlay that keeps gateway TLS on (for
+# example ci/values-tls-port-forward.yaml) to reach the gateway over mTLS
+# through the port-forward with the chart-generated client certificate.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local
 #     `openshell/{gateway,sandbox,supervisor}:${IMAGE_TAG}`
@@ -1465,6 +1469,27 @@ else
     # OpenShift: reach the gateway over the passthrough Route with mTLS so the
     # SSH-relay `sandbox connect` suites work (port-forward stalls them).
     openshift_register_route_gateway || exit 1
+  elif [ "${OPENSHELL_E2E_KUBE_TLS:-0}" = "1" ]; then
+    # Topologies that require gateway TLS: reach the gateway over mTLS through
+    # the port-forward with the chart-generated client certificate. The
+    # server certificate names 127.0.0.1.
+    start_gateway_portforward || exit 1
+    kube_pki_dir="${WORKDIR}/kube-client-pki"
+    mkdir -p "${kube_pki_dir}/client"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.ca\.crt}' | base64 -d >"${kube_pki_dir}/ca.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.crt}' | base64 -d >"${kube_pki_dir}/client/tls.crt"
+    kctl -n "${NAMESPACE}" get secret openshell-client-tls \
+      -o jsonpath='{.data.tls\.key}' | base64 -d >"${kube_pki_dir}/client/tls.key"
+    GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+    GATEWAY_ENDPOINT="https://127.0.0.1:${LOCAL_PORT}"
+    e2e_register_mtls_gateway \
+      "${XDG_CONFIG_HOME}" \
+      "${GATEWAY_NAME}" \
+      "${GATEWAY_ENDPOINT}" \
+      "${LOCAL_PORT}" \
+      "${kube_pki_dir}"
   else
     # Vanilla Kubernetes: reach the gateway in plaintext over port-forward.
     start_gateway_portforward || exit 1

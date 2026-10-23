@@ -18,6 +18,42 @@ Retries reuse that generation and session, including after gateway restart.
 Credential renewal retains both; credentials for an older launch cannot
 authorize the new one.
 
+## Shared supervisor pool
+
+With a supervisor pool (the Kubernetes driver's `shared_supervisor.high_availability`),
+`supervisor_pool` keeps the pool's durable state and reconciles it every two
+seconds on every gateway replica:
+
+- **Membership.** The replica serving a member's host stream refreshes its
+  `supervisor_pool_member` record. A record older than 15 seconds is dead; a
+  member that announces it is leaving drops out at once; a member whose process
+  changed lost every instance its previous process owned.
+- **Placement and ownership.** A launch records its owner, the live member the
+  consistent-hash ring prefers (`gateway_ring`), before the instance is
+  assigned; a member at its 256-instance capacity is skipped. One
+  `supervisor_instance_owner` record per instance names the member, its
+  process, and the ownership term (the sandbox's credential epoch). Records
+  change only by compare-and-swap, and a live owner keeps its instances.
+- **Takeover.** Only an instance whose owner failed or left moves. A replica
+  records the intent (new owner, next term, the process the runtime will pin,
+  a new token lineage), advances the sandbox's persisted epoch with
+  `advance_identity_for_takeover`, which revokes the previous owner's
+  credentials on every replica, and then grants it. Any replica completes an
+  interrupted intent; a stopping, stopped, or deleted sandbox, a replaced
+  generation, or a term another lineage holds cancels it. A replica that just
+  started waits 30 seconds before taking over, so members reconnect after a
+  gateway restart first.
+- **Credentials.** Each replica mints a takeover term's grant and session
+  credentials only for members it serves, from the granted record and the
+  persisted identity, and mints them again after half the grant's lifetime.
+  Other replicas send the term without credentials; a host that already runs
+  it keeps it.
+
+Owner records of ended generations (sandbox gone, replaced, stopped, or being
+deleted) are removed. Pool members still authenticate with the one shared
+supervisor token, so a member identity is asserted by its hello rather than
+bound to its Pod.
+
 ## Operator credential export
 
 `GetProviderCredentials` exports selected profile-declared runtime environment

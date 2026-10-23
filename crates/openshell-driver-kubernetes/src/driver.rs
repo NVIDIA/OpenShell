@@ -419,6 +419,10 @@ fn admission_error(error: tonic::Status) -> KubernetesDriverError {
     }
 }
 const SANDBOX_RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+/// How often every gateway replica derives a supervisor pool's desired set.
+/// Pool members reach whichever replica their connection lands on, and only
+/// one replica runs the sandbox watch.
+const SHARED_POOL_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// Unsupervised shared sandbox instances removed at once by one reconcile pass.
 /// Bound how long a crash-interrupted, fail-closed bootstrap may remain stranded.
 const SANDBOX_RUNTIME_BOOTSTRAP_GRACE: Duration = Duration::from_mins(5);
@@ -1096,6 +1100,13 @@ impl KubernetesComputeDriver {
 
         if driver.workspace_mode() == WorkspaceMode::Shared {
             driver.backfill_gateway_id_labels().await?;
+        }
+        if driver
+            .shared_supervisor
+            .as_ref()
+            .is_some_and(|shared| shared.config().high_availability)
+        {
+            driver.spawn_shared_pool_refresh(shutdown_rx.clone());
         }
 
         Ok(driver)
@@ -3472,10 +3483,10 @@ impl KubernetesComputeDriver {
                 ),
             ),
             GenerationLaunchTarget::Shared {
+                shared,
                 route,
                 target,
                 control_policy,
-                ..
             } => (
                 KubernetesSupervisorClaim::SandboxInstance(route.clone()),
                 KubernetesControlPath::RuntimeInitiatedShared {
@@ -3485,6 +3496,8 @@ impl KubernetesComputeDriver {
                     route: route.clone(),
                     control_policy_uid: control_policy.uid.clone(),
                     control_policy_resource_version: control_policy.resource_version.clone(),
+                    route_redirects: shared.config().high_availability,
+                    recovery_timeout_secs: shared.config().boundary_recovery_timeout_secs(),
                 },
             ),
         };
@@ -3629,6 +3642,9 @@ impl KubernetesComputeDriver {
                         LaunchError::Refused(error) => {
                             KubernetesDriverError::Precondition(error.to_string())
                         }
+                        // No pool member could take the instance; the create
+                        // fails before its workload runs.
+                        LaunchError::Unplaced(error) => KubernetesDriverError::Precondition(error),
                         LaunchError::Invalid(error) => {
                             KubernetesDriverError::Message(error.to_string())
                         }
@@ -4522,6 +4538,68 @@ impl KubernetesComputeDriver {
                 KUBE_API_TIMEOUT.as_secs()
             )),
         }
+    }
+
+    /// Keep a supervisor pool's desired set current on this gateway replica,
+    /// whether or not it runs the sandbox watch, so pool members connected to
+    /// any replica receive complete assignments. Recovery only derives the
+    /// set from the Sandbox resources that may run; it changes nothing in
+    /// Kubernetes.
+    fn spawn_shared_pool_refresh(&self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
+        let driver = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(SHARED_POOL_REFRESH_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => driver.refresh_shared_instances().await,
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// Derive the shared supervisor's desired set from the Sandbox resources
+    /// that may run.
+    async fn refresh_shared_instances(&self) {
+        let Some(shared) = &self.shared_supervisor else {
+            return;
+        };
+        let lookup_api = match self
+            .supported_sandbox_api_for_lookup(self.client.clone())
+            .await
+        {
+            Ok(api) => api,
+            Err(error) => {
+                debug!(%error, "skipping supervisor pool refresh: Sandbox API unavailable");
+                return;
+            }
+        };
+        // Begin before the list, as the watch's recovery does.
+        let baseline = shared.supervision().begin_recovery();
+        let list = match tokio::time::timeout(
+            KUBE_API_TIMEOUT,
+            lookup_api
+                .api
+                .list(&ListParams::default().labels(&self.openshell_sandbox_selector())),
+        )
+        .await
+        {
+            Ok(Ok(list)) => list,
+            Ok(Err(error)) => {
+                warn!(%error, "skipping supervisor pool refresh: Sandbox list failed");
+                return;
+            }
+            Err(_) => {
+                warn!("skipping supervisor pool refresh: Sandbox list timed out");
+                return;
+            }
+        };
+        self.recover_shared_instances(baseline, &list.items).await;
     }
 
     /// Repair lifecycle drift and reap unowned workload fences while the
