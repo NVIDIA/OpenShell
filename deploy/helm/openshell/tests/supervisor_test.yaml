@@ -13,7 +13,7 @@ tests:
     asserts:
       - hasDocuments:
           count: 0
-  - it: deploys one instance host without Kubernetes identity in the gateway namespace
+  - it: deploys the supervisor pool without Kubernetes identity in the gateway namespace
     template: templates/supervisor.yaml
     set:
       gatewayConfig:
@@ -22,7 +22,7 @@ tests:
           supervisor_image: example.com/supervisor:shared
     asserts:
       - hasDocuments:
-          count: 4
+          count: 5
       - equal:
           path: kind
           value: Deployment
@@ -261,7 +261,7 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
-  - it: keeps a single shared supervisor free of pool settings
+  - it: runs one replica as a high-availability pool by default
     template: templates/supervisor.yaml
     set:
       gatewayConfig:
@@ -269,11 +269,7 @@ tests:
           supervisor_topology: gateway
     asserts:
       - hasDocuments:
-          count: 4
-      - containsDocument:
-          kind: PodDisruptionBudget
-          apiVersion: policy/v1
-        not: true
+          count: 5
       - equal:
           path: spec.replicas
           value: 1
@@ -281,33 +277,48 @@ tests:
       - equal:
           path: spec.strategy
           value:
-            type: Recreate
+            type: RollingUpdate
+            rollingUpdate:
+              maxSurge: 1
+              maxUnavailable: 0
         documentIndex: 0
       - equal:
           path: spec.template.spec.terminationGracePeriodSeconds
-          value: 30
+          value: 60
         documentIndex: 0
-      - notExists:
-          path: spec.template.spec.affinity
+      - exists:
+          path: spec.template.spec.affinity.podAntiAffinity
         documentIndex: 0
-      - notContains:
+      - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
-          any: true
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
         documentIndex: 0
-      - notContains:
+      - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: OPENSHELL_SUPERVISOR_POOL_MEMBER_UID
-          any: true
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.uid
         documentIndex: 0
-      - notContains:
+      - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
-          any: true
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
         documentIndex: 0
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+        documentSelector:
+          path: kind
+          value: PodDisruptionBudget
   - it: runs two or more replicas as a high-availability pool
     template: templates/supervisor.yaml
     set:
@@ -410,110 +421,6 @@ tests:
         documentSelector:
           path: kind
           value: PodDisruptionBudget
-  - it: runs a one-replica pool when high availability is enabled
-    template: templates/supervisor.yaml
-    set:
-      supervisor:
-        highAvailability: true
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
-    asserts:
-      - hasDocuments:
-          count: 5
-      - equal:
-          path: spec.replicas
-          value: 1
-        documentIndex: 0
-      - equal:
-          path: spec.strategy
-          value:
-            type: RollingUpdate
-            rollingUpdate:
-              maxSurge: 1
-              maxUnavailable: 0
-        documentIndex: 0
-      - equal:
-          path: spec.template.spec.terminationGracePeriodSeconds
-          value: 60
-        documentIndex: 0
-      - exists:
-          path: spec.template.spec.affinity.podAntiAffinity
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_SUPERVISOR_POOL_MEMBER_ID
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.name
-        documentIndex: 0
-      - equal:
-          path: spec.maxUnavailable
-          value: 1
-        documentSelector:
-          path: kind
-          value: PodDisruptionBudget
-  - it: keeps two or more replicas a pool when high availability is false
-    template: templates/supervisor.yaml
-    set:
-      supervisor:
-        highAvailability: false
-        replicas: 2
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
-    asserts:
-      - hasDocuments:
-          count: 5
-      - equal:
-          path: spec.replicas
-          value: 2
-        documentIndex: 0
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP
-            valueFrom:
-              fieldRef:
-                fieldPath: status.podIP
-        documentIndex: 0
-  - it: rejects a high availability setting that is not a boolean
-    template: templates/supervisor.yaml
-    set:
-      supervisor:
-        highAvailability: "yes"
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
-    asserts:
-      - failedTemplate:
-          errorPattern: supervisor.highAvailability must be true or false
-  - it: enables the supervisor pool table for a one-replica pool
-    template: templates/gateway-config.yaml
-    set:
-      supervisor:
-        highAvailability: true
-        recoveryTimeoutSeconds: 90
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '\[openshell\.gateway\.supervisor_pool\]\nenabled = true\nrecovery_timeout_secs = 90\n'
-  - it: keeps a single shared supervisor out of the pool table when high availability is false
-    template: templates/gateway-config.yaml
-    set:
-      supervisor:
-        highAvailability: false
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
-    asserts:
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: supervisor_pool
   - it: protects the pool from voluntary disruption without a NetworkPolicy
     template: templates/supervisor.yaml
     set:
@@ -533,11 +440,9 @@ tests:
         documentSelector:
           path: kind
           value: PodDisruptionBudget
-  - it: enables the supervisor pool in the gateway table, not the driver table
+  - it: enables the supervisor pool with its recovery deadline in the gateway table by default
     template: templates/gateway-config.yaml
     set:
-      supervisor:
-        replicas: 2
       gatewayConfig:
         openshell.drivers.kubernetes:
           supervisor_topology: gateway
@@ -547,10 +452,25 @@ tests:
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
       - matchRegex:
           path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.supervisor_pool\]\nenabled = true\nrecovery_timeout_secs = 60\n'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: high_availability
+  - it: leaves the gateway's recovery default when the recovery timeout is null
+    template: templates/gateway-config.yaml
+    set:
+      supervisor:
+        recoveryTimeoutSeconds: null
+      gatewayConfig:
+        openshell.drivers.kubernetes:
+          supervisor_topology: gateway
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
           pattern: '\[openshell\.gateway\.supervisor_pool\]\nenabled = true\n'
       - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: recovery_timeout_secs|high_availability
+          pattern: recovery_timeout_secs
   - it: renders a configured recovery timeout into the supervisor pool table
     template: templates/gateway-config.yaml
     set:
@@ -567,21 +487,16 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
-  - it: renders no supervisor pool for a single shared supervisor
+  - it: renders no supervisor pool without the gateway topology
     template: templates/gateway-config.yaml
     set:
       supervisor:
+        replicas: 2
         recoveryTimeoutSeconds: 120
-      gatewayConfig:
-        openshell.drivers.kubernetes:
-          supervisor_topology: gateway
     asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: 'shared_supervisor = \{ runtime_port = 5500, service_name = "openshell-supervisor", service_namespace = "gateway", token_secret_name = "openshell-supervisor-token" \}'
       - notMatchRegex:
           path: data["gateway.toml"]
-          pattern: supervisor_pool|recovery_timeout_secs|high_availability
+          pattern: supervisor_pool|recovery_timeout_secs|shared_supervisor
   - it: rejects a hand-written supervisor pool table
     template: templates/supervisor.yaml
     set:
@@ -594,7 +509,7 @@ tests:
           enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
   - it: rejects a hand-written supervisor pool inside the gateway table
     template: templates/supervisor.yaml
     set:
@@ -606,7 +521,7 @@ tests:
             enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
   - it: rejects a hand-written supervisor pool without the gateway topology
     template: templates/supervisor.yaml
     set:
@@ -615,7 +530,7 @@ tests:
           enabled: true
     asserts:
       - failedTemplate:
-          errorMessage: supervisor_pool is rendered by the chart; set supervisor.highAvailability, supervisor.replicas, and supervisor.recoveryTimeoutSeconds
+          errorMessage: supervisor_pool is rendered by the chart; set supervisor.replicas and supervisor.recoveryTimeoutSeconds
   - it: rejects zero supervisor replicas
     template: templates/supervisor.yaml
     set:

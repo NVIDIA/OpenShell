@@ -2,12 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# A shared supervisor high-availability pool scales between one and more
-# replicas without changing anything but the supervisor Deployment's replica
-# count: not the gateway configuration (so the gateway does not roll), not the
-# supervisor Pod template (so running members are not replaced), and not the
-# PodDisruptionBudget or Service. Switching a single shared supervisor to a
-# pool does change them; that switch interrupts running sandboxes.
+# The shared supervisor always runs as a high-availability pool, which scales
+# between one and more replicas without changing anything but the supervisor
+# Deployment's replica count: not the gateway configuration (so the gateway
+# does not roll), not the supervisor Pod template (so running members are not
+# replaced), and not the PodDisruptionBudget or Service. The renders differ
+# only in supervisor.replicas.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
@@ -22,7 +22,6 @@ render() {
     --namespace scaling-namespace \
     --set agentSandbox.preflight.enabled=false \
     --set-string 'gatewayConfig.openshell\.drivers\.kubernetes.supervisor_topology=gateway' \
-    --set supervisor.recoveryTimeoutSeconds=60 \
     "$@" >"${work_dir}/${name}.yaml"
 }
 
@@ -46,16 +45,15 @@ fail() {
   exit 1
 }
 
-render one --set supervisor.highAvailability=true --set supervisor.replicas=1
-render two --set supervisor.highAvailability=true --set supervisor.replicas=2
-render three --set supervisor.highAvailability=true --set supervisor.replicas=3
-render legacy --set supervisor.replicas=1
+render one --set supervisor.replicas=1
+render two --set supervisor.replicas=2
+render three --set supervisor.replicas=3
 
 [[ "$(supervisor_replicas one)" == "1" ]] || fail "one-replica pool renders $(supervisor_replicas one) replicas"
 [[ "$(supervisor_replicas two)" == "2" ]] || fail "two-replica pool renders $(supervisor_replicas two) replicas"
 [[ "$(supervisor_replicas three)" == "3" ]] || fail "three-replica pool renders $(supervisor_replicas three) replicas"
 
-for name in one two three legacy; do
+for name in one two three; do
   without_replica_count "${name}"
 done
 
@@ -65,18 +63,16 @@ for name in two three; do
   fi
 done
 
-# The pool table is present at every count, and the gateway's config checksum
-# (which rolls the gateway when it changes) is the same.
+# The pool table, with the chart's default recovery deadline, is present at
+# every count, and the gateway's config checksum (which rolls the gateway when
+# it changes) is the same.
 for name in one two three; do
   yq ea -e -r 'select(.kind == "ConfigMap" and (.data | has("gateway.toml"))) | .data."gateway.toml"' \
-    "${work_dir}/${name}.yaml" | grep -q '^\[openshell\.gateway\.supervisor_pool\]$' \
+    "${work_dir}/${name}.yaml" >"${work_dir}/${name}.toml"
+  grep -q '^\[openshell\.gateway\.supervisor_pool\]$' "${work_dir}/${name}.toml" \
     || fail "the ${name}-replica pool renders no supervisor_pool table"
+  grep -q '^recovery_timeout_secs = 60$' "${work_dir}/${name}.toml" \
+    || fail "the ${name}-replica pool renders no recovery deadline"
 done
-
-# Switching from a single shared supervisor to a pool is a different
-# deployment, not a scaling step.
-if diff -q "${work_dir}/legacy.normalized.yaml" "${work_dir}/one.normalized.yaml" >/dev/null; then
-  fail "a one-replica pool renders the same as a single shared supervisor"
-fi
 
 echo "supervisor pool scaling: only the replica count changes across 1, 2, and 3 replicas"

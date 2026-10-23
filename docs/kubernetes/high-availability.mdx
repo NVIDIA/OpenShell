@@ -509,9 +509,10 @@ rollout finishes.
 With `supervisor_topology = "gateway"`, one shared supervisor Deployment in the
 release namespace supervises new sandboxes instead of a supervisor Pod per
 sandbox. The topology requires gateway TLS and does not support upstream proxy
-settings or provider SPIFFE identity. By default, the Deployment runs one
-replica and has no failover. Run two or more replicas as a pool when sandboxes
-must stay supervised through the loss of a supervisor Pod or node.
+settings or provider SPIFFE identity. The Deployment always runs as a pool of
+supervisors that the gateway coordinates. By default it has one member and no
+failover. Run two or more replicas when sandboxes must stay supervised through
+the loss of a supervisor Pod or node.
 
 Add these values to your release:
 
@@ -522,12 +523,11 @@ gatewayConfig:
 
 supervisor:
   replicas: 2
-  # Optional. From 10 to 300 seconds; defaults to 60 in a pool.
+  # Optional. From 10 to 300 seconds; defaults to 60.
   recoveryTimeoutSeconds: 90
 ```
 
-With two or more replicas, or with `supervisor.highAvailability: true`, the
-chart enables the gateway's
+The chart enables the gateway's
 [supervisor pool](/how-it-works/gateways/configuration#supervisor-pool) and
 prefers to schedule the supervisor Pods on different nodes. It replaces them
 one at a time during rollouts, and its PodDisruptionBudget lets voluntary
@@ -547,8 +547,8 @@ agent and exec processes and keeps the sandbox CA, SSH host key, and
 Proxied connections and interactive exec and SSH sessions that are open during
 the failure break, and clients must reconnect.
 
-`supervisor.recoveryTimeoutSeconds` limits how long a workload stays frozen in
-a pool. The pool's supervisors offer the limit to each sandbox runtime when
+`supervisor.recoveryTimeoutSeconds` limits how long a workload stays frozen.
+The pool's supervisors offer the limit to each sandbox runtime when
 they attach. If no replacement confirms the takeover in time, the sandbox
 runtime terminates the workload instead of letting it run unsupervised. When
 unset, the limit is 60 seconds. The gateway takes up to 22 seconds to detect a
@@ -556,22 +556,10 @@ failed node, or 30 seconds right after a gateway replica starts, and the
 replacement then needs time to take over, so keep the limit well above that.
 A pool fails over only to a live member, so keep at least two members running.
 
-A single shared supervisor has no failover and ignores
-`supervisor.recoveryTimeoutSeconds`: the sandbox runtime keeps its default
-limit of 30 seconds, and a supervisor failure terminates the workloads it
-supervises when the limit passes.
-
-To scale between one and more supervisors without interrupting sandboxes, run
-the pool with `supervisor.highAvailability: true`. A one-replica pool has no
-failover either, but its gateway configuration and supervisor Pod template do
-not depend on the replica count, so changing only `supervisor.replicas`
-neither restarts the gateway nor replaces running members:
-
-```yaml
-supervisor:
-  highAvailability: true
-  replicas: 1
-```
+With one member, a supervisor failure terminates the workloads it supervises
+once the limit passes. The gateway configuration and supervisor Pod template do
+not depend on the replica count, so changing `supervisor.replicas` neither
+restarts the gateway nor replaces running members:
 
 ```shell
 helm upgrade openshell <chart> -n openshell --reuse-values --set supervisor.replicas=2
@@ -583,12 +571,6 @@ on the new member. Scaling down removes a member, which hands its sandboxes to
 the remaining members before it exits, within its 60-second grace period. The
 sandboxes keep running; open proxied connections and exec or SSH sessions on
 the handed-off sandboxes break and must reconnect.
-
-Switching between a single shared supervisor and a pool, by changing
-`supervisor.highAvailability` or by changing `supervisor.replicas` between 1
-and 2 or more without it, switches the supervision mode and interrupts shared
-sandboxes that are running, whose workloads can be terminated. Make that change
-when no shared sandboxes are running, or recreate them afterward.
 
 Check the supervisor Pods and their disruption budget:
 

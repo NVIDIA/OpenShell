@@ -99,13 +99,11 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 
 ### Shared supervisor high availability
 
-`supervisor.highAvailability: true` makes the shared supervisor a pool at any
-replica count, including one, and `supervisor.replicas` of 2 or more always
-does (`openshell.supervisorPool` in `_helpers.tpl` decides it for every
-template). The chart then renders the gateway's `[openshell.gateway.supervisor_pool]` table
-(`enabled = true`, plus `recovery_timeout_secs` when
-`supervisor.recoveryTimeoutSeconds` is set; the driver's `shared_supervisor`
-table stays unchanged), a
+The shared supervisor is always a pool of `supervisor.replicas` members
+(default 1). With the gateway topology the chart renders the gateway's
+`[openshell.gateway.supervisor_pool]` table (`enabled = true`, plus
+`recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
+the driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with preferred
 hostname anti-affinity and a 60-second grace period, the pool identity env vars
 (`OPENSHELL_SUPERVISOR_POOL_MEMBER_ID`, `_MEMBER_UID`, `_ADVERTISE_IP` from the
@@ -118,7 +116,7 @@ e2e:kubernetes:shared-supervisor-ha` sets both, creates a task-scoped k3d
 cluster, kills the supervisor Pod that owns a sandbox, and checks that the
 sandbox keeps its Pod, generation, main process, and in-memory state.
 
-A pool's rendered gateway configuration and supervisor Pod template do not
+The rendered gateway configuration and supervisor Pod template do not
 depend on `supervisor.replicas`; `deploy/helm/test-supervisor-pool-scaling.sh`
 (part of `mise run helm:test`) renders a pool at 1, 2, and 3 replicas and
 fails if anything but the replica count differs. `mise run
@@ -583,7 +581,7 @@ for dependencies still declared in `Chart.yaml`.
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
-| `deploy/helm/openshell/ci/values-supervisor.yaml`, `ci/values-supervisor-ha.yaml`, `ci/values-supervisor-ha-scaling.yaml` | Shared supervisor topology overlays: one replica, a two-replica high-availability pool (Skaffold profile `shared-supervisor-high-availability`), or a one-replica pool to scale |
+| `deploy/helm/openshell/ci/values-supervisor.yaml`, `ci/values-supervisor-ha.yaml`, `ci/values-supervisor-ha-scaling.yaml` | Shared supervisor pool overlays: one member, two members (Skaffold profile `shared-supervisor-high-availability`), or one member to scale to two and back |
 | `deploy/helm/openshell/ci/values-tls-port-forward.yaml` | Keeps gateway TLS on over the Skaffold values for e2e topologies that need it (`OPENSHELL_E2E_KUBE_TLS=1`) |
 | `deploy/helm/openshell/ci/values-autoscaling.yaml` | Render-only overlay for the optional gateway HorizontalPodAutoscaler (helm lint and helm-unittest) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |

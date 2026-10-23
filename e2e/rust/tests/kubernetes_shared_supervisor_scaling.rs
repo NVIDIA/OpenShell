@@ -3,9 +3,10 @@
 
 #![cfg(feature = "e2e-kubernetes-shared-supervisor-scaling")]
 
-//! Scaling a shared supervisor high-availability pool (`supervisor_topology =
-//! "gateway"` with `supervisor.highAvailability: true`) from one member to two
-//! and back to one, with `helm upgrade` of the installed release.
+//! Scaling the shared supervisor pool (`supervisor_topology = "gateway"`, which
+//! always runs as a high-availability pool) from one member to two and back to
+//! one, with `helm upgrade --set supervisor.replicas=N` of the installed
+//! release.
 //!
 //! The release starts as a one-member pool (ci/values-supervisor-ha-scaling.yaml).
 //! Scaling up adds a member and moves nothing: a live owner keeps its
@@ -37,8 +38,11 @@ use shared_supervisor::{
 };
 use tokio::time::Instant;
 
-/// Sandboxes created, at most, until one lands on the new member.
-const PLACEMENT_ATTEMPTS: usize = 8;
+/// Sandboxes created, at most, until one lands on the new member. The ring
+/// places each sandbox by its random server-assigned ID, so placements can
+/// cluster on one member for many sandboxes in a row; the bound must not
+/// assume they alternate (eight in a row on one member was seen live).
+const PLACEMENT_ATTEMPTS: usize = 32;
 /// Bound on one `helm upgrade --wait`.
 const HELM_TIMEOUT: Duration = Duration::from_mins(6);
 /// Bound on the pool reaching its new size once Helm returns: a removed
@@ -464,7 +468,7 @@ async fn scaling_a_supervisor_pool_up_and_down_keeps_its_sandboxes_running() {
             .flatten()
             .flat_map(|container| container["env"].as_array().into_iter().flatten())
             .any(|env| env["name"] == POOL_MEMBER_ENV),
-        "the one-replica shared supervisor is not a pool member; install with supervisor.highAvailability: true"
+        "the shared supervisor Pod template carries no pool member identity; install the chart from this branch"
     );
     let endpoint = HostEndpoint::start().await;
     let policy = policy(endpoint.port);

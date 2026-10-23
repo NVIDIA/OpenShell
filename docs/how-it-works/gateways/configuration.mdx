@@ -777,11 +777,12 @@ recovery_timeout_secs = 60
 | `enabled` | `false` | Coordinates the shared supervisor's replicas as a pool. |
 | `recovery_timeout_secs` | `60` | Seconds, from 10 to 300, that a sandbox runtime keeps its workload frozen after losing its pool member before it terminates the workload. The pool's supervisors offer this limit to each sandbox runtime when they attach. Without a pool, the runtime uses 30 seconds. |
 
-The Helm chart renders this table when `supervisor.highAvailability` is `true`
-or `supervisor.replicas` is 2 or more, sets `recovery_timeout_secs` from
-`supervisor.recoveryTimeoutSeconds`, and rejects a hand-written table. The
-table does not depend on the replica count, so scaling a pool does not change
-the gateway configuration or restart the gateway. For failover behavior, refer to
+The Helm chart always renders this table with the gateway topology, at any
+`supervisor.replicas`, sets `recovery_timeout_secs` from
+`supervisor.recoveryTimeoutSeconds` (60 by default), and rejects a
+hand-written table. The table does not depend on the replica count, so scaling
+the pool does not change the gateway configuration or restart the gateway. For
+failover behavior, refer to
 [Shared Supervisor High Availability](/kubernetes/high-availability#shared-supervisor-high-availability).
 
 ## Driver References

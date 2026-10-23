@@ -29,8 +29,11 @@ use tokio::io::AsyncBufReadExt as _;
 /// Bound on the takeover: membership expiry, a reconciliation pass, the
 /// replacement's startup, and the CLI's own retries.
 const RECOVERY_DEADLINE: Duration = Duration::from_mins(3);
-/// Sandboxes created, at most, until two land on different members.
-const PLACEMENT_ATTEMPTS: usize = 8;
+/// Sandboxes created, at most, until two land on different members. The ring
+/// places each sandbox by its random server-assigned ID, so placements can
+/// cluster on one member for many sandboxes in a row; the bound must not
+/// assume they alternate (eight in a row on one member was seen live).
+const PLACEMENT_ATTEMPTS: usize = 32;
 /// A member that announces it is leaving is drained within a reconciliation
 /// pass (2 s); an abruptly lost member is taken over only once its record
 /// expires (15 s TTL, refreshed every 2 s). A move this late cannot come from

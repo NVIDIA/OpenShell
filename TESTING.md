@@ -619,9 +619,9 @@ Available task variants:
 | `e2e:kubernetes:workspace-operator` | Operator workspace mode (pre-provisioned namespaces) |
 | `e2e:kubernetes:v1alpha1` | Agent Sandbox v1alpha1 compatibility |
 | `e2e:kubernetes:external-driver` | External Kubernetes driver sidecar |
-| `e2e:kubernetes:shared-supervisor` | One shared supervisor for the gateway's sandboxes (gateway TLS through the port-forward) |
+| `e2e:kubernetes:shared-supervisor` | One-member shared supervisor pool for the gateway's sandboxes (gateway TLS through the port-forward) |
 | `e2e:kubernetes:shared-supervisor-ha` | Two-replica shared supervisor pool: kills the member that owns a sandbox and checks the sandbox is adopted, not restarted |
-| `e2e:kubernetes:shared-supervisor-scaling` | One-replica shared supervisor pool (`supervisor.highAvailability: true`): scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
+| `e2e:kubernetes:shared-supervisor-scaling` | One-member shared supervisor pool: scales it to two members and back with `helm upgrade`, checking sandboxes stay running and the removed member hands its sandboxes off |
 
 Kubernetes e2e environment variables:
 

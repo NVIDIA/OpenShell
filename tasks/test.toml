@@ -268,7 +268,7 @@ env = { OPENSHELL_E2E_CREDENTIAL_DRIVERS = "1", OPENSHELL_E2E_CREDENTIAL_DRIVER 
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:shared-supervisor"]
-description = "Run Kubernetes e2e with one supervisor shared by the gateway's sandboxes (gateway supervisor topology)"
+description = "Run Kubernetes e2e with a one-member shared supervisor pool for the gateway's sandboxes (gateway supervisor topology)"
 env = { OPENSHELL_E2E_KUBE_TEST = "kubernetes_shared_supervisor", OPENSHELL_E2E_KUBE_TLS = "1", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-host-gateway,e2e-kubernetes,e2e-kubernetes-shared-supervisor" }
 # Prepend the supervisor overlay to any caller overlays, such as a workspace
 # mode. The shared supervisor requires gateway TLS, which the Skaffold values
