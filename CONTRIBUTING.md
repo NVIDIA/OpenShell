@@ -345,6 +345,10 @@ These are the primary `mise` tasks for day-to-day development:
 | `proto/`        | Protocol buffer definitions and [public API conventions](proto/README.md) |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `tests/testkit/` | Support library for SDK-driven end-to-end suites |
+| `tests/suites/` | End-to-end suites, one Cargo workspace per family (`conformance/sandbox` runs through a plan) |
+| `tests/tmachine/` | QEMU test machines provisioned with Ansible, and the `Session` API that drives them |
+| `tests/runner/` | `openshell-test-runner`: expands test plans into jobs, runs them in tmachine environments, and checks the results |
+| `tests/plans/`, `tests/environments/` | Test plans, and the environments they run in |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `docs/`         | Published Fern docs source, navigation, and content assets |
 | `fern/`         | Fern site config, components, and theme assets |

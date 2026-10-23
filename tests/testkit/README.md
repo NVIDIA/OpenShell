@@ -9,6 +9,7 @@ This is a separate Cargo workspace with its own lockfile:
 |---|---|
 | `testkit` | Finds and connects to the gateway, creates and cleans up sandboxes, runs the CLI. Also builds `testkit-ready`. |
 | `testkit-macros` | The `#[testkit::test]` attribute. |
+| `testkit-spec` | Parses `#[testkit::test]` functions. The macro and a test runner's catalog can both use it, so tools can list tests, with their ID and description, without compiling them. |
 
 ## Writing a test
 
@@ -31,11 +32,26 @@ async fn long_running_exec_delete(cx: &mut Context) -> testkit::Result {
 
 - **The doc comment is required.** It is the test's description.
 - **The function name is the nextest test name.**
+- **Keep tests at the top level of the file.** `testkit_spec::scan`, which
+  lists tests from source for tools such as a test runner's catalog, doesn't
+  look inside `mod` blocks yet, so it refuses a test there.
+- **No `#[cfg]` or `#[cfg_attr]`** on a test, or `#![cfg]` on a file with
+  tests. Listing from source can't tell whether a test is compiled, so a
+  runner would expect a test that never runs. A test that only applies to some
+  environments belongs in a `features` or `drivers` suite.
+- **No other tests in the file.** A file with `#[testkit::test]` functions
+  can't also have `#[test]` or `#[tokio::test]` functions. nextest would run
+  them, but a runner listing tests from source wouldn't expect them.
 - **Other attributes apply to the test.** For example, `#[ignore = "reason"]`
   skips it unless run with `--run-ignored`. `#[should_panic]` is rejected,
   because a testkit test panics on any failure. To check that something is
   refused, assert the failure in the body, for example with
   `cx.cli([...]).await?.failure()?` and `testkit::ensure!`.
+- **`id` is optional.** `#[testkit::test(id = "t-0123abcd")]` gives a test an
+  identity that survives renames and moves. Tools that need one, such as
+  result history, use it; without it the function name is the
+  identity. An ID is `t-` and eight lowercase letters or digits, unique across
+  all suites. A malformed ID's compile error suggests a fresh one.
 
 Cleanup runs after every test, whether it passes, fails, or panics. It only
 deletes sandboxes created through `cx.sandbox(...)`. Delete anything else a
@@ -88,6 +104,12 @@ time or the CLI does not report it connected.
 `e2e/with-docker-gateway.sh` and `e2e/with-podman-gateway.sh` start an
 ephemeral gateway and export `OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so a
 suite runs under them unchanged.
+
+`mise run e2e:testkit` does this for the suites in `tests/suites/conformance`.
+On CI the test runner (`tests/runner/`) does the same for a guest: it sets
+`OPENSHELL_GATEWAY` to the gateway the installer registered, `OPENSHELL_BIN` to
+the installed CLI, then runs the plan's suites with nextest. See [TESTING.md](../../TESTING.md) and
+[tests/plans/README.md](../plans/README.md).
 
 ## Checks
 

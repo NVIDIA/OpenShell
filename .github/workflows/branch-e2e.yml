@@ -303,6 +303,22 @@ jobs:
           {"environment":"fedora-podman-rootless","installer":"binaries","testsuite":"driver-podman"}
         ]
 
+  # Run the tests in tests/plans/cpu-tests.yaml. The plan decides which suites
+  # run in which environments, so adding coverage means editing the plan, not
+  # this workflow. Not yet in core-e2e-result.needs: it starts out advisory.
+  plan-cpu-tests:
+    needs: [pr_metadata, prepare-integration]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
+    permissions:
+      actions: read
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-suites.yml
+    with:
+      plan: cpu-tests
+      source-sha: ${{ needs.prepare-integration.outputs.source_sha }}
+      integration-inputs-artifact-id: ${{ needs.prepare-integration.outputs.integration_inputs_artifact_id }}
+
   docker-e2e:
     needs: [pr_metadata, build-binaries, build-images]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'

@@ -17,6 +17,8 @@ use crate::gateway::Gateway;
 pub struct TestInfo {
     /// The function name, which is also the nextest test name.
     pub name: &'static str,
+    /// The stable test ID, if the test declares one.
+    pub id: Option<&'static str>,
     pub description: &'static str,
 }
 
@@ -33,7 +35,10 @@ where
     F: AsyncFnOnce(&mut Context) -> Result,
 {
     let name = info.name;
-    eprintln!("[{name}] {}", info.description);
+    match info.id {
+        Some(id) => eprintln!("[{name}] {} ({id})", info.description),
+        None => eprintln!("[{name}] {}", info.description),
+    }
 
     let gateway = Gateway::from_env().unwrap_or_else(|error| panic!("[{name}] {error}"));
     eprintln!("[{name}] {}", gateway.describe());

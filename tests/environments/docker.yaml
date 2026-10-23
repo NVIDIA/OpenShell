@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Docker-backed environments, by Evan Lezar (NVIDIA/OpenShell#4629).
+#
+# The ID must equal <backend>.<os><version without dots>-<arch>.<runtime>.<installer>.
+# `tmachine` names the environment and installer in tests/tmachine/config.nix
+# that provision it. `gateway` is the name the installer registers the gateway
+# under with the CLI (`openshell gateway add --name`); the packaged installers
+# register `openshell`.
+#
+# Only amd64 is defined: CI has no arm64 runner with KVM for tmachine yet. To add
+# arm64, copy the entry with `arch: arm64` and a `ubuntu2404-arm64` ID, then list
+# it in a plan. The CI matrix picks the `ubuntu-24.04-arm` runner for it (see
+# runner_label in tests/runner/src/github.rs); the calling workflow must also
+# build arm64 inputs.
+environments:
+  - id: tmachine.ubuntu2404-amd64.docker-rootful.deb
+    backend: tmachine
+    machine: { os: ubuntu, version: "24.04", arch: amd64 }
+    runtime: docker-rootful
+    installer: deb
+    tmachine: { environment: ubuntu-docker-rootful, installer: deb }
+    gateway: openshell

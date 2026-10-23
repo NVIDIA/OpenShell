@@ -5,4 +5,4 @@
 # by path.
 [workspace]
 resolver = "2"
-members = ["testkit", "testkit-macros"]
+members = ["testkit", "testkit-macros", "testkit-spec"]

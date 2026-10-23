@@ -127,6 +127,8 @@ gh run list --json databaseId,status,headBranch,url --jq '.[] | {id: .databaseId
 
 For tmachine Kubernetes conformance failures, inspect the `tmachine-diagnostics-*` artifact. The K3s report includes Agent Sandbox controller state, leader leases, events, and current and previous controller logs. The conformance playbook checks reconciliation after guest boot with a temporary scheduling-gated Sandbox probe before running tests. Distinguish a failed controller probe from a failed conformance scenario; gateway connectivity and controller Deployment availability do not prove reconciliation works.
 
+For test plan lanes (`plan-cpu-tests` and other `e2e-suites.yml` callers), start with the runner's `Summary` block in the job log, which gives PASS, FAIL or ERROR per environment and family. Then inspect the `e2e-results-<plan>-<environment>` artifact: `suites.json` lists what the runner selected, and `<environment>/<family>/` holds `junit.xml`, `nextest.log` and, after a failure, the guest's `diagnostics/`.
+
 `Pre-release` temporarily omits Codex Security from its `Security Scan` job.
 `Release` uses the passing prerelease qualification result. Other scanners and
 qualification gates still run. Use the standalone

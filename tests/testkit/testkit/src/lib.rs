@@ -20,7 +20,7 @@
 //! ```
 //!
 //! Tests find the gateway the same way the `openshell` CLI does (see
-//! [`gateway`]).
+//! [`gateway`]). `id = "t-..."` optionally gives a test a stable identity.
 
 mod cli;
 mod context;

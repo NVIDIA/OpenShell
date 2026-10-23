@@ -17,6 +17,11 @@ python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
+tests/suites/conformance/  # Testkit suites (the `sandbox` crate) beside the older CLI conformance crate
+tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session API
+tests/runner/          # openshell-test-runner: runs test plans in environments
+tests/plans/           # Test plans: which suites run in which environments
+tests/environments/    # Environment definitions
 ```
 
 ## Rust Tests
@@ -139,6 +144,85 @@ gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
 by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
+
+Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
+with its own lockfile, and a family name is what a plan's `type` selects.
+`tests/suites/conformance/sandbox` is the first testkit suite; it has one smoke
+test. Run it against a local Docker gateway with:
+
+```shell
+mise run e2e:testkit
+```
+
+That task runs `e2e/with-docker-gateway.sh`, which starts a gateway and exports
+`OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so the suite runs the same way the
+runner runs it in a guest.
+
+Workspaces that build root crates through path dependencies must lock shared
+crates at the versions in the root `Cargo.lock`; otherwise CI can build against
+dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
+verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
+re-locks a workspace from the root lockfile. Add new testkit workspaces to
+`ALIGNED_WORKSPACES` in that script.
+
+### Test plans and the runner (`tests/runner/`)
+
+`openshell-test-runner` runs testkit suites in provisioned environments. It is the
+runner and plan layer from NVIDIA/OpenShell#4629 by Evan Lezar, on top of the
+testkit and tmachine here. A plan selects which suites run in which environments. The plan is the only list of
+what runs where: CI reads it, so no workflow or playbook repeats it.
+
+- **Plans** (`tests/plans/*.yaml`) pair a family (a workspace under
+  `tests/suites/`, such as `conformance`) and optionally some of its suites with
+  environment IDs. See [tests/plans/README.md](tests/plans/README.md).
+- **Environments** (`tests/environments/*.yaml`) name the tmachine environment and
+  installer that provision them and the gateway name the installer registers. The
+  runner points the tests at that gateway and the installed CLI with
+  `OPENSHELL_GATEWAY` and `OPENSHELL_BIN`.
+- **Test IDs** are optional: `#[testkit::test(id = "t-0123abcd")]` gives a test
+  an identity that survives renames. There is no per-environment skipping. A test
+  that cannot pass everywhere belongs in a different family, and a flaky or
+  broken one is marked `#[ignore = "<issue link>"]`, which drops it everywhere.
+- **Results** are checked, not trusted. A job passes only if nextest succeeds and
+  its JUnit report has a passing case for exactly the tests the runner selected.
+  A test missing from the report, or skipped, fails the job. An `#[ignore]` test
+  is left out of what a lane expects, so it can't fail the lane on its own. That
+  is the only way to take a broken or flaky test out of a lane, and it does so in every
+  environment: give the reason as a link to the tracking issue,
+  `#[ignore = "https://github.com/NVIDIA/OpenShell/issues/<n>"]`.
+- **Strict mode** (`--strict`, or `OPENSHELL_TEST_STRICT=true`) is for CI. It fails
+  instead of skipping an environment the host can't provision, a family
+  with no tests, or a plan that selects nothing. A family whose selected tests
+  are all ignored has no tests, so strict mode fails it: the plan pairs that
+  environment with suites that have nothing to run. Without it the
+  runner reports those and exits successfully, so a laptop can run the part of a
+  plan it can boot.
+
+```shell
+nix run .#openshell-test-runner -- test --plan tests/plans/cpu-tests.yaml --dry-run
+nix run .#openshell-test-runner -- test --plan tests/plans/cpu-tests.yaml --strict
+```
+
+`nix run .#openshell-test-runner` cross-builds the suites for the guest, boots
+each environment through tmachine (this needs KVM), runs nextest in the guest
+over SSH, and writes JUnit reports, logs and gateway diagnostics to
+`artifacts/test-results/<plan>/`. Every SSH and nextest step has a timeout, and
+the runner kills its VMs if it receives SIGTERM. Two runs on one host need
+different `TMACHINE_SSH_PORT` values (default 2222). The installer inputs, such
+as the Debian package and the images, come from `artifacts/`, built by
+`nix run .#build-artifacts` or downloaded by CI.
+
+**CI runs the plan.** `.github/workflows/e2e-suites.yml` takes a plan name. It
+runs `openshell-test-runner test --plan tests/plans/<name>.yaml --emit-github-matrix`,
+which prints the `{"include": [...]}` a workflow reads with `fromJSON`: one job
+per environment with the runner label that can boot it. Each job then runs
+`nix run .#openshell-test-runner -- test --plan ... --env <id> --strict` and
+uploads its JUnit reports and logs. Branch E2E calls the workflow for `cpu-tests` when the
+`test:e2e` label is set. To change what CI runs, edit the plan.
+
+The older conformance, feature and driver lanes in `.github/workflows/` are still
+written by hand and run through the tmachine testsuites in
+`tests/tmachine/config.nix`. They move to plans as their suites move to testkit.
 
 ### Python E2E (`e2e/python/`)
 

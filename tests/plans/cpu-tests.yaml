@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Tests that need no GPU. `type` names a family under tests/suites/ (a Cargo
+# workspace of testkit suites). Omit `suites` to run every suite in the family,
+# or list suite names (a suite is a file under <crate>/tests/) to run only
+# those. `environments` are IDs from tests/environments/.
+#
+# CI runs this plan from .github/workflows/e2e-suites.yml, one job per
+# environment listed here. To add coverage, add an environment to an entry or an
+# entry for another family; no workflow change is needed.
+#
+# Only amd64 is listed: Branch E2E has no arm64 runner with KVM for tmachine
+# yet. See tests/environments/docker.yaml for how to add arm64.
+matrix:
+  - type: conformance
+    environments:
+      - tmachine.ubuntu2404-amd64.docker-rootful.deb
