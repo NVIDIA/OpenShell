@@ -192,6 +192,12 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
+    /// Path to a PEM CA bundle for an OIDC issuer signed by a private CA.
+    /// Must be a regular file no larger than 1 MiB. The certificates augment
+    /// platform trust roots for OIDC requests only.
+    #[arg(long, env = "OPENSHELL_OIDC_CA_BUNDLE")]
+    oidc_ca_bundle: Option<PathBuf>,
+
     /// Development only: permit OIDC metadata and JWKS over HTTP when the
     /// endpoint uses a numeric loopback address.
     #[arg(
@@ -633,6 +639,7 @@ fn prepare_server_config_with_drivers(
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
+            ca_bundle: args.oidc_ca_bundle.clone(),
             dangerously_allow_insecure_http: args.oidc_dangerously_allow_insecure_http,
             jwks_allowed_origins: args.oidc_jwks_allowed_origins.clone(),
             audience: args.oidc_audience.clone(),
@@ -1293,6 +1300,9 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     if let Some(oidc) = &file.oidc {
         if args.oidc_issuer.is_none() && arg_defaulted(matches, "oidc_issuer") {
             args.oidc_issuer = Some(oidc.issuer.clone());
+        }
+        if args.oidc_ca_bundle.is_none() && arg_defaulted(matches, "oidc_ca_bundle") {
+            args.oidc_ca_bundle.clone_from(&oidc.ca_bundle);
         }
         if arg_defaulted(matches, "oidc_dangerously_allow_insecure_http") {
             args.oidc_dangerously_allow_insecure_http = oidc.dangerously_allow_insecure_http;
@@ -3226,6 +3236,7 @@ compute_driver = "podman"
             .remove("OPENSHELL_OIDC_AUDIENCE")
             .remove("OPENSHELL_OIDC_DANGEROUSLY_ALLOW_INSECURE_HTTP")
             .remove("OPENSHELL_OIDC_JWKS_ALLOWED_ORIGINS")
+            .remove("OPENSHELL_OIDC_CA_BUNDLE")
             .run(|| {
                 let (mut args, matches) =
                     parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
@@ -3233,6 +3244,7 @@ compute_driver = "podman"
                     r#"
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com"
+ca_bundle = "/etc/openshell/oidc-ca.pem"
 audience = "openshell-cli"
 dangerously_allow_insecure_http = true
 jwks_allowed_origins = ["https://keys.example.com"]
@@ -3241,6 +3253,10 @@ jwks_allowed_origins = ["https://keys.example.com"]
                 merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
                 assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
+                assert_eq!(
+                    args.oidc_ca_bundle.as_deref(),
+                    Some(std::path::Path::new("/etc/openshell/oidc-ca.pem"))
+                );
                 assert_eq!(args.oidc_audience, "openshell-cli");
                 assert!(args.oidc_dangerously_allow_insecure_http);
                 assert_eq!(
