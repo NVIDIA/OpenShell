@@ -7,7 +7,9 @@
 //!
 //! Tests find the gateway the way the CLI does, so the runner points them at
 //! the one the installer registered with `OPENSHELL_GATEWAY` and at the
-//! installed CLI with `OPENSHELL_BIN`.
+//! installed CLI with `OPENSHELL_BIN`. Anything else the environment provides,
+//! such as Keycloak, the tests learn from the variables it publishes (see
+//! [`crate::test_env`]).
 
 use std::fmt;
 use std::path::Path;
@@ -19,6 +21,7 @@ use tmachine::Session;
 use tmachine::config::Config;
 
 use crate::bundle::{Bundle, PROFILE, READY_BINARY};
+use crate::test_env;
 
 const GUEST_DIR: &str = "/var/tmp/openshell-tests";
 /// The nextest log's name, in the guest directory and in the results.
@@ -221,10 +224,15 @@ async fn run_tests(session: &Session, run: &Run<'_>) -> Result<Status> {
         !openshell_bin.is_empty(),
         "the installer did not put openshell on the guest's PATH"
     );
-    let env = [
+    let mut env = vec![
         format!("OPENSHELL_GATEWAY={}", run.gateway),
         format!("OPENSHELL_BIN={openshell_bin}"),
     ];
+    env.extend(
+        test_env::read(session)
+            .await
+            .context("read the variables the environment publishes for tests")?,
+    );
 
     let guest = GUEST_DIR;
     checked(
