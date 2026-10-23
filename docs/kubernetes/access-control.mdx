@@ -14,6 +14,7 @@ The OpenShell gateway supports these access-control models for human callers on 
 |---|---|
 | mTLS | Gateways with a configured client CA and no OIDC issuer. The gateway maps a verified client certificate to a user identity. |
 | OIDC (recommended) | Production deployments. Integrates with an existing identity provider, supports role-based access control, and gives each user their own identity without distributing certificates. |
+| Cloudflare Access token verification (recommended behind Cloudflare Access) | Cloudflare Access authenticates callers in front of the gateway. The gateway verifies the Access token on every request and gives each user their own identity. |
 | Reverse-proxy auth termination | An access proxy (Cloudflare Access, ngrok, corporate SSO) authenticates callers in front of the gateway. The gateway trusts the proxy and skips its own client-cert check. |
 
 The Helm chart generates a gateway TLS certificate and a user client certificate at install time. Supervisor Pods project only `ca.crt` from the client Secret so they can authenticate the gateway; the client certificate and private key are not exposed to sandboxes. Supervisors authenticate their RPCs with gateway-minted sandbox JWTs.
@@ -112,8 +113,29 @@ helm upgrade openshell \
 The gateway listens on plaintext HTTP behind the trusted proxy, while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. User-facing CLI/API calls without OIDC or mTLS credentials are accepted as an unauthenticated local developer principal. The proxy is responsible for authenticating callers and forwarding only authorized traffic.
 
 <Warning>
-Only enable unauthenticated users when the gateway is not reachable from outside a trusted local development environment or the proxy path is fully trusted. Never expose a plaintext, auth-disabled gateway to a public network.
+Only enable unauthenticated users when the gateway is not reachable from outside a trusted local development environment or the proxy path is fully trusted. Never expose a plaintext, auth-disabled gateway to a public network. Behind Cloudflare Access, [verify the Access token](#verify-cloudflare-access-tokens) instead.
 </Warning>
+
+### Verify Cloudflare Access Tokens
+
+Cloudflare Access sends a signed token with every request. Configure the gateway to verify it so a gRPC caller that bypasses the proxy is rejected instead of accepted as the local developer principal. Do not set `allow_unauthenticated_users`; the gateway refuses to start with it, or with OIDC.
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.disableTls=true \
+  --set 'gatewayConfig.openshell\.gateway\.edge_auth.provider=cloudflare_access' \
+  --set 'gatewayConfig.openshell\.gateway\.edge_auth.issuer=https://<team>.cloudflareaccess.com' \
+  --set 'gatewayConfig.openshell\.gateway\.edge_auth.audience=<application-aud-tag>'
+```
+
+The audience is the AUD tag on the Access application's overview page. The gateway reads the token from the `cf-access-jwt-assertion` header or the `CF_Authorization` cookie. It checks the signature, issuer, audience, expiry, and `nbf` when present, using the keys that the team publishes at `<issuer>/cdn-cgi/access/certs`. It refreshes the keys on an unknown key ID. A missing, invalid, or expired token returns `Unauthenticated`.
+
+A valid token becomes a user whose subject is the token `sub`. Run `openshell whoami` to see it. Access service tokens carry no subject and are rejected.
+
+Without `admin_role` and `user_role`, every caller that Access admits is a platform admin, and workspace membership is not enforced, as with mTLS users. Scope the Access policy accordingly. To enforce roles and membership, set `roles_claim` to the claim that carries them, such as `custom.groups`, and set both `admin_role` and `user_role`. For all fields, refer to [Gateway Configuration](/how-it-works/gateways/configuration).
 
 Register the gateway with the CLI using the proxy's public URL. The browser-based login flow runs automatically on first use:
 

@@ -245,6 +245,10 @@ pub struct Config {
     /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
     pub oidc: Option<OidcConfig>,
 
+    /// Edge JWT configuration. When `Some`, the server verifies the edge
+    /// proxy's token on every request.
+    pub edge_auth: Option<EdgeAuthConfig>,
+
     /// Gateway user authentication behavior.
     pub auth: GatewayAuthConfig,
 
@@ -452,6 +456,50 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+}
+
+/// Identity provider that signs the edge token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeAuthProvider {
+    /// Cloudflare Access (`cf-access-jwt-assertion` header or `CF_Authorization` cookie).
+    CloudflareAccess,
+}
+
+/// Edge JWT authentication for gateways behind an authenticating proxy.
+///
+/// When configured, the gateway verifies the edge token on every request
+/// instead of trusting the network path to the proxy. Roles are optional;
+/// leave `admin_role` and `user_role` empty for authentication-only mode,
+/// where every verified caller is authorized.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgeAuthConfig {
+    /// Provider that issued the edge token.
+    pub provider: EdgeAuthProvider,
+
+    /// Token issuer, for example `https://example-team.cloudflareaccess.com`.
+    pub issuer: String,
+
+    /// Expected audience (`aud`), such as the Access application AUD tag.
+    pub audience: String,
+
+    /// Signing-key cache TTL in seconds. Defaults to 3600 (1 hour).
+    #[serde(default = "default_jwks_ttl_secs")]
+    pub jwks_ttl_secs: u64,
+
+    /// Dot-separated path to the roles array in the token claims, such as
+    /// `custom.groups`. Empty disables role extraction.
+    #[serde(default)]
+    pub roles_claim: String,
+
+    /// Role that grants admin access. Empty disables role checks.
+    #[serde(default)]
+    pub admin_role: String,
+
+    /// Role that grants standard user access. Empty disables role checks.
+    #[serde(default)]
+    pub user_role: String,
 }
 
 /// mTLS user authentication for gateway users.
@@ -934,6 +982,7 @@ impl Config {
             config_delivery_mode: ConfigDeliveryMode::default(),
             tls,
             oidc: None,
+            edge_auth: None,
             auth: GatewayAuthConfig::default(),
             enable_websocket_tunnel: false,
             gateway_interceptors: Vec::new(),
@@ -1107,6 +1156,13 @@ impl Config {
     #[must_use]
     pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
         self.oidc = Some(oidc);
+        self
+    }
+
+    /// Set the edge JWT configuration for proxy-authenticated gateways.
+    #[must_use]
+    pub fn with_edge_auth(mut self, edge_auth: EdgeAuthConfig) -> Self {
+        self.edge_auth = Some(edge_auth);
         self
     }
 

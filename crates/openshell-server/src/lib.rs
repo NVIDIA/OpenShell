@@ -379,6 +379,10 @@ pub struct ServerState {
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
+    /// Signing-key cache for edge token validation. `None` when edge
+    /// authentication is not configured.
+    pub edge_auth_cache: Option<Arc<auth::oidc::JwksCache>>,
+
     /// Typed extension JWT issuer and public verification metadata.
     pub extension_jwt_issuer: Option<Arc<auth::sandbox_jwt::ExtensionJwtIssuer>>,
 
@@ -414,9 +418,10 @@ pub struct ServerState {
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
 
-    /// OIDC admin role name for workspace-level authorization.
-    /// Empty when OIDC is not configured — `authorize_workspace()` treats
-    /// every authenticated user as Platform Admin in that case.
+    /// Admin role name for workspace-level authorization, from OIDC or edge
+    /// authentication. Empty when neither configures roles, in which case
+    /// `authorize_workspace()` treats every authenticated user as Platform
+    /// Admin.
     pub admin_role: String,
 }
 
@@ -481,10 +486,8 @@ impl ServerState {
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         let reflection_service = reflection::build_gateway_reflection_service(&config)
             .expect("compiled public gateway descriptors must be valid");
-        let admin_role = config
-            .oidc
-            .as_ref()
-            .map_or_else(String::new, |oidc| oidc.admin_role.clone());
+        let admin_role = auth::authz::AuthzPolicy::from_config(&config)
+            .map_or_else(String::new, |policy| policy.admin_role);
         let config_delivery =
             config_delivery::ConfigDelivery::for_db_connections(store.max_connections());
         Self {
@@ -510,6 +513,7 @@ impl ServerState {
             extension_mint_limiter: auth::extension_mint_limit::ExtensionMintLimiter::default(),
             middleware_registry: Arc::new(MiddlewareRegistry::default()),
             oidc_cache,
+            edge_auth_cache: None,
             extension_jwt_issuer: None,
             sandbox_session_jwt_authority: None,
             compute_driver_authenticator: None,
@@ -593,6 +597,7 @@ pub(crate) async fn run_server(
         compute_driver,
         legacy_compute_driver_env_seen: _,
     } = startup;
+    auth::edge::validate_config(&config).map_err(Error::config)?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     auth::descriptor_authz::init()
@@ -682,19 +687,24 @@ pub(crate) async fn run_server(
     )
     .await?;
 
-    let oidc_cache = if let Some(ref oidc) = config.oidc {
-        // Validate RBAC configuration before starting.
-        let policy = auth::authz::AuthzPolicy {
-            admin_role: oidc.admin_role.clone(),
-            user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
-        };
+    // Validate RBAC configuration before starting.
+    if let Some(policy) = auth::authz::AuthzPolicy::from_config(&config) {
         policy.validate().map_err(Error::config)?;
-
+    }
+    let oidc_cache = if let Some(ref oidc) = config.oidc {
         let cache = auth::oidc::JwksCache::new(oidc)
             .await
             .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
         info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+    let edge_auth_cache = if let Some(ref edge) = config.edge_auth {
+        let cache = auth::oidc::JwksCache::for_edge_auth(edge)
+            .await
+            .map_err(|e| Error::config(format!("edge auth initialization failed: {e}")))?;
+        info!("Edge JWT validation enabled (issuer: {})", edge.issuer);
         Some(Arc::new(cache))
     } else {
         None
@@ -783,6 +793,7 @@ pub(crate) async fn run_server(
         oidc_cache,
         credentials,
     );
+    state.edge_auth_cache = edge_auth_cache;
     state.middleware_registry = middleware_registry;
     state.gateway_interceptors = gateway_interceptors;
     state.provider_profile_sources = provider_profile_sources;

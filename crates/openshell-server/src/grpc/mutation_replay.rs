@@ -208,7 +208,14 @@ pub(super) async fn run<M: Mutation>(
             },
             "",
         ),
-        IdentityProvider::CloudflareAccess => ("cloudflare_access", ""),
+        IdentityProvider::CloudflareAccess => (
+            "cloudflare_access",
+            state
+                .config
+                .edge_auth
+                .as_ref()
+                .map_or("", |config| config.issuer.as_str()),
+        ),
         IdentityProvider::LocalDev => ("local_dev", ""),
     };
     let caller = hash_json(&serde_json::json!([provider, issuer, identity.subject,]))?;
