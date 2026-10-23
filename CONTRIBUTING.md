@@ -72,7 +72,9 @@ Every pull request must be approved by someone listed in [MAINTAINERS.md](MAINTA
 
 Pull requests that touch the enforcement machinery itself — anything under `.github/workflows/`, `.github/actions/`, `MAINTAINERS.md`, `.github/CODEOWNERS`, or the enforcement scripts in `tasks/scripts/` — additionally require a code owner's approval, listed in [.github/CODEOWNERS](.github/CODEOWNERS). The status check reads its inputs from `main`, but a workflow triggered by a review runs the pull request's own copy of the workflow file, so GitHub's native code owner requirement is what keeps a change from disabling the gate that would have blocked it.
 
-Maintainers are not requested automatically. If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
+Use exactly one `area:` label and any relevant `topic:` labels on your pull request. The [reviewer routing workflow](.github/workflows/review-readiness.yml) requests all matching members of [REVIEWERS.md](REVIEWERS.md) with repository write access, excluding the author, when a PR opens ready for review, leaves draft status, or gains or loses an area/topic label. Manual reviewer choices and people who have commented or reviewed are preserved. Propose roster membership changes through a reviewed PR.
+
+If your pull request has been idle, ask for a reviewer in the pull request or in the CNCF Slack channel rather than waiting.
 
 ## Agent Skills
 
