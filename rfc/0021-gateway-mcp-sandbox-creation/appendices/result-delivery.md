@@ -84,7 +84,7 @@ If 45 seconds pass first, `wait` returns `timed_out: true` and the parent calls 
 
 ## Evidence
 
-The proof of concept ran nine delegation tasks with six harnesses (Pi, OpenCode, Qwen Code, Codex, Deep Agents and Hermes), three rounds each: 161 of 162 runs passed, and the one failure was the model provider's content filter. Checks without a model pass 26 of 26, including a failing command that publishes `exit=4` and repeated reads that return the same content. The benchmark is in `examples/gateway-mcp-poc/bench/`.
+The proof of concept ran nine delegation tasks with six harnesses (Pi, OpenCode, Qwen Code, Codex, Deep Agents and Hermes), three rounds each: 161 of 162 runs passed, and the one failure was the model provider's content filter. Checks without a model pass 26 of 26, including a failing command that publishes `exit=4` and repeated reads that return the same content. How to run the benchmark is in its [README](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/bench/README.md), and the results are in its [report](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/bench/REPORT.md).
 
 ## Open items
 

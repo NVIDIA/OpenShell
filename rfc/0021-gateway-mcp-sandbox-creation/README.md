@@ -110,8 +110,8 @@ sandbox, for whom, and was it allowed".
   A single prompt that shows the child's request and approves it in one step is
   future work.
 - **Storing results or streaming them.** The gateway never keeps a child's
-  output. A child leaves its result in its own files, says it is done, and the
-  parent reads the files with `get_file` (see [Returning results](#returning-results)).
+  output. A child leaves its result in a file in its own sandbox, and the
+  parent's `wait` returns it (see [Returning results](#returning-results)).
   Progress updates and messages between running agents are future work (see
   [Agent-to-agent communication through the gateway](#agent-to-agent-communication-through-the-gateway)).
 
@@ -240,9 +240,6 @@ service SandboxChildren {
   }
   rpc GetSandboxLimits(GetSandboxLimitsRequest) returns (GetSandboxLimitsResponse) {
     option (authorization) = { auth_mode: "dual" workspace_role: "user" scope: "sandbox:read" };
-  }
-  rpc SubmitChildResult(SubmitChildResultRequest) returns (SubmitChildResultResponse) {
-    option (authorization) = { auth_mode: "sandbox" };
   }
 }
 ```
@@ -792,14 +789,13 @@ made.
 | Tool | Listed for | Input | Output | Errors |
 |------|------------|-------|--------|--------|
 | `create_sandbox` | users and sandboxes | `name`, `kind`, `lifetime`, `command`, `task`, `policy`, `providers`, `inputs`, `request_id`, `limits`, `idle_timeout_s`; users only: `image`, `grant` | `handle` | `NOT_ALLOWED`, `LIMIT_REACHED(depth\|breadth\|total)`, `EXCEEDS_CEILING`, `UNSUPPORTED_RULES`, `PROVER_INCONCLUSIVE`, `PROGRAM_NOT_ALLOWED`, `GLOBAL_POLICY_ACTIVE`, `EXCEEDS_GLOBAL_POLICY`, `IN_PROGRESS`, `STALE_ADMISSION`, `INVALID_ARGUMENT` (request_id reused with different arguments) |
-| `wait` | sandboxes | `handle`, `timeout_s`, `for_done` | `phase`, `exit_code`, `done` | `NOT_YOUR_CHILD` |
+| `wait` | sandboxes | `handle`, `timeout_s`, `until_file`, `return_file` | `phase`, `exit_code`, `timed_out`; with `until_file`: `file_ready`; with `return_file`: `content`, `truncated` | `NOT_YOUR_CHILD`, `INVALID_ARGUMENT` (`return_file` without `until_file`, or a relative path) |
 | `exec` | sandboxes | `handle`, `command`, `timeout_s` | `stdout`, `stderr`, `exit_code` | `NOT_YOUR_CHILD`, `WRONG_KIND` |
-| `get_file` | sandboxes | `handle`, `path` | `content` | `NOT_YOUR_CHILD` |
+| `get_file` | sandboxes | `handle`, `path` | `content` (up to 256 KiB), `truncated` | `NOT_YOUR_CHILD` |
 | `stop_sandbox` | sandboxes | `handle` | `stopped` | `NOT_YOUR_CHILD` |
 | `get_output` | sandboxes | `handle` | recent log lines of the child; not a durable result, and a child's own standard output is not included | `NOT_YOUR_CHILD` |
 | `list_children` | sandboxes | none | children with kind, lifetime, depth | none |
 | `get_limits` | sandboxes | none | depth, children and total used and allowed; `can_create_children` (agents) and `can_create_tools` | none |
-| `mark_done` | sandboxes | none | `done`, `repeated` | `NOT_A_CHILD` |
 | `grant_list` | users | none | grants in the caller's workspace | none |
 | `grant_create` | users | `handle` of a running top-level sandbox, grant fields | the grant | `NOT_ALLOWED`, `ALREADY_EXISTS` |
 | `grant_update` | users | `grant_id`, `max_depth`, `max_breadth`, `max_total`, `revoke` | the new limits, or `revoked` | `NOT_FOUND`, `NOT_ALLOWED` |
@@ -866,35 +862,31 @@ to pass on, are the only point at which the user may be prompted during a run.
 
 ### Returning results
 
-> The proof of concept replaced the design below with `wait` returning the
-> result file (`until_file`, `return_file`), so children never call the
-> gateway. See [Appendix: Delivering a Child's Result](appendices/result-delivery.md).
+**A child writes its result to a file in its own sandbox and keeps running; the
+parent's `wait` returns the file's content, and the parent then stops the
+child.** The gateway reads the file through the exec relay, as `get_file` does,
+and keeps no copy: it is the control plane, and agent output stays in the
+sandboxes. The child never calls the gateway.
 
-**A child leaves its result in its own files and says it is done; the parent's
-`wait` returns, and the parent reads the files with `get_file`.** The gateway
-keeps a "done" flag, never the result: it is the control plane, and agent output
-stays in the sandboxes. Without the flag, a parent cannot tell a child that is
-still working from one whose result is ready, and has to poll `get_file`, which
-costs model turns and can read a half-written file.
-
-- **`mark_done {}`** is called by the child through its own door, after its
-  result file is complete. The gateway takes the child's identity from the
-  door's token, so a child can mark only itself. A sandbox with no parent gets
-  `NOT_A_CHILD`. Calling it again is a no-op.
-- **`wait` with `for_done: true`** keeps waiting past READY until the child is
-  done or exits, and returns `done` with the phase and exit code. A child that
-  exits without marking done returns `done: false` and its exit code. A `wait`
-  that times out can be repeated.
-- **The parent reads the result with `get_file`** while the child runs. The
-  bytes pass through the gateway's relay and are not stored. Any ancestor may
-  see the flag and read the files, as it may today.
-- **The child keeps running until the parent stops it**, because its files go
-  when it exits. A harness wrapper can write the agent's final answer to a
-  file and call `mark_done`, so the model does not have to remember to.
-- **The flag is deleted with the child**, including by cascade stop.
+- **`wait` with `until_file`** (an absolute path in the child) keeps waiting
+  past READY until the file exists or the child exits, and returns
+  `file_ready`. While the child is READY, the gateway checks for the file every
+  few seconds. A `wait` that times out can be repeated.
+- **`return_file: true`** adds the file's `content` to the reply, so the parent
+  has the result before it can stop the child.
+- **`run-child`**, a small wrapper for the child's command, closes stdin,
+  writes the result whole and renames it into place, so it never appears
+  half-written. The first line is the command's exit status (`exit=N`), then
+  its output. It publishes the result even when the command fails, and keeps
+  the child running for a collection window.
+- **Results must fit in 256 KiB.** `wait` and `get_file` report `truncated`
+  beyond that; the status line comes first, so it is never cut.
+- **The result is deleted with the child**, including by cascade stop.
 
 A result is text written by the child, so the parent's harness must treat it as
-data, not instructions (see [Risks](#risks)).
+data, not instructions (see [Risks](#risks)). The full flow, contract and
+failure cases are in
+[Appendix: Delivering a Child's Result](appendices/result-delivery.md).
 
 ### Images and resources
 
@@ -1073,7 +1065,8 @@ The work is phased so that each phase is usable and testable on its own:
   callers. Carrying gRPC through the door comes in a later phase (see
   [Open questions](#open-questions)).
 - **Phase 3: Tool sandboxes and results.** `kind: tool`, `exec` with command
-  audit, and the idle timeout; `mark_done` and `wait`'s `done` and `for_done`.
+  audit, and the idle timeout; `wait`'s `until_file` and `return_file`, and
+  `run-child`.
 - **Phase 4: Global policy as a maximum.** Add `global_policy_mode` and the
   proof of every grant holder's policy (at create and when a grant is
   attached), child policy and policy write against the global policy in
@@ -1098,10 +1091,13 @@ A proof of concept of phases 1 to 3 exists on the branch
 [tutorials](https://github.com/patkraw/OpenShell/tree/gateway-mcp-poc/examples/gateway-mcp-poc/tutorials)
 that run as written. Returning results is in
 [tutorial 02](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/tutorials/02-mcp-inside-sandbox.md#collect-an-agent-childs-result),
-and `run-pi-done-demo.sh` runs it with a real Pi lead and Pi worker. Its
+and `run-pi-result-demo.sh` runs it with a real Pi lead and Pi worker. Its
 current end-to-end result, tied to a commit, is in
 [`examples/gateway-mcp-poc/README.md`](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/README.md#results)
-under Results. The proof of concept keeps grants, lineage and results in memory and forwards the supervisor's main session
+under Results. A benchmark runs nine delegation tasks with six harnesses (Pi,
+OpenCode, Qwen Code, Codex, Deep Agents and Hermes); how to run it is in its
+[README](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/bench/README.md), and the results are in its
+[report](https://github.com/patkraw/OpenShell/blob/gateway-mcp-poc/examples/gateway-mcp-poc/bench/REPORT.md). The proof of concept keeps grants, lineage and results in memory and forwards the supervisor's main session
 token instead of a dedicated token; it has no durable pending operations,
 startup reconciliation or stopping fence (see [Risks](#risks)), which phases 1
 and 5 add.
@@ -1131,8 +1127,9 @@ and 5 add.
 
 - **Results are untrusted input.** A result is text the child wrote, and it
   reaches the parent's model. A child that was manipulated through a prompt
-  injection can put instructions in it. The gateway checks who submits and how
-  much, not what it says; harnesses must treat a result as data.
+  injection can put instructions in it, or fake its status line. The gateway
+  checks who may read it and how much, not what it says; harnesses must treat a
+  result as data.
 
 - **Spawn storms.** A misbehaving lead can create children up to its grant
   quickly. Atomic counters, `max_total`, operator caps, retry deduplication and
@@ -1402,16 +1399,14 @@ UpdateSandboxGrant { grant_id, max_breadth: 3, max_total: 4 }
 **8. The lead collects the result and stops the worker.**
 
 `wait` reaching READY means the worker's sandbox is up, not that its agent has
-finished. The worker writes its answer to a file and calls `mark_done`; the
-lead's `wait` with `for_done` returns, and the lead reads the file.
+finished. The worker's `run-child` writes its answer to a file; the lead's
+`wait` with `until_file` returns the file.
 
 ```text
-worker: writes /tmp/result.txt, then mark_done {}
-→ door adds the worker's token → gateway sets the worker's done flag → done
-lead: wait { handle: worker, for_done: true }
-→ { phase: READY, done: true }
-lead: get_file { handle: worker, path: "/tmp/result.txt" }
-→ read through the relay, not stored → "review: LGTM, 2 nits"
+worker: run-child writes /tmp/result.txt (exit=0, then the answer)
+lead: wait { handle: worker, until_file: "/tmp/result.txt", return_file: true }
+→ gateway reads the file through the relay, not stored
+→ { phase: READY, file_ready: true, content: "exit=0\nreview: LGTM, 2 nits" }
 stop_sandbox { handle: worker }
 → worker's descendants (none) stopped first, then worker; identity revoked first
 ```
