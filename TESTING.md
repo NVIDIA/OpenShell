@@ -174,7 +174,9 @@ what runs where: CI reads it, so no workflow or playbook repeats it.
 
 - **Plans** (`tests/plans/*.yaml`) pair a family (a workspace under
   `tests/suites/`, such as `conformance`) and optionally some of its suites with
-  environment IDs. See [tests/plans/README.md](tests/plans/README.md).
+  environment IDs. See [tests/plans/README.md](tests/plans/README.md). A `conformance` entry must
+  select the same suites in every environment; the runner refuses a plan that
+  doesn't.
 - **Environments** (`tests/environments/*.yaml`) name the tmachine environment and
   installer that provision them and the gateway name the installer registers. The
   runner points the tests at that gateway and the installed CLI with

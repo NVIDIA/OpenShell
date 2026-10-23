@@ -83,7 +83,7 @@
       when: gateway_status is succeeded and conformance_k3s.stat.exists
       block:
         - name: Verify Agent Sandbox reconciliation
-          ansible.builtin.include_tasks: k3s-ready.yaml
+          ansible.builtin.include_tasks: ../k3s-controller-ready.yaml
       rescue:
         - name: Record controller readiness failure
           ansible.builtin.set_fact:

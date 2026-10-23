@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kubernetes (k3s) environments, by Evan Lezar (NVIDIA/OpenShell#4629). See
+# docker.yaml for the fields and for adding arm64. The k3s installers register the gateway as
+# `tmachine`.
+environments:
+  - id: tmachine.ubuntu2404-amd64.k3s.k3s
+    backend: tmachine
+    machine: { os: ubuntu, version: "24.04", arch: amd64 }
+    runtime: k3s
+    installer: k3s
+    tmachine: { environment: ubuntu-k3s, installer: k3s }
+    gateway: tmachine
+  - id: tmachine.ubuntu2404-amd64.k3s.k3s-ha
+    backend: tmachine
+    machine: { os: ubuntu, version: "24.04", arch: amd64 }
+    runtime: k3s
+    installer: k3s-ha
+    tmachine: { environment: ubuntu-k3s, installer: k3s-ha }
+    gateway: tmachine

@@ -16,3 +16,7 @@ matrix:
   - type: conformance
     environments:
       - tmachine.ubuntu2404-amd64.docker-rootful.deb
+      - tmachine.fedora44-amd64.podman-rootful.rpm
+      - tmachine.fedora44-amd64.podman-rootless.rpm
+      - tmachine.ubuntu2404-amd64.k3s.k3s
+      - tmachine.ubuntu2404-amd64.k3s.k3s-ha

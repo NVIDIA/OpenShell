@@ -8,10 +8,17 @@ the file with `_` replaced by `-` (`file_transfer.rs` is `file-transfer`).
 | Suite | Covers |
 |---|---|
 | `smoke` | Create a sandbox, run `echo` in it, delete it |
+| `lifecycle` | SDK: long-running and run-to-completion sandboxes, the default command, restart of a stopped sandbox, deleting a stopped sandbox |
+| `cli` | The same lifecycle through the `openshell` CLI: status, create, get, list, exec, stop, start, delete |
+| `persistent-workspace` | Files in `/sandbox` survive stop and start |
+| `file-transfer` | `sandbox upload` and `download`: round trips, `.gitignore` filtering, workspace-escape and option-looking names |
 
-The suite is small on purpose. It proves that a plan can run a real test through
-the runner on CI. The older suites move to testkit by adding suites here (or a
-new family under `tests/suites/`) and listing them in a plan.
+`smoke` is the smallest end-to-end check that a plan can run a real test through
+the runner on CI. The other suites are ports of the old `conformance/cli`
+scenarios and of Evan Lezar's suites in NVIDIA/OpenShell#4629 (credited in each
+file). `file-transfer` runs `git` on the machine that runs the tests, so a test
+environment needs it installed (`tests/tmachine/ansible/playbooks/test-tools.yaml`
+does that for the tmachine environments).
 
 ## Running it
 
@@ -47,8 +54,9 @@ leave driver behavior alone.
   published docs.
 - Assert `phase` and `exit_code`. Don't assert condition reasons.
 - Check that something did not happen by reading state, not by sleeping.
-- Every environment must pass every test here. If a behavior is left to the
-  driver, the test belongs in a `features` or `drivers` suite instead.
+- Don't test behavior that only some drivers have. A test that can't pass on
+  every environment isn't conformance; put it in `tests/suites/features` or
+  `tests/suites/drivers`.
 - Use the CLI for upload, download, connect and forward. Rely on its exit code
   and `--output json`.
 - Add a testkit helper instead of calling raw gRPC from a test.

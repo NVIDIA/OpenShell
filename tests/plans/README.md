@@ -12,6 +12,10 @@ matrix:
       - tmachine.ubuntu2404-amd64.docker-rootful.deb   # IDs from tests/environments/
 ```
 
+A `conformance` entry must select the same suites in every environment: the
+runner refuses a plan that doesn't, so conformance means the same thing
+everywhere. A test that can't pass everywhere belongs in another family.
+
 A family is a Cargo workspace directly under `tests/suites/` with at least one
 testkit suite. A suite is a test file in a crate's `tests/` directory containing
 `#[testkit::test]` functions. Its name is the file name without `.rs`, with `_`
@@ -19,7 +23,7 @@ replaced by `-`: `tests/file_transfer.rs` is the suite `file-transfer`.
 
 | Plan | Runs |
 |---|---|
-| `cpu-tests.yaml` | The `conformance` family on Ubuntu 24.04 amd64 with rootful Docker and the Debian package |
+| `cpu-tests.yaml` | The `conformance` family on rootful Docker (Debian package), rootful and rootless Podman (RPM), and k3s and HA k3s, all amd64 |
 
 ## How a plan runs on CI
 

@@ -101,6 +101,31 @@ impl Context {
         }
     }
 
+    /// Track a sandbox the test is about to create through the CLI, so cleanup
+    /// deletes it even if the test fails after the gateway accepted the create.
+    /// Call this before the CLI command; use [`Context::adopt`] afterwards.
+    pub fn track(&self, name: &str) {
+        lock(&self.sandboxes).insert(name.to_string());
+    }
+
+    /// A handle to a sandbox created outside the builder, e.g. by the CLI.
+    /// It is tracked for cleanup like a built one.
+    pub async fn adopt(&self, name: &str) -> Result<Sandbox> {
+        self.track(name);
+        let found = self
+            .client
+            .get_sandbox(name)
+            .await
+            .context(format!("get sandbox {name}"))?;
+        Ok(Sandbox {
+            client: self.client.clone(),
+            grpc: self.grpc.clone(),
+            sandboxes: Arc::clone(&self.sandboxes),
+            name: name.to_string(),
+            id: found.id,
+        })
+    }
+
     /// Fail unless the sandbox is gone from both get and list.
     pub async fn expect_absent(&self, sandbox: &Sandbox) -> Result {
         let name = sandbox.name();

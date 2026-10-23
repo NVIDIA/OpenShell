@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Podman-backed environments, by Evan Lezar (NVIDIA/OpenShell#4629). See
+# docker.yaml for the fields and for adding arm64.
+environments:
+  - id: tmachine.fedora44-amd64.podman-rootful.rpm
+    backend: tmachine
+    machine: { os: fedora, version: "44", arch: amd64 }
+    runtime: podman-rootful
+    installer: rpm
+    tmachine: { environment: fedora-podman-rootful, installer: rpm }
+    gateway: openshell
+  - id: tmachine.fedora44-amd64.podman-rootless.rpm
+    backend: tmachine
+    machine: { os: fedora, version: "44", arch: amd64 }
+    runtime: podman-rootless
+    installer: rpm
+    tmachine: { environment: fedora-podman-rootless, installer: rpm }
+    gateway: openshell

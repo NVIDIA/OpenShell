@@ -48,6 +48,7 @@ let
           use_galaxy = true;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/docker.yaml"
           ];
         };
@@ -59,6 +60,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/k3s.yaml"
           ];
         };
@@ -70,6 +72,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootful.yaml"
           ];
@@ -82,6 +85,7 @@ let
           use_galaxy = false;
           playbooks = [
             "ansible/playbooks/nextest.yaml"
+            "ansible/playbooks/test-tools.yaml"
             "ansible/playbooks/selinux.yaml"
             "ansible/playbooks/podman-rootless.yaml"
           ];

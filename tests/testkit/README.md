@@ -64,6 +64,10 @@ test creates, such as providers, in the test itself.
 - `cx.sandbox(suffix)` to build and create a sandbox with a run-unique name.
   The returned `Sandbox` can wait for ready or finished, stop, start, exec,
   read its config and draft policy, set a setting, and delete.
+- `cx.track(name)` to register a sandbox created some other way, such as
+  through the CLI, for cleanup. Call it before the
+  create, so a create that fails after the gateway accepted it is still cleaned
+  up. `cx.adopt(name)` returns a `Sandbox` handle for one the CLI created.
 - `cx.expect_listed` and `cx.expect_absent` to check a sandbox in list and get.
 - `cx.cli([...])` to run the installed CLI against the same gateway, with
   `success()`, `failure()`, and `json()` on the output.

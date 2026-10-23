@@ -91,6 +91,8 @@ pub fn expand(
         }
     }
 
+    check_conformance_is_uniform(&selected)?;
+
     for id in &narrowing.environments {
         if !selected.contains_key(id) {
             bail!("--env {id:?} is not in the plan");
@@ -137,6 +139,44 @@ pub fn expand(
         });
     }
     Ok(jobs)
+}
+
+/// The family every driver and install must pass. A plan can't run part of it
+/// somewhere, or conformance would mean different things in different places.
+const CONFORMANCE: &str = "conformance";
+
+/// Every environment the plan runs conformance in must select the same suites.
+fn check_conformance_is_uniform(
+    selected: &BTreeMap<String, BTreeMap<String, Vec<String>>>,
+) -> Result<()> {
+    let mut by_suites: BTreeMap<BTreeSet<&str>, Vec<&str>> = BTreeMap::new();
+    for (id, families) in selected {
+        if let Some(suites) = families.get(CONFORMANCE) {
+            by_suites
+                .entry(suites.iter().map(String::as_str).collect())
+                .or_default()
+                .push(id);
+        }
+    }
+    if by_suites.len() > 1 {
+        let groups: Vec<String> = by_suites
+            .iter()
+            .map(|(suites, ids)| {
+                format!(
+                    "{} select {}",
+                    ids.join(", "),
+                    suites.iter().copied().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .collect();
+        bail!(
+            "the plan selects different {CONFORMANCE} suites in different environments, so \
+             {CONFORMANCE} would not mean the same thing everywhere; use the same suites \
+             everywhere, or move the suite that can't run everywhere to another family:\n  {}",
+            groups.join("\n  ")
+        );
+    }
+    Ok(())
 }
 
 /// What strict mode (CI) refuses to run: nothing selected at all, an
@@ -339,7 +379,7 @@ mod tests {
     fn groups_entries_by_environment() {
         let jobs = expand_plan(
             &format!(
-                "matrix:\n  - type: conformance\n    suites: [providers]\n    environments: [{AMD64}, {ARM64}]\n  - type: conformance\n    suites: [providers, sandbox-lifecycle]\n    environments: [{AMD64}]\n"
+                "matrix:\n  - type: conformance\n    suites: [providers]\n    environments: [{AMD64}, {ARM64}]\n  - type: conformance\n    suites: [sandbox-lifecycle]\n    environments: [{AMD64}, {ARM64}]\n"
             ),
             &Narrowing::default(),
         )
@@ -419,6 +459,35 @@ mod tests {
             not_in_plan.to_string().contains("not in the plan"),
             "{not_in_plan}"
         );
+    }
+
+    #[test]
+    fn conformance_must_select_the_same_suites_in_every_environment() {
+        let err = expand_plan(
+            &format!(
+                "matrix:\n  - type: conformance\n    environments: [{AMD64}]\n  - type: conformance\n    suites: [providers]\n    environments: [{ARM64}]\n"
+            ),
+            &Narrowing::default(),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("different conformance suites"),
+            "{message}"
+        );
+        assert!(
+            message.contains(AMD64) && message.contains(ARM64),
+            "{message}"
+        );
+
+        // The same suites listed differently are the same selection.
+        expand_plan(
+            &format!(
+                "matrix:\n  - type: conformance\n    suites: [providers, sandbox-lifecycle]\n    environments: [{AMD64}]\n  - type: conformance\n    environments: [{ARM64}]\n"
+            ),
+            &Narrowing::default(),
+        )
+        .unwrap();
     }
 
     #[test]

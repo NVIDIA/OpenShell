@@ -2685,6 +2685,9 @@ name = "sandbox"
 version = "0.0.0"
 dependencies = [
  "openshell-testkit",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

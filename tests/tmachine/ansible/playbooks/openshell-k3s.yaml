@@ -167,6 +167,11 @@
           - k3s_gateway_address.stdout is match('^[0-9.]+:[0-9]+$')
         fail_msg: "Unexpected gateway Service address: {{ k3s_gateway_address.stdout }}"
 
+    # Deployment readiness doesn't establish that the controller reconciles
+    # Sandboxes, so the first test would otherwise race it. Tests don't wait.
+    - name: Verify Agent Sandbox reconciliation
+      ansible.builtin.include_tasks: k3s-controller-ready.yaml
+
 - name: Register OpenShell gateway for test client
   hosts: all
   gather_facts: false
