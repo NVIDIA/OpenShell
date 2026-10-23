@@ -281,6 +281,11 @@ openshell sandbox create -- codex
 
 ### Rust build cache
 
+The `openshell-core` build script embeds a version derived from Git. It
+reruns when HEAD, local branches or tags change, in clones and linked
+worktrees, even if no Rust source changed. Source archives without Git
+metadata use the package version.
+
 Mise preserves an existing `SCCACHE_DIR` so each environment can choose where
 to store compiler cache entries. When `SCCACHE_DIR` is unset, OpenShell uses
 the worktree-local `.cache/sccache` directory. To make cache entries available
