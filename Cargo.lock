@@ -5031,6 +5031,7 @@ dependencies = [
  "openshell-policy",
  "openshell-prover",
  "openshell-providers",
+ "openshell-spire",
  "openshell-supervisor-control",
  "openshell-supervisor-middleware",
  "openshell-supervisor-middleware-builtins",
@@ -5080,6 +5081,21 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser 0.16.0",
+]
+
+[[package]]
+name = "openshell-spire"
+version = "0.0.0"
+dependencies = [
+ "async-trait",
+ "http 1.4.0",
+ "openshell-core",
+ "openshell-crypto",
+ "prost",
+ "spiffe",
+ "tokio",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

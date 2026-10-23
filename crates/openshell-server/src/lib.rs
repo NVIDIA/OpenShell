@@ -415,8 +415,9 @@ pub struct ServerState {
     /// on demand when the user source is configured.
     pub(crate) provider_profile_sources: provider_profile_sources::ProviderProfileSources,
 
-    /// Parsed gateway-owned SPIRE delegation settings. `None` when disabled.
-    pub(crate) spiffe_delegation: Option<spiffe_delegation::SpiffeDelegation>,
+    /// Source of sandbox JWT-SVIDs for brokered provider tokens, built once
+    /// from the SPIRE delegation settings. `None` when disabled.
+    pub(crate) sandbox_identity: Option<Arc<dyn openshell_core::spiffe::SandboxIdentityProvider>>,
 
     /// OIDC admin role name for workspace-level authorization.
     /// Empty when OIDC is not configured — `authorize_workspace()` treats
@@ -493,8 +494,8 @@ impl ServerState {
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
         credentials: credentials::CredentialRuntime,
     ) -> Result<Self> {
-        let spiffe_delegation =
-            spiffe_delegation::SpiffeDelegation::from_config(&config).map_err(Error::config)?;
+        let sandbox_identity =
+            spiffe_delegation::sandbox_identity_provider(&config).map_err(Error::config)?;
         let replica_id = compute::lease::replica_id();
         compute.configure_ssh_identities(credentials.clone());
         let peer_endpoint = derive_peer_endpoint(&config);
@@ -540,7 +541,7 @@ impl ServerState {
             gateway_interceptors: None,
             provider_profile_sources:
                 provider_profile_sources::ProviderProfileSources::with_default_sources(),
-            spiffe_delegation,
+            sandbox_identity,
             admin_role,
         })
     }

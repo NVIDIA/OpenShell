@@ -19,6 +19,7 @@ use openshell_core::proto::{
     GetSandboxProviderAccessTokenRequest, GetSandboxProviderAccessTokenResponse,
     ProviderCredentialTokenGrant,
 };
+use openshell_core::spiffe::SandboxIdentityProvider;
 use openshell_core::token_grant_failure::BROKERED_TOKEN_GATEWAY_DEADLINE;
 use std::time::Duration;
 
@@ -223,16 +224,21 @@ async fn obtain(
     if principal.sandbox_id != session.sandbox_id.as_str() {
         return Err(token_grant_identity_rejected(tonic::Code::PermissionDenied));
     }
-    let delegation = state
-        .spiffe_delegation
-        .as_ref()
-        .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
+    // Startup enables an identity provider only with gateway session JWTs.
+    let (Some(identity), Some(gateway_jwt)) = (
+        state.sandbox_identity.as_deref(),
+        state.config.gateway_jwt.as_ref(),
+    ) else {
+        return Err(token_grant_configuration_status(
+            tonic::Code::FailedPrecondition,
+        ));
+    };
     if state.compute.configured_driver_name() != "kubernetes" {
         return Err(token_grant_configuration_status(
             tonic::Code::FailedPrecondition,
         ));
     }
-    let gateway_id = delegation.gateway_id();
+    let gateway_id = gateway_jwt.gateway_id.as_str();
     let key = &request.get_ref().credential_key;
     let configured = grant_configuration(state, session.sandbox_id.as_str(), key).await?;
     let grant = &configured.grant;
@@ -297,7 +303,8 @@ async fn obtain(
                 state,
                 &bearer,
                 &session,
-                delegation,
+                identity,
+                gateway_id,
                 grant,
                 subject.as_ref(),
                 ttl_override,
@@ -347,7 +354,8 @@ async fn acquire(
     state: &ServerState,
     bearer: &str,
     session: &AuthenticatedSandboxSession,
-    delegation: &crate::spiffe_delegation::SpiffeDelegation,
+    identity: &dyn SandboxIdentityProvider,
+    gateway_id: &str,
     grant: &ProviderCredentialTokenGrant,
     subject: Option<&Subject>,
     ttl_override: Option<Duration>,
@@ -355,8 +363,8 @@ async fn acquire(
 ) -> Result<(oauth::OAuthTokenResponse, i64), Status> {
     authorize(state, bearer).await?;
     let audience = effective_jwt_svid_audience(&grant.token_endpoint, &grant.jwt_svid_audience);
-    let (svid, svid_expiry) = delegation
-        .fetch_jwt_svid(session.sandbox_id.as_str(), &audience)
+    let svid = identity
+        .fetch_jwt_svid(gateway_id, session.sandbox_id.as_str(), &audience)
         .await
         .map_err(TokenGrantFailure::to_status)?;
     authorize(state, bearer).await?;
@@ -364,9 +372,6 @@ async fn acquire(
     let subject_expiry = subject.and_then(|subject| subject.expires_at_ms);
     let token = if let Some(subject) = subject {
         let component_svid = fetch_gateway_jwt_svid(&audience).await?;
-        let stable_id = delegation
-            .sandbox_spiffe_id(session.sandbox_id.as_str())
-            .map_err(|_| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
         let intermediate = perform_intermediate_token_exchange(
             &grant.token_endpoint,
             &TokenExchangeParams {
@@ -374,7 +379,7 @@ async fn acquire(
                 client_assertion_type: &grant.client_assertion_type,
                 subject_token: &subject.value,
                 subject_token_type: &subject.token_type,
-                audience: &stable_id,
+                audience: &svid.spiffe_id,
                 scopes: &[],
                 requested_token_type: &grant.requested_token_type,
             },
@@ -386,7 +391,7 @@ async fn acquire(
             client,
             &grant.token_endpoint,
             &TokenExchangeParams {
-                client_assertion: &svid,
+                client_assertion: &svid.token,
                 client_assertion_type: &grant.client_assertion_type,
                 subject_token: &intermediate.access_token,
                 subject_token_type: oauth::ACCESS_TOKEN_TYPE,
@@ -403,7 +408,7 @@ async fn acquire(
             client,
             &grant.token_endpoint,
             &oauth::TokenGrantParams {
-                client_assertion: &svid,
+                client_assertion: &svid.token,
                 client_assertion_type: &grant.client_assertion_type,
                 audience: &grant.audience,
                 scopes: &grant.scopes,
@@ -417,7 +422,7 @@ async fn acquire(
     let identity_expires_at_ms = session
         .expires_at
         .saturating_mul(1000)
-        .min(svid_expiry.saturating_mul(1000))
+        .min(svid.expires_at.saturating_mul(1000))
         .min(subject_expiry.unwrap_or(i64::MAX));
     let serve_until_ms =
         serve_until_ms(&token, ttl_override, obtained_at_ms, identity_expires_at_ms).ok_or_else(

@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Run the gateway's SPIRE delegated-identity test against a real
+# Run the openshell-spire delegated-identity test against a real
 # SPIRE server and agent.
 #
 # Downloads a pinned, checksum-verified SPIRE release, starts a server and an
 # agent with a private admin socket, authorizes this user's processes as the
 # delegate, registers the sandbox entries the test expects, and runs the
-# ignored `spire_tests` test in openshell-server.
+# ignored live test in openshell-spire.
 
 set -euo pipefail
 
@@ -153,8 +153,6 @@ sandbox_entry() {
   entry "${ID_PREFIX}/gateway/${GATEWAY_ID}/sandbox/$2" "openshell:sandbox:${GATEWAY_ID}:$1"
 }
 
-# The delegate: this user's processes, attested over the admin socket.
-entry "${DELEGATE_ID}" "unix:uid:$(id -u)"
 ALPHA="$(sandbox_id)"
 BETA="$(sandbox_id)"
 UNREGISTERED="$(sandbox_id)"
@@ -166,6 +164,17 @@ sandbox_entry "${BETA}" "${BETA}"
 sandbox_entry "${MISREGISTERED}" "${ALPHA}"
 sandbox_entry "${AMBIGUOUS}" "${AMBIGUOUS}"
 sandbox_entry "${AMBIGUOUS}" "${AMBIGUOUS}-other"
+# The delegate: this user's processes, attested over the admin socket.
+# Registered last, so once the agent issues it the sandbox entries have
+# synced as well.
+entry "${DELEGATE_ID}" "unix:uid:$(id -u)"
+for _ in $(seq 1 60); do
+  if "${BIN}/spire-agent" api fetch jwt -audience openshell-fixture \
+    -socketPath "${WORK}/agent/public/api.sock" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.5
+done
 
 status=0
 OPENSHELL_TEST_SPIRE_ADMIN_SOCKET="${ADMIN_SOCKET}" \
@@ -176,8 +185,7 @@ OPENSHELL_TEST_SPIRE_ADMIN_SOCKET="${ADMIN_SOCKET}" \
   OPENSHELL_TEST_SPIRE_SANDBOX_UNREGISTERED="${UNREGISTERED}" \
   OPENSHELL_TEST_SPIRE_SANDBOX_MISREGISTERED="${MISREGISTERED}" \
   OPENSHELL_TEST_SPIRE_SANDBOX_AMBIGUOUS="${AMBIGUOUS}" \
-  cargo test -p openshell-server --lib spiffe_delegation::tests \
-  -- --ignored --nocapture || status=$?
+  cargo test -p openshell-spire --lib -- --ignored --nocapture || status=$?
 if [ "${status}" -ne 0 ]; then
   echo "--- spire-server log" >&2
   tail -n 50 "${WORK}/server.log" >&2 || true

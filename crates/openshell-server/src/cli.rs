@@ -654,7 +654,7 @@ fn prepare_server_config_with_drivers(
         .and_then(|file| file.openshell.gateway.spiffe_delegation.clone());
 
     // Reject invalid delegation before startup; gateway state parses it later.
-    crate::spiffe_delegation::SpiffeDelegation::validate_config(&config)
+    crate::spiffe_delegation::validate_config(&config)
         .map_err(|error| miette::miette!("{error}"))?;
 
     Ok(ServerStartupConfig {

@@ -101,8 +101,9 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 `openshell.gateway.spiffe_delegation` overlay
 (`ci/values-supervisor-spiffe.yaml`), then registers sandbox
 identities with `ClusterStaticEntry` resources. `mise run test:spire-delegation`
-checks delegated issuance and identity selection against a local SPIRE server
-and agent without a cluster; the Kubernetes test covers the gateway broker.
+checks the `openshell-spire` adapter's delegated issuance and identity selection
+against a local SPIRE server and agent without a cluster; the Kubernetes test
+covers the gateway broker.
 
 The fixture requires admission that permits the admin socket `hostPath` and
 supplemental group; an unlabeled namespace can still inherit cluster-wide
