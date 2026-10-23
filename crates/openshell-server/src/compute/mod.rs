@@ -4442,8 +4442,42 @@ impl ComputeRuntime {
         }
 
         let sandbox_name = current.object_name().to_string();
-        self.validate_isolation_backend_binding(&current)
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = self.validate_isolation_backend_binding(&current) {
+            // Only an explicit stop and start can relaunch the sandbox once the
+            // gateway selection matches again, so leave the restart scan.
+            let message = error.message().to_string();
+            match self
+                .store
+                .update_message_cas::<Sandbox, _>(
+                    sandbox_id,
+                    sandbox_resource_version(&current),
+                    |sandbox| {
+                        let status = sandbox.status.get_or_insert_with(Default::default);
+                        set_next_restart_at_ms(status, 0);
+                        sandbox.set_phase(SandboxPhase::Error as i32);
+                        upsert_ready_condition(
+                            &mut sandbox.status,
+                            SandboxCondition {
+                                r#type: "Ready".to_string(),
+                                status: "False".to_string(),
+                                reason: "IsolationBackendMismatch".to_string(),
+                                message: message.clone(),
+                                transition_time: None,
+                            },
+                        );
+                    },
+                )
+                .await
+            {
+                Ok(updated) => {
+                    self.sandbox_index.update_from_sandbox(&updated);
+                    self.sandbox_watch_bus.notify(sandbox_id);
+                }
+                Err(crate::persistence::PersistenceError::Conflict { .. }) => return Ok(()),
+                Err(err) => return Err(err.to_string()),
+            }
+            return Err(error.to_string());
+        }
         let already_claimed = current
             .status
             .as_ref()
@@ -10548,6 +10582,64 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(next_restart_at_ms(&stored.status.unwrap()) > openshell_core::time::now_ms());
+    }
+
+    #[tokio::test]
+    async fn restart_scan_reports_isolation_backend_mismatch_once() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Starting);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .insert(ISOLATION_BACKEND_ANNOTATION.into(), "other-backend".into());
+        sandbox.status = Some(SandboxStatus {
+            phase: SandboxPhase::Starting as i32,
+            exit_code: Some(9),
+            restart_count: 1,
+            next_restart_time: restart_timestamp(openshell_core::time::now_ms() - 1),
+            ..Default::default()
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.restart_due_sandboxes().await.unwrap();
+        let failed = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        runtime.restart_due_sandboxes().await.unwrap();
+
+        assert_eq!(driver.stop_calls(), 0);
+        assert_eq!(driver.start_calls(), 0);
+        assert_eq!(failed.phase(), SandboxPhase::Error as i32);
+        assert!(
+            failed
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| {
+                    condition.r#type == "Ready"
+                        && condition.reason == "IsolationBackendMismatch"
+                        && condition.message.contains("restore the gateway selection")
+                })
+        );
+        let rescanned = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            sandbox_resource_version(&rescanned),
+            sandbox_resource_version(&failed),
+            "the next scan must leave a mismatched sandbox alone"
+        );
     }
 
     #[tokio::test]
@@ -17301,6 +17393,17 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
                 driver.calls().is_empty(),
                 "another replica must not launch a differently bound resource"
             );
+            assert_eq!(
+                runtime
+                    .store
+                    .get_message::<Sandbox>("external-start")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .phase(),
+                SandboxPhase::Starting as i32,
+                "another replica must not fail a launch it cannot run"
+            );
         }
         let mut capabilities = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest::default()))
@@ -19458,6 +19561,79 @@ endpoint = { kind = "unix", socket_path = "/run/agent-substrate/isolation.sock" 
         .await
         .unwrap();
         assert_eq!(driver.stop_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn preparation_timeout_reports_isolation_backend_mismatch() {
+        let driver = ControlledDriver::new();
+        let runtime = test_runtime(driver.clone()).await;
+        let mut sandbox = sandbox_record("sb-prepare", "prepare", SandboxPhase::Starting);
+        sandbox
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .insert(ISOLATION_BACKEND_ANNOTATION.into(), "other-backend".into());
+        sandbox.status.as_mut().unwrap().provisioning =
+            Some(provisioning_deadline::new_preparation_record(0, 1800));
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let sandbox = runtime
+            .store
+            .get_message::<Sandbox>("sb-prepare")
+            .await
+            .unwrap()
+            .unwrap();
+        let gate = runtime.lifecycle_gates.lock_for("sb-prepare").await;
+        let _sandbox_guard = runtime.lock_sandbox_for_lifecycle(&gate).await;
+        let expired = runtime
+            .claim_provisioning_timeout(&sandbox, 1_800_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expired.phase(), i32::from(SandboxPhase::Error));
+        assert!(
+            expired
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| {
+                    condition.reason == "IsolationBackendMismatch"
+                        && condition.message.contains("restore the gateway selection")
+                })
+        );
+
+        // A registered supervisor keeps the admission diagnostic.
+        let mut admitted = sandbox_record("sb-admission", "admission", SandboxPhase::Starting);
+        admitted
+            .metadata
+            .as_mut()
+            .unwrap()
+            .annotations
+            .insert(ISOLATION_BACKEND_ANNOTATION.into(), "other-backend".into());
+        admitted.status.as_mut().unwrap().provisioning = Some(provisioning_deadline::new_record(0));
+        runtime.store.put_message(&admitted).await.unwrap();
+        let admitted = runtime
+            .store
+            .get_message::<Sandbox>("sb-admission")
+            .await
+            .unwrap()
+            .unwrap();
+        let expired = runtime
+            .claim_provisioning_timeout(&admitted, 300_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            expired
+                .status
+                .as_ref()
+                .unwrap()
+                .conditions
+                .iter()
+                .any(|condition| condition.reason == "ProvisioningTimedOut")
+        );
     }
 
     #[tokio::test]
