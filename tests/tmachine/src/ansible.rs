@@ -4,14 +4,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use tokio::process::Command;
 
 pub fn requirements_path() -> PathBuf {
     PathBuf::from(std::env::var("ANSIBLE_CONFIG").unwrap()).with_file_name("requirements.yaml")
 }
 
-pub async fn install_roles() {
+pub async fn install_roles() -> Result<()> {
     let status = Command::new("ansible-galaxy")
         .arg("role")
         .arg("install")
@@ -20,13 +20,18 @@ pub async fn install_roles() {
         .arg(requirements_path())
         .status()
         .await
-        .unwrap();
+        .context("run ansible-galaxy")?;
 
-    assert!(status.success());
+    ensure!(status.success(), "ansible-galaxy exited with {status}");
+    Ok(())
 }
 
 pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<()> {
     let mut command = Command::new("ansible-playbook");
+    // The VM's SSH forward may not be the inventory's default port.
+    command
+        .arg("--extra-vars")
+        .arg(format!("ansible_port={}", crate::ssh_port()));
     for (name, path) in inputs {
         let value = match std::fs::canonicalize(path) {
             Ok(path) => path,
@@ -42,8 +47,19 @@ pub async fn run(playbook: &Path, inputs: &BTreeMap<String, PathBuf>) -> Result<
             .arg(format!("{name}={}", value.display()));
     }
 
-    let status = command.arg(playbook).status().await.unwrap();
+    // Stop ansible-playbook if the caller is dropped, for example when the
+    // runner is cancelled.
+    command.kill_on_drop(true);
+    let status = command
+        .arg(playbook)
+        .status()
+        .await
+        .context("run ansible-playbook")?;
 
-    assert!(status.success());
+    ensure!(
+        status.success(),
+        "ansible-playbook {} exited with {status}",
+        playbook.display()
+    );
     Ok(())
 }

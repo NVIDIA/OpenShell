@@ -10,7 +10,7 @@ use blake3::Hasher;
 use directories::ProjectDirs;
 
 use super::img::QemuImage;
-use super::vm::QemuVm;
+use super::vm::{LAYER_POWER_OFF_TIMEOUT, QemuVm};
 
 pub(super) async fn cached_layer(
     base_image: &Path,
@@ -29,7 +29,7 @@ pub(super) async fn cached_layer(
     }
 
     if use_galaxy {
-        crate::ansible::install_roles().await;
+        crate::ansible::install_roles().await?;
     }
 
     let temporary_disk = disks_dir.join(format!("{hash}.tmp"));
@@ -38,10 +38,12 @@ pub(super) async fn cached_layer(
     }
 
     let image = QemuImage::create(base_image, temporary_disk.clone()).await;
-    let vm = QemuVm::start(&image).await;
+    let vm = QemuVm::start(&image).await?;
     run_playbooks(playbooks, inputs).await?;
-    vm.shutdown().await;
-    vm.wait().await;
+    // A layer is only cached after a clean power-off, so failing here is an
+    // error rather than something to log and move past.
+    vm.shutdown().await.context("power off the VM")?;
+    vm.wait(LAYER_POWER_OFF_TIMEOUT).await?;
 
     std::fs::rename(temporary_disk, &disk).unwrap();
     Ok(disk)

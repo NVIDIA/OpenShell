@@ -17,6 +17,9 @@ python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 tests/testkit/         # Support library for SDK-driven E2E suites
+tests/suites/conformance/  # Testkit suites (the `sandbox` crate) beside the older CLI conformance crate
+tests/tmachine/        # QEMU test machines, Ansible playbooks, and the Session API
+tests/runner/          # openshell-test-runner: runs a test family in a tmachine environment
 ```
 
 ## Rust Tests
@@ -139,6 +142,71 @@ gateway the same way the CLI does, through `OPENSHELL_GATEWAY_ENDPOINT`,
 by `OPENSHELL_BIN`. See
 [tests/testkit/README.md](tests/testkit/README.md) for how to write and run
 tests.
+
+Suites live under `tests/suites/<family>/`. Each family is a Cargo workspace
+with its own lockfile. `tests/suites/conformance/sandbox` is the first testkit
+suite; it has one smoke test. Run it against a local Docker gateway with:
+
+```shell
+mise run e2e:testkit
+```
+
+That task runs `e2e/with-docker-gateway.sh`, which starts a gateway and exports
+`OPENSHELL_GATEWAY` and `OPENSHELL_BIN`, so the suite runs the same way the
+runner runs it in a guest.
+
+Workspaces that build root crates through path dependencies must lock shared
+crates at the versions in the root `Cargo.lock`; otherwise CI can build against
+dependencies the Nix toolchain doesn't support. `mise run rust:lockfiles:check`
+verifies this, and `uv run tasks/scripts/check_cargo_lockfile_alignment.py --fix`
+re-locks a workspace from the root lockfile. Add new testkit workspaces to
+`ALIGNED_WORKSPACES` in that script.
+
+### Running suites in a tmachine environment (`tests/runner/`)
+
+`openshell-test-runner` runs a test family inside a tmachine VM, against the
+OpenShell that the VM's installer set up. It is adapted from the runner in
+NVIDIA/OpenShell#4629 by Evan Lezar.
+
+```shell
+nix run .#openshell-test-runner -- \
+  --environment ubuntu-docker-rootful --installer deb \
+  --family conformance --package sandbox
+```
+
+It:
+
+1. builds the family's packages on the host as a nextest archive for the
+   guest's musl target, with `testkit-ready`;
+2. boots the tmachine environment with the installer (this needs KVM, and
+   tmachine only boots guests of the host's architecture);
+3. copies the archive in, waits for the gateway with `testkit-ready`, and runs
+   the tests with the guest's `cargo-nextest`, pointing them at the installed
+   CLI (`OPENSHELL_BIN`) and the gateway the installer registered
+   (`OPENSHELL_GATEWAY`, `--gateway`, default `openshell`);
+4. writes `junit.xml`, `nextest.log` and, after a failure, the guest's
+   diagnostics to `artifacts/test-results/` (`--results`);
+5. shuts the VM down, also on failure or SIGTERM.
+
+A run passes if nextest succeeds and its JUnit report shows at least one test
+and no failures. `--filter <filterset>` narrows the tests with a nextest
+filterset, and `--keep` leaves the VM running until you press Enter. Every SSH
+and nextest step has a timeout. Two runs on one host need different
+`TMACHINE_SSH_PORT` values (default 2222). The installer inputs, such as the
+Debian package and the images, come from `artifacts/`, built by
+`nix run .#build-artifacts` or downloaded by CI.
+
+A flaky or broken test is marked `#[ignore = "<issue link>"]`, which takes it
+out of every environment until it's fixed.
+
+**CI.** `.github/workflows/e2e-suites.yml` lists the environments and suites as
+an explicit matrix and runs the runner once per row. Branch E2E calls it when
+the `test:e2e` label is set. It is advisory for now. To run a suite in another
+environment on CI, add a row.
+
+The older conformance, feature and driver lanes in `.github/workflows/` still
+run through the tmachine testsuites in `tests/tmachine/config.nix`. They move
+to the runner as their suites move to testkit.
 
 ### Python E2E (`e2e/python/`)
 

@@ -63,6 +63,9 @@ Do not rely on this file for a full inventory. The detailed public and contribut
 | `sdk/typescript/` | TypeScript SDK | Native Connect client, curated sandbox API, and generated protobuf types |
 | `proto/` | Protobuf definitions | gRPC service contracts |
 | `tests/testkit/` | E2E testkit | Support library and `#[testkit::test]` attribute for SDK-driven E2E suites |
+| `tests/suites/` | E2E suites | One Cargo workspace per test family; `conformance/sandbox` is the first testkit suite |
+| `tests/tmachine/` | Test machines | QEMU machines provisioned with Ansible, and the `Session` API that drives them |
+| `tests/runner/` | Test runner | `openshell-test-runner`: builds a family's tests, runs them in one tmachine environment, checks the JUnit results |
 | `deploy/` | Docker, Helm, K8s | Dockerfiles, Helm chart, manifests |
 | `docs/` | Published docs | MDX pages, navigation, and content assets |
 | `fern/` | Docs site config | Fern site config, components, and theme assets |
