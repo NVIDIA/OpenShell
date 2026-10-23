@@ -745,7 +745,8 @@ pub(crate) fn prepare_private_dir(_path: &Path) -> Result<()> {
     ))
 }
 
-#[cfg(test)]
+// Hosted sandbox instances require a Unix host.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use http_body_util::BodyExt as _;
@@ -1050,7 +1051,6 @@ mod tests {
 
         // Files that cannot be deleted keep the key reserved until a later
         // removal deletes them. Root ignores the permission this relies on.
-        #[cfg(unix)]
         if !nix::unistd::geteuid().is_root() {
             use std::os::unix::fs::PermissionsExt as _;
 
