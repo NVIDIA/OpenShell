@@ -403,7 +403,7 @@ Issues and pull requests receive `state:stale` after 14 days without activity. O
 
 For release notes, describe the user-facing change in a few short, easy-to-read sentences in the optional **Release Notes** section of the PR description. Keep the section concise. Stable releases use it when non-empty; otherwise they summarize the PR title and description.
 
-Every PR except an automated dependency update must close an existing issue. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
+Every PR must close an existing issue, except automated dependency updates and the build and flaky-test fixes described below. In the PR's **Related Issue** section, use `Closes #NNN` for the issue covering that PR's scope. Split multi-PR work into a closable issue for each PR; a tracking issue can link them. Security fixes follow the private disclosure process in [SECURITY.md](SECURITY.md).
 
 Authors without write access to the target repository must link at least one issue with `state:accepted`, and every linked issue must be accepted. This applies to drafts and direct requests to agents. Authors with verified `WRITE`, `MAINTAIN`, or `ADMIN` access may create a PR without the acceptance label; they must still follow the issue-linking requirement above. PR body text, roadmap placement, other labels, and vouch status do not bypass acceptance.
 
@@ -411,11 +411,13 @@ The `PR Issue Acceptance` workflow reports the native `OpenShell / PR Issue Acce
 
 Automated dependency update PRs, including Dependabot PRs, are exempt from the separate issue and closing-reference requirement. Human-authored dependency updates follow the normal issue requirement. The exception does not bypass `PR Issue Acceptance` for authors without repository write access or change applicable verification, review, or private vulnerability disclosure requirements.
 
+Authors with `WRITE`, `MAINTAIN`, or `ADMIN` access may open a PR that only fixes a broken build or flaky tests without a separate issue. Describe the failure in the PR instead. Authors without write access follow the normal issue and acceptance requirements.
+
 ### Branch Names
 
 Use `<type>/<issue-id>-<short-description>/<github-username>` for contributor branches. Choose the Conventional Commit type that describes the work, such as `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`, `test`, or `ci`. The description is a short lowercase slug separated by hyphens; the final component is your GitHub login, not initials.
 
-For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
+For example, issue 1234 with contributor `octocat` uses `feat/1234-add-pagination/octocat`. A PR without an issue omits the issue ID, such as `fix/flaky-sandbox-tests/octocat`. Dependent PRs follow the same naming rule and branch from their parent PR's branch.
 
 Branches created by automation, such as Dependabot and CI mirror branches, keep their generated names. For private security work, follow the authorized disclosure workflow and use a neutral description that does not expose vulnerability details.
 
