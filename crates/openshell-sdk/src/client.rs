@@ -14,6 +14,7 @@ use crate::error::{Result, SdkError};
 use crate::pagination::{Page, Pager};
 use crate::raw::AuthedGrpcClient;
 use crate::refresh::{RefreshedToken, TokenSource};
+use crate::routing::{OwnerCache, owner_replica, retry_unrouted, routed_to, with_owner_hint};
 use crate::types::{
     DeleteOptions, DeletionResult, ExecOptions, ExecResult, Health, ListOptions, SandboxPhase,
     SandboxRef, SandboxSpec, SandboxTemplateCreateSpec, SandboxTemplateListOptions,
@@ -26,6 +27,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tonic::metadata::AsciiMetadataValue;
 use tonic::transport::Channel;
 
 /// Async client for a single `OpenShell` gateway.
@@ -43,6 +45,7 @@ pub struct OpenShellClient {
     /// Live bearer slot the interceptor reads; refreshed tokens are written
     /// here so rotation reaches in-flight requests. `None` for non-OIDC auth.
     bearer_slot: Option<BearerSlot>,
+    owners: OwnerCache,
 }
 
 impl OpenShellClient {
@@ -60,6 +63,7 @@ impl OpenShellClient {
             interceptor,
             token_source,
             bearer_slot,
+            owners: OwnerCache::default(),
         })
     }
 
@@ -75,6 +79,7 @@ impl OpenShellClient {
             interceptor,
             token_source: None,
             bearer_slot,
+            owners: OwnerCache::default(),
         }
     }
 
@@ -625,16 +630,7 @@ impl OpenShellClient {
             no_login_shell: opts.no_login_shell,
         };
 
-        // Open the stream under the same OIDC-aware auth policy as unary RPCs
-        // (proactive refresh, then one reactive retry on `Unauthenticated`).
-        // Mid-stream rotation is out of scope; streaming retry is tracked
-        // separately.
-        let mut stream = self
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.exec_sandbox(request).await }
-            })
-            .await?;
+        let mut stream = self.open_exec("default", request).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -790,21 +786,76 @@ impl OpenShellClient {
         F: Fn(AuthedGrpcClient) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
     {
+        self.unary_response(call)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    /// [`OpenShellClient::unary`] that keeps the response metadata.
+    async fn unary_response<T, F, Fut>(&self, call: F) -> Result<tonic::Response<T>>
+    where
+        F: Fn(AuthedGrpcClient) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, tonic::Status>>,
+    {
         self.ensure_fresh().await?;
         match call(self.raw_grpc()).await {
-            Ok(resp) => Ok(resp.into_inner()),
+            Ok(resp) => Ok(resp),
             Err(status) if status.code() == tonic::Code::Unauthenticated => {
                 if self.refresh_on_unauthorized().await? {
-                    call(self.raw_grpc())
-                        .await
-                        .map(tonic::Response::into_inner)
-                        .map_err(map_status)
+                    call(self.raw_grpc()).await.map_err(map_status)
                 } else {
                     Err(map_status(status))
                 }
             }
             Err(status) => Err(map_status(status)),
         }
+    }
+
+    /// Best effort: a failed lookup leaves the call unrouted.
+    async fn owner_of(&self, workspace: &str, name: &str) -> Option<AsciiMetadataValue> {
+        if let Some(cached) = self.owners.get(workspace, name) {
+            return cached.0;
+        }
+        let response = self
+            .unary_response(|mut grpc| {
+                let request = with_owner_hint(proto::GetSandboxRequest {
+                    name: name.to_string(),
+                    workspace_scope: Some(proto::workspace_selector(workspace)),
+                });
+                async move { grpc.get_sandbox(request).await }
+            })
+            .await
+            .ok()?;
+        let owner = owner_replica(&response);
+        self.owners.insert(workspace, name, owner.clone());
+        owner
+    }
+
+    /// Open `ExecSandbox` on the owner replica under the unary auth policy.
+    async fn open_exec(
+        &self,
+        workspace: &str,
+        request: proto::ExecSandboxRequest,
+    ) -> Result<tonic::Streaming<proto::ExecSandboxEvent>> {
+        let owner = self.owner_of(workspace, &request.sandbox).await;
+        let owners = &self.owners;
+        self.unary(|mut grpc| {
+            let request = request.clone();
+            let owner = owner.clone();
+            async move {
+                match grpc
+                    .exec_sandbox(routed_to(request.clone(), owner.as_ref()))
+                    .await
+                {
+                    Err(status) if retry_unrouted(owner.as_ref(), &status) => {
+                        owners.forget(workspace, &request.sandbox);
+                        grpc.exec_sandbox(request).await
+                    }
+                    response => response,
+                }
+            }
+        })
+        .await
     }
 
     /// Proactive refresh: if a token source is wired and the token is within
@@ -1204,13 +1255,7 @@ impl WorkspaceScopedClient {
             no_login_shell: opts.no_login_shell,
         };
 
-        let mut stream = self
-            .client
-            .unary(|mut grpc| {
-                let request = request.clone();
-                async move { grpc.exec_sandbox(request).await }
-            })
-            .await?;
+        let mut stream = self.client.open_exec(&self.workspace, request).await?;
 
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1547,6 +1592,7 @@ mod tests {
             interceptor,
             token_source: Some(source),
             bearer_slot,
+            owners: OwnerCache::default(),
         }
     }
 

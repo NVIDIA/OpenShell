@@ -10,6 +10,7 @@
 
 use openshell_core::proto;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
+use openshell_core::replica_routing;
 use openshell_sdk::{
     AuthConfig, ClientConfig, ExecOptions, ListOptions, OpenShellClient, Refresh, RefreshError,
     RefreshedToken, SandboxPhase, SandboxSpec, SandboxTemplateCreateSpec,
@@ -60,6 +61,11 @@ struct MockState {
     last_list_request: Mutex<Option<proto::ListSandboxesRequest>>,
     list_requests: Mutex<Vec<proto::ListSandboxesRequest>>,
     last_exec_request: Mutex<Option<proto::ExecSandboxRequest>>,
+    owner_replica: Option<&'static str>,
+    owner_lookups: AtomicU32,
+    /// `x-openshell-replica` per `ExecSandbox` call; empty when unrouted.
+    exec_routes: Mutex<Vec<String>>,
+    routed_exec_error: Option<Status>,
     last_workspace_request: Mutex<Option<String>>,
     get_calls: AtomicU32,
     phase_sequence: Vec<proto::SandboxPhase>,
@@ -456,6 +462,12 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::GetSandboxRequest>,
     ) -> Result<Response<proto::SandboxResponse>, Status> {
+        let wants_owner = request
+            .metadata()
+            .contains_key(replica_routing::OWNER_REQUEST_HEADER);
+        if wants_owner {
+            self.state.owner_lookups.fetch_add(1, Ordering::SeqCst);
+        }
         let req = request.into_inner();
         let name = req.name.clone();
         *self.state.last_get_name.lock().await = Some(name.clone());
@@ -487,10 +499,17 @@ impl OpenShell for TestOpenShell {
         if let Some(id) = &self.state.get_sandbox_id {
             sandbox.metadata.as_mut().unwrap().id.clone_from(id);
         }
-        Ok(Response::new(proto::SandboxResponse {
+        let mut response = Response::new(proto::SandboxResponse {
             sandbox: Some(sandbox),
             service_urls: HashMap::new(),
-        }))
+        });
+        if wants_owner && let Some(owner) = self.state.owner_replica {
+            response.metadata_mut().insert(
+                replica_routing::OWNER_REPLICA_HEADER,
+                owner.parse().unwrap(),
+            );
+        }
+        Ok(response)
     }
 
     async fn list_sandboxes(
@@ -621,6 +640,15 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<proto::ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        let route = request
+            .metadata()
+            .get(replica_routing::ROUTE_REPLICA_HEADER)
+            .map_or_else(String::new, |value| value.to_str().unwrap().to_string());
+        let routed = !route.is_empty();
+        self.state.exec_routes.lock().await.push(route);
+        if routed && let Some(error) = &self.state.routed_exec_error {
+            return Err(error.clone());
+        }
         *self.state.last_exec_request.lock().await = Some(request.into_inner());
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(async move {
@@ -1738,6 +1766,100 @@ async fn exec_buffers_stdout_stderr_and_exit() {
             .and_then(|value| openshell_core::time::duration_to_std(value).ok()),
         Some(Duration::from_secs(10))
     );
+}
+
+/// Run `count` execs on `my-box` and return the mock with the routes it saw.
+async fn run_execs(state: MockState, count: usize) -> Arc<MockState> {
+    let state = Arc::new(state);
+    let client = connect(&start_mock(state.clone()).await).await;
+    for _ in 0..count {
+        let _ = client
+            .exec("my-box", &["echo".to_string()], ExecOptions::default())
+            .await;
+    }
+    state
+}
+
+async fn routes(state: &MockState) -> Vec<String> {
+    state.exec_routes.lock().await.clone()
+}
+
+#[tokio::test]
+async fn exec_routes_to_the_reported_owner_and_reuses_it() {
+    let state = run_execs(
+        MockState {
+            owner_replica: Some("openshell-1"),
+            ..Default::default()
+        },
+        2,
+    )
+    .await;
+    assert_eq!(routes(&state).await, ["openshell-1"; 2]);
+    assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 1);
+
+    let state = run_execs(MockState::default(), 2).await;
+    assert_eq!(routes(&state).await, ["", ""]);
+    assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn exec_retries_unrouted_only_when_the_owner_route_has_no_endpoints() {
+    let state = run_execs(
+        MockState {
+            owner_replica: Some("openshell-1"),
+            routed_exec_error: Some(Status::unavailable("")),
+            ..Default::default()
+        },
+        2,
+    )
+    .await;
+    assert_eq!(routes(&state).await, ["openshell-1", "", "openshell-1", ""]);
+    assert_eq!(state.owner_lookups.load(Ordering::SeqCst), 2);
+
+    let state = run_execs(
+        MockState {
+            owner_replica: Some("openshell-1"),
+            routed_exec_error: Some(Status::unavailable("supervisor not connected")),
+            ..Default::default()
+        },
+        1,
+    )
+    .await;
+    assert_eq!(routes(&state).await, ["openshell-1"]);
+}
+
+#[tokio::test]
+async fn exec_runs_unrouted_when_the_owner_lookup_fails() {
+    let state = run_execs(
+        MockState {
+            owner_replica: Some("openshell-1"),
+            get_error: Some(Status::internal("lookup failed")),
+            ..Default::default()
+        },
+        1,
+    )
+    .await;
+    assert_eq!(routes(&state).await, [""]);
+    assert!(state.last_exec_request.lock().await.is_some());
+}
+
+#[tokio::test]
+async fn workspace_exec_looks_up_the_owner_in_its_workspace() {
+    let state = Arc::new(MockState {
+        owner_replica: Some("openshell-1"),
+        ..Default::default()
+    });
+    let client = connect(&start_mock(state.clone()).await).await;
+    client
+        .workspace("team")
+        .exec("my-box", &["echo".to_string()], ExecOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        state.last_get_workspace.lock().await.as_deref(),
+        Some("team")
+    );
+    assert_eq!(routes(&state).await, ["openshell-1"]);
 }
 
 /// Refresher that hands out a fixed "fresh-token" and counts invocations.
