@@ -211,6 +211,12 @@ pub fn normalize_compute_driver_name(value: &str) -> Result<String, String> {
 pub struct SpiffeDelegationConfig {
     pub admin_socket_path: String,
     pub spiffe_id_prefix: String,
+    /// Supplementary group permitted to open the admin socket.
+    ///
+    /// The gateway validates it but
+    /// never changes its own groups; the Helm chart adds it to the gateway
+    /// Pod's `supplementalGroups`, and other deployments must run the gateway
+    /// with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_socket_group: Option<u32>,
 }

@@ -1,0 +1,29 @@
+{{- /*
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+*/ -}}
+{{- $delegation := get (.Values.gatewayConfig | default dict) "openshell.gateway.spiffe_delegation" | default dict -}}
+{{- if $delegation }}
+SPIRE delegation (openshell.gateway.spiffe_delegation) is enabled. Provider
+token grants for shared-supervisor sandboxes need these prerequisites:
+
+1. Admission. The gateway Pod mounts the SPIRE agent admin socket directory
+   {{ dir (get $delegation "admin_socket_path") }} as a hostPath volume. Pod Security
+   Standards forbid hostPath at Baseline and Restricted, so namespace
+   {{ .Release.Namespace }} needs an explicit policy exception or a custom
+   admission policy for this volume, or an approved alternative mount.
+{{- with get $delegation "admin_socket_group" }}
+   The Pod also joins supplemental group {{ . }}. Admission must allow it; on
+   OpenShift the restricted-v2 SCC rejects groups outside the namespace range.
+{{- end }}
+
+2. Startup order. The volume has type Directory: the SPIRE agent must create
+   that directory before the gateway Pod starts. A missing directory leaves
+   the Pod in ContainerCreating. The agent must also serve the socket with
+   group access for the gateway before provider token grants can succeed.
+
+3. Registrations. The gateway obtains sandbox identities from the agent on its
+   own node. Register them for every SPIRE agent that may run a gateway Pod,
+   for example with a node alias or one entry per agent. A gateway Pod on a
+   node whose agent lacks the entries fails every grant.
+{{- end }}

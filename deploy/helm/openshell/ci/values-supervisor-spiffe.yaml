@@ -5,6 +5,13 @@
 # identity from the node's SPIRE agent (ci/values-spire-delegation-stack.yaml)
 # for provider token grants. The gateway keeps its own Workload API identity
 # for the RFC 8693 intermediate exchange.
+#
+# This fixture requires admission that permits the admin socket hostPath and
+# group; an unlabeled namespace can inherit cluster-wide restrictions. The
+# test registers sandboxes only with the agent on the gateway's node. A
+# deployment needs a Pod Security exception or
+# equivalent admission policy and registrations for every agent that may run a
+# gateway Pod.
 gatewayConfig:
   openshell.drivers.kubernetes:
     supervisor_topology: gateway

@@ -309,6 +309,12 @@ spec:
             path: ca.crt
     {{- end }}
     {{- if $delegation }}
+    {{- /*
+    Pod Security Baseline and Restricted forbid hostPath; NOTES.txt lists the
+    admission, startup-order, and registration prerequisites. Keep Directory:
+    creating an empty directory would provide neither the agent's socket nor
+    its group permissions.
+    */}}
     - name: spire-agent-admin
       hostPath:
         path: {{ dir (get $delegation "admin_socket_path") | quote }}

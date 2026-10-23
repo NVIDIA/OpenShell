@@ -104,6 +104,17 @@ identities with `ClusterStaticEntry` resources. `mise run test:spire-delegation`
 checks delegated issuance and identity selection against a local SPIRE server
 and agent without a cluster; the Kubernetes test covers the gateway broker.
 
+The fixture requires admission that permits the admin socket `hostPath` and
+supplemental group; an unlabeled namespace can still inherit cluster-wide
+restrictions. The test registers sandboxes with the agent on the gateway's
+node only. Real deployments need a Pod Security
+exception or custom admission policy (Baseline and Restricted forbid it),
+OpenShift must admit `admin_socket_group` as a supplemental group, the agent
+must create the socket directory before the gateway starts (`type: Directory`
+is intentional), and registrations must cover every agent that may run a
+gateway Pod, for example with a SPIRE node alias. Limiting replicas does not
+cover rescheduling. The chart's install notes list these prerequisites.
+
 ### 2. Deploy OpenShell
 
 **Iterative dev** (rebuilds on file changes, recommended during active development):

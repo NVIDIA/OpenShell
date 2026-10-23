@@ -2579,7 +2579,7 @@ use openshell_core::oauth::{
     effective_token_type,
 };
 use openshell_core::token_grant_failure::{
-    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage,
+    TokenGrantFailure, TokenGrantFailureKind, TokenGrantStage, WORKLOAD_IDENTITY_CALL_TIMEOUT,
 };
 const DEFAULT_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const MAX_INTERMEDIATE_TOKEN_CACHE_TTL_SECONDS: i64 = 3600;
@@ -2616,17 +2616,23 @@ impl IntermediateTokenCache {
     }
 
     fn get(&self, key: &str) -> Option<oauth::OAuthTokenResponse> {
+        self.get_until(key).map(|(token, _)| token)
+    }
+
+    /// The unexpired token with the time its entry expires, in milliseconds.
+    fn get_until(&self, key: &str) -> Option<(oauth::OAuthTokenResponse, i64)> {
         let now_ms = crate::persistence::current_time_ms();
         let tokens = self.tokens.read().ok()?;
         let cached = tokens.get(key)?;
         if cached.expires_at_ms <= now_ms {
             return None;
         }
-        Some(oauth::OAuthTokenResponse {
+        let token = oauth::OAuthTokenResponse {
             access_token: cached.access_token.clone(),
             expires_in: cached.expires_at_ms.saturating_sub(now_ms) / 1000,
             token_type: cached.token_type.clone(),
-        })
+        };
+        Some((token, cached.expires_at_ms))
     }
 
     fn set(&self, key: String, token: &oauth::OAuthTokenResponse, expires_at_ms: i64) {
@@ -4660,13 +4666,28 @@ async fn fetch_gateway_jwt_svid(audience: &str) -> Result<String, Status> {
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| token_grant_configuration_status(tonic::Code::FailedPrecondition))?;
     let endpoint = workload_api_endpoint(std::path::Path::new(&socket_path));
-    let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
-        .await
-        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))?;
-    client
-        .fetch_jwt_token([audience], None)
-        .await
-        .map_err(|error| token_grant_workload_api_status(error, tonic::Code::FailedPrecondition))
+    // A wedged Workload API socket must not hold the grant past its deadline.
+    tokio::time::timeout(WORKLOAD_IDENTITY_CALL_TIMEOUT, async {
+        let client = spiffe::WorkloadApiClient::connect_to(&endpoint)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })?;
+        client
+            .fetch_jwt_token([audience], None)
+            .await
+            .map_err(|error| {
+                token_grant_workload_api_status(error, tonic::Code::FailedPrecondition)
+            })
+    })
+    .await
+    .map_err(|_| {
+        TokenGrantFailure::new(
+            TokenGrantFailureKind::Timeout,
+            TokenGrantStage::WorkloadIdentity,
+        )
+        .to_status()
+    })?
 }
 
 fn validate_gateway_jwt_svid_claims(

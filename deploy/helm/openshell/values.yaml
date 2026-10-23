@@ -329,6 +329,12 @@ affinity: {}
 gatewayConfig:
   openshell:
     version: 2
+  # openshell.gateway.spiffe_delegation mounts the SPIRE agent admin socket
+  # directory into the gateway as a hostPath volume, which Pod Security
+  # Baseline and Restricted forbid. It needs an admission exception, the
+  # agent's socket directory before the gateway starts, an admitted
+  # admin_socket_group, and sandbox registrations for every agent that may run
+  # a gateway Pod. The install notes repeat these prerequisites.
 
 # Server configuration
 server:

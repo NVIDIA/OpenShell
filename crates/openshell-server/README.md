@@ -91,15 +91,38 @@ fixture at an existing deployment database.
 acquisition for the Kubernetes shared supervisor. The private admin
 socket is mounted only in the gateway. `GetSandboxProviderAccessToken` accepts an
 endpoint-bound configured credential key; sandbox identity comes from the
-verified, currently authorized session JWT. Provider attachment and profile
+verified, currently authorized session JWT. The key must equal one of the
+gateway's configured keys, including its endpoint owner, once the supervisor's
+revision and installation are removed. Provider attachment and profile
 configuration determine the endpoint, audience, and scopes. The gateway performs
 RFC 7523 or both RFC 8693 exchanges and returns only the final access token.
 Its bounded cache is isolated by sandbox generation, credential epoch, provider
-revision, and grant. The session is authorized again around each SPIRE and
+revision, the matched configured key and grant, and the subject token, which is
+resolved before every lookup so its revocation or rotation also applies to
+cached tokens. Concurrent misses for one cache key wait for a single
+acquisition, then use its cached token. A token is served until the usual skew
+before the earliest of its `expires_in`, its JWT `exp`, and the session, SVID,
+and subject expiries, and no longer than the default cache lifetime; a
+configured cache TTL can only shorten that. The response reports the remaining
+lifetime. The session is authorized again around each SPIRE and
 token-service call. A cache hit and a fresh token then pass the same final
 check: the grant configuration still matches and the session is still
 authorized. A fresh token is cached only after that check. Startup validates
 the delegation settings, and gateway state construction parses them once and
-returns a configuration error when they are invalid; each request still fetches
+returns a configuration error when they are invalid; each cache miss fetches
 a new SVID and the agent's current JWT bundle. SPIRE still trusts the gateway as a
 delegate for its agent's available registration scope.
+
+`openshell_core::token_grant_failure` defines the time limits: SPIRE and
+Workload API calls, token-service requests, the gateway's deadline for one
+request (including waiting for a concurrent acquisition), and the longer
+supervisor deadline that covers connecting to the gateway.
+
+Deployments must admit the admin socket mount: the chart uses a hostPath
+volume, which Pod Security Baseline and Restricted forbid, so the namespace
+needs a policy exception or custom admission policy, and OpenShift must admit
+`admin_socket_group`. The gateway never changes its own groups; outside the
+chart, run it with that group. The SPIRE agent must create the socket directory
+before the gateway Pod starts. Sandbox registrations must cover every agent
+that may run a gateway Pod, for example through a node alias; a gateway on a
+node whose agent lacks them fails every grant.

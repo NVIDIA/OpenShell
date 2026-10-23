@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e-kubernetes-shared-supervisor-spiffe")]
 
-//! Sandbox identities delegated by SPIRE to the shared supervisor.
+//! Sandbox identities delegated by SPIRE to the gateway for a shared supervisor.
 //!
 //! The wrapper installs SPIRE (`ci/values-spire-delegation-stack.yaml`) and
 //! the gateway topology with SPIRE delegation
@@ -11,12 +11,13 @@
 //! sandbox identities as an operator would, with `ClusterStaticEntry`
 //! resources, and drives the existing RFC 8693 provider exchange: the gateway
 //! exchanges the stored subject token with its own SVID for the sandbox's
-//! SPIFFE ID, and the shared supervisor exchanges that intermediate token with
-//! the sandbox's delegated SVID. The token service is a host fixture reached
+//! SPIFFE ID, then exchanges that intermediate token with the sandbox's
+//! delegated SVID. The supervisor receives only the final access token.
+//! The token service is a host fixture reached
 //! through a selectorless Service, and it hands out tokens that name the
 //! identity they were issued to.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write as _;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -455,12 +456,18 @@ fn call_script(port: u16) -> String {
         r#"
 import urllib.error, urllib.request, uuid
 
+def canonical_request_id(value):
+    try:
+        return str(uuid.UUID(value)) == value
+    except (TypeError, ValueError, AttributeError):
+        return False
+
 try:
     with urllib.request.urlopen("http://{TEST_HOST}:{port}/resource", timeout=20) as response:
         print(response.read().decode())
 except urllib.error.HTTPError as error:
     request_id = error.headers.get("x-openshell-request-id", "")
-    if error.code == 502 and str(uuid.UUID(request_id)) == request_id:
+    if error.code == 502 and canonical_request_id(request_id):
         print("DENIED")
     else:
         print(f"HTTP-{{error.code}}")
@@ -636,10 +643,10 @@ async fn unregister_all() {
 // contain "spiffe" without exposing an identity socket or credential.
 fn assert_no_spiffe_access(pod: &serde_json::Value) {
     let spec = &pod["spec"];
-    let containers = spec["containers"]
-        .as_array()
-        .unwrap()
-        .iter()
+    let containers = ["containers", "initContainers", "ephemeralContainers"]
+        .into_iter()
+        .filter_map(|field| spec[field].as_array())
+        .flatten()
         .map(|container| {
             serde_json::json!({
                 "env": container["env"],
@@ -778,13 +785,16 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
             .map(|exchange| exchange.assertion_subject.clone())
             .collect::<Vec<_>>()
     };
+    // A retried exchange may repeat an identity, but only these two appear.
     let exchanges = tokens.exchanges();
+    let subjects = finals(&exchanges);
     assert_eq!(
-        finals(&exchanges),
-        [
+        subjects.iter().cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([
             spiffe_id(&gateway_id, &alpha_id),
             spiffe_id(&gateway_id, &beta_id)
-        ]
+        ]),
+        "final exchange subjects: {subjects:?}"
     );
     // The gateway asked for intermediate tokens for exactly those identities,
     // with its own identity rather than a sandbox's.
@@ -854,9 +864,13 @@ async fn shared_supervisor_acts_as_each_sandboxs_stable_spiffe_identity() {
     assert_eq!(tokens.exchanges().len(), before_recreate);
     register(&gateway_id, &recreated_id, &agent_id).await;
     call_until(&recreated, target.port, &format!("SAW:{recreated_id}")).await;
-    assert_eq!(
-        finals(&tokens.exchanges()).last(),
-        Some(&spiffe_id(&gateway_id, &recreated_id))
+    let after_recreate = finals(&tokens.exchanges()[before_recreate..]);
+    assert!(
+        !after_recreate.is_empty()
+            && after_recreate
+                .iter()
+                .all(|subject| *subject == spiffe_id(&gateway_id, &recreated_id)),
+        "final exchange subjects after recreate: {after_recreate:?}"
     );
     assert_sandbox_holds_no_spiffe_material(&recreated).await;
 
