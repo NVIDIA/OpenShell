@@ -133,11 +133,14 @@ struct RunArgs {
     ///
     /// When unset, the gateway uses its backend default: 10 with Postgres,
     /// 5 with an on-disk `SQLite` database. An in-memory `SQLite` database is
-    /// always a single connection. Postgres needs at least 2, because the SSH
-    /// identity lock keeps one connection while it queries the pool, so the
-    /// gateway rejects 1 there at startup. Each replica opens its own pool,
-    /// plus a mutation lock pool on Postgres (`--db-lock-max-connections`), so
-    /// keep the total below what the database server itself admits.
+    /// always a single connection. Postgres needs at least 2, so the gateway
+    /// rejects 1 there at startup: an SSH identity or provider-refresh lock
+    /// holder keeps one data connection for its lock and queries the pool on
+    /// another, and the gateway caps those holders at half of
+    /// `database_max_connections` per replica. Each replica opens its own
+    /// pool, plus a mutation lock pool on Postgres
+    /// (`--db-lock-max-connections`), so keep the total below what the
+    /// database server itself admits.
     #[arg(
         long,
         env = "OPENSHELL_DB_MAX_CONNECTIONS",

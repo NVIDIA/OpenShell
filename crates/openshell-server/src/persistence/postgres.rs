@@ -25,6 +25,7 @@ use sqlx::{Connection, PgPool, Postgres, QueryBuilder, Row};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
@@ -45,6 +46,9 @@ pub struct PostgresStore {
     lock_pool: PgPool,
     /// How acquisitions and guards use the lock pool's connections.
     lock_usage: Arc<LockPoolUsage>,
+    /// Data connections that advisory-lock holders on the data pool may keep,
+    /// sized by [`data_lock_slot_count`].
+    data_lock_slots: Arc<Semaphore>,
 }
 
 /// Lock-pool connections checked out by acquisitions and guards.
@@ -124,10 +128,38 @@ pub(super) struct PostgresAdvisoryLockGuard {
     checkout: LockConnectionCheckout,
 }
 
-/// Holds a session-level advisory lock on a data-pool connection, which is
-/// closed on drop.
+/// Holds session-level advisory locks on a data-pool connection and one
+/// data-pool lock slot. Dropping it closes the connection, which releases the
+/// locks, and frees the slot only once the close ends, so a closing connection
+/// still counts against the slots.
 pub(super) struct PostgresDataPoolLockGuard {
-    _connection: PoolConnection<Postgres>,
+    connection: Option<PoolConnection<Postgres>>,
+    slot: Option<OwnedSemaphorePermit>,
+}
+
+impl PostgresDataPoolLockGuard {
+    fn connection(&mut self) -> &mut PoolConnection<Postgres> {
+        self.connection
+            .as_mut()
+            .expect("data-pool lock connection is present until dropped")
+    }
+}
+
+impl Drop for PostgresDataPoolLockGuard {
+    fn drop(&mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            // Still closes the session if the task below never runs.
+            connection.close_on_drop();
+            let slot = self.slot.take();
+            // `close` keeps the pool permit until the session is closed, and
+            // the slot stays taken until then.
+            tokio::spawn(async move {
+                let _slot = slot;
+                let _ =
+                    tokio::time::timeout(LOCK_CONNECTION_RELEASE_TIMEOUT, connection.close()).await;
+            });
+        }
+    }
 }
 
 impl Drop for PostgresAdvisoryLockGuard {
@@ -270,10 +302,19 @@ pub const DEFAULT_MAX_CONNECTIONS: u32 = 10;
 
 /// Smallest pool ceiling an operator may configure.
 ///
-/// The SSH identity lock keeps one data connection for as long as it is held,
-/// and its holder queries the same pool, so a single-connection pool would
-/// wait on itself until the acquire times out.
+/// An SSH identity or provider-refresh lock holder keeps one data connection
+/// for its lock and queries the pool on another. [`data_lock_slot_count`]
+/// caps those holders at half the pool, which needs at least 2.
 pub const MIN_MAX_CONNECTIONS: u32 = 2;
+
+/// Data connections that advisory-lock holders on the data pool may keep at
+/// once: half of `max_connections`, rounded down and clamped to 1, so every
+/// holder can still get a second connection for its queries.
+/// [`PostgresStore::connect`] skips the [`MIN_MAX_CONNECTIONS`] check, so a
+/// pool of 1 still gets one slot.
+fn data_lock_slot_count(max_connections: u32) -> usize {
+    (max_connections / 2).max(1) as usize
+}
 
 impl PostgresStore {
     /// Connect and size the data and lock pools, falling back to
@@ -340,6 +381,7 @@ impl PostgresStore {
             pool,
             lock_pool,
             lock_usage: Arc::new(LockPoolUsage::new(lock_pool_size)),
+            data_lock_slots: Arc::new(Semaphore::new(data_lock_slot_count(max_connections))),
         })
     }
 
@@ -479,31 +521,99 @@ impl PostgresStore {
         Ok(pending.into_guard())
     }
 
-    /// Acquire `key` as a session-level advisory lock on a data-pool
-    /// connection instead of the mutation lock pool. Sandbox creation takes
-    /// the SSH identity lock while it holds its mutation guard, so a second
-    /// lock-pool connection there could exhaust that pool. The wait uses the
-    /// mutation lock timeout as its `lock_timeout`. Closing the connection on
-    /// drop releases the lock.
-    pub(super) async fn acquire_data_pool_lock(
+    /// Acquire `locks` as session-level advisory locks, in slice order, on one
+    /// data-pool connection instead of the mutation lock pool. Sandbox
+    /// creation takes the SSH identity locks while it holds its mutation
+    /// guard, so a second lock-pool connection there could exhaust that pool.
+    /// The locks use the single-`bigint` advisory functions, so a shared lock
+    /// conflicts with an earlier release's `pg_advisory_lock` of the same key.
+    /// Closing the connection on drop releases the locks.
+    ///
+    /// Each holder first takes one of the store's data-pool lock slots
+    /// ([`data_lock_slot_count`]), so holders keep at most half the data
+    /// connections and leave the rest for queries. One deadline of
+    /// [`MUTATION_LOCK_TIMEOUT`] covers the slot, the connection, and every
+    /// lock: a slot, connection, or lock not obtained by then fails with
+    /// [`PersistenceError::LockTimeout`].
+    pub(super) async fn acquire_data_pool_locks(
         &self,
-        key: i64,
+        locks: &[(i64, LockMode)],
     ) -> PersistenceResult<PostgresDataPoolLockGuard> {
-        let mut connection = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
-        connection.close_on_drop();
-        sqlx::query("SELECT set_config('lock_timeout', $1, false)")
-            .bind(MUTATION_LOCK_TIMEOUT_SETTING)
-            .execute(&mut *connection)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(key)
-            .execute(&mut *connection)
-            .await
-            .map_err(|e| map_db_error(&e))?;
-        Ok(PostgresDataPoolLockGuard {
-            _connection: connection,
-        })
+        debug_assert!(!locks.is_empty(), "a data-pool lock guard holds a lock");
+        let deadline = tokio::time::Instant::now() + MUTATION_LOCK_TIMEOUT;
+        let Ok(slot) =
+            tokio::time::timeout_at(deadline, Arc::clone(&self.data_lock_slots).acquire_owned())
+                .await
+        else {
+            let max_connections = self.pool.options().get_max_connections();
+            tracing::warn!(
+                max_connections,
+                slots = data_lock_slot_count(max_connections),
+                "data-pool lock slots stayed busy; raise database_max_connections"
+            );
+            return Err(PersistenceError::LockTimeout(
+                "waiting for a data-pool lock slot".into(),
+            ));
+        };
+        let slot = slot.expect("the data-pool lock slots are never closed");
+        let connection = match tokio::time::timeout_at(deadline, self.pool.acquire()).await {
+            Err(_) | Ok(Err(sqlx::Error::PoolTimedOut)) => {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a data-pool lock connection".into(),
+                ));
+            }
+            Ok(Err(error)) => return Err(map_db_error(&error)),
+            Ok(Ok(connection)) => connection,
+        };
+        // From here on, every exit closes the connection before the slot frees,
+        // which releases the keys already taken.
+        let mut guard = PostgresDataPoolLockGuard {
+            connection: Some(connection),
+            slot: Some(slot),
+        };
+        for &(key, mode) in locks {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining < Duration::from_millis(1) {
+                return Err(PersistenceError::LockTimeout(
+                    "waiting for a PostgreSQL advisory lock".into(),
+                ));
+            }
+            // As in `acquire_mutation_locks`, one statement sets the remaining
+            // deadline as `lock_timeout` before the lock wait starts.
+            let sql = match mode {
+                LockMode::Shared => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock_shared($2) FROM timeout"
+                }
+                LockMode::Exclusive => {
+                    "WITH timeout AS (SELECT set_config('lock_timeout', $1, false)) \
+                     SELECT pg_advisory_lock($2) FROM timeout"
+                }
+            };
+            let statement = sqlx::query(sql)
+                .bind(format!("{}ms", remaining.as_millis()))
+                .bind(key)
+                .execute(&mut **guard.connection());
+            match tokio::time::timeout_at(deadline + LOCK_STATEMENT_CLIENT_GRACE, statement).await {
+                Err(_) => {
+                    return Err(PersistenceError::LockTimeout(
+                        "waiting for a PostgreSQL advisory lock".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    // 55P03 lock_not_available: the statement's own
+                    // `lock_timeout` ended the wait.
+                    if let Some(db) = error.as_database_error()
+                        && db.code().as_deref() == Some("55P03")
+                    {
+                        return Err(PersistenceError::LockTimeout(db.message().to_string()));
+                    }
+                    return Err(map_db_error(&error));
+                }
+                Ok(Ok(_)) => {}
+            }
+        }
+        Ok(guard)
     }
 
     /// The error of a lock-pool acquire that ran out of time.
@@ -2151,9 +2261,10 @@ impl PostgresStore {
     /// Test support only: a store whose pools connect on first use, so it
     /// can point at an address where `PostgreSQL` does not answer.
     pub(crate) fn connect_lazy_for_tests(url: &str, lock_pool_size: u32) -> Self {
+        let max_connections = 10;
         Self {
             pool: PgPoolOptions::new()
-                .max_connections(10)
+                .max_connections(max_connections)
                 .connect_lazy(url)
                 .expect("build the lazy data pool"),
             lock_pool: PgPoolOptions::new()
@@ -2163,6 +2274,7 @@ impl PostgresStore {
                 .connect_lazy(url)
                 .expect("build the lazy lock pool"),
             lock_usage: Arc::new(LockPoolUsage::new(lock_pool_size)),
+            data_lock_slots: Arc::new(Semaphore::new(data_lock_slot_count(max_connections))),
         }
     }
 
@@ -2180,6 +2292,7 @@ impl PostgresStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::mutation_lock::SSH_IDENTITY_LOCK_KEY;
     use super::*;
 
     #[tokio::test]
@@ -2307,5 +2420,102 @@ mod tests {
             Ok(_) => panic!("nothing listens, yet a lock connection opened"),
         }
         assert_eq!(store.lock_usage.in_use.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn data_lock_slots_take_half_the_data_pool() {
+        // `PostgresStore::connect` skips the floor check, so a pool of one
+        // still gets a slot.
+        assert_eq!(data_lock_slot_count(1), 1);
+        assert_eq!(data_lock_slot_count(MIN_MAX_CONNECTIONS), 1);
+        assert_eq!(data_lock_slot_count(3), 1);
+        assert_eq!(data_lock_slot_count(DEFAULT_MAX_CONNECTIONS), 5);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_pool_lock_slot_wait_is_bounded_by_the_mutation_lock_timeout() {
+        struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let _log = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_writer(move || LogWriter(writer.clone()))
+                .finish(),
+        );
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            1,
+        );
+        let available = u32::try_from(store.data_lock_slots.available_permits())
+            .expect("the slot count fits in u32");
+        let _held = Arc::clone(&store.data_lock_slots)
+            .try_acquire_many_owned(available)
+            .expect("take every data-pool lock slot");
+
+        // The outer timeout turns a missing bound into a failure instead of a
+        // hang. It also fails a data connection acquired before the slot:
+        // SQLx retries the refused connection until its 30-second acquire
+        // timeout, past this one.
+        match tokio::time::timeout(
+            MUTATION_LOCK_TIMEOUT * 2,
+            store.acquire_data_pool_locks(&[(SSH_IDENTITY_LOCK_KEY, LockMode::Exclusive)]),
+        )
+        .await
+        .expect("the slot wait must end by the mutation lock timeout")
+        {
+            Err(PersistenceError::LockTimeout(detail)) => {
+                assert_eq!(detail, "waiting for a data-pool lock slot");
+            }
+            Err(error) => panic!("expected a lock timeout, got {error:?}"),
+            Ok(_) => panic!("every slot is held, yet a data-pool lock was acquired"),
+        }
+        // The warning is what tells slot exhaustion apart from lock contention.
+        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("data-pool lock slots stayed busy; raise database_max_connections"),
+            "{output}"
+        );
+        assert!(output.contains("max_connections=10"), "{output}");
+        assert!(output.contains("slots=5"), "{output}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_data_pool_lock_acquisition_returns_its_slot() {
+        let store = PostgresStore::connect_lazy_for_tests(
+            &PostgresStore::refusing_url_for_tests().await,
+            1,
+        );
+        let slots = store.data_lock_slots.available_permits();
+        // SQLx retries the refused connection until its 30-second acquire
+        // timeout, so the acquisition's own deadline ends the wait first.
+        match tokio::time::timeout(
+            MUTATION_LOCK_TIMEOUT * 2,
+            store.acquire_data_pool_locks(&[(SSH_IDENTITY_LOCK_KEY, LockMode::Exclusive)]),
+        )
+        .await
+        .expect("the data connection wait must end by the mutation lock timeout")
+        {
+            Err(PersistenceError::LockTimeout(detail)) => {
+                assert_eq!(detail, "waiting for a data-pool lock connection");
+            }
+            Err(error) => panic!("expected a lock timeout, got {error:?}"),
+            Ok(_) => panic!("nothing listens, yet a data-pool lock was acquired"),
+        }
+        assert_eq!(
+            store.data_lock_slots.available_permits(),
+            slots,
+            "a failed acquisition returns its data-pool lock slot"
+        );
     }
 }

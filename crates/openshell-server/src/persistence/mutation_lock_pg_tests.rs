@@ -4,20 +4,23 @@
 //! `PostgreSQL` tests of the mutation advisory locks: exclusion between two
 //! stores (as between two gateway replicas), exclusion against the legacy
 //! global key, cleanup after timed-out and cancelled acquisitions, a stalled
-//! holder, the lock-pool bound and its in-use gauge, and lock connections that
-//! `PostgreSQL` does not open.
+//! holder, the lock-pool bound and its in-use gauge, lock connections that
+//! `PostgreSQL` does not open, the bound on data-pool lock holders at the
+//! smallest data pool, and per-sandbox SSH identity locks across stores and
+//! against legacy holders.
 //!
 //! Advisory locks are database-wide, not per schema, so every test uses
 //! random workspace and sandbox ids, and `mise run test:rust:postgres` runs
-//! the tests one at a time. Apart from the pool-size test, which connects as
-//! the gateway does, the stores here run no migrations: the schema only
-//! scopes their connections.
+//! the tests one at a time. Apart from the pool-size and SSH identity tests,
+//! which connect as the gateway does, the stores here run no migrations: the
+//! schema only scopes their connections.
 
 use super::mutation_lock::{
     GLOBAL_MUTATION_LOCK_KEY, LOCK_CONNECTION_MIN_BUDGET, MUTATION_LOCK_POOL_MAX_CONNECTIONS,
-    MUTATION_LOCK_TIMEOUT, MutationLockKey, MutationLockSet,
+    MUTATION_LOCK_TIMEOUT, MutationLockKey, MutationLockSet, SSH_IDENTITY_LOCK_KEY,
+    sandbox_ssh_identity_lock_key,
 };
-use super::postgres::LOCK_CONNECTION_RELEASE_TIMEOUT;
+use super::postgres::{LOCK_CONNECTION_RELEASE_TIMEOUT, MIN_MAX_CONNECTIONS};
 use super::test_postgres::TestSchema;
 use super::{
     DistributedMutationGuard, PersistenceError, PersistenceResult, PostgresStore, Store,
@@ -181,6 +184,399 @@ async fn postgres_concurrent_sandbox_creates_with_ssh_identity_do_not_exhaust_lo
     schema.drop_schema().await;
 }
 
+/// Launch authentication for a supervisor whose SSH host key is not yet
+/// resolved.
+fn ssh_launch_authentication() -> openshell_core::jwt::SandboxLaunchAuthentication {
+    use openshell_core::jwt::{
+        CredentialEpoch, SandboxLaunchAuthentication, SecretJwt, SessionRotation,
+        SupervisorAuthBundle,
+    };
+    use openshell_core::{SandboxSessionId, sandbox_generation::SandboxGenerationId};
+
+    SandboxLaunchAuthentication {
+        supervisor: SupervisorAuthBundle {
+            session_id: SandboxSessionId::new(),
+            runtime_generation: SandboxGenerationId::parse("generation").unwrap(),
+            session_rotation: SessionRotation::new(1).unwrap(),
+            auth_epoch: CredentialEpoch::new(1).unwrap(),
+            gateway_token: SecretJwt::parse("gateway-token").unwrap(),
+            gateway_expires_at: 0,
+            sandbox_token: SecretJwt::parse("sandbox-token").unwrap(),
+            sandbox_expires_at: 0,
+            ssh_host_private_key: None,
+            ocsf_otlp_headers: None,
+        },
+        gateway_id: "gateway".to_string(),
+        verification_keys: Vec::new(),
+    }
+}
+
+/// At the smallest data pool `PostgreSQL` accepts, a provider-refresh holder
+/// and an SSH identity holder on one replica leave a data connection free for
+/// queries: the SSH identity holder waits for the one data-pool lock slot
+/// instead of taking the last connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_data_pool_lock_holders_leave_a_connection_free_at_floor() {
+    use crate::credentials::CredentialRuntime;
+    use crate::ssh_identity::SshIdentityStore;
+    use openshell_core::proto::Sandbox;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use std::sync::Arc;
+
+    let fixture = LockFixture::new().await;
+    let store =
+        Store::connect_with_pool_sizes(fixture.schema.url(), Some(MIN_MAX_CONNECTIONS), None)
+            .await
+            .expect("connect a store with the smallest data pool");
+    let shared = Arc::new(store.clone());
+    let config = crate::Config::new(None)
+        .with_credential_drivers(["test-static"])
+        .with_default_credential_driver(Some("test-static"));
+    let identities = SshIdentityStore::new(
+        shared.clone(),
+        CredentialRuntime::from_config_with_store(&config, shared).unwrap(),
+    );
+    let id = random_id("sb");
+    let sandbox = Sandbox {
+        metadata: Some(ObjectMeta {
+            id: id.clone(),
+            name: id.clone(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    store
+        .put_message(&sandbox)
+        .await
+        .expect("store the sandbox");
+
+    let refresh = store
+        .acquire_refresh_guard(&random_id("provider"), "ACCESS_TOKEN")
+        .await
+        .expect("hold a provider refresh lock");
+    let preparing = {
+        let identities = identities.clone();
+        let mut sandbox = sandbox.clone();
+        tokio::spawn(async move {
+            identities
+                .prepare(&mut sandbox, &mut ssh_launch_authentication())
+                .await
+                .map(|()| sandbox)
+        })
+    };
+    // Long enough for the SSH identity holder to take a data connection if
+    // nothing stops it.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    tokio::time::timeout(PROCEEDS_WITHIN, store.get_message::<Sandbox>(&id))
+        .await
+        .expect("a query must find a free data connection while both lock holders run")
+        .expect("load the sandbox")
+        .expect("the sandbox exists");
+    assert_eq!(
+        fixture.lock_count(SSH_IDENTITY_LOCK_KEY).await,
+        0,
+        "the SSH identity holder waits for a data-pool lock slot, not in PostgreSQL"
+    );
+
+    drop(refresh);
+    let prepared = tokio::time::timeout(PROCEEDS_WITHIN, preparing)
+        .await
+        .expect("the SSH identity holder proceeds once the refresh lock is released")
+        .expect("prepare task")
+        .expect("prepare the SSH identity");
+    assert!(
+        !prepared.host_key_fingerprint.is_empty(),
+        "prepare publishes the SSH host key fingerprint"
+    );
+
+    fixture.finish(vec![store]).await;
+}
+
+/// A sandbox with a unique name, ready for its SSH identity.
+fn ssh_sandbox(id: &str) -> openshell_core::proto::Sandbox {
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+
+    openshell_core::proto::Sandbox {
+        metadata: Some(ObjectMeta {
+            id: id.to_string(),
+            name: id.to_string(),
+            workspace: "default".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Prepare `sandbox`'s SSH identity in a task that returns the prepared
+/// sandbox.
+fn spawn_prepare(
+    identities: &crate::ssh_identity::SshIdentityStore,
+    sandbox: &openshell_core::proto::Sandbox,
+) -> JoinHandle<Result<openshell_core::proto::Sandbox, tonic::Status>> {
+    let identities = identities.clone();
+    let mut sandbox = sandbox.clone();
+    tokio::spawn(async move {
+        identities
+            .prepare(&mut sandbox, &mut ssh_launch_authentication())
+            .await
+            .map(|()| sandbox)
+    })
+}
+
+/// SSH identity steps for different sandboxes run at once, on one replica and
+/// across replicas, while steps for the same sandbox still exclude each other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_ssh_identity_locks_are_per_sandbox_across_replicas() {
+    use crate::credentials::CredentialRuntime;
+    use crate::ssh_identity::SshIdentityStore;
+    use openshell_core::ObjectId;
+    use std::sync::Arc;
+
+    let fixture = LockFixture::new().await;
+    let store_a = Store::connect_with_pool_sizes(fixture.schema.url(), None, None)
+        .await
+        .expect("connect replica A");
+    let store_b = Store::connect_with_pool_sizes(fixture.schema.url(), None, None)
+        .await
+        .expect("connect replica B");
+    let config = crate::Config::new(None)
+        .with_credential_drivers(["test-static"])
+        .with_default_credential_driver(Some("test-static"));
+    // The test-static driver keeps values per instance, so both replicas
+    // share one runtime, like replicas sharing one credential backend.
+    let credentials =
+        CredentialRuntime::from_config_with_store(&config, Arc::new(store_a.clone())).unwrap();
+    let replica_a = SshIdentityStore::new(Arc::new(store_a.clone()), credentials.clone());
+    let replica_b = SshIdentityStore::new(Arc::new(store_b.clone()), credentials.clone());
+    let [held, other, local] = [(); 3].map(|()| ssh_sandbox(&random_id("sb")));
+    for sandbox in [&held, &other, &local] {
+        store_a
+            .put_message(sandbox)
+            .await
+            .expect("store the sandbox");
+    }
+
+    let (entered, release) = credentials.gate_next_store();
+    let gated = spawn_prepare(&replica_a, &held);
+    entered
+        .await
+        .expect("replica A stores the held sandbox's SSH host key");
+
+    tokio::time::timeout(PROCEEDS_WITHIN, spawn_prepare(&replica_b, &other))
+        .await
+        .expect("replica B prepares another sandbox while replica A holds one")
+        .expect("prepare task")
+        .expect("prepare another sandbox on replica B");
+    tokio::time::timeout(PROCEEDS_WITHIN, spawn_prepare(&replica_a, &local))
+        .await
+        .expect("replica A prepares another sandbox while it holds one")
+        .expect("prepare task")
+        .expect("prepare another sandbox on replica A");
+    let waiting = spawn_prepare(&replica_b, &held);
+    fixture
+        .wait_for_waiting_backend(
+            sandbox_ssh_identity_lock_key(held.object_id()),
+            Instant::now() + PROCEEDS_WITHIN,
+        )
+        .await;
+    assert!(
+        !waiting.is_finished(),
+        "replica B waits for the sandbox replica A holds"
+    );
+
+    release.send(()).expect("release replica A's store");
+    let first = tokio::time::timeout(PROCEEDS_WITHIN, gated)
+        .await
+        .expect("replica A finishes once its store is released")
+        .expect("prepare task")
+        .expect("prepare the held sandbox on replica A");
+    let second = tokio::time::timeout(PROCEEDS_WITHIN, waiting)
+        .await
+        .expect("replica B proceeds once replica A releases the sandbox")
+        .expect("prepare task")
+        .expect("prepare the held sandbox on replica B");
+    assert!(!first.host_key_fingerprint.is_empty());
+    assert_eq!(
+        first.host_key_fingerprint, second.host_key_fingerprint,
+        "both replicas resolve the one published SSH identity"
+    );
+
+    fixture.finish(vec![store_a, store_b]).await;
+}
+
+/// The SSH identity guard takes the legacy key shared, so it and a gateway
+/// from an earlier release, which takes the key exclusively, exclude each
+/// other, while guards for different sandboxes share it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_ssh_identity_lock_excludes_legacy_holders() {
+    let fixture = LockFixture::new().await;
+    let store = Store::connect_with_pool_sizes(fixture.schema.url(), None, None)
+        .await
+        .expect("connect a store");
+    // Debug builds reject two SSH identity guards on one owner, so each guard
+    // is acquired in its own task.
+    let spawn_guard = |sandbox_id: String| {
+        let store = store.clone();
+        tokio::spawn(async move { store.acquire_ssh_identity_mutation_guard(&sandbox_id).await })
+    };
+    let (sandbox_1, sandbox_2) = (random_id("sb"), random_id("sb"));
+
+    // A gateway from an earlier release holds the legacy key exclusively.
+    let mut legacy = fixture.raw_session().await;
+    raw_lock(&mut legacy, SSH_IDENTITY_LOCK_KEY)
+        .await
+        .expect("the legacy holder takes the SSH identity key");
+    let waiting = spawn_guard(sandbox_1.clone());
+    let pid = fixture
+        .wait_for_waiting_backend(SSH_IDENTITY_LOCK_KEY, Instant::now() + PROCEEDS_WITHIN)
+        .await;
+    assert_eq!(
+        fixture.session_lock_count(pid).await,
+        1,
+        "the new holder waits for the legacy key before its sandbox key"
+    );
+    raw_unlock(&mut legacy, SSH_IDENTITY_LOCK_KEY).await;
+    let held_1 = tokio::time::timeout(PROCEEDS_WITHIN, waiting)
+        .await
+        .expect("the new holder proceeds once the legacy holder releases")
+        .expect("guard task")
+        .expect("the SSH identity guard");
+
+    let sandbox_holders = fixture
+        .granted_holders(sandbox_ssh_identity_lock_key(&sandbox_1))
+        .await;
+    let [(pid, mode)] = sandbox_holders.as_slice() else {
+        panic!("one session holds the sandbox key, got {sandbox_holders:?}");
+    };
+    assert_eq!(mode, "ExclusiveLock");
+    assert_eq!(
+        fixture.granted_holders(SSH_IDENTITY_LOCK_KEY).await,
+        vec![(*pid, "ShareLock".to_string())],
+        "the same session holds the legacy key shared"
+    );
+
+    sqlx::query("SET lock_timeout = '200ms'")
+        .execute(&mut legacy)
+        .await
+        .expect("bound the legacy lock wait");
+    let Err(error) = raw_lock(&mut legacy, SSH_IDENTITY_LOCK_KEY).await else {
+        panic!("the legacy SSH identity lock should wait behind a new holder");
+    };
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::code)
+            .as_deref(),
+        Some("55P03"),
+        "{error}"
+    );
+
+    let held_2 = tokio::time::timeout(PROCEEDS_WITHIN, spawn_guard(sandbox_2))
+        .await
+        .expect("a guard for another sandbox does not wait")
+        .expect("guard task")
+        .expect("the SSH identity guard for another sandbox");
+    assert_eq!(
+        fixture.lock_count(SSH_IDENTITY_LOCK_KEY).await,
+        2,
+        "guards for different sandboxes share the legacy key"
+    );
+
+    drop(held_1);
+    drop(held_2);
+    sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut legacy)
+        .await
+        .expect("bound the legacy lock wait");
+    raw_lock(&mut legacy, SSH_IDENTITY_LOCK_KEY)
+        .await
+        .expect("the legacy lock after the new holders release");
+    raw_unlock(&mut legacy, SSH_IDENTITY_LOCK_KEY).await;
+
+    legacy.close().await.expect("close the legacy session");
+    fixture.finish(vec![store]).await;
+}
+
+/// When the sandbox key's wait times out after the shared legacy key was
+/// granted, closing the data connection releases the legacy key and the
+/// data-pool lock slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_ssh_identity_lock_timeout_releases_the_legacy_key_and_slot() {
+    let fixture = LockFixture::new().await;
+    // One data-pool lock slot, so a leaked slot fails the last acquisition.
+    let store =
+        Store::connect_with_pool_sizes(fixture.schema.url(), Some(MIN_MAX_CONNECTIONS), None)
+            .await
+            .expect("connect a store with the smallest data pool");
+    // Debug builds reject two SSH identity guards on one owner, so each guard
+    // is acquired in its own task.
+    let spawn_guard = |sandbox_id: String| {
+        let store = store.clone();
+        tokio::spawn(async move {
+            store
+                .acquire_ssh_identity_mutation_guard(&sandbox_id)
+                .await
+                .map(drop)
+        })
+    };
+    let sandbox = random_id("sb");
+    let sandbox_key = sandbox_ssh_identity_lock_key(&sandbox);
+    let mut holder = fixture.raw_session().await;
+    raw_lock(&mut holder, sandbox_key)
+        .await
+        .expect("the raw session takes the sandbox key");
+
+    let started = Instant::now();
+    let waiting = spawn_guard(sandbox.clone());
+    let pid = fixture
+        .wait_for_waiting_backend(sandbox_key, Instant::now() + PROCEEDS_WITHIN)
+        .await;
+    assert_eq!(
+        fixture.granted_holders(SSH_IDENTITY_LOCK_KEY).await,
+        vec![(pid, "ShareLock".to_string())],
+        "the waiter holds the legacy key shared while it waits for the sandbox key"
+    );
+
+    let result =
+        tokio::time::timeout_at(started + MUTATION_LOCK_TIMEOUT + PROCEEDS_WITHIN, waiting)
+            .await
+            .expect("the sandbox key wait ends by its lock_timeout")
+            .expect("guard task");
+    assert!(
+        matches!(result, Err(PersistenceError::LockTimeout(_))),
+        "{result:?}"
+    );
+
+    // The raw session still holds the sandbox key, yet the legacy key the
+    // acquisition took is already released.
+    fixture
+        .wait_for_lock_count(
+            SSH_IDENTITY_LOCK_KEY,
+            0,
+            Instant::now() + RELEASED_WITHIN,
+            "legacy key after the sandbox key timed out",
+        )
+        .await;
+    assert_eq!(fixture.lock_count(sandbox_key).await, 1);
+
+    // The slot wait is 10 s, so a leaked slot fails this 5 s bound.
+    tokio::time::timeout(PROCEEDS_WITHIN, spawn_guard(random_id("sb")))
+        .await
+        .expect("the timed-out acquisition returned its data-pool lock slot")
+        .expect("guard task")
+        .expect("the SSH identity guard for another sandbox");
+
+    raw_unlock(&mut holder, sandbox_key).await;
+    holder.close().await.expect("close the raw session");
+    fixture.finish(vec![store]).await;
+}
+
 /// Drop client traffic while keeping sockets open, like a failed network path.
 /// Client EOF still closes the upstream socket so `PostgreSQL` can release locks.
 struct StallingProxy {
@@ -333,6 +729,24 @@ impl LockFixture {
         .fetch_one(&self.observer)
         .await
         .expect("count advisory locks")
+    }
+
+    /// Backends granted one bigint advisory key in this database, with their
+    /// lock modes.
+    async fn granted_holders(&self, key: i64) -> Vec<(i32, String)> {
+        let (high, low) = key_halves(key);
+        sqlx::query_as(
+            "SELECT pid, mode FROM pg_locks \
+             WHERE locktype = 'advisory' AND granted AND objsubid = 1 \
+               AND classid = $1::bigint::oid AND objid = $2::bigint::oid \
+               AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+             ORDER BY pid",
+        )
+        .bind(high)
+        .bind(low)
+        .fetch_all(&self.observer)
+        .await
+        .expect("list advisory lock holders")
     }
 
     /// Advisory locks held or awaited by one backend.

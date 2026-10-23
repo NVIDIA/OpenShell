@@ -359,15 +359,29 @@ impl Store {
 
     /// Independent of the mutation locks: creation already holds its sandbox
     /// mutation guard when it provisions a supervisor's durable SSH identity.
+    ///
+    /// On `PostgreSQL` it takes the legacy
+    /// [`mutation_lock::SSH_IDENTITY_LOCK_KEY`] shared and then the sandbox's
+    /// [`mutation_lock::sandbox_ssh_identity_lock_key`] exclusively, in that
+    /// order on one data-pool connection. Steps for different sandboxes run at
+    /// once, and gateways from earlier releases, which hold the legacy key
+    /// exclusively, still exclude every one of them.
     pub(crate) async fn acquire_ssh_identity_mutation_guard(
         &self,
+        sandbox_id: &str,
     ) -> PersistenceResult<SshIdentityMutationGuard> {
         lock_order::check(lock_order::Lock::SshIdentity);
         match self {
             Self::Postgres(store) => Ok(SshIdentityMutationGuard {
                 _postgres: Some(
                     store
-                        .acquire_data_pool_lock(mutation_lock::SSH_IDENTITY_LOCK_KEY)
+                        .acquire_data_pool_locks(&[
+                            (mutation_lock::SSH_IDENTITY_LOCK_KEY, LockMode::Shared),
+                            (
+                                mutation_lock::sandbox_ssh_identity_lock_key(sandbox_id),
+                                LockMode::Exclusive,
+                            ),
+                        ])
                         .await?,
                 ),
                 _order: lock_order::hold(lock_order::Lock::SshIdentity),
@@ -396,7 +410,11 @@ impl Store {
         let key = i64::from_be_bytes(hash[..8].try_into().expect("eight digest bytes"));
         match self {
             Self::Postgres(store) => Ok(RefreshMutationGuard {
-                _postgres: Some(store.acquire_data_pool_lock(key).await?),
+                _postgres: Some(
+                    store
+                        .acquire_data_pool_locks(&[(key, LockMode::Exclusive)])
+                        .await?,
+                ),
             }),
             Self::Sqlite(_) => Ok(RefreshMutationGuard { _postgres: None }),
         }
@@ -428,8 +446,9 @@ impl Store {
             {
                 return Err(CoreError::config(format!(
                     "database_max_connections (--db-max-connections, OPENSHELL_DB_MAX_CONNECTIONS) \
-                     is {configured}, but PostgreSQL needs at least {}: the SSH identity lock \
-                     keeps one data connection while it queries the pool",
+                     is {configured}, but PostgreSQL needs at least {}: an SSH identity or \
+                     provider-refresh lock holder keeps one data connection for its lock and \
+                     queries the pool on another",
                     postgres::MIN_MAX_CONNECTIONS
                 )));
             }

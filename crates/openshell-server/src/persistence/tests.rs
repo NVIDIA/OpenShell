@@ -315,9 +315,10 @@ async fn in_memory_sqlite_pins_the_pool_to_one_connection() {
     assert_eq!(store.max_connections(), 1);
 }
 
-/// The SSH identity lock keeps one data connection while it queries the
-/// pool, so a single-connection `PostgreSQL` pool is refused at startup. The
-/// check runs before any connection opens, so nothing listens on the URL.
+/// On `PostgreSQL`, an SSH identity or provider-refresh lock holder keeps one
+/// data connection for its lock and queries the pool on another, so a
+/// single-connection pool is refused at startup.
+/// The check runs before any connection opens, so nothing listens on the URL.
 #[tokio::test]
 async fn postgres_rejects_a_single_connection_data_pool_before_connecting() {
     for url in [
@@ -337,8 +338,8 @@ async fn postgres_rejects_a_single_connection_data_pool_before_connecting() {
     }
 }
 
-/// `SQLite` takes the SSH identity lock without a pool connection, so one
-/// connection is enough there, on disk and in memory.
+/// `SQLite` takes the SSH identity and provider-refresh locks without a pool
+/// connection, so one connection is enough there, on disk and in memory.
 #[tokio::test]
 async fn sqlite_accepts_a_single_connection_data_pool() {
     let tmp = tempfile::tempdir().expect("tempdir");

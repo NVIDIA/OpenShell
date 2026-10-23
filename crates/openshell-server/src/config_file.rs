@@ -111,8 +111,10 @@ pub struct GatewayFileSection {
     /// which must stay under the server's own `max_connections`. Omit to keep
     /// the backend default (10 for Postgres, 5 for on-disk `SQLite`); an
     /// in-memory `SQLite` database is always a single connection. Postgres
-    /// needs at least 2, because the SSH identity lock keeps one connection
-    /// while it queries the pool.
+    /// needs at least 2: an SSH identity or provider-refresh lock holder keeps
+    /// one data connection for its lock and queries the pool on another, and
+    /// the gateway caps those holders at half of `database_max_connections`
+    /// per replica.
     #[serde(default)]
     pub database_max_connections: Option<u32>,
 
