@@ -1330,6 +1330,12 @@ enum GatewayCommands {
         #[arg(long, conflicts_with = "remote")]
         local: bool,
 
+        /// Keep an existing complete mTLS bundle in the gateway config
+        /// directory instead of refreshing it from the package-managed TLS
+        /// directory. Use this when the bundle is externally managed.
+        #[arg(long, requires = "local")]
+        preserve_mtls_bundle: bool,
+
         /// Register as an OIDC-authenticated gateway using the given issuer URL.
         /// The server must be configured with `--oidc-issuer` matching this URL.
         #[arg(long, conflicts_with = "remote")]
@@ -2663,6 +2669,7 @@ async fn run_async() -> Result<()> {
                 name,
                 remote,
                 local,
+                preserve_mtls_bundle,
                 oidc_issuer,
                 oidc_client_id,
                 oidc_audience,
@@ -2673,6 +2680,7 @@ async fn run_async() -> Result<()> {
                     name.as_deref(),
                     remote.as_deref(),
                     local,
+                    preserve_mtls_bundle,
                     oidc_issuer.as_deref(),
                     &oidc_client_id,
                     oidc_audience.as_deref(),
