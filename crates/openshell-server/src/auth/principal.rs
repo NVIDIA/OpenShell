@@ -15,6 +15,7 @@
 //! to prevent cross-sandbox access (see issue #1354).
 
 use super::identity::Identity;
+use openshell_core::jwt::CredentialEpoch;
 
 /// Who is calling.
 ///
@@ -85,6 +86,17 @@ pub struct SandboxPrincipal {
     pub trust_domain: Option<String>,
 }
 
+impl SandboxPrincipal {
+    /// The ownership term of a supervisor session this principal opens, when
+    /// its credential carries one.
+    pub fn auth_epoch(&self) -> Option<CredentialEpoch> {
+        match &self.source {
+            SandboxIdentitySource::BootstrapJwt { auth_epoch, .. } => *auth_epoch,
+            SandboxIdentitySource::ComputeDriver { .. } => None,
+        }
+    }
+}
+
 /// Shared supervisor caller.
 #[derive(Debug, Clone)]
 pub struct SupervisorPrincipal {
@@ -110,7 +122,12 @@ pub struct PeerPrincipal {
 pub enum SandboxIdentitySource {
     /// Generation-bound gateway JWT validated against the persisted runtime
     /// identity by [`super::sandbox_jwt::SandboxSessionJwtAuthenticator`].
-    BootstrapJwt { issuer: String },
+    BootstrapJwt {
+        issuer: String,
+        /// Credential epoch of the bearer: the supervisor ownership term it
+        /// belongs to. `None` only where no bearer was verified.
+        auth_epoch: Option<CredentialEpoch>,
+    },
     /// Driver-native credential used to bootstrap a gateway-minted JWT via
     /// `IssueSandboxToken`. The named compute driver authenticated only the
     /// sandbox identity and its concrete runtime binding; the gateway still
@@ -139,7 +156,9 @@ impl Principal {
 /// Principals for tests.
 #[cfg(test)]
 pub mod test_support {
-    use super::{Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
+    use super::{
+        CredentialEpoch, Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::auth::identity::{Identity, IdentityProvider};
 
     /// An OIDC user with no roles or scopes.
@@ -157,10 +176,23 @@ pub mod test_support {
 
     /// A sandbox holding a gateway JWT.
     pub fn sandbox(sandbox_id: &str) -> Principal {
+        sandbox_principal(sandbox_id, None)
+    }
+
+    /// A sandbox holding a gateway JWT of credential epoch `auth_epoch`.
+    pub fn sandbox_with_epoch(sandbox_id: &str, auth_epoch: u64) -> Principal {
+        sandbox_principal(
+            sandbox_id,
+            Some(CredentialEpoch::new(auth_epoch).expect("credential epoch")),
+        )
+    }
+
+    fn sandbox_principal(sandbox_id: &str, auth_epoch: Option<CredentialEpoch>) -> Principal {
         Principal::Sandbox(SandboxPrincipal {
             sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test".to_string(),
+                auth_epoch,
             },
             trust_domain: Some("openshell".to_string()),
         })

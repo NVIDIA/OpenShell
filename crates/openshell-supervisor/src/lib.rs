@@ -791,6 +791,13 @@ pub struct SandboxInstanceConfig {
     /// SPIFFE Workload API socket for provider token grants; absent fails closed.
     pub provider_workload_api_socket: Option<std::path::PathBuf>,
     pub proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles,
+    /// Gateway-granted authority to replace the generation's current owner.
+    /// The instance then adopts the running workload instead of starting it.
+    pub takeover: Option<openshell_sandbox_backend::BoundaryTakeover>,
+    /// Recovery deadline (seconds) offered to the sandbox runtime at every
+    /// attach: how long it keeps the workload frozen after losing this
+    /// supervisor. `None` leaves the runtime default.
+    pub supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl SandboxInstanceConfig {
@@ -939,6 +946,8 @@ pub async fn run_sandbox_instance(
         trace_context,
         provider_workload_api_socket,
         proxy_tls,
+        takeover,
+        supervisor_recovery_timeout_secs,
     } = config;
     // The owner binds the event context and log sink to the instance's
     // threads; the instance itself uses the rest.
@@ -1164,6 +1173,8 @@ pub async fn run_sandbox_instance(
                 ca_file_paths: ca_file_paths.clone(),
                 provider_credentials: provider_credentials.clone(),
                 sandbox_bearer,
+                takeover,
+                supervisor_recovery_timeout_secs,
             },
             policy.clone(),
             openshell_isolation_interface::AgentSpec {
@@ -1249,18 +1260,20 @@ pub async fn run_sandbox_instance(
         .is_none()
         .then(|| remote_boundary.0.network_mediation_source());
     let remote_host_gateway_ip = remote_boundary.0.host_gateway_ip();
-    let (remote_ready, backend_name, ca_file_paths) = {
-        let (bound, backend_name, ca_file_paths) = remote_boundary;
+    let takeover_attach = remote_boundary.0.is_takeover();
+    let adopts_running_agent = remote_boundary.0.adopts_running_agent();
+    let (bound, backend_name, ca_file_paths) = remote_boundary;
+    let confirm = Box::pin(async {
         let ready = bound
             .confirm()
             .instrument(tracing::info_span!(parent: &startup, "supervisor.boundary.confirm"))
             .await
             .map_err(|error| miette::miette!(error.to_string()))?;
         info!(backend = %backend_name, "Isolation boundary enforcement confirmed");
-        (ready, backend_name, ca_file_paths)
-    };
-
-    let mut networking = Some(
+        Ok::<_, miette::Report>(ready)
+    });
+    // Both startup futures are boxed: the order below holds them at once.
+    let start_networking = Box::pin(async {
         openshell_supervisor_network::run::run_networking(
             &policy,
             None,
@@ -1294,8 +1307,37 @@ pub async fn run_sandbox_instance(
             remote_network_source,
             proxy_listener,
         )
-        .await?,
-    );
+        .await
+    });
+    // A replacement supervisor confirms only once its own enforcement is up:
+    // confirmation resumes a frozen workload, whose network opens then wait
+    // for this supervisor's mediation rather than for nothing. Mediation
+    // accepts start once the boundary is confirmed.
+    let (remote_ready, networking) = if takeover_attach {
+        let networking = start_networking.await?;
+        (confirm.await?, networking)
+    } else {
+        let ready = confirm.await?;
+        (ready, start_networking.await?)
+    };
+    let mut networking = Some(networking);
+    if takeover_attach {
+        info!(
+            adopts_running_agent,
+            "Supervisor takeover confirmed; previous owner fenced"
+        );
+        ocsf_emit!(
+            // Lifecycle activity 3 is Start.
+            AppLifecycleBuilder::new(ocsf_ctx())
+                .activity(ActivityId::Reset)
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .message(format!(
+                    "Supervisor took over the sandbox runtime [adopted_workload:{adopts_running_agent}]"
+                ))
+                .build()
+        );
+    }
 
     ca_file_paths
         .lock()
@@ -1490,7 +1532,17 @@ pub async fn run_sandbox_instance(
             .await
             .map_err(|error| start_agent_error(error.to_string()))?;
         workload_started_tx.send_replace(true);
-        info!(backend = %backend_name, "Isolation boundary agent started");
+        if running.agent_adopted() {
+            info!(
+                backend = %backend_name,
+                process_id = %running.agent().process_id(),
+                adopted_execs = running.adopted_exec_processes().len(),
+                "Adopted the running agent from the previous supervisor"
+            );
+            observe_adopted_execs(running.adopted_exec_processes());
+        } else {
+            info!(backend = %backend_name, "Isolation boundary agent started");
+        }
         let agent = running.agent();
         let boundary_access = openshell_supervisor_process::delegated::start_boundary_access(
             sandbox_id.as_deref(),
@@ -1638,6 +1690,28 @@ pub async fn run_sandbox_instance(
     drop(networking);
 
     Ok(exit_code)
+}
+
+/// Exec processes a replacement supervisor adopted outlive their original
+/// clients; record when each exits so their end is not silent.
+fn observe_adopted_execs(processes: &[Arc<openshell_sandbox_backend::BoundaryProcess>]) {
+    for process in processes {
+        let process = process.clone();
+        tokio::spawn(async move {
+            match process.wait().await {
+                Ok(status) => info!(
+                    process_id = %process.process_id(),
+                    ?status,
+                    "Adopted exec process exited"
+                ),
+                Err(error) => debug!(
+                    process_id = %process.process_id(),
+                    %error,
+                    "Stopped observing adopted exec process"
+                ),
+            }
+        });
+    }
 }
 
 fn persist_main_exit_marker(path: &std::path::Path, exit_code: i32) -> std::io::Result<()> {
@@ -4367,6 +4441,8 @@ mod tests {
             trace_context: None,
             provider_workload_api_socket: None,
             proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::default(),
+            takeover: None,
+            supervisor_recovery_timeout_secs: None,
         };
         let bindings = SandboxInstanceBindings::dedicated(
             &config,

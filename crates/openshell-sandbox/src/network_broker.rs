@@ -92,14 +92,34 @@ pub struct PendingTcpOpen {
 }
 
 impl PendingTcpOpen {
+    #[cfg(test)]
     pub(crate) async fn complete(self, decision: TcpOpenDecision) -> io::Result<Option<TcpStream>> {
+        self.decide(decision)?.established().await
+    }
+
+    /// Hand the decision to the broker. Once this returns the decision has
+    /// taken effect; only the relay setup of an allowed open remains.
+    pub(crate) fn decide(self, decision: TcpOpenDecision) -> io::Result<DecidedTcpOpen> {
         self.decision
             .send(decision)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "network broker stopped"))?;
-        if matches!(decision, TcpOpenDecision::Denied(_)) {
+        Ok(DecidedTcpOpen {
+            relay: (!matches!(decision, TcpOpenDecision::Denied(_))).then_some(self.relay),
+        })
+    }
+}
+
+/// A decided TCP open: the relay of an allowed open, or nothing.
+pub struct DecidedTcpOpen {
+    relay: Option<oneshot::Receiver<io::Result<TcpStream>>>,
+}
+
+impl DecidedTcpOpen {
+    pub(crate) async fn established(self) -> io::Result<Option<TcpStream>> {
+        let Some(relay) = self.relay else {
             return Ok(None);
-        }
-        self.relay
+        };
+        relay
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -126,6 +146,25 @@ impl PendingDnsQuery {
         self.response
             .send(response)
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DNS relay stopped"))
+    }
+
+    /// A UDP query as the relay queues it, and where its answer arrives.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        request: Vec<u8>,
+    ) -> (Self, std::sync::mpsc::Receiver<io::Result<Vec<u8>>>) {
+        let (response, answers) = std::sync::mpsc::sync_channel(1);
+        (
+            Self {
+                request,
+                transport: DnsTransport::Udp,
+                identity: dns_sender_identity(),
+                notification_to_queue: Duration::ZERO,
+                queued_at: Instant::now(),
+                response,
+            },
+            answers,
+        )
     }
 }
 

@@ -113,6 +113,17 @@ message DiscoverPolicy {}
 message Attach {
   string supervisor_instance_id = 1;
   SandboxPolicy policy = 2;
+  // Gateway-signed supervisor takeover grant. Present only when this
+  // supervisor process replaces the current owner of the generation at a
+  // higher credential epoch; send it only to a runtime advertising
+  // openshell.sandbox.supervisor-takeover. The runtime stages the replacement
+  // and promotes it at Confirm, fencing every older connection and epoch.
+  optional string supervisor_takeover = 3 [(openshell.options.v1.secret) = true];
+  // How long the runtime should keep the workload frozen after losing this
+  // connection's supervision, offered by the supervisor in whole seconds. The
+  // runtime refuses an offer outside 10 to 300 seconds and applies its
+  // default (30 seconds) without one.
+  google.protobuf.Duration supervisor_recovery_timeout = 4;
 }
 // Success asserts that the backend can enforce the attached policy and trusted
 // workload identity. Unsupported requirements fail before StartAgent, which
@@ -329,6 +340,10 @@ message BoundaryConfirmation {
 message SessionSnapshot {
   string generation = 1;
   repeated ProcessSnapshot processes = 2;
+  // Launch controls the runtime bound at its first attach. A replacement
+  // supervisor reattaches with exactly these; they never change for a
+  // running generation.
+  SandboxPolicy bound_policy = 3;
 }
 message ProcessSnapshot {
   string process_id = 1;

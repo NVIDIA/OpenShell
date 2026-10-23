@@ -192,6 +192,9 @@ pub struct GatewayFileSection {
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
     pub ocsf_log: Option<OcsfLogConfig>,
+    /// Tuning of the shared supervisor pool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_pool: Option<SupervisorPoolConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -200,6 +203,25 @@ pub struct GatewayFileSection {
     // rejected in [`load`].
     #[serde(default)]
     pub database_url: Option<String>,
+}
+
+/// `[openshell.gateway.supervisor_pool]`: optional tuning of the shared
+/// supervisor pool.
+///
+/// The shared supervisor always runs as a pool that the gateway coordinates
+/// for high availability: it places each sandbox instance on a live member by
+/// consistent hash, records its owner durably, and moves the instances of a
+/// failed or leaving member to another member, which adopts their running
+/// workloads. Without this table the defaults apply.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorPoolConfig {
+    /// Seconds a sandbox runtime keeps its workload frozen after losing its
+    /// supervisor before terminating it, from 10 to 300. The pool's
+    /// supervisors offer it to each runtime; unset offers
+    /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_timeout_secs: Option<u32>,
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -789,6 +811,20 @@ fn parse_and_validate(path: &Path, contents: &str) -> Result<ConfigFile, ConfigF
         return Err(ConfigFileError::InvalidValue {
             field: "openshell.gateway.credential_drivers",
             message: "omit the field to use default encrypted gateway credential storage, or specify exactly one external credential driver",
+        });
+    }
+    if file
+        .openshell
+        .gateway
+        .supervisor_pool
+        .and_then(|pool| pool.recovery_timeout_secs)
+        .is_some_and(|timeout| {
+            !openshell_supervisor_control::SUPERVISOR_RECOVERY_TIMEOUT_RANGE.contains(&timeout)
+        })
+    {
+        return Err(ConfigFileError::InvalidValue {
+            field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
+            message: "must be between 10 and 300 seconds",
         });
     }
     if let Some((name, _)) = file
@@ -1727,6 +1763,43 @@ database_lock_max_connections = 0
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_the_supervisor_pool_tuning() {
+        let pool = |table: &str| {
+            let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
+            load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool)
+        };
+        let configured = pool("recovery_timeout_secs = 90\n").unwrap().unwrap();
+        assert_eq!(configured.recovery_timeout_secs, Some(90));
+        assert_eq!(pool("").unwrap().unwrap().recovery_timeout_secs, None);
+        let tmp = write_tmp("[openshell.gateway]\n");
+        assert!(
+            load(tmp.path())
+                .unwrap()
+                .openshell
+                .gateway
+                .supervisor_pool
+                .is_none()
+        );
+        // Recovery stays bounded, and unknown keys, including the removed
+        // `enabled` switch, are refused.
+        for out_of_range in ["9", "301"] {
+            assert!(matches!(
+                pool(&format!("recovery_timeout_secs = {out_of_range}\n")),
+                Err(ConfigFileError::InvalidValue {
+                    field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
+                    ..
+                })
+            ));
+        }
+        for unknown in ["enabled = true\n", "high_availability = true\n"] {
+            assert!(
+                matches!(pool(unknown), Err(ConfigFileError::Parse { .. })),
+                "{unknown}"
+            );
+        }
     }
 
     #[test]

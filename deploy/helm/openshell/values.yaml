@@ -69,6 +69,20 @@ supervisor:
     tag: ""
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
+  # -- Shared supervisor pool members, used only when gatewayConfig selects
+  # supervisor_topology = "gateway". The gateway always coordinates the shared
+  # supervisor as a high-availability pool: when a member fails or leaves,
+  # another member takes over its sandboxes without restarting their
+  # workloads. 1 has no failover; use 2 or more to survive losing a member.
+  # Only the supervisor Deployment's replica count depends on this value, so
+  # changing it neither restarts the gateway nor replaces running members.
+  replicas: 1
+  # -- Seconds a sandbox workload stays frozen after losing its pool member's
+  # supervision before the sandbox runtime terminates it, rendered as
+  # [openshell.gateway.supervisor_pool] recovery_timeout_secs. Must be an
+  # integer from 10 to 300. Null leaves the gateway's pool default of 60
+  # seconds.
+  recoveryTimeoutSeconds: 60
   # Pod security context for the shared supervisor Deployment, rendered only
   # when gatewayConfig selects supervisor_topology = "gateway". On OpenShift,
   # set the user and group IDs to null so the restricted-v2 SCC can assign the

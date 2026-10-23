@@ -11,25 +11,44 @@ use crate::boundary_protocol::{BoundaryConfig, SandboxRuntimeDescriptor};
 use crate::proto::{ExchangeFrame, exchange_frame::Payload};
 
 pub const SANDBOX_PROTOCOL_CAPABILITY: &str = "openshell.sandbox.protocol";
-const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+/// Optional: the runtime accepts a gateway-granted supervisor takeover.
+///
+/// The grant travels on Attach (`supervisor_takeover`). A supervisor holding
+/// one must not send it, or resume a workload it does not own, unless the
+/// runtime advertises this; an older runtime keeps rejecting replacement
+/// supervisors.
+pub const SUPERVISOR_TAKEOVER_CAPABILITY: &str = "openshell.sandbox.supervisor-takeover";
+const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 1 };
 
-/// The built-in runtime supports fresh launches; suspend/resume is optional.
+/// The built-in runtime supports fresh launches and supervisor takeover;
+/// suspend/resume is optional.
 #[must_use]
 pub fn metadata(implementation: &str) -> PeerMetadata {
-    let capabilities = vec![SANDBOX_PROTOCOL_CAPABILITY.to_string()];
+    let required = vec![SANDBOX_PROTOCOL_CAPABILITY.to_string()];
     PeerMetadata {
         protocol_version: Some(PROTOCOL_VERSION),
         implementation_name: implementation.to_string(),
         implementation_version: openshell_core::VERSION.to_string(),
-        supported_capabilities: capabilities.clone(),
-        required_capabilities: capabilities,
+        supported_capabilities: vec![
+            SANDBOX_PROTOCOL_CAPABILITY.to_string(),
+            SUPERVISOR_TAKEOVER_CAPABILITY.to_string(),
+        ],
+        required_capabilities: required,
     }
 }
 
 /// Use the shared extension rules: equal majors and both peers' requirements.
 pub fn negotiate(local: &PeerMetadata, remote: Option<PeerMetadata>) -> Result<(), tonic::Status> {
+    negotiate_capabilities(local, remote).map(drop)
+}
+
+/// Negotiate and return the remote peer's normalized metadata, so optional
+/// capabilities it advertises can be checked before they are used.
+pub fn negotiate_capabilities(
+    local: &PeerMetadata,
+    remote: Option<PeerMetadata>,
+) -> Result<PeerMetadata, tonic::Status> {
     negotiate_metadata("isolation", "sandbox-protocol", local, remote)
-        .map(drop)
         .map_err(|error| tonic::Status::failed_precondition(error.to_string()))
 }
 

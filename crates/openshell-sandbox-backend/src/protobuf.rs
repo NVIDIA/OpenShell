@@ -134,6 +134,14 @@ fn duration(micros: u64) -> Result<prost_types::Duration, FrameError> {
         nanos: number((micros % 1_000_000) * 1000)?,
     })
 }
+/// A whole number of seconds that fits `u32`, such as an offered recovery
+/// deadline.
+fn whole_seconds(v: prost_types::Duration) -> Result<u32, FrameError> {
+    if v.nanos != 0 {
+        return Err(invalid("duration is not a whole number of seconds"));
+    }
+    u32::try_from(v.seconds).map_err(|_| invalid("duration outside the accepted range"))
+}
 fn micros(v: Option<prost_types::Duration>) -> Result<u64, FrameError> {
     let v = v.unwrap_or_default();
     if !(0..=315_576_000_000).contains(&v.seconds)
@@ -385,11 +393,20 @@ impl WireMessage for w::SessionSnapshotWire {
                     })
                 })
                 .collect::<Result<_, FrameError>>()?,
+            bound_policy: self
+                .bound_policy
+                .as_ref()
+                .map(|policy| policy.to_proto())
+                .transpose()?,
         })
     }
     fn from_proto(v: Self::Proto) -> Result<Self, FrameError> {
         Ok(Self {
             generation: v.generation,
+            bound_policy: v
+                .bound_policy
+                .map(|policy| w::SandboxPolicyWire::from_proto(policy).map(Box::new))
+                .transpose()?,
             processes: v
                 .processes
                 .into_iter()
@@ -441,9 +458,18 @@ impl WireMessage for w::RequestEnvelope {
             W::Attach {
                 supervisor_instance_id,
                 policy,
+                supervisor_takeover,
+                supervisor_recovery_timeout_secs,
             } => P::Attach(p::Attach {
                 supervisor_instance_id: supervisor_instance_id.to_string(),
                 policy: Some(policy.to_proto()?),
+                supervisor_takeover: supervisor_takeover.clone(),
+                supervisor_recovery_timeout: supervisor_recovery_timeout_secs.map(|seconds| {
+                    prost_types::Duration {
+                        seconds: i64::from(seconds),
+                        nanos: 0,
+                    }
+                }),
             }),
             W::Confirm => P::Confirm(p::Confirm {}),
             W::StartAgent {
@@ -525,6 +551,11 @@ impl WireMessage for w::RequestEnvelope {
             P::Attach(v) => W::Attach {
                 supervisor_instance_id: parse(&v.supervisor_instance_id)?,
                 policy: Box::new(w::SandboxPolicyWire::from_proto(required(v.policy)?)?),
+                supervisor_takeover: v.supervisor_takeover,
+                supervisor_recovery_timeout_secs: v
+                    .supervisor_recovery_timeout
+                    .map(whole_seconds)
+                    .transpose()?,
             },
             P::Confirm(_) => W::Confirm,
             P::StartAgent(v) => W::StartAgent {
@@ -794,6 +825,8 @@ mod tests {
             request: Some(p::request_envelope::Request::Attach(p::Attach {
                 supervisor_instance_id: uuid::Uuid::new_v4().to_string(),
                 policy: None,
+                supervisor_takeover: None,
+                supervisor_recovery_timeout: None,
             })),
         };
         assert!(w::RequestEnvelope::from_proto(attach).is_err());
@@ -805,6 +838,53 @@ mod tests {
             })),
         };
         assert!(w::RequestEnvelope::from_proto(signal).is_err());
+    }
+
+    #[test]
+    fn attach_carries_an_offered_recovery_deadline_only_when_present() {
+        for offered in [None, Some(60)] {
+            let request = w::RequestEnvelope::new(w::Request::Attach {
+                supervisor_instance_id: w::SupervisorInstanceId::new(),
+                policy: Box::new(w::SandboxPolicyWire::from(
+                    openshell_core::policy::SandboxPolicy {
+                        version: 1,
+                        filesystem: openshell_core::policy::FilesystemPolicy::default(),
+                        network: openshell_core::policy::NetworkPolicy::default(),
+                        landlock: openshell_core::policy::LandlockPolicy::default(),
+                        process: openshell_core::policy::ProcessPolicy::default(),
+                    },
+                )),
+                supervisor_takeover: None,
+                supervisor_recovery_timeout_secs: offered,
+            })
+            .unwrap();
+            let encoded = request.to_proto().unwrap();
+            let Some(p::request_envelope::Request::Attach(attach)) = &encoded.request else {
+                unreachable!()
+            };
+            assert_eq!(
+                attach.supervisor_recovery_timeout,
+                offered.map(|seconds| prost_types::Duration {
+                    seconds: i64::from(seconds),
+                    nanos: 0,
+                })
+            );
+            let mut fractional = encoded.clone();
+            let decoded = w::RequestEnvelope::from_proto(encoded).unwrap();
+            assert!(matches!(
+                decoded.request,
+                w::Request::Attach { supervisor_recovery_timeout_secs, .. }
+                    if supervisor_recovery_timeout_secs == offered
+            ));
+            // An offer that is not whole seconds is not a valid frame.
+            if let Some(p::request_envelope::Request::Attach(attach)) = &mut fractional.request {
+                attach.supervisor_recovery_timeout = Some(prost_types::Duration {
+                    seconds: 60,
+                    nanos: 1,
+                });
+            }
+            assert!(w::RequestEnvelope::from_proto(fractional).is_err());
+        }
     }
 
     #[test]

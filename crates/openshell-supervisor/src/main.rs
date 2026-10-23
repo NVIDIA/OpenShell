@@ -83,6 +83,24 @@ struct Args {
     #[arg(long, required_if_eq("mode", "shared"))]
     session_root: Option<PathBuf>,
 
+    /// Stable name of this shared supervisor as a member of the gateway's
+    /// supervisor pool (its Pod name), so the gateway can place, keep, and
+    /// fail over sandbox instances among members. Required for
+    /// `--mode=shared`.
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID")]
+    pool_member_id: Option<String>,
+
+    /// Identity of this incarnation of the pool member (its Pod UID).
+    /// Required for `--mode=shared`.
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_MEMBER_UID")]
+    pool_member_uid: Option<String>,
+
+    /// Address other pool members redirect this member's sandbox runtimes
+    /// to (its Pod IP); the runtime listener's port is appended. Required for
+    /// `--mode=shared`.
+    #[arg(long, env = "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP")]
+    pool_advertise_ip: Option<std::net::IpAddr>,
+
     /// Supervisor responsibility to run.
     #[arg(long, value_enum, default_value_t)]
     role: SupervisorRole,
@@ -596,6 +614,8 @@ fn main() -> Result<()> {
                     .filter(|path| !path.is_empty())
                     .map(PathBuf::from),
                     proxy_tls: openshell_supervisor_network::run::ProxyTlsFiles::from_environment(),
+                    takeover: None,
+                    supervisor_recovery_timeout_secs: None,
                 };
                 // Log push already shares these credentials and the logging
                 // layers these OCSF JSON settings.

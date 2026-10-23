@@ -3082,3 +3082,216 @@ async fn store_operations_export_spans_with_parents() {
         "the store span records what it queried"
     );
 }
+
+/// Exercises one atomic write group on `store`: results come back in input
+/// order, and any unmet condition leaves every row as it was. Writes run in
+/// `(object_type, id)` order, so each failing write below sorts after a
+/// create, an update, and a delete that already succeeded inside the group.
+async fn atomic_write_groups_apply_all_or_nothing(store: &Store) {
+    use super::AtomicWrite;
+    let create = |id: &str, name: &str| AtomicWrite::Create {
+        object_type: "atomic_test".to_string(),
+        id: id.to_string(),
+        name: name.to_string(),
+        workspace: String::new(),
+        payload: b"one".to_vec(),
+    };
+    let update = |id: &str, expected_version| AtomicWrite::Update {
+        object_type: "atomic_test".to_string(),
+        id: id.to_string(),
+        payload: b"two".to_vec(),
+        expected_version,
+    };
+    let delete = |id: &str, expected_version| AtomicWrite::Delete {
+        object_type: "atomic_test".to_string(),
+        id: id.to_string(),
+        expected_version,
+    };
+    let results = store
+        .write_atomically(&[create("x", "x"), create("b", "b"), create("a", "a")])
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert!(
+        results
+            .iter()
+            .all(|result| result.as_ref().unwrap().resource_version == 1)
+    );
+    let unchanged = || async {
+        for id in ["a", "b", "x"] {
+            let row = store.get("atomic_test", id).await.unwrap().unwrap();
+            assert_eq!(
+                (row.payload.as_slice(), row.resource_version),
+                (b"one".as_slice(), 1),
+                "{id} is unchanged"
+            );
+        }
+        assert!(store.get("atomic_test", "c").await.unwrap().is_none());
+    };
+
+    // Each group updates a, deletes b, and creates c before its last write
+    // fails; every one of those effects is rolled back.
+    let failing_last = [
+        // An update at a stale version.
+        update("x", 7),
+        // A create of an existing id.
+        create("x", "other"),
+        // A create of a new id under an existing name.
+        create("y", "x"),
+        // A delete at a stale version.
+        delete("x", 7),
+    ];
+    for last in failing_last {
+        let unique = matches!(last, AtomicWrite::Create { .. });
+        let outcome = store
+            .write_atomically(&[last, create("c", "c"), delete("b", 1), update("a", 1)])
+            .await;
+        if unique {
+            assert!(
+                matches!(outcome, Err(PersistenceError::UniqueViolation { .. })),
+                "{outcome:?}"
+            );
+        } else {
+            assert!(
+                matches!(outcome, Err(PersistenceError::Conflict { .. })),
+                "{outcome:?}"
+            );
+        }
+        unchanged().await;
+        assert!(store.get("atomic_test", "y").await.unwrap().is_none());
+    }
+
+    // A group whose conditions hold applies every write.
+    let applied = store
+        .write_atomically(&[delete("b", 1), update("a", 1), create("c", "c")])
+        .await
+        .unwrap();
+    assert!(applied[0].is_none());
+    assert_eq!(applied[1].as_ref().unwrap().resource_version, 2);
+    assert_eq!(applied[2].as_ref().unwrap().resource_version, 1);
+    assert!(store.get("atomic_test", "b").await.unwrap().is_none());
+    assert!(store.get("atomic_test", "c").await.unwrap().is_some());
+    let a = store.get("atomic_test", "a").await.unwrap().unwrap();
+    assert_eq!(
+        (a.payload.as_slice(), a.resource_version),
+        (b"two".as_slice(), 2)
+    );
+}
+
+/// Concurrent groups that update the same row at the same version: exactly
+/// one applies, and the rest change nothing.
+async fn concurrent_atomic_write_groups_admit_one(store: &Store) {
+    use super::AtomicWrite;
+    store
+        .write_atomically(&[AtomicWrite::Create {
+            object_type: "atomic_race".to_string(),
+            id: "slot".to_string(),
+            name: "slot".to_string(),
+            workspace: String::new(),
+            payload: b"0".to_vec(),
+        }])
+        .await
+        .unwrap();
+    let contenders = (0..8).map(|index| {
+        let store = store.clone();
+        async move {
+            store
+                .write_atomically(&[
+                    AtomicWrite::Create {
+                        object_type: "atomic_race".to_string(),
+                        id: format!("claim-{index}"),
+                        name: format!("claim-{index}"),
+                        workspace: String::new(),
+                        payload: Vec::new(),
+                    },
+                    AtomicWrite::Update {
+                        object_type: "atomic_race".to_string(),
+                        id: "slot".to_string(),
+                        payload: index.to_string().into_bytes(),
+                        expected_version: 1,
+                    },
+                ])
+                .await
+        }
+    });
+    let outcomes = futures::future::join_all(contenders).await;
+    let winners = outcomes
+        .iter()
+        .enumerate()
+        .filter(|(_, outcome)| outcome.is_ok())
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    for outcome in &outcomes {
+        if let Err(error) = outcome {
+            assert!(
+                matches!(error, PersistenceError::Conflict { .. }),
+                "{error:?}"
+            );
+        }
+    }
+    let slot = store.get("atomic_race", "slot").await.unwrap().unwrap();
+    assert_eq!(slot.payload, winners[0].to_string().into_bytes());
+    assert_eq!(slot.resource_version, 2);
+    for index in 0..8 {
+        let claim = store
+            .get("atomic_race", &format!("claim-{index}"))
+            .await
+            .unwrap();
+        assert_eq!(claim.is_some(), index == winners[0], "claim-{index}");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_atomic_write_groups_apply_all_or_nothing() {
+    atomic_write_groups_apply_all_or_nothing(&test_store().await).await;
+}
+
+#[tokio::test]
+async fn sqlite_concurrent_atomic_write_groups_admit_one() {
+    concurrent_atomic_write_groups_admit_one(&test_store().await).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_atomic_write_groups_apply_all_or_nothing() {
+    let schema = super::test_postgres::TestSchema::create("atomic_write").await;
+    let store = schema.connect_store().await;
+    atomic_write_groups_apply_all_or_nothing(&store).await;
+    drop(store);
+    schema.drop_schema().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_concurrent_atomic_write_groups_admit_one() {
+    let schema = super::test_postgres::TestSchema::create("atomic_race").await;
+    let store = schema.connect_store().await;
+    concurrent_atomic_write_groups_admit_one(&store).await;
+    drop(store);
+    schema.drop_schema().await;
+}
+
+/// A group's queries all run on the connection its transaction holds, so a
+/// one-connection pool neither deadlocks nor loses atomicity.
+#[tokio::test]
+#[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+async fn postgres_atomic_write_groups_run_on_a_one_connection_pool() {
+    let schema = super::test_postgres::TestSchema::create("atomic_one").await;
+    // Below the operator minimum on purpose: atomic groups alone must not
+    // need a second connection.
+    let backend = super::postgres::PostgresStore::connect(schema.url(), Some(1), None)
+        .await
+        .expect("connect a one-connection store");
+    backend.migrate().await.expect("migrate");
+    let store = Store::Postgres(backend);
+    assert_eq!(store.max_connections(), 1);
+    tokio::time::timeout(std::time::Duration::from_mins(1), async {
+        atomic_write_groups_apply_all_or_nothing(&store).await;
+        concurrent_atomic_write_groups_admit_one(&store).await;
+    })
+    .await
+    .expect("atomic write groups finish on one connection");
+    drop(store);
+    schema.drop_schema().await;
+}

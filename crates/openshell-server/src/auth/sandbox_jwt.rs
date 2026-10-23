@@ -295,6 +295,17 @@ impl SandboxSessionJwtAuthority {
         self.issuer.mint_supervisor_token(ttl)
     }
 
+    /// Mint the takeover grant of one supervisor term of a shared pool
+    /// instance. The caller has already advanced the sandbox's persisted
+    /// credential epoch to the grant's.
+    pub fn mint_supervisor_takeover(
+        &self,
+        takeover: &openshell_core::jwt::SupervisorTakeover,
+        ttl: Duration,
+    ) -> Result<MintedSessionToken, SessionJwtError> {
+        self.issuer.mint_supervisor_takeover(takeover, ttl)
+    }
+
     /// Verify a presented supervisor token.
     pub fn verify_supervisor_token(
         &self,
@@ -366,6 +377,7 @@ impl Authenticator for SandboxSessionJwtAuthenticator {
                 sandbox_id: authenticated.sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "launch-session".to_string(),
+                    auth_epoch: Some(authenticated.auth_epoch),
                 },
                 trust_domain: Some("openshell".to_string()),
             },

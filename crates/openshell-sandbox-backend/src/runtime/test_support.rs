@@ -728,6 +728,9 @@ fn client(peer: Peer) -> Arc<BoundaryClient> {
         task,
     }));
     client.boundary_handle.set("test".into()).unwrap();
+    // Fixtures stand for an attached, confirmed boundary, whose mediation
+    // sources accept at once.
+    client.confirmed.send_replace(true);
     Arc::new(client)
 }
 pub fn process(process: Arc<dyn BoundaryProcess>) -> Arc<crate::BoundaryProcess> {
@@ -738,6 +741,7 @@ pub fn process(process: Arc<dyn BoundaryProcess>) -> Arc<crate::BoundaryProcess>
         }),
         process_id: "main".into(),
         exec: false,
+        adopted: false,
     })
 }
 pub fn terminal(terminal: Arc<dyn BoundaryTerminal>) -> Arc<crate::BoundaryTerminal> {
