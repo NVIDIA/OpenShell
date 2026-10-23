@@ -37,6 +37,7 @@ from pathlib import Path
 ALIGNED_WORKSPACES = (
     "tests/testkit",
     "tests/suites/conformance",
+    "tests/suites/features",
 )
 
 
