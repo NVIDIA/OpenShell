@@ -171,7 +171,8 @@ control listener: it dials the gateway and receives its assignments from it.
 - **Disconnects.** Losing the gateway stream never stops an instance. The
   host reconnects with backoff, reports what it runs, and applies the first
   snapshot of the new session; only a snapshot that omits an instance, or
-  process shutdown, stops it.
+  process shutdown, stops it. A standby gateway replica's marked refusal is
+  retried after a short jittered delay instead, to reach the leader.
 - **Runtime connections.** One routed listener (`--runtime-listen`) accepts every
   instance's runtime-initiated Sandbox Protocol connections; see
   `openshell-sandbox-backend` for the routing preface.

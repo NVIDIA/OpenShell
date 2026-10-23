@@ -40,8 +40,9 @@ pub enum LaunchError<E> {
     /// The driver could not persist the launch material; nothing was assigned.
     #[error("{0}")]
     Persist(E),
-    /// The host is at capacity. The material was persisted; the caller rolls
-    /// the generation back before its workload runs.
+    /// The publishing gateway's host is at capacity. The material was
+    /// persisted; the caller rolls the generation back before its workload
+    /// runs.
     #[error("{0}")]
     Refused(AssignmentError),
 }
@@ -68,11 +69,12 @@ pub struct RecoverableInstance<R> {
 pub enum RecoveryOutcome {
     /// The desired set matches the records; carries the revision in force.
     Published(u64),
-    /// The desired set changed while the records were listed; the next pass
-    /// derives them again.
+    /// The desired set changed, or this replica stopped publishing, while
+    /// the records were listed; the next pass derives them again.
     Conflict,
     /// Launch material could not be read or does not match its record, or the
-    /// set exceeds the host's capacity; the previous set stays published.
+    /// set exceeds the host's capacity before the host has reported what it
+    /// runs; the previous set stays published.
     Kept,
 }
 
@@ -84,8 +86,9 @@ pub enum InstanceSupervision {
     /// The host has not reconciled to the assigning snapshot yet, or hosts
     /// the instance but it is still starting.
     Degraded,
-    /// The host reconciled past the assignment and does not host the
-    /// instance, hosts it for another sandbox, or reports it ended.
+    /// The host reconciled past the assignment, or past the recovery that
+    /// left the instance unassigned, and does not host the instance, hosts
+    /// it for another sandbox, or reports it ended.
     Unavailable,
     /// No host is connected, so nothing is known.
     Unknown,
@@ -127,8 +130,12 @@ impl SharedSupervision {
     /// assign the instance so the host starts it. The launch material is
     /// persisted first so a restarted gateway recovers the assignment from the
     /// generation's own records. An identical assignment changes nothing.
-    /// Capacity is refused as [`LaunchError::Refused`], so the caller fails
-    /// its create before the workload runs.
+    /// On the publishing gateway, capacity is refused as
+    /// [`LaunchError::Refused`], so the caller fails its create before the
+    /// workload runs. On a replicated gateway's standby, admission is
+    /// eventual: the leader's recovery assigns the persisted instance, or
+    /// leaves it unassigned beyond capacity so its supervision becomes
+    /// unavailable.
     pub async fn launch<E, F>(
         &self,
         registration: &SandboxInstanceRegistration,
@@ -149,7 +156,8 @@ impl SharedSupervision {
     }
 
     /// Withdraw a generation's sandbox instance so the host stops it. Nothing
-    /// happens for a route that is not assigned.
+    /// happens for a route that is not assigned; a standby leaves the stop to
+    /// the leader's recovery from durable records.
     pub fn withdraw(&self, route: &str) {
         self.controller.unassign(route);
     }
@@ -175,8 +183,10 @@ impl SharedSupervision {
     /// The first completed pass initializes the desired set; until then
     /// nothing is sent to the host. A failed or mismatched read keeps the
     /// previous set, because an incomplete set would stop running instances.
-    /// A pass that raced a lifecycle edit is refused and derived again next
-    /// time.
+    /// A pass that raced a lifecycle edit or the end of this replica's term
+    /// is refused and derived again next time. A candidate whose material is
+    /// gone, or that exceeds the host's capacity, is left unassigned and
+    /// becomes absent once the host acknowledges a snapshot omitting it.
     pub async fn complete_recovery<R, E, F>(
         &self,
         baseline: RecoveryBaseline,
@@ -189,6 +199,7 @@ impl SharedSupervision {
         F: Future<Output = Result<Option<Vec<u8>>, E>> + Send,
     {
         let mut assignments = Vec::with_capacity(candidates.len());
+        let mut excluded = Vec::new();
         for candidate in &candidates {
             if let Some(assignment) = self.controller.assignment(&candidate.route) {
                 assignments.push(assignment);
@@ -202,6 +213,7 @@ impl SharedSupervision {
                         route = %candidate.route,
                         "shared sandbox instance has no launch material; it stays unassigned"
                     );
+                    excluded.push(candidate.route.clone());
                     continue;
                 }
                 Err(error) => {
@@ -229,10 +241,12 @@ impl SharedSupervision {
         }
         match self
             .controller
-            .replace_assignments(baseline.revision, assignments)
+            .replace_assignments(baseline.revision, assignments, excluded)
         {
             Ok(revision) => RecoveryOutcome::Published(revision),
-            Err(AssignmentError::Conflict { .. }) => RecoveryOutcome::Conflict,
+            Err(AssignmentError::Conflict { .. } | AssignmentError::Standby) => {
+                RecoveryOutcome::Conflict
+            }
             Err(error) => {
                 tracing::warn!(%error, "could not publish the shared sandbox instances; keeping the previous assignments");
                 RecoveryOutcome::Kept
@@ -300,7 +314,8 @@ fn recovered_assignment<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::SandboxInstanceAssignment;
+    use crate::controller::HostIdentity;
+    use crate::proto::{HostHello, HostStatus, SandboxInstanceAssignment};
 
     fn candidate(route: &str, sandbox_id: &str) -> RecoverableInstance<&'static str> {
         RecoverableInstance {
@@ -367,6 +382,56 @@ mod tests {
         assert_eq!(
             supervision.controller().assignment(&assigned.route),
             Some(assigned.clone())
+        );
+
+        // The skipped record is pending until the host acknowledges the
+        // snapshot omitting it, then unavailable, unlike an undiscovered
+        // route. A later failed read is no evidence and changes nothing.
+        let controller = supervision.controller();
+        let (session, _) = controller
+            .begin_session(
+                HostIdentity {
+                    subject: "openshell-supervisor:test".to_string(),
+                    token_id: "token".to_string(),
+                    expires_at: i64::MAX,
+                },
+                &HostHello {
+                    instance_id: "boot".to_string(),
+                    connection_epoch: 1,
+                },
+            )
+            .unwrap();
+        let acked = |applied_revision| HostStatus {
+            applied_revision,
+            instances: Vec::new(),
+        };
+        controller.record_status(session, acked(0)).unwrap();
+        assert_eq!(
+            supervision.supervision("rt-gone-0123456789", "sandbox-d"),
+            InstanceSupervision::Degraded
+        );
+        controller.record_sent(session, 1);
+        controller.record_status(session, acked(1)).unwrap();
+        assert_eq!(
+            supervision.supervision("rt-gone-0123456789", "sandbox-d"),
+            InstanceSupervision::Unavailable
+        );
+        assert_eq!(
+            supervision.supervision("rt-undiscovered-0123456789", "sandbox-e"),
+            InstanceSupervision::Degraded
+        );
+        let baseline = supervision.begin_recovery();
+        let outcome = supervision
+            .complete_recovery(
+                baseline,
+                vec![candidate("rt-gone-0123456789", "sandbox-d")],
+                |_record| async { Err::<Option<Vec<u8>>, _>("boom") },
+            )
+            .await;
+        assert_eq!(outcome, RecoveryOutcome::Kept);
+        assert_eq!(
+            supervision.supervision("rt-gone-0123456789", "sandbox-d"),
+            InstanceSupervision::Unavailable
         );
 
         // A baseline read before a lifecycle edit is refused, and the edit stands.

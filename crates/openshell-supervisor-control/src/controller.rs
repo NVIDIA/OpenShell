@@ -20,12 +20,16 @@
 //! before the records were listed, so a list that raced a lifecycle edit
 //! never resurrects a withdrawn instance or discards a new one.
 //!
+//! Only the publisher owns desired state. A replica that does not publish
+//! keeps none: its lifecycle edits are durable records that the publisher's
+//! next recovery discovers, so admission on a replicated gateway is eventual.
+//!
 //! Exactly one host serves a gateway: a new attach from a newer connection of
 //! the same host process, or from a new host process, supersedes the current
 //! session; reports and acks from a superseded stream are dropped, and a
 //! delayed hello from an older connection of the current process is refused.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,10 +58,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Gateway-to-host messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
-/// Most sandbox instances one shared supervisor host runs. The gateway
-/// refuses to assign beyond it, and the host refuses snapshots beyond it, so
-/// a sandbox is never created that its host could not accept.
+/// Most sandbox instances one shared supervisor host runs. The publishing
+/// gateway refuses to assign beyond it, recovery leaves any excess
+/// unassigned, and the host refuses snapshots beyond it.
 pub const MAX_ASSIGNED_INSTANCES: usize = 256;
+/// Metadata key marking a standby replica's `UNAVAILABLE` refusal of `Attach`.
+///
+/// Paired with [`STANDBY_REFUSAL_VALUE`], it lets the host retry leader
+/// discovery promptly rather than backing off as it would from an outage.
+pub const STANDBY_REFUSAL_METADATA: &str = "x-openshell-supervisor-host";
+pub const STANDBY_REFUSAL_VALUE: &str = "standby";
 /// Most instances one host status report may describe: every assignment plus
 /// instances still being removed.
 pub const MAX_REPORTED_INSTANCES: usize = 4 * MAX_ASSIGNED_INSTANCES;
@@ -92,10 +102,12 @@ pub enum ObservedInstance {
     /// No host session is connected.
     NoHost,
     /// A host is connected, but this gateway has not recovered the route's
-    /// assignment yet or the host has not reconciled the snapshot assigning it.
+    /// assignment yet or the host has not reconciled the snapshot assigning
+    /// or excluding it.
     Pending,
     /// The host reconciled to the snapshot assigning this route and does
-    /// not host it.
+    /// not host it, or to one omitting a route the latest complete recovery
+    /// left unassigned.
     Absent,
     /// The host's latest report of the instance.
     Reported(SandboxInstanceStatus),
@@ -141,6 +153,10 @@ struct Desired {
     assignments: BTreeMap<String, Assigned>,
     /// Edits made before initialization, applied over the first full list.
     pending: BTreeMap<String, Option<SandboxInstanceAssignment>>,
+    /// Routes the latest complete recovery listed but left unassigned (no
+    /// launch material, or beyond capacity), each with the first revision
+    /// whose snapshot omits it. Assigning or withdrawing a route clears it.
+    excluded: BTreeMap<String, u64>,
 }
 
 impl Desired {
@@ -237,6 +253,35 @@ pub enum AssignmentError {
     /// The change would assign more instances than one host runs.
     #[error("the shared supervisor hosts at most {MAX_ASSIGNED_INSTANCES} sandbox instances")]
     Capacity,
+    /// This replica does not publish assignments, so a full resync begun in
+    /// an ended term is discarded.
+    #[error("this gateway replica does not publish shared supervisor assignments")]
+    Standby,
+}
+
+/// The refusal a replica that does not publish gives an attaching host.
+fn standby_refusal() -> Status {
+    let mut metadata = tonic::metadata::MetadataMap::new();
+    metadata.insert(
+        STANDBY_REFUSAL_METADATA,
+        tonic::metadata::MetadataValue::from_static(STANDBY_REFUSAL_VALUE),
+    );
+    Status::with_metadata(
+        tonic::Code::Unavailable,
+        "reconnect to the gateway reconciler leader",
+        metadata,
+    )
+}
+
+/// Whether `status` is a standby replica's refusal of `Attach`, as opposed to
+/// a transport or gateway failure.
+#[must_use]
+pub fn is_standby_refusal(status: &Status) -> bool {
+    status.code() == tonic::Code::Unavailable
+        && status
+            .metadata()
+            .get(STANDBY_REFUSAL_METADATA)
+            .is_some_and(|value| value.to_str().ok() == Some(STANDBY_REFUSAL_VALUE))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -293,11 +338,21 @@ impl SupervisorHostController {
 
     /// Revoke publication before releasing the lease or waiting for worker
     /// cleanup. Existing sandbox instances survive their stream closing.
+    /// The term's desired state is discarded and its revision fenced, so a
+    /// standby holds none and a recovery begun in the term cannot
+    /// reinitialize it.
     pub fn stop_publishing(&self) {
         let mut publisher = lock(&self.inner.publisher);
         *publisher = Publisher::Standby;
+        let mut desired = lock(&self.inner.desired);
+        let revision = desired.revision + 1;
+        *desired = Desired {
+            revision,
+            ..Desired::default()
+        };
         Self::disconnect(&mut lock(&self.inner.observed));
         self.inner.credential.send_replace(None);
+        self.inner.revision.send_replace(revision);
     }
 
     fn disconnect(observed: &mut Observed) {
@@ -327,6 +382,7 @@ impl SupervisorHostController {
             desired
                 .assignments
                 .keys()
+                .chain(desired.excluded.keys())
                 .map(|route| {
                     let value = match Self::observe(&desired, &observed, route) {
                         ObservedInstance::Reported(status) => SharedObservation::Reported(
@@ -390,19 +446,32 @@ impl SupervisorHostController {
     }
 
     /// Replace the whole desired set with `assignments`, derived from
-    /// durable records while the revision was `baseline`.
+    /// durable records while the revision was `baseline`; `excluded` names
+    /// the listed routes that are deliberately left unassigned.
     ///
     /// Initializes the controller; edits made before initialization are
     /// applied on top of the list. The replacement is compare-and-replace:
     /// when the revision moved past `baseline` while
     /// the list was being derived, nothing changes and the conflict is
-    /// returned so the caller derives the list again.
+    /// returned so the caller derives the list again. Only the publisher
+    /// replaces its set.
+    ///
+    /// Only listed candidates are selected. A list beyond the host's
+    /// capacity keeps those currently assigned or that the host reports
+    /// running, then fills the rest in route order; the remainder is
+    /// excluded like `excluded`. Until this term's host has sent its initial
+    /// report it is refused, since any cut could stop a running instance.
     pub fn replace_assignments(
         &self,
         baseline: u64,
         assignments: impl IntoIterator<Item = SandboxInstanceAssignment>,
+        excluded: impl IntoIterator<Item = String>,
     ) -> Result<u64, AssignmentError> {
+        let publisher = lock(&self.inner.publisher);
         let mut desired = lock(&self.inner.desired);
+        if !publisher.active() {
+            return Err(AssignmentError::Standby);
+        }
         if desired.revision != baseline {
             return Err(AssignmentError::Conflict {
                 baseline,
@@ -425,8 +494,42 @@ impl SupervisorHostController {
                 }
             }
         }
+        let mut excluded = excluded
+            .into_iter()
+            .filter(|route| !resolved.contains_key(route) && !desired.pending.contains_key(route))
+            .collect::<BTreeSet<_>>();
         if resolved.len() > MAX_ASSIGNED_INSTANCES {
-            return Err(AssignmentError::Capacity);
+            let observed = lock(&self.inner.observed);
+            let Some(status) = &observed.status else {
+                return Err(AssignmentError::Capacity);
+            };
+            let running = status
+                .instances
+                .iter()
+                .filter(|instance| {
+                    !SandboxInstanceStatusReport::from_proto(instance)
+                        .phase
+                        .is_terminal()
+                })
+                .map(|instance| instance.route.as_str())
+                .collect::<BTreeSet<_>>();
+            // A stable sort keeps route order within each tier.
+            let mut ranked = resolved.keys().cloned().collect::<Vec<_>>();
+            ranked.sort_by_key(|route| {
+                (
+                    !desired.assignments.contains_key(route),
+                    !running.contains(route.as_str()),
+                )
+            });
+            let overflow = ranked.split_off(MAX_ASSIGNED_INSTANCES);
+            tracing::warn!(
+                unassigned = overflow.len(),
+                "shared sandbox instances exceed the supervisor's capacity; leaving the excess unassigned"
+            );
+            for route in overflow {
+                resolved.remove(&route);
+                excluded.insert(route);
+            }
         }
         desired.pending.clear();
         let next = desired.revision + 1;
@@ -444,14 +547,33 @@ impl SupervisorHostController {
             desired.revision = next;
             self.inner.revision.send_replace(next);
         }
-        Ok(desired.revision)
+        // A route that stays excluded keeps the revision that first omitted
+        // it, so an unchanged recovery needs no new snapshot or ack.
+        let revision = desired.revision;
+        let previous = std::mem::take(&mut desired.excluded);
+        desired.excluded = excluded
+            .into_iter()
+            .map(|route| {
+                let since = previous.get(&route).copied().unwrap_or(revision);
+                (route, since)
+            })
+            .collect();
+        Ok(revision)
     }
 
     /// Assign one instance. Before initialization the edit is kept until the
     /// first full list arrives. Refused when it would exceed the host's
     /// capacity, so the caller fails its create before anything runs.
+    ///
+    /// A replica that does not publish keeps nothing: the persisted launch
+    /// material is the assignment, and the publisher's recovery admits it or
+    /// leaves it unassigned beyond capacity.
     pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
+        let publisher = lock(&self.inner.publisher);
         let mut desired = lock(&self.inner.desired);
+        if !publisher.active() {
+            return Ok(());
+        }
         if !desired.initialized {
             let pending_additions = desired
                 .pending
@@ -473,6 +595,7 @@ impl SupervisorHostController {
         {
             return Err(AssignmentError::Capacity);
         }
+        desired.excluded.remove(&assignment.route);
         let next = desired.revision + 1;
         if desired.put(assignment, next) {
             desired.revision = next;
@@ -481,18 +604,28 @@ impl SupervisorHostController {
         Ok(())
     }
 
-    /// Withdraw one instance so the host stops it.
+    /// Withdraw one instance so the host stops it. A replica that does not
+    /// publish keeps nothing; the publisher's recovery discovers the stop.
+    ///
+    /// After initialization every withdrawal advances the revision, even for
+    /// a route that is excluded or not yet discovered, so a recovery listed
+    /// before it conflicts instead of admitting the withdrawn generation. No
+    /// tombstone is kept: the next recovery lists the durable records again.
     pub fn unassign(&self, route: &str) {
+        let publisher = lock(&self.inner.publisher);
         let mut desired = lock(&self.inner.desired);
+        if !publisher.active() {
+            return;
+        }
         if !desired.initialized {
             desired.pending.insert(route.to_string(), None);
             return;
         }
-        if desired.assignments.remove(route).is_some() {
-            desired.revision += 1;
-            let revision = desired.revision;
-            self.inner.revision.send_replace(revision);
-        }
+        desired.excluded.remove(route);
+        desired.assignments.remove(route);
+        desired.revision += 1;
+        let revision = desired.revision;
+        self.inner.revision.send_replace(revision);
     }
 
     /// Whether a host session is currently connected.
@@ -531,15 +664,22 @@ impl SupervisorHostController {
         if observed.session.is_none() {
             return ObservedInstance::NoHost;
         }
-        let Some(assigned) = desired
+        let since = match desired
             .assignments
             .get(route)
             .filter(|_| desired.initialized)
-        else {
-            // A create can have reached another replica before this leader's
-            // recovery discovers its durable assignment. Never suspend that
-            // workload based on a snapshot that did not assign it.
-            return ObservedInstance::Pending;
+        {
+            Some(assigned) => assigned.revision,
+            // The latest complete recovery listed the route and left it
+            // unassigned; the host's ack of a snapshot omitting it is a verdict.
+            None => match desired.excluded.get(route) {
+                Some(since) => *since,
+                // A create can have reached another replica before this
+                // leader's recovery discovers its durable assignment. Never
+                // suspend that workload based on a snapshot that did not
+                // assign it.
+                None => return ObservedInstance::Pending,
+            },
         };
         let Some(status) = &observed.status else {
             return ObservedInstance::Pending;
@@ -551,7 +691,7 @@ impl SupervisorHostController {
         {
             return ObservedInstance::Reported(instance.clone());
         }
-        if assigned.revision > status.applied_revision {
+        if since > status.applied_revision {
             ObservedInstance::Pending
         } else {
             ObservedInstance::Absent
@@ -566,9 +706,7 @@ impl SupervisorHostController {
         mut inbound: Streaming<HostMessage>,
     ) -> Result<ReceiverStream<Result<HostGatewayMessage, Status>>, Status> {
         if !self.is_publisher() {
-            return Err(Status::unavailable(
-                "reconnect to the gateway reconciler leader",
-            ));
+            return Err(standby_refusal());
         }
         let hello = match tokio::time::timeout(HELLO_TIMEOUT, inbound.next()).await {
             Ok(Some(Ok(HostMessage {
@@ -623,16 +761,14 @@ impl SupervisorHostController {
     /// Start a session for `hello`, superseding the current one. A hello from
     /// the current host process with a connection epoch that is not newer is
     /// a delayed or replayed connection and is refused.
-    fn begin_session(
+    pub(crate) fn begin_session(
         &self,
         identity: HostIdentity,
         hello: &HostHello,
     ) -> Result<(u64, watch::Receiver<bool>), Status> {
         let publisher = lock(&self.inner.publisher);
         if !publisher.active() {
-            return Err(Status::unavailable(
-                "reconnect to the gateway reconciler leader",
-            ));
+            return Err(standby_refusal());
         }
         let mut observed = lock(&self.inner.observed);
         if let Some(current) = &observed.session
@@ -695,7 +831,7 @@ impl SupervisorHostController {
     }
 
     /// Note that `revision` was sent on session `id`.
-    fn record_sent(&self, id: u64, revision: u64) {
+    pub(crate) fn record_sent(&self, id: u64, revision: u64) {
         let mut observed = lock(&self.inner.observed);
         if let Some(session) = observed.session.as_mut().filter(|session| session.id == id) {
             session.sent_revision = session.sent_revision.max(revision);
@@ -705,7 +841,7 @@ impl SupervisorHostController {
     /// Record a report from session `id`. Reports from other sessions, acks
     /// of revisions never sent on this session, regressing acks, and
     /// oversized reports are dropped.
-    fn record_status(&self, id: u64, status: HostStatus) -> Result<(), &'static str> {
+    pub(crate) fn record_status(&self, id: u64, status: HostStatus) -> Result<(), &'static str> {
         let mut observed = lock(&self.inner.observed);
         let Some(session) = observed.session.as_ref().filter(|session| session.id == id) else {
             return Err("report from a superseded supervisor host session");
@@ -918,6 +1054,7 @@ mod tests {
                     assignment("rt-stopped-before-list", b"old"),
                     assignment("rt-listed", b"b"),
                 ],
+                [],
             ),
             Ok(1)
         );
@@ -941,6 +1078,7 @@ mod tests {
                     assignment("rt-created-before-list", b"a"),
                     assignment("rt-listed", b"b"),
                 ],
+                [],
             ),
             Ok(1)
         );
@@ -958,6 +1096,7 @@ mod tests {
                     assignment("rt-created-before-list", b"a"),
                     assignment("rt-listed", b"b"),
                 ],
+                [],
             ),
             Err(AssignmentError::Conflict {
                 baseline: 1,
@@ -965,13 +1104,13 @@ mod tests {
             })
         );
         assert!(controller.assignment("rt-listed").is_none());
-        assert_eq!(controller.replace_assignments(2, []), Ok(3));
+        assert_eq!(controller.replace_assignments(2, [], []), Ok(3));
         assert!(controller.snapshot().unwrap().instances.is_empty());
 
         // The gateway refuses the assignment its host could not accept.
         let full =
             (0..MAX_ASSIGNED_INSTANCES).map(|index| assignment(&format!("rt-{index}"), b"x"));
-        assert_eq!(controller.replace_assignments(3, full), Ok(4));
+        assert_eq!(controller.replace_assignments(3, full, []), Ok(4));
         assert_eq!(
             controller.assign(assignment("rt-one-too-many", b"x")),
             Err(AssignmentError::Capacity)
@@ -983,10 +1122,20 @@ mod tests {
     async fn leadership_fences_old_sessions_recovery_and_cached_observations() {
         let controller = SupervisorHostController::new();
         controller
-            .replace_assignments(0, [assignment("rt-old", b"old")])
+            .replace_assignments(0, [assignment("rt-old", b"old")], [])
             .unwrap();
         let old_baseline = controller.revision();
         controller.require_leadership();
+        assert!(!controller.is_initialized());
+        // A standby keeps no desired state, so creates and deletes beyond the
+        // host's capacity are left to the leader's durable recovery.
+        for index in 0..=MAX_ASSIGNED_INSTANCES {
+            controller
+                .assign(assignment(&format!("rt-standby-{index}"), b"s"))
+                .unwrap();
+            controller.unassign(&format!("rt-standby-deleted-{index}"));
+        }
+        assert!(lock(&controller.inner.desired).pending.is_empty());
         let identity = HostIdentity {
             subject: "openshell-supervisor:test".to_string(),
             token_id: "token".to_string(),
@@ -996,24 +1145,30 @@ mod tests {
             instance_id: "boot".to_string(),
             connection_epoch: 1,
         };
-        assert_eq!(
-            controller
-                .begin_session(identity.clone(), &hello)
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unavailable
-        );
+        // The refusal is marked, and the marker survives gRPC trailers.
+        let refusal = controller
+            .begin_session(identity.clone(), &hello)
+            .unwrap_err();
+        let mut trailers = tonic::codegen::http::HeaderMap::new();
+        refusal.add_header(&mut trailers).unwrap();
+        assert!(is_standby_refusal(
+            &Status::from_header_map(&trailers).unwrap()
+        ));
         controller.start_publishing(Instant::now() + Duration::from_secs(30));
         assert!(!controller.is_initialized());
         assert!(controller.assignment("rt-old").is_none());
-        assert!(controller.replace_assignments(old_baseline, []).is_err());
+        assert!(
+            controller
+                .replace_assignments(old_baseline, [], [])
+                .is_err()
+        );
         // No authoritative empty snapshot before the new term's full recovery.
         assert!(controller.snapshot().is_none());
         let (session, revoked) = controller.begin_session(identity.clone(), &hello).unwrap();
         controller.record_status(session, status(0, &[])).unwrap();
         assert_eq!(controller.observed("rt-new"), ObservedInstance::Pending);
         controller
-            .replace_assignments(controller.revision(), [assignment("rt-new", b"new")])
+            .replace_assignments(controller.revision(), [assignment("rt-new", b"new")], [])
             .unwrap();
         controller.record_sent(session, controller.revision());
         controller
@@ -1041,39 +1196,159 @@ mod tests {
         tokio::time::advance(Duration::from_secs(11)).await;
         assert!(controller.is_publisher());
         assert_eq!(standby.observed("rt-new"), ObservedInstance::NoHost);
+        // Demotion discards the term's desired state, and a recovery begun in
+        // the term cannot reinitialize the standby.
+        let stale_baseline = controller.revision();
         controller.stop_publishing();
         assert!(*revoked.borrow());
+        assert!(!controller.is_initialized());
+        assert!(controller.assignment("rt-new").is_none());
+        assert_eq!(
+            controller.replace_assignments(stale_baseline, [assignment("rt-new", b"new")], []),
+            Err(AssignmentError::Standby)
+        );
+        assert!(!controller.is_initialized());
         assert!(controller.record_status(session, status(0, &[])).is_err());
         assert_eq!(controller.observed("rt-new"), ObservedInstance::NoHost);
-        assert_eq!(
-            controller
-                .begin_session(identity.clone(), &hello)
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unavailable
-        );
+        let refusal = controller
+            .begin_session(identity.clone(), &hello)
+            .unwrap_err();
+        assert!(is_standby_refusal(&refusal));
 
         controller.start_publishing(Instant::now() + Duration::from_secs(30));
         assert!(!controller.is_initialized());
         assert!(controller.snapshot().is_none());
+        let expired_baseline = controller.revision();
         tokio::time::advance(Duration::from_secs(31)).await;
-        // A late renewal cannot revive an expired term.
+        // A late renewal cannot revive an expired term, and an expired
+        // publisher edits nothing even before its demotion runs.
         controller.renew_publishing(Instant::now() + Duration::from_secs(30));
         assert!(!controller.is_publisher());
+        controller.assign(assignment("rt-late", b"l")).unwrap();
+        controller.unassign("rt-late-stop");
+        assert!(lock(&controller.inner.desired).pending.is_empty());
         assert_eq!(
-            controller
-                .begin_session(identity, &hello)
-                .unwrap_err()
-                .code(),
-            tonic::Code::Unavailable
+            controller.replace_assignments(expired_baseline, [], []),
+            Err(AssignmentError::Standby)
         );
+        assert!(!controller.is_initialized());
+        assert!(is_standby_refusal(
+            &controller.begin_session(identity, &hello).unwrap_err()
+        ));
+    }
+
+    #[test]
+    fn recovery_exclusions_become_absent_once_acknowledged_and_bound_capacity() {
+        let controller = SupervisorHostController::new();
+        let identity = HostIdentity {
+            subject: "openshell-supervisor:test".to_string(),
+            token_id: "token".to_string(),
+            expires_at: i64::MAX,
+        };
+        let hello = HostHello {
+            instance_id: "boot".to_string(),
+            connection_epoch: 1,
+        };
+        let (session, _) = controller.begin_session(identity, &hello).unwrap();
+        let listed = || {
+            (0..MAX_ASSIGNED_INSTANCES + 2)
+                .map(|index| assignment(&format!("rt-{index:03}"), b"x"))
+                .collect::<Vec<_>>()
+        };
+        // Beyond capacity, nothing is cut until the host reports what it runs.
+        assert_eq!(
+            controller.replace_assignments(0, listed(), ["rt-gone".to_string()]),
+            Err(AssignmentError::Capacity)
+        );
+        assert!(!controller.is_initialized());
+
+        // The running instance stays; the excess is excluded in route order.
+        controller
+            .record_status(session, status(0, &["rt-257"]))
+            .unwrap();
+        assert_eq!(
+            controller.replace_assignments(0, listed(), ["rt-gone".to_string()]),
+            Ok(1)
+        );
+        assert_eq!(
+            controller.snapshot().unwrap().instances.len(),
+            MAX_ASSIGNED_INSTANCES
+        );
+        assert!(controller.assignment("rt-257").is_some());
+        let excluded = ["rt-gone", "rt-255", "rt-256"];
+        for route in excluded {
+            assert_eq!(controller.observed(route), ObservedInstance::Pending);
+        }
+        controller.record_sent(session, 1);
+        controller
+            .record_status(session, status(1, &["rt-257"]))
+            .unwrap();
+        for route in excluded {
+            assert_eq!(controller.observed(route), ObservedInstance::Absent);
+        }
+        assert_eq!(
+            controller.observed("rt-undiscovered"),
+            ObservedInstance::Pending
+        );
+        let observations = controller.shared_observations().unwrap();
+        assert_eq!(
+            observations.get("rt-gone"),
+            Some(&SharedObservation::Absent)
+        );
+        assert!(!observations.contains_key("rt-undiscovered"));
+
+        // A later recovery keeps current assignments over a new route that
+        // sorts first, and an unchanged set needs no new snapshot or ack.
+        let revision = controller.inner.revision.subscribe();
+        let mut relisted = listed();
+        relisted.push(assignment("rt-0", b"x"));
+        assert_eq!(
+            controller.replace_assignments(1, relisted, ["rt-gone".to_string()]),
+            Ok(1)
+        );
+        assert!(!revision.has_changed().unwrap());
+        assert_eq!(controller.observed("rt-0"), ObservedInstance::Absent);
+        assert_eq!(controller.observed("rt-gone"), ObservedInstance::Absent);
+
+        // Withdrawing or reassigning an excluded route clears its verdict, a
+        // raced recovery records nothing, and restored material assigns it.
+        // A withdrawal fences recovery listed before it, so a stale list
+        // cannot re-admit an excluded or undiscovered withdrawn route.
+        let stale = controller.revision();
+        controller.unassign("rt-255");
+        controller.unassign("rt-undiscovered");
+        assert_eq!(controller.observed("rt-255"), ObservedInstance::Pending);
+        let stale_list = [
+            assignment("rt-255", b"x"),
+            assignment("rt-undiscovered", b"x"),
+        ];
+        assert!(matches!(
+            controller.replace_assignments(stale, stale_list, []),
+            Err(AssignmentError::Conflict { .. })
+        ));
+        assert!(controller.assignment("rt-255").is_none());
+        assert!(controller.assignment("rt-undiscovered").is_none());
+        controller.unassign("rt-000");
+        controller.assign(assignment("rt-256", b"x")).unwrap();
+        assert_eq!(controller.observed("rt-256"), ObservedInstance::Pending);
+        assert!(
+            controller
+                .replace_assignments(1, [], ["rt-raced".to_string()])
+                .is_err()
+        );
+        assert_eq!(controller.observed("rt-raced"), ObservedInstance::Pending);
+        controller
+            .replace_assignments(controller.revision(), [assignment("rt-gone", b"x")], [])
+            .unwrap();
+        assert_eq!(controller.observed("rt-gone"), ObservedInstance::Pending);
+        assert_eq!(controller.observed("rt-0"), ObservedInstance::Pending);
     }
 
     #[test]
     fn sessions_fence_stale_streams_epochs_and_acks() {
         let controller = SupervisorHostController::new();
         controller
-            .replace_assignments(0, [assignment("rt-a", b"a")])
+            .replace_assignments(0, [assignment("rt-a", b"a")], [])
             .unwrap();
         assert_eq!(controller.observed("rt-a"), ObservedInstance::NoHost);
 

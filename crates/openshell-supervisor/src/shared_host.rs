@@ -55,6 +55,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Delay, plus up to [`STANDBY_RETRY_JITTER`], before reconnecting after a
+/// standby gateway replica refused the host, so a load-balanced endpoint
+/// reaches the reconciler leader promptly without synchronized retries.
+const STANDBY_RETRY_MIN: Duration = Duration::from_millis(250);
+const STANDBY_RETRY_JITTER: Duration = Duration::from_millis(750);
 /// Host-to-gateway messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
 /// Most sandbox instances one snapshot may assign to a host; the gateway
@@ -492,11 +497,38 @@ enum StreamEnd {
     /// The gateway rejected or closed the stream; reconnect after a backoff.
     /// `accepted` records whether the gateway had accepted the host.
     Lost { accepted: bool },
+    /// A gateway replica that does not publish assignments refused the host;
+    /// reconnect promptly on a fresh connection to reach the leader.
+    Standby,
+}
+
+/// Delay before the next connection attempt. A standby refusal waits a
+/// short jittered delay and leaves the backoff alone; any other loss waits
+/// out the backoff, which restarts from its minimum once the gateway had
+/// accepted the host and doubles up to its cap otherwise.
+fn reconnect_delay(end: &StreamEnd, backoff: &mut Duration) -> Duration {
+    match end {
+        StreamEnd::Standby => {
+            let jitter_ms = u64::try_from(STANDBY_RETRY_JITTER.as_millis())
+                .unwrap_or(1)
+                .max(1);
+            let jitter = uuid::Uuid::new_v4().as_u64_pair().0 % jitter_ms;
+            STANDBY_RETRY_MIN + Duration::from_millis(jitter)
+        }
+        StreamEnd::Lost { accepted } => {
+            if *accepted {
+                *backoff = RECONNECT_BACKOFF_MIN;
+            }
+            let delay = *backoff;
+            *backoff = (*backoff * 2).min(RECONNECT_BACKOFF_MAX);
+            delay
+        }
+    }
 }
 
 /// Keep one assignment stream open to the gateway until `shutdown`
-/// completes, reconnecting with backoff. Hosted instances run on across
-/// disconnects.
+/// completes, reconnecting with backoff, or promptly after a standby
+/// replica's refusal. Hosted instances run on across disconnects.
 pub async fn attach_to_gateway(
     host: Arc<SharedHost>,
     link: GatewayLink,
@@ -512,22 +544,25 @@ pub async fn attach_to_gateway(
             instance_id: instance_id.clone(),
             connection_epoch,
         };
-        let StreamEnd::Lost { accepted } = tokio::select! {
+        let end = tokio::select! {
             end = run_stream(&host, &link, hello) => end,
             () = &mut shutdown => return,
         };
-        if accepted {
-            backoff = RECONNECT_BACKOFF_MIN;
+        let delay = reconnect_delay(&end, &mut backoff);
+        match end {
+            StreamEnd::Standby => tracing::debug!(
+                retry_in_ms = delay.as_millis(),
+                "gateway replica is a standby; reconnecting to reach the reconciler leader"
+            ),
+            StreamEnd::Lost { .. } => tracing::info!(
+                retry_in_secs = delay.as_secs(),
+                "gateway assignment stream lost; hosted sandbox instances keep running"
+            ),
         }
-        tracing::info!(
-            retry_in_secs = backoff.as_secs(),
-            "gateway assignment stream lost; hosted sandbox instances keep running"
-        );
         tokio::select! {
-            () = tokio::time::sleep(backoff) => {}
+            () = tokio::time::sleep(delay) => {}
             () = &mut shutdown => return,
         }
-        backoff = (backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
 }
 
@@ -580,6 +615,9 @@ async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello
     let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(rx));
     let mut inbound = match tokio::time::timeout(CONNECT_TIMEOUT, attach).await {
         Ok(Ok(response)) => response.into_inner(),
+        Ok(Err(status)) if openshell_supervisor_control::is_standby_refusal(&status) => {
+            return StreamEnd::Standby;
+        }
         Ok(Err(status)) => {
             tracing::warn!(%status, "gateway refused the supervisor host stream");
             return lost(false);
@@ -721,4 +759,40 @@ async fn run_stream(host: &Arc<SharedHost>, link: &GatewayLink, hello: HostHello
         let _ = applying.await;
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standby_refusals_retry_promptly_and_other_losses_back_off() {
+        let mut backoff = RECONNECT_BACKOFF_MIN;
+        let lost = StreamEnd::Lost { accepted: false };
+        assert_eq!(reconnect_delay(&lost, &mut backoff), Duration::from_secs(1));
+        assert_eq!(reconnect_delay(&lost, &mut backoff), Duration::from_secs(2));
+
+        // Standby refusals stay short, jittered, and leave the outage backoff
+        // where it was.
+        for _ in 0..32 {
+            let delay = reconnect_delay(&StreamEnd::Standby, &mut backoff);
+            assert!(delay >= STANDBY_RETRY_MIN);
+            assert!(delay < STANDBY_RETRY_MIN + STANDBY_RETRY_JITTER);
+        }
+        assert_eq!(reconnect_delay(&lost, &mut backoff), Duration::from_secs(4));
+        for _ in 0..8 {
+            reconnect_delay(&lost, &mut backoff);
+        }
+        assert_eq!(reconnect_delay(&lost, &mut backoff), RECONNECT_BACKOFF_MAX);
+        assert_eq!(
+            reconnect_delay(&StreamEnd::Lost { accepted: true }, &mut backoff),
+            RECONNECT_BACKOFF_MIN
+        );
+
+        // Only the gateway's marked refusal counts as a standby; a bare
+        // UNAVAILABLE is an outage.
+        assert!(!openshell_supervisor_control::is_standby_refusal(
+            &tonic::Status::unavailable("reconnect to the gateway reconciler leader")
+        ));
+    }
 }
