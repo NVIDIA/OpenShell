@@ -194,7 +194,7 @@ pub struct GatewayFileSection {
     pub otlp: Option<OtlpConfig>,
     #[serde(default)]
     pub ocsf_log: Option<OcsfLogConfig>,
-    /// Run the shared supervisor as a high-availability pool of replicas.
+    /// Tuning of the shared supervisor pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_pool: Option<SupervisorPoolConfig>,
 
@@ -207,36 +207,23 @@ pub struct GatewayFileSection {
     pub database_url: Option<String>,
 }
 
-/// `[openshell.gateway.supervisor_pool]`: run the shared supervisor as a pool.
+/// `[openshell.gateway.supervisor_pool]`: optional tuning of the shared
+/// supervisor pool.
 ///
-/// The gateway coordinates the shared supervisor's replicas for high
-/// availability: it places each sandbox instance on a live member by
+/// The shared supervisor always runs as a pool that the gateway coordinates
+/// for high availability: it places each sandbox instance on a live member by
 /// consistent hash, records its owner durably, and moves the instances of a
 /// failed or leaving member to another member, which adopts their running
-/// workloads.
+/// workloads. Without this table the defaults apply.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SupervisorPoolConfig {
-    /// Coordinate the shared supervisor's replicas as a pool.
-    #[serde(default)]
-    pub enabled: bool,
     /// Seconds a sandbox runtime keeps its workload frozen after losing its
     /// supervisor before terminating it, from 10 to 300. The pool's
     /// supervisors offer it to each runtime; unset offers
     /// [`openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_timeout_secs: Option<u32>,
-}
-
-impl SupervisorPoolConfig {
-    /// The recovery deadline the pool offers, when the pool is enabled.
-    #[must_use]
-    pub fn enabled_recovery_timeout_secs(&self) -> Option<u32> {
-        self.enabled.then(|| {
-            self.recovery_timeout_secs
-                .unwrap_or(openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS)
-        })
-    }
 }
 
 /// Gateway listener TLS fields accepted in `gateway.toml`.
@@ -1845,24 +1832,14 @@ database_lock_max_connections = 0
     }
 
     #[test]
-    fn parses_the_supervisor_pool() {
+    fn parses_the_supervisor_pool_tuning() {
         let pool = |table: &str| {
             let tmp = write_tmp(&format!("[openshell.gateway.supervisor_pool]\n{table}"));
             load(tmp.path()).map(|file| file.openshell.gateway.supervisor_pool)
         };
-        // Enabled, a pool offers its default recovery deadline unless
-        // configured; disabled, it offers none.
-        let enabled = pool("enabled = true\n").unwrap().unwrap();
-        assert_eq!(
-            enabled.enabled_recovery_timeout_secs(),
-            Some(openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS)
-        );
-        let configured = pool("enabled = true\nrecovery_timeout_secs = 90\n")
-            .unwrap()
-            .unwrap();
-        assert_eq!(configured.enabled_recovery_timeout_secs(), Some(90));
-        let disabled = pool("recovery_timeout_secs = 90\n").unwrap().unwrap();
-        assert_eq!(disabled.enabled_recovery_timeout_secs(), None);
+        let configured = pool("recovery_timeout_secs = 90\n").unwrap().unwrap();
+        assert_eq!(configured.recovery_timeout_secs, Some(90));
+        assert_eq!(pool("").unwrap().unwrap().recovery_timeout_secs, None);
         let tmp = write_tmp("[openshell.gateway]\n");
         assert!(
             load(tmp.path())
@@ -1872,22 +1849,23 @@ database_lock_max_connections = 0
                 .supervisor_pool
                 .is_none()
         );
-        // Recovery stays bounded, and unknown keys are refused.
+        // Recovery stays bounded, and unknown keys, including the removed
+        // `enabled` switch, are refused.
         for out_of_range in ["9", "301"] {
             assert!(matches!(
-                pool(&format!(
-                    "enabled = true\nrecovery_timeout_secs = {out_of_range}\n"
-                )),
+                pool(&format!("recovery_timeout_secs = {out_of_range}\n")),
                 Err(ConfigFileError::InvalidValue {
                     field: "openshell.gateway.supervisor_pool.recovery_timeout_secs",
                     ..
                 })
             ));
         }
-        assert!(matches!(
-            pool("enabled = true\nhigh_availability = true\n"),
-            Err(ConfigFileError::Parse { .. })
-        ));
+        for unknown in ["enabled = true\n", "high_availability = true\n"] {
+            assert!(
+                matches!(pool(unknown), Err(ConfigFileError::Parse { .. })),
+                "{unknown}"
+            );
+        }
     }
 
     #[test]

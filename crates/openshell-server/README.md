@@ -20,10 +20,11 @@ authorize the new one.
 
 ## Shared supervisor pool
 
-With `[openshell.gateway.supervisor_pool] enabled = true`, the `SharedSupervision`
-the gateway hands its compute driver coordinates a pool of shared supervisor
-hosts; the driver itself is unchanged. The gateway refuses a pool when no
-in-process driver uses the shared supervisor. `supervisor_pool` keeps the
+The `SharedSupervision` the gateway hands a compute driver that asks for it
+always coordinates a pool of shared supervisor hosts, at any member count; the
+driver itself is unchanged. `[openshell.gateway.supervisor_pool]` only tunes it
+(`recovery_timeout_secs`), and the gateway refuses the table when no in-process
+driver uses the shared supervisor. `supervisor_pool` keeps the
 pool's durable state and reconciles it every two seconds on every gateway
 replica, independent of which replica runs the compute driver's watch:
 
@@ -52,18 +53,29 @@ replica, independent of which replica runs the compute driver's watch:
   atomic store writes and holds no lock: it reserves the route with a row named
   by the route and identified by a fresh writer token, stores the material, has
   a `supervisor_instance_material_candidate` row own the handle, and publishes
-  by advancing exactly its reservation's version. Collection deletes a
-  candidate's material only once its recording no longer holds the reservation,
-  after which that recording can never publish; a reservation that does not
-  publish within two minutes is fenced by removing it. A withdrawal removes the
-  material and then the record, or fences a reservation; an ended generation
+  by advancing exactly its reservation's version. A launch publishes its
+  record as `Admitting`, which is not desired (nothing places, charges, or
+  grants it) and keeps its candidate; a driver recovery's backfill publishes
+  directly. Collection deletes a candidate's material only once its recording
+  no longer holds its reserved or admitting row, after which that recording
+  can never publish or be admitted; a reservation or admitting record older
+  than two minutes (a stalled, failed, or crashed launch) is fenced by
+  removing it at its version, and its material is then collected. A
+  withdrawal removes the material and then the record, or fences a reserved or
+  admitting row; an ended generation
   (sandbox gone, replaced, stopped, or deleting) is withdrawn by the sweep; and
   the compute driver's recovery backfills instances it runs without a record and
   withdraws records published before its listing that it no longer lists.
-- **Placement and ownership.** A launch records its owner, the live member the
-  consistent-hash ring prefers (`gateway_ring`), right after the instance; a
-  member at its 256-instance capacity is skipped, and with no live member with
-  room the launch is refused as a capacity refusal. One
+- **Placement and ownership.** A launch admits its instance on the live member
+  the consistent-hash ring prefers (`gateway_ring`): one transaction creates
+  the owner record, charges the member's capacity, and publishes the
+  `Admitting` record, conditioned on that record's version, so an owner always
+  has its published instance and a removed record never gains one. A member at
+  its 256-instance capacity is skipped. With no live member with room the
+  launch is refused as a capacity refusal: it removes the admitting record it
+  created, only at the version it created (a concurrent launch of the same
+  generation that admitted it first wins), and then that record's candidate
+  and material; a removal that fails is left to fencing. One
   `supervisor_instance_owner` record per instance names the member, its
   process, and the ownership term (the sandbox's credential epoch). Records
   change only by compare-and-swap, and a live owner keeps its instances.

@@ -1,29 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Supervisor shared by the sandboxes of one gateway.
+//! Supervisor shared by the sandboxes of one gateway, as a member of the
+//! gateway's supervisor pool (high availability).
 //!
 //! The gateway owns which sandbox instances, one running generation of a
-//! stable Sandbox resource each, this process hosts. The host dials the
-//! gateway presenting the supervisor token the gateway minted for it,
-//! receives complete assignment snapshots over the private
-//! `openshell.supervisor.host.v1` stream, reconciles the
+//! stable Sandbox resource each, this process hosts: the instances its
+//! process owns. The host dials the gateway presenting the supervisor token
+//! the gateway minted for it, receives complete assignment snapshots over the
+//! private `openshell.supervisor.host.v1` stream, reconciles the
 //! [`SandboxInstanceHost`] registry to each one, and reports what it
 //! observes. An assignment carries exactly the gateway-issued credentials of
 //! its generation; the host never acts with any other identity toward
-//! sandbox APIs. Losing the gateway stream never stops an instance;
-//! only a later snapshot that omits it does. Snapshots are reconciled one at
-//! a time, and a connection finishes the reconciliation it started before the
-//! next connection begins, so a superseded stream can never apply after its
-//! replacement. Runtime connections arrive through one routed listener.
+//! sandbox APIs. Runtime connections arrive through one routed listener.
 //!
-//! A member of a supervisor pool (high availability) is sent only the
-//! instances its process owns. An instance a snapshot omits has moved to
-//! another member: the host relinquishes it, ending supervision without
-//! stopping the workload, which its runtime keeps frozen until the new owner
-//! takes it over. Only instances the snapshot lists for stopping are stopped.
-//! A member that shuts down announces that it is leaving, so the gateway moves
-//! its instances first, and relinquishes whatever it still hosts.
+//! Losing the gateway stream never stops an instance. An instance a snapshot
+//! omits has moved to another member: the host relinquishes it, ending
+//! supervision without stopping the workload, which its runtime keeps frozen
+//! until the new owner takes it over. Only instances a snapshot lists for
+//! stopping are stopped. Snapshots are reconciled one at a time by one worker
+//! that outlives connections, and work an older connection queued is dropped
+//! when a new one begins. A member that shuts down announces that it is
+//! leaving, so the gateway moves its instances first, and relinquishes
+//! whatever it still hosts.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -69,16 +68,13 @@ const RELINQUISHED_FOR_LATER_TERM: &str =
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Shortest heartbeat interval the host accepts from the gateway.
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
-/// Silence after which the host abandons a stream and reconnects.
-const GATEWAY_SILENCE_TIMEOUT: Duration = Duration::from_mins(1);
-/// Bound on dialing the gateway, on the gateway answering the attach call,
-/// and on it accepting the host.
+/// Bound on connecting, attaching, and being accepted, once more than the
+/// covered attempts since the last accepted stream went unanswered, so a slow
+/// but responsive gateway is still reached.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on queueing one host-to-gateway message; a gateway that cannot
-/// drain the stream this long is treated as lost.
+/// Bound on queueing one host-to-gateway message, short of the stream's
+/// silence budget; a gateway that cannot drain the stream is treated as lost.
 const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(1);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// Host-to-gateway messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
 /// Most sandbox instances one snapshot may assign to a host; the gateway
@@ -91,61 +87,48 @@ const MAX_GATEWAY_MESSAGE_BYTES: usize =
 /// Largest host message: a status report is a few hundred bytes per instance.
 const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 
-/// How a host notices a silent gateway and paces its reconnects.
-///
-/// A pool member must reach a responsive gateway replica well before its
-/// membership record expires (see [`openshell_supervisor_control::pool_timing`]);
-/// a lone shared supervisor keeps its long, quiet defaults.
+/// How a host notices a silent gateway and paces its reconnects: it must
+/// reach a responsive gateway replica well before its membership record
+/// expires (see [`openshell_supervisor_control::pool_timing`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StreamTimings {
     /// Silence after which a stream is abandoned.
     silence_timeout: Duration,
-    /// How often silence is checked; `None` checks on each heartbeat.
-    silence_check: Option<Duration>,
+    /// How often silence is checked.
+    silence_check: Duration,
     /// First reconnect backoff; it doubles up to `backoff_max`.
     backoff_min: Duration,
     backoff_max: Duration,
     /// Most jitter added to a backoff, as a fraction of it.
     jitter: f64,
     /// Bound on connecting, attaching, and being accepted while no more than
-    /// this many attempts failed since the last accepted stream; later
-    /// attempts get [`CONNECT_TIMEOUT`].
-    quick_attempts: Option<(Duration, u32)>,
+    /// `covered_attempts` attempts failed since the last accepted stream;
+    /// later attempts get [`CONNECT_TIMEOUT`].
+    attempt_timeout: Duration,
+    covered_attempts: u32,
 }
 
 impl StreamTimings {
-    fn for_host(pool: bool) -> Self {
+    fn pool() -> Self {
         use openshell_supervisor_control::pool_timing;
-        if pool {
-            Self {
-                silence_timeout: pool_timing::HOST_SILENCE_TIMEOUT,
-                silence_check: Some(pool_timing::HOST_SILENCE_CHECK),
-                backoff_min: pool_timing::HOST_RECONNECT_BACKOFF_MIN,
-                backoff_max: pool_timing::HOST_RECONNECT_BACKOFF_MAX,
-                jitter: pool_timing::HOST_RECONNECT_JITTER,
-                quick_attempts: Some((
-                    pool_timing::HOST_ATTEMPT_TIMEOUT,
-                    pool_timing::COVERED_UNANSWERED_ATTEMPTS,
-                )),
-            }
-        } else {
-            Self {
-                silence_timeout: GATEWAY_SILENCE_TIMEOUT,
-                silence_check: None,
-                backoff_min: RECONNECT_BACKOFF_MIN,
-                backoff_max: RECONNECT_BACKOFF_MAX,
-                jitter: 0.0,
-                quick_attempts: None,
-            }
+        Self {
+            silence_timeout: pool_timing::HOST_SILENCE_TIMEOUT,
+            silence_check: pool_timing::HOST_SILENCE_CHECK,
+            backoff_min: pool_timing::HOST_RECONNECT_BACKOFF_MIN,
+            backoff_max: pool_timing::HOST_RECONNECT_BACKOFF_MAX,
+            jitter: pool_timing::HOST_RECONNECT_JITTER,
+            attempt_timeout: pool_timing::HOST_ATTEMPT_TIMEOUT,
+            covered_attempts: pool_timing::COVERED_UNANSWERED_ATTEMPTS,
         }
     }
 
     /// Bound on an attempt after `unanswered` attempts since the last
     /// accepted stream that were never accepted.
     fn attempt_timeout(&self, unanswered: u32) -> Duration {
-        match self.quick_attempts {
-            Some((timeout, covered)) if unanswered <= covered => timeout,
-            _ => CONNECT_TIMEOUT,
+        if unanswered <= self.covered_attempts {
+            self.attempt_timeout
+        } else {
+            CONNECT_TIMEOUT
         }
     }
 
@@ -157,27 +140,6 @@ impl StreamTimings {
             .saturating_mul(1_u32 << failed.saturating_sub(1).min(16))
             .min(self.backoff_max);
         doubled.mul_f64(self.jitter.mul_add(sample.clamp(0.0, 1.0), 1.0))
-    }
-}
-
-/// What bounds the stages of one connection attempt: connecting, attaching,
-/// and being accepted.
-#[derive(Clone, Copy)]
-enum AttemptDeadline {
-    /// One deadline covers every stage, so a slow stage leaves less time for
-    /// the next; a pool member's reconnect budget counts on it.
-    Shared(tokio::time::Instant),
-    /// Each stage gets its own bound when it begins.
-    PerStage(Duration),
-}
-
-impl AttemptDeadline {
-    /// The deadline of a stage beginning now.
-    fn stage(self) -> tokio::time::Instant {
-        match self {
-            Self::Shared(deadline) => deadline,
-            Self::PerStage(bound) => tokio::time::Instant::now() + bound,
-        }
     }
 }
 
@@ -213,8 +175,8 @@ pub struct SharedHostConfig {
     pub runtime_listen: SocketAddr,
     /// Time a withdrawn sandbox instance may take to stop its workload.
     pub removal_grace: Duration,
-    /// Present when this process is a member of a supervisor pool.
-    pub pool: Option<PoolIdentity>,
+    /// This process's identity as a member of the supervisor pool.
+    pub pool: PoolIdentity,
 }
 
 /// The sandbox instance registry and the routed runtime listener its
@@ -230,16 +192,16 @@ pub struct SharedHost {
     /// Routes of the latest applied snapshot, so a withdrawal whose cleanup
     /// failed can be retried without the gateway resending the snapshot.
     desired_routes: Mutex<Option<std::collections::BTreeSet<String>>>,
-    /// Present when this process is a member of a supervisor pool.
-    pool: Option<PoolIdentity>,
-    /// Pool only: routes of the latest snapshot listed for stopping. Every
-    /// other route it omits is relinquished.
+    /// This process's identity as a member of the supervisor pool.
+    pool: PoolIdentity,
+    /// Routes of the latest snapshot listed for stopping. Every other route
+    /// it omits is relinquished.
     stop_routes: Mutex<std::collections::BTreeSet<String>>,
-    /// Pool only: the latest snapshot while some of its assignments wait for
+    /// The latest snapshot while some of its assignments wait for
     /// an earlier instance of their route to leave, or for the credentials of
     /// their term.
     deferred: Mutex<Option<AssignmentSnapshot>>,
-    /// Pool only: deferred assignments, reported as starting. The gateway
+    /// Deferred assignments, reported as starting. The gateway
     /// reads an assigned route the host does not report as gone, so a
     /// deferral must never look like one.
     deferred_reports: Mutex<BTreeMap<String, SandboxInstanceStatusReport>>,
@@ -347,10 +309,10 @@ impl SharedHost {
         }))
     }
 
-    /// Pool identity of this process, when it is a pool member.
+    /// Pool identity of this process.
     #[must_use]
-    pub fn pool(&self) -> Option<&PoolIdentity> {
-        self.pool.as_ref()
+    pub fn pool(&self) -> &PoolIdentity {
+        &self.pool
     }
 
     /// Whether this pool member announced that it is leaving.
@@ -361,12 +323,8 @@ impl SharedHost {
 
     /// Announce that this pool member is leaving, and wait up to `limit` for
     /// the gateway to move its instances to other members; each is
-    /// relinquished as a snapshot omits it. Does nothing for a lone shared
-    /// supervisor.
+    /// relinquished as a snapshot omits it.
     pub async fn leave(&self, limit: Duration) {
-        if self.pool.is_none() {
-            return;
-        }
         tracing::info!(
             hosted = self.host.list().len(),
             "pool member is leaving; asking the gateway to move its sandbox instances"
@@ -394,34 +352,17 @@ impl SharedHost {
         }
     }
 
-    /// End supervision of every hosted instance at process shutdown: a pool
-    /// member relinquishes them to the members that take them over; a lone
-    /// shared supervisor stops them, since no one could take them over.
+    /// End supervision of every hosted instance at process shutdown: they are
+    /// relinquished to the members that take them over, and their workloads
+    /// keep running.
     pub async fn shut_down(&self) {
-        if self.pool.is_some() {
-            self.host.relinquish_all().await;
-        } else {
-            self.remove_all().await;
-        }
+        self.host.relinquish_all().await;
     }
 
     /// Address of the routed runtime listener.
     #[must_use]
     pub fn runtime_addr(&self) -> SocketAddr {
         self.router.local_addr()
-    }
-
-    /// Start a sandbox instance for `registration`, or confirm an identical
-    /// one.
-    pub fn register(
-        &self,
-        registration: SandboxInstanceRegistration,
-    ) -> Result<SandboxInstanceAdmitted, ControlError> {
-        registration
-            .validate()
-            .map_err(|error| ControlError::Invalid(error.to_string()))?;
-        let fingerprint = registration_digest(&registration)?;
-        self.admit(registration, fingerprint, Ok(None))
     }
 
     /// Admit `registration` under `fingerprint`. A new instance takes over
@@ -531,11 +472,6 @@ impl SharedHost {
         self.host.remove(route, self.removal_grace).await
     }
 
-    /// Stop every sandbox instance, for process shutdown.
-    pub async fn remove_all(&self) {
-        self.host.remove_all(self.removal_grace).await;
-    }
-
     /// Make the registry match `snapshot`: admit every assignment and remove
     /// every hosted instance it omits. Assignments that cannot be admitted are
     /// reported as failed instances; they never affect a running instance.
@@ -563,36 +499,35 @@ impl SharedHost {
             }
         }
         self.offer_recovery_timeout(snapshot.recovery_timeout.as_ref());
-        if snapshot.pool != self.pool.is_some() {
-            return Err(ControlError::Invalid(if snapshot.pool {
-                "the gateway sent a supervisor pool snapshot to a lone shared supervisor"
-                    .to_string()
-            } else {
-                "the gateway sent a lone shared supervisor's snapshot to a pool member".to_string()
-            }));
+        // Only a pool snapshot says what to stop and where other members
+        // are; a snapshot without it would release everything it omits.
+        if !snapshot.pool {
+            return Err(ControlError::Invalid(
+                "the gateway sent a snapshot that is not a supervisor pool's; run a gateway \
+                 that supports the shared supervisor pool"
+                    .to_string(),
+            ));
         }
-        if let Some(pool) = &self.pool {
-            *self
-                .stop_routes
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                snapshot.stop_routes.iter().cloned().collect();
-            // Runtimes that reach this member for an instance another member
-            // supervises are redirected there.
-            let owners = snapshot
-                .route_directory
-                .iter()
-                .filter_map(|entry| {
-                    let address = entry.runtime_address.parse().ok();
-                    if address.is_none() {
-                        tracing::warn!(route = %entry.route, "ignoring a malformed route directory address");
-                    }
-                    Some((entry.route.clone(), address?))
-                })
-                .collect();
-            self.router
-                .set_directory(Some(pool.runtime_address), owners);
-        }
+        *self
+            .stop_routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            snapshot.stop_routes.iter().cloned().collect();
+        // Runtimes that reach this member for an instance another member
+        // supervises are redirected there.
+        let owners = snapshot
+            .route_directory
+            .iter()
+            .filter_map(|entry| {
+                let address = entry.runtime_address.parse().ok();
+                if address.is_none() {
+                    tracing::warn!(route = %entry.route, "ignoring a malformed route directory address");
+                }
+                Some((entry.route.clone(), address?))
+            })
+            .collect();
+        self.router
+            .set_directory(Some(self.pool.runtime_address), owners);
         // Owned instances the gateway could not describe yet are kept as they
         // are: neither started, released, nor stopped.
         routes.extend(snapshot.keep_routes.iter().cloned());
@@ -617,13 +552,7 @@ impl SharedHost {
         let mut rejected = BTreeMap::new();
         let mut deferred = BTreeMap::new();
         for assignment in admitted {
-            let outcome = if self.pool.is_some() {
-                self.admit_pool_assignment(assignment).await
-            } else {
-                SandboxInstanceRegistration::from_assignment(assignment)
-                    .map_err(|error| ControlError::Invalid(error.to_string()))
-                    .and_then(|registration| self.register(registration))
-            };
+            let outcome = self.admit_pool_assignment(assignment).await;
             match outcome {
                 Ok(SandboxInstanceAdmitted::Created) => {
                     let route = &assignment.route;
@@ -636,9 +565,7 @@ impl SharedHost {
                 Ok(SandboxInstanceAdmitted::Unchanged) => {}
                 // An earlier instance of the route is still leaving, or the
                 // term's credentials are on their way; retried shortly.
-                Err(error @ (ControlError::Removing | ControlError::Deferred(_)))
-                    if self.pool.is_some() =>
-                {
+                Err(error @ (ControlError::Removing | ControlError::Deferred(_))) => {
                     tracing::debug!(
                         route = %assignment.route,
                         %error,
@@ -746,7 +673,7 @@ impl SharedHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         futures::future::join_all(withdrawn.iter().map(|hosted| {
-            let stop = self.pool.is_none() || stop_routes.contains(&hosted.route);
+            let stop = stop_routes.contains(&hosted.route);
             async move {
                 let route = &hosted.route;
                 if stop {
@@ -897,14 +824,6 @@ impl SharedHost {
         )
         .map_err(failure)
     }
-}
-
-fn registration_digest(
-    registration: &SandboxInstanceRegistration,
-) -> Result<[u8; 32], ControlError> {
-    let encoded = serde_json::to_vec(registration)
-        .map_err(|error| ControlError::Invalid(format!("encode registration: {error}")))?;
-    openshell_crypto::sha256(&encoded).map_err(|error| ControlError::Unavailable(error.to_string()))
 }
 
 /// Admission fingerprint of a pool instance: its launch material and its
@@ -1078,7 +997,7 @@ trait GatewayConnector: Send + Sync {
     fn open(
         &self,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
-        deadline: AttemptDeadline,
+        deadline: tokio::time::Instant,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>;
 }
 
@@ -1086,7 +1005,7 @@ impl GatewayConnector for GatewayLink {
     fn open(
         &self,
         outbound: tokio::sync::mpsc::Receiver<HostMessage>,
-        deadline: AttemptDeadline,
+        deadline: tokio::time::Instant,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>> {
         Box::pin(async move {
             if !self.endpoint.starts_with("https://") {
@@ -1096,7 +1015,7 @@ impl GatewayConnector for GatewayLink {
                 .read_token()
                 .map_err(|error| format!("no usable supervisor token: {error}"))?;
             let connect = openshell_core::grpc_client::connect_gateway_channel(&self.endpoint);
-            let channel = tokio::time::timeout_at(deadline.stage(), connect)
+            let channel = tokio::time::timeout_at(deadline, connect)
                 .await
                 .map_err(|_| "connecting to the gateway timed out".to_string())?
                 .map_err(|error| format!("could not connect to the gateway: {error}"))?;
@@ -1104,7 +1023,7 @@ impl GatewayConnector for GatewayLink {
                 .max_decoding_message_size(MAX_GATEWAY_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_HOST_MESSAGE_BYTES);
             let attach = client.attach(tokio_stream::wrappers::ReceiverStream::new(outbound));
-            let response = tokio::time::timeout_at(deadline.stage(), attach)
+            let response = tokio::time::timeout_at(deadline, attach)
                 .await
                 .map_err(|_| {
                     "gateway did not answer the supervisor host stream in time".to_string()
@@ -1136,7 +1055,7 @@ async fn attach_with(
 ) {
     let instance_id = uuid::Uuid::new_v4().to_string();
     let mut connection_epoch = 0_u64;
-    let timings = StreamTimings::for_host(host.pool.is_some());
+    let timings = StreamTimings::pool();
     let reconciler = Reconciler::start(host.clone());
     // Streams lost since the last accepted stream, counting its own loss;
     // the backoff grows with it.
@@ -1151,10 +1070,10 @@ async fn attach_with(
         let hello = HostHello {
             instance_id: instance_id.clone(),
             connection_epoch,
-            member: host.pool.as_ref().map(|pool| PoolMember {
-                member_id: pool.member_id.clone(),
-                member_uid: pool.member_uid.clone(),
-                runtime_address: pool.runtime_address.to_string(),
+            member: Some(PoolMember {
+                member_id: host.pool.member_id.clone(),
+                member_uid: host.pool.member_uid.clone(),
+                runtime_address: host.pool.runtime_address.to_string(),
             }),
         };
         let attempt_timeout = timings.attempt_timeout(unanswered);
@@ -1417,23 +1336,16 @@ async fn run_stream(
     attempt_timeout: Duration,
 ) -> StreamEnd {
     let lost = |accepted| StreamEnd::Lost { accepted };
-    let pool = timings.silence_check.is_some();
-    let deadline = if pool {
-        AttemptDeadline::Shared(tokio::time::Instant::now() + attempt_timeout)
-    } else {
-        AttemptDeadline::PerStage(attempt_timeout)
-    };
+    // One deadline covers saying hello, connecting, attaching, and being
+    // accepted, so a slow stage leaves less time for the next; the reconnect
+    // budget counts on it.
+    let deadline = tokio::time::Instant::now() + attempt_timeout;
     let stream = reconciler.begin_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<HostMessage>(OUTBOUND_QUEUE);
-    // A send gives up by the ordinary bound, and on a pool member once the
-    // stream has been silent for its whole silence budget.
+    // A send gives up by the ordinary bound, or once the stream has been
+    // silent for its whole silence budget.
     let send_deadline = |last_heard: tokio::time::Instant| {
-        let bound = tokio::time::Instant::now() + SEND_TIMEOUT;
-        if pool {
-            bound.min(last_heard + timings.silence_timeout)
-        } else {
-            bound
-        }
+        (tokio::time::Instant::now() + SEND_TIMEOUT).min(last_heard + timings.silence_timeout)
     };
     let send = |message: HostMessage, deadline: tokio::time::Instant| {
         let tx = tx.clone();
@@ -1443,29 +1355,19 @@ async fn run_stream(
                 .is_ok_and(|sent| sent.is_ok())
         }
     };
-    let hello_deadline = match deadline {
-        AttemptDeadline::Shared(deadline) => deadline,
-        AttemptDeadline::PerStage(_) => tokio::time::Instant::now() + SEND_TIMEOUT,
-    };
     if !send(
         HostMessage {
             payload: Some(host_message::Payload::Hello(hello)),
         },
-        hello_deadline,
+        deadline,
     )
     .await
     {
         return lost(false);
     }
-    let opened = match deadline {
-        AttemptDeadline::Shared(deadline) => tokio::time::timeout_at(
-            deadline,
-            connector.open(rx, AttemptDeadline::Shared(deadline)),
-        )
+    let opened = tokio::time::timeout_at(deadline, connector.open(rx, deadline))
         .await
-        .unwrap_or_else(|_| Err("connecting to the gateway timed out".to_string())),
-        AttemptDeadline::PerStage(_) => connector.open(rx, deadline).await,
-    };
+        .unwrap_or_else(|_| Err("connecting to the gateway timed out".to_string()));
     let mut inbound = match opened {
         Ok(inbound) => inbound,
         Err(error) => {
@@ -1473,7 +1375,7 @@ async fn run_stream(
             return lost(false);
         }
     };
-    let accept_deadline = deadline.stage();
+    let accept_deadline = deadline;
     let mut changes = host.changes();
     changes.mark_unchanged();
     let mut leaving = host.leaving.subscribe();
@@ -1490,8 +1392,7 @@ async fn run_stream(
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A pool member checks for silence and for acceptance on its own, short
     // cadence; a lone host checks on each heartbeat.
-    let mut silence_check =
-        tokio::time::interval(timings.silence_check.unwrap_or(HEARTBEAT_INTERVAL));
+    let mut silence_check = tokio::time::interval(timings.silence_check);
     silence_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let end = loop {
         tokio::select! {
@@ -1578,26 +1479,18 @@ async fn run_stream(
                     break lost(accepted);
                 }
             }
-            // A pool member gives up on acceptance exactly at its deadline.
-            () = tokio::time::sleep_until(accept_deadline), if pool && !accepted => {
+            // Acceptance is given up exactly at the attempt's deadline.
+            () = tokio::time::sleep_until(accept_deadline), if !accepted => {
                 tracing::warn!("gateway did not accept the supervisor host in time");
                 break lost(accepted);
             }
-            _ = silence_check.tick(), if pool => {
+            _ = silence_check.tick() => {
                 if last_heard.elapsed() > timings.silence_timeout {
                     tracing::warn!("gateway assignment stream went silent; reconnecting");
                     break lost(accepted);
                 }
             }
             _ = heartbeat.tick() => {
-                if !accepted && tokio::time::Instant::now() > accept_deadline {
-                    tracing::warn!("gateway did not accept the supervisor host in time");
-                    break lost(accepted);
-                }
-                if !pool && last_heard.elapsed() > timings.silence_timeout {
-                    tracing::warn!("gateway assignment stream went silent; reconnecting");
-                    break lost(accepted);
-                }
                 let beat = HostMessage { payload: Some(host_message::Payload::Heartbeat(HostHeartbeat {})) };
                 if !send(beat, send_deadline(last_heard)).await {
                     break lost(accepted);
@@ -1673,11 +1566,11 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
-            pool: Some(PoolIdentity {
+            pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
-            }),
+            },
         })
         .unwrap();
         for (revision, (offered, kept)) in [
@@ -1710,11 +1603,11 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
-            pool: Some(PoolIdentity {
+            pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
-            }),
+            },
         })
         .unwrap();
         let routes = [
@@ -1774,7 +1667,7 @@ mod tests {
         );
         assert!(stops[0].try_recv().is_err());
 
-        // A lone shared supervisor's snapshot is refused by a pool member.
+        // A snapshot that is not a pool's is refused.
         assert!(
             host.reconcile(&AssignmentSnapshot {
                 revision: 2,
@@ -1828,11 +1721,11 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
-            pool: Some(PoolIdentity {
+            pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
-            }),
+            },
         })
         .unwrap();
         let (released, stopped) = ("rt-released-0123456789", "rt-stopped-0123456789");
@@ -1868,11 +1761,11 @@ mod tests {
     }
 
     #[test]
-    fn pool_hosts_reconnect_inside_the_membership_budget_and_lone_hosts_do_not_change() {
+    fn hosts_reconnect_inside_the_membership_budget() {
         use openshell_supervisor_control::pool_timing;
-        let pool = StreamTimings::for_host(true);
+        let pool = StreamTimings::pool();
         assert_eq!(pool.silence_timeout, pool_timing::HOST_SILENCE_TIMEOUT);
-        assert_eq!(pool.silence_check, Some(pool_timing::HOST_SILENCE_CHECK));
+        assert_eq!(pool.silence_check, pool_timing::HOST_SILENCE_CHECK);
         // The covered attempts after a lost stream are quick; later ones get
         // the ordinary bound, so a slow but responsive gateway is reached.
         for failed in 0..=pool_timing::COVERED_UNANSWERED_ATTEMPTS {
@@ -1902,19 +1795,6 @@ mod tests {
         );
         let sample = jitter_sample();
         assert!((0.0..1.0).contains(&sample));
-
-        let lone = StreamTimings::for_host(false);
-        assert_eq!(lone.silence_timeout, GATEWAY_SILENCE_TIMEOUT);
-        assert_eq!(lone.silence_check, None);
-        assert_eq!(lone.attempt_timeout(0), CONNECT_TIMEOUT);
-        assert_eq!(lone.attempt_timeout(50), CONNECT_TIMEOUT);
-        let lone_backoffs = (1..=7)
-            .map(|failed| lone.backoff(failed, 0.9))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            lone_backoffs,
-            [1, 2, 4, 8, 16, 30, 30].map(Duration::from_secs)
-        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1925,11 +1805,11 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
-            pool: Some(PoolIdentity {
+            pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
-            }),
+            },
         })
         .unwrap();
         let (hosted_route, stopped_route) = ("rt-hosted-0123456789", "rt-stopped-0123456789");
@@ -2040,7 +1920,7 @@ mod tests {
         fn open(
             &self,
             outbound: tokio::sync::mpsc::Receiver<HostMessage>,
-            _deadline: AttemptDeadline,
+            _deadline: tokio::time::Instant,
         ) -> std::pin::Pin<Box<dyn Future<Output = Result<GatewayInbound, String>> + Send + '_>>
         {
             let at = tokio::time::Instant::now();
@@ -2136,11 +2016,11 @@ mod tests {
             instance_root: root.path().join("instances"),
             runtime_listen: "127.0.0.1:0".parse().unwrap(),
             removal_grace: Duration::from_secs(10),
-            pool: Some(PoolIdentity {
+            pool: PoolIdentity {
                 member_id: "member-1".to_string(),
                 member_uid: "uid-1".to_string(),
                 runtime_address: "127.0.0.1:5500".parse().unwrap(),
-            }),
+            },
         })
         .unwrap();
         let (opened, streams) = tokio::sync::mpsc::unbounded_channel();

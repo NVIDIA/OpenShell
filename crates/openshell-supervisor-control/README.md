@@ -12,22 +12,19 @@ re-implementing the control contracts.
 
 ## Modules
 
-- `controller`: `SupervisorHostController` holds the desired set of
-  `SandboxInstanceAssignment`s and serves it to the host. Desired state is
-  uninitialized until the complete set has been derived from durable records
-  once, so a restarted gateway never presents an empty set as authoritative;
-  an explicit empty set after initialization does stop instances. Full
-  replacements are compare-and-replace against the revision read before the
-  records were listed. One host session at a time: a newer connection epoch
-  of the same host process or a new process supersedes the current stream, a
-  delayed older hello is refused, and reports from superseded streams, acks
-  of revisions never sent, regressing acks, and oversized reports are
-  dropped. A stream ends when the token that opened it expires; hosted
-  instances keep running. A lone host runs at most 256 instances.
-- **Supervisor pool.** With `enable_pool` (set by the gateway from its own
-  configuration), several hosts (pool members) are served at once and each
-  instance has one durable owner: a member, its process, and an ownership
-  term. The gateway's pool reconciler replaces the `PoolView` as a whole
+- `controller`: `SupervisorHostController` serves the shared supervisor,
+  which is always a pool (high availability): several hosts (pool members)
+  are served at once and each instance has one durable owner: a member, its
+  process, and an ownership term. Every member names itself in its hello; a
+  hello without a member, or with an invalid one, is refused with the
+  `OPENSHELL_SUPERVISOR_POOL_*` setting to fix. One session per member: a
+  newer connection epoch of the same member process or a new process of the
+  member supersedes its stream, a delayed older hello is refused, and reports
+  from superseded streams, acks of revisions never sent, regressing acks,
+  and oversized reports are dropped. A stream ends when the token that opened
+  it expires; hosted instances keep running. The pool's recovery deadline
+  defaults to `POOL_RECOVERY_TIMEOUT_SECS` (`set_recovery_timeout_secs`
+  overrides it). The gateway's pool reconciler replaces the `PoolView` as a whole
   (`update_pool`): the desired set from the gateway's durable records, the
   owners, the launch material this replica loaded, and the latest recorded
   reports of owners served elsewhere. Owners placed, instances launched, and
@@ -54,8 +51,7 @@ re-implementing the control contracts.
   15 s membership TTL, the 2 s record refresh, 1 s heartbeats, host silence
   detection and bounded reconnect attempts, and `reconnect_budget`, the worst
   case for a member to reconnect past an unresponsive replica and be refreshed
-  elsewhere, which a test keeps well inside the TTL. A lone shared supervisor
-  keeps its own longer timings.
+  elsewhere, which a test keeps well inside the TTL.
 - `registration`: `SandboxInstanceRegistration` is the JSON launch material
   one assignment carries and the driver persists with the generation. It
   grants the supervisor exactly that generation's gateway and Sandbox Protocol

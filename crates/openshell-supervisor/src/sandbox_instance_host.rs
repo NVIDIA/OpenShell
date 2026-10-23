@@ -414,12 +414,6 @@ impl SandboxInstanceHost {
         }))
     }
 
-    /// Stop every sandbox instance, for process shutdown.
-    pub async fn remove_all(&self, grace: Duration) {
-        let keys = lock(&self.instances).keys().cloned().collect::<Vec<_>>();
-        futures::future::join_all(keys.iter().map(|key| self.remove(key, grace))).await;
-    }
-
     /// Relinquish every sandbox instance, for the shutdown of a supervisor
     /// whose instances other supervisors take over.
     pub async fn relinquish_all(&self) {
@@ -1199,7 +1193,6 @@ mod tests {
             Some(SandboxInstancePhaseReport::Exited { exit_code: 4 })
         );
         assert!(!dir.exists());
-        host.remove_all(Duration::from_secs(10)).await;
         assert!(host.list().is_empty());
     }
 

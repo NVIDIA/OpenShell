@@ -226,6 +226,12 @@ struct OwnerRecord {
 enum RecordPhase {
     /// A recording reserved the route; nothing is published.
     Reserved,
+    /// A launch recorded the instance and its launch material, and is
+    /// admitting it onto a member. Not desired: nothing places, charges, or
+    /// grants it. Its owner and its publication are one atomic write, so a
+    /// launch that admits nothing removes it, and one that stalls or dies is
+    /// fenced like a reservation; its material candidate stays until then.
+    Admitting,
     /// The pool must run the instance, with this launch material.
     Published,
 }
@@ -258,6 +264,15 @@ struct AssignmentRecord {
     /// When the row was last written: for a published record, its
     /// publication, the one change after its reservation.
     updated_at_ms: i64,
+}
+
+/// An instance record as a recording left it.
+#[derive(Debug, Clone)]
+struct Recording {
+    record: AssignmentRecord,
+    /// The material candidate this recording staged and still keeps: only
+    /// for a record it published as [`RecordPhase::Admitting`] itself.
+    candidate: Option<String>,
 }
 
 /// What an owner reported of one instance in one ownership term, for gateway
@@ -351,6 +366,9 @@ enum Transition {
     Applied(Option<Box<OwnerRecord>>),
     /// The target member has no free slot for the route.
     Full,
+    /// The admitted instance record changed or was removed before the owner
+    /// was written.
+    InstanceChanged,
     /// The owner record is not what the change was based on.
     OwnerChanged,
 }
@@ -433,6 +451,13 @@ struct TestHooks {
     /// Routes dropped from assignment and owner listings, as a listing that
     /// is not a snapshot can miss rows.
     listing_omits: Mutex<BTreeSet<String>>,
+    /// Pauses the next launch that admitted its instance nowhere before it
+    /// removes the record.
+    give_up_gate: Mutex<Option<Gate>>,
+    /// Fails the next admission write before it reaches the store.
+    fail_admission: Mutex<Option<()>>,
+    /// Fails the next removal of a refused launch's record.
+    fail_give_up: Mutex<Option<()>>,
     /// Pauses the next reconciliation pass before it does anything.
     reconcile_gate: Mutex<Option<Gate>>,
     /// Replaces the members whose streams the controller serves.
@@ -1115,6 +1140,37 @@ impl SupervisorPool {
         before: Option<&OwnerRecord>,
         after: Option<&OwnerPayload>,
     ) -> Result<Transition, PersistenceError> {
+        self.transition_admitting(route, before, after, None).await
+    }
+
+    /// [`Self::transition`] that also publishes `admitting`, an
+    /// [`RecordPhase::Admitting`] record of the route, in the same atomic
+    /// write, conditioned on its version. A launch that gives the record up
+    /// removes exactly that version, so an owner is written only for a record
+    /// that is still being admitted, and a removed record never gains one.
+    async fn transition_admitting(
+        &self,
+        route: &str,
+        before: Option<&OwnerRecord>,
+        after: Option<&OwnerPayload>,
+        admitting: Option<&AssignmentRecord>,
+    ) -> Result<Transition, PersistenceError> {
+        let admission = admitting
+            .map(|record| {
+                let payload = AssignmentPayload {
+                    phase: RecordPhase::Published,
+                    ..record.payload.clone()
+                };
+                serde_json::to_vec(&payload)
+                    .map(|bytes| AtomicWrite::Update {
+                        object_type: ASSIGNMENT_OBJECT_TYPE.to_string(),
+                        id: assignment_object_id(&payload.route, &payload.writer),
+                        payload: bytes,
+                        expected_version: record.resource_version,
+                    })
+                    .map_err(|error| PersistenceError::Encode(error.to_string()))
+            })
+            .transpose()?;
         let from = before.map(|record| record.payload.member_id.as_str());
         let to = after.map(|payload| payload.member_id.as_str());
         let encode = |payload: &OwnerPayload| {
@@ -1152,6 +1208,15 @@ impl SupervisorPool {
                     }
                     barrier.wait().await;
                 }
+            }
+            if let Some(admission) = &admission {
+                writes.push(admission.clone());
+            }
+            #[cfg(test)]
+            if admission.is_some() && lock(&self.hooks.fail_admission).take().is_some() {
+                return Err(PersistenceError::Database(
+                    "test: the admission write failed".to_string(),
+                ));
             }
             let owner_index = writes.len();
             writes.push(match (before, after) {
@@ -1205,6 +1270,23 @@ impl SupervisorPool {
                     if !unchanged {
                         return Ok(Transition::OwnerChanged);
                     }
+                    if let Some(record) = admitting
+                        && self
+                            .store
+                            .get(
+                                ASSIGNMENT_OBJECT_TYPE,
+                                &assignment_object_id(
+                                    &record.payload.route,
+                                    &record.payload.writer,
+                                ),
+                            )
+                            .await?
+                            .is_none_or(|current| {
+                                current.resource_version != record.resource_version
+                            })
+                    {
+                        return Ok(Transition::InstanceChanged);
+                    }
                 }
                 Err(error) => return Err(error),
             }
@@ -1223,7 +1305,7 @@ impl SupervisorPool {
         match transition {
             Transition::Applied(Some(record)) => Ok(Reconciled::Changed(record)),
             Transition::Applied(None) => Ok(Reconciled::Removed),
-            Transition::Full => Ok(Reconciled::Unchanged),
+            Transition::Full | Transition::InstanceChanged => Ok(Reconciled::Unchanged),
             Transition::OwnerChanged => self.reload(route).await,
         }
     }
@@ -1361,15 +1443,42 @@ impl SupervisorPool {
         &self,
         assignment: &SandboxInstanceAssignment,
     ) -> Result<AssignmentRecord, String> {
+        self.record_assignment_as(assignment, RecordPhase::Published)
+            .await
+            .map(|recording| recording.record)
+    }
+
+    /// Record a launched instance as [`RecordPhase::Admitting`], for its
+    /// launch to admit onto a member.
+    async fn record_admitting(
+        &self,
+        assignment: &SandboxInstanceAssignment,
+    ) -> Result<Recording, String> {
+        self.record_assignment_as(assignment, RecordPhase::Admitting)
+            .await
+    }
+
+    /// [`Self::record_assignment`], publishing the record as `phase`
+    /// ([`RecordPhase::Published`] or [`RecordPhase::Admitting`]). An
+    /// admitting record keeps its material candidate, which this recording
+    /// reports; a published one releases it.
+    async fn record_assignment_as(
+        &self,
+        assignment: &SandboxInstanceAssignment,
+        phase: RecordPhase,
+    ) -> Result<Recording, String> {
         let read = |error: PersistenceError| format!("read supervisor pool instance: {error}");
         let existing = |record: AssignmentRecord| match record.payload.phase {
-            RecordPhase::Published
+            RecordPhase::Published | RecordPhase::Admitting
                 if record.payload.generation == assignment.generation
                     && record.payload.sandbox_id == assignment.sandbox_id =>
             {
-                Ok(record)
+                Ok(Recording {
+                    record,
+                    candidate: None,
+                })
             }
-            RecordPhase::Published => {
+            RecordPhase::Published | RecordPhase::Admitting => {
                 Err("the sandbox instance route is recorded for another generation".to_string())
             }
             RecordPhase::Reserved => {
@@ -1472,7 +1581,7 @@ impl SupervisorPool {
                 let _ = publish.await;
             }
         }
-        payload.phase = RecordPhase::Published;
+        payload.phase = phase;
         let published = self
             .store
             .put_if(
@@ -1487,21 +1596,28 @@ impl SupervisorPool {
             .await;
         match published {
             Ok(written) => {
-                // The record owns the material now; a candidate row that
-                // outlives this is released by collection.
-                if let Err(error) = self
-                    .store
-                    .delete(MATERIAL_CANDIDATE_OBJECT_TYPE, &candidate)
-                    .await
-                {
-                    warn!(route = %payload.route, %error, "could not release a supervisor pool material candidate; retrying later");
-                }
-                lock(&self.materials).insert(payload.route.clone(), assignment.clone());
-                Ok(AssignmentRecord {
+                let record = AssignmentRecord {
                     payload,
                     resource_version: written.resource_version,
                     created_at_ms: written.created_at_ms,
                     updated_at_ms: written.updated_at_ms,
+                };
+                if phase == RecordPhase::Admitting {
+                    // The candidate keeps the material until the record is
+                    // admitted, or is collected once the record is gone.
+                    return Ok(Recording {
+                        record,
+                        candidate: Some(candidate),
+                    });
+                }
+                // The record owns the material now; a candidate row that
+                // outlives this is released by collection.
+                self.release_candidate(&record.payload.route, &candidate)
+                    .await;
+                lock(&self.materials).insert(record.payload.route.clone(), assignment.clone());
+                Ok(Recording {
+                    record,
+                    candidate: None,
                 })
             }
             Err(error) => {
@@ -1517,6 +1633,18 @@ impl SupervisorPool {
                     error => format!("publish supervisor pool instance: {error}"),
                 })
             }
+        }
+    }
+
+    /// Release a candidate whose material a published record owns; a
+    /// failure leaves it for collection, which releases it the same way.
+    async fn release_candidate(&self, route: &str, candidate: &str) {
+        if let Err(error) = self
+            .store
+            .delete(MATERIAL_CANDIDATE_OBJECT_TYPE, candidate)
+            .await
+        {
+            warn!(route, %error, "could not release a supervisor pool material candidate; retrying later");
         }
     }
 
@@ -1540,22 +1668,28 @@ impl SupervisorPool {
         }
     }
 
-    /// Fence reservations older than [`RESERVATION_GRACE`]: their recording
-    /// stalled or died, and once its reservation is gone it can never
-    /// publish. A recording that published first keeps its record.
+    /// Fence reservations and admitting records older than
+    /// [`RESERVATION_GRACE`]: their recording or launch stalled or died, and
+    /// once the row is gone it can never publish or be admitted. A recording
+    /// that published first, or a launch that admitted first, keeps its
+    /// record. The material of a fenced record stays with its candidate,
+    /// which collection then deletes.
     async fn fence_stale_reservations(&self, records: &BTreeMap<String, AssignmentRecord>) {
         let grace_ms = i64::try_from(self.reservation_grace.as_millis()).unwrap_or(i64::MAX);
         let stale = records
             .values()
             .filter(|record| {
-                record.payload.phase == RecordPhase::Reserved
-                    && now_ms().saturating_sub(record.created_at_ms) >= grace_ms
+                matches!(
+                    record.payload.phase,
+                    RecordPhase::Reserved | RecordPhase::Admitting
+                ) && now_ms().saturating_sub(record.created_at_ms) >= grace_ms
             })
             .take(CLEANUP_PER_PASS);
         for record in stale {
             info!(
                 route = %record.payload.route,
-                "fencing a supervisor pool instance reservation that did not publish in time"
+                phase = ?record.payload.phase,
+                "fencing a supervisor pool instance record that did not publish or admit in time"
             );
             if let Err(error) = self
                 .store
@@ -1618,8 +1752,10 @@ impl SupervisorPool {
             };
             match record {
                 Some(record)
-                    if record.payload.phase == RecordPhase::Reserved
-                        && record.payload.writer == payload.writer => {}
+                    if matches!(
+                        record.payload.phase,
+                        RecordPhase::Reserved | RecordPhase::Admitting
+                    ) && record.payload.writer == payload.writer => {}
                 Some(record)
                     if record.payload.phase == RecordPhase::Published
                         && record.payload.material_handle == payload.material_handle =>
@@ -1634,9 +1770,11 @@ impl SupervisorPool {
         }
     }
 
-    /// Remove an instance record and its launch material, or a reservation,
-    /// which fences its recording. The material goes first, so a failure
-    /// leaves the record to retry from.
+    /// Remove an instance record and its launch material, or a reservation or
+    /// admitting record, which fences its recording or launch (the material
+    /// of those stays with their candidate, which collection deletes). A
+    /// published record's material goes first, so a failure leaves the record
+    /// to retry from.
     async fn delete_assignment(&self, record: &AssignmentRecord) -> Result<(), String> {
         if record.payload.phase == RecordPhase::Published {
             let handle = CredentialHandle::decode(record.payload.material_handle.as_slice())
@@ -1692,8 +1830,18 @@ impl SupervisorPool {
     }
 
     /// Record a new instance and the owner of its launch term, on the member
-    /// the ring prefers among live members with room. The instance is
-    /// recorded first, so every recorded owner has its instance recorded.
+    /// the ring prefers among live members with room.
+    ///
+    /// The instance is recorded first, as [`RecordPhase::Admitting`], which
+    /// nothing places, charges, or grants. Its owner and its publication are
+    /// then one atomic write conditioned on the record's version, so every
+    /// owner has its instance published. A launch that admits it nowhere
+    /// removes the record it created at that version (never a record another
+    /// launch of the generation created or admitted) and then its material;
+    /// a removal that fails, or a launch that stalls or dies, leaves an
+    /// admitting record that is fenced after [`RESERVATION_GRACE`], and its
+    /// material is collected with its candidate. A failed write that may have
+    /// applied keeps the record, so a retry of the launch admits it.
     async fn place_launch(&self, request: PlacementRequest) -> Result<(), String> {
         let assignment = &request.assignment;
         let members = self
@@ -1728,7 +1876,9 @@ impl SupervisorPool {
         if targets.is_empty() {
             return Err(no_room());
         }
-        self.record_assignment(assignment).await?;
+        let recording = self.record_admitting(assignment).await?;
+        let admitting =
+            (recording.record.payload.phase == RecordPhase::Admitting).then_some(&recording.record);
         let mut placed = None;
         for target in targets {
             let payload = OwnerPayload {
@@ -1744,7 +1894,7 @@ impl SupervisorPool {
                 previous_member_id: None,
             };
             match self
-                .transition(&assignment.route, None, Some(&payload))
+                .transition_admitting(&assignment.route, None, Some(&payload), admitting)
                 .await
                 .map_err(|error| format!("record supervisor instance owner: {error}"))?
             {
@@ -1753,27 +1903,113 @@ impl SupervisorPool {
                     break;
                 }
                 Transition::Full => {}
-                // A retried launch keeps the owner it already recorded.
-                Transition::OwnerChanged => match self
-                    .reload(&assignment.route)
-                    .await
-                    .map_err(|error| format!("read supervisor instance owner: {error}"))?
-                {
-                    Reconciled::Changed(existing)
-                        if existing.payload.generation == assignment.generation =>
-                    {
-                        placed = Some(*existing);
-                        break;
-                    }
-                    _ => {
-                        return Err(
-                            "the sandbox instance route is owned by another generation".to_string()
-                        );
-                    }
-                },
+                // Another launch of the generation admitted or recorded the
+                // owner first, or the record is gone.
+                Transition::OwnerChanged | Transition::InstanceChanged => {
+                    placed = Some(self.launched_owner(assignment).await?);
+                    break;
+                }
             }
         }
-        let record = placed.ok_or_else(no_room)?;
+        let Some(record) = placed else {
+            // Another launch of the generation may have admitted it meanwhile.
+            let Some(record) = self.give_up_admission(&recording, assignment).await else {
+                return Err(no_room());
+            };
+            self.placed(assignment, record);
+            return Ok(());
+        };
+        // Only the launch that recorded the instance holds its material; a
+        // retry that admitted an existing record leaves the first recording's
+        // material, which every replica loads from the record.
+        if let Some(candidate) = &recording.candidate {
+            self.release_candidate(&assignment.route, candidate).await;
+            lock(&self.materials).insert(assignment.route.clone(), assignment.clone());
+        }
+        self.placed(assignment, record);
+        Ok(())
+    }
+
+    /// The owner another launch of `assignment`'s generation recorded, or an
+    /// error when the route has none or another generation's.
+    async fn launched_owner(
+        &self,
+        assignment: &SandboxInstanceAssignment,
+    ) -> Result<OwnerRecord, String> {
+        match self
+            .reload(&assignment.route)
+            .await
+            .map_err(|error| format!("read supervisor instance owner: {error}"))?
+        {
+            Reconciled::Changed(existing)
+                if existing.payload.generation == assignment.generation =>
+            {
+                Ok(*existing)
+            }
+            Reconciled::Changed(_) => {
+                Err("the sandbox instance route is owned by another generation".to_string())
+            }
+            _ => Err("the sandbox instance record was withdrawn before admission".to_string()),
+        }
+    }
+
+    /// A launch admitted its instance nowhere: remove the admitting record it
+    /// created, at the version it created, and then its material. A record
+    /// another launch created, or one admitted meanwhile, is left alone; the
+    /// owner such a launch recorded is returned. A removal that fails leaves
+    /// the record for fencing and the material for collection.
+    async fn give_up_admission(
+        &self,
+        recording: &Recording,
+        assignment: &SandboxInstanceAssignment,
+    ) -> Option<OwnerRecord> {
+        let record = &recording.record;
+        let Some(candidate) = &recording.candidate else {
+            return self.launched_owner(assignment).await.ok();
+        };
+        #[cfg(test)]
+        {
+            let gate = lock(&self.hooks.give_up_gate).take();
+            if let Some((paused, resume)) = gate {
+                let _ = paused.send(());
+                let _ = resume.await;
+            }
+            if lock(&self.hooks.fail_give_up).take().is_some() {
+                warn!(route = %assignment.route, "test: removing a refused admitting record failed");
+                return None;
+            }
+        }
+        match self
+            .store
+            .delete_if(
+                ASSIGNMENT_OBJECT_TYPE,
+                &assignment_object_id(&record.payload.route, &record.payload.writer),
+                record.resource_version,
+            )
+            .await
+        {
+            Ok(true) => {
+                info!(
+                    sandbox_id = %assignment.sandbox_id,
+                    route = %assignment.route,
+                    "removed the record of a sandbox instance no supervisor pool member had room for"
+                );
+                self.discard_candidate(candidate, &record.payload).await;
+                None
+            }
+            // Admitted by another launch of the generation, or fenced.
+            Ok(false) | Err(PersistenceError::Conflict { .. }) => {
+                self.launched_owner(assignment).await.ok()
+            }
+            Err(error) => {
+                warn!(route = %assignment.route, %error, "could not remove a refused sandbox instance record; it is fenced later");
+                None
+            }
+        }
+    }
+
+    /// Serve a newly placed owner at once.
+    fn placed(&self, assignment: &SandboxInstanceAssignment, record: OwnerRecord) {
         info!(
             sandbox_id = %assignment.sandbox_id,
             route = %assignment.route,
@@ -1794,7 +2030,6 @@ impl SupervisorPool {
                 },
             );
         }
-        Ok(())
     }
 
     /// One reconciliation pass: remove withdrawn instances; then place, take
@@ -2629,7 +2864,6 @@ mod tests {
         /// A gateway replica's pool over this store, with its own controller.
         fn replica(&self, replica_id: &str) -> Arc<SupervisorPool> {
             let controller = SupervisorHostController::new();
-            controller.enable_pool(openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS);
             let mut pool = SupervisorPool::new(
                 self.store.clone(),
                 controller,
@@ -2662,7 +2896,6 @@ mod tests {
         /// A replica that just started, within its takeover grace.
         fn starting_replica(&self, replica_id: &str) -> Arc<SupervisorPool> {
             let controller = SupervisorHostController::new();
-            controller.enable_pool(openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS);
             SupervisorPool::new(
                 self.store.clone(),
                 controller,
@@ -2716,6 +2949,46 @@ mod tests {
                 })
                 .await
                 .unwrap();
+        }
+
+        /// The persisted credential epoch of `sandbox_id`.
+        async fn auth_epoch(&self, sandbox_id: &str) -> u64 {
+            let sandbox = self
+                .store
+                .get_message::<Sandbox>(sandbox_id)
+                .await
+                .unwrap()
+                .unwrap();
+            PersistedSandboxIdentity::read(&sandbox.metadata.unwrap().annotations)
+                .unwrap()
+                .auth_epoch
+                .get()
+        }
+
+        /// A launch of `route` that read a free slot on `m1`, the pool's only
+        /// member, and found it taken by another sandbox once it tried to
+        /// admit: it is refused.
+        async fn refused_launch(&self, pool: &Arc<SupervisorPool>, route: &str, sandbox: &str) {
+            self.member("m1", "p1", false).await;
+            self.fill("m1", "p1", MAX_ASSIGNED_INSTANCES - 1).await;
+            self.sandbox(sandbox, "generation-1", SandboxPhase::Ready)
+                .await;
+            let release = Arc::new(tokio::sync::Barrier::new(2));
+            let reached = pool.pause_next_transition_reached(release.clone());
+            let launching = {
+                let pool = pool.clone();
+                let request = launch(route, sandbox, "generation-1");
+                tokio::spawn(async move { pool.place_launch(request).await })
+            };
+            reached.await.unwrap();
+            self.sandbox("sandbox-last", "generation-1", SandboxPhase::Ready)
+                .await;
+            self.publish("rt-last-slot-0123", "sandbox-last", "generation-1")
+                .await;
+            self.own("rt-last-slot-0123", "sandbox-last", "m1", "p1")
+                .await;
+            release.wait().await;
+            assert!(launching.await.unwrap().is_err(), "{route} is refused");
         }
 
         async fn member(&self, member_id: &str, process_id: &str, leaving: bool) {
@@ -3969,6 +4242,251 @@ mod tests {
         assert!(stalled_launch.await.unwrap().is_err());
         assert!(fixture.owner("rt-route-x000").await.is_none());
         assert_eq!(fixture.charged("m1").await.len(), MAX_ASSIGNED_INSTANCES);
+        // The refused launch left nothing: no record, no material (only the
+        // admitted launch's), no candidate, nothing cached.
+        assert!(fixture.instance("rt-route-x000").await.is_none());
+        assert_eq!(fixture.credentials.stored_credential_count(), Some(1));
+        assert_eq!(fixture.candidates().await, 0);
+        assert!(!lock(&stalled.materials).contains_key("rt-route-x000"));
+        // Room appears later; no pass places, charges, or grants it.
+        fixture.member("m2", "p2", false).await;
+        let pass = fixture.replica("gw-c");
+        pass.reconcile_once().await.unwrap();
+        pass.reconcile_once().await.unwrap();
+        assert!(fixture.owner("rt-route-x000").await.is_none());
+        assert!(fixture.charged("m2").await.is_empty());
+        assert_eq!(fixture.auth_epoch("sandbox-x").await, 1);
+        assert!(fixture.instance("rt-route-x000").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_whose_cleanup_fails_is_fenced_and_never_placed() {
+        a_refused_launch_whose_cleanup_fails_is_fenced_and_never_placed_on(&Fixture::new().await)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_refused_launch_whose_cleanup_fails_is_fenced_and_never_placed() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_refused_launch_whose_cleanup_fails_is_fenced_and_never_placed_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_refused_launch_whose_cleanup_fails_is_fenced_and_never_placed_on(fixture: &Fixture) {
+        let pool = fixture.replica("gw-a");
+        *lock(&pool.hooks.fail_give_up) = Some(());
+        fixture
+            .refused_launch(&pool, "rt-route-x000", "sandbox-x")
+            .await;
+        // The record stays, but only as an admitting record with its
+        // candidate: not desired, so room appearing places nothing.
+        let kept = fixture.instance("rt-route-x000").await.unwrap();
+        assert_eq!(kept.payload.phase, RecordPhase::Admitting);
+        assert_eq!(fixture.candidates().await, 1);
+        fixture.member("m2", "p2", false).await;
+        let pass = fixture.replica("gw-b");
+        pass.reconcile_once().await.unwrap();
+        assert!(fixture.owner("rt-route-x000").await.is_none());
+        assert!(fixture.charged("m2").await.is_empty());
+        assert_eq!(fixture.auth_epoch("sandbox-x").await, 1);
+        // Once its grace passes, any replica fences it and collects its
+        // material.
+        let mut fencing = fixture.replica("gw-c");
+        Arc::get_mut(&mut fencing).unwrap().reservation_grace = Duration::ZERO;
+        fencing.reconcile_once().await.unwrap();
+        fencing.reconcile_once().await.unwrap();
+        assert!(fixture.instance("rt-route-x000").await.is_none());
+        assert_eq!(fixture.candidates().await, 0);
+        assert_eq!(fixture.credentials.stored_credential_count(), Some(0));
+        assert!(fixture.owner("rt-route-x000").await.is_none());
+        assert!(fixture.charged("m2").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_retried_launch_admits_the_record_a_refused_attempt_kept() {
+        a_retried_launch_admits_the_record_a_refused_attempt_kept_on(&Fixture::new().await).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_retried_launch_admits_the_record_a_refused_attempt_kept() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_retried_launch_admits_the_record_a_refused_attempt_kept_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_retried_launch_admits_the_record_a_refused_attempt_kept_on(fixture: &Fixture) {
+        let pool = fixture.replica("gw-a");
+        *lock(&pool.hooks.fail_give_up) = Some(());
+        fixture
+            .refused_launch(&pool, "rt-route-x000", "sandbox-x")
+            .await;
+        // The launch is retried once there is room, on another replica.
+        fixture.member("m2", "p2", false).await;
+        fixture
+            .replica("gw-b")
+            .place_launch(launch("rt-route-x000", "sandbox-x", "generation-1"))
+            .await
+            .unwrap();
+        let owner = fixture.owner("rt-route-x000").await.unwrap();
+        assert_eq!((owner.member_id.as_str(), owner.auth_epoch), ("m2", 1));
+        let record = fixture.instance("rt-route-x000").await.unwrap();
+        assert_eq!(record.payload.phase, RecordPhase::Published);
+        assert!(fixture.charged("m2").await.contains("rt-route-x000"));
+        // One material, now the record's; its candidate is released.
+        let mut collecting = fixture.replica("gw-c");
+        Arc::get_mut(&mut collecting).unwrap().reservation_grace = Duration::ZERO;
+        collecting.reconcile_once().await.unwrap();
+        assert_eq!(fixture.candidates().await, 0);
+        assert_eq!(fixture.credentials.stored_credential_count(), Some(1));
+        assert!(fixture.instance("rt-route-x000").await.is_some());
+        assert!(fixture.owner("rt-route-x000").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material() {
+        a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material_on(
+            &Fixture::new().await,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material_on(
+            &Fixture::with_store(schema.connect_store().await),
+        )
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_failed_admission_keeps_the_record_for_a_retry_with_its_first_material_on(
+        fixture: &Fixture,
+    ) {
+        fixture.member("m1", "p1", false).await;
+        fixture
+            .sandbox("sandbox-x", "generation-1", SandboxPhase::Ready)
+            .await;
+        let first = launch("rt-route-x000", "sandbox-x", "generation-1");
+        let failing = fixture.replica("gw-a");
+        *lock(&failing.hooks.fail_admission) = Some(());
+        // The admission write fails without a known outcome: the launch
+        // fails and keeps its admitting record, which nothing places.
+        assert!(failing.place_launch(first.clone()).await.is_err());
+        let kept = fixture.instance("rt-route-x000").await.unwrap();
+        assert_eq!(kept.payload.phase, RecordPhase::Admitting);
+        assert!(fixture.owner("rt-route-x000").await.is_none());
+        fixture.replica("gw-b").reconcile_once().await.unwrap();
+        assert!(fixture.owner("rt-route-x000").await.is_none());
+        assert!(fixture.charged("m1").await.is_empty());
+        // A retry with other launch material admits the kept record; the
+        // first recording's material stays the instance's everywhere.
+        let mut retry = first.clone();
+        retry.assignment.launch_material = b"{\"launch\":\"retried\"}".to_vec();
+        let retrying = fixture.replica("gw-c");
+        retrying.place_launch(retry).await.unwrap();
+        assert!(!lock(&retrying.materials).contains_key("rt-route-x000"));
+        let record = fixture.instance("rt-route-x000").await.unwrap();
+        assert_eq!(record.payload.phase, RecordPhase::Published);
+        assert_eq!(
+            retrying.load_material(&record.payload).await.unwrap(),
+            first.assignment.launch_material
+        );
+        assert_eq!(fixture.credentials.stored_credential_count(), Some(1));
+        assert_eq!(
+            fixture.owner("rt-route-x000").await.unwrap().member_id,
+            "m1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_never_removes_a_record_another_launch_admitted() {
+        a_refused_launch_never_removes_a_record_another_launch_admitted_on(&Fixture::new().await)
+            .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable PostgreSQL database in OPENSHELL_TEST_POSTGRES_URL; run mise run test:rust:postgres"]
+    async fn postgres_a_refused_launch_never_removes_a_record_another_launch_admitted() {
+        let schema = TestSchema::create("supervisor_pool").await;
+        a_refused_launch_never_removes_a_record_another_launch_admitted_on(&Fixture::with_store(
+            schema.connect_store().await,
+        ))
+        .await;
+        schema.drop_schema().await;
+    }
+
+    async fn a_refused_launch_never_removes_a_record_another_launch_admitted_on(fixture: &Fixture) {
+        // The refused launch pauses before removing the record it created;
+        // meanwhile a retry of the same launch admits that record elsewhere.
+        let pool = fixture.replica("gw-a");
+        let (paused, resume) = {
+            let (paused, paused_rx) = tokio::sync::oneshot::channel();
+            let (resume, resume_rx) = tokio::sync::oneshot::channel();
+            *lock(&pool.hooks.give_up_gate) = Some((paused, resume_rx));
+            (paused_rx, resume)
+        };
+        fixture.member("m1", "p1", false).await;
+        fixture.fill("m1", "p1", MAX_ASSIGNED_INSTANCES - 1).await;
+        fixture
+            .sandbox("sandbox-x", "generation-1", SandboxPhase::Ready)
+            .await;
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let reached = pool.pause_next_transition_reached(release.clone());
+        let launching = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                pool.place_launch(launch("rt-route-x000", "sandbox-x", "generation-1"))
+                    .await
+            })
+        };
+        reached.await.unwrap();
+        fixture
+            .sandbox("sandbox-last", "generation-1", SandboxPhase::Ready)
+            .await;
+        fixture
+            .publish("rt-last-slot-0123", "sandbox-last", "generation-1")
+            .await;
+        fixture
+            .own("rt-last-slot-0123", "sandbox-last", "m1", "p1")
+            .await;
+        release.wait().await;
+        tokio::time::timeout(Duration::from_secs(30), paused)
+            .await
+            .expect("the refused launch reaches its removal")
+            .unwrap();
+        fixture.member("m2", "p2", false).await;
+        fixture
+            .replica("gw-b")
+            .place_launch(launch("rt-route-x000", "sandbox-x", "generation-1"))
+            .await
+            .unwrap();
+        let _ = resume.send(());
+        // The first launch finds the record admitted by the retry and
+        // succeeds with it; nothing of the instance is removed.
+        launching.await.unwrap().unwrap();
+        let record = fixture.instance("rt-route-x000").await.unwrap();
+        assert_eq!(record.payload.phase, RecordPhase::Published);
+        assert_eq!(
+            fixture.owner("rt-route-x000").await.unwrap().member_id,
+            "m2"
+        );
+        assert_eq!(fixture.credentials.stored_credential_count(), Some(1));
+        let mut collecting = fixture.replica("gw-c");
+        Arc::get_mut(&mut collecting).unwrap().reservation_grace = Duration::ZERO;
+        collecting.reconcile_once().await.unwrap();
+        assert_eq!(fixture.candidates().await, 0);
+        assert_eq!(fixture.credentials.stored_credential_count(), Some(1));
+        assert!(fixture.instance("rt-route-x000").await.is_some());
     }
 
     #[tokio::test]

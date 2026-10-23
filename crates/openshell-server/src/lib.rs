@@ -821,17 +821,15 @@ pub(crate) async fn run_server(
             ttl_secs = ttl.as_secs(),
             "shared supervisor assignment stream enabled; minting supervisor tokens"
         );
-        if controller.is_pool() {
-            info!("shared supervisor pool enabled; reconciling pool membership and ownership");
-            supervisor_pool::SupervisorPool::new(
-                state.store.clone(),
-                controller.clone(),
-                authority.clone(),
-                state.credentials.clone(),
-                state.replica_id.clone(),
-            )
-            .start(shutdown_rx.clone());
-        }
+        info!("shared supervisor pool enabled; reconciling pool membership and ownership");
+        supervisor_pool::SupervisorPool::new(
+            state.store.clone(),
+            controller.clone(),
+            authority.clone(),
+            state.credentials.clone(),
+            state.replica_id.clone(),
+        )
+        .start(shutdown_rx.clone());
         spawn_supervisor_token_refresh(authority, ttl, controller.clone(), shutdown_rx.clone());
     }
 
@@ -1708,25 +1706,25 @@ pub struct ComputeDriverBuildContext<'a> {
     config: ComputeDriverConfigContext<'a>,
     shutdown_rx: watch::Receiver<bool>,
     shared_supervision: &'a OnceLock<openshell_supervisor_control::SharedSupervision>,
-    /// Recovery deadline of a configured supervisor pool.
-    supervisor_pool: Option<u32>,
+    /// Recovery deadline from `[openshell.gateway.supervisor_pool]`, when
+    /// configured.
+    supervisor_recovery_timeout_secs: Option<u32>,
 }
 
 impl ComputeDriverBuildContext<'_> {
-    /// The gateway's coordination of a shared supervisor host, for an
+    /// The gateway's coordination of the shared supervisor pool, for an
     /// in-process driver whose configuration places new generations on it.
-    /// The gateway owns the desired set, serves it to the host over the
-    /// private assignment stream, mints the supervisor token, and publishes
-    /// each renewal for the driver to deliver. With
-    /// `[openshell.gateway.supervisor_pool]` enabled it coordinates a pool of
-    /// hosts. Created on first request; every call returns the same
-    /// coordination.
+    /// The gateway owns the desired set and ownership durably, serves each
+    /// member over the private assignment stream, mints the supervisor
+    /// token, and publishes each renewal for the driver to deliver.
+    /// `[openshell.gateway.supervisor_pool]` only tunes it. Created on first
+    /// request; every call returns the same coordination.
     pub fn shared_supervision(&self) -> openshell_supervisor_control::SharedSupervision {
         self.shared_supervision
             .get_or_init(|| {
                 let supervision = openshell_supervisor_control::SharedSupervision::new();
-                if let Some(recovery_timeout_secs) = self.supervisor_pool {
-                    supervision.enable_pool(recovery_timeout_secs);
+                if let Some(recovery_timeout_secs) = self.supervisor_recovery_timeout_secs {
+                    supervision.set_recovery_timeout_secs(recovery_timeout_secs);
                 }
                 supervision
             })
@@ -1850,8 +1848,7 @@ async fn build_compute_runtime(
     info!(driver = %driver.name(), "Using compute driver");
     let supervisor_pool = driver_startup
         .file
-        .and_then(|file| file.openshell.gateway.supervisor_pool)
-        .and_then(|pool| pool.enabled_recovery_timeout_secs());
+        .and_then(|file| file.openshell.gateway.supervisor_pool);
     let runtime = match driver {
         ConfiguredComputeDriver::Registered(registration) => {
             let shared_supervision = OnceLock::new();
@@ -1865,7 +1862,8 @@ async fn build_compute_runtime(
                 },
                 shutdown_rx,
                 shared_supervision: &shared_supervision,
-                supervisor_pool,
+                supervisor_recovery_timeout_secs: supervisor_pool
+                    .and_then(|pool| pool.recovery_timeout_secs),
             };
             let instance = registration.factory.build(build_context).await?;
             let supervisor_host = shared_supervision
@@ -1873,7 +1871,9 @@ async fn build_compute_runtime(
                 .map(|supervision| supervision.controller().clone());
             if supervisor_pool.is_some() && supervisor_host.is_none() {
                 return Err(Error::config(
-                    "openshell.gateway.supervisor_pool requires a compute driver that hosts                      sandboxes on the gateway's shared supervisor (Kubernetes                      supervisor_topology = \"gateway\")",
+                    "openshell.gateway.supervisor_pool tunes the shared supervisor pool, but no \
+                     compute driver hosts sandboxes on it; set the Kubernetes driver's \
+                     supervisor_topology = \"gateway\" or remove the table",
                 ));
             }
             match instance {
@@ -1916,8 +1916,8 @@ async fn build_compute_runtime(
         }
         ConfiguredComputeDriver::Remote { .. } if supervisor_pool.is_some() => {
             return Err(Error::config(
-                "openshell.gateway.supervisor_pool requires an in-process compute driver that \
-                 hosts sandboxes on the gateway's shared supervisor",
+                "openshell.gateway.supervisor_pool tunes the shared supervisor pool, which \
+                 only an in-process compute driver can use; remove the table",
             ));
         }
         ConfiguredComputeDriver::Remote { name } => {
@@ -2343,10 +2343,16 @@ mod tests {
     struct TestComputeDriverFactory;
 
     #[test]
-    fn a_configured_supervisor_pool_makes_the_drivers_shared_supervision_a_pool() {
+    fn shared_supervision_is_always_a_pool_tuned_by_its_table() {
         let endpoint_overrides = std::collections::BTreeMap::new();
         let (_shutdown, shutdown_rx) = watch::channel(false);
-        for supervisor_pool in [None, Some(75)] {
+        for (configured, offered) in [
+            (
+                None,
+                openshell_supervisor_control::POOL_RECOVERY_TIMEOUT_SECS,
+            ),
+            (Some(75), 75),
+        ] {
             let shared = std::sync::OnceLock::new();
             let context = super::ComputeDriverBuildContext {
                 config: super::ComputeDriverConfigContext {
@@ -2364,19 +2370,21 @@ mod tests {
                 },
                 shutdown_rx: shutdown_rx.clone(),
                 shared_supervision: &shared,
-                supervisor_pool,
+                supervisor_recovery_timeout_secs: configured,
             };
-            // The driver asks for shared supervision as before; the gateway's
-            // configuration alone decides whether it coordinates a pool.
+            // The driver asks for shared supervision as before; it is the
+            // pool, with the configured recovery deadline or the default.
             let supervision = context.shared_supervision();
-            assert_eq!(supervision.is_pool(), supervisor_pool.is_some());
             assert_eq!(
                 supervision.controller().pool_recovery_timeout_secs(),
-                supervisor_pool
+                offered
             );
             assert_eq!(
-                context.shared_supervision().is_pool(),
-                supervisor_pool.is_some()
+                context
+                    .shared_supervision()
+                    .controller()
+                    .pool_recovery_timeout_secs(),
+                offered
             );
             assert!(shared.get().is_some());
         }

@@ -758,31 +758,29 @@ The gateway refuses to start when a peer endpoint is configured on a multi-repli
 
 ## Supervisor Pool
 
-`[openshell.gateway.supervisor_pool]` runs the Kubernetes driver's shared
-supervisor as a high-availability pool. The gateway places each sandbox on one
-pool member, records its owner durably, and moves the sandboxes of a member
-that fails or leaves to a live member without restarting their workloads. The
-pool requires the Kubernetes driver's `supervisor_topology = "gateway"`; the
-gateway refuses to start a pool when no compute driver uses the shared
-supervisor.
+With the Kubernetes driver's `supervisor_topology = "gateway"`, the gateway
+always runs the shared supervisor as a high-availability pool, whatever its
+replica count. It places each sandbox on one pool member, records its owner
+durably, and moves the sandboxes of a member that fails or leaves to a live
+member without restarting their workloads.
+`[openshell.gateway.supervisor_pool]` is optional tuning of that pool; without
+it the defaults apply. The gateway refuses to start with the table when no
+in-process compute driver uses the shared supervisor.
 
 ```toml
 [openshell.gateway.supervisor_pool]
-enabled = true
 recovery_timeout_secs = 60
 ```
 
 | Field | Default | Behavior |
 |---|---|---|
-| `enabled` | `false` | Coordinates the shared supervisor's replicas as a pool. |
-| `recovery_timeout_secs` | `60` | Seconds, from 10 to 300, that a sandbox runtime keeps its workload frozen after losing its pool member before it terminates the workload. The pool's supervisors offer this limit to each sandbox runtime when they attach. Without a pool, the runtime uses 30 seconds. |
+| `recovery_timeout_secs` | `60` | Seconds, from 10 to 300, that a sandbox runtime keeps its workload frozen after losing its pool member before it terminates the workload. The pool's supervisors offer this limit to each sandbox runtime when they attach. |
 
-The Helm chart always renders this table with the gateway topology, at any
-`supervisor.replicas`, sets `recovery_timeout_secs` from
-`supervisor.recoveryTimeoutSeconds` (60 by default), and rejects a
-hand-written table. The table does not depend on the replica count, so scaling
-the pool does not change the gateway configuration or restart the gateway. For
-failover behavior, refer to
+The Helm chart renders `recovery_timeout_secs` from
+`supervisor.recoveryTimeoutSeconds` (60 by default; null renders no table) and
+rejects a hand-written table. The table does not depend on the replica count,
+so scaling the pool does not change the gateway configuration or restart the
+gateway. For failover behavior, refer to
 [Shared Supervisor High Availability](/kubernetes/high-availability#shared-supervisor-high-availability).
 
 ## Driver References

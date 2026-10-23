@@ -40,24 +40,38 @@ fn run_platform(args: crate::Args) -> Result<()> {
     let instance_root = args
         .session_root
         .ok_or_else(|| miette::miette!("--session-root is required for --mode=shared"))?;
-    let pool = match (
+    // Every shared supervisor is a member of the gateway's supervisor pool.
+    let missing = [
+        (
+            args.pool_member_id.is_none(),
+            "--pool-member-id (OPENSHELL_SUPERVISOR_POOL_MEMBER_ID, the Pod name)",
+        ),
+        (
+            args.pool_member_uid.is_none(),
+            "--pool-member-uid (OPENSHELL_SUPERVISOR_POOL_MEMBER_UID, the Pod UID)",
+        ),
+        (
+            args.pool_advertise_ip.is_none(),
+            "--pool-advertise-ip (OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP, the Pod IP)",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(missing, setting)| missing.then_some(setting))
+    .collect::<Vec<_>>();
+    let (Some(name), Some(incarnation), Some(advertise_ip)) = (
         args.pool_member_id,
         args.pool_member_uid,
         args.pool_advertise_ip,
-    ) {
-        (None, None, None) => None,
-        (Some(name), Some(uid), Some(advertise_ip)) => {
-            Some(openshell_supervisor::shared_host::PoolIdentity {
-                member_id: name,
-                member_uid: uid,
-                runtime_address: std::net::SocketAddr::new(advertise_ip, runtime_listen.port()),
-            })
-        }
-        _ => {
-            return Err(miette::miette!(
-                "a supervisor pool member needs --pool-member-id, --pool-member-uid, and --pool-advertise-ip"
-            ));
-        }
+    ) else {
+        return Err(miette::miette!(
+            "--mode=shared runs a supervisor pool member and needs {}",
+            missing.join(", ")
+        ));
+    };
+    let pool = openshell_supervisor::shared_host::PoolIdentity {
+        member_id: name,
+        member_uid: incarnation,
+        runtime_address: std::net::SocketAddr::new(advertise_ip, runtime_listen.port()),
     };
     // The supervisor token travels only over TLS; the host verifies the
     // gateway the way every sandbox instance does, with `OPENSHELL_TLS_CA`
@@ -130,7 +144,7 @@ fn run_platform(args: crate::Args) -> Result<()> {
         tracing::info!(
             runtime = %host.runtime_addr(),
             health = %address,
-            pool_member = host.pool().map(|pool| pool.member_id.as_str()),
+            pool_member = %host.pool().member_id,
             "Shared supervisor ready for sandbox instance assignments"
         );
         let (stop, stopped) = tokio::sync::watch::channel(false);
@@ -153,9 +167,8 @@ fn run_platform(args: crate::Args) -> Result<()> {
         stop.send_replace(true);
         let _ = probes.await;
         let _ = attachment.await;
-        // A lone shared supervisor's sandboxes lose supervision with this
-        // process and fail closed; a pool member relinquishes what it still
-        // hosts to the member the gateway grants it to.
+        // The member relinquishes what it still hosts to the members the
+        // gateway grants it to; the workloads keep running.
         host.shut_down().await;
         Ok(())
     })

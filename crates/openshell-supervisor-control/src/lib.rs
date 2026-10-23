@@ -38,10 +38,10 @@ pub mod proto {
 }
 
 pub use controller::{
-    AssignmentError, ConnectedMember, HOST_HEARTBEAT_INTERVAL, HostIdentity, InstanceOwner,
-    MAX_ASSIGNED_INSTANCES, MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberReport, MemberView,
-    ObservedInstance, POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_SECS, PoolView,
-    SupervisorCredential, SupervisorHostController,
+    AssignmentError, ConnectedMember, HostIdentity, InstanceOwner, MAX_ASSIGNED_INSTANCES,
+    MAX_POOL_INSTANCES, MAX_REPORTED_INSTANCES, MemberReport, MemberView, ObservedInstance,
+    POOL_HEARTBEAT_INTERVAL, POOL_RECOVERY_TIMEOUT_SECS, PoolView, SupervisorCredential,
+    SupervisorHostController,
 };
 pub use coordinator::{
     InstancePlacement, InstanceSupervision, LaunchError, PlacementFuture, PlacementRequest,

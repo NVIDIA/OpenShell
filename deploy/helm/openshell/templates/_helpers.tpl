@@ -435,10 +435,11 @@ default.
 {{- end }}
 
 {{/*
-The gateway's [openshell.gateway.supervisor_pool] table as YAML, or nothing.
-The chart owns it: the shared supervisor always runs as a high-availability
-pool that the gateway coordinates, at any replica count, so the table does not
-depend on supervisor.replicas and scaling never changes the gateway
+The gateway's [openshell.gateway.supervisor_pool] tuning table as YAML, or
+nothing. The shared supervisor always runs as a high-availability pool that
+the gateway coordinates; the chart owns the table only to set the recovery
+deadline (supervisor.recoveryTimeoutSeconds; none leaves the gateway default).
+It never depends on supervisor.replicas, so scaling never changes the gateway
 configuration. Renders nothing without the gateway topology. Validates the
 supervisor values whenever the topology is selected, and refuses a
 hand-written table in either TOML form.
@@ -451,11 +452,9 @@ hand-written table in either TOML form.
 {{- if include "openshell.supervisorEnabled" . -}}
 {{- $_ := include "openshell.supervisorReplicas" . -}}
 {{- $recoveryTimeout := include "openshell.supervisorRecoveryTimeoutSeconds" . -}}
-{{- $pool := dict "enabled" true -}}
 {{- if $recoveryTimeout -}}
-{{- $_ := set $pool "recovery_timeout_secs" (int64 $recoveryTimeout) -}}
+{{- toYaml (dict "recovery_timeout_secs" (int64 $recoveryTimeout)) -}}
 {{- end -}}
-{{- toYaml $pool -}}
 {{- end -}}
 {{- end }}
 

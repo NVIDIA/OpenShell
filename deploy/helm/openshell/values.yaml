@@ -70,9 +70,8 @@ supervisor:
     # -- Supervisor image digest. When set, this takes precedence over tag.
     digest: ""
   # -- Shared supervisor pool members, used only when gatewayConfig selects
-  # supervisor_topology = "gateway". The shared supervisor always runs as a
-  # high-availability pool, which the chart enables in the gateway's
-  # [openshell.gateway.supervisor_pool] table: when a member fails or leaves,
+  # supervisor_topology = "gateway". The gateway always coordinates the shared
+  # supervisor as a high-availability pool: when a member fails or leaves,
   # another member takes over its sandboxes without restarting their
   # workloads. 1 has no failover; use 2 or more to survive losing a member.
   # Only the supervisor Deployment's replica count depends on this value, so

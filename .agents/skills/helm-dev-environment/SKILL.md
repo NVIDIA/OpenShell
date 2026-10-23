@@ -101,7 +101,7 @@ OPENSHELL_E2E_KUBE_IMAGE_PULL_SECRET=e2e-regcred \
 
 The shared supervisor is always a pool of `supervisor.replicas` members
 (default 1). With the gateway topology the chart renders the gateway's
-`[openshell.gateway.supervisor_pool]` table (`enabled = true`, plus
+`[openshell.gateway.supervisor_pool]` tuning table (only
 `recovery_timeout_secs` from `supervisor.recoveryTimeoutSeconds`, default 60;
 the driver's `shared_supervisor` table stays unchanged), a
 RollingUpdate Deployment (`maxSurge: 1`, `maxUnavailable: 0`) with preferred

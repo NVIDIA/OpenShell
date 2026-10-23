@@ -4,39 +4,30 @@
 //! Gateway side of the private supervisor host protocol
 //! (`openshell.supervisor.host.v1`).
 //!
-//! The gateway owns the desired set of sandbox instances a shared supervisor
-//! runs. The [`SharedSupervision`](crate::SharedSupervision) coordinator
-//! publishes that set here on behalf of a compute driver; the gateway's gRPC
-//! server hands each host stream authenticated by a supervisor token to
-//! [`SupervisorHostController::attach`], which sends complete snapshots and
-//! records what the host reports. The gateway also mints that token and
-//! publishes each renewal here for the driver to deliver to the host.
+//! Shared supervisors always run as a pool (high availability) that the
+//! gateway coordinates. The [`SharedSupervision`](crate::SharedSupervision)
+//! coordinator publishes launches and withdrawals here on behalf of a compute
+//! driver; the gateway's gRPC server hands each member stream authenticated
+//! by a supervisor token to [`SupervisorHostController::attach`], which sends
+//! complete snapshots and records what the member reports. The gateway also
+//! mints that token and publishes each renewal here for the driver to deliver.
 //!
-//! Desired state is uninitialized until the complete set has been derived
-//! from durable records once. Nothing is sent before that, so a restarted
-//! gateway can never present an empty map as authoritative and stop running
-//! instances. An explicit empty snapshot, after initialization, does stop
-//! them. Full resyncs are compare-and-replace against the revision read
-//! before the records were listed, so a list that raced a lifecycle edit
-//! never resurrects a withdrawn instance or discards a new one.
+//! The pool's desired set, the durable owner of every instance (a member's
+//! process and an ownership term), and the latest reports of owners served by
+//! other gateway replicas come from the gateway's durable records through
+//! [`PoolView`], on every gateway replica alike; each member is sent only the
+//! instances its current process owns, with the credentials of their term. A
+//! member releases, without stopping, an instance a snapshot omits; only
+//! withdrawn instances are listed for stopping. Nothing is sent to members
+//! until the first view has been loaded, so a restarted gateway never
+//! releases running instances.
 //!
-//! Without a pool, exactly one host serves a gateway: a new attach from a
-//! newer connection of the same host process, or from a new host process,
-//! supersedes the current session; reports and acks from a superseded stream
-//! are dropped, and a delayed hello from an older connection of the current
-//! process is refused.
-//!
-//! With a supervisor pool (high availability) the same rules apply per pool
-//! member, and several members are served at once. The pool's desired set,
-//! the durable owner of every instance (a member's process and an ownership
-//! term), and the latest reports of owners served by other gateway replicas
-//! come from the gateway's durable records through [`PoolView`], on every
-//! gateway replica alike; each member is sent only the instances its current
-//! process owns, with the credentials of their term. A pool member releases,
-//! without stopping, an instance a snapshot omits; only withdrawn instances
-//! are listed for stopping. Nothing is sent to pool members until the first
-//! view has been loaded, so a restarted gateway never releases running
-//! instances.
+//! Every member names itself in its hello. A new attach from a newer
+//! connection of the same member process, or from a new process of the
+//! member, supersedes the member's current session; reports and acks from a
+//! superseded stream are dropped, and a delayed hello from an older
+//! connection of the current process is refused. Several members are served
+//! at once.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -53,30 +44,23 @@ use crate::proto::{
     SandboxInstanceStatus, SandboxInstanceTakeover, host_gateway_message, host_message,
 };
 
-/// Recovery deadline a supervisor pool offers each sandbox runtime.
+/// Recovery deadline a supervisor pool offers each sandbox runtime unless the
+/// gateway configures another.
 ///
 /// Membership expiry, one reconciliation pass, and a replacement instance's
-/// startup fit with room to spare. The gateway may configure another; without
-/// a pool the runtime keeps its own default.
+/// startup fit with room to spare.
 pub const POOL_RECOVERY_TIMEOUT_SECS: u32 = 60;
 
-/// Interval at which both ends send heartbeats on an idle stream.
-pub const HOST_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// Heartbeat interval of pool members, whose liveness drives failover.
 pub const POOL_HEARTBEAT_INTERVAL: Duration = crate::pool_timing::HEARTBEAT_INTERVAL;
-/// Silence after which the gateway closes a host stream.
-const HOST_SILENCE_TIMEOUT: Duration = Duration::from_mins(1);
 /// Silence after which the gateway closes a pool member's stream.
 const POOL_SILENCE_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 /// Bound on the host sending its hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on queueing one gateway-to-host message; a host that cannot drain
-/// its stream this long is disconnected rather than stalling the session.
-const SEND_TIMEOUT: Duration = Duration::from_secs(30);
-/// [`SEND_TIMEOUT`] for pool members, whose served stream keeps their
-/// membership record alive: a member that stops reading is dropped as soon as
-/// one that stops writing.
-const POOL_SEND_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
+/// Bound on queueing one gateway-to-host message. A member's served stream
+/// keeps its membership record alive, so a member that stops reading is
+/// dropped as soon as one that stops writing.
+const SEND_TIMEOUT: Duration = crate::pool_timing::GATEWAY_SILENCE_TIMEOUT;
 /// Gateway-to-host messages queued before the stream applies backpressure.
 const OUTBOUND_QUEUE: usize = 16;
 /// How long a withdrawn pool instance stays on its owner's stop list.
@@ -255,9 +239,7 @@ struct Desired {
     initialized: bool,
     revision: u64,
     assignments: BTreeMap<String, Assigned>,
-    /// Edits made before initialization, applied over the first full list.
-    pending: BTreeMap<String, Option<SandboxInstanceAssignment>>,
-    /// Pool only: withdrawn instances to stop, with the owner and the time of
+    /// Withdrawn instances to stop, with the owner and the time of
     /// withdrawal.
     stopping: BTreeMap<String, (InstanceOwner, tokio::time::Instant)>,
 }
@@ -319,7 +301,7 @@ struct HostSession {
     identity: HostIdentity,
     instance_id: String,
     connection_epoch: u64,
-    member: Option<PoolMember>,
+    member: PoolMember,
     superseded: watch::Sender<bool>,
     /// Highest snapshot revision sent on this stream; acks beyond it are
     /// impossible and rejected.
@@ -344,8 +326,8 @@ struct PendingTerms {
 }
 
 impl HostSession {
-    fn member_id(&self) -> Option<&str> {
-        self.member.as_ref().map(|member| member.member_id.as_str())
+    fn member_id(&self) -> &str {
+        &self.member.member_id
     }
 }
 
@@ -357,8 +339,9 @@ struct Observed {
 
 struct Inner {
     desired: Mutex<Desired>,
-    /// Present when the host is a supervisor pool.
-    pool: Mutex<Option<Pool>>,
+    /// The supervisor pool: its durable view and what this gateway placed,
+    /// launched, and withdrawn since.
+    pool: Mutex<Pool>,
     /// The gateway's durable placement of new pool instances.
     placement: Mutex<Option<Arc<dyn crate::coordinator::InstancePlacement>>>,
     /// Latest supervisor token the gateway minted; `None` until the first.
@@ -372,8 +355,8 @@ struct Inner {
     observed: Mutex<Observed>,
 }
 
-/// Gateway-owned desired assignments and observed status of a shared
-/// supervisor host or pool.
+/// Gateway-owned desired assignments and observed status of the shared
+/// supervisor pool.
 #[derive(Clone)]
 pub struct SupervisorHostController {
     inner: Arc<Inner>,
@@ -396,12 +379,8 @@ impl std::fmt::Debug for SupervisorHostController {
 /// Why a change to the desired set was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum AssignmentError {
-    /// A full resync was derived from a desired set that has since changed:
-    /// `baseline` is the revision the caller read before deriving its list and
-    /// `current` the one now in force; derive the list again from it.
-    #[error("desired assignments changed from revision {baseline} to {current} during the resync")]
-    Conflict { baseline: u64, current: u64 },
-    /// The change would assign more instances than one host runs.
+    /// The change would assign more instances than the pool runs, or no
+    /// member has room.
     #[error("the shared supervisor has no capacity for another sandbox instance")]
     Capacity,
 }
@@ -418,7 +397,7 @@ impl SupervisorHostController {
         Self {
             inner: Arc::new(Inner {
                 desired: Mutex::new(Desired::default()),
-                pool: Mutex::new(None),
+                pool: Mutex::new(Pool::new(POOL_RECOVERY_TIMEOUT_SECS)),
                 placement: Mutex::new(None),
                 credential: watch::Sender::new(None),
                 revision: watch::Sender::new(0),
@@ -428,20 +407,10 @@ impl SupervisorHostController {
         }
     }
 
-    /// Serve a supervisor pool instead of a single host, offering every
-    /// instance's runtime `recovery_timeout_secs`. Must be called before any
-    /// host attaches.
-    pub fn enable_pool(&self, recovery_timeout_secs: u32) {
-        let mut pool = lock(&self.inner.pool);
-        if pool.is_none() {
-            *pool = Some(Pool::new(recovery_timeout_secs));
-        }
-    }
-
-    /// Whether this controller serves a supervisor pool.
-    #[must_use]
-    pub fn is_pool(&self) -> bool {
-        lock(&self.inner.pool).is_some()
+    /// Offer every instance's runtime `recovery_timeout_secs` instead of
+    /// [`POOL_RECOVERY_TIMEOUT_SECS`]. Call it before any host attaches.
+    pub fn set_recovery_timeout_secs(&self, recovery_timeout_secs: u32) {
+        lock(&self.inner.pool).recovery_timeout_secs = recovery_timeout_secs;
     }
 
     /// Install the gateway's durable placement of new pool instances.
@@ -473,9 +442,8 @@ impl SupervisorHostController {
         lock(&self.inner.desired).initialized
     }
 
-    /// Current desired revision: 0 while uninitialized. Read it before
-    /// deriving a full list for [`Self::replace_assignments`]; the
-    /// coordinator does so through
+    /// Current desired revision: 0 while uninitialized. The coordinator reads
+    /// it through
     /// [`SharedSupervision::begin_recovery`](crate::SharedSupervision::begin_recovery).
     #[must_use]
     pub fn revision(&self) -> u64 {
@@ -501,154 +469,29 @@ impl SupervisorHostController {
             .collect()
     }
 
-    /// Most instances the desired set may hold: one host's, or a pool's.
-    fn capacity(&self) -> usize {
-        if self.is_pool() {
-            MAX_POOL_INSTANCES
-        } else {
-            MAX_ASSIGNED_INSTANCES
-        }
-    }
-
     fn bump(&self, desired: &mut Desired) -> u64 {
         desired.revision += 1;
         self.inner.revision.send_replace(desired.revision);
         desired.revision
     }
 
-    /// Record withdrawn pool instances for their owner to stop.
-    fn record_stops(&self, desired: &mut Desired, routes: impl IntoIterator<Item = String>) {
-        let pool = lock(&self.inner.pool);
-        let Some(pool) = pool.as_ref() else {
-            return;
-        };
-        let now = tokio::time::Instant::now();
-        for route in routes {
-            if let Some(owner) = pool.view.owners.get(&route) {
-                desired.stopping.insert(route, (owner.clone(), now));
-            }
-        }
-    }
-
-    /// Replace the whole desired set with `assignments`, derived from
-    /// durable records while the revision was `baseline`.
-    ///
-    /// Initializes the controller; edits made before initialization are
-    /// applied on top of the list. After initialization the replacement is
-    /// compare-and-replace: when the revision moved past `baseline` while
-    /// the list was being derived, nothing changes and the conflict is
-    /// returned so the caller derives the list again.
-    pub fn replace_assignments(
-        &self,
-        baseline: u64,
-        assignments: impl IntoIterator<Item = SandboxInstanceAssignment>,
-    ) -> Result<u64, AssignmentError> {
-        let mut desired = lock(&self.inner.desired);
-        if desired.initialized && desired.revision != baseline {
-            return Err(AssignmentError::Conflict {
-                baseline,
-                current: desired.revision,
-            });
-        }
-        // Resolve the list and the pending overlay first, so a refused
-        // replacement leaves the current set untouched.
-        let mut resolved = BTreeMap::new();
-        for assignment in assignments {
-            resolved.insert(assignment.route.clone(), assignment);
-        }
-        let mut withdrawn = Vec::new();
-        for (route, edit) in &desired.pending {
-            if let Some(assignment) = edit {
-                resolved.insert(route.clone(), assignment.clone());
-            } else {
-                resolved.remove(route);
-                withdrawn.push(route.clone());
-            }
-        }
-        if resolved.len() > self.capacity() {
-            return Err(AssignmentError::Capacity);
-        }
-        desired.pending.clear();
-        // A route the list assigns is not being stopped, whatever an earlier
-        // withdrawal recorded.
-        desired
-            .stopping
-            .retain(|route, _| !resolved.contains_key(route));
-        let next = desired.revision + 1;
-        let mut changed = !desired.initialized;
-        for assignment in resolved.values() {
-            changed |= desired.put(assignment.clone(), next);
-        }
-        withdrawn.extend(
-            desired
-                .assignments
-                .keys()
-                .filter(|route| !resolved.contains_key(*route))
-                .cloned(),
-        );
-        let before = desired.assignments.len();
-        desired
-            .assignments
-            .retain(|route, _| resolved.contains_key(route));
-        changed |= desired.assignments.len() != before;
-        desired.initialized = true;
-        self.record_stops(&mut desired, withdrawn);
-        if changed {
-            desired.revision = next;
-            self.inner.revision.send_replace(next);
-        }
-        Ok(desired.revision)
-    }
-
-    /// Assign one instance. Before initialization the edit is kept until the
-    /// first full list arrives. Refused when it would exceed the host's
-    /// capacity, so the caller fails its create before anything runs. In a
-    /// pool the instance is served at once and kept over views listed before
-    /// it; its durable record makes it desired on every gateway replica.
+    /// Assign one instance, served at once and kept over views listed
+    /// before it; its durable record makes it desired on every gateway
+    /// replica. Refused beyond the pool's capacity, so the caller fails its
+    /// create before anything runs.
     pub fn assign(&self, assignment: SandboxInstanceAssignment) -> Result<(), AssignmentError> {
         let mut desired = lock(&self.inner.desired);
-        {
-            let mut pool_guard = lock(&self.inner.pool);
-            if let Some(pool) = pool_guard.as_mut() {
-                if !desired.assignments.contains_key(&assignment.route)
-                    && desired.assignments.len() >= MAX_POOL_INSTANCES
-                {
-                    return Err(AssignmentError::Capacity);
-                }
-                pool.launched
-                    .insert(assignment.route.clone(), tokio::time::Instant::now());
-                pool.withdrawals.remove(&assignment.route);
-                pool.view.desired.insert(assignment.route.clone());
-                drop(pool_guard);
-                let next = desired.revision + 1;
-                desired.stopping.remove(&assignment.route);
-                if desired.put(assignment, next) {
-                    desired.revision = next;
-                    self.inner.revision.send_replace(next);
-                }
-                return Ok(());
-            }
-        }
-        if !desired.initialized {
-            let pending_additions = desired
-                .pending
-                .values()
-                .filter(|edit| edit.is_some())
-                .count();
-            if !desired.pending.contains_key(&assignment.route)
-                && pending_additions >= self.capacity()
-            {
-                return Err(AssignmentError::Capacity);
-            }
-            desired
-                .pending
-                .insert(assignment.route.clone(), Some(assignment));
-            return Ok(());
-        }
         if !desired.assignments.contains_key(&assignment.route)
-            && desired.assignments.len() >= self.capacity()
+            && desired.assignments.len() >= MAX_POOL_INSTANCES
         {
             return Err(AssignmentError::Capacity);
+        }
+        {
+            let mut pool = lock(&self.inner.pool);
+            pool.launched
+                .insert(assignment.route.clone(), tokio::time::Instant::now());
+            pool.withdrawals.remove(&assignment.route);
+            pool.view.desired.insert(assignment.route.clone());
         }
         let next = desired.revision + 1;
         desired.stopping.remove(&assignment.route);
@@ -659,38 +502,26 @@ impl SupervisorHostController {
         Ok(())
     }
 
-    /// Withdraw one instance so the host stops it. In a pool the withdrawal
-    /// is also listed for the gateway to remove the instance's durable
-    /// record (see [`Self::pool_withdrawals`]).
+    /// Withdraw one instance so its owner stops it. The withdrawal is also
+    /// listed for the gateway to remove the instance's durable record (see
+    /// [`Self::pool_withdrawals`]).
     pub fn unassign(&self, route: &str) {
         let mut desired = lock(&self.inner.desired);
-        {
-            let mut pool_guard = lock(&self.inner.pool);
-            if let Some(pool) = pool_guard.as_mut() {
-                pool.launched.remove(route);
-                pool.withdrawals.insert(route.to_string());
-                pool.view.desired.remove(route);
-                let owner = pool.view.owners.get(route).cloned();
-                drop(pool_guard);
-                let removed = desired.assignments.remove(route).is_some();
-                if let Some(owner) = &owner {
-                    desired.stopping.insert(
-                        route.to_string(),
-                        (owner.clone(), tokio::time::Instant::now()),
-                    );
-                }
-                if removed || owner.is_some() {
-                    self.bump(&mut desired);
-                }
-                return;
-            }
+        let owner = {
+            let mut pool = lock(&self.inner.pool);
+            pool.launched.remove(route);
+            pool.withdrawals.insert(route.to_string());
+            pool.view.desired.remove(route);
+            pool.view.owners.get(route).cloned()
+        };
+        let removed = desired.assignments.remove(route).is_some();
+        if let Some(owner) = &owner {
+            desired.stopping.insert(
+                route.to_string(),
+                (owner.clone(), tokio::time::Instant::now()),
+            );
         }
-        if !desired.initialized {
-            desired.pending.insert(route.to_string(), None);
-            return;
-        }
-        if desired.assignments.remove(route).is_some() {
-            self.record_stops(&mut desired, [route.to_string()]);
+        if removed || owner.is_some() {
             self.bump(&mut desired);
         }
     }
@@ -707,9 +538,7 @@ impl SupervisorHostController {
     pub fn update_pool(&self, mut view: PoolView, listed_at: tokio::time::Instant) {
         let mut desired = lock(&self.inner.desired);
         let mut pool_guard = lock(&self.inner.pool);
-        let Some(pool) = pool_guard.as_mut() else {
-            return;
-        };
+        let pool = &mut *pool_guard;
         pool.placed
             .retain(|_, (_, placed_at)| *placed_at >= listed_at);
         for (route, (owner, _)) in &pool.placed {
@@ -798,26 +627,18 @@ impl SupervisorHostController {
     /// remove; see [`Self::forget_withdrawal`].
     #[must_use]
     pub fn pool_withdrawals(&self) -> Vec<String> {
-        lock(&self.inner.pool)
-            .as_ref()
-            .map(|pool| pool.withdrawals.iter().cloned().collect())
-            .unwrap_or_default()
+        lock(&self.inner.pool).withdrawals.iter().cloned().collect()
     }
 
     /// The durable record of a route withdrawn here is gone.
     pub fn forget_withdrawal(&self, route: &str) {
-        if let Some(pool) = lock(&self.inner.pool).as_mut() {
-            pool.withdrawals.remove(route);
-        }
+        lock(&self.inner.pool).withdrawals.remove(route);
     }
 
-    /// Recovery deadline a pool offers each instance's runtime; `None`
-    /// without a pool.
+    /// Recovery deadline the pool offers each instance's runtime.
     #[must_use]
-    pub fn pool_recovery_timeout_secs(&self) -> Option<u32> {
-        lock(&self.inner.pool)
-            .as_ref()
-            .map(|pool| pool.recovery_timeout_secs)
+    pub fn pool_recovery_timeout_secs(&self) -> u32 {
+        lock(&self.inner.pool).recovery_timeout_secs
     }
 
     /// What the pool members served here last reported of their instances.
@@ -825,13 +646,11 @@ impl SupervisorHostController {
     /// show, and drops reports of routes the reporting process does not own.
     #[must_use]
     pub fn member_reports(&self) -> Vec<MemberReport> {
-        if !self.is_pool() {
-            return Vec::new();
-        }
         let observed = lock(&self.inner.observed);
         let mut reports = Vec::new();
         for session in observed.sessions.values() {
-            let (Some(member_id), Some(status)) = (session.member_id(), &session.status) else {
+            let member_id = session.member_id();
+            let Some(status) = &session.status else {
                 continue;
             };
             // A report counts only for a term the stream acknowledged; a
@@ -868,9 +687,7 @@ impl SupervisorHostController {
     pub fn place_owner(&self, route: &str, owner: InstanceOwner) {
         let mut desired = lock(&self.inner.desired);
         let mut pool_guard = lock(&self.inner.pool);
-        let Some(pool) = pool_guard.as_mut() else {
-            return;
-        };
+        let pool = &mut *pool_guard;
         pool.placed.insert(
             route.to_string(),
             (owner.clone(), tokio::time::Instant::now()),
@@ -890,10 +707,8 @@ impl SupervisorHostController {
     /// The durable pool view this gateway serves, once loaded.
     #[must_use]
     pub fn pool_view(&self) -> Option<PoolView> {
-        lock(&self.inner.pool)
-            .as_ref()
-            .filter(|pool| pool.loaded)
-            .map(|pool| pool.view.clone())
+        let pool = lock(&self.inner.pool);
+        pool.loaded.then(|| pool.view.clone())
     }
 
     /// Pool members whose streams this gateway serves, for its durable
@@ -903,16 +718,13 @@ impl SupervisorHostController {
         lock(&self.inner.observed)
             .sessions
             .values()
-            .filter_map(|session| {
-                let member = session.member.as_ref()?;
-                Some(ConnectedMember {
-                    member_id: member.member_id.clone(),
-                    member_uid: member.member_uid.clone(),
-                    process_id: session.instance_id.clone(),
-                    runtime_address: member.runtime_address.clone(),
-                    leaving: session.status.as_ref().is_some_and(|status| status.leaving),
-                    connected_at_ms: session.connected_at_ms,
-                })
+            .map(|session| ConnectedMember {
+                member_id: session.member.member_id.clone(),
+                member_uid: session.member.member_uid.clone(),
+                process_id: session.instance_id.clone(),
+                runtime_address: session.member.runtime_address.clone(),
+                leaving: session.status.as_ref().is_some_and(|status| status.leaving),
+                connected_at_ms: session.connected_at_ms,
             })
             .collect()
     }
@@ -936,52 +748,34 @@ impl SupervisorHostController {
         !lock(&self.inner.observed).sessions.is_empty()
     }
 
-    /// What the connected host reports for `route`. For a pool, only the
-    /// session of the route's owning process renders a verdict.
+    /// What the pool reports for `route`: the session of the route's owning
+    /// process, or the owner's recorded report when it streams elsewhere.
     #[must_use]
     pub fn observed(&self, route: &str) -> ObservedInstance {
         let desired = lock(&self.inner.desired);
         let pool = lock(&self.inner.pool);
         let observed = lock(&self.inner.observed);
-        let (session, assigned_revision) = match pool.as_ref() {
-            None => {
-                let Some(session) = observed.sessions.values().next() else {
-                    return ObservedInstance::NoHost;
-                };
-                (
-                    session,
-                    desired
-                        .assignments
-                        .get(route)
-                        .map(|assigned| assigned.revision),
-                )
-            }
-            Some(pool) => {
-                let Some(owner) = pool.view.owners.get(route) else {
-                    return ObservedInstance::NoHost;
-                };
-                let Some(session) = observed.sessions.values().find(|session| {
-                    session.member_id() == Some(owner.member_id.as_str())
-                        && session.instance_id == owner.process_id
-                }) else {
-                    // The owner streams to another gateway replica, which
-                    // records its reports for every replica.
-                    return pool
-                        .view
-                        .reports
-                        .get(route)
-                        .map_or(ObservedInstance::NoHost, |status| {
-                            ObservedInstance::Reported(status.clone())
-                        });
-                };
-                let assigned = desired
-                    .assignments
-                    .get(route)
-                    .map(|assigned| assigned.revision);
-                let since = pool.owned_since.get(route).copied();
-                (session, assigned.max(since))
-            }
+        let Some(owner) = pool.view.owners.get(route) else {
+            return ObservedInstance::NoHost;
         };
+        let Some(session) = observed.sessions.values().find(|session| {
+            session.member_id() == owner.member_id && session.instance_id == owner.process_id
+        }) else {
+            // The owner streams to another gateway replica, which records its
+            // reports for every replica.
+            return pool
+                .view
+                .reports
+                .get(route)
+                .map_or(ObservedInstance::NoHost, |status| {
+                    ObservedInstance::Reported(status.clone())
+                });
+        };
+        let assigned = desired
+            .assignments
+            .get(route)
+            .map(|assigned| assigned.revision);
+        let assigned_revision = assigned.max(pool.owned_since.get(route).copied());
         let Some(status) = &session.status else {
             return ObservedInstance::Pending;
         };
@@ -1031,30 +825,11 @@ impl SupervisorHostController {
                 "supervisor host hello names no instance",
             ));
         }
-        let pool = self.is_pool();
-        match (&hello.member, pool) {
-            (None, true) => {
-                return Err(Status::failed_precondition(
-                    "this gateway serves a supervisor pool; the host must name its pool member",
-                ));
-            }
-            (Some(_), false) => {
-                return Err(Status::failed_precondition(
-                    "this gateway serves a single shared supervisor, not a pool",
-                ));
-            }
-            (Some(member), true) if !valid_member(member) => {
-                return Err(Status::invalid_argument(
-                    "supervisor pool member identity is incomplete",
-                ));
-            }
-            _ => {}
-        }
-        let heartbeat = if pool {
-            POOL_HEARTBEAT_INTERVAL
-        } else {
-            HOST_HEARTBEAT_INTERVAL
+        let Some(member) = &hello.member else {
+            return Err(Status::failed_precondition(MISSING_MEMBER));
         };
+        validate_member(member).map_err(Status::invalid_argument)?;
+        let heartbeat = POOL_HEARTBEAT_INTERVAL;
         let (tx, rx) = mpsc::channel(OUTBOUND_QUEUE);
         let expires_at = identity.expires_at;
         let (session_id, superseded) = self.begin_session(identity, &hello)?;
@@ -1079,21 +854,25 @@ impl SupervisorHostController {
         Ok(ReceiverStream::new(rx))
     }
 
-    /// Start a session for `hello`, superseding the session it replaces: the
-    /// only session without a pool, or the same member's session in a pool.
-    /// A hello from the current host process with a connection epoch that is
-    /// not newer is a delayed or replayed connection and is refused.
+    /// Start a session for `hello`, superseding the same member's session. A
+    /// hello that names no member is refused. A hello from the current host
+    /// process with a connection epoch that is not newer is a delayed or
+    /// replayed connection and is refused.
     fn begin_session(
         &self,
         identity: HostIdentity,
         hello: &HostHello,
     ) -> Result<(u64, watch::Receiver<bool>), Status> {
+        let member = hello
+            .member
+            .clone()
+            .ok_or_else(|| Status::failed_precondition(MISSING_MEMBER))?;
         let mut observed = lock(&self.inner.observed);
-        let member_id = hello.member.as_ref().map(|member| member.member_id.clone());
+        let member_id = member.member_id.clone();
         let replaced = observed
             .sessions
             .values()
-            .filter(|session| member_id.is_none() || session.member_id() == member_id.as_deref())
+            .filter(|session| session.member_id() == member_id)
             .map(|session| session.id)
             .collect::<Vec<_>>();
         if let Some(current) = replaced
@@ -1113,7 +892,7 @@ impl SupervisorHostController {
                 tracing::info!(
                     subject = %previous.identity.subject,
                     instance_id = %previous.instance_id,
-                    member = previous.member_id().unwrap_or_default(),
+                    member = previous.member_id(),
                     connection_epoch = previous.connection_epoch,
                     "superseding supervisor host session"
                 );
@@ -1123,7 +902,7 @@ impl SupervisorHostController {
         tracing::info!(
             subject = %identity.subject,
             instance_id = %hello.instance_id,
-            member = member_id.as_deref().unwrap_or_default(),
+            member = %member_id,
             connection_epoch = hello.connection_epoch,
             session = id,
             "supervisor host attached"
@@ -1136,7 +915,7 @@ impl SupervisorHostController {
                 identity,
                 instance_id: hello.instance_id.clone(),
                 connection_epoch: hello.connection_epoch,
-                member: hello.member.clone(),
+                member,
                 superseded,
                 sent_revision: 0,
                 status: None,
@@ -1146,9 +925,7 @@ impl SupervisorHostController {
             },
         );
         drop(observed);
-        if member_id.is_some() {
-            self.membership_changed();
-        }
+        self.membership_changed();
         Ok((id, watch))
     }
 
@@ -1161,13 +938,11 @@ impl SupervisorHostController {
         tracing::info!(
             subject = %session.identity.subject,
             instance_id = %session.instance_id,
-            member = session.member_id().unwrap_or_default(),
+            member = session.member_id(),
             session = id,
             "supervisor host detached; hosted instances keep running"
         );
-        if session.member.is_some() {
-            self.membership_changed();
-        }
+        self.membership_changed();
     }
 
     /// Note that `revision` was sent on session `id`. A route keeps the
@@ -1243,32 +1018,21 @@ impl SupervisorHostController {
         Ok(())
     }
 
-    /// The snapshot for session `id`: every desired instance for a single
-    /// host; for a pool member, the instances its process owns, the stop
-    /// list, and the route directory. `None` until it can be authoritative.
+    /// The snapshot for session `id`'s member: the instances its process
+    /// owns, the stop list, and the route directory. `None` until it can be
+    /// authoritative.
     fn snapshot(&self, id: u64) -> Option<AssignmentSnapshot> {
         let mut desired = lock(&self.inner.desired);
         if !desired.initialized {
             return None;
         }
         let pool = lock(&self.inner.pool);
-        let Some(pool) = pool.as_ref() else {
-            return Some(AssignmentSnapshot {
-                revision: desired.revision,
-                instances: desired
-                    .assignments
-                    .values()
-                    .map(|assigned| assigned.assignment.clone())
-                    .collect(),
-                ..AssignmentSnapshot::default()
-            });
-        };
         if !pool.loaded {
             return None;
         }
         let mut observed = lock(&self.inner.observed);
         let session = observed.sessions.get_mut(&id)?;
-        let member_id = session.member_id()?.to_string();
+        let member_id = session.member_id().to_string();
         let instance_id = session.instance_id.clone();
         let owned_by_session =
             |owner: &InstanceOwner| owner.member_id == member_id && owner.process_id == instance_id;
@@ -1375,15 +1139,8 @@ impl SupervisorHostController {
         // reconnects with the renewed token it has been delivered.
         let credential_expiry = tokio::time::sleep(credential_remaining(expires_at));
         tokio::pin!(credential_expiry);
-        let (heartbeat_interval, silence_timeout, send_timeout) = if self.is_pool() {
-            (
-                POOL_HEARTBEAT_INTERVAL,
-                POOL_SILENCE_TIMEOUT,
-                POOL_SEND_TIMEOUT,
-            )
-        } else {
-            (HOST_HEARTBEAT_INTERVAL, HOST_SILENCE_TIMEOUT, SEND_TIMEOUT)
-        };
+        let (heartbeat_interval, silence_timeout, send_timeout) =
+            (POOL_HEARTBEAT_INTERVAL, POOL_SILENCE_TIMEOUT, SEND_TIMEOUT);
         let mut revision = self.inner.revision.subscribe();
         let mut last_snapshot: Option<AssignmentSnapshot> = None;
         let mut sent_revision = 0;
@@ -1410,11 +1167,10 @@ impl SupervisorHostController {
             if current > sent_revision
                 && let Some(snapshot) = self.snapshot(session_id)
             {
-                // Pool members are only sent snapshots that change something
-                // they act on.
+                // Members are only sent snapshots that change something they
+                // act on.
                 let unchanged = last_snapshot.as_ref().is_some_and(|previous| {
-                    previous.pool
-                        && previous.instances == snapshot.instances
+                    previous.instances == snapshot.instances
                         && previous.stop_routes == snapshot.stop_routes
                         && previous.route_directory == snapshot.route_directory
                         && previous.keep_routes == snapshot.keep_routes
@@ -1487,16 +1243,40 @@ impl SupervisorHostController {
     }
 }
 
-fn valid_member(member: &PoolMember) -> bool {
+/// Why a hello without a pool member is refused.
+const MISSING_MEMBER: &str = "the shared supervisor did not name its pool member; set \
+OPENSHELL_SUPERVISOR_POOL_MEMBER_ID, OPENSHELL_SUPERVISOR_POOL_MEMBER_UID, and \
+OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP (the OpenShell Helm chart sets them from the Pod name, \
+UID, and IP)";
+
+/// Check a pool member's identity, naming the setting that is wrong.
+fn validate_member(member: &PoolMember) -> Result<(), &'static str> {
     let valid = |value: &str| {
         !value.is_empty() && value.len() <= 253 && !value.chars().any(char::is_whitespace)
     };
-    valid(&member.member_id)
-        && valid(&member.member_uid)
-        && member
-            .runtime_address
-            .parse::<std::net::SocketAddr>()
-            .is_ok()
+    if !valid(&member.member_id) {
+        return Err(
+            "the shared supervisor's pool member id is empty or invalid; set \
+OPENSHELL_SUPERVISOR_POOL_MEMBER_ID to its Pod name",
+        );
+    }
+    if !valid(&member.member_uid) {
+        return Err(
+            "the shared supervisor's pool member UID is empty or invalid; set \
+OPENSHELL_SUPERVISOR_POOL_MEMBER_UID to its Pod UID",
+        );
+    }
+    if member
+        .runtime_address
+        .parse::<std::net::SocketAddr>()
+        .is_err()
+    {
+        return Err(
+            "the shared supervisor's pool member runtime address is invalid; set \
+OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP to its Pod IP",
+        );
+    }
+    Ok(())
 }
 
 fn unix_millis() -> i64 {
@@ -1550,107 +1330,35 @@ mod tests {
     }
 
     #[test]
-    fn full_resyncs_initialize_once_and_then_compare_and_replace() {
+    fn assignments_are_refused_beyond_the_pools_capacity() {
         let controller = SupervisorHostController::new();
-        let revision = controller.inner.revision.subscribe();
-        // Edits before the first full list wait for it.
-        controller
-            .assign(assignment("rt-created-before-list", b"a"))
-            .unwrap();
-        controller.unassign("rt-stopped-before-list");
-        assert!(!controller.is_initialized());
-        assert!(controller.snapshot(0).is_none());
-        assert!(!revision.has_changed().unwrap());
-
-        let baseline = controller.revision();
-        assert_eq!(
-            controller.replace_assignments(
-                baseline,
-                [
-                    assignment("rt-stopped-before-list", b"old"),
-                    assignment("rt-listed", b"b"),
-                ],
-            ),
-            Ok(1)
-        );
-        let snapshot = controller.snapshot(0).unwrap();
-        assert_eq!(snapshot.revision, 1);
-        assert_eq!(
-            snapshot
-                .instances
-                .iter()
-                .map(|instance| instance.route.as_str())
-                .collect::<Vec<_>>(),
-            ["rt-created-before-list", "rt-listed"]
-        );
-        assert!(revision.has_changed().unwrap());
-
-        // An identical list changes nothing.
-        assert_eq!(
-            controller.replace_assignments(
-                1,
-                [
-                    assignment("rt-created-before-list", b"a"),
-                    assignment("rt-listed", b"b"),
-                ],
-            ),
-            Ok(1)
-        );
-        controller.assign(assignment("rt-listed", b"b")).unwrap();
-        assert_eq!(controller.revision(), 1);
-
-        // A list derived at revision 1 that races a stop cannot resurrect the
-        // stopped instance; the caller derives it again.
-        controller.unassign("rt-listed");
-        assert_eq!(controller.revision(), 2);
-        assert_eq!(
-            controller.replace_assignments(
-                1,
-                [
-                    assignment("rt-created-before-list", b"a"),
-                    assignment("rt-listed", b"b"),
-                ],
-            ),
-            Err(AssignmentError::Conflict {
-                baseline: 1,
-                current: 2
-            })
-        );
-        assert!(controller.assignment("rt-listed").is_none());
-        assert_eq!(controller.replace_assignments(2, []), Ok(3));
-        assert!(controller.snapshot(0).unwrap().instances.is_empty());
-
-        // The gateway refuses the assignment its host could not accept.
-        let full =
-            (0..MAX_ASSIGNED_INSTANCES).map(|index| assignment(&format!("rt-{index}"), b"x"));
-        assert_eq!(controller.replace_assignments(3, full), Ok(4));
+        for index in 0..MAX_POOL_INSTANCES {
+            controller
+                .assign(assignment(&format!("rt-{index}"), b"x"))
+                .unwrap();
+        }
         assert_eq!(
             controller.assign(assignment("rt-one-too-many", b"x")),
             Err(AssignmentError::Capacity)
         );
+        // Assigning a route again is not a new instance.
         assert_eq!(controller.assign(assignment("rt-0", b"x")), Ok(()));
     }
 
     #[test]
     fn sessions_fence_stale_streams_epochs_and_acks() {
         let controller = SupervisorHostController::new();
-        controller
-            .replace_assignments(0, [assignment("rt-a", b"a")])
-            .unwrap();
+        controller.update_pool(
+            loaded_view(
+                vec![member_view("m1", "boot-1")],
+                [("rt-a", owner("m1", "boot-1", 1))],
+            ),
+            tokio::time::Instant::now(),
+        );
         assert_eq!(controller.observed("rt-a"), ObservedInstance::NoHost);
 
-        let identity = HostIdentity {
-            subject: "openshell-supervisor:test".to_string(),
-            token_id: "token".to_string(),
-            expires_at: i64::MAX,
-        };
-        let hello = |instance_id: &str, connection_epoch| HostHello {
-            instance_id: instance_id.to_string(),
-            connection_epoch,
-            member: None,
-        };
         let (first, superseded) = controller
-            .begin_session(identity.clone(), &hello("boot-1", 1))
+            .begin_session(identity(), &member_hello("m1", "boot-1", 1))
             .unwrap();
         assert_eq!(controller.observed("rt-a"), ObservedInstance::Pending);
 
@@ -1658,20 +1366,25 @@ mod tests {
         // refused; a newer one supersedes the stream.
         assert!(
             controller
-                .begin_session(identity.clone(), &hello("boot-1", 1))
+                .begin_session(identity(), &member_hello("m1", "boot-1", 1))
                 .is_err()
         );
         let (current, _) = controller
-            .begin_session(identity.clone(), &hello("boot-1", 2))
+            .begin_session(identity(), &member_hello("m1", "boot-1", 2))
             .unwrap();
         assert!(*superseded.borrow());
         assert!(controller.record_status(first, status(0, &[])).is_err());
 
         // Acks are bounded by what this stream was sent and never regress.
-        assert!(controller.record_status(current, status(1, &[])).is_err());
-        controller.record_sent(current, 1);
+        let revision = controller.revision();
+        assert!(
+            controller
+                .record_status(current, status(revision, &[]))
+                .is_err()
+        );
+        controller.record_sent(current, revision);
         controller
-            .record_status(current, status(1, &["rt-a"]))
+            .record_status(current, status(revision, &["rt-a"]))
             .unwrap();
         assert!(controller.record_status(current, status(0, &[])).is_err());
         assert!(matches!(
@@ -1679,17 +1392,23 @@ mod tests {
             ObservedInstance::Reported(status) if status.ready
         ));
 
-        // A newer assignment is pending until the host reconciles past it.
+        // A newer instance of the process is pending until its member
+        // reconciles past it; a route without an owner has no verdict.
         controller.assign(assignment("rt-b", b"b")).unwrap();
+        controller.place_owner("rt-b", owner("m1", "boot-1", 1));
         assert_eq!(controller.observed("rt-b"), ObservedInstance::Pending);
-        assert_eq!(controller.observed("rt-unknown"), ObservedInstance::Absent);
-        controller.record_sent(current, 2);
-        controller.record_status(current, status(2, &[])).unwrap();
+        assert_eq!(controller.observed("rt-unknown"), ObservedInstance::NoHost);
+        let next = controller.revision();
+        controller.record_sent(current, next);
+        controller
+            .record_status(current, status(next, &[]))
+            .unwrap();
         assert_eq!(controller.observed("rt-b"), ObservedInstance::Absent);
 
-        // A new host process always takes over; ending a stale session is a no-op.
+        // A new process of the member always takes over; ending a stale
+        // session is a no-op.
         let (replacement, _) = controller
-            .begin_session(identity, &hello("boot-2", 1))
+            .begin_session(identity(), &member_hello("m1", "boot-2", 1))
             .unwrap();
         controller.end_session(current);
         assert!(controller.host_connected());
@@ -1773,7 +1492,6 @@ mod tests {
     #[test]
     fn membership_changes_follow_member_streams_and_leaving() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool(75);
         let mut changes = controller.membership_changes();
         changes.mark_unchanged();
         let (first, _) = controller
@@ -1807,7 +1525,7 @@ mod tests {
     #[tokio::test]
     async fn pool_members_receive_only_what_their_process_owns() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool(75);
+        controller.set_recovery_timeout_secs(75);
         let (one, _) = controller
             .begin_session(identity(), &member_hello("m1", "p1", 1))
             .unwrap();
@@ -1929,7 +1647,6 @@ mod tests {
     #[test]
     fn reports_count_only_for_the_term_their_stream_acknowledged() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
         let (one, _) = controller
             .begin_session(identity(), &member_hello("m1", "p1", 1))
             .unwrap();
@@ -1980,7 +1697,6 @@ mod tests {
     #[test]
     fn pool_observations_follow_the_owning_process_through_a_takeover() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
         let (two, _) = controller
             .begin_session(identity(), &member_hello("m-2", "p2", 1))
             .unwrap();
@@ -2077,7 +1793,6 @@ mod tests {
     #[tokio::test]
     async fn pool_views_keep_fresh_placements_and_owned_instances() {
         let controller = SupervisorHostController::new();
-        controller.enable_pool(POOL_RECOVERY_TIMEOUT_SECS);
         let (one, _) = controller
             .begin_session(identity(), &member_hello("m1", "p1", 1))
             .unwrap();
@@ -2168,24 +1883,54 @@ mod tests {
     }
 
     #[test]
-    fn pool_member_identities_must_be_complete() {
+    fn pool_member_identities_name_the_setting_to_fix() {
         let member = member_hello("m1", "p1", 1).member.unwrap();
-        assert!(valid_member(&member));
-        for broken in [
-            PoolMember {
-                member_id: String::new(),
-                ..member.clone()
-            },
-            PoolMember {
-                member_uid: "uid with space".to_string(),
-                ..member.clone()
-            },
-            PoolMember {
-                runtime_address: "not-an-address".to_string(),
-                ..member
-            },
+        assert_eq!(validate_member(&member), Ok(()));
+        for (broken, setting) in [
+            (
+                PoolMember {
+                    member_id: String::new(),
+                    ..member.clone()
+                },
+                "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID",
+            ),
+            (
+                PoolMember {
+                    member_uid: "uid with space".to_string(),
+                    ..member.clone()
+                },
+                "OPENSHELL_SUPERVISOR_POOL_MEMBER_UID",
+            ),
+            (
+                PoolMember {
+                    runtime_address: "not-an-address".to_string(),
+                    ..member
+                },
+                "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP",
+            ),
         ] {
-            assert!(!valid_member(&broken));
+            let error = validate_member(&broken).unwrap_err();
+            assert!(error.contains(setting), "{error}");
         }
+        // A host that names no member is told every setting.
+        let controller = SupervisorHostController::new();
+        let error = controller
+            .begin_session(
+                identity(),
+                &HostHello {
+                    instance_id: "p1".to_string(),
+                    connection_epoch: 1,
+                    member: None,
+                },
+            )
+            .unwrap_err();
+        for setting in [
+            "OPENSHELL_SUPERVISOR_POOL_MEMBER_ID",
+            "OPENSHELL_SUPERVISOR_POOL_MEMBER_UID",
+            "OPENSHELL_SUPERVISOR_POOL_ADVERTISE_IP",
+        ] {
+            assert!(error.message().contains(setting), "{}", error.message());
+        }
+        assert!(!error.message().contains("  "), "{}", error.message());
     }
 }
