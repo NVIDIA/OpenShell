@@ -3103,6 +3103,90 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn relay_queued_during_setup_follows_session_accepted() {
+        assert_relay_queued_during_setup_follows_session_accepted(StreamFeatures::Legacy).await;
+    }
+
+    #[tokio::test]
+    async fn relay_queued_during_push_setup_follows_session_accepted() {
+        assert_relay_queued_during_setup_follows_session_accepted(StreamFeatures::Apply).await;
+    }
+
+    /// The supervisor drops a session whose first frame is not
+    /// `SessionAccepted`, so a relay routed to a session that is registered
+    /// but not yet acknowledged must wait behind the ack.
+    async fn assert_relay_queued_during_setup_follows_session_accepted(features: StreamFeatures) {
+        let mut state = crate::grpc::test_support::test_server_state().await;
+        if features == StreamFeatures::Apply {
+            crate::grpc::test_support::enable_push_delivery(&mut state);
+        }
+        let mut sandbox = sandbox_record("sb-setup", "sb-setup");
+        // A push bootstrap needs a spec.
+        sandbox.spec = Some(openshell_core::proto::SandboxSpec::default());
+        state.store.put_message(&sandbox).await.unwrap();
+        // Setup takes this guard for its endpoint-status reset, which runs
+        // after registration and before the ack.
+        let guard = state
+            .compute
+            .sandbox_mutation_guard_by_id("sb-setup")
+            .await
+            .unwrap()
+            .expect("sandbox exists");
+        let connect = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move {
+                crate::grpc::test_support::connect_supervisor_stream(&state, "sb-setup", features)
+                    .await
+            }
+        });
+        let (session_id, _) = state
+            .supervisor_sessions
+            .wait_for_session(
+                "sb-setup",
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                true,
+            )
+            .await
+            .expect("session registers before its setup finishes");
+        let (channel_id, _relay_rx) = state
+            .supervisor_sessions
+            .open_relay("sb-setup", Duration::from_secs(5))
+            .await
+            .expect("relay is queued on the registered session");
+        // Endpoint-status authority is set before the ack, so the relay
+        // went out while the session was registered but not acknowledged.
+        assert!(
+            !state
+                .supervisor_sessions
+                .is_endpoint_status_authority("sb-setup", &session_id)
+        );
+        drop(guard);
+
+        let mut harness = connect.await.unwrap().expect("supervisor connects");
+        let Some(gateway_message::Payload::SessionAccepted(accepted)) =
+            first_gateway_message(&mut harness).await.payload
+        else {
+            panic!("expected SessionAccepted ahead of the queued relay");
+        };
+        assert_eq!(accepted.session_id, session_id);
+        assert_eq!(
+            accepted.config_push_enabled,
+            features == StreamFeatures::Apply
+        );
+        match first_gateway_message(&mut harness).await.payload {
+            Some(gateway_message::Payload::RelayOpen(open)) => {
+                assert_eq!(open.channel_id, channel_id);
+            }
+            other => panic!("expected the queued RelayOpen, got {other:?}"),
+        }
+        assert!(
+            state
+                .supervisor_sessions
+                .is_current_session("sb-setup", &accepted.session_id)
+        );
+    }
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn test_store() -> Arc<Store> {
