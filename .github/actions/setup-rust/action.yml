@@ -24,7 +24,7 @@ runs:
         echo "hash=$(nix hash file --type sha256 --base16 "$shell_drv")" >> "$GITHUB_OUTPUT"
 
     - name: Cache Rust target and registry
-      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      uses: Swatinem/rust-cache@6a7bc3ebce750e0a16a430dd57485acfdb38b05f
       with:
         shared-key: ${{ inputs.cache-key }}-${{ steps.dev-shell.outputs.hash }}
         save-if: ${{ inputs.save-cache }}
