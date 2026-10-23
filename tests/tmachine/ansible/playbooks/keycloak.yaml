@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Run Keycloak in the environment and publish how tests reach it.
+#
+# Environment setup applies this once and caches the disk, so the container
+# restarts on every boot (see the keycloak role). Tests read the variables in
+# the env file below through openshell-test-runner, which passes every
+# /etc/openshell-test/env.d/*.env file to them. The keycloak features suite
+# (tests/suites/features/keycloak) reads them.
+---
+- name: Keycloak for tests
+  hosts: all
+  gather_facts: false
+  roles:
+    - keycloak
+  tasks:
+    - name: Create the test environment directory
+      become: true
+      ansible.builtin.file:
+        path: /etc/openshell-test/env.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # The values are the throwaway fixture realm's (scripts/keycloak-realm.json).
+    - name: Publish Keycloak test variables
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/openshell-test/env.d/keycloak.env
+        owner: tmachine
+        group: tmachine
+        mode: "0600"
+        content: |
+          OPENSHELL_TEST_KEYCLOAK_ISSUER=http://127.0.0.1:{{ keycloak_port }}/realms/{{ keycloak_realm }}
+          OPENSHELL_TEST_KEYCLOAK_CLIENT_ID=openshell-cli
+          OPENSHELL_TEST_KEYCLOAK_USERNAME=admin@test
+          OPENSHELL_TEST_KEYCLOAK_PASSWORD=admin
