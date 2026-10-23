@@ -449,9 +449,9 @@ rg -q 'alone is not a process blocker' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
 rg -q '`test_dispatch_required`' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
-rg -q 'Apply `test:windows` whenever a PR affects Windows support' \
+rg -q 'treat both Windows checks as required gates' \
     "$GATOR_DIR/skills/gator-gate/SKILL.md"
-rg -q 'require the `test:windows` label' \
+rg -q 'require passing x64 and ARM64 `Windows MSVC` checks' \
     "$GATOR_DIR/../../../.claude/agents/principal-engineer-reviewer.md"
 rg -q 'attacker_or_operator_prerequisite' \
     "$GATOR_DIR/skills/gator-gate/references/review-findings-schema.md"

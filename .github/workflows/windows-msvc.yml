@@ -3,6 +3,7 @@ name: Windows MSVC
 on:
   push:
     branches:
+      - main
       - windows
       - "pull-request/[0-9]+"
   workflow_dispatch:
@@ -12,7 +13,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Let main runs finish so they seed the cache that pull-request mirrors restore.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   # sccache cannot cache incremental Rust compilations, and rust-cache removes
@@ -27,21 +29,20 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      should_run: ${{ github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
+      should_run: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/windows' || steps.gate.outputs.should_run == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - id: gate
-        if: github.ref != 'refs/heads/windows'
+        if: github.ref != 'refs/heads/main' && github.ref != 'refs/heads/windows'
         uses: ./.github/actions/pr-gate
-        with:
-          required_label: test:windows
 
   pr-check:
     name: PR lint and test (${{ matrix.arch }})
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
+      github.ref != 'refs/heads/main' &&
       github.ref != 'refs/heads/windows' &&
       github.event_name != 'workflow_dispatch'
     strategy:
@@ -92,7 +93,9 @@ jobs:
         with:
           shared-key: windows-msvc-${{ matrix.arch }}
           cache-targets: "true"
-          cache-on-failure: "true"
+          # Other mirrors cannot restore this branch's cache, so saving it only
+          # evicts the main cache they do restore.
+          save-if: "true"
           cache-bin: "false"
       - name: Lint Windows-supported crates
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
@@ -105,11 +108,11 @@ jobs:
   cache-seed:
     name: Seed cache (${{ matrix.arch }})
     # Keep release-branch Windows validation advisory while the lane matures.
-    continue-on-error: true
+    continue-on-error: ${{ github.ref == 'refs/heads/windows' }}
     needs: pr_metadata
     if: >-
       needs.pr_metadata.outputs.should_run == 'true' &&
-      github.ref == 'refs/heads/windows'
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/windows')
     strategy:
       fail-fast: false
       matrix:
@@ -156,7 +159,7 @@ jobs:
           cache-bin: "false"
       - name: Lint Windows-supported crates
         # Keep the seed workload identical to the pull-request workload so the
-        # windows-branch cache reflects the same lint and test commands.
+        # seeded cache reflects the same lint and test commands.
         run: mise run --skip-tools windows:lint:${{ matrix.arch }}
       - name: Test
         run: mise run --skip-tools windows:test:${{ matrix.arch }}
@@ -168,6 +171,7 @@ jobs:
     name: Build binaries (${{ matrix.arch }})
     continue-on-error: true
     needs: cache-seed
+    if: github.ref == 'refs/heads/windows'
     strategy:
       fail-fast: false
       matrix:
